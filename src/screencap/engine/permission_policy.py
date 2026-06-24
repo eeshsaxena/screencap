@@ -18,7 +18,7 @@ returns the stale granted-at-startup value even after the user revokes.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Callable, Protocol
 
 from screencap.engine.screen_recorder import Monitor
 
@@ -85,3 +85,92 @@ class Noop:
 
     def poll(self, now: float) -> None:
         pass
+
+
+class FreshScreenWatch:
+    """Shell/daemon-path policy: cache-immune mid-recording Screen-Recording watch (SCR-106).
+
+    ``Noop`` left the daemon worker with NO robust mid-recording Screen-Recording
+    revocation teardown — the standalone ``MacOSTCC`` poll is skipped to avoid
+    per-process TCC subprocesses, and the startup preflight (``session.py``) is a
+    one-shot check at ``elapsed=0``. The only remaining fallback was the
+    capture-health supervisor's screen edge, which is doubly unreliable here:
+
+    * its in-process ``CGPreflightScreenCaptureAccess`` labeller reads the
+      per-process TCC cache, pinned to "granted" from the worker's granted start
+      (see the module docstring + the linked solution doc); and
+    * its attempt-vs-output detector can be defeated by a denial that still
+      yields a readable desktop/wallpaper frame (``screen.output`` keeps
+      advancing, so the gap never opens) — a documented SCR-76 gap.
+
+    This policy adds the one robust signal: a FRESH-process Screen-Recording read
+    on a slow cadence. A spawned child does a fresh TCC lookup (no inherited
+    cache) and the read is content-independent (it never inspects a frame), so it
+    closes both gaps. On a debounced *explicit* denial it raises
+    ``PermissionRevoked("screen_recording")`` so the existing
+    ``_run_screen_recorder`` loop emits ``permission_lost`` and stops — the same
+    teardown the standalone path uses.
+
+    Fail-open: a probe that returns ``None`` (spawn/timeout/PyObjC error, or a
+    non-darwin host) is "couldn't determine" — it resets the streak and never
+    tears down a healthy recording.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval: float | None = None,
+        debounce: int | None = None,
+        probe: Callable[[], bool | None] | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        import sys
+
+        self._enabled = (sys.platform == "darwin") if enabled is None else enabled
+        if interval is None or debounce is None:
+            from screencap.engine.config import config as _config
+
+            interval = _config.SCREEN_PERM_WATCH_INTERVAL_SECS if interval is None else interval
+            debounce = _config.SCREEN_PERM_WATCH_DEBOUNCE if debounce is None else debounce
+        self._interval = interval
+        self._debounce = max(1, int(debounce))
+        self._probe = probe
+        self._next_poll_at: float = 0.0
+        self._denied_streak = 0
+
+    @property
+    def next_poll_at(self) -> float:
+        return float("inf") if not self._enabled else self._next_poll_at
+
+    def preflight(self) -> None:
+        # Startup TCC is the worker's own fail-fast preflight (session.py); this
+        # policy governs only the mid-recording window, so preflight is a no-op
+        # here — re-running it would risk a duplicate prompt.
+        pass
+
+    def poll(self, now: float) -> None:
+        if not self._enabled or now < self._next_poll_at:
+            return
+        self._next_poll_at = now + self._interval
+
+        granted = self._run_probe()
+        if granted is False:
+            self._denied_streak += 1
+            if self._denied_streak >= self._debounce:
+                from screencap.engine.screen_recorder import PermissionRevoked
+
+                raise PermissionRevoked("screen_recording")
+        else:
+            # True (granted) or None (couldn't determine) → fail-open reset.
+            # A transient denied-then-recovered blip never reaches the debounce.
+            self._denied_streak = 0
+
+    def _run_probe(self) -> bool | None:
+        if self._probe is not None:
+            try:
+                return self._probe()
+            except Exception:
+                return None
+        from screencap.engine._screen_perm_probe import probe_screen_recording_granted
+
+        return probe_screen_recording_granted()

@@ -1,8 +1,10 @@
 """Daemon-spawn engine-worker Screen Recording preflight.
 
-The daemon spawns ``run_recording_worker`` with ``_permission_policy=PermNoop``
-to avoid the standalone-CLI's console prompt path. Without a startup
-preflight, an unauthorized daemon binary (e.g., a fresh PyInstaller build
+The daemon spawns ``run_recording_worker`` with
+``_permission_policy=FreshScreenWatch`` (whose ``preflight`` is a no-op — it
+watches only the mid-recording window, SCR-106) to avoid the standalone-CLI's
+console prompt path. Without a startup preflight, an unauthorized daemon binary
+(e.g., a fresh PyInstaller build
 whose code-signing identifier doesn't match the user's prior TCC grant)
 enters ``screen_event_reader`` at 20 fps and triggers a TCC consent prompt
 on every ``screencapture`` / ``CGWindowListCopyWindowInfo`` call — the

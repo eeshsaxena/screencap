@@ -224,6 +224,131 @@ def test_macos_tcc_next_poll_at_advances_after_each_check():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# FreshScreenWatch — shell/daemon-path mid-recording Screen-Recording watch (SCR-106)
+# ---------------------------------------------------------------------------
+
+
+def _watch(probe_returns, *, debounce=2, interval=20.0):
+    """Build a FreshScreenWatch driven by a scripted probe.
+
+    ``probe_returns`` is a list of tri-state values yielded one per probe call.
+    """
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    seq = iter(probe_returns)
+    return FreshScreenWatch(
+        interval=interval,
+        debounce=debounce,
+        probe=lambda: next(seq),
+        enabled=True,
+    )
+
+
+def test_fresh_screen_watch_constructs_with_no_args():
+    """Mirrors MacOSTCC/Noop: constructible with no args for the policy seam."""
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    FreshScreenWatch()
+
+
+def test_fresh_screen_watch_raises_after_debounced_denial():
+    """Two consecutive *explicit* denials → PermissionRevoked('screen_recording').
+
+    This is the SCR-106 fix: the daemon worker (Noop before) now tears down on a
+    genuine mid-recording Screen-Recording revocation via the existing
+    PermissionRevoked → permission_lost → stop() path.
+    """
+    import pytest
+
+    from screencap.engine.screen_recorder import PermissionRevoked
+
+    watch = _watch([False, False], debounce=2)
+    watch.poll(0.0)  # first denial — below debounce, no raise
+    with pytest.raises(PermissionRevoked) as excinfo:
+        watch.poll(20.0)  # second denial — debounce reached
+    assert excinfo.value.missing == "screen_recording"
+
+
+def test_fresh_screen_watch_fail_open_on_none():
+    """A probe that can't determine (None) NEVER tears down a healthy recording."""
+    watch = _watch([None, None, None], debounce=2)
+    watch.poll(0.0)
+    watch.poll(20.0)
+    watch.poll(40.0)  # must not raise
+
+
+def test_fresh_screen_watch_granted_does_not_raise():
+    """Granted reads never raise."""
+    watch = _watch([True, True], debounce=2)
+    watch.poll(0.0)
+    watch.poll(20.0)  # must not raise
+
+
+def test_fresh_screen_watch_denied_then_recovered_resets_streak():
+    """A denied blip that recovers before the debounce must not tear down.
+
+    Sequence: denied (streak=1), granted (streak reset), denied (streak=1) —
+    debounce of 2 is never reached, so no PermissionRevoked.
+    """
+    watch = _watch([False, True, False], debounce=2)
+    watch.poll(0.0)
+    watch.poll(20.0)
+    watch.poll(40.0)  # must not raise — streak was reset by the granted read
+
+
+def test_fresh_screen_watch_skips_probe_before_interval():
+    """poll() within the interval does not spend a probe."""
+    calls = {"n": 0}
+
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    def _probe():
+        calls["n"] += 1
+        return True
+
+    watch = FreshScreenWatch(interval=20.0, debounce=2, probe=_probe, enabled=True)
+    watch.poll(0.0)
+    watch.poll(5.0)  # within interval — no probe
+    assert calls["n"] == 1
+
+
+def test_fresh_screen_watch_disabled_never_polls():
+    """On a non-darwin host (enabled=False) the watch is inert."""
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    def _probe():
+        raise AssertionError("probe must not run when disabled")
+
+    watch = FreshScreenWatch(interval=20.0, debounce=2, probe=_probe, enabled=False)
+    watch.poll(0.0)
+    watch.poll(100.0)  # must not raise / must not probe
+    assert watch.next_poll_at == float("inf")
+
+
+def test_fresh_screen_watch_preflight_is_noop():
+    """preflight must NOT spawn a probe or prompt — startup TCC is the worker's
+    own fail-fast check (session.py); this policy owns only the runtime window."""
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    def _probe():
+        raise AssertionError("preflight must not probe")
+
+    FreshScreenWatch(probe=_probe, enabled=True).preflight()  # must not raise
+
+
+def test_fresh_screen_watch_probe_exception_is_fail_open():
+    """A probe callable that raises is swallowed to None (fail-open), not denied."""
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    def _probe():
+        raise RuntimeError("simulated probe crash")
+
+    watch = FreshScreenWatch(interval=20.0, debounce=1, probe=_probe, enabled=True)
+    watch.poll(0.0)
+    watch.poll(20.0)  # must not raise — exceptions map to None, never to denied
+
+
 def test_screen_recorder_calls_permission_policy_preflight_and_poll(tmp_path):
     """``ScreenRecorder.run()`` must invoke ``permission_policy.preflight()``
     during setup and ``permission_policy.poll(elapsed)`` in the recording loop.

@@ -1,11 +1,13 @@
 """Tests for SCR-76 mid-recording capture-health detection.
 
-The daemon recording path runs the engine with ``PermNoop``, so the standalone
-CLI's subprocess-based TCC watcher never runs there — and that subprocess probe
-is itself broken in the frozen daemon binary (SCR-69). This suite covers the
-capture-side mechanism that replaces it: per-reader attempt-vs-output counters
-folded into the engine's 1s supervisor loop, attributed in-process and surfaced
-as ``permission_lost`` (TCC cause) or the advisory ``capture_unhealthy`` (non-TCC).
+The daemon recording path runs the engine without the standalone CLI's
+subprocess-based TCC watcher (that ``[sys.executable, "-c", ...]`` probe is
+broken in the frozen daemon binary, SCR-69). This suite covers the capture-side
+mechanism that complements it: per-reader attempt-vs-output counters folded into
+the engine's 1s supervisor loop, attributed in-process and surfaced as
+``permission_lost`` (TCC cause) or the advisory ``capture_unhealthy`` (non-TCC).
+(The mid-recording Screen-Recording revocation gap this mechanism does NOT close
+on the daemon path is handled by ``FreshScreenWatch``; see SCR-106.)
 
 Following the repo's testing posture (see ``test_permission_revocation_engine``
 and ``test_health_monitoring``), assertions target observed counter / verdict
