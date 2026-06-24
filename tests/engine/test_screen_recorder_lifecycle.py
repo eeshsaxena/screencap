@@ -176,6 +176,55 @@ def test_permission_revoked_mid_loop_emits_stderr_event_and_stops(tmp_path, capf
     assert meta["terminated_reason"] == "permission_lost"
 
 
+def test_fresh_screen_watch_revocation_drives_loop_teardown(tmp_path, capfd):
+    """A real ``FreshScreenWatch`` revocation drives the run()-level teardown.
+
+    The seam-level tests (``test_permission_policy.py``) only prove the watch
+    *raises* ``PermissionRevoked`` from ``poll()`` directly; the
+    ``permission_lost`` consumer branch is otherwise exercised only through the
+    ``MacOSTCC``-shaped ``_OneShotPermissionPolicy`` fake. This pins that a
+    genuine ``FreshScreenWatch`` — driven through the supervisor loop so its own
+    debounce trips — flows through the same ``permission_lost`` + ``stop()``
+    teardown. ``interval=0.0`` lets the loop poll every tick so the scripted
+    denials reach the debounce.
+    """
+    from screencap.engine.disk_policy import Noop as DiskNoop
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    watch = FreshScreenWatch(
+        interval=0.0,
+        debounce=2,
+        # Deny on every probe; the debounce of 2 trips on the second loop tick.
+        probe=lambda: False,
+        enabled=True,
+    )
+    rec = _build_seam(tmp_path, permission=watch, disk=DiskNoop())
+
+    mocks = _common_mocks()
+    for m in mocks:
+        m.start()
+    try:
+        rec.run()
+    finally:
+        for m in mocks:
+            m.stop()
+
+    err = capfd.readouterr().err
+    events = [
+        json.loads(line) for line in err.splitlines()
+        if line.strip().startswith("{") and "permission_lost" in line
+    ]
+    assert events, (
+        "a FreshScreenWatch revocation must emit the ``permission_lost`` stderr "
+        f"event the SwiftUI shell relies on; got stderr={err!r}"
+    )
+    assert events[0]["permission"] == "screen_recording"
+
+    capture_dir = tmp_path / "rec"
+    meta = json.loads((capture_dir / ".recording_stop_meta.json").read_text())
+    assert meta["terminated_reason"] == "permission_lost"
+
+
 def test_disk_space_critical_mid_loop_marks_stop_reason(tmp_path):
     """``DiskSpaceCritical`` mid-loop → ``terminated_reason='disk_full'`` + ``DiskFullError``."""
     from screencap.engine.permission_policy import Noop as PermNoop
