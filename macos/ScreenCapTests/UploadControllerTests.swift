@@ -54,7 +54,7 @@ final class UploadControllerTests: XCTestCase {
     /// production `.shared` registry.
     private func makeController(
         service: UploadService,
-        inactivityTimeoutSeconds: Double = 120
+        inactivityTimeoutSeconds: Double = UploadController.defaultInactivityTimeoutSeconds
     ) -> UploadController {
         UploadController(
             service: service,
@@ -192,7 +192,7 @@ final class UploadControllerTests: XCTestCase {
         // the default watchdog, or the busy event can't surface first.
         XCTAssertLessThan(
             Double(LiveUploadService.interactiveLockTimeoutSeconds),
-            120,
+            UploadController.defaultInactivityTimeoutSeconds,
             "interactive lock timeout must stay under the 120s inactivity watchdog"
         )
     }

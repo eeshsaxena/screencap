@@ -145,6 +145,13 @@ final class UploadRegistry {
 
 @MainActor
 final class UploadController: ObservableObject {
+    /// Production default for the inactivity watchdog bound (seconds). Single
+    /// source of truth: the `init` default below references this, and the
+    /// SCR-165 test asserts the interactive `--lock-timeout` stays strictly
+    /// under it via this same constant (no bare `120` literal). If this drops,
+    /// the under-watchdog invariant tightens with it instead of going stale.
+    static let defaultInactivityTimeoutSeconds: Double = 120
+
     @Published private(set) var state: UploadState = .idle
 
     private let service: UploadService
@@ -177,7 +184,7 @@ final class UploadController: ObservableObject {
     init(
         service: UploadService = LiveUploadService(),
         registry: UploadRegistry = .shared,
-        inactivityTimeoutSeconds: Double = 120
+        inactivityTimeoutSeconds: Double = UploadController.defaultInactivityTimeoutSeconds
     ) {
         self.service = service
         self.registry = registry
