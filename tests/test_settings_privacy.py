@@ -426,7 +426,7 @@ class TestConcurrentMutations:
         import multiprocessing
         import time as _time
 
-        from screencap.cli import _config_lock_path
+        from screencap.privacy_settings import _config_lock_path
 
         # Pre-create the directory so the child can open the lock file
         _config_lock_path().parent.mkdir(parents=True, exist_ok=True)

@@ -116,10 +116,10 @@ def stub_daemon(monkeypatch):
             # The start command surrounds itself with first-run prompts;
             # neutralize them so CliRunner does not block on stdin.
             monkeypatch.setattr(
-                "screencap.cli._maybe_prompt_privacy_setup", lambda **kw: None
+                "screencap.privacy_settings._maybe_prompt_privacy_setup", lambda **kw: None
             )
             monkeypatch.setattr(
-                "screencap.cli._maybe_prompt_matrix_acknowledgement", lambda: None
+                "screencap.privacy_settings._maybe_prompt_matrix_acknowledgement", lambda: None
             )
             monkeypatch.setattr(
                 "screencap.cli._stdin_is_tty", lambda: False

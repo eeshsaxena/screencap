@@ -35,8 +35,8 @@ def _safe_start_prompts():
     neutralizes the prompt/exit path.
     """
     with (
-        mock.patch("screencap.cli._maybe_prompt_privacy_setup"),
-        mock.patch("screencap.cli._maybe_prompt_matrix_acknowledgement"),
+        mock.patch("screencap.privacy_settings._maybe_prompt_privacy_setup"),
+        mock.patch("screencap.privacy_settings._maybe_prompt_matrix_acknowledgement"),
         mock.patch("screencap.cli._stdin_is_tty", return_value=False),
         mock.patch("os._exit"),
     ):

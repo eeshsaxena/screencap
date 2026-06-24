@@ -108,7 +108,7 @@ def _eval_for(evaluator, bundle_id, title="Whatever", domain=None):
 class TestAllowAppsRespectsMatrixFloor:
     """allow_apps observes the matrix-strictness floor at the configured mode.
 
-    The CLI guard (cli._matrix_blocks_allow_for_class) rejects new
+    The CLI guard (privacy_settings._matrix_blocks_allow_for_class) rejects new
     additions of bundles whose matrix action is EXCLUDE / MASK_WINDOW /
     TEXT_REDACT. The runtime evaluator must apply the same floor so an
     EXISTING entry (carried over from before the guard or from a prior

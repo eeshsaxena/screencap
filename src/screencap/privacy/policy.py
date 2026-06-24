@@ -452,7 +452,7 @@ class DefaultPolicyEvaluator:
         # the matrix so sensitive sites are still gated.
         #
         # Matrix-strictness floor (mirrors the CLI guard at
-        # cli._matrix_blocks_allow_for_class): allow_apps cannot loosen the
+        # privacy_settings._matrix_blocks_allow_for_class): allow_apps cannot loosen the
         # matrix when it produces EXCLUDE / MASK_WINDOW / TEXT_REDACT. The
         # CLI prevents NEW additions of those bundles, but EXISTING entries
         # from before Unit 7a (e.g., a pre-existing Slack allowlist that
