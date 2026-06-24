@@ -281,7 +281,7 @@ def test_auto_exports_missing_events_with_upload_config(recordings_root):
 
 def test_nullable_metadata_serialized_as_json_null(recordings_root):
     """A playable recording with no action events (``_read_recording_meta``
-    returns None timing, timing_error=False) still yields ok=True with
+    returns None timing, timing_status="ok") still yields ok=True with
     started_at/duration_seconds as JSON null — the Swift side decodes them as
     Double?. timing_error is False because the DB read itself succeeded."""
     rec_dir = _make_recording(recordings_root, "rec-nometa")
@@ -290,7 +290,7 @@ def test_nullable_metadata_serialized_as_json_null(recordings_root):
 
     with mock.patch(
         "screencap.catalog._read_recording_meta",
-        return_value=(None, None, False),
+        return_value=(None, None, "ok"),
     ):
         envelope = prepare_review_data("rec-nometa")
 
@@ -298,18 +298,21 @@ def test_nullable_metadata_serialized_as_json_null(recordings_root):
     assert envelope["started_at"] is None
     assert envelope["duration_seconds"] is None
     # Benign event-free null is NOT a read failure.
+    assert envelope["timing_status"] == "ok"
     assert envelope["timing_error"] is False
     # Serialized as JSON null, not omitted and not 0.
     serialized = json.loads(json.dumps(envelope))
     assert serialized["started_at"] is None
     assert serialized["duration_seconds"] is None
+    assert serialized["timing_status"] == "ok"
     assert serialized["timing_error"] is False
 
 
-def test_timing_error_flagged_when_db_read_fails(recordings_root):
-    """SCR-107: a swallowed DB-read failure (corrupt/unreadable recording.db)
-    yields ok=True + null timing BUT timing_error=True, so the Swift consumer
-    can surface a non-blocking advisory instead of presenting a corrupted DB
+def test_timing_status_corrupt_when_db_read_fails(recordings_root):
+    """SCR-107/SCR-166: a swallowed DB-read failure (corrupt/unreadable
+    recording.db) yields ok=True + null timing with timing_status="corrupt" (and
+    the back-compat timing_error=True), so the Swift consumer can surface a
+    "metadata couldn't be read" advisory instead of presenting a corrupted DB
     as a clean, event-free review."""
     rec_dir = _make_recording(recordings_root, "rec-badmeta")
     _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
@@ -317,7 +320,7 @@ def test_timing_error_flagged_when_db_read_fails(recordings_root):
 
     with mock.patch(
         "screencap.catalog._read_recording_meta",
-        return_value=(None, None, True),
+        return_value=(None, None, "corrupt"),
     ):
         envelope = prepare_review_data("rec-badmeta")
 
@@ -325,19 +328,41 @@ def test_timing_error_flagged_when_db_read_fails(recordings_root):
     assert envelope["ok"] is True
     assert envelope["started_at"] is None
     assert envelope["duration_seconds"] is None
-    # The discriminator that separates corruption from a benign event-free DB.
+    assert envelope["timing_status"] == "corrupt"
+    # Back-compat boolean stays True for the non-"ok" state.
     assert envelope["timing_error"] is True
     serialized = json.loads(json.dumps(envelope))
+    assert serialized["timing_status"] == "corrupt"
     assert serialized["timing_error"] is True
 
 
-def test_timing_error_real_corrupt_db(recordings_root):
-    """SCR-107 end-to-end: a real corrupt recording.db (non-sqlite bytes) causes
-    timing_error=True in the envelope without mocking _read_recording_meta.
+def test_timing_status_locked_is_distinct_from_corrupt(recordings_root):
+    """SCR-166: a transient lock yields timing_status="locked" — distinct from
+    "corrupt" — so the consumer can say "temporarily unavailable" instead of a
+    corruption-flavored advisory. The back-compat boolean is still True."""
+    rec_dir = _make_recording(recordings_root, "rec-locked")
+    _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    with mock.patch(
+        "screencap.catalog._read_recording_meta",
+        return_value=(None, None, "locked"),
+    ):
+        envelope = prepare_review_data("rec-locked")
+
+    assert envelope["ok"] is True
+    assert envelope["timing_status"] == "locked"
+    # A lock is non-"ok", so the legacy boolean still flags the advisory.
+    assert envelope["timing_error"] is True
+
+
+def test_timing_status_real_corrupt_db(recordings_root):
+    """SCR-166 end-to-end: a real corrupt recording.db (non-sqlite bytes) yields
+    timing_status="corrupt" in the envelope without mocking _read_recording_meta.
 
     The review stays playable (ok=True), started_at/duration_seconds are null,
-    and timing_error is True — distinguishing a corrupt DB from a benign
-    event-free recording.
+    and timing_status is "corrupt" (not "locked") — a real unreadable DB is
+    corruption, not contention.
     """
     rec_dir = _make_recording(recordings_root, "rec-realcorrupt", with_db=False)
     _write_video(rec_dir / "video.mp4", (0, 0, 200), pix_fmt="yuv420p")
@@ -348,6 +373,7 @@ def test_timing_error_real_corrupt_db(recordings_root):
 
     assert envelope["ok"] is True
     assert envelope["started_at"] is None
+    assert envelope["timing_status"] == "corrupt"
     assert envelope["timing_error"] is True
 
 
@@ -372,6 +398,7 @@ def test_cli_emits_json_envelope(recordings_root):
     assert payload["video_pixfmt_remediated"] is False
     assert "timing_error" in payload
     assert payload["timing_error"] is False
+    assert payload["timing_status"] == "ok"
 
 
 def test_cli_cant_process_emits_error_envelope(recordings_root):

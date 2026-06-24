@@ -257,23 +257,48 @@ def _ledger_has_uploaded_chunk(db_path: Path) -> bool | None:
         conn.close()
 
 
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    """Return whether an ``OperationalError`` is a transient SQLite lock/busy.
+
+    Prefers the numeric error code (Python 3.11+ sets ``sqlite_errorcode`` on
+    raised exceptions); falls back to message matching on 3.10, or for
+    manually-constructed exceptions that carry no code. SQLite raises
+    SQLITE_BUSY (5) / SQLITE_LOCKED (6) — and their extended variants, which
+    share the low byte — for lock contention; other ``OperationalError``\\ s
+    (disk I/O, missing table) are not transient locks (SCR-166).
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in (5, 6)  # SQLITE_BUSY, SQLITE_LOCKED
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
 def _read_recording_meta(
     db_path: Path,
-) -> tuple[float | None, float | None, bool]:
-    """Read (started_timestamp, duration_seconds, timing_error) from a recording.db.
+) -> tuple[float | None, float | None, str]:
+    """Read (started_timestamp, duration_seconds, timing_status) from a recording.db.
 
-    ``timing_error`` is True ONLY when the read itself failed — a caught
-    sqlite3/OS exception from a corrupt, truncated, locked, or otherwise
-    unreadable DB. A DB that opens cleanly but carries no usable timing (no
-    ``recording`` table, a zero/NULL timestamp, or no ``action_event`` rows)
-    returns ``timing_error=False`` so a legitimately event-free recording is
-    never flagged as corrupt.
+    ``timing_status`` is one of:
+
+    * ``"ok"`` — the read succeeded. A DB that opens cleanly but carries no
+      usable timing (no ``recording`` table, a zero/NULL timestamp, or no
+      ``action_event`` rows) is still ``"ok"`` with ``None`` timing, so a
+      legitimately event-free recording is never flagged.
+    * ``"locked"`` — the DB was locked/busy: an active recording (or a
+      concurrent writer) held it past ``busy_timeout``, raising
+      ``sqlite3.OperationalError``. A *transient* condition that resolves once
+      the writer releases — NOT corruption (SCR-166).
+    * ``"corrupt"`` — the read failed for any other reason (a corrupt,
+      truncated, or otherwise unreadable DB; an OS/parse error).
 
     Display-only callers (``list_recordings``, ``cli info``) ignore the third
-    value; the review-data emitter uses it to tell "couldn't read the DB" apart
-    from "DB read fine, just no timing" — without it, ``except Exception``
-    collapses both into the same ``(None, None)`` and a corrupted DB presents as
-    a clean, playable review (SCR-107).
+    value; the review-data emitter threads it so the UI can tell a *transient
+    lock* ("timeline temporarily unavailable") from *corruption* ("metadata
+    couldn't be read") from a *benign event-free* recording (no advisory) —
+    without it, ``except Exception`` collapses all three into the same
+    ``(None, None)`` (SCR-107 split corrupt from event-free; SCR-166 splits
+    locked from corrupt).
     """
     import sqlite3
 
@@ -290,10 +315,19 @@ def _read_recording_meta(
                     if ev and ev[0] is not None:
                         duration = float(ev[0]) - started
 
-            return started, duration, False
+            return started, duration, "ok"
+    except sqlite3.OperationalError as exc:
+        # OperationalError ⊂ DatabaseError ⊂ sqlite3.Error, so this clause must
+        # precede the broad catch below. A lock/busy is transient; everything
+        # else (disk I/O, etc.) is treated as an unreadable DB.
+        if _is_lock_error(exc):
+            logger.warning("recording.db locked (transient) for %s: %r", db_path, exc)
+            return None, None, "locked"
+        logger.warning("recording.db read failed for %s: %r", db_path, exc)
+        return None, None, "corrupt"
     except (sqlite3.Error, OSError, ValueError) as exc:
         logger.warning("recording.db read failed for %s: %r", db_path, exc)
-        return None, None, True
+        return None, None, "corrupt"
 
 
 def get_seen_bundle_ids(directories: list[Path] | None = None) -> set[str]:

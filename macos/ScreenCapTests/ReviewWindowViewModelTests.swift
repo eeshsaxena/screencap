@@ -462,19 +462,20 @@ final class ReviewWindowViewModelTests: XCTestCase {
             XCTAssertEqual(data.videoURL.path, "/tmp/video.mp4")
             XCTAssertEqual(data.startedAt, 0, "null started_at falls back to origin 0")
             XCTAssertEqual(data.durationSeconds, 0, "null duration_seconds falls back to unknown (0)")
-            XCTAssertFalse(data.timingError, "benign event-free null is not a read failure")
+            XCTAssertEqual(data.timingStatus, .ok, "benign event-free null is not a read failure")
         } else {
             XCTFail("expected ready for playable recording with null timing, got \(model.state)")
         }
     }
 
-    /// SCR-107 — `ok: true` with null timing AND `timing_error: true` is a
-    /// playable recording whose `recording.db` couldn't be read (corrupt /
-    /// unreadable). It must still land on `.ready` (the video plays) but carry
-    /// `timingError` so the panes surface a non-blocking advisory — NOT
-    /// `.failed`, and NOT silently indistinguishable from a clean event-free
-    /// recording. This is the discriminator the SCR-102 fix erased.
-    func testTimingErrorEnvelopeLandsOnReadyWithAdvisoryFlag() async {
+    /// SCR-107/SCR-166 — `ok: true` with null timing AND a legacy
+    /// `timing_error: true` (no `timing_status`, i.e. an older CLI) is a
+    /// playable recording whose `recording.db` couldn't be read. It must still
+    /// land on `.ready` (the video plays) but resolve to `.corrupt` so the
+    /// panes surface the advisory — NOT `.failed`, and NOT silently
+    /// indistinguishable from a clean event-free recording. This pins the
+    /// back-compat fallback (legacy boolean → `.corrupt`).
+    func testLegacyTimingErrorEnvelopeResolvesToCorrupt() async {
         let loader = FakeReviewDataLoader()
         loader.nextEnvelope = .init(
             ok: true,
@@ -492,11 +493,40 @@ final class ReviewWindowViewModelTests: XCTestCase {
         await model.loadReviewData()
 
         if case .ready(let data) = model.state {
-            XCTAssertTrue(data.timingError, "DB-read failure must set the advisory flag")
+            XCTAssertEqual(data.timingStatus, .corrupt, "legacy timing_error=true maps to .corrupt")
             XCTAssertEqual(data.startedAt, 0, "null timing still falls back to origin 0")
             XCTAssertEqual(data.durationSeconds, 0)
         } else {
             XCTFail("expected ready with advisory for unreadable-DB recording, got \(model.state)")
+        }
+    }
+
+    /// SCR-166 — `timing_status: "locked"` resolves to `.locked` (distinct from
+    /// `.corrupt`), so the panes can render "temporarily unavailable" for a
+    /// transient lock instead of a corruption-flavored advisory. Still
+    /// `.ready` — the video plays.
+    func testLockedTimingStatusResolvesToLocked() async {
+        let loader = FakeReviewDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true,
+            schemaVersion: 3,
+            videoPath: "/tmp/video.mp4",
+            eventsPath: "/tmp/events.jsonl",
+            startedAt: nil,
+            durationSeconds: nil,
+            videoPixfmtRemediated: false,
+            error: nil,
+            timingError: true,
+            timingStatus: "locked"
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadReviewData()
+
+        if case .ready(let data) = model.state {
+            XCTAssertEqual(data.timingStatus, .locked, "timing_status=locked must not read as corruption")
+        } else {
+            XCTFail("expected ready with transient-lock advisory, got \(model.state)")
         }
     }
 
@@ -724,6 +754,30 @@ final class ReviewWindowViewModelTests: XCTestCase {
         XCTAssertNil(env.redaction?.blockedIntervals?.first?.end, "null end → nil")
         XCTAssertEqual(env.coverage?.transcriptUploadedScrubbed, false)
         XCTAssertEqual(env.timingError, true)
+        // SCR-166: an older (v2) envelope omits timing_status → nil, and
+        // resolve() falls back to the legacy boolean (true → .corrupt).
+        XCTAssertNil(env.timingStatus)
+        XCTAssertEqual(
+            ReviewTimingStatus.resolve(status: env.timingStatus, legacyError: env.timingError),
+            .corrupt)
+    }
+
+    /// SCR-166 — pins the new `timing_status` key: a v3 envelope's snake_case
+    /// `"locked"` decodes and resolves to `.locked` (not the corruption
+    /// fallback), so a transient lock reads as temporarily unavailable.
+    func testDecodesTimingStatusLockedFromRawJSON() throws {
+        let json = """
+        {"ok": true, "schema_version": 3, "video_path": "/v.mp4",
+         "events_path": "/s/events.jsonl",
+         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false,
+         "timing_error": true, "timing_status": "locked"}
+        """
+        let env = try JSONDecoder().decode(ReviewDataEnvelope.self, from: Data(json.utf8))
+        XCTAssertEqual(env.timingStatus, "locked")
+        XCTAssertEqual(env.timingError, true)
+        XCTAssertEqual(
+            ReviewTimingStatus.resolve(status: env.timingStatus, legacyError: env.timingError),
+            .locked)
     }
 
     // MARK: - Helpers

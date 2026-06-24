@@ -57,7 +57,12 @@ console = Console(stderr=True)
 # and coverage fields plus the scrubbed screenshot set. All new fields are
 # nullable/empty-representable; Swift decodes them with safe defaults and never
 # gates readiness on them (see the nullable-timing learning).
-REVIEW_SCHEMA_VERSION = 2
+#
+# Bumped to 3 in SCR-166: added the additive ``timing_status`` (ok|locked|
+# corrupt) field. The pre-existing ``timing_error`` boolean is retained as a
+# back-compat alias (True for both locked and corrupt), so an older Swift
+# consumer that only reads ``timing_error`` keeps its current behavior.
+REVIEW_SCHEMA_VERSION = 3
 
 
 class ReviewPrepareError(RuntimeError):
@@ -298,18 +303,20 @@ def prepare_review_data(name: str) -> dict:
     # original DB (scrubbing nulls content, not timestamps). Nullable — see the
     # docstring; a playable recording may have no action events.
     #
-    # `timing_error` (SCR-107) disambiguates the null: True ONLY when the DB
-    # read itself failed (corrupt / unreadable recording.db, a swallowed
-    # exception), so the Swift consumer can surface a non-blocking advisory
-    # instead of presenting a corrupted DB as a clean, event-free review. A
-    # benign event-free recording (or an absent DB) keeps it False — null
-    # timing alone is not an error.
+    # `timing_status` (SCR-166) disambiguates the null three ways: "ok" (benign
+    # event-free recording, or absent DB), "locked" (a transient lock held by an
+    # active recording / concurrent writer — resolves on its own), or "corrupt"
+    # (an unreadable recording.db). The Swift consumer renders a "temporarily
+    # unavailable" advisory for a lock vs a "metadata couldn't be read" advisory
+    # for corruption, instead of presenting either as a clean, event-free
+    # review. `timing_error` (SCR-107) is kept as the back-compat boolean older
+    # consumers read — True for both non-"ok" states.
     db_path = find_db(rec_dir)
     started_at: float | None = None
     duration_seconds: float | None = None
-    timing_error: bool = False
+    timing_status: str = "ok"
     if db_path is not None:
-        started_at, duration_seconds, timing_error = _read_recording_meta(db_path)
+        started_at, duration_seconds, timing_status = _read_recording_meta(db_path)
 
     return {
         "ok": True,
@@ -327,9 +334,12 @@ def prepare_review_data(name: str) -> dict:
         "coverage": coverage,
         "started_at": started_at,
         "duration_seconds": duration_seconds,
-        # SCR-107: True only when null timing is due to a failed DB read, so the
-        # consumer can tell a corrupted DB from a benign event-free recording.
-        "timing_error": timing_error,
+        # SCR-166: tri-state "ok" | "locked" | "corrupt" — lets the consumer tell
+        # a transient lock from corruption from a benign event-free recording.
+        "timing_status": timing_status,
+        # SCR-107 back-compat: True for both non-"ok" states, so an older
+        # consumer that only reads this boolean still surfaces the advisory.
+        "timing_error": timing_status != "ok",
         "video_pixfmt_remediated": remediated,
     }
 
