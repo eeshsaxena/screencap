@@ -83,6 +83,27 @@ def test_view_not_found(tmp_path):
         assert "Error" in result.output
 
 
+def test_view_success_escapes_rich_markup():
+    """SCR-169: the ``view`` success line interpolates the user-chosen recording
+    ``name`` into ``[dim]Opening {name}/viewer.html ...[/dim]``. A name carrying
+    an unbalanced ``[/]`` makes Rich raise ``MarkupError`` and crash the command
+    after the viewer already opened; a balanced ``[x]`` run is silently stripped.
+    The dynamic segment must be escaped so the brackets survive verbatim.
+
+    ``open_viewer`` is mocked to a no-op (no browser launch / HTML render). Force
+    the human path — CliRunner stdout is non-TTY, but ``view`` has no --json mode,
+    so the human sink runs unconditionally."""
+    from rich.errors import MarkupError
+
+    with mock.patch("screencap.viewer.open_viewer", return_value=None):
+        result = CliRunner().invoke(cli, ["view", "we[/]ird"])
+
+    assert not isinstance(result.exception, MarkupError), result.exception
+    assert result.exit_code == 0
+    # Escaped, so the literal brackets survive instead of crashing/stripping.
+    assert "we[/]ird" in result.output
+
+
 # --- info command tests ---
 
 
@@ -220,6 +241,47 @@ def test_info_command_nonexistent_recording(tmp_path):
         result = runner.invoke(cli, ["info", "doesnotexist"])
     assert result.exit_code == 1
     assert "Error" in result.output
+
+
+def test_info_command_escapes_os_derived_markup(tmp_path):
+    """SCR-169: the human-path ``info`` listing interpolates OS-derived metric
+    values — a running-application name and a wifi field value — into Rich-markup
+    strings. These come from the recorded machine's environment (app names, SSID,
+    etc.), not the developer. A value carrying an unbalanced ``[/]`` makes Rich
+    raise ``MarkupError`` and crash the command; a balanced ``[x]`` run is silently
+    stripped. The dynamic segments must be escaped so brackets render verbatim and
+    never reach the parser.
+
+    Drive the human path (``_should_default_to_json`` → False; CliRunner stdout is
+    non-TTY, which would otherwise auto-select the unaffected --json path) with a
+    metrics file whose running-app name + wifi value carry ``[/]``."""
+    from rich.errors import MarkupError
+
+    _make_recording_dir(tmp_path, "demo", with_metrics=False)
+    metrics = {
+        "schema_version": 4,
+        "static": {
+            "hostname": "host.local",
+            "wifi": {"ssid": "Corp[/]Net", "phy_mode": "802.11ax"},
+            "running_applications": [
+                {"name": "Evil[/]App", "bundle_id": "com.evil[/]app", "version": "1.0"},
+            ],
+        },
+        "start": {"wifi": {"ssid": "Corp[/]Net"}},
+    }
+    (tmp_path / "demo" / "system_metrics.json").write_text(json.dumps(metrics))
+
+    runner = CliRunner()
+    with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._should_default_to_json", return_value=False):
+        result = runner.invoke(cli, ["info", "demo"])
+
+    assert not isinstance(result.exception, MarkupError), result.exception
+    assert result.exit_code == 0
+    # Escaped, so the literal brackets survive instead of crashing/stripping.
+    assert "Evil[/]App" in result.output
+    assert "com.evil[/]app" in result.output
+    assert "Corp[/]Net" in result.output
 
 
 # --- stop command tests (Phase 2 U1.5: thin daemon client) ---

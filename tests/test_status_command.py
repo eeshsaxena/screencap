@@ -245,6 +245,37 @@ def test_status_includes_nlp_models_cached_flag(monkeypatch):
     assert isinstance(payload["nlp_models_cached"], bool)
 
 
+def test_status_human_path_escapes_daemon_markup(monkeypatch):
+    """SCR-169: the human-path ``status`` output interpolates the
+    daemon-controlled ``recording_name`` and ``claimant`` into Rich-markup
+    strings. A value carrying an unbalanced ``[/]`` makes Rich raise
+    ``MarkupError`` and crash the command; a balanced ``[x]`` run is silently
+    stripped. The dynamic segments must be escaped so brackets render verbatim
+    and never reach the parser.
+
+    Force the human path — CliRunner stdout is non-TTY, which would otherwise
+    auto-select the unaffected --json path."""
+    from rich.errors import MarkupError
+
+    import screencap.cli as cli_mod
+
+    snapshot = _recording_snapshot(name="rec[/]ord", started_at=time.time() - 5.0)
+    snapshot["claimant"] = "cl[/]aim"  # override the helper's default "daemon"
+
+    def handler(request):
+        return httpx.Response(200, json=snapshot)
+
+    _patch_client(monkeypatch, handler)
+    monkeypatch.setattr(cli_mod, "_should_default_to_json", lambda: False)
+    result = CliRunner().invoke(cli, ["status"], catch_exceptions=False)
+
+    assert not isinstance(result.exception, MarkupError), result.exception
+    assert result.exit_code == 0
+    # Escaped, so the literal brackets survive instead of crashing/stripping.
+    assert "rec[/]ord" in result.output
+    assert "cl[/]aim" in result.output
+
+
 def test_daemon_api_error_surfaces_and_reports_not_recording(monkeypatch):
     def handler(request):
         return httpx.Response(
