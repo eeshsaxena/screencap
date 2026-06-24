@@ -18,13 +18,14 @@ returns the stale granted-at-startup value even after the user revokes.
 
 from __future__ import annotations
 
+import sys
 from typing import Callable, Protocol
 
 from screencap.engine.screen_recorder import Monitor
 
 
 class PermissionPolicy(Monitor, Protocol):
-    """TCC permission preflight + revocation polling. ``MacOSTCC`` | ``Noop``."""
+    """TCC permission preflight + revocation polling. ``MacOSTCC`` | ``Noop`` | ``FreshScreenWatch``."""
 
 
 _INTERVAL = 5.0
@@ -124,15 +125,19 @@ class FreshScreenWatch:
         probe: Callable[[], bool | None] | None = None,
         enabled: bool | None = None,
     ) -> None:
-        import sys
-
         self._enabled = (sys.platform == "darwin") if enabled is None else enabled
-        if interval is None or debounce is None:
+        # Resolve each default from config independently so the type checker can
+        # narrow ``interval``/``debounce`` to non-None before the assignments
+        # below. Config is still read only when an arg is None (lazy import).
+        if interval is None:
             from screencap.engine.config import config as _config
 
-            interval = _config.SCREEN_PERM_WATCH_INTERVAL_SECS if interval is None else interval
-            debounce = _config.SCREEN_PERM_WATCH_DEBOUNCE if debounce is None else debounce
-        self._interval = interval
+            interval = _config.SCREEN_PERM_WATCH_INTERVAL_SECS
+        if debounce is None:
+            from screencap.engine.config import config as _config
+
+            debounce = _config.SCREEN_PERM_WATCH_DEBOUNCE
+        self._interval: float = interval
         self._debounce = max(1, int(debounce))
         self._probe = probe
         self._next_poll_at: float = 0.0

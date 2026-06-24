@@ -18,8 +18,13 @@ inherited cache.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 
-def _probe_child(q) -> None:
+if TYPE_CHECKING:
+    import multiprocessing
+
+
+def _probe_child(q: multiprocessing.Queue[bool | None]) -> None:
     """Run in the spawned child: put ``True``/``False``/``None`` on ``q``.
 
     ``None`` signals "couldn't determine" (PyObjC import/bridge error) — the
