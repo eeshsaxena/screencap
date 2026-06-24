@@ -89,6 +89,7 @@ final class RecordingStateMachineTests: XCTestCase {
     func testForceStateToIdleClearsLedgerFields() {
         var machine = RecordingStateMachine()
         machine.setPendingStartCursor(42)
+        machine.setStartedSessionID("force-state-session")
         _ = machine.observeActiveDaemonSession(startedAt: Date(), now: Date())
 
         machine.forceState(.idle)
@@ -96,6 +97,7 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertEqual(machine.state, .idle)
         XCTAssertNil(machine.pendingStartCursor)
         XCTAssertNil(machine.recordingStartedAt)
+        XCTAssertNil(machine.startedSessionID)
     }
 
     // MARK: - Event: started
@@ -159,12 +161,14 @@ final class RecordingStateMachineTests: XCTestCase {
     func testRecordingFailedTransitionsToIdleAndResolvesAwaits() {
         var machine = RecordingStateMachine()
         machine.setPendingStartCursor(9)
+        machine.setStartedSessionID("recording-failed-session")
         _ = machine.enterStarting()
 
         let effects = machine.handle(event: event(type: "recording_failed", reason: "engine crashed"))
 
         XCTAssertEqual(machine.state, .idle)
         XCTAssertNil(machine.pendingStartCursor)
+        XCTAssertNil(machine.startedSessionID)
         XCTAssertEqual(effects, [
             .surfaceError("engine crashed"),
             .resolveAwaiting(.finalized, success: true),

@@ -57,6 +57,17 @@ enum DaemonSession {
         case fatalError(FailureOutcome)
     }
 
+    /// Outcome of a successful `/v0/recording.start`. Carries both the
+    /// late-join `cursor` and the daemon-assigned `sessionID` so the
+    /// orchestrator can bind subsequent snapshot-driven promotions to the
+    /// session it actually started (SCR-68). `sessionID` is the daemon's
+    /// `session_id`, which equals the `recording_name` by contract (see
+    /// `supervisor.py`), so it is comparable against `SessionSnapshotResponse.recordingName`.
+    struct StartedRecording: Equatable {
+        let cursor: Int
+        let sessionID: String
+    }
+
     /// Error returned by `reload()` so the orchestrator can build the
     /// pre-refactor two-message split:
     ///   - `spawnFailed(Error)`     → "Failed to reload ScreenCap daemon: <desc>"
@@ -78,6 +89,12 @@ enum DaemonSession {
         let onTransientWarning: @MainActor (String) -> Void
         let getPendingStartCursor: @MainActor () -> Int?
         let clearPendingStartCursor: @MainActor () -> Void
+        /// The `session_id` of the recording this controller started, or nil
+        /// when the stream is attached to a pre-existing daemon session
+        /// (`syncDaemonSnapshot`) for which no started identity exists. Used to
+        /// reject a `cursor_unknown` snapshot promotion onto a *foreign* session
+        /// (SCR-68). Unlike `pendingStartCursor`, it survives a 410 eviction.
+        let getStartedSessionID: @MainActor () -> String?
         let isRecording: @MainActor () -> Bool
         /// Signal that the in-scope snapshot reports an active daemon-owned
         /// recording during `cursor_unknown` recovery. The orchestrator
@@ -96,7 +113,7 @@ enum DaemonSession {
 protocol DaemonSessionService {
     func probe() async -> DaemonSession.ProbeOutcome
     func snapshot() async -> DaemonSession.SnapshotOutcome
-    func startRecording(name: String?) async throws -> Int
+    func startRecording(name: String?) async throws -> DaemonSession.StartedRecording
     func stopRecording(force: Bool) async throws
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome
     func reload() async -> Result<Void, DaemonSession.ReloadError>
@@ -145,11 +162,11 @@ final class LiveDaemonSessionService: DaemonSessionService {
         }
     }
 
-    func startRecording(name: String?) async throws -> Int {
+    func startRecording(name: String?) async throws -> DaemonSession.StartedRecording {
         let response = try await DaemonClient.recordingStart(
             RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon")
         )
-        return response.cursor
+        return DaemonSession.StartedRecording(cursor: response.cursor, sessionID: response.sessionID)
     }
 
     func stopRecording(force: Bool) async throws {
@@ -308,8 +325,25 @@ final class LiveDaemonSessionService: DaemonSessionService {
                 // so a pre-`started` stream drop cascades into this branch.
                 callbacks.clearPendingStartCursor()
                 daemonSessionLogger.info("Daemon event stream evicted cursor; refetching snapshot.")
+                // Cross-session identity guard (SCR-68): only treat the
+                // in-scope snapshot as *our* recording when its `recording_name`
+                // matches the `session_id` we started. The two are the same
+                // value by the daemon contract (`supervisor.py` sets
+                // `session_id == recording_name == name`). If the daemon
+                // restarted or a foreign claimant took over between our start
+                // and this 410, the snapshot may report a *different* healthy
+                // daemon-owned session — promoting onto it would attribute the
+                // UI to a recording we never started. A nil `startedSessionID`
+                // means we attached to a pre-existing session and have no
+                // identity to bind, so any healthy snapshot is accepted
+                // (preserves the `syncDaemonSnapshot` attach path).
+                let startedSessionID = callbacks.getStartedSessionID()
+                let snapshotIsOurSession =
+                    snapshot.isRecording == true
+                    && snapshot.daemonOwned
+                    && (startedSessionID == nil || snapshot.recordingName == startedSessionID)
                 let recoveryBackoff: TimeInterval
-                if snapshot.isRecording == true, snapshot.daemonOwned {
+                if snapshotIsOurSession {
                     let startedAt = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
                     callbacks.onSnapshotConfirmedActiveRecording(startedAt)
                     // Healthy snapshot is positive evidence the recording is

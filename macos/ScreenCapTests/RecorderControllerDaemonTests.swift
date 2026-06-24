@@ -437,7 +437,11 @@ final class RecorderControllerDaemonTests: XCTestCase {
             // cursor_unknown below.
             case "/v0/recording.start":
                 _ = startCount.incrementAndGet()
-                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-unknown","started_at":10.0,"engine_pid":9994,"cursor":2}"#)
+                // `session_id` must equal the snapshot `recording_name` below:
+                // the daemon sets `session_id == recording_name == name`, and
+                // the SCR-68 identity gate compares the two. A mismatch here
+                // would reject the promotion as a foreign session.
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"unknown","started_at":10.0,"engine_pid":9994,"cursor":2}"#)
             case "/v0/session.snapshot":
                 guard startCount.value > 0 else {
                     return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
@@ -511,7 +515,8 @@ final class RecorderControllerDaemonTests: XCTestCase {
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
                 _ = startCount.incrementAndGet()
-                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-stuck","started_at":10.0,"engine_pid":9996,"cursor":2}"#)
+                // session_id == recording_name ("stuck") per daemon contract (SCR-68 gate).
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"stuck","started_at":10.0,"engine_pid":9996,"cursor":2}"#)
             case "/v0/session.snapshot":
                 guard startCount.value > 0 else {
                     return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
@@ -572,6 +577,76 @@ final class RecorderControllerDaemonTests: XCTestCase {
         XCTAssertNil(recorder.lastError)
     }
 
+    /// SCR-68 regression test (negative counterpart of the promotion test
+    /// above). If the daemon restarts or a foreign claimant takes over between
+    /// `recording.start` returning and the 410 firing, the refetched snapshot
+    /// can report a *different* healthy daemon-owned session. The
+    /// `cursor_unknown` catch must NOT promote `.starting → .recording` onto
+    /// that session — doing so would attribute the UI to a recording we never
+    /// started. Here we start session "mine" but every post-start snapshot
+    /// reports `recording_name:"intruder"`; the controller must stay
+    /// `.starting` (identity mismatch) instead of latching onto the intruder.
+    func testCursorUnknownDoesNotPromoteOntoForeignSession() async throws {
+        let startCount = LockedInt()
+        let cursorUnknownCount = LockedInt()
+
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/recording.start":
+                _ = startCount.incrementAndGet()
+                // We start session "mine" (session_id == recording_name).
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"mine","started_at":10.0,"engine_pid":9993,"cursor":2}"#)
+            case "/v0/session.snapshot":
+                guard startCount.value > 0 else {
+                    return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+                }
+                // A foreign session took over: healthy and daemon-owned, but a
+                // DIFFERENT recording_name than the "mine" we started. Distinct
+                // started_at so a (buggy) promotion would also be detectable via
+                // elapsed, not just state.
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"intruder","started_at":9000000.0,"claimant":"daemon","recovering":false,"cursor":5}"#)
+            case let path where path.hasPrefix("/v0/events?since="):
+                // Both the start cursor (since=2) and the refetched snapshot
+                // cursor (since=5) 410, keeping the recovery loop spinning on
+                // the intruder snapshot.
+                _ = cursorUnknownCount.incrementAndGet()
+                return .json(
+                    #"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"cursor_unknown","requested_cursor":2}"#,
+                    status: 410,
+                    reason: "Gone"
+                )
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+        recorder.start(name: "mine")
+
+        // Deterministically wait for the recovery loop to fire at least two
+        // cursor_unknown cycles (baseBackoff 0.1, 0.2, 0.4 …) rather than
+        // sleeping a fixed interval. Reaching `>= 2` is positive proof the
+        // catch engaged at least twice against the foreign snapshot; the
+        // generous 5s cap is well below the 10-failure `.lostContact` ceiling
+        // (tens of seconds of cumulative backoff away), so when this returns the
+        // state can only be `.starting` (rejected) or — pre-fix — `.recording`
+        // (wrongly promoted onto the intruder). `waitUntil` XCTFails on timeout,
+        // which doubles as the "recovery loop never engaged" assertion.
+        await waitUntil(timeout: 5) { cursorUnknownCount.value >= 2 }
+
+        // Core SCR-68 invariant: the foreign session must not be promoted.
+        // Pre-fix this is `.recording` (the catch trusted isRecording &&
+        // daemonOwned only); post-fix the identity gate keeps us `.starting`.
+        guard case .starting = recorder.state else {
+            return XCTFail("cursor_unknown promoted the UI onto a foreign session; state=\(recorder.state). The identity gate must reject a snapshot whose recording_name differs from the started session_id.")
+        }
+    }
+
     /// SCR-59 follow-on regression test. Post-fix, the `cursor_unknown` catch
     /// path is a *recovery-success* when the in-scope snapshot confirms an
     /// active daemon-owned recording — the orchestrator has either just
@@ -597,7 +672,8 @@ final class RecorderControllerDaemonTests: XCTestCase {
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
                 _ = startCount.incrementAndGet()
-                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-repeated","started_at":10.0,"engine_pid":9997,"cursor":2}"#)
+                // session_id == recording_name ("repeated") per daemon contract (SCR-68 gate).
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"repeated","started_at":10.0,"engine_pid":9997,"cursor":2}"#)
             case "/v0/session.snapshot":
                 guard startCount.value > 0 else {
                     return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
@@ -682,7 +758,8 @@ final class RecorderControllerDaemonTests: XCTestCase {
                 return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
             case "/v0/recording.start":
                 _ = startCount.incrementAndGet()
-                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"session-guard","started_at":\#(originalStartedAt),"engine_pid":9995,"cursor":2}"#)
+                // session_id == recording_name ("guard") per daemon contract (SCR-68 gate).
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"session_id":"guard","started_at":\#(originalStartedAt),"engine_pid":9995,"cursor":2}"#)
             case "/v0/session.snapshot":
                 guard startCount.value > 0 else {
                     return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
