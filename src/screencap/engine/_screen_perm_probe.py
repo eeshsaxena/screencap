@@ -77,13 +77,17 @@ def probe_screen_recording_granted(timeout: float = 2.0) -> bool | None:
         # in a Quartz/TCC syscall can't outlive the probe and pile up orphans.
         if p is not None:
             try:
-                p.join(timeout=0.5)
+                # Short joins keep worst-case reap well under the ~1 s supervisor
+                # loop tick: 3 x 0.2 s = 0.6 s even on a fully wedged child. A
+                # wedged child is daemon=True, so the OS reaps it on worker exit
+                # regardless — these joins only bound the in-loop stall.
+                p.join(timeout=0.2)
                 if p.is_alive():
                     p.terminate()
-                    p.join(timeout=0.5)
+                    p.join(timeout=0.2)
                 if p.is_alive():
                     p.kill()
-                    p.join(timeout=0.5)
+                    p.join(timeout=0.2)
             except Exception:
                 pass
         if q is not None:

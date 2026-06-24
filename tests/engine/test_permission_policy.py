@@ -349,6 +349,54 @@ def test_fresh_screen_watch_probe_exception_is_fail_open():
     watch.poll(20.0)  # must not raise — exceptions map to None, never to denied
 
 
+def test_fresh_screen_watch_clamps_nonpositive_config_interval():
+    """A 0/negative ``SCREEN_PERM_WATCH_INTERVAL_SECS`` env misconfig is floored.
+
+    Only the config-sourced default is clamped (mirrors the debounce clamp) so a
+    misconfigured env can't make ``poll()`` spawn a fresh probe every supervisor
+    tick. An explicitly-injected ``interval`` arg is honoured as-is (the
+    every-tick fake-probe tests rely on ``interval=0.0``).
+    """
+    from screencap.engine.permission_policy import FreshScreenWatch
+
+    with mock.patch("screencap.engine.config.config") as cfg:
+        cfg.SCREEN_PERM_WATCH_INTERVAL_SECS = 0.0
+        cfg.SCREEN_PERM_WATCH_DEBOUNCE = 2
+        watch = FreshScreenWatch(enabled=True)
+    assert watch._interval == 20.0  # floored to the documented default
+
+    # An explicit non-None arg is NOT clamped, even at the config path's value.
+    assert FreshScreenWatch(interval=0.0, enabled=True)._interval == 0.0
+
+
+def test_fresh_screen_watch_inconclusive_surfaces_once_and_rearms(caplog):
+    """A persistently inconclusive (all-None) watch warns once, never raises.
+
+    A ``None`` probe is fail-open, but a watch that is blind for ``_debounce``
+    consecutive probes is indistinguishable from "granted", so it must surface a
+    one-time advisory. It must NOT spam (re-arm only after a non-None probe) and
+    must NEVER raise ``PermissionRevoked``.
+    """
+    import logging
+
+    watch = _watch([None, None, None, True, None, None], debounce=2)
+
+    with caplog.at_level(logging.WARNING, logger="screencap.engine.permission_policy"):
+        watch.poll(0.0)  # None streak=1 — below debounce, no warning
+        watch.poll(20.0)  # None streak=2 — debounce reached, warns once
+        watch.poll(40.0)  # None streak=3 — already warned, must not re-warn
+    first = [r for r in caplog.records if "inconclusive" in r.getMessage()]
+    assert len(first) == 1, "must warn exactly once per blind spell"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="screencap.engine.permission_policy"):
+        watch.poll(60.0)  # True — re-arms the advisory, resets the None streak
+        watch.poll(80.0)  # None streak=1 — below debounce
+        watch.poll(100.0)  # None streak=2 — re-armed, warns again
+    second = [r for r in caplog.records if "inconclusive" in r.getMessage()]
+    assert len(second) == 1, "a non-None probe must re-arm the one-time advisory"
+
+
 def test_screen_recorder_calls_permission_policy_preflight_and_poll(tmp_path):
     """``ScreenRecorder.run()`` must invoke ``permission_policy.preflight()``
     during setup and ``permission_policy.poll(elapsed)`` in the recording loop.

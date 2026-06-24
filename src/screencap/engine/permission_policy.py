@@ -18,10 +18,13 @@ returns the stale granted-at-startup value even after the user revokes.
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Callable, Protocol
 
 from screencap.engine.screen_recorder import Monitor
+
+_logger = logging.getLogger(__name__)
 
 
 class PermissionPolicy(Monitor, Protocol):
@@ -133,6 +136,14 @@ class FreshScreenWatch:
             from screencap.engine.config import config as _config
 
             interval = _config.SCREEN_PERM_WATCH_INTERVAL_SECS
+            # Floor the config-sourced interval so a 0/negative env misconfig
+            # (SCREEN_PERM_WATCH_INTERVAL_SECS<=0) can't make poll() spawn a fresh
+            # probe process every supervisor tick. Mirrors the debounce clamp
+            # below; only the env/default path is clamped — an explicit non-None
+            # constructor arg (tests pass interval=0.0 with a fake probe) is
+            # honoured as-is.
+            if interval <= 0:
+                interval = 20.0
         if debounce is None:
             from screencap.engine.config import config as _config
 
@@ -142,6 +153,11 @@ class FreshScreenWatch:
         self._probe = probe
         self._next_poll_at: float = 0.0
         self._denied_streak = 0
+        # Counts consecutive inconclusive (``None``) probes so a persistently
+        # blind watch surfaces once. Re-armed (set False) on the first non-None
+        # probe so a recovered watch can warn again on a later blind spell.
+        self._none_streak = 0
+        self._none_warned = False
 
     @property
     def next_poll_at(self) -> float:
@@ -161,14 +177,33 @@ class FreshScreenWatch:
         granted = self._run_probe()
         if granted is False:
             self._denied_streak += 1
+            self._none_streak = 0
             if self._denied_streak >= self._debounce:
                 from screencap.engine.screen_recorder import PermissionRevoked
 
                 raise PermissionRevoked("screen_recording")
-        else:
-            # True (granted) or None (couldn't determine) → fail-open reset.
-            # A transient denied-then-recovered blip never reaches the debounce.
+        elif granted is None:
+            # Couldn't determine → fail-open: reset the denied streak so a blind
+            # watch never tears down. But a *persistently* inconclusive watch is
+            # silently blind (indistinguishable from "granted"), so once it has
+            # been blind for ``_debounce`` consecutive probes, surface a one-time
+            # advisory. We never raise here — staying fail-open is the contract.
             self._denied_streak = 0
+            self._none_streak += 1
+            if self._none_streak >= self._debounce and not self._none_warned:
+                self._none_warned = True
+                _logger.warning(
+                    "Screen-Recording permission watch inconclusive for %d "
+                    "consecutive probes; mid-recording revocation detection is "
+                    "degraded (fail-open, recording continues).",
+                    self._none_streak,
+                )
+        else:
+            # True (granted) → fail-open reset of both streaks and re-arm the
+            # inconclusive advisory so a later blind spell can warn again.
+            self._denied_streak = 0
+            self._none_streak = 0
+            self._none_warned = False
 
     def _run_probe(self) -> bool | None:
         if self._probe is not None:
