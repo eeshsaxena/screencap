@@ -227,6 +227,33 @@ class TestEventSchemas:
         # `since_frame` is reserved (schema-doc) but not currently emitted —
         # do not assert on it.
 
+    def test_permission_required_schema(self):
+        """SCR-142 start-time permission block. Unlike single-permission
+        `permission_lost`, it carries a `missing` LIST of denied permissions
+        (each a value the SwiftUI parser maps to a PrivacyPane), so the
+        CLI-fallback shell can name every missing permission at once. Re-emitted
+        by the `screencap start` daemon client when the daemon rejects the start
+        with a `permission_required` envelope; pairs with process exit code 3.
+        """
+        from screencap._stderr_events import (
+            EVENT_PERMISSION_REQUIRED,
+            EVENT_SCHEMA_VERSION,
+        )
+        from screencap.cli import _emit_event
+
+        out = _capture_stderr(lambda: _emit_event(
+            EVENT_PERMISSION_REQUIRED,
+            missing=["screen_recording", "accessibility"],
+        ))
+        evt = _parse_lines(out)[0]
+        assert evt["type"] == "permission_required"
+        assert evt["schema_version"] == EVENT_SCHEMA_VERSION
+        assert isinstance(evt["missing"], list)
+        # Every entry must be a production-emittable permission label so the
+        # SwiftUI `PrivacyPane.from(permissionString:)` mapping stays total.
+        for perm in evt["missing"]:
+            assert perm in ("screen_recording", "accessibility", "input_monitoring")
+
     def test_capture_unhealthy_schema(self):
         """SCR-76 advisory event. Carries reason (closed set) + reader + elapsed,
         and — unlike permission_lost — has NO exit_code (it never terminates)."""
