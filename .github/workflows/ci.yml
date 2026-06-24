@@ -75,11 +75,12 @@ jobs:
     # several non-privacy modules (tests/engine/*, tests/network/*, test_capture_health*)
     # import screencap.engine.recorder -> pynput at module load. pynput's Xlib backend
     # fails to import on a headless Linux runner (no X server), which broke an earlier
-    # broadening attempt with 7 collection errors (run 27702808290). xvfb-run provides a
-    # virtual X server so pynput imports and the whole tree collects. Xvfb is
-    # pre-installed on the ubuntu-latest runner image, so no apt-get step is needed.
+    # broadening attempt with 7 collection errors before xvfb-run was added (pynput's
+    # Xlib backend raises at import time when no X server is present). xvfb-run provides
+    # a virtual X server so pynput imports and the whole tree collects. Xvfb is
+    # pre-installed on the ubuntu-24.04 runner image, so no apt-get step is needed.
     name: Privacy guards (Vision-free, Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -103,8 +104,17 @@ jobs:
 
       - name: Download spaCy model (presidio NER backbone)
         # The broadened privacy suite exercises the real DetectionPipeline (presidio);
-        # its spaCy backbone needs this model. Same step as the macOS lane.
-        run: python -m spacy download en_core_web_sm
+        # its spaCy backbone needs this model. Retried because this lane is the privacy
+        # backstop and the model installs into site-packages (outside ~/.cache/pip), so
+        # it has no cache fallback — a transient PyPI/CDN blip would otherwise red the lane.
+        run: |
+          for i in 1 2 3; do
+            if python -m spacy download en_core_web_sm; then exit 0; fi
+            echo "spaCy model download attempt $i failed; retrying in 15s..." >&2
+            sleep 15
+          done
+          echo "spaCy model download failed after 3 attempts" >&2
+          exit 1
 
       - name: Run privacy guard suite (xvfb so pynput imports headless)
         # xvfb-run -a auto-picks a free display number so `pytest -m privacy` can import
