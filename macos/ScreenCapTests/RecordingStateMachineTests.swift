@@ -455,6 +455,21 @@ final class RecordingStateMachineTests: XCTestCase {
         )
     }
 
+    func testPermissionRequiredWithEmptyMissingEmitsEffectWithEmptyList() {
+        // SCR-142 fallback: a `permission_required` carrying an empty `missing`
+        // list (a non-list / absent `missing` collapsed by the CLI) still routes
+        // into the grant flow — the effect carries `[]` and the controller's
+        // `privacyPanes(fromMissing:)` supplies the `.screenRecording` fallback.
+        var machine = RecordingStateMachine()
+
+        let effects = machine.handle(event: event(
+            type: "permission_required",
+            missing: []
+        ))
+
+        XCTAssertEqual(effects, [.handlePermissionRequired(missing: [])])
+    }
+
     func testPermissionRequiredThenExit3SuppressesGenericRevokedMessage() {
         // SCR-142 de-dup: once `permission_required` routed the precise grant
         // flow, the process exits 3 — but the generic "permission was revoked"
@@ -473,6 +488,26 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertFalse(
             effects.contains(.surfaceError("Recording stopped because a required permission was revoked.")),
             "exit-3 message must be suppressed after a permission_required block"
+        )
+    }
+
+    func testPermissionRequiredThenNonExit3StillSurfacesItsRealMessage() {
+        // SCR-142 de-dup scope: the suppression only covers exit 3. If a
+        // `permission_required` event is followed by a NON-3 exit (e.g. a
+        // disk_full crash exiting 4), that exit's real message must still
+        // surface — the routed flag must not swallow an unrelated failure.
+        var machine = RecordingStateMachine()
+        _ = machine.enterStarting()
+        _ = machine.handle(event: event(
+            type: "permission_required",
+            missing: ["screen_recording"]
+        ))
+
+        let effects = machine.processTerminated(exitCode: 4)
+
+        XCTAssertTrue(
+            effects.contains(.surfaceError("Disk is full — recording stopped.")),
+            "a non-3 exit after permission_required must still surface its real message"
         )
     }
 

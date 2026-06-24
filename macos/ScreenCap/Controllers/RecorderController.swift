@@ -622,10 +622,7 @@ final class RecorderController: ObservableObject {
             // client-side start-block (U4). No engine spawned, so no duplicate
             // permission_lost for this attempt.
             transitionToIdle()
-            let panes = missing.isEmpty
-                ? [PrivacyPane.screenRecording]
-                : missing.map { PrivacyPane.from(permissionString: $0) }
-            routeToPermissionGrant(missing: panes)
+            routeToPermissionGrant(missing: privacyPanes(fromMissing: missing))
         case .other(let description):
             lastError = description
             if state.isRecording { transitionToIdle() }
@@ -672,10 +669,19 @@ final class RecorderController: ObservableObject {
     /// No recording is in flight (the start was blocked before spawn), so this
     /// only surfaces + routes — `processTerminated` drops the state to `.idle`.
     private func handlePermissionRequired(missing: [String]) {
-        let panes = missing.isEmpty
+        routeToPermissionGrant(missing: privacyPanes(fromMissing: missing))
+    }
+
+    /// Map the raw daemon `missing` permission strings to their `PrivacyPane`s,
+    /// falling back to `[.screenRecording]` when the list is empty so the
+    /// grant flow always names at least the permission fatal to capture. Single
+    /// owner of that empty-fallback, shared by the daemon-transport typed
+    /// `permission_required` failure (U6) and the CLI-fallback stderr event
+    /// (SCR-142).
+    private func privacyPanes(fromMissing missing: [String]) -> [PrivacyPane] {
+        missing.isEmpty
             ? [PrivacyPane.screenRecording]
             : missing.map { PrivacyPane.from(permissionString: $0) }
-        routeToPermissionGrant(missing: panes)
     }
 
     private func handlePermissionLost(permission: String?) {

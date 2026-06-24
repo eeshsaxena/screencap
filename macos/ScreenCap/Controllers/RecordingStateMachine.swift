@@ -162,6 +162,7 @@ struct RecordingStateMachine {
         if case .idle = newState {
             recordingStartedAt = nil
             pendingStartCursor = nil
+            permissionRequiredRouted = false
         }
         state = newState
     }
@@ -313,13 +314,15 @@ struct RecordingStateMachine {
         // a new recording begins.
         if exitCode == 0 || exitCode == 130 || exitCode == 143 {
             // Keep any prior user-facing warning.
-        } else if permissionRequiredRouted {
+        } else if permissionRequiredRouted && exitCode == 3 {
             // SCR-142: a start-time `permission_required` block already routed
             // the user into the precise grant flow this attempt (and named every
             // missing permission). The process now exits 3, but the generic
             // case-3 "permission was revoked" copy would be both redundant and
             // wrong (nothing was recording to revoke), so suppress it and let the
-            // grant-flow alert stand.
+            // grant-flow alert stand. The suppression is scoped to exit 3: a
+            // non-3 exit after a `permission_required` event is a different
+            // failure (e.g. disk_full → 4) whose real message must still surface.
         } else {
             switch exitCode {
             case 1:

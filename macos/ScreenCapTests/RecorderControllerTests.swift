@@ -381,6 +381,32 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertFalse(recorder.state.isRecording)
     }
 
+    /// SCR-142 empty-`missing` fallback: a `permission_required` event with an
+    /// empty `missing` list (the CLI collapses a non-list / absent `missing` to
+    /// `[]`) must still route into the grant flow, naming Screen Recording — the
+    /// permission fatal to capture — via `privacyPanes(fromMissing:)`.
+    func testCLIFallbackPermissionRequiredWithEmptyMissingFallsBackToScreenRecording() throws {
+        let alert = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateLater)
+        let cliService = CapturingCLIRecorderService()
+        let recorder = RecorderController(alertPresenter: alert, cliService: cliService)
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "demo")
+
+        let event = try XCTUnwrap(RecorderEventLine.parse(
+            stderrLine: #"{"type":"permission_required","missing":[],"schema_version":1}"#
+        ))
+        let onEvent = try XCTUnwrap(cliService.capturedEvent)
+        let onTerminated = try XCTUnwrap(cliService.capturedTerminated)
+
+        onEvent(event)
+        onTerminated(3)
+
+        XCTAssertEqual(alert.lastPermissionRequiredPresented, ["Screen Recording"])
+        XCTAssertEqual(recorder.lastError, "Grant Screen Recording to ScreenCap before recording.")
+        XCTAssertFalse(recorder.state.isRecording)
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(

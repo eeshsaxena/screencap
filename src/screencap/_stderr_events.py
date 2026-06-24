@@ -147,6 +147,16 @@ PERMISSION_LABELS = frozenset({
     PERMISSION_INPUT_MONITORING,
     PERMISSION_ACCESSIBILITY,
 })
+# Canonical human-readable names for each TCC label. Single source of truth for
+# the display strings, so the ``permission_required`` human echo (cli) names
+# permissions identically to the SwiftUI shell's ``PrivacyPane.displayName``
+# rather than relying on a ``.replace("_", " ").title()`` that would render
+# "Input_monitoring" → "Input Monitoring" only by coincidence.
+PERMISSION_DISPLAY: dict[str, str] = {
+    PERMISSION_SCREEN_RECORDING: "Screen Recording",
+    PERMISSION_ACCESSIBILITY: "Accessibility",
+    PERMISSION_INPUT_MONITORING: "Input Monitoring",
+}
 # Type alias mirroring PERMISSION_LABELS for use in type hints.
 PermissionLabel = Literal["screen_recording", "input_monitoring", "accessibility"]
 
@@ -191,6 +201,7 @@ __all__ = [
     "PERMISSION_INPUT_MONITORING",
     "PERMISSION_ACCESSIBILITY",
     "PERMISSION_LABELS",
+    "PERMISSION_DISPLAY",
     "PermissionLabel",
     "EVENT_STOPPED",
     "EVENT_MENUBAR_NEUTRALIZED_BY_ENV",

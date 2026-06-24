@@ -220,6 +220,64 @@ def test_start_permission_required_envelope_names_permissions_and_exits_three(st
     assert perm_events[0]["missing"] == ["screen_recording", "accessibility"]
 
 
+def test_start_permission_required_bare_string_missing_normalizes_to_empty(stub_daemon):
+    """Defensive: a drifted/buggy daemon sends ``missing`` as a bare string
+    rather than a list. The CLI must NOT iterate it into single-char garbage —
+    it normalizes to ``[]`` (so the event carries an empty list) and echoes the
+    generic "a required permission" copy, while still exiting 3."""
+    stub_daemon.start_status = 403
+    stub_daemon.start_response = {
+        "ok": False,
+        "error": "permission_required",
+        "schema_version": 1,
+        "api_schema_version": 1,
+        "daemon_version": "test",
+        "missing": "screen_recording",
+    }
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+
+    assert result.exit_code == 3, result.output
+
+    captured = result.output + (_safe_stderr(result))
+    events = [
+        json.loads(line)
+        for line in captured.splitlines()
+        if line.strip().startswith("{")
+    ]
+    perm_events = [e for e in events if e.get("type") == "permission_required"]
+    assert perm_events, f"no permission_required event emitted; captured={captured!r}"
+    assert perm_events[0]["missing"] == []
+    assert "a required permission" in captured
+
+
+def test_start_permission_required_absent_missing_normalizes_to_empty(stub_daemon):
+    """The ``missing`` key is absent from the envelope entirely. Same contract
+    as the bare-string case: normalize to ``[]``, emit the event with an empty
+    list, echo "a required permission", and exit 3."""
+    stub_daemon.start_status = 403
+    stub_daemon.start_response = {
+        "ok": False,
+        "error": "permission_required",
+        "schema_version": 1,
+        "api_schema_version": 1,
+        "daemon_version": "test",
+    }
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+
+    assert result.exit_code == 3, result.output
+
+    captured = result.output + (_safe_stderr(result))
+    events = [
+        json.loads(line)
+        for line in captured.splitlines()
+        if line.strip().startswith("{")
+    ]
+    perm_events = [e for e in events if e.get("type") == "permission_required"]
+    assert perm_events, f"no permission_required event emitted; captured={captured!r}"
+    assert perm_events[0]["missing"] == []
+    assert "a required permission" in captured
+
+
 def test_start_disk_full_exits_four(stub_daemon):
     stub_daemon.events = [
         {

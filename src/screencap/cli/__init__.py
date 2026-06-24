@@ -334,9 +334,10 @@ def _permission_probe_cmd() -> None:
 # docs/research/2026-04-28-stderr-event-schema.md.
 #
 # Events: started, chunk_finalized, recording_finalized, disk_full,
-#         permission_lost, stopped
-# Exit codes: 0=clean, 2=lock-held (Unit 3), 3=permission_lost (Unit 8),
-#             4=disk_full
+#         permission_lost, permission_required, stopped
+# Exit codes: 0=clean, 2=lock-held (Unit 3), 3=permission denied/lost
+#             (permission_required start-time block OR permission_lost
+#             mid-recording), 4=disk_full
 #
 # ``permission_lost`` is emitted from src/screencap/recorder.py (Unit 8).
 # ``chunk_finalized`` is emitted from src/screencap/session.py.
@@ -349,6 +350,7 @@ def _permission_probe_cmd() -> None:
 from screencap._stderr_events import (  # noqa: E402
     EVENT_PERMISSION_REQUIRED,
     EVENT_STOPPED,
+    PERMISSION_DISPLAY,
 )
 from screencap._stderr_events import (
     emit_event as _emit_event,
@@ -1065,7 +1067,10 @@ def _run_start_via_daemon(
                     )
                     _emit_event(EVENT_PERMISSION_REQUIRED, missing=missing)
                     names = (
-                        ", ".join(p.replace("_", " ").title() for p in missing)
+                        ", ".join(
+                            PERMISSION_DISPLAY.get(p, p.replace("_", " ").title())
+                            for p in missing
+                        )
                         if missing
                         else "a required permission"
                     )
