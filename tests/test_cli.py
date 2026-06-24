@@ -1236,6 +1236,47 @@ def test_upload_no_delete_passes_keep_forever_override(tmp_path):
     assert kwargs["retention_override"] == RetentionPolicy.KEEP_FOREVER
 
 
+def test_upload_lock_timeout_flag_threads_into_terminal_stage(tmp_path):
+    """SCR-165: --lock-timeout overrides the blocking-with-timeout bound passed
+    to run_terminal_stage. The Swift-spawned interactive upload uses a short
+    value (well under its 120s inactivity watchdog) so a contended terminal lock
+    raises TerminalStageBusy fast and surfaces ``upload_busy`` — instead of the
+    watchdog SIGTERMing the child mid-wait and rendering a hard timeout failure."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-lt")
+    runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result())
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-lt", "--lock-timeout", "30"])
+
+    assert result.exit_code == 0
+    _, kwargs = fake.call_args
+    assert kwargs["lock_timeout"] == 30.0
+
+
+def test_upload_default_lock_timeout_preserves_converge_over_winner(tmp_path):
+    """SCR-165: without --lock-timeout the CLI keeps the 600s converge-over-winner
+    default (the loser waits for the winner, then converges over its committed
+    ledger — idempotent). The short timeout is opt-in for the interactive Swift
+    path only, so the CLI/agent default must not regress."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-lt-default")
+    runner = CliRunner()
+    fake = mock.MagicMock(return_value=_terminal_result())
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", fake),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-lt-default"])
+
+    assert result.exit_code == 0
+    _, kwargs = fake.call_args
+    assert kwargs["lock_timeout"] == 600.0
+
+
 def test_upload_busy_shows_friendly_message(tmp_path):
     """TerminalStageBusy (a live finalize / daemon resume holds the lock) → a
     friendly 'in progress' message, not a traceback."""

@@ -2115,7 +2115,12 @@ def update():
               help="Parallel file transfers per recording (default: 4).")
 @click.option("--no-delete", is_flag=True, default=False,
               help="Keep local recording files after upload instead of auto-deleting.")
-def upload(names, all_recordings, dry_run, force, jobs, no_delete):
+@click.option("--lock-timeout", type=click.FloatRange(min=0), default=None,
+              help="Seconds to wait for a contended per-recording terminal lock "
+                   "before reporting it busy (default: 600). The interactive app "
+                   "passes a short value (well under its 120s watchdog) so a "
+                   "contended lock surfaces as retryable rather than timing out.")
+def upload(names, all_recordings, dry_run, force, jobs, no_delete, lock_timeout):
     """Upload recordings to cloud storage.
 
     Exit codes: 0 = all recordings uploaded (or a retryable "already in progress"
@@ -2195,10 +2200,19 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
     )
     from screencap.pipeline_policy import Destination, RetentionPolicy
     from screencap.terminal_stage import (
+        _DEFAULT_LOCK_TIMEOUT,
         PromotionRefused,
         TerminalStageBusy,
         run_terminal_stage,
     )
+
+    # SCR-165: keep terminal_stage the single source of truth for the default
+    # lock-timeout. The click option defaults to None (sentinel) so we don't
+    # import terminal_stage at module-import time (CLAUDE.md: deferred heavy
+    # imports keep ``screencap --help`` fast); resolve it here, where the import
+    # already happens. Help text still advertises "(default: 600)".
+    if lock_timeout is None:
+        lock_timeout = _DEFAULT_LOCK_TIMEOUT
 
     # SCR-94: install a top-level SIGTERM handler BEFORE the terminal stage runs
     # so a cancel during the multi-second pre-upload prep phase (GCS reconcile,
@@ -2261,6 +2275,13 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete):
                     console=console,
                     force=force,
                     dry_run=dry_run,
+                    # SCR-165: blocking-with-timeout bound for the per-recording
+                    # terminal lock. Default 600s preserves the CLI/agent
+                    # converge-over-winner behavior; the interactive Swift path
+                    # passes a short value so a contended lock raises
+                    # TerminalStageBusy (→ upload_busy) well under its 120s
+                    # inactivity watchdog instead of being SIGTERMed mid-wait.
+                    lock_timeout=lock_timeout,
                     force_destination=Destination.CLOUD,
                     # --no-delete keeps local media after upload (a per-run override).
                     retention_override=(
