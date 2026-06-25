@@ -454,7 +454,22 @@ final class UploadControllerTests: XCTestCase {
             return XCTFail("A should be uploading, got \(controllerA.state)")
         }
         if case .refused(let msg) = controllerB.state {
-            XCTAssertTrue(msg.contains("another window"), "got: \(msg)")
+            // SCR-163: the controller must surface the single-source canonical
+            // refused copy. Asserting equality against the constant pins the
+            // wiring without coupling to fragile substrings of an inline literal
+            // (the old `!contains("already")` would false-fail on any unrelated
+            // future copy that happens to use the word).
+            XCTAssertEqual(msg, UploadState.refusedCrossWindowMessage)
+            // ...and that canonical copy must stay honest: it names the recovery
+            // floor (the Recordings-list Upload button) rather than promising the
+            // owning window finishes. Guard the load-bearing property
+            // case-insensitively against the single source.
+            XCTAssertNotNil(
+                UploadState.refusedCrossWindowMessage.range(
+                    of: "Recordings list", options: .caseInsensitive
+                ),
+                "refused copy must name the recovery affordance"
+            )
         } else {
             XCTFail("B should be refused, got \(controllerB.state)")
         }

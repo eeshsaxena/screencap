@@ -425,7 +425,10 @@ struct ReviewWindow: View {
             // Deliberately no Retry: while the owner holds the claim a Retry
             // would silently re-refuse, and "released" is optimistic (SCR-154
             // releases eagerly, before the owning child exits). Close is the
-            // honest affordance; the owning window carries the upload to done.
+            // honest affordance; if the owner doesn't finish, the recording
+            // stays `uploaded == false` and the Recordings-list Upload button
+            // (intent-agnostic recovery floor) re-uploads it — the copy points
+            // there rather than promising completion (SCR-163).
             HStack(spacing: 8) {
                 Image(systemName: "info.circle.fill")
                     .foregroundStyle(.secondary)
