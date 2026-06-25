@@ -325,6 +325,66 @@ struct PermissionRequestResponse: Decodable {
     }
 }
 
+// MARK: - SCR-174 search verb requests (SCR-118 retrieval surface)
+
+struct ContentSearchRequest: Encodable {
+    let query: String
+    let recording: String?
+    let limit: Int?
+
+    init(query: String, recording: String? = nil, limit: Int? = nil) {
+        self.query = query
+        self.recording = recording
+        self.limit = limit
+    }
+}
+
+struct TranscriptSearchRequest: Encodable {
+    let query: String
+    let recording: String?
+    let limit: Int?
+
+    init(query: String, recording: String? = nil, limit: Int? = nil) {
+        self.query = query
+        self.recording = recording
+        self.limit = limit
+    }
+}
+
+/// `timeline.query` input. v1 always passes an explicit `limit` — the verb
+/// defaults to 50 and truncates earliest-first by `timestamp_ms`, so without a
+/// raised limit + bounding window the recency ranking would silently drop the
+/// most recent hits.
+struct TimelineQueryRequest: Encodable {
+    let startMs: Int?
+    let endMs: Int?
+    let app: String?
+    let recording: String?
+    let limit: Int?
+
+    init(
+        startMs: Int? = nil,
+        endMs: Int? = nil,
+        app: String? = nil,
+        recording: String? = nil,
+        limit: Int? = nil
+    ) {
+        self.startMs = startMs
+        self.endMs = endMs
+        self.app = app
+        self.recording = recording
+        self.limit = limit
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case app
+        case recording
+        case limit
+    }
+}
+
 private struct APIEnvelopeProbe: Decodable {
     let ok: Bool?
     let apiSchemaVersion: Int?
@@ -506,6 +566,31 @@ enum DaemonClient {
             body: body,
             timeout: 10
         )
+    }
+
+    // MARK: - SCR-174 search verbs
+
+    /// On-screen-text search (SCR-118). Daemon-only, local, pointer-only. On
+    /// `socketUnavailable`/`connectionFailed` the caller surfaces a "daemon not
+    /// running" state — there is no CLI fallback for these verbs.
+    static func contentSearch(_ req: ContentSearchRequest) async throws -> ContentSearchResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/content.search", body: body)
+    }
+
+    /// Transcript keyword search (SCR-118). Hits are chunk-granular (no
+    /// `timestamp_ms`).
+    static func transcriptSearch(_ req: TranscriptSearchRequest) async throws -> TranscriptSearchResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/transcript.search", body: body)
+    }
+
+    /// Structured timeline query (SCR-118, authoritative). Returns a typed
+    /// `invalid_range` envelope error (HTTP 400) when `start_ms > end_ms`,
+    /// surfaced here as `.envelopeError(code: "invalid_range", ...)`.
+    static func timelineQuery(_ req: TimelineQueryRequest) async throws -> TimelineQueryResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/timeline.query", body: body)
     }
 
     private static func connect(_ connection: NWConnection) async throws {
