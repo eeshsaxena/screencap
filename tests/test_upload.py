@@ -78,7 +78,7 @@ def test_put_sends_content_type_and_no_checksum_header(tmp_path):
     transfer methods, not a raw ``requests.put`` — cannot break the upload."""
     from rich.progress import Progress
 
-    from screencap.upload import _content_type, _upload_with_progress, FileInfo
+    from screencap.upload import _upload_with_progress
 
     payload = tmp_path / "video.mp4"
     payload.write_bytes(b"\x00\x01\x02fake-video-bytes")
