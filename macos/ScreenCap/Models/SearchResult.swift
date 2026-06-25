@@ -99,6 +99,18 @@ struct ContentSearchResponse: Decodable, Sendable {
 
     var indexState: ContentIndexState { ContentIndexState(wire: indexStateRaw) }
 
+    init(
+        ok: Bool = true, schemaVersion: Int = 1, daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1, hits: [ContentHit], indexState: ContentIndexState
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.hits = hits
+        self.indexStateRaw = indexState.rawValue
+    }
+
     enum CodingKeys: String, CodingKey {
         case ok
         case schemaVersion = "schema_version"
@@ -120,6 +132,18 @@ struct TranscriptSearchResponse: Decodable, Sendable {
 
     var coverage: SearchCoverage { SearchCoverage(wire: coverageRaw) }
 
+    init(
+        ok: Bool = true, schemaVersion: Int = 1, daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1, hits: [TranscriptHit], coverage: SearchCoverage
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.hits = hits
+        self.coverageRaw = coverage.rawValue
+    }
+
     enum CodingKeys: String, CodingKey {
         case ok
         case schemaVersion = "schema_version"
@@ -140,6 +164,18 @@ struct TimelineQueryResponse: Decodable, Sendable {
     private let coverageRaw: String?
 
     var coverage: SearchCoverage { SearchCoverage(wire: coverageRaw) }
+
+    init(
+        ok: Bool = true, schemaVersion: Int = 1, daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1, rows: [TimelineRow], coverage: SearchCoverage
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.rows = rows
+        self.coverageRaw = coverage.rawValue
+    }
 
     enum CodingKeys: String, CodingKey {
         case ok
