@@ -455,6 +455,20 @@ final class UploadControllerTests: XCTestCase {
         }
         if case .refused(let msg) = controllerB.state {
             XCTAssertTrue(msg.contains("another window"), "got: \(msg)")
+            // SCR-163: the copy must stay honest — it must NOT assert the other
+            // window WILL finish (the claim releases eagerly and the owner can
+            // die mid-upload), and it must point at the real recovery floor (the
+            // Recordings-list Upload button). Pinning both guards against a
+            // future copy edit that re-introduces the optimistic "already
+            // uploaded; nothing to do" framing the ticket flagged.
+            XCTAssertFalse(
+                msg.contains("already"),
+                "refused copy must not assert completion, got: \(msg)"
+            )
+            XCTAssertTrue(
+                msg.contains("Recordings list"),
+                "refused copy must point to the recovery affordance, got: \(msg)"
+            )
         } else {
             XCTFail("B should be refused, got \(controllerB.state)")
         }

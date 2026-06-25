@@ -225,7 +225,17 @@ final class UploadController: ObservableObject {
             uploadLogger.info(
                 "Cross-window refusal for \(name, privacy: .public): another window already holds the upload claim."
             )
-            state = .refused("This recording is already being uploaded in another window.")
+            // SCR-163: honest copy — do NOT assert the other window WILL finish.
+            // The cross-window claim is released eagerly (SCR-154), before the
+            // owning child exits, and that owner can be closed/killed/fail
+            // mid-upload. The recording is never stranded (it stays
+            // `uploaded == false`, so the Recordings list keeps its Upload
+            // button — the intent-agnostic recovery floor), so we point the user
+            // there instead of promising completion in another window.
+            state = .refused(
+                "This recording is being uploaded in another window. If it "
+                    + "doesn't finish, you can upload it again from the Recordings list."
+            )
             return
         }
         claimedName = name
