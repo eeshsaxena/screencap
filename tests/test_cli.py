@@ -1277,6 +1277,50 @@ def test_upload_default_lock_timeout_preserves_converge_over_winner(tmp_path):
     assert kwargs["lock_timeout"] == 600.0
 
 
+def test_upload_emits_preparing_events_during_silent_prep(tmp_path):
+    """SCR-175: the pre-upload prep (contended-lock handoff, GCS reconcile,
+    scrub/mask produce) is silent — the first existing event, ``upload_started``,
+    fires only at transfer. The interactive Swift watchdog (reset on any parsed
+    event) would otherwise subtract the lock wait from the same single 120s
+    budget the silent converge draws on and re-trip as a false timeout. The CLI
+    must wire ``run_terminal_stage``'s ``on_progress`` callback to a lightweight
+    ``upload_preparing`` stderr event so the prep registers as activity."""
+    rec_dir = _make_upload_recording(tmp_path, "rec-prep")
+    runner = CliRunner()
+
+    # Simulate the terminal stage exercising its prep phases (the real
+    # run_terminal_stage fires these from inside the held flock).
+    def _fake_run(d, **kw):
+        on_progress = kw.get("on_progress")
+        assert on_progress is not None, "interactive upload must pass on_progress"
+        on_progress("locked")
+        on_progress("reconcile")
+        on_progress("scrub")
+        return _terminal_result()
+
+    with (
+        mock.patch("screencap.upload.resolve_recording_dirs", return_value=[rec_dir]),
+        mock.patch("screencap.terminal_stage.run_terminal_stage", _fake_run),
+    ):
+        result = runner.invoke(cli, ["upload", "rec-prep"])
+
+    assert result.exit_code == 0
+    events = [
+        json.loads(line)
+        for line in result.stderr.splitlines()
+        if line.strip().startswith("{")
+    ]
+    preparing = [e for e in events if e.get("type") == "upload_preparing"]
+    assert preparing, f"expected upload_preparing events on stderr, got: {result.stderr!r}"
+    assert {e["phase"] for e in preparing} == {"locked", "reconcile", "scrub"}
+    assert all(e["recording"] == "rec-prep" for e in preparing)
+    # It is a progress ping, NOT a terminal event — must not masquerade as one.
+    assert not any(
+        e.get("type") in ("upload_failed", "upload_finished", "upload_busy")
+        for e in events
+    )
+
+
 def test_upload_busy_shows_friendly_message(tmp_path):
     """TerminalStageBusy (a live finalize / daemon resume holds the lock) → a
     friendly 'in progress' message, not a traceback."""

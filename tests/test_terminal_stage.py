@@ -115,7 +115,7 @@ class TestAE12DecisionTimeRace:
         signed_url_calls: list[float] = []
         calls_lock = threading.Lock()
 
-        def _fake_route_cloud(recording_dir, *, ledger, console, force, result, remote_exists, policy=None, retention_override=None):
+        def _fake_route_cloud(recording_dir, *, ledger, console, force, result, remote_exists, policy=None, retention_override=None, on_progress=None):
             # This stands in for the reconcile→scrub→upload critical section.
             # The "request signed URLs" decision happens HERE, inside the lock.
             with calls_lock:
@@ -1235,3 +1235,135 @@ class TestSCR127RevalidateUploaded:
         assert n == 1
         assert ledger.get_chunk(0).upload_state == UploadState.FAILED
         assert ledger.get_chunk(1).upload_state == UploadState.UPLOADED
+
+
+class TestSCR175PreparingProgress:
+    """SCR-175: the pre-upload prep — the contended-lock handoff, the GCS
+    reconcile, and the scrub/mask ``produce()`` — is SILENT (no stderr event
+    fires before ``upload_started`` at upload step 3). The interactive Swift
+    ``UploadController`` arms a single 120s inactivity watchdog that resets ONLY
+    on a parsed event, so a contended-then-released lock can leave too little of
+    that one budget for the silent converge and re-trip the watchdog as a false
+    ``.failed("upload timed out")`` (SCR-165 moved the cliff, didn't remove it).
+
+    The terminal stage now fires an ``on_progress`` callback at the lock-acquired
+    boundary, per reconcile probe, and right before ``produce()``; the
+    interactive CLI wires it to an ``upload_preparing`` event so the watchdog sees
+    the prep as activity. These tests pin that the callback fires on the path the
+    bug traverses (a contended-then-released lock followed by a non-trivial
+    ``produce()``) — the gap the SCR-165 tests never exercised."""
+
+    def test_on_progress_fires_for_lock_reconcile_and_scrub(self, tmp_path, monkeypatch):
+        from screencap import terminal_stage as ts
+        from screencap.terminal_stage import CloudCopyOutcome
+        from screencap.upload import UploadResult
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        for i in range(2):
+            (scrubbed / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 32)
+
+        produced = {"n": 0}
+
+        def _fake_produce(self, **kw):
+            produced["n"] += 1
+            return CloudCopyOutcome(scrubbed_dir=scrubbed)
+
+        monkeypatch.setattr(ts.CloudCopyProducer, "produce", _fake_produce)
+        import screencap.upload as up
+        monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
+        monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+        phases: list[str] = []
+        # remote_exists=False → reconcile probes both PENDING chunks (no flip), so
+        # the already-converged fast path is NOT taken and produce() runs — the
+        # non-trivial-converge path the SCR-175 watchdog cliff lives on.
+        ts.run_terminal_stage(
+            rec_dir,
+            _remote_exists=lambda idx: False,
+            on_progress=phases.append,
+        )
+
+        assert produced["n"] == 1, "produce() must run (not the converged fast path)"
+        assert "locked" in phases, phases
+        assert "scrub" in phases, phases
+        # Both PENDING chunks are probed → at least one reconcile ping, so the
+        # reconcile phase is not one unbounded silent span under the watchdog.
+        assert phases.count("reconcile") >= 1, phases
+        # Lock acquired BEFORE produce: the lock-handoff ping must precede the
+        # scrub ping so a contended-then-released lock resets the watchdog first.
+        assert phases.index("locked") < phases.index("scrub"), phases
+
+    def test_on_progress_default_none_is_a_noop(self, tmp_path, monkeypatch):
+        """The daemon / live-finalize callers pass no callback; the prep phases
+        must run unchanged (the ping is interactive-only, best-effort)."""
+        from screencap import terminal_stage as ts
+        from screencap.terminal_stage import CloudCopyOutcome
+        from screencap.upload import UploadResult
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        (scrubbed / "chunk_0000.mp4").write_bytes(b"\x00" * 32)
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        import screencap.upload as up
+        monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
+        monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+        # No on_progress → no crash, normal routing.
+        result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda idx: False)
+        assert result.routed is True
+
+    def test_on_progress_fires_during_ae8_hole_probe(self, tmp_path, monkeypatch):
+        """The AE8 hole scan (assert_promotable_to_cloud → detect_promotion_holes)
+        runs a per-chunk GCS confirm() for every chunk whose local media is gone
+        and not UPLOADED — a span that scales with evicted chunks and was silent
+        before SCR-175. Force that probe (a chunk whose .mp4 is absent but IS
+        confirmed remote, so it is NOT a hole) and assert a 'reconcile' ping fires
+        DURING the scan AND the run still converges."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        # Chunk 1's local media is gone and it is still STAGED (not UPLOADED), so
+        # detect_promotion_holes must call confirm(1). remote_exists=True for it
+        # → confirmed present in GCS → NOT a hole, so the promotion is allowed and
+        # the run converges (rather than raising PromotionRefused).
+        (rec_dir / "chunk_0001.mp4").unlink()
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        phases: list[str] = []
+        result = ts.run_terminal_stage(
+            rec_dir,
+            _remote_exists=lambda idx: True,
+            on_progress=phases.append,
+        )
+
+        # The hole-probe loop pinged 'reconcile' before its per-chunk confirm()
+        # — the AE8 scan is no longer one unbounded silent span under the watchdog.
+        assert phases.count("reconcile") >= 1, phases
+        # The run still converged despite the evicted-but-confirmed chunk.
+        assert result.routed is True
+
+    def test_on_progress_raising_does_not_break_convergence(self, tmp_path, monkeypatch):
+        """The on_progress ping is a pure side effect: a callback that always
+        raises must NOT perturb the terminal stage's outcome (_notify_progress
+        swallows everything). Proves the except-Exception swallow protects
+        convergence on the real cloud route."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        # A callback that always raises at EVERY phase (lock / reconcile / scrub).
+        result = ts.run_terminal_stage(
+            rec_dir,
+            _remote_exists=lambda idx: False,
+            on_progress=lambda phase: 1 / 0,
+        )
+        assert result.routed is True

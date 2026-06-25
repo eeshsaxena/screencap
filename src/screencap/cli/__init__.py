@@ -2196,6 +2196,7 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete, lock_timeout)
     from screencap._stderr_events import (
         EVENT_UPLOAD_BUSY,
         EVENT_UPLOAD_FAILED,
+        EVENT_UPLOAD_PREPARING,
         emit_event,
     )
     from screencap.pipeline_policy import Destination, RetentionPolicy
@@ -2240,6 +2241,19 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete, lock_timeout)
                 fields["recording"] = _current_name
             emit_event(EVENT_UPLOAD_FAILED, **fields)
         raise KeyboardInterrupt
+
+    def _on_progress(phase: str) -> None:
+        # SCR-175: surface run_terminal_stage's otherwise-silent pre-upload prep
+        # (the contended-lock handoff, the GCS reconcile, the scrub/mask
+        # produce) as a lightweight stderr event. The Swift UploadController
+        # arms a single 120s inactivity watchdog reset only on a parsed event;
+        # without this the lock wait is subtracted from the same budget the
+        # silent converge draws on and a contended-then-released lock can
+        # re-trip the watchdog as a false `.failed("upload timed out")`. Reads
+        # `_current_name` at call time so it labels the recording in flight.
+        # NOT a terminal event (distinct from upload_started, which still fires
+        # at transfer); tolerant consumers just need *an* event to reset.
+        emit_event(EVENT_UPLOAD_PREPARING, recording=_current_name, phase=phase)
 
     # Install INSIDE the outer try so a SIGTERM arriving in the gap between
     # install and try-entry still routes through the restoring finally
@@ -2287,6 +2301,10 @@ def upload(names, all_recordings, dry_run, force, jobs, no_delete, lock_timeout)
                     retention_override=(
                         RetentionPolicy.KEEP_FOREVER if no_delete else None
                     ),
+                    # SCR-175: emit upload_preparing during the silent prep so the
+                    # interactive Swift watchdog sees the lock handoff + reconcile +
+                    # scrub as activity instead of timing them out as a wedged child.
+                    on_progress=_on_progress,
                 )
             except PromotionRefused as e:
                 console.print(

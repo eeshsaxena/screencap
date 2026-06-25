@@ -416,6 +416,19 @@ final class UploadController: ObservableObject {
                 "Upload already in progress — a recording is finalizing or being "
                     + "uploaded elsewhere. Try again shortly."
             )
+        case "upload_preparing":
+            // SCR-175: a non-terminal prep-phase heartbeat the child emits during
+            // the otherwise-SILENT pre-upload prep (contended-lock handoff, GCS
+            // reconcile, scrub/mask produce) — none of which emit any other event
+            // before `upload_started` at transfer. The whole point is the
+            // `armWatchdog()` call above: it has already reset the inactivity
+            // watchdog on this parsed event, so the silent reconcile + scrub no
+            // longer share one 120s budget with the lock wait (the SCR-165 cliff
+            // that was moved, not removed). Keep the indeterminate `.uploading`
+            // state — no file counts yet, and we must not clobber progress a
+            // prior event already showed. Handled explicitly (not via `default`)
+            // so this watchdog-keepalive contract is legible and test-pinned.
+            break
         default:
             // Unknown event type — silently ignore. A future addition
             // (e.g. `upload_progress`) does not need a Swift bump.

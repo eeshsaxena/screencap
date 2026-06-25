@@ -13,8 +13,8 @@ Active events (emitted in v1):
   permission_lost, permission_required, capture_unhealthy,
   capture_recovered, stopped, menubar_neutralized_by_env,
   matrix_disclosure_required, lock_metadata_write_failed,
-  terminated_reason_persist_failed, upload_started, upload_file_done,
-  upload_finished, upload_failed, upload_busy
+  terminated_reason_persist_failed, upload_preparing, upload_started,
+  upload_file_done, upload_finished, upload_failed, upload_busy
 
 Reserved events (schema documented, NOT emitted in v1 — todo 004):
   chunk_finalized — wiring deferred to a follow-up that touches
@@ -111,6 +111,19 @@ EVENT_SUBSCRIBED = "subscribed"
 # UploadController to drive progress UI. Emitted from upload.py via the same
 # tolerant-reader contract as recorder events: tolerant Swift parsers ignore
 # unknown event types, so adding new ones never breaks existing consumers.
+# Pre-upload prep heartbeat (SCR-175). Emitted by the interactive ``screencap
+# upload`` path from inside ``run_terminal_stage`` during the otherwise-SILENT
+# prep — the contended-lock handoff, the GCS reconcile, and the scrub/mask
+# ``produce()`` — which all run BEFORE ``upload_started`` (the first transfer
+# event). The Swift ``UploadController`` arms a single 120s inactivity watchdog
+# that resets ONLY on a parsed event; without a prep-phase heartbeat the lock
+# wait is subtracted from the same budget the silent converge draws on and a
+# contended-then-released lock can re-trip the watchdog as a false
+# ``.failed("upload timed out")`` (SCR-165 shortened the lock wait but left this
+# gap). Advisory only: carries ``recording`` + a coarse ``phase`` label; tolerant
+# consumers just need *an* event to reset the watchdog (the Swift ``default``
+# branch already does). NOT terminal and NOT a progress count.
+EVENT_UPLOAD_PREPARING = "upload_preparing"
 EVENT_UPLOAD_STARTED = "upload_started"
 EVENT_UPLOAD_FILE_DONE = "upload_file_done"
 EVENT_UPLOAD_FINISHED = "upload_finished"
@@ -212,6 +225,7 @@ __all__ = [
     "EVENT_PREVIOUS_SESSION_RECOVERED",
     "EVENT_PREVIOUS_SESSION_FORCE_TERMINATED",
     "EVENT_SUBSCRIBED",
+    "EVENT_UPLOAD_PREPARING",
     "EVENT_UPLOAD_STARTED",
     "EVENT_UPLOAD_FILE_DONE",
     "EVENT_UPLOAD_FINISHED",

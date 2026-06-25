@@ -519,6 +519,32 @@ def _append_warning(existing: str | None, fragment: str) -> str:
     return f"{existing}; {fragment}" if existing else fragment
 
 
+def _notify_progress(
+    on_progress: Callable[[str], None] | None, phase: str
+) -> None:
+    """Best-effort progress ping for the interactive upload watchdog (SCR-175).
+
+    The terminal stage's pre-upload prep — the contended-lock handoff, the GCS
+    reconcile, and the scrub/mask ``produce()`` — is SILENT: no stderr event
+    fires before ``upload_started`` at the transfer step. The Swift
+    ``UploadController`` arms a single 120s inactivity watchdog reset ONLY on a
+    parsed event, so a contended-then-released lock can leave too little of that
+    one budget for the silent converge and re-trip the watchdog as a false
+    ``.failed("upload timed out")`` (SCR-165 shortened the lock wait but left
+    this gap). Calling this at the prep boundaries lets the interactive CLI emit
+    an ``upload_preparing`` event so the watchdog sees the prep as activity.
+
+    ``None`` on the daemon / live-finalize callers (no watcher). Swallows
+    everything: a progress ping must NEVER perturb the terminal stage's outcome.
+    """
+    if on_progress is None:
+        return
+    try:
+        on_progress(phase)
+    except Exception:  # noqa: BLE001 — a progress ping must not affect convergence
+        logger.debug("terminal_stage: on_progress(%s) raised; ignored", phase, exc_info=True)
+
+
 def _masked_convergence_ok(recording_dir: Path) -> bool:
     """SCR-126 R8 gate for the convergence fast path.
 
@@ -553,6 +579,7 @@ def run_terminal_stage(
     lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
     force_destination: "Destination | str | None" = None,
     retention_override: "RetentionPolicy | str | None" = None,
+    on_progress: Callable[[str], None] | None = None,
     _remote_exists: Callable[[int], bool] | None = None,
     _on_locked: Callable[[], None] | None = None,
 ) -> TerminalResult:
@@ -579,6 +606,14 @@ def run_terminal_stage(
         retention_override: SCR-125 U3 per-run retention override (e.g.
             ``keep_forever`` for ``screencap upload --no-delete``). ``None`` uses
             the frozen policy's retention.
+        on_progress: SCR-175 prep-phase heartbeat — a callback ``(phase) -> None``
+            invoked at the lock-acquired boundary (``"locked"``), per reconcile
+            probe (``"reconcile"``), and right before the scrub/mask
+            ``produce()`` (``"scrub"``). The interactive ``screencap upload``
+            wires it to an ``upload_preparing`` stderr event so the Swift
+            inactivity watchdog sees the otherwise-silent prep as activity.
+            ``None`` (the default) on the daemon / live-finalize callers — no
+            watcher there; best-effort and never affects the outcome.
         _remote_exists: test/eviction seam — a callback ``(idx) -> bool`` used
             in place of a real GCS stat.
         _on_locked: test hook invoked immediately after the lock is acquired,
@@ -616,6 +651,11 @@ def run_terminal_stage(
     with terminal_lock(name, non_blocking=non_blocking, timeout=lock_timeout):
         if _on_locked is not None:
             _on_locked()
+        # SCR-175: the lock wait just ended (≤lock_timeout, silent). Ping NOW so a
+        # contended-then-released lock resets the interactive watchdog before the
+        # equally-silent reconcile + produce begin — they no longer share one
+        # budget with the wait.
+        _notify_progress(on_progress, "locked")
         return _run_locked(
             recording_dir,
             console=console,
@@ -623,6 +663,7 @@ def run_terminal_stage(
             dry_run=dry_run,
             force_destination=force_destination,
             retention_override=retention_override,
+            on_progress=on_progress,
             remote_exists=_remote_exists,
         )
 
@@ -635,6 +676,7 @@ def _run_locked(
     dry_run: bool,
     force_destination: "Destination | str | None" = None,
     retention_override: "RetentionPolicy | str | None" = None,
+    on_progress: Callable[[str], None] | None = None,
     remote_exists: Callable[[int], bool] | None = None,
 ) -> TerminalResult:
     """The critical section — runs only while the terminal flock is held."""
@@ -698,6 +740,7 @@ def _run_locked(
         remote_exists=remote_exists,
         policy=policy,
         retention_override=retention_override,
+        on_progress=on_progress,
     )
 
 
@@ -812,6 +855,7 @@ def _route_cloud(
     remote_exists: Callable[[int], bool] | None,
     policy: "ResolvedPolicy | None" = None,
     retention_override: "RetentionPolicy | str | None" = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> TerminalResult:
     """Produce the cloud copy, reconcile, upload, gate the sentinel.
 
@@ -870,14 +914,19 @@ def _route_cloud(
 
     # 0. AE8 — refuse a promotion with HOLES before producing any cloud copy
     # (fail-closed, never a partial cloud copy). A legacy / no-ledger recording
-    # has no closed chunk set, so this is a no-op (R14 whole-dir path).
-    assert_promotable_to_cloud(recording_dir, remote_exists=remote_exists)
+    # has no closed chunk set, so this is a no-op (R14 whole-dir path). SCR-175:
+    # thread on_progress so the per-chunk hole-probe loop pings the interactive
+    # watchdog (it scales with evicted/hole chunks and was otherwise silent).
+    assert_promotable_to_cloud(
+        recording_dir, remote_exists=remote_exists, on_progress=on_progress
+    )
 
     # 1. Reconcile from disk before doing work (R9). Confirmed-in-GCS chunks
     # flip to UPLOADED so we never re-upload them.
     if ledger is not None:
         result.reconciled = _reconcile_ledger_against_gcs(
             recording_dir, ledger, remote_exists=remote_exists,
+            on_progress=on_progress,
         )
         # 1a. SCR-127 — the SYMMETRIC re-validation: a stale/false UPLOADED (the
         # live mirror wrote it from in-memory EMITTED, no independent re-confirm)
@@ -886,6 +935,7 @@ def _route_cloud(
         # only — a downgraded chunk re-converges through produce + upload.
         result.downgraded = _revalidate_uploaded_chunks(
             recording_dir, ledger, remote_exists=remote_exists,
+            on_progress=on_progress,
         )
 
     # 1b. ALREADY-CONVERGED FAST PATH (SCR-125 U4 "finalize is cheap"). If the
@@ -920,7 +970,11 @@ def _route_cloud(
         )
         return result
 
-    # 2. Produce the cloud copy via the scrub seam adapter.
+    # 2. Produce the cloud copy via the scrub seam adapter. SCR-175: ping just
+    # before the longest silent phase (recovery + scrub + OCR masking) so the
+    # interactive watchdog enters produce() with a freshly-reset budget rather
+    # than whatever the lock wait + reconcile already consumed of it.
+    _notify_progress(on_progress, "scrub")
     producer = CloudCopyProducer(recording_dir, console=console)
     try:
         copy = producer.produce(ledger=ledger, force=force)
@@ -1248,6 +1302,7 @@ def _reconcile_ledger_against_gcs(
     ledger: "PipelineLedger",
     *,
     remote_exists: Callable[[int], bool] | None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> int:
     """Re-stat not-yet-UPLOADED chunks against the server; flip confirmed ones.
 
@@ -1276,6 +1331,10 @@ def _reconcile_ledger_against_gcs(
 
     flipped = 0
     for idx in needs:
+        # SCR-175: ping BEFORE each probe (a per-chunk network round-trip) so a
+        # many-chunk reconcile is never one unbounded silent span under the
+        # interactive watchdog — each probe resets it.
+        _notify_progress(on_progress, "reconcile")
         if _chunk_confirmed_remote(recording_dir, idx, remote_exists=remote_exists):
             with contextlib.suppress(Exception):
                 ledger.mark_uploaded(idx)
@@ -1438,6 +1497,7 @@ def _revalidate_uploaded_chunks(
     ledger: "PipelineLedger",
     *,
     remote_exists: Callable[[int], bool] | None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> int:
     """Re-stat a sample of UPLOADED rows; downgrade confirmed-absent ones (SCR-127).
 
@@ -1472,6 +1532,9 @@ def _revalidate_uploaded_chunks(
     ]
     downgraded = 0
     for idx in resident[:_REVALIDATE_SAMPLE_SIZE]:
+        # SCR-175: same per-probe heartbeat as the reconcile pass (bounded to the
+        # sample size, but each probe is still a network round-trip).
+        _notify_progress(on_progress, "reconcile")
         if _chunk_confirmed_absent(recording_dir, idx, remote_exists=remote_exists):
             with contextlib.suppress(Exception):
                 ledger.mark_failed(
@@ -1621,6 +1684,7 @@ def detect_promotion_holes(
     recording_dir: Path | str,
     *,
     remote_exists: Callable[[int], bool] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[int]:
     """Return the chunk indices that are HOLES for a local->cloud promotion (AE8).
 
@@ -1684,6 +1748,11 @@ def detect_promotion_holes(
             continue
         if _chunk_local_media_present(recording_dir, idx):
             continue  # rich local copy survives — upload can re-scrub it.
+        # SCR-175: ping BEFORE each per-chunk GCS confirm (a network round-trip)
+        # so the AE8 hole scan of a large, partially-evicted recording is never
+        # one unbounded silent span under the interactive watchdog — each probe
+        # resets it. Mirrors _reconcile_ledger_against_gcs's per-probe ping.
+        _notify_progress(on_progress, "reconcile")
         if confirm(idx):
             continue  # cloud copy survives — no hole.
         holes.append(idx)
@@ -1694,6 +1763,7 @@ def assert_promotable_to_cloud(
     recording_dir: Path | str,
     *,
     remote_exists: Callable[[int], bool] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> None:
     """Raise :class:`PromotionRefused` if promoting this recording has holes (AE8).
 
@@ -1705,7 +1775,9 @@ def assert_promotable_to_cloud(
     stage on the surviving chunks.
     """
     recording_dir = Path(recording_dir)
-    holes = detect_promotion_holes(recording_dir, remote_exists=remote_exists)
+    holes = detect_promotion_holes(
+        recording_dir, remote_exists=remote_exists, on_progress=on_progress
+    )
     if not holes:
         return
     name = recording_dir.name
