@@ -101,12 +101,10 @@ def test_put_sends_content_type_and_no_checksum_header(tmp_path):
 
     headers = captured["headers"]
     assert headers.get("Content-Type") == "video/mp4"
-    # No checksum header in any casing — a raw PUT must not commit to a hash the
-    # signed URL never required.
-    lowered = {k.lower() for k in headers}
-    assert "x-goog-hash" not in lowered
-    assert "content-md5" not in lowered
-    assert not any("crc32c" in k.lower() or "checksum" in k.lower() for k in headers)
+    # The PUT commits to exactly Content-Type + Content-Length — no checksum header
+    # (x-goog-hash / Content-MD5 / crc32c) the signed URL never required, and nothing
+    # unexpected. The exact-set assertion is strictly stronger than per-name checks.
+    assert set(headers) == {"Content-Type", "Content-Length"}
 
 
 def test_list_recording_files(tmp_path):

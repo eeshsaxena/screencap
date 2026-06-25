@@ -181,7 +181,9 @@ def proxy():
         time.sleep(0.5)  # small grace for addon/proxy machinery to finish loading
 
         ca_subject = x509.load_pem_x509_certificate(ca_cert_file.read_bytes()).subject
-        yield port, ca_subject
+        # Yield the exact patterns the proxy was spawned with, so the control test asserts
+        # against them directly (provably the same list) instead of recomputing.
+        yield port, ca_subject, patterns
     finally:
         proc.terminate()
         try:
@@ -201,9 +203,8 @@ def test_control_host_is_not_on_ignore_list_and_is_intercepted(proxy):
     NOT matched by the production patterns (so a future blocklist expansion can't silently
     neutralize the control), then the runtime EFFECT: the proxy intercepts it (leaf issued
     by the proxy CA). Without this, an all-tunnel misconfiguration would pass vacuously."""
-    port, ca_subject = proxy
+    port, ca_subject, patterns = proxy
 
-    patterns = _production_ignore_hosts()
     assert not any(re.search(p, f"{CONTROL_HOST}:443", re.IGNORECASE) for p in patterns), (
         f"control host {CONTROL_HOST} is matched by an ignore_hosts pattern — pick a "
         f"different control or the interception guard is void"
@@ -226,7 +227,7 @@ def test_required_auth_host_is_tunneled(proxy, host):
     leaf cert is the REAL upstream cert (issued by a public CA), NOT the proxy CA — meaning
     mitmproxy never TLS-intercepts it and the capture addon can never see the plaintext
     bearer/refresh/ID-token exchange."""
-    port, ca_subject = proxy
+    port, ca_subject, _patterns = proxy
     try:
         issuer = _proxied_leaf_issuer(port, host)
     except _Unreachable as exc:
