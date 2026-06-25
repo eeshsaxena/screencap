@@ -32,6 +32,31 @@ enum FirstRunSetupPresentationPolicy {
             return daemonGrants.anyRequiredDenied
         }
     }
+
+    /// Decide whether an in-flight grant/transport/probe update should auto-close
+    /// the walkthrough sheet — the inverse of the launch gate, re-evaluated on
+    /// every `daemonGrants` / `transport` / `daemonProbeCompleted` change while
+    /// the sheet is up.
+    ///
+    /// Closes once the daemon path is satisfied: reachable (`transport == .daemon`)
+    /// and NOT reporting a required denial (all granted, or indeterminate). Covers
+    /// the cold-boot cliFallback→daemon bounce and the post-grant refresh (U5). A
+    /// reachable daemon still reporting a denial keeps the walkthrough up.
+    ///
+    /// `reopenedViaRecovery` suppresses the close for the lifetime of a sheet
+    /// opened by the explicit "Finish setup" recovery latch (SCR-144). Without it,
+    /// the sheet's immediate on-open daemon-grant refresh (or a coincident
+    /// transport flip) re-enters this gate and dismisses the sheet the user just
+    /// reopened, before they can act. The launch path leaves the flag `false`, so
+    /// its documented auto-close behavior is unchanged.
+    static func shouldAutoCloseOnUpdate(
+        transport: RecorderTransport,
+        daemonGrants: DaemonPermissionGrants,
+        reopenedViaRecovery: Bool
+    ) -> Bool {
+        guard !reopenedViaRecovery else { return false }
+        return transport == .daemon && !daemonGrants.anyRequiredDenied
+    }
 }
 
 /// Top-level window content. Sidebar (Calendar / Recordings / Privacy) +
@@ -52,6 +77,13 @@ struct MainWindow: View {
     @State private var selectedDate: Date?
     @State private var visibleMonth: Date = startOfCurrentMonth()
     @State private var showingPermissionsSheet = false
+    /// True while the walkthrough sheet is open because the user explicitly tapped
+    /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
+    /// the recovery latch presents the sheet, cleared when the sheet dismisses
+    /// (`onDismiss`). Suppresses `updateFirstRunSheetPresentation`'s auto-close so a
+    /// coincident daemon-grant / transport update can't dismiss the just-reopened
+    /// sheet before the user acts (SCR-144).
+    @State private var reopenedViaRecovery = false
 
     var body: some View {
         NavigationSplitView {
@@ -95,7 +127,7 @@ struct MainWindow: View {
                 }
             }
         }
-        .sheet(isPresented: $showingPermissionsSheet) {
+        .sheet(isPresented: $showingPermissionsSheet, onDismiss: { reopenedViaRecovery = false }) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
                 .environmentObject(recorder)
@@ -128,6 +160,10 @@ struct MainWindow: View {
             // the launch gate. This is the way back from a mistaken "Skip for
             // now". Consume the latch so it doesn't re-present on later updates.
             guard requested else { return }
+            // Mark this as a recovery-latched open so updateFirstRunSheetPresentation
+            // won't auto-close it out from under the user (SCR-144). Cleared in the
+            // sheet's onDismiss.
+            reopenedViaRecovery = true
             showingPermissionsSheet = true
             permissions.consumeReopenSetupRequest()
         }
@@ -150,11 +186,23 @@ struct MainWindow: View {
         if recorder.state.isRecording {
             return
         }
-        // Close once the daemon path is satisfied — reachable and NOT reporting
-        // a required denial (all granted, or indeterminate). Covers the cold-boot
-        // cliFallback→daemon bounce and the post-grant refresh (U5). A reachable
-        // daemon that still reports a denial keeps the walkthrough up.
-        if recorder.transport == .daemon, !permissions.daemonGrants.anyRequiredDenied {
+        // SCR-144 hardening: self-heal a stranded recovery flag. `reopenedViaRecovery`
+        // is normally cleared in the sheet's `onDismiss`, but if a co-located sheet
+        // won the presentation race the permissions sheet's `onDismiss` may never
+        // fire, leaving the flag stuck true and suppressing every future auto-close.
+        // If the flag is still set while the sheet is no longer showing, that clear
+        // was missed — reset it here so a later satisfied-daemon update auto-closes
+        // normally. (Durable fix: fold both sheets into one enum-driven binding.)
+        if reopenedViaRecovery, !showingPermissionsSheet {
+            reopenedViaRecovery = false
+        }
+        // Auto-close decision lives in FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate
+        // (see its doc-comment); suppressed while the sheet was reopened via the recovery latch.
+        if FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
+            transport: recorder.transport,
+            daemonGrants: permissions.daemonGrants,
+            reopenedViaRecovery: reopenedViaRecovery
+        ) {
             showingPermissionsSheet = false
         }
         if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
