@@ -127,6 +127,16 @@ version and JSON shape so tolerant clients can handle them on the same taxonomy:
 Emitted from `upload.py` and `cli/__init__.py`'s `upload` command; consumed by
 the SwiftUI review window's `UploadController` to drive progress UI.
 
+- **`upload_preparing`** (SCR-175) — **advisory/heartbeat, NON-terminal**, no
+  exit code. Emitted from the interactive `upload` path while the terminal stage
+  runs its SILENT pre-upload prep (the contended-lock handoff, the GCS reconcile,
+  the scrub/mask `produce()`) so the Swift `UploadController`'s 120s inactivity
+  watchdog sees the prep as activity rather than re-tripping as a false
+  `.failed("upload timed out")`. Fires before `upload_started`. Fields:
+  `recording` (`str | null`), `phase` (`str`, one of `locked` / `reconcile` /
+  `scrub`). Additive/non-breaking — tolerant consumers may ignore `phase`
+  entirely (the event's presence alone is enough to reset the watchdog), so
+  `EVENT_SCHEMA_VERSION` is unchanged.
 - **`upload_started`** — fields: `recording: str`, `file_count: int`,
   `total_bytes: int`.
 - **`upload_file_done`** — fields: `recording: str`, `name: str`,

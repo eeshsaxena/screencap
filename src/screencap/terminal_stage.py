@@ -520,7 +520,7 @@ def _append_warning(existing: str | None, fragment: str) -> str:
 
 
 def _notify_progress(
-    on_progress: "Callable[[str], None] | None", phase: str
+    on_progress: Callable[[str], None] | None, phase: str
 ) -> None:
     """Best-effort progress ping for the interactive upload watchdog (SCR-175).
 
@@ -914,8 +914,12 @@ def _route_cloud(
 
     # 0. AE8 — refuse a promotion with HOLES before producing any cloud copy
     # (fail-closed, never a partial cloud copy). A legacy / no-ledger recording
-    # has no closed chunk set, so this is a no-op (R14 whole-dir path).
-    assert_promotable_to_cloud(recording_dir, remote_exists=remote_exists)
+    # has no closed chunk set, so this is a no-op (R14 whole-dir path). SCR-175:
+    # thread on_progress so the per-chunk hole-probe loop pings the interactive
+    # watchdog (it scales with evicted/hole chunks and was otherwise silent).
+    assert_promotable_to_cloud(
+        recording_dir, remote_exists=remote_exists, on_progress=on_progress
+    )
 
     # 1. Reconcile from disk before doing work (R9). Confirmed-in-GCS chunks
     # flip to UPLOADED so we never re-upload them.
@@ -1680,6 +1684,7 @@ def detect_promotion_holes(
     recording_dir: Path | str,
     *,
     remote_exists: Callable[[int], bool] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[int]:
     """Return the chunk indices that are HOLES for a local->cloud promotion (AE8).
 
@@ -1743,6 +1748,11 @@ def detect_promotion_holes(
             continue
         if _chunk_local_media_present(recording_dir, idx):
             continue  # rich local copy survives — upload can re-scrub it.
+        # SCR-175: ping BEFORE each per-chunk GCS confirm (a network round-trip)
+        # so the AE8 hole scan of a large, partially-evicted recording is never
+        # one unbounded silent span under the interactive watchdog — each probe
+        # resets it. Mirrors _reconcile_ledger_against_gcs's per-probe ping.
+        _notify_progress(on_progress, "reconcile")
         if confirm(idx):
             continue  # cloud copy survives — no hole.
         holes.append(idx)
@@ -1753,6 +1763,7 @@ def assert_promotable_to_cloud(
     recording_dir: Path | str,
     *,
     remote_exists: Callable[[int], bool] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> None:
     """Raise :class:`PromotionRefused` if promoting this recording has holes (AE8).
 
@@ -1764,7 +1775,9 @@ def assert_promotable_to_cloud(
     stage on the surviving chunks.
     """
     recording_dir = Path(recording_dir)
-    holes = detect_promotion_holes(recording_dir, remote_exists=remote_exists)
+    holes = detect_promotion_holes(
+        recording_dir, remote_exists=remote_exists, on_progress=on_progress
+    )
     if not holes:
         return
     name = recording_dir.name

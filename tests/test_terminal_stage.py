@@ -1317,3 +1317,53 @@ class TestSCR175PreparingProgress:
         # No on_progress → no crash, normal routing.
         result = ts.run_terminal_stage(rec_dir, _remote_exists=lambda idx: False)
         assert result.routed is True
+
+    def test_on_progress_fires_during_ae8_hole_probe(self, tmp_path, monkeypatch):
+        """The AE8 hole scan (assert_promotable_to_cloud → detect_promotion_holes)
+        runs a per-chunk GCS confirm() for every chunk whose local media is gone
+        and not UPLOADED — a span that scales with evicted chunks and was silent
+        before SCR-175. Force that probe (a chunk whose .mp4 is absent but IS
+        confirmed remote, so it is NOT a hole) and assert a 'reconcile' ping fires
+        DURING the scan AND the run still converges."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        # Chunk 1's local media is gone and it is still STAGED (not UPLOADED), so
+        # detect_promotion_holes must call confirm(1). remote_exists=True for it
+        # → confirmed present in GCS → NOT a hole, so the promotion is allowed and
+        # the run converges (rather than raising PromotionRefused).
+        (rec_dir / "chunk_0001.mp4").unlink()
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        phases: list[str] = []
+        result = ts.run_terminal_stage(
+            rec_dir,
+            _remote_exists=lambda idx: True,
+            on_progress=phases.append,
+        )
+
+        # The hole-probe loop pinged 'reconcile' before its per-chunk confirm()
+        # — the AE8 scan is no longer one unbounded silent span under the watchdog.
+        assert phases.count("reconcile") >= 1, phases
+        # The run still converged despite the evicted-but-confirmed chunk.
+        assert result.routed is True
+
+    def test_on_progress_raising_does_not_break_convergence(self, tmp_path, monkeypatch):
+        """The on_progress ping is a pure side effect: a callback that always
+        raises must NOT perturb the terminal stage's outcome (_notify_progress
+        swallows everything). Proves the except-Exception swallow protects
+        convergence on the real cloud route."""
+        from screencap import terminal_stage as ts
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        _stub_cloud_seam(monkeypatch, scrubbed)
+
+        # A callback that always raises at EVERY phase (lock / reconcile / scrub).
+        result = ts.run_terminal_stage(
+            rec_dir,
+            _remote_exists=lambda idx: False,
+            on_progress=lambda phase: 1 / 0,
+        )
+        assert result.routed is True
