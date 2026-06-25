@@ -67,6 +67,48 @@ def test_content_type_unknown():
     assert ct == "application/octet-stream"
 
 
+def test_put_sends_content_type_and_no_checksum_header(tmp_path):
+    """Client end of the SCR-140/R2 upload contract: the raw PUT to a signed URL sends
+    only Content-Type (+ Content-Length) and NO checksum header.
+
+    This is the companion to ``scripts/cloud-function/test_signing_contract.py``: that
+    test proves the signed PUT URL pins no ``x-goog-hash``; this proves the client never
+    sends one. Together they show both ends of the upload stay checksum-free, so the gcs
+    3.x ``crc32c="auto"`` default — which only affects the library's ``upload_from_*``
+    transfer methods, not a raw ``requests.put`` — cannot break the upload."""
+    from rich.progress import Progress
+
+    from screencap.upload import _content_type, _upload_with_progress, FileInfo
+
+    payload = tmp_path / "video.mp4"
+    payload.write_bytes(b"\x00\x01\x02fake-video-bytes")
+    f = FileInfo("video.mp4", payload, _content_type(payload), payload.stat().st_size)
+
+    captured = {}
+
+    def _fake_put(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs.get("headers", {})
+        return mock.Mock(status_code=200, raise_for_status=mock.Mock())
+
+    with Progress() as progress:
+        task_id = progress.add_task("up", total=f.size)
+        with mock.patch("screencap.upload.requests.put", side_effect=_fake_put):
+            _upload_with_progress(
+                f, "https://signed.example/video.mp4", progress, task_id,
+                recording_name="rec1", max_retries=0,
+            )
+
+    headers = captured["headers"]
+    assert headers.get("Content-Type") == "video/mp4"
+    # No checksum header in any casing — a raw PUT must not commit to a hash the
+    # signed URL never required.
+    lowered = {k.lower() for k in headers}
+    assert "x-goog-hash" not in lowered
+    assert "content-md5" not in lowered
+    assert not any("crc32c" in k.lower() or "checksum" in k.lower() for k in headers)
+
+
 def test_list_recording_files(tmp_path):
     rec = tmp_path / "my-rec"
     rec.mkdir()
