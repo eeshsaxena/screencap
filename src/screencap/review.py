@@ -40,7 +40,7 @@ from __future__ import annotations
 import contextlib
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from rich.console import Console
 
@@ -197,9 +197,13 @@ def prepare_review_data(name: str) -> dict:
     They are serialized as JSON ``null`` in that case — a perfectly
     playable recording can still carry null metadata, so the Swift side
     decodes them as ``Double?`` (upstream plan U6/U8). The companion
-    ``timing_error`` flag (SCR-107) is ``True`` only when that null is due to a
-    failed DB read, letting the consumer distinguish a corrupted/unreadable
-    ``recording.db`` from a legitimately event-free recording.
+    ``timing_status`` (SCR-166) disambiguates the null three ways — ``"ok"``
+    (clean read, including a benign event-free recording), ``"locked"`` (a
+    transient lock that resolves once the writer releases), or ``"corrupt"``
+    (an unreadable ``recording.db``) — so the consumer can tell a temporary
+    lock from corruption from an event-free recording. ``timing_error``
+    (SCR-107) is kept as the back-compat boolean alias: ``True`` for both
+    non-``"ok"`` states.
     """
     from screencap.catalog import _read_recording_meta, find_db
     from screencap.config import get_recordings_dir, resolve_recording_dir
@@ -314,7 +318,7 @@ def prepare_review_data(name: str) -> dict:
     db_path = find_db(rec_dir)
     started_at: float | None = None
     duration_seconds: float | None = None
-    timing_status: str = "ok"
+    timing_status: Literal["ok", "locked", "corrupt"] = "ok"
     if db_path is not None:
         started_at, duration_seconds, timing_status = _read_recording_meta(db_path)
 

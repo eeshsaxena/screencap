@@ -873,7 +873,7 @@ def test_envelope_schema_version_is_bumped(recordings_root):
     envelope = prepare_review_data("rec-ver")
 
     assert envelope["schema_version"] == REVIEW_SCHEMA_VERSION
-    assert REVIEW_SCHEMA_VERSION >= 2, "the U3 enrichment must bump the version"
+    assert REVIEW_SCHEMA_VERSION >= 3, "SCR-166's timing_status addition must bump the version"
 
 
 def test_zero_redactions_serialize_empty_collections_not_null(recordings_root):

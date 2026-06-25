@@ -701,15 +701,11 @@ def test_read_recording_meta_locked_db_reports_locked(tmp_path):
     ``BEGIN EXCLUSIVE`` does NOT block a WAL reader — so the lock is forced with
     ``PRAGMA locking_mode=EXCLUSIVE`` + a held write, which takes the
     file-level EXCLUSIVE lock a reader's ``busy_timeout`` then expires against,
-    raising ``OperationalError("database is locked")``. The opener is patched to
-    a short ``busy_timeout_ms`` so the read fails fast instead of waiting the
-    5s production default.
+    raising ``OperationalError("database is locked")``. ``_read_recording_meta``
+    opens with a 500ms ``busy_timeout`` (the SCR-166 fast-fail), so the read
+    fails fast rather than waiting the 5s production default.
     """
-    import functools
-    from unittest import mock
-
     from screencap import catalog
-    from screencap.recording_db import open_recording_db
 
     d = _make_recording(tmp_path, "locked", duration=60.0)
     db_path = d / "recording.db"
@@ -719,12 +715,7 @@ def test_read_recording_meta_locked_db_reports_locked(tmp_path):
     holder.execute("BEGIN IMMEDIATE")
     holder.execute("UPDATE recording SET timestamp = timestamp")  # hold the write lock
     try:
-        with mock.patch.object(
-            catalog,
-            "open_recording_db",
-            functools.partial(open_recording_db, busy_timeout_ms=300),
-        ):
-            started, duration, timing_status = catalog._read_recording_meta(db_path)
+        started, duration, timing_status = catalog._read_recording_meta(db_path)
     finally:
         holder.rollback()
         holder.close()

@@ -780,6 +780,24 @@ final class ReviewWindowViewModelTests: XCTestCase {
             .locked)
     }
 
+    /// SCR-166 — sibling of the locked decode test: a v3 envelope's `"corrupt"`
+    /// decodes and resolves to `.corrupt` via the explicit case arm (not the
+    /// legacy-boolean fallback), pinning the third `resolve` decode branch.
+    func testDecodesTimingStatusCorruptFromRawJSON() throws {
+        let json = """
+        {"ok": true, "schema_version": 3, "video_path": "/v.mp4",
+         "events_path": "/s/events.jsonl",
+         "started_at": null, "duration_seconds": null, "video_pixfmt_remediated": false,
+         "timing_error": true, "timing_status": "corrupt"}
+        """
+        let env = try JSONDecoder().decode(ReviewDataEnvelope.self, from: Data(json.utf8))
+        XCTAssertEqual(env.timingStatus, "corrupt")
+        XCTAssertEqual(env.timingError, true)
+        XCTAssertEqual(
+            ReviewTimingStatus.resolve(status: env.timingStatus, legacyError: env.timingError),
+            .corrupt)
+    }
+
     // MARK: - Helpers
 
     private func makeModel(

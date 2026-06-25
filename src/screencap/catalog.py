@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from screencap.config import get_recordings_dir
 from screencap.recording_db import has_table, open_recording_db
@@ -276,7 +276,7 @@ def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
 
 def _read_recording_meta(
     db_path: Path,
-) -> tuple[float | None, float | None, str]:
+) -> tuple[float | None, float | None, Literal["ok", "locked", "corrupt"]]:
     """Read (started_timestamp, duration_seconds, timing_status) from a recording.db.
 
     ``timing_status`` is one of:
@@ -303,7 +303,9 @@ def _read_recording_meta(
     import sqlite3
 
     try:
-        with open_recording_db(db_path) as conn:
+        # SCR-166: fail fast (~500ms) on a locked DB rather than blocking the
+        # full 5s default — the lock is then classified below, not waited out.
+        with open_recording_db(db_path, busy_timeout_ms=500) as conn:
             started: float | None = None
             duration: float | None = None
 
