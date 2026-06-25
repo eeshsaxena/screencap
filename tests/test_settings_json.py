@@ -170,3 +170,17 @@ def test_content_index_enabled_rejects_non_bool():
     )
     assert result.exit_code == 1
     assert "true or false" in result.output
+
+
+def test_content_index_consent_declined_defaults_false_in_json():
+    """The one-time-consent decision (SCR-174 U7) is exposed and defaults off.
+    Persisted separately from `content_index_enabled` so 'declined' never
+    re-prompts and isn't conflated with 'feature off'."""
+    settings = _invoke_settings_json()["settings"]
+    assert settings["content_index_consent_declined"] is False
+
+
+def test_content_index_consent_declined_set_roundtrips():
+    """The Search consent flow persists a decline via this writable bool."""
+    _invoke_set("content_index_consent_declined=true")
+    assert _invoke_settings_json()["settings"]["content_index_consent_declined"] is True

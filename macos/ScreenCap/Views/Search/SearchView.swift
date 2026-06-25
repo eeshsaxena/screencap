@@ -165,14 +165,27 @@ struct SearchView: View {
         }
     }
 
-    // MARK: - Consent (minimal note; U7 makes this interactive)
+    // MARK: - Consent (U7) — one-time, fires only when free-text is present and
+    // the on-screen-text flag is off; "Not now" persists so it never re-fires.
 
     private var consentBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "text.viewfinder").foregroundStyle(.orange)
-            Text("On-screen text isn\u{2019}t being indexed yet, so screen matches are limited.")
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "text.viewfinder").foregroundStyle(.orange)
+                Text("Search on-screen text too?").font(.callout).bold()
+                Spacer()
+            }
+            Text("Turn this on to also search the text that was on your screen. Newly recorded screens become searchable \u{2014} it all stays on this Mac and is never uploaded.")
                 .font(.caption)
-            Spacer()
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Not now") { declineConsent() }
+                    .buttonStyle(.bordered)
+                Button("Turn on") { enableConsent() }
+                    .buttonStyle(.borderedProminent)
+            }
         }
         .padding(10)
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
@@ -256,6 +269,38 @@ struct SearchView: View {
             // Best-effort: search still works (timeline is authoritative); the
             // consent CTA simply may show since the flag reads false.
             contentIndexEnabled = false
+        }
+    }
+
+    /// Consent: enable on-screen-text indexing going forward, then re-run the
+    /// query. Optimistic update with success-latch (revert on write failure).
+    private func enableConsent() {
+        contentIndexEnabled = true
+        Task {
+            do {
+                _ = try await CLIClient.runJSONRaw(
+                    ["settings", "--set", "content_index_enabled=true", "--json"]
+                )
+            } catch {
+                contentIndexEnabled = false  // latch on success only
+                return
+            }
+            runSearch()
+        }
+    }
+
+    /// Decline: persist the decision so the prompt never re-fires. Optimistic
+    /// hide with revert-on-failure so a failed write can be re-offered.
+    private func declineConsent() {
+        consentDeclined = true
+        Task {
+            do {
+                _ = try await CLIClient.runJSONRaw(
+                    ["settings", "--set", "content_index_consent_declined=true", "--json"]
+                )
+            } catch {
+                consentDeclined = false
+            }
         }
     }
 }

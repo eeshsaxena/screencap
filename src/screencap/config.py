@@ -185,6 +185,25 @@ def get_content_index_enabled() -> bool:
     return _parse_bool_env("SCREENCAP_CONTENT_INDEX", "content_index_enabled", False)
 
 
+def get_content_index_consent_declined() -> bool:
+    """Return whether the user declined the one-time on-screen-text indexing
+    consent prompt (SCR-174 U7).
+
+    Persisted as a settings bool distinct from ``content_index_enabled`` so that
+    "declined" never re-prompts and is never conflated with "feature off"
+    (never-asked = flag off and not declined; consented = flag on; declined =
+    flag off and this set). The in-app Search consent prompt is a UI-honesty
+    gate, not a security boundary — enabling indexing directly via
+    ``screencap settings --set content_index_enabled=true`` is an accepted
+    same-EUID path (consistent with SECURITY.md).
+    """
+    return _parse_bool_env(
+        "SCREENCAP_CONTENT_INDEX_CONSENT_DECLINED",
+        "content_index_consent_declined",
+        False,
+    )
+
+
 def get_downloads_dir() -> Path:
     """Return downloads directory, creating it if needed."""
     env = os.environ.get("SCREENCAP_DOWNLOADS_DIR")
