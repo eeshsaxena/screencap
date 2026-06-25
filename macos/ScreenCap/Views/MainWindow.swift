@@ -186,11 +186,18 @@ struct MainWindow: View {
         if recorder.state.isRecording {
             return
         }
-        // Close once the daemon path is satisfied — reachable and NOT reporting
-        // a required denial (all granted, or indeterminate). Covers the cold-boot
-        // cliFallback→daemon bounce and the post-grant refresh (U5). A reachable
-        // daemon that still reports a denial keeps the walkthrough up. Suppressed
-        // while the sheet was opened via the recovery latch (SCR-144).
+        // SCR-144 hardening: self-heal a stranded recovery flag. `reopenedViaRecovery`
+        // is normally cleared in the sheet's `onDismiss`, but if a co-located sheet
+        // won the presentation race the permissions sheet's `onDismiss` may never
+        // fire, leaving the flag stuck true and suppressing every future auto-close.
+        // If the flag is still set while the sheet is no longer showing, that clear
+        // was missed — reset it here so a later satisfied-daemon update auto-closes
+        // normally. (Durable fix: fold both sheets into one enum-driven binding.)
+        if reopenedViaRecovery, !showingPermissionsSheet {
+            reopenedViaRecovery = false
+        }
+        // Auto-close decision lives in FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate
+        // (see its doc-comment); suppressed while the sheet was reopened via the recovery latch.
         if FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
