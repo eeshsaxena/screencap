@@ -23,9 +23,10 @@ final class SearchViewModel: ObservableObject {
     private let parser: QueryParser
     private let now: @Sendable () -> Date
     /// Recording chunk length (seconds), read once from `settings` by the live
-    /// wiring. Used to estimate a transcript chunk's wall-clock position before
-    /// snapping it to a real timeline event.
-    private let chunkDurationSeconds: Double
+    /// wiring (set on the view model after the settings fetch). Used to estimate
+    /// a transcript chunk's wall-clock position before snapping it to a real
+    /// timeline event.
+    var chunkDurationSeconds: Double
     private var inFlight = false
 
     init(

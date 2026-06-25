@@ -46,7 +46,7 @@ struct MainWindow: View {
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var privacy: PrivacyController
 
-    enum SidebarSection: Hashable { case calendar, recordings, privacy }
+    enum SidebarSection: Hashable { case calendar, recordings, search, privacy }
 
     @State private var section: SidebarSection = .calendar
     @State private var selectedDate: Date?
@@ -185,6 +185,9 @@ struct MainWindow: View {
             NavigationLink(value: SidebarSection.recordings) {
                 Label("Recordings", systemImage: "list.bullet.rectangle")
             }
+            NavigationLink(value: SidebarSection.search) {
+                Label("Search", systemImage: "magnifyingglass")
+            }
             NavigationLink(value: SidebarSection.privacy) {
                 Label("Privacy", systemImage: "lock.shield")
             }
@@ -245,11 +248,17 @@ struct MainWindow: View {
 
     @ViewBuilder
     private var detail: some View {
+        // Search does not depend on the recordings list, so it is reachable
+        // even while the index is loading or errored — intercept before the
+        // index gate.
+        if section == .search {
+            SearchView()
+        }
         // Three distinct states the user can be in. Without this gate the
         // welcome state (CalendarView) would render misleadingly during
         // first-load and after any CLI failure — both of which look like
         // "no recordings" but mean something different.
-        if index.isLoading && index.recordings.isEmpty {
+        else if index.isLoading && index.recordings.isEmpty {
             loadingState
         } else if let error = index.lastError {
             errorState(error)
@@ -275,6 +284,10 @@ struct MainWindow: View {
                 visibleMonth = day
                 section = .calendar
             }
+        case .search:
+            // Normally intercepted in `detail` before the index gate; handled
+            // here too for switch exhaustiveness.
+            SearchView()
         case .privacy:
             PrivacyPaneView()
         }

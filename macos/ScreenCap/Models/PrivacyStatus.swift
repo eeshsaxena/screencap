@@ -26,6 +26,23 @@ struct PrivacyStatus: Decodable, Equatable {
 struct SettingsEnvelope: Decodable {
     struct Inner: Decodable {
         let privacy: PrivacyStatus?
+        /// SCR-174: on-screen-text indexing flag (drives the search consent
+        /// trigger). Optional/tolerant — older daemons omit it.
+        let contentIndexEnabled: Bool?
+        /// SCR-174: one-time consent decision, persisted as a settings bool so
+        /// "declined" ≠ "off" and the prompt never re-fires (U7).
+        let contentIndexConsentDeclined: Bool?
+        /// SCR-174: recording chunk length (seconds) — used to estimate a
+        /// transcript chunk's wall-clock position before snapping to a real
+        /// timeline event.
+        let chunkDuration: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case privacy
+            case contentIndexEnabled = "content_index_enabled"
+            case contentIndexConsentDeclined = "content_index_consent_declined"
+            case chunkDuration = "chunk_duration"
+        }
     }
 
     let ok: Bool
