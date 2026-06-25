@@ -235,9 +235,13 @@ struct SearchView: View {
         searchTask = Task { await model.search(trimmed, contentIndexEnabled: contentIndexEnabled) }
     }
 
-    /// Opens the Review window for the result's recording. U6 augments this to
-    /// also seek to `item.anchorMs`.
+    /// Opens the Review window for the result's recording and (U6) requests a
+    /// one-shot seek to the hit moment. The seek is delivered out-of-band so the
+    /// window stays keyed on the recording name (no duplicate windows).
     private func openReview(_ item: SearchResultItem) {
+        if let anchorMs = item.anchorMs {
+            ReviewWindowOpener.shared.pendingSeekMs[item.recording] = anchorMs
+        }
         openWindow(id: ReviewWindowID, value: item.recording)
     }
 

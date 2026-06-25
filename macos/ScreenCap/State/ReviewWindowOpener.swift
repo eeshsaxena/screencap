@@ -19,6 +19,14 @@ final class ReviewWindowOpener: ObservableObject {
     /// first window renders, so callsites must use optional chaining.
     var openReview: ((String) -> Void)?
 
+    /// SCR-174: pending one-shot seek targets (absolute unix ms) keyed by
+    /// recording name. A search-result tap sets this just before opening the
+    /// window; `ReviewWindow` reads and clears it when it reaches `.ready`.
+    /// Delivering the seek out-of-band (rather than via the scene value) keeps
+    /// the window keyed on the recording name, so opening the same recording at
+    /// two different moments reuses one window instead of spawning duplicates.
+    var pendingSeekMs: [String: Int] = [:]
+
     private init() {}
 
     /// Convenience entry point. Forwards to `openReview` if registered,
