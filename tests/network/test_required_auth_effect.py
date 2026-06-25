@@ -111,7 +111,19 @@ def _proxied_leaf_issuer(proxy_port: int, host: str, port: int = 443) -> x509.Na
             f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode()
         )
         sock.settimeout(20)
-        head = sock.recv(4096)
+        # Read until the full CONNECT response headers arrive — don't assume one recv
+        # delivers the whole status line. (Safe to read to \r\n\r\n: the upstream stays
+        # silent until we send the TLS ClientHello, so we can't over-read TLS bytes.) A
+        # fragmented response would otherwise spuriously skip an auth host — and a silent
+        # skip on a security proof is worse than a loud failure.
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise _Unreachable(f"proxy closed before CONNECT response for {host}")
+            head += chunk
+            if len(head) > 65536:
+                raise _Unreachable(f"CONNECT response too large for {host}")
         status_line = head.split(b"\r\n", 1)[0]
         if b" 200" not in status_line:
             # The proxy refused to open the tunnel (often an upstream-connect failure for
@@ -141,7 +153,15 @@ def _proxied_leaf_issuer(proxy_port: int, host: str, port: int = 443) -> x509.Na
 @pytest.fixture(scope="module")
 def proxy():
     """Spawn real ``mitmdump`` with the production ``ignore_hosts`` and a throwaway CA in a
-    tmp confdir. Yields ``(proxy_port, ca_subject)``. Guarantees teardown even on failure."""
+    tmp confdir. Yields ``(proxy_port, ca_subject, patterns)``. Guarantees teardown even on
+    failure.
+
+    Production runs these same patterns *in-process* (``DumpMaster`` +
+    ``Options(ignore_hosts=...)``, ``proxy_runner.py``); this test passes them to the
+    ``mitmdump`` CLI via repeated ``--set ignore_hosts=`` (the idiomatic way to build a
+    sequence option). The transport differs but the load-bearing input — the pattern list
+    from ``build_ignore_hosts_regex`` — and mitmproxy's tunnel/intercept decision are the
+    same, which is what the EFFECT proves."""
     import tempfile
 
     patterns = _production_ignore_hosts()
