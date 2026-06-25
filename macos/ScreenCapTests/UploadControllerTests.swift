@@ -431,6 +431,40 @@ final class UploadControllerTests: XCTestCase {
         }
     }
 
+    /// SCR-175: the pre-upload prep (contended-lock handoff, GCS reconcile,
+    /// scrub/mask produce) emits NO event before `upload_started` at transfer,
+    /// so the single inactivity watchdog — armed at spawn — would subtract the
+    /// lock wait from the same budget the silent converge draws on and re-trip
+    /// as a false `.failed("upload timed out")` (SCR-165 moved the cliff, didn't
+    /// remove it). The terminal stage now emits `upload_preparing` pings during
+    /// that window; each must reset the watchdog so a long-but-progressing prep
+    /// never trips it. Pins the cross-language keepalive contract: a steady
+    /// stream of `upload_preparing` (and nothing else) keeps the controller
+    /// `.uploading` past several watchdog bounds.
+    func testPreparingEventsKeepWatchdogAliveDuringSilentPrep() async {
+        let service = FakeUploadService()
+        // Bound = 100ms; prep pings arrive every 30ms for ~200ms (2× the bound).
+        let controller = makeController(service: service, inactivityTimeoutSeconds: 0.1)
+
+        controller.start(name: "rec-001")
+        for phase in ["locked", "reconcile", "reconcile", "scrub", "scrub", "scrub"] {
+            try? await Task.sleep(nanoseconds: 30_000_000)
+            service.emit(#"{"type": "upload_preparing", "schema_version": 1, "recording": "rec-001", "phase": "\#(phase)"}"#)
+        }
+
+        // The child is still preparing (no upload_started yet) but the watchdog
+        // must NOT have fired: each preparing ping reset it.
+        if case .uploading = controller.state {
+            // pass — the prep heartbeat kept the watchdog alive.
+        } else {
+            XCTFail("upload_preparing must reset the watchdog; got \(controller.state)")
+        }
+        XCTAssertEqual(
+            service.fakeProcess.terminateInvocations, 0,
+            "a progressing prep phase must not be SIGTERMed by the watchdog"
+        )
+    }
+
     /// SCR-89 — two controllers (two review windows) for the SAME recording
     /// must not both spawn `screencap upload`. The first claims the name; the
     /// second is refused by the cross-window registry, never starts a
