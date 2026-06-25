@@ -1,7 +1,7 @@
 ---
 title: "test: SCR-140 U5 carry-forward EFFECT tests (mitmdump tunnel proof + gcs 3.x signing-contract re-test)"
 type: test
-status: active
+status: completed
 date: 2026-06-25
 origin: docs/todos/feat/per-user-cloud-storage-isolation/000-handoff.md
 ---
