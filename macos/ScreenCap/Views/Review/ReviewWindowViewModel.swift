@@ -85,12 +85,16 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     var redaction: ReviewRedaction? = nil
     var coverage: ReviewCoverage? = nil
     /// SCR-107 — `true` only when null `startedAt`/`durationSeconds` is due to a
-    /// failed `recording.db` read (corrupt/unreadable), as opposed to a benign
-    /// recording with no action events. Lets the consumer surface a
-    /// non-blocking advisory instead of silently treating a corrupted DB as a
-    /// clean, event-free review. Absent (older envelope) → nil → treated as no
-    /// error.
+    /// failed `recording.db` read (corrupt/unreadable OR locked), as opposed to
+    /// a benign recording with no action events. Retained as the back-compat
+    /// alias of `timingStatus` (true for both `"locked"` and `"corrupt"`).
+    /// Absent (older envelope) → nil → treated as no error.
     var timingError: Bool? = nil
+    /// SCR-166 — tri-state `"ok"` | `"locked"` | `"corrupt"` refining
+    /// `timingError`. Decoded as a raw String (forward-compatible with any
+    /// future status); `ReviewTimingStatus.resolve` maps it, falling back to
+    /// `timingError` when an older envelope omits it. Absent → nil.
+    var timingStatus: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -106,6 +110,34 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case redaction
         case coverage
         case timingError = "timing_error"
+        case timingStatus = "timing_status"
+    }
+}
+
+/// SCR-166 — the three outcomes of reading a recording's timing from
+/// `recording.db`, threaded from the envelope's `timing_status`:
+/// `.ok` (read fine — including a benign event-free recording, no advisory),
+/// `.locked` (a *transient* lock held by an active recording / concurrent
+/// writer — resolves once it releases), and `.corrupt` (an unreadable DB).
+/// The review stays playable in every case; only the timeline pane's advisory
+/// copy differs.
+enum ReviewTimingStatus: Equatable {
+    case ok
+    case locked
+    case corrupt
+
+    /// Map the envelope's `timing_status` string, falling back to the legacy
+    /// `timing_error` boolean when the field is absent (an older CLI): `true`
+    /// → `.corrupt` (the pre-SCR-166 advisory was corruption-flavored),
+    /// `false`/absent → `.ok`. An unrecognized status also falls back to the
+    /// boolean, so a future status still surfaces *some* advisory.
+    static func resolve(status: String?, legacyError: Bool?) -> ReviewTimingStatus {
+        switch status {
+        case "ok": return .ok
+        case "locked": return .locked
+        case "corrupt": return .corrupt
+        default: return (legacyError ?? false) ? .corrupt : .ok
+        }
     }
 }
 
@@ -127,10 +159,11 @@ struct ReviewData: Equatable {
     let durationSeconds: Double
     let redaction: ReviewRedaction?
     let coverage: ReviewCoverage?
-    /// SCR-107 — the timing metadata couldn't be read (corrupt/unreadable
-    /// `recording.db`). The review is still playable; the panes surface a
-    /// non-blocking advisory and the timeline stays at its 0-origin fallback.
-    let timingError: Bool
+    /// SCR-166 — whether the timing read was ok / a transient lock / corrupt
+    /// (`recording.db`). The review is still playable in every case; the panes
+    /// surface a status-specific non-blocking advisory and the timeline stays
+    /// at its 0-origin fallback.
+    let timingStatus: ReviewTimingStatus
 }
 
 /// Test seam over `CLIClient.runJSONRaw` so the review-data fetch can be
@@ -320,10 +353,12 @@ final class ReviewWindowViewModel: ObservableObject {
                 durationSeconds: envelope.durationSeconds ?? 0,
                 redaction: envelope.redaction,
                 coverage: envelope.coverage,
-                // SCR-107: a null-timing envelope flagged as a DB-read failure
-                // stays playable but carries the advisory; a missing flag
-                // (older envelope) is treated as no error.
-                timingError: envelope.timingError ?? false
+                // SCR-166: a null-timing envelope stays playable but carries a
+                // status-specific advisory (locked vs corrupt); `resolve` falls
+                // back to the legacy `timing_error` boolean for older envelopes
+                // that omit `timing_status`.
+                timingStatus: ReviewTimingStatus.resolve(
+                    status: envelope.timingStatus, legacyError: envelope.timingError)
             )
             state = .ready(data)
         } catch {

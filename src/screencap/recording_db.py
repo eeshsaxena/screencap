@@ -76,15 +76,20 @@ def open_recording_db(
     *,
     read_only: bool = True,
     row_factory: object | None = None,
+    busy_timeout_ms: int = 5000,
 ) -> Iterator[sqlite3.Connection]:
     """Open ``recording.db`` with the canonical PRAGMAs and yield the connection.
 
     Raises ``FileNotFoundError`` if the path does not point at an existing
     file (prevents ``sqlite3.connect`` from silently creating an empty DB).
 
-    Sets ``PRAGMA busy_timeout=5000``. When ``read_only=True`` (the default),
-    also sets ``PRAGMA query_only=ON``. When ``row_factory`` is provided
-    (typically ``Row`` for column-by-name access), assigns it before yielding.
+    Sets ``PRAGMA busy_timeout`` (``busy_timeout_ms``, default 5000). Lower it
+    for a read that must fail fast on a locked DB rather than block for the full
+    default — the caller then classifies the resulting ``OperationalError``
+    (e.g. ``catalog._read_recording_meta``'s locked-vs-corrupt split, SCR-166).
+    When ``read_only=True`` (the default), also sets ``PRAGMA query_only=ON``.
+    When ``row_factory`` is provided (typically ``Row`` for column-by-name
+    access), assigns it before yielding.
 
     Closes the connection on exit, even if the body raises.
     """
@@ -94,7 +99,7 @@ def open_recording_db(
 
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         if read_only:
             conn.execute("PRAGMA query_only=ON")
         if row_factory is not None:

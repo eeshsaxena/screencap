@@ -577,29 +577,30 @@ def test_get_seen_bundle_ids_empty_dirs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _read_recording_meta — timing_error discriminator (SCR-107)
+# _read_recording_meta — timing_status discriminator (SCR-107 / SCR-166)
 #
 # A swallowed DB-read exception must be distinguishable from a structurally
-# event-free recording. ``timing_error`` (the third tuple element) is True ONLY
-# on the caught-exception path (corrupt / unreadable DB); every readable-but-
-# empty case stays False so a legitimately event-free recording is never
-# flagged. Display-only callers discard the third element.
+# event-free recording (SCR-107), AND a transient lock must be distinguishable
+# from corruption (SCR-166). ``timing_status`` (the third tuple element) is
+# "ok" for every clean read (including readable-but-empty), "locked" for a
+# transient lock/busy, and "corrupt" for any other read failure. Display-only
+# callers discard the third element.
 # ---------------------------------------------------------------------------
 
 
 def test_read_recording_meta_healthy_recording(tmp_path):
-    """A healthy recording reads timing with timing_error=False."""
+    """A healthy recording reads timing with timing_status="ok"."""
     from screencap.catalog import _read_recording_meta
 
     d = _make_recording(tmp_path, "healthy", duration=60.0)
-    started, duration, timing_error = _read_recording_meta(d / "recording.db")
+    started, duration, timing_status = _read_recording_meta(d / "recording.db")
     assert started is not None
     assert duration is not None and duration > 0
-    assert timing_error is False
+    assert timing_status == "ok"
 
 
-def test_read_recording_meta_corrupt_db_flags_error(tmp_path):
-    """A corrupt / unreadable DB raises inside the read -> timing_error=True.
+def test_read_recording_meta_corrupt_db_reports_corrupt(tmp_path):
+    """A corrupt / unreadable DB raises inside the read -> timing_status="corrupt".
 
     This is the SCR-107 case: the swallowed exception previously collapsed
     into the same (None, None) a benign recording produces.
@@ -608,25 +609,25 @@ def test_read_recording_meta_corrupt_db_flags_error(tmp_path):
 
     corrupt = tmp_path / "corrupt.db"
     corrupt.write_bytes(b"this is not a sqlite database at all")
-    started, duration, timing_error = _read_recording_meta(corrupt)
+    started, duration, timing_status = _read_recording_meta(corrupt)
     assert started is None
     assert duration is None
-    assert timing_error is True
+    assert timing_status == "corrupt"
 
 
 def test_read_recording_meta_valid_db_no_recording_table(tmp_path):
     """A valid sqlite file missing the recording table is NOT an error.
 
-    The DB opened cleanly; it simply carries no timing. timing_error stays
-    False so it is not mistaken for corruption.
+    The DB opened cleanly; it simply carries no timing. timing_status stays
+    "ok" so it is not mistaken for corruption.
     """
     from screencap.catalog import _read_recording_meta
 
     db_path = tmp_path / "noschema.db"
     sqlite3.connect(str(db_path)).close()
-    started, duration, timing_error = _read_recording_meta(db_path)
+    started, duration, timing_status = _read_recording_meta(db_path)
     assert (started, duration) == (None, None)
-    assert timing_error is False
+    assert timing_status == "ok"
 
 
 def test_read_recording_meta_zero_timestamp_not_error(tmp_path):
@@ -639,14 +640,14 @@ def test_read_recording_meta_zero_timestamp_not_error(tmp_path):
     conn.execute("INSERT INTO recording VALUES (0)")
     conn.commit()
     conn.close()
-    started, duration, timing_error = _read_recording_meta(db_path)
+    started, duration, timing_status = _read_recording_meta(db_path)
     assert (started, duration) == (None, None)
-    assert timing_error is False
+    assert timing_status == "ok"
 
 
 def test_read_recording_meta_valid_timestamp_no_action_event_table(tmp_path):
     """A DB with a valid non-zero timestamp but no action_event table is NOT
-    an error: started is populated, duration is unknown, timing_error is False."""
+    an error: started is populated, duration is unknown, timing_status is "ok"."""
     from screencap.catalog import _read_recording_meta
 
     db_path = tmp_path / "notimeline.db"
@@ -655,15 +656,78 @@ def test_read_recording_meta_valid_timestamp_no_action_event_table(tmp_path):
     conn.execute("INSERT INTO recording VALUES (1716800000.0)")
     conn.commit()
     conn.close()
-    started, duration, timing_error = _read_recording_meta(db_path)
+    started, duration, timing_status = _read_recording_meta(db_path)
     assert started is not None
     assert duration is None
-    assert timing_error is False
+    assert timing_status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# _read_recording_meta — locked vs corrupt discriminator (SCR-166)
+#
+# A *transient* lock (an active recording / concurrent writer holding the DB)
+# must report "locked", distinct from the *permanent* "corrupt" a truly
+# unreadable DB reports, so the review window can show "temporarily
+# unavailable" instead of a corruption-flavored advisory. "ok" covers every
+# clean read (including a benign event-free recording).
+# ---------------------------------------------------------------------------
+
+
+def test_is_lock_error_classifies_lock_and_busy_messages():
+    """The message-fallback branch (Python 3.10, no `sqlite_errorcode`) maps a
+    locked/busy OperationalError to a lock; manually-built exceptions carry no
+    errorcode, so this exercises the fallback."""
+    from screencap.catalog import _is_lock_error
+
+    assert _is_lock_error(sqlite3.OperationalError("database is locked")) is True
+    assert _is_lock_error(sqlite3.OperationalError("database table is locked")) is True
+    assert _is_lock_error(sqlite3.OperationalError("database is busy")) is True
+
+
+def test_is_lock_error_rejects_non_lock_operational_errors():
+    """A non-lock OperationalError (disk I/O, missing table) is NOT a transient
+    lock and must fall through to the corrupt/error path."""
+    from screencap.catalog import _is_lock_error
+
+    assert _is_lock_error(sqlite3.OperationalError("disk I/O error")) is False
+    assert _is_lock_error(sqlite3.OperationalError("no such table: recording")) is False
+
+
+def test_read_recording_meta_locked_db_reports_locked(tmp_path):
+    """SCR-166: a recording.db locked by a concurrent writer reports "locked",
+    NOT "corrupt".
+
+    recording.db is WAL-mode (engine/db sets journal_mode=WAL), and a plain
+    ``BEGIN EXCLUSIVE`` does NOT block a WAL reader — so the lock is forced with
+    ``PRAGMA locking_mode=EXCLUSIVE`` + a held write, which takes the
+    file-level EXCLUSIVE lock a reader's ``busy_timeout`` then expires against,
+    raising ``OperationalError("database is locked")``. ``_read_recording_meta``
+    opens with a 500ms ``busy_timeout`` (the SCR-166 fast-fail), so the read
+    fails fast rather than waiting the 5s production default.
+    """
+    from screencap import catalog
+
+    d = _make_recording(tmp_path, "locked", duration=60.0)
+    db_path = d / "recording.db"
+
+    holder = sqlite3.connect(str(db_path))
+    holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("UPDATE recording SET timestamp = timestamp")  # hold the write lock
+    try:
+        started, duration, timing_status = catalog._read_recording_meta(db_path)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert started is None
+    assert duration is None
+    assert timing_status == "locked"
 
 
 def test_list_recordings_tolerates_corrupt_db(tmp_path):
     """The display caller (list_recordings) still lists a recording whose DB is
-    corrupt — it discards timing_error and shows the '—' date fallback rather
+    corrupt — it discards timing_status and shows the '—' date fallback rather
     than crashing on the 3-tuple read."""
     rec_dir = tmp_path / "rec-corrupt"
     rec_dir.mkdir()
