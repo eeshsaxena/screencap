@@ -90,6 +90,17 @@ enum UploadState: Equatable {
     /// as `.failed("upload exited with code 0")`.
     case busy(String)
 
+    /// Single-source user-facing copy for the cross-window `.refused` state
+    /// (SCR-163). Honest framing — it does NOT promise the owning window will
+    /// finish (the claim releases eagerly, SCR-154, and that owner can be
+    /// closed/killed/fail mid-upload) — and it names the recovery floor: the
+    /// Recordings-list Upload button (intent-agnostic, `!uploaded && !isStub`).
+    /// Lives here so the controller and its tests reference one string rather
+    /// than duplicating the literal and asserting fragile substrings of it.
+    static let refusedCrossWindowMessage =
+        "This recording is being uploaded in another window. If it "
+        + "doesn't finish, you can upload it again from the Recordings list."
+
     struct Progress: Equatable {
         let filesDone: Int
         let filesTotal: Int
@@ -232,10 +243,7 @@ final class UploadController: ObservableObject {
             // `uploaded == false`, so the Recordings list keeps its Upload
             // button — the intent-agnostic recovery floor), so we point the user
             // there instead of promising completion in another window.
-            state = .refused(
-                "This recording is being uploaded in another window. If it "
-                    + "doesn't finish, you can upload it again from the Recordings list."
-            )
+            state = .refused(UploadState.refusedCrossWindowMessage)
             return
         }
         claimedName = name

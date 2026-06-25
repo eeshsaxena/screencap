@@ -454,20 +454,21 @@ final class UploadControllerTests: XCTestCase {
             return XCTFail("A should be uploading, got \(controllerA.state)")
         }
         if case .refused(let msg) = controllerB.state {
-            XCTAssertTrue(msg.contains("another window"), "got: \(msg)")
-            // SCR-163: the copy must stay honest — it must NOT assert the other
-            // window WILL finish (the claim releases eagerly and the owner can
-            // die mid-upload), and it must point at the real recovery floor (the
-            // Recordings-list Upload button). Pinning both guards against a
-            // future copy edit that re-introduces the optimistic "already
-            // uploaded; nothing to do" framing the ticket flagged.
-            XCTAssertFalse(
-                msg.contains("already"),
-                "refused copy must not assert completion, got: \(msg)"
-            )
-            XCTAssertTrue(
-                msg.contains("Recordings list"),
-                "refused copy must point to the recovery affordance, got: \(msg)"
+            // SCR-163: the controller must surface the single-source canonical
+            // refused copy. Asserting equality against the constant pins the
+            // wiring without coupling to fragile substrings of an inline literal
+            // (the old `!contains("already")` would false-fail on any unrelated
+            // future copy that happens to use the word).
+            XCTAssertEqual(msg, UploadState.refusedCrossWindowMessage)
+            // ...and that canonical copy must stay honest: it names the recovery
+            // floor (the Recordings-list Upload button) rather than promising the
+            // owning window finishes. Guard the load-bearing property
+            // case-insensitively against the single source.
+            XCTAssertNotNil(
+                UploadState.refusedCrossWindowMessage.range(
+                    of: "Recordings list", options: .caseInsensitive
+                ),
+                "refused copy must name the recovery affordance"
             )
         } else {
             XCTFail("B should be refused, got \(controllerB.state)")
