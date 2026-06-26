@@ -182,7 +182,7 @@ def _assert_within_recordings_root(path: Path, recordings_root: Path) -> None:
         )
 
 
-def _prepare_review_video(name: str) -> tuple[Path, Path, bool]:
+def _prepare_recording_video(name: str) -> tuple[Path, Path, bool]:
     """Shared local-video preparation for both ``review-data`` and
     ``inspect-data``: resolve the recording dir and prepare the local
     navigation video (concat ``chunk_*.mp4`` → remediate ``yuv444p`` for AVKit),
@@ -233,7 +233,7 @@ def _prepare_review_video(name: str) -> tuple[Path, Path, bool]:
     return rec_dir, video_path, remediated
 
 
-def _read_review_timing(
+def _read_recording_timing(
     rec_dir: Path,
 ) -> tuple[float | None, float | None, Literal["ok", "locked", "corrupt"]]:
     """Shared timing read for the timeline pane's coordinate space, from the
@@ -286,8 +286,8 @@ def prepare_review_data(name: str) -> dict:
     from screencap.config import get_recordings_dir
 
     # Resolve the recording dir + prepare the local navigation video (shared
-    # with inspect-data via _prepare_review_video).
-    rec_dir, video_path, remediated = _prepare_review_video(name)
+    # with inspect-data via _prepare_recording_video).
+    rec_dir, video_path, remediated = _prepare_recording_video(name)
 
     # Scrub-before-review (R1/R2/R7): prepare the exact post-hoc upload payload
     # — masked screenshots + scrubbed events/DB/transcript — so the bytes
@@ -353,7 +353,7 @@ def prepare_review_data(name: str) -> dict:
     # for corruption, instead of presenting either as a clean, event-free
     # review. `timing_error` (SCR-107) is kept as the back-compat boolean older
     # consumers read — True for both non-"ok" states.
-    started_at, duration_seconds, timing_status = _read_review_timing(rec_dir)
+    started_at, duration_seconds, timing_status = _read_recording_timing(rec_dir)
 
     return {
         "ok": True,
@@ -412,7 +412,7 @@ def prepare_inspect_data(name: str) -> dict:
 
     # Resolve the recording dir + prepare the local navigation video (shared
     # with review-data). No scrub, no lock.
-    rec_dir, video_path, remediated = _prepare_review_video(name)
+    rec_dir, video_path, remediated = _prepare_recording_video(name)
 
     # Local events from the ORIGINAL dir: ensure_canonical_events self-gates
     # (no-op when chunked; exports the combined events.jsonl from the DB
@@ -440,7 +440,7 @@ def prepare_inspect_data(name: str) -> dict:
     for p in event_files:
         _assert_within_recordings_root(p, recordings_root)
 
-    started_at, duration_seconds, timing_status = _read_review_timing(rec_dir)
+    started_at, duration_seconds, timing_status = _read_recording_timing(rec_dir)
 
     return {
         "ok": True,

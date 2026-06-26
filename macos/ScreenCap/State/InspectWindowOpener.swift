@@ -20,7 +20,13 @@ final class InspectWindowOpener: ObservableObject {
     /// out-of-band delivery). Keeping the seek off the scene value lets the
     /// window stay keyed on the recording name, so opening the same recording at
     /// two different moments reuses one window instead of spawning duplicates.
-    var pendingSeekMs: [String: Int] = [:]
+    ///
+    /// `@Published` so an already-open, already-ready inspect window can observe a
+    /// freshly-set entry (a second anchored search result for the same recording)
+    /// and re-seek its existing player — the first-open `.ready` path is only
+    /// reached once, so a reused window would otherwise stay at the prior moment
+    /// (Finding #2). Direct get/set still works, which the unit tests rely on.
+    @Published var pendingSeekMs: [String: Int] = [:]
 
     private init() {}
 

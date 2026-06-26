@@ -171,6 +171,12 @@ def test_nonchunked_events_exported_to_original_dir(recordings_root):
     assert "-scrubbed" not in envelope["events_path"]
     # Shared gate → canonical upload config (the network-exclusion guarantee).
     assert ex.call_args.kwargs["exclude_moves"] is False
+    # include_network parity with upload: ensure_canonical_events relies on
+    # export_recording's cloud-safe `include_network=False` default, so the
+    # inspect export must never opt into network rows the upload path excludes.
+    # The kwarg is left at its default here, so assert the effective value is
+    # False (absent ≡ False) rather than an explicit True.
+    assert ex.call_args.kwargs.get("include_network", False) is False
 
 
 def test_empty_events_is_tolerated_video_first(recordings_root):
@@ -271,6 +277,23 @@ def test_path_outside_recordings_root_is_rejected(recordings_root, tmp_path):
 
     with pytest.raises(ReviewPrepareError, match="outside the recordings root"):
         prepare_inspect_data("rec-escape")
+
+
+def test_video_symlink_outside_recordings_root_is_rejected(recordings_root, tmp_path):
+    """Defense-in-depth, video branch: a ``video.mp4`` symlinked to a real video
+    OUTSIDE the recordings root is refused before its path is emitted. Mirrors
+    the event-file containment test, but exercises the ``video_path`` arm of
+    ``_assert_within_recordings_root`` — the AVKit player would otherwise be
+    handed an out-of-tree absolute path."""
+    rec_dir = _make_recording(recordings_root, "rec-videscape")
+    # A real, AVKit-safe video living outside the root; the in-dir video.mp4 is a
+    # symlink to it, so the resolved path escapes containment.
+    outside = tmp_path / "outside.mp4"
+    _write_video(outside)
+    (rec_dir / "video.mp4").symlink_to(outside)
+
+    with pytest.raises(ReviewPrepareError, match="outside the recordings root"):
+        prepare_inspect_data("rec-videscape")
 
 
 def test_no_video_is_distinct_error(recordings_root):

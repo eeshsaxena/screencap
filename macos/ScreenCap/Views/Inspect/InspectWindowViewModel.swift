@@ -66,6 +66,15 @@ final class LiveInspectDataLoader: InspectDataLoader {
 final class InspectWindowViewModel: ObservableObject {
     @Published private(set) var state: InspectState = .preparing
 
+    /// Concurrent-entry guard for `loadInspectData()`. Both entry points (the
+    /// view's `.task` and the Try-Again button's unstructured `Task`) funnel
+    /// through the same method; a re-tap while a load is still in flight must be
+    /// a no-op, not a second racing fetch. `@MainActor` isolation makes the
+    /// check-and-set non-atomic-but-safe (no preemption between the `guard` and
+    /// the `true` assignment, since both run on the main actor before the first
+    /// `await`).
+    private var isLoading = false
+
     let recordingName: String
     private let loader: InspectDataLoader
 
@@ -80,6 +89,12 @@ final class InspectWindowViewModel: ObservableObject {
     /// Drives `preparing → ready` (or `preparing → failed`). Called from the
     /// view's `.task` on first appear, and re-entrant on a Try-Again retry.
     func loadInspectData() async {
+        // Concurrent-entry guard: a re-tap of Try-Again (or a `.task` that races
+        // a retry) while a load is still in flight is a no-op, so two fetches
+        // can't interleave and clobber `state` out of order.
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
         // Re-entrancy: a retry after a failure comes back through here; reset to
         // preparing so the spinner shows while the second call runs.
         if case .failed = state { state = .preparing }

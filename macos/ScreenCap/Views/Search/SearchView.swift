@@ -4,7 +4,7 @@ import SwiftUI
 // as a single `List` that is the detail root (per-day `Section`s); the search
 // field is pinned with `.safeAreaInset`. A List-as-root sizes reliably inside
 // the NavigationSplitView detail — stacking a List/ScrollView below siblings in
-// a VStack does not. Selecting a result opens the Review window at that moment.
+// a VStack does not. Selecting a result opens the read-only inspect window at that moment.
 struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @Environment(\.openWindow) private var openWindow

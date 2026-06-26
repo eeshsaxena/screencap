@@ -34,6 +34,11 @@ struct InspectWindow: View {
     let recordingName: String
     @StateObject private var model: InspectWindowViewModel
 
+    // Observed so a freshly-set `pendingSeekMs[recordingName]` (a second anchored
+    // search result for an already-open, already-ready window) re-renders the body
+    // and fires the reuse `.onChange` below (Finding #2).
+    @ObservedObject private var opener = InspectWindowOpener.shared
+
     @State private var videoModel: VideoPlayerPaneModel?
     @State private var timelineEvents: [TimelineEvent] = []
     @State private var currentTime: Double = 0
@@ -54,6 +59,18 @@ struct InspectWindow: View {
             .task { await model.loadInspectData() }
             .onChange(of: model.state) { newState in
                 buildVideoIfReady(newState)
+            }
+            // Reuse hook: an already-ready window gets a NEW search moment. The
+            // first-open `.ready` path runs only once (gated on `videoModel == nil`),
+            // so without this a re-opened window would stay at the prior moment
+            // (Finding #2). When the player isn't built yet, leave the entry for
+            // `buildVideoIfReady` to consume on `.ready` — no double-consumption,
+            // since consuming clears the entry.
+            .onChange(of: opener.pendingSeekMs[recordingName]) { seekMs in
+                guard seekMs != nil,
+                      let vm = videoModel,
+                      case .ready(let data) = model.state else { return }
+                consumePendingSeek(into: vm, data: data)
             }
     }
 
@@ -176,14 +193,7 @@ struct InspectWindow: View {
         let vm = VideoPlayerPaneModel(engine: engine)
         videoModel = vm
 
-        if let seekMs = InspectWindowOpener.shared.pendingSeekMs[recordingName] {
-            InspectWindowOpener.shared.pendingSeekMs[recordingName] = nil
-            vm.seek(toSeconds: SearchSeek.relativeSeconds(
-                anchorMs: seekMs,
-                startedAt: data.startedAt,
-                durationSeconds: data.durationSeconds
-            ))
-        }
+        consumePendingSeek(into: vm, data: data)
 
         if !timelineLoaded {
             timelineLoaded = true
@@ -197,5 +207,22 @@ struct InspectWindow: View {
                 await MainActor.run { timelineEvents = parsed }
             }
         }
+    }
+
+    /// Read-and-clear the pending seek for this recording and, if one was set,
+    /// seek `vm` to that moment. Clearing the entry is the double-consumption
+    /// guard: the first-open path (`buildVideoIfReady`) and the reuse `.onChange`
+    /// hook share this helper, so whichever runs first leaves nothing for the
+    /// other. With no pending seek the player simply stays where it is — a
+    /// Recordings-list reuse sets `pendingSeekMs[name] = nil` at the click site,
+    /// so it never jumps to a stale moment.
+    private func consumePendingSeek(into vm: VideoPlayerPaneModel, data: InspectData) {
+        guard let seekMs = InspectWindowOpener.shared.pendingSeekMs[recordingName] else { return }
+        InspectWindowOpener.shared.pendingSeekMs[recordingName] = nil
+        vm.seek(toSeconds: SearchSeek.relativeSeconds(
+            anchorMs: seekMs,
+            startedAt: data.startedAt,
+            durationSeconds: data.durationSeconds
+        ))
     }
 }

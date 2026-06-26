@@ -163,8 +163,8 @@ struct RecordingsListView: View {
     /// (`uploaded == false && isStub == false`, per R2). Opens the review
     /// `WindowGroup` (plan U3) scoped to this recording — the review-then-
     /// upload pipeline lives in U7/U8. The button has its own `.buttonStyle`
-    /// scope so its tap area doesn't fight the outer row button (which still
-    /// owns the browser link-out path on row body click).
+    /// scope so its tap area doesn't fight the outer row button (which now
+    /// opens the read-only inspect window on row body click).
     @ViewBuilder
     private func uploadButton(for rec: RecordingSummary) -> some View {
         Button {

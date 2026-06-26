@@ -66,6 +66,19 @@ final class InspectWindowOpenerTests: XCTestCase {
         XCTAssertNil(InspectWindowOpener.shared.pendingSeekMs["rec-unset"])
     }
 
+    /// `InspectWindow.buildVideoIfReady` clears a consumed seek via
+    /// `pendingSeekMs[name] = nil`, relying on Swift dictionaries removing the
+    /// key on a nil assignment. Pin that semantic so a stale seek can't survive
+    /// to re-fire on a later open of the same window.
+    func testAssigningNilClearsPendingSeek() {
+        InspectWindowOpener.shared.pendingSeekMs["rec-clear"] = 1716800123_456
+        XCTAssertEqual(InspectWindowOpener.shared.pendingSeekMs["rec-clear"], 1716800123_456)
+
+        InspectWindowOpener.shared.pendingSeekMs["rec-clear"] = nil
+
+        XCTAssertNil(InspectWindowOpener.shared.pendingSeekMs["rec-clear"])
+    }
+
     /// Ensures the published scene id and the opener-bridge id agree — a typo on
     /// either side would silently break the search/row → inspect-window dispatch.
     func testInspectWindowIDConstantIsStable() {
