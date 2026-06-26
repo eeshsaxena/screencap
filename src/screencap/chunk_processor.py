@@ -162,7 +162,18 @@ class ChunkProcessor:
         self._cloud_intent = cloud_intent
         self._privacy_mode = privacy_mode
         self._screen_filter = screen_filter
-        self._segmentation_mode = segmentation_mode
+        # SCR-35: manifest production (mode selection + blocked_intervals +
+        # partial-file cleanup) is owned by the ChunkManifest seam, injected as
+        # the PipelineStageRunner manifest step. The processor no longer reads
+        # segmentation_mode itself.
+        from screencap.chunk_manifest import ChunkManifest
+
+        self._chunk_manifest = ChunkManifest(
+            self._capture_dir,
+            segmentation_mode=segmentation_mode,
+            rest_threshold=rest_threshold,
+            screen_filter=screen_filter,
+        )
         self._scrub_enabled = scrub_enabled
         self._show_on_website = show_on_website
 
@@ -667,32 +678,11 @@ class ChunkProcessor:
             return result
 
         def _manifest_step(i, s, e):
+            # Status stays a processor concern; the manifest's content
+            # (mode + blocked_intervals + partial-file cleanup) is owned by
+            # the ChunkManifest seam (SCR-35).
             self._set_status("Generating manifest...")
-            blocked_intervals = None
-            if self._screen_filter is not None and hasattr(
-                self._screen_filter, "get_blocked_intervals"
-            ):
-                try:
-                    blocked_intervals = (
-                        self._screen_filter.get_blocked_intervals(s, e) or None
-                    )
-                except Exception:
-                    logger.warning(
-                        f"Failed to get blocked_intervals for chunk {i}",
-                        exc_info=True,
-                    )
-            try:
-                return self._generate_manifest(
-                    i, s, e, blocked_intervals=blocked_intervals
-                )
-            except Exception:
-                logger.exception(f"Chunk {i}: manifest generation failed")
-                # Remove any partially-written manifest so a later retry
-                # (or screencap upload) doesn't ship a truncated file.
-                (self._capture_dir / f"chunk_{i:04d}_manifest.json").unlink(
-                    missing_ok=True
-                )
-                raise
+            return self._chunk_manifest.produce(i, s, e)
 
         runner = PipelineStageRunner(
             self._capture_dir,
@@ -1069,20 +1059,6 @@ class ChunkProcessor:
             raise
 
         return jsonl_path
-
-    def _generate_manifest(
-        self, idx: int, start_ts: float, end_ts: float,
-        blocked_intervals: list[dict] | None = None,
-    ) -> Path:
-        """Generate task manifest for this chunk."""
-        from screencap.task_manifest import generate_manifest
-
-        return generate_manifest(
-            self._capture_dir, idx, start_ts, end_ts,
-            rest_threshold=self._rest_threshold,
-            blocked_intervals=blocked_intervals,
-            segmentation_mode=self._segmentation_mode,
-        )
 
     def _scrub_chunk_files(
         self, idx: int, start_ts: float, end_ts: float,

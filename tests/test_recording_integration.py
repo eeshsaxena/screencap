@@ -325,7 +325,7 @@ def test_chunk_processor_single_chunk_export(tmp_path):
     with (
         mock.patch.object(cp, "_wait_for_audio", return_value=True),
         mock.patch.object(cp, "_transcribe", return_value=None),
-        mock.patch.object(cp, "_generate_manifest") as mock_manifest,
+        mock.patch.object(cp._chunk_manifest, "produce") as mock_manifest,
     ):
         cp.start()
 
@@ -542,7 +542,7 @@ def test_multi_chunk_no_event_overlap_or_gaps(tmp_path):
     with (
         mock.patch.object(cp, "_wait_for_audio", return_value=True),
         mock.patch.object(cp, "_transcribe", return_value=None),
-        mock.patch.object(cp, "_generate_manifest"),
+        mock.patch.object(cp._chunk_manifest, "produce"),
     ):
         cp.start()
 
@@ -678,7 +678,7 @@ def test_start_recording_multi_chunk_produces_all_chunk_files(recording_env):
         # Mock transcription/upload inside ChunkProcessor
         mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
         mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
-        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        mock.patch("screencap.chunk_manifest.ChunkManifest.produce"),
         mock.patch("screencap.chunk_processor.ChunkProcessor._upload_chunk"),
     ):
         capture_dir, elapsed, _, _ = start_recording(
@@ -730,7 +730,7 @@ def test_chunk_processor_survives_queue_close_during_processing(tmp_path):
     with (
         mock.patch.object(cp, "_wait_for_audio", return_value=True),
         mock.patch.object(cp, "_transcribe", return_value=None),
-        mock.patch.object(cp, "_generate_manifest"),
+        mock.patch.object(cp._chunk_manifest, "produce"),
     ):
         cp.start()
 
@@ -883,7 +883,7 @@ def test_stub_recording_not_called_when_uploads_disabled(recording_env):
         # Mock side effects inside ChunkProcessor
         mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
         mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
-        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        mock.patch("screencap.chunk_manifest.ChunkManifest.produce"),
         # stub_recording must NOT be called
         mock.patch("screencap.chunk_processor.stub_recording") as mock_stub,
         # upload_sentinel must NOT be called
@@ -974,7 +974,7 @@ def test_upload_warning_surfaced_at_stop(recording_env):
         ),
         mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
         mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
-        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        mock.patch("screencap.chunk_manifest.ChunkManifest.produce"),
     ):
         capture_dir, elapsed, _, _ = start_recording(
             name="test-warning",
@@ -1103,7 +1103,7 @@ def test_sentinel_not_uploaded_without_sentinel_for_cloud(recording_env, monkeyp
         mock.patch("screencap.config.get_privacy_config", return_value=_test_privacy_config),
         mock.patch("screencap.chunk_processor.ChunkProcessor._wait_for_audio", return_value=True),
         mock.patch("screencap.chunk_processor.ChunkProcessor._transcribe", return_value=None),
-        mock.patch("screencap.chunk_processor.ChunkProcessor._generate_manifest"),
+        mock.patch("screencap.chunk_manifest.ChunkManifest.produce"),
         mock.patch("screencap.chunk_processor.time.sleep"),
         # stub_recording is gone in the new model — guard that it is never called.
         mock.patch("screencap.chunk_processor.stub_recording") as mock_stub,

@@ -843,7 +843,9 @@ class TestBlockedIntervalsInManifest:
     """Tests for Phase 6: blocked intervals in chunk manifest."""
 
     def test_generate_manifest_passes_blocked_intervals(self, cloud_capture_dir):
-        """_process_chunk passes screen_filter intervals to _generate_manifest."""
+        """_process_chunk → ChunkManifest gathers screen_filter intervals and
+        forwards them to the task_manifest renderer (SCR-35: the gathering now
+        lives in the ChunkManifest seam, so spy on the renderer it delegates to)."""
         from screencap.chunk_processor import ChunkProcessor
 
         q = multiprocessing.Queue()
@@ -860,15 +862,18 @@ class TestBlockedIntervalsInManifest:
             screen_filter=mock_filter,
         )
 
-        # Patch _generate_manifest to capture what _process_chunk passes
+        # Spy on the renderer ChunkManifest.produce delegates to, capturing the
+        # blocked_intervals it forwards. Write a real file so downstream stages
+        # see a manifest artifact.
         captured_kwargs = {}
-        original_generate = cp._generate_manifest
 
         def spy_generate(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return original_generate(*args, **kwargs)
+            p = cloud_capture_dir / f"chunk_{args[1]:04d}_manifest.json"
+            p.write_text("{}")
+            return p
 
-        with patch.object(cp, "_generate_manifest", side_effect=spy_generate), \
+        with patch("screencap.task_manifest.generate_manifest", side_effect=spy_generate), \
              patch.object(cp, "_wait_for_audio"), \
              patch.object(cp, "_transcribe", return_value=None), \
              patch.object(cp, "_trigger_flush"):
@@ -901,12 +906,12 @@ class TestBlockedIntervalsInManifest:
 
         partial = cloud_capture_dir / "chunk_0000_manifest.json"
 
-        def failing_generate(idx, *args, **kwargs):
+        def failing_generate(*args, **kwargs):
             # Simulate a mid-write failure that leaves a partial file on disk.
             partial.write_text('{"partial":')
             raise RuntimeError("manifest write blew up")
 
-        with patch.object(cp, "_generate_manifest", side_effect=failing_generate), \
+        with patch("screencap.task_manifest.generate_manifest", side_effect=failing_generate), \
              patch.object(cp, "_wait_for_audio"), \
              patch.object(cp, "_transcribe", return_value=None), \
              patch.object(cp, "_trigger_flush"), \
@@ -1296,7 +1301,7 @@ def _build_chunk_processor(
     # Mock side effects that aren't under test
     cp._wait_for_audio = lambda *a, **kw: True
     cp._transcribe = lambda *a, **kw: None
-    cp._generate_manifest = lambda *a, **kw: None
+    cp._chunk_manifest.produce = lambda *a, **kw: None
 
     return cp, chunk_q
 
@@ -1501,7 +1506,7 @@ class TestPrivacyFailureDataLoss:
         # Mock side effects not under test
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 7)
@@ -1545,7 +1550,7 @@ class TestPrivacyFailureDataLoss:
 
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 3)
@@ -1593,7 +1598,7 @@ class TestPrivacyFailureDataLoss:
 
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 7)
@@ -1651,7 +1656,7 @@ class TestPrivacyFailureDataLoss:
 
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 7)
@@ -2281,7 +2286,7 @@ class TestProcessChunkFinalAssignment:
         cp._transcribe = lambda *a, **kw: None
         cp._trigger_flush = lambda *a, **kw: None
         cp._export_events = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
         cp._scrub_chunk_files = lambda *a, **kw: None
         cp._collect_chunk_files = lambda *a, **kw: [
             {"name": "events_0000.jsonl", "path": capture_dir / "events_0000.jsonl"},
@@ -2362,7 +2367,7 @@ class TestProcessChunkFinalAssignment:
         def boom(*a, **kw):
             raise RuntimeError("manifest write blew up")
 
-        cp._generate_manifest = boom
+        cp._chunk_manifest.produce = boom
 
         # _process_chunk re-raises the manifest failure (after the
         # finally block writes the final status).
