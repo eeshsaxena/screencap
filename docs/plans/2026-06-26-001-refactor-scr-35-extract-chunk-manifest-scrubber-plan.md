@@ -1,7 +1,7 @@
 ---
 title: "refactor: SCR-35 — pull ChunkManifest and ChunkScrubber out of ChunkProcessor"
 type: refactor
-status: active
+status: completed
 date: 2026-06-26
 ---
 
