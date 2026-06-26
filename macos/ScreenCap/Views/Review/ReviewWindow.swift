@@ -82,13 +82,8 @@ struct ReviewWindow: View {
                 // seek to the hit moment (consumed one-shot). A null/0 startedAt
                 // falls back to the start; if the recording isn't playable the
                 // window simply opens without seeking (graceful fallback).
-                if let seekMs = ReviewWindowOpener.shared.pendingSeekMs[recordingName] {
-                    ReviewWindowOpener.shared.pendingSeekMs[recordingName] = nil
-                    videoModel?.seek(toSeconds: SearchSeek.relativeSeconds(
-                        anchorMs: seekMs,
-                        startedAt: data.startedAt,
-                        durationSeconds: data.durationSeconds
-                    ))
+                if let seekMs = ReviewWindowOpener.shared.consumePendingSeek(for: recordingName) {
+                    applySeek(absoluteMs: seekMs, data: data)
                 }
                 // The masked screenshots that actually upload — the primary
                 // truth view (U6). Parsed once on first ready.
@@ -121,6 +116,17 @@ struct ReviewWindow: View {
                 }
             }
             syncUploadCount(for: newState)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .reviewWindowSeekRequested)) { note in
+            // A search-result tap on an ALREADY-OPEN window: `openWindow` no-ops
+            // so the `.ready` seek path never re-fires. If we're already ready
+            // with a player, apply the seek now; otherwise leave the pending
+            // entry for the `.ready` path (still racing toward ready).
+            guard (note.userInfo?["recording"] as? String) == recordingName else { return }
+            guard let videoModel, case .ready(let data) = model.state else { return }
+            if let seekMs = ReviewWindowOpener.shared.consumePendingSeek(for: recordingName) {
+                applySeek(absoluteMs: seekMs, data: data, videoModel: videoModel)
+            }
         }
         .sheet(isPresented: $showSignInSheet, onDismiss: {
             // Esc / system / external (menu) dismissal bypasses the Cancel
@@ -184,6 +190,19 @@ struct ReviewWindow: View {
         if isSignInInProgress {
             auth.cancelSignIn()
         }
+    }
+
+    /// Convert a search result's absolute-ms anchor to a recording-relative
+    /// seek and apply it (SCR-174 U6). `videoModel` can be passed explicitly
+    /// (the notification path) or defaults to the state-held one (the `.ready`
+    /// path, where `self.videoModel` is already set).
+    private func applySeek(absoluteMs: Int, data: ReviewData, videoModel: VideoPlayerPaneModel? = nil) {
+        let player = videoModel ?? self.videoModel
+        player?.seek(toSeconds: SearchSeek.relativeSeconds(
+            anchorMs: absoluteMs,
+            startedAt: data.startedAt,
+            durationSeconds: data.durationSeconds
+        ))
     }
 
     /// Upload tapped (the `.ready` and `.failed`-with-retry action). Signed in
@@ -514,4 +533,11 @@ extension Notification.Name {
     /// Subscribed by the index from inside the main scene's body (added
     /// in U9).
     static let reviewWindowUploadSucceeded = Notification.Name("com.screencap.reviewWindow.uploadSucceeded")
+
+    /// SCR-174: posted by a search-result tap to deliver a one-shot seek to an
+    /// ALREADY-OPEN review window. `openWindow(id:value:)` no-ops when a window
+    /// for the recording exists, so a window already past `.ready` would never
+    /// re-read `pendingSeekMs` — this notification lets it apply the seek
+    /// immediately. The recording name travels in `userInfo["recording"]`.
+    static let reviewWindowSeekRequested = Notification.Name("com.screencap.reviewWindow.seekRequested")
 }

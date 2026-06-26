@@ -21,13 +21,28 @@ final class ReviewWindowOpener: ObservableObject {
 
     /// SCR-174: pending one-shot seek targets (absolute unix ms) keyed by
     /// recording name. A search-result tap sets this just before opening the
-    /// window; `ReviewWindow` reads and clears it when it reaches `.ready`.
-    /// Delivering the seek out-of-band (rather than via the scene value) keeps
-    /// the window keyed on the recording name, so opening the same recording at
-    /// two different moments reuses one window instead of spawning duplicates.
-    var pendingSeekMs: [String: Int] = [:]
+    /// window; `ReviewWindow` consumes it (read-and-clear) when it reaches
+    /// `.ready`. Delivering the seek out-of-band (rather than via the scene
+    /// value) keeps the window keyed on the recording name, so opening the same
+    /// recording at two different moments reuses one window instead of spawning
+    /// duplicates. Private storage — go through `setPendingSeek` /
+    /// `consumePendingSeek` so the one-shot contract is enforced in one place.
+    private var pendingSeekMs: [String: Int] = [:]
 
     private init() {}
+
+    /// Record a one-shot seek target for `recording`, to be consumed by the
+    /// Review window when it reaches `.ready`.
+    func setPendingSeek(_ anchorMs: Int, for recording: String) {
+        pendingSeekMs[recording] = anchorMs
+    }
+
+    /// Read-and-clear the pending seek for `recording` (one-shot). Returns nil
+    /// when none is pending.
+    func consumePendingSeek(for recording: String) -> Int? {
+        defer { pendingSeekMs[recording] = nil }
+        return pendingSeekMs[recording]
+    }
 
     /// Convenience entry point. Forwards to `openReview` if registered,
     /// otherwise no-ops. Safe to call before the bridge has registered the

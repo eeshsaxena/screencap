@@ -65,6 +65,42 @@ final class QueryParserTests: XCTestCase {
         XCTAssertEqual(parsed.timeWindow, TimeWindow(startMs: ms(d), endMs: ms(end)))
     }
 
+    func testLastWeekResolvesToFullPriorIsoWeek() {
+        let parsed = parser.parse("errors last week", now: now)
+        XCTAssertEqual(parsed.freeText, "errors")
+        XCTAssertNil(parsed.appFilter)
+
+        // Independent reference: ISO week start (Mon, firstWeekday=1 here is
+        // Sunday-based via yearForWeekOfYear) one week before this week's start.
+        let comps = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: now)
+        let thisWeekStart = cal.date(from: comps)!
+        let start = cal.date(byAdding: .weekOfYear, value: -1, to: thisWeekStart)!
+        let end = cal.date(byAdding: .weekOfYear, value: 1, to: start)!
+        XCTAssertEqual(parsed.timeWindow, TimeWindow(startMs: ms(start), endMs: ms(end)))
+    }
+
+    func testThisWeekResolvesToCurrentIsoWeek() {
+        let parsed = parser.parse("salesforce this week", now: now)
+        XCTAssertEqual(parsed.appFilter, "salesforce")
+
+        let comps = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: now)
+        let start = cal.date(from: comps)!
+        let end = cal.date(byAdding: .weekOfYear, value: 1, to: start)!
+        XCTAssertEqual(parsed.timeWindow, TimeWindow(startMs: ms(start), endMs: ms(end)))
+    }
+
+    func testLastWeekdayWhenTodayIsThatWeekdayResolvesAWeekBack() {
+        // now is a Wednesday; "last wednesday" must mean a week ago, not today
+        // (the diff==0 → 7 rule in mostRecentWeekdayWindow).
+        XCTAssertEqual(cal.component(.weekday, from: now), 4)  // 4 == Wednesday
+        let parsed = parser.parse("notes last wednesday", now: now)
+        XCTAssertEqual(parsed.freeText, "notes")
+
+        let day = cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: now))!
+        let end = cal.date(byAdding: .day, value: 1, to: day)!
+        XCTAssertEqual(parsed.timeWindow, TimeWindow(startMs: ms(day), endMs: ms(end)))
+    }
+
     func testAppWithPartOfDay() {
         let parsed = parser.parse("slack this morning", now: now)
         XCTAssertEqual(parsed.appFilter, "slack")

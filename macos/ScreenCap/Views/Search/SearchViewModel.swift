@@ -19,6 +19,11 @@ final class SearchViewModel: ObservableObject {
         case daemonDown
     }
 
+    /// Per-stream row cap applied to every daemon query. `timeline.query`
+    /// truncates earliest-first, so this also bounds the snap pool the
+    /// transcript correlation draws from.
+    private static let searchResultLimit = 200
+
     private let service: SearchService
     private let parser: QueryParser
     private let now: @Sendable () -> Date
@@ -27,12 +32,17 @@ final class SearchViewModel: ObservableObject {
     /// a transcript chunk's wall-clock position before snapping it to a real
     /// timeline event.
     var chunkDurationSeconds: Double
-    private var inFlight = false
+    /// Monotonic search token for latest-wins publishing (#2). Bumped at each
+    /// `search(_:)` entry; a run only publishes its result if it is still the
+    /// current generation when it finishes.
+    private var generation = 0
 
     init(
         service: SearchService = LiveSearchService(),
         parser: QueryParser = QueryParser(),
-        chunkDurationSeconds: Double = 300,
+        // Matches `config.get_chunk_duration()`'s 900 s (15 min) default; the
+        // live wiring overwrites this from `settings --json` when present.
+        chunkDurationSeconds: Double = 900,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.service = service
@@ -45,16 +55,19 @@ final class SearchViewModel: ObservableObject {
     /// consent trigger keys on the flag, not on `index_state` (which only
     /// signals an absent index file).
     func search(_ query: String, contentIndexEnabled: Bool) async {
-        guard !inFlight else { return }
         let parsed = parser.parse(query, now: now())
         guard !parsed.isEmpty else {
             phase = .idle
             return
         }
 
-        inFlight = true
+        // Latest-wins: capture a monotonic token at entry and only publish if
+        // still current. An overlapping newer search supersedes this one rather
+        // than being dropped (#2) — the SwiftUI callsite also cancels the prior
+        // Task, so `Task.isCancelled` short-circuits a superseded run early.
+        generation &+= 1
+        let token = generation
         phase = .searching
-        defer { inFlight = false }
 
         let hasFreeText = !parsed.freeText.isEmpty
 
@@ -68,6 +81,8 @@ final class SearchViewModel: ObservableObject {
         let content = await contentFetch
         let transcript = await transcriptFetch
 
+        guard !Task.isCancelled, token == generation else { return }
+
         // All three share one socket: a socket-level failure on the
         // always-attempted timeline call means the daemon is unreachable.
         if case .down = timeline {
@@ -77,6 +92,7 @@ final class SearchViewModel: ObservableObject {
 
         var items: [SearchResultItem] = []
         var idx = 0
+        var capReached = false
         func nextID(_ stream: SearchResultItem.Stream, _ recording: String, _ anchor: Int?) -> String {
             defer { idx += 1 }
             return "\(stream.rawValue)-\(recording)-\(anchor.map(String.init) ?? "u")-\(idx)"
@@ -86,6 +102,7 @@ final class SearchViewModel: ObservableObject {
         var timelineState: StreamState = .notRun
         if case .ok(let rows) = timeline {
             timelineState = rows.isEmpty ? .empty : .ok(count: rows.count)
+            if rows.count >= Self.searchResultLimit { capReached = true }
             for row in rows {
                 items.append(SearchResultItem(
                     id: nextID(.activity, row.recording, row.timestampMs),
@@ -97,12 +114,15 @@ final class SearchViewModel: ObservableObject {
         } else if case .errored = timeline {
             timelineState = .unavailable
         }
+        // Note: a `.down` timeline already returned `.daemonDown` above, so it
+        // never reaches here.
 
         // Content / on-screen text (best-effort). Client-side time filter.
         var contentState: StreamState = .notRun
         if case .ok(let payload) = content {
             let filtered = payload.hits.filter { inWindow($0.timestampMs, parsed.timeWindow) }
-            contentState = mapContentState(payload.indexState, matched: !filtered.isEmpty)
+            contentState = mapContentState(payload.indexState, matched: !filtered.isEmpty, count: filtered.count)
+            if payload.hits.count >= Self.searchResultLimit { capReached = true }
             for hit in filtered {
                 items.append(SearchResultItem(
                     id: nextID(.screen, hit.recording, hit.timestampMs),
@@ -113,13 +133,17 @@ final class SearchViewModel: ObservableObject {
             }
         } else if case .errored = content {
             contentState = .unavailable
+        } else if case .down = content {
+            contentState = .unavailable
         }
 
         // Transcript / audio (best-effort). Correlate chunk_index -> a real
         // captured moment via per-recording timeline.query, then time-filter.
         var transcriptState: StreamState = .notRun
         if case .ok(let hits) = transcript {
+            if hits.count >= Self.searchResultLimit { capReached = true }
             let anchored = await correlateTranscript(hits)
+            guard !Task.isCancelled, token == generation else { return }
             let filtered = anchored.filter { inWindow($0.anchorMs, parsed.timeWindow) }
             transcriptState = filtered.isEmpty ? .empty : .ok(count: filtered.count)
             for a in filtered {
@@ -132,6 +156,8 @@ final class SearchViewModel: ObservableObject {
             }
         } else if case .errored = transcript {
             transcriptState = .unavailable
+        } else if case .down = transcript {
+            transcriptState = .unavailable
         }
 
         let results = SearchResults(
@@ -139,7 +165,8 @@ final class SearchViewModel: ObservableObject {
             coverage: CoverageReport(screen: contentState, audio: transcriptState, activity: timelineState),
             consentNeeded: hasFreeText && !contentIndexEnabled,
             timeWindow: parsed.timeWindow,
-            appFilter: parsed.appFilter
+            appFilter: parsed.appFilter,
+            capReached: capReached
         )
         phase = .loaded(results)
     }
@@ -159,7 +186,7 @@ final class SearchViewModel: ObservableObject {
         do {
             let resp = try await service.timelineQuery(TimelineQueryRequest(
                 startMs: p.timeWindow?.startMs, endMs: p.timeWindow?.endMs,
-                app: p.appFilter, limit: 200
+                app: p.appFilter, limit: Self.searchResultLimit
             ))
             return .ok(resp.rows)
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
@@ -171,7 +198,7 @@ final class SearchViewModel: ObservableObject {
 
     private func fetchContent(_ freeText: String) async -> Fetched<ContentPayload> {
         do {
-            let resp = try await service.contentSearch(ContentSearchRequest(query: freeText, limit: 200))
+            let resp = try await service.contentSearch(ContentSearchRequest(query: freeText, limit: Self.searchResultLimit))
             return .ok(ContentPayload(hits: resp.hits, indexState: resp.indexState))
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
@@ -182,7 +209,7 @@ final class SearchViewModel: ObservableObject {
 
     private func fetchTranscript(_ freeText: String) async -> Fetched<[TranscriptHit]> {
         do {
-            let resp = try await service.transcriptSearch(TranscriptSearchRequest(query: freeText, limit: 200))
+            let resp = try await service.transcriptSearch(TranscriptSearchRequest(query: freeText, limit: Self.searchResultLimit))
             return .ok(resp.hits)
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
@@ -195,31 +222,86 @@ final class SearchViewModel: ObservableObject {
 
     private struct AnchoredTranscript { let hit: TranscriptHit; let anchorMs: Int? }
 
-    /// For each recording with transcript hits, query its timeline once, then
-    /// place each chunk at `recordingStart + chunkIndex * chunkDuration` snapped
-    /// to the nearest real timeline event (a captured moment). A recording with
-    /// no timeline rows yields an unanchored hit (surfaced off the timeline).
+    /// For each recording with transcript hits, place each chunk at
+    /// `recordingStart + chunkIndex * chunkDuration` snapped to the nearest real
+    /// timeline event (a captured moment). A recording with no timeline rows
+    /// yields an unanchored hit (surfaced off the timeline).
+    ///
+    /// The per-recording timeline queries run CONCURRENTLY via a task group
+    /// (#3 — was a serial N+1), each bounded to a window that surrounds the
+    /// chunk estimates (#6 — `timeline.query` truncates earliest-first, so an
+    /// unbounded `limit` query would only ever return the OLDEST events and miss
+    /// the snap pool for any late chunk).
     private func correlateTranscript(_ hits: [TranscriptHit]) async -> [AnchoredTranscript] {
+        guard !Task.isCancelled else { return [] }
         let byRecording = Dictionary(grouping: hits, by: { $0.recording })
-        var out: [AnchoredTranscript] = []
-        for (recording, recHits) in byRecording {
-            let timestamps = await recordingTimestamps(recording)
-            guard let start = timestamps.first else {
-                out.append(contentsOf: recHits.map { AnchoredTranscript(hit: $0, anchorMs: nil) })
-                continue
+
+        let anchoredByRecording: [String: [AnchoredTranscript]] = await withTaskGroup(
+            of: (String, [AnchoredTranscript]).self
+        ) { group in
+            for (recording, recHits) in byRecording {
+                group.addTask { [self] in
+                    guard !Task.isCancelled else {
+                        return (recording, recHits.map { AnchoredTranscript(hit: $0, anchorMs: nil) })
+                    }
+                    return (recording, await self.anchorRecording(recording, hits: recHits))
+                }
             }
-            for hit in recHits {
-                let estimate = start + Int((Double(hit.chunkIndex) * chunkDurationSeconds * 1000).rounded())
-                let snapped = nearest(estimate, in: timestamps)
-                out.append(AnchoredTranscript(hit: hit, anchorMs: snapped))
+            var collected: [String: [AnchoredTranscript]] = [:]
+            for await (recording, anchored) in group {
+                collected[recording] = anchored
             }
+            return collected
         }
-        return out
+
+        // Flatten in a stable recording order so output is deterministic.
+        return byRecording.keys.sorted().flatMap { anchoredByRecording[$0] ?? [] }
     }
 
-    private func recordingTimestamps(_ recording: String) async -> [Int] {
+    /// Snap one recording's transcript hits to its real timeline events. First
+    /// resolves the recording start (earliest events — the verb truncates
+    /// earliest-first, so `.first` is reliable), then snaps within a window
+    /// bounded to surround the chunk estimates.
+    private func anchorRecording(_ recording: String, hits: [TranscriptHit]) async -> [AnchoredTranscript] {
+        guard let start = await recordingStartMs(recording) else {
+            return hits.map { AnchoredTranscript(hit: $0, anchorMs: nil) }
+        }
+
+        let chunkMs = Int((chunkDurationSeconds * 1000).rounded())
+        let estimates = hits.map { start + $0.chunkIndex * chunkMs }
+        guard let minEst = estimates.min(), let maxEst = estimates.max() else {
+            return hits.map { AnchoredTranscript(hit: $0, anchorMs: nil) }
+        }
+
+        // Bound the snap pool to ±chunkDuration around the estimate span so the
+        // nearest captured moment surrounds each estimate (#6).
+        let pool = await recordingTimestamps(
+            recording, startMs: minEst - chunkMs, endMs: maxEst + chunkMs
+        )
+        let snapPool = pool.isEmpty ? [start] : pool
+
+        return zip(hits, estimates).map { hit, estimate in
+            AnchoredTranscript(hit: hit, anchorMs: nearest(estimate, in: snapPool))
+        }
+    }
+
+    /// The recording's start time (ms) = its earliest captured event. Uses the
+    /// verb's earliest-first truncation: a small unbounded query reliably yields
+    /// the first event.
+    private func recordingStartMs(_ recording: String) async -> Int? {
         do {
-            let resp = try await service.timelineQuery(TimelineQueryRequest(recording: recording, limit: 200))
+            let resp = try await service.timelineQuery(TimelineQueryRequest(recording: recording, limit: Self.searchResultLimit))
+            return resp.rows.map { $0.timestampMs }.min()
+        } catch {
+            return nil
+        }
+    }
+
+    private func recordingTimestamps(_ recording: String, startMs: Int, endMs: Int) async -> [Int] {
+        do {
+            let resp = try await service.timelineQuery(TimelineQueryRequest(
+                startMs: startMs, endMs: endMs, recording: recording, limit: Self.searchResultLimit
+            ))
             return resp.rows.map { $0.timestampMs }.sorted()
         } catch {
             return []
@@ -254,60 +336,13 @@ final class SearchViewModel: ObservableObject {
         }
     }
 
-    private func mapContentState(_ state: ContentIndexState, matched: Bool) -> StreamState {
+    private func mapContentState(_ state: ContentIndexState, matched: Bool, count: Int) -> StreamState {
         switch state {
-        case .ok: return matched ? .ok(count: 1) : .empty
+        case .ok: return matched ? .ok(count: count) : .empty
         case .noMatch: return .empty
         case .notIndexed: return .notIndexed
-        case .indexDegraded: return matched ? .ok(count: 1) : .degraded
+        case .indexDegraded: return matched ? .ok(count: count) : .degraded
         case .storeUnavailable: return .unavailable
         }
     }
-}
-
-// MARK: - View-facing result types
-
-struct SearchResults: Equatable, Sendable {
-    var items: [SearchResultItem]
-    var coverage: CoverageReport
-    /// Free-text present but on-screen-text indexing is off — drives the U7
-    /// consent CTA (the flag is the trigger, not `index_state`).
-    var consentNeeded: Bool
-    /// The resolved interpretation, surfaced to the user ("searched yesterday
-    /// afternoon").
-    var timeWindow: TimeWindow?
-    var appFilter: String?
-}
-
-struct SearchResultItem: Identifiable, Equatable, Sendable {
-    enum Stream: String, Sendable { case screen, audio, activity }
-
-    let id: String
-    let stream: Stream
-    let recording: String
-    /// Placement on the per-day timeline; `nil` = unanchored (surfaced off the
-    /// timeline — currently only transcript hits whose chunk can't be resolved).
-    let anchorMs: Int?
-    let approximate: Bool
-    let score: Double
-    let snippet: String?
-    let app: String?
-    let title: String?
-}
-
-/// Honest per-stream coverage. `screen` (content) carries the index-state
-/// distinctions; `audio`/`activity` only distinguish ran/empty/unavailable.
-struct CoverageReport: Equatable, Sendable {
-    var screen: StreamState
-    var audio: StreamState
-    var activity: StreamState
-}
-
-enum StreamState: Equatable, Sendable {
-    case notRun        // free-text empty → stream not queried
-    case ok(count: Int)
-    case empty         // searched, no matches
-    case notIndexed    // on-screen text indexing off / no index file (content only)
-    case degraded      // FTS5 absent → LIKE fallback (content only)
-    case unavailable   // store corrupt or the call errored
 }

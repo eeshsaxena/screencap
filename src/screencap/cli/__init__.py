@@ -2659,6 +2659,7 @@ def settings(ctx, set_pair, as_json):
       auto_name          LLM auto-naming after recording (true/false)
       upload_default     Default destination (local/cloud/both/ask)
       content_index_enabled  Index on-screen text for local search (true/false)
+      content_index_consent_declined  Suppress the in-app indexing consent prompt (true/false)
     """
     if ctx.invoked_subcommand is not None:
         # privacy subcommand path — defer to the subcommand handler.

@@ -199,4 +199,86 @@ final class SearchViewModelTests: XCTestCase {
         await vm.search("   ", contentIndexEnabled: true)
         XCTAssertEqual(vm.phase, .idle)
     }
+
+    // MARK: - Coverage matrix (#15)
+
+    func testIndexDegradedWithMatchReportsOk() async {
+        let fake = FakeSearchService()
+        fake.contentResponse = ContentSearchResponse(
+            hits: [ContentHit(recording: "rec", timestampMs: 9000, snippet: "hit", score: -1)],
+            indexState: .indexDegraded
+        )
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+
+        if case .ok(let count) = loaded(vm)?.coverage.screen {
+            XCTAssertEqual(count, 1)
+        } else {
+            XCTFail("degraded index with a match should report .ok")
+        }
+    }
+
+    func testIndexDegradedWithNoMatchReportsDegraded() async {
+        let fake = FakeSearchService()
+        fake.contentResponse = ContentSearchResponse(hits: [], indexState: .indexDegraded)
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+
+        XCTAssertEqual(loaded(vm)?.coverage.screen, .degraded)
+    }
+
+    func testNoMatchWithFlagOffStillSurfacesConsent() async {
+        // notIndexed + free-text + flag off → the consent CTA must fire even
+        // though the content stream returned nothing.
+        let fake = FakeSearchService()
+        fake.contentResponse = ContentSearchResponse(hits: [], indexState: .notIndexed)
+        let vm = makeVM(fake)
+        await vm.search("refund macro", contentIndexEnabled: false)
+
+        let results = loaded(vm)
+        XCTAssertEqual(results?.consentNeeded, true)
+        XCTAssertEqual(results?.coverage.screen, .notIndexed)
+    }
+
+    func testAuthoritativeEmptyWithTimeWindowIsNothingRecordedThen() async {
+        // R9: a time-scoped query whose authoritative timeline is empty is
+        // "nothing recorded then" — encoded as activity == .empty with a window.
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(rows: [], coverage: .authoritative)
+        let vm = makeVM(fake)
+        await vm.search("yesterday", contentIndexEnabled: true)
+
+        let results = loaded(vm)
+        XCTAssertNotNil(results?.timeWindow)
+        XCTAssertEqual(results?.coverage.activity, .empty)
+        XCTAssertTrue(results?.items.isEmpty ?? false)
+    }
+
+    func testPartialStreamFailureOneSocketUnavailableOthersSucceed() async {
+        // Transcript fails at the socket level while content + timeline succeed.
+        // A single non-timeline stream being down must NOT flip the whole search
+        // to daemonDown (only the always-attempted timeline call does that) —
+        // the others still publish, and the failed stream reports unavailable.
+        let startOfDay = cal.startOfDay(for: fixedNow)
+        let inWindowMs = Int(cal.date(byAdding: .hour, value: 2, to: startOfDay)!.timeIntervalSince1970 * 1000)
+
+        let fake = FakeSearchService()
+        fake.transcriptError = DaemonClientError.socketUnavailable(path: "/tmp/x.sock")
+        fake.contentResponse = ContentSearchResponse(
+            hits: [ContentHit(recording: "rec", timestampMs: inWindowMs, snippet: "ok", score: -1)],
+            indexState: .ok
+        )
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: inWindowMs, app: "Slack", title: nil)],
+            coverage: .authoritative
+        )
+        let vm = makeVM(fake)
+        await vm.search("today refund", contentIndexEnabled: true)
+
+        let results = loaded(vm)
+        XCTAssertNotNil(results, "one non-timeline stream down must not collapse to daemonDown")
+        XCTAssertEqual(results?.coverage.audio, .unavailable)
+        if case .ok = results?.coverage.screen {} else { XCTFail("content should be ok") }
+        if case .ok = results?.coverage.activity {} else { XCTFail("activity should be ok") }
+    }
 }

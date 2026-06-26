@@ -32,7 +32,9 @@ struct SearchView: View {
     private var searchField: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 TextField("Search your history — e.g. \u{201C}salesforce yesterday afternoon\u{201D}", text: $query)
                     .textFieldStyle(.plain)
                     .onSubmit { runSearch() }
@@ -87,6 +89,13 @@ struct SearchView: View {
                 }
                 coverageRow(results.coverage)
                     .listRowSeparator(.hidden)
+                if results.capReached {
+                    Label("Showing the most relevant matches — refine with an app or time to narrow further.",
+                          systemImage: "line.3.horizontal.decrease.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .listRowSeparator(.hidden)
+                }
                 if results.consentNeeded && !consentDeclined {
                     consentBanner
                         .listRowSeparator(.hidden)
@@ -117,12 +126,44 @@ struct SearchView: View {
         .listStyle(.inset)
     }
 
+    /// Groups anchored results into day buckets, most-recent day first, newest
+    /// within each day. Private to the only consumer (this view).
+    private func searchResultsGroupedByDay(_ items: [SearchResultItem]) -> [(day: Date, items: [SearchResultItem])] {
+        let groups = Dictionary(grouping: items) { item -> Date in
+            let secs = Double(item.anchorMs ?? 0) / 1000
+            return Calendar.current.startOfDay(for: Date(timeIntervalSince1970: secs))
+        }
+        return groups
+            .map { (day: $0.key, items: $0.value.sorted { ($0.anchorMs ?? 0) > ($1.anchorMs ?? 0) }) }
+            .sorted { $0.day > $1.day }
+    }
+
+    /// Hoisted so a per-day section header doesn't allocate a DateFormatter.
+    private static let dayLabelFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "EEE MMM d"
+        return f
+    }()
+
+    private func searchDayLabel(_ day: Date) -> String {
+        if Calendar.current.isDateInToday(day) { return "Today" }
+        if Calendar.current.isDateInYesterday(day) { return "Yesterday" }
+        return Self.dayLabelFormatter.string(from: day)
+    }
+
+    /// Hoisted so it isn't re-allocated on every render of the interpretation
+    /// row (DateFormatter init is expensive — mirrors RecordingsListView).
+    private static let interpretationFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, HH:mm"
+        return f
+    }()
+
     private func interpretationText(_ results: SearchResults) -> String {
         var parts: [String] = []
         if let app = results.appFilter { parts.append("in \(app)") }
         if let w = results.timeWindow {
-            let f = DateFormatter()
-            f.dateFormat = "MMM d, HH:mm"
+            let f = Self.interpretationFormatter
             let start = Date(timeIntervalSince1970: Double(w.startMs) / 1000)
             let end = Date(timeIntervalSince1970: Double(w.endMs) / 1000)
             parts.append("\(f.string(from: start)) \u{2013} \(f.string(from: end))")
@@ -245,34 +286,63 @@ struct SearchView: View {
     /// stays keyed on the recording name.
     private func openReview(_ item: SearchResultItem) {
         if let anchorMs = item.anchorMs {
-            ReviewWindowOpener.shared.pendingSeekMs[item.recording] = anchorMs
+            ReviewWindowOpener.shared.setPendingSeek(anchorMs, for: item.recording)
         }
+        // Opens a new window, or surfaces an already-open one for this recording
+        // (the WindowGroup is keyed on the name). The notification covers the
+        // already-open case: that window won't re-run its `.ready` seek path, so
+        // it applies the pending seek on receipt instead (#1).
         openWindow(id: ReviewWindowID, value: item.recording)
+        if item.anchorMs != nil {
+            NotificationCenter.default.post(
+                name: .reviewWindowSeekRequested,
+                object: nil,
+                userInfo: ["recording": item.recording]
+            )
+        }
+    }
+
+    /// The two-bool consent state, kept in sync with the `@State` flags that
+    /// drive the view. Mutations go through `ContentIndexConsent` so the
+    /// optimistic/revert/preserve invariants are the unit-tested ones (#10).
+    private var consentState: ContentIndexConsentState {
+        ContentIndexConsentState(indexEnabled: contentIndexEnabled, declined: consentDeclined)
+    }
+
+    private func setConsent(_ s: ContentIndexConsentState) {
+        contentIndexEnabled = s.indexEnabled
+        consentDeclined = s.declined
     }
 
     private func loadSettings() async {
         do {
             let data = try await CLIClient.runJSONRaw(["settings", "--json"])
             let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
-            contentIndexEnabled = env.settings.contentIndexEnabled ?? false
-            consentDeclined = env.settings.contentIndexConsentDeclined ?? false
+            setConsent(ContentIndexConsent.applyLoaded(
+                indexEnabled: env.settings.contentIndexEnabled,
+                declined: env.settings.contentIndexConsentDeclined,
+                into: consentState
+            ))
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
         } catch {
-            contentIndexEnabled = false
+            // Decode/read failure: assume indexing off (conservative CTA) but
+            // PRESERVE a prior decline — a transient read failure must not
+            // resurface a dismissed banner (#10).
+            setConsent(ContentIndexConsent.loadDidFail(consentState))
         }
     }
 
     /// Enable on-screen-text indexing going forward, then re-run the query.
     /// Optimistic with success-latch (revert on write failure).
     private func enableConsent() {
-        contentIndexEnabled = true
+        setConsent(ContentIndexConsent.optimisticEnable(consentState))
         Task {
             do {
                 _ = try await CLIClient.runJSONRaw(
                     ["settings", "--set", "content_index_enabled=true", "--json"]
                 )
             } catch {
-                contentIndexEnabled = false
+                setConsent(ContentIndexConsent.enableDidFail(consentState))
                 return
             }
             runSearch()
@@ -281,14 +351,14 @@ struct SearchView: View {
 
     /// Persist the decline so the prompt never re-fires (revert on failure).
     private func declineConsent() {
-        consentDeclined = true
+        setConsent(ContentIndexConsent.optimisticDecline(consentState))
         Task {
             do {
                 _ = try await CLIClient.runJSONRaw(
                     ["settings", "--set", "content_index_consent_declined=true", "--json"]
                 )
             } catch {
-                consentDeclined = false
+                setConsent(ContentIndexConsent.declineDidFail(consentState))
             }
         }
     }

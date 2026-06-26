@@ -6,26 +6,6 @@ import SwiftUI
 // nesting a List/ScrollView below siblings in a VStack inside the
 // NavigationSplitView detail does not — it starves every sibling of height).
 
-/// Groups anchored results into day buckets, most-recent day first, newest
-/// within each day.
-func searchResultsGroupedByDay(_ items: [SearchResultItem]) -> [(day: Date, items: [SearchResultItem])] {
-    let groups = Dictionary(grouping: items) { item -> Date in
-        let secs = Double(item.anchorMs ?? 0) / 1000
-        return Calendar.current.startOfDay(for: Date(timeIntervalSince1970: secs))
-    }
-    return groups
-        .map { (day: $0.key, items: $0.value.sorted { ($0.anchorMs ?? 0) > ($1.anchorMs ?? 0) }) }
-        .sorted { $0.day > $1.day }
-}
-
-func searchDayLabel(_ day: Date) -> String {
-    if Calendar.current.isDateInToday(day) { return "Today" }
-    if Calendar.current.isDateInYesterday(day) { return "Yesterday" }
-    let f = DateFormatter()
-    f.dateFormat = "EEE MMM d"
-    return f.string(from: day)
-}
-
 struct ResultRow: View {
     let item: SearchResultItem
 
@@ -62,6 +42,13 @@ struct ResultRow: View {
 }
 
 extension SearchResultItem {
+    /// Hoisted so a row render doesn't allocate a DateFormatter per cell.
+    private static let timeLabelFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
     var streamIcon: String {
         switch stream {
         case .screen: return "text.viewfinder"
@@ -96,8 +83,6 @@ extension SearchResultItem {
 
     var timeLabel: String {
         guard let anchorMs else { return "—" }
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm"
-        return f.string(from: Date(timeIntervalSince1970: Double(anchorMs) / 1000))
+        return Self.timeLabelFormatter.string(from: Date(timeIntervalSince1970: Double(anchorMs) / 1000))
     }
 }

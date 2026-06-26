@@ -1,4 +1,10 @@
 import Foundation
+import os
+
+/// Diagnostics for tolerant wire→enum decoding. A `nil` raw field means a
+/// stripped or missing coverage/index-state field — the pessimistic default
+/// hides it, so log at debug level to keep version-skew observable.
+private let searchDecodeLogger = Logger(subsystem: "com.screencap.macos", category: "search-decode")
 
 // SCR-174 — pointer-only result models for in-app "ask your history" search.
 // These mirror the daemon's SCR-118 query verbs (`/v0/content.search`,
@@ -20,6 +26,9 @@ enum ContentIndexState: String, Sendable, Equatable {
     case storeUnavailable = "store_unavailable"
 
     init(wire: String?) {
+        if wire == nil {
+            searchDecodeLogger.debug("content.search omitted index_state; defaulting to storeUnavailable")
+        }
         self = ContentIndexState(rawValue: wire ?? "") ?? .storeUnavailable
     }
 }
@@ -33,6 +42,9 @@ enum SearchCoverage: String, Sendable, Equatable {
     case bestEffort = "best_effort"
 
     init(wire: String?) {
+        if wire == nil {
+            searchDecodeLogger.debug("response omitted coverage; defaulting to bestEffort")
+        }
         self = SearchCoverage(rawValue: wire ?? "") ?? .bestEffort
     }
 }
@@ -185,4 +197,59 @@ struct TimelineQueryResponse: Decodable, Sendable {
         case rows
         case coverageRaw = "coverage"
     }
+}
+
+// MARK: - View-facing result types
+
+// Merged + ranked search output consumed by SearchView / SearchTimelineView.
+// Kept here next to the wire models (rather than inside SearchViewModel) so the
+// view layer depends on data types, not the orchestrator (#14).
+
+struct SearchResults: Equatable, Sendable {
+    var items: [SearchResultItem]
+    var coverage: CoverageReport
+    /// Free-text present but on-screen-text indexing is off — drives the U7
+    /// consent CTA (the flag is the trigger, not `index_state`).
+    var consentNeeded: Bool
+    /// The resolved interpretation, surfaced to the user ("searched yesterday
+    /// afternoon").
+    var timeWindow: TimeWindow?
+    var appFilter: String?
+    /// At least one stream returned the full `searchResultLimit` rows, so the
+    /// daemon truncated the result set — surfaced as a "showing first N" hint so
+    /// the user knows the list is capped (#13, plan R9). Defaults false.
+    var capReached: Bool = false
+}
+
+struct SearchResultItem: Identifiable, Equatable, Sendable {
+    enum Stream: String, Sendable { case screen, audio, activity }
+
+    let id: String
+    let stream: Stream
+    let recording: String
+    /// Placement on the per-day timeline; `nil` = unanchored (surfaced off the
+    /// timeline — currently only transcript hits whose chunk can't be resolved).
+    let anchorMs: Int?
+    let approximate: Bool
+    let score: Double
+    let snippet: String?
+    let app: String?
+    let title: String?
+}
+
+/// Honest per-stream coverage. `screen` (content) carries the index-state
+/// distinctions; `audio`/`activity` only distinguish ran/empty/unavailable.
+struct CoverageReport: Equatable, Sendable {
+    var screen: StreamState
+    var audio: StreamState
+    var activity: StreamState
+}
+
+enum StreamState: Equatable, Sendable {
+    case notRun        // free-text empty → stream not queried
+    case ok(count: Int)
+    case empty         // searched, no matches
+    case notIndexed    // on-screen text indexing off / no index file (content only)
+    case degraded      // FTS5 absent → LIKE fallback (content only)
+    case unavailable   // store corrupt or the call errored
 }

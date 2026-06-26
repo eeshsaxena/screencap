@@ -181,6 +181,22 @@ def test_content_index_consent_declined_defaults_false_in_json():
 
 
 def test_content_index_consent_declined_set_roundtrips():
-    """The Search consent flow persists a decline via this writable bool."""
+    """The Search consent flow persists a decline via this writable bool, in
+    both directions (so a re-consent that clears the decline also sticks)."""
     _invoke_set("content_index_consent_declined=true")
     assert _invoke_settings_json()["settings"]["content_index_consent_declined"] is True
+
+    _invoke_set("content_index_consent_declined=false")
+    assert _invoke_settings_json()["settings"]["content_index_consent_declined"] is False
+
+
+def test_content_index_consent_declined_rejects_non_bool():
+    """A non-boolean value is rejected, matching the other _BOOL_KEYS."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["settings", "--set", "content_index_consent_declined=maybe"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 1
+    assert "true or false" in result.output
