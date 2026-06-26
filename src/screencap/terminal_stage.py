@@ -84,6 +84,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "TerminalStageBusy",
     "TerminalResult",
+    "AccountMismatch",
     "CloudCopyProducer",
     "PromotionRefused",
     "terminal_lock",
@@ -130,6 +131,24 @@ class PromotionRefused(RuntimeError):
     """
 
 
+@dataclass(frozen=True)
+class AccountMismatch:
+    """Structured account-ownership-mismatch signal (SCR-171).
+
+    Set on :class:`TerminalResult` by the cloud-routing account gate when a
+    recording's pinned ``owner_uid`` differs from the currently signed-in uid.
+    This is the *typed discriminator* the daemon lifts onto the ``/v0/events``
+    bus as an ``account_mismatch`` event — distinct from the free-text
+    ``upload_warning`` (which is also set by scrub/upload failures, so it can
+    NOT drive a specific event). Both uids are gate-authoritative for the
+    comparison that fired; the daemon enriches with ``whoami`` email/stale at
+    emit time.
+    """
+
+    owner_uid: str
+    signed_in_uid: str
+
+
 @dataclass
 class TerminalResult:
     """Outcome of one ``run_terminal_stage`` invocation.
@@ -154,6 +173,11 @@ class TerminalResult:
     downgraded: int = 0
     stubbed: bool = False
     upload_warning: str | None = None
+    # SCR-171 — typed account-ownership-mismatch signal, set ONLY by the cloud
+    # account gate (never by other upload_warning setters). The daemon publishes
+    # an ``account_mismatch`` /v0/events event off this field; ``upload_warning``
+    # stays set in parallel for back-compat (CLI / shutdown messaging).
+    account_mismatch: AccountMismatch | None = None
     failed_indices: list[int] = field(default_factory=list)
     # U8 retention/eviction outcome for this run (informational; the ledger is
     # the source of truth). ``evicted`` = chunk indices whose local rich copy
@@ -909,6 +933,11 @@ def _route_cloud(
             result.upload_warning = (
                 "account mismatch — this recording belongs to a different account "
                 "than the one now signed in; cloud convergence refused (kept local)"
+            )
+            # SCR-171: typed signal the daemon lifts onto /v0/events. Both uids
+            # are authoritative for the comparison that fired this refusal.
+            result.account_mismatch = AccountMismatch(
+                owner_uid=owner_uid, signed_in_uid=current_uid
             )
             return result
 
