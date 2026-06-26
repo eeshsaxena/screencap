@@ -35,12 +35,16 @@ struct ResultRow: View {
     var frameIndex: RecordingFrameIndex?
     var thumbnailLoader: ThumbnailLoader?
 
-    @State private var thumbState: ThumbState = .loading
+    /// The decoded thumbnail tagged with the pointer key it was loaded for. The
+    /// cell only trusts it when its key matches the current row (mirrors
+    /// `ScreenshotTruthPane`'s `loaded?.url == url` gate) so a reused row never
+    /// paints the previous recording's frame. `image == nil` = resolved but no
+    /// frame (the miss placeholder).
+    @State private var loaded: LoadedThumb?
 
-    private enum ThumbState {
-        case loading
-        case loaded(ThumbnailImage)
-        case miss
+    private struct LoadedThumb {
+        let key: String
+        let image: ThumbnailImage?
     }
 
     var body: some View {
@@ -90,19 +94,22 @@ struct ResultRow: View {
     @ViewBuilder
     private var thumbnailCell: some View {
         Group {
-            switch thumbState {
-            case .loaded(let image):
-                Image(decorative: image.cgImage, scale: 1)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            case .loading:
+            // Only trust `loaded` when it matches this row's current pointer; a
+            // stale (reused-row) or not-yet-loaded state shows the placeholder.
+            if loaded?.key == thumbnailLoadKey, let resolved = loaded {
+                if let image = resolved.image {
+                    Image(decorative: image.cgImage, scale: 1)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Rectangle()
+                        .fill(Color(nsColor: .separatorColor).opacity(0.4))
+                        .overlay {
+                            Image(systemName: item.streamIcon).foregroundStyle(item.streamTint)
+                        }
+                }
+            } else {
                 Rectangle().fill(Color(nsColor: .separatorColor))
-            case .miss:
-                Rectangle()
-                    .fill(Color(nsColor: .separatorColor).opacity(0.4))
-                    .overlay {
-                        Image(systemName: item.streamIcon).foregroundStyle(item.streamTint)
-                    }
             }
         }
         .frame(width: 56, height: 32)
@@ -114,23 +121,27 @@ struct ResultRow: View {
         "\(item.recording)|\(item.anchorMs.map(String.init) ?? "nil")"
     }
 
-    /// Resolve the pointer to a frame and decode its thumbnail. A `nil` anchor or
-    /// an over-stale snap resolves to `nil` in U1 → the miss placeholder (never an
-    /// arbitrary frame-0); an unreadable frame → miss too (R5).
+    /// Resolve the pointer to a frame and decode its thumbnail, tagging the result
+    /// with the key it was loaded for. A `nil` anchor or an over-stale snap
+    /// resolves to `nil` in U1 → the miss placeholder (never an arbitrary
+    /// frame-0); an unreadable frame → miss too (R5). Every write after an
+    /// `await` is cancellation-guarded so a reused row's cancelled load cannot
+    /// clobber the new item's state.
     private func loadThumbnail() async {
-        thumbState = .loading
-        guard let frameIndex, let thumbnailLoader,
-              let url = await frameIndex.resolve(recording: item.recording, anchorMs: item.anchorMs)
-        else {
-            thumbState = .miss
+        let key = thumbnailLoadKey
+        guard let frameIndex, let thumbnailLoader else {
+            loaded = LoadedThumb(key: key, image: nil)
             return
         }
+        let url = await frameIndex.resolve(recording: item.recording, anchorMs: item.anchorMs)
         if Task.isCancelled { return }
-        if let image = await thumbnailLoader.thumbnail(for: url) {
-            if !Task.isCancelled { thumbState = .loaded(image) }
-        } else {
-            thumbState = .miss
+        guard let url else {
+            loaded = LoadedThumb(key: key, image: nil)
+            return
         }
+        let image = await thumbnailLoader.thumbnail(for: url)
+        if Task.isCancelled { return }
+        loaded = LoadedThumb(key: key, image: image)
     }
 }
 

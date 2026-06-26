@@ -83,6 +83,25 @@ final class ThumbnailLoaderTests: XCTestCase {
         XCTAssertNil(image)
     }
 
+    func testNilResultIsNotCachedSoLaterCallRetries() async {
+        // A frame absent at first resolve may appear later (still-processing
+        // recording); a nil must not be cached or the row sticks on the placeholder.
+        let counter = Counter()
+        let image = Self.dummyThumbnail()
+        let loader = ThumbnailLoader(decode: { _, _ in
+            defer { counter.increment() }
+            return counter.count == 0 ? nil : image
+        })
+        let url = URL(fileURLWithPath: "/tmp/scr177-retry.jpg")
+
+        let first = await loader.thumbnail(for: url)
+        let second = await loader.thumbnail(for: url)
+
+        XCTAssertNil(first)
+        XCTAssertNotNil(second)
+        XCTAssertEqual(counter.count, 2, "nil result must not be cached; the second call re-decodes")
+    }
+
     func testDecodeDownsamplesToMaxPixelSize() throws {
         let url = try Self.writeJPEG(width: 400, height: 300)
         defer { try? FileManager.default.removeItem(at: url) }
