@@ -16,6 +16,7 @@ init-failure → upload-disable side effect with an explicit result.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,7 +25,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ChunkScrubber"]
+__all__ = ["ChunkScrubber", "ScrubInit"]
+
+
+@dataclass(frozen=True)
+class ScrubInit:
+    """The upload-policy fact scrub/masking init reports back to the sequencer.
+
+    ``disable_uploads_reason`` is non-None only when scrub/masking init failed
+    for a *cloud-intent* recording — the sequencer must then disable uploads
+    (and record the reason) so the failure is fail-closed: a cloud recording
+    never ships unscrubbed. ``None`` means no upload-policy change is required
+    (init succeeded, or this is a local recording whose best-effort scrubbing
+    silently downgraded). This replaces the old side effect where scrub init
+    reached up and mutated ``ChunkProcessor._upload_enabled`` directly.
+    """
+
+    disable_uploads_reason: str | None = None
 
 
 class ChunkScrubber:
@@ -49,6 +66,96 @@ class ChunkScrubber:
         self._classifier = classifier
         self._pixel_ratio = pixel_ratio
 
+    @classmethod
+    def create(
+        cls,
+        capture_dir: Path | str,
+        *,
+        cloud_intent: bool,
+        upload_enabled: bool,
+        scrub_enabled: bool,
+    ) -> tuple["ChunkScrubber", ScrubInit]:
+        """Build the scrub seam and report the upload-policy fact (SCR-35, U3).
+
+        Owns the "is scrubbing on?" decision and all scrub/masking-config
+        construction that used to live inline in ``ChunkProcessor.__init__``:
+        the redaction pipeline + anonymizer, and the screenshot-masking
+        classifier/evaluator (with the cloud-intent ``PrivacyMode.PUBLIC``
+        override). The decision matrix is preserved verbatim:
+
+          * cloud-intent + uploads on  → init; a deps/masking failure returns a
+            non-None ``disable_uploads_reason`` (fail-closed).
+          * local opt-in               → init; a deps failure silently disables
+            scrubbing (``enabled=False``), uploads unaffected.
+          * neither                    → inert seam, no heavy imports.
+
+        The init-failure → upload-disable coupling is now an explicit
+        ``ScrubInit`` the sequencer consumes, not a mutation reaching back into
+        ``ChunkProcessor`` state.
+        """
+        pipeline = None
+        anonymizer = None
+        evaluator = None
+        classifier = None
+        pixel_ratio = 2.0  # safe Retina default
+        enabled = scrub_enabled
+        disable_uploads_reason: str | None = None
+
+        should_init = (cloud_intent and upload_enabled) or scrub_enabled
+        if should_init:
+            try:
+                from screencap.redaction import Anonymizer, create_default_pipeline
+
+                pipeline = create_default_pipeline(require_pii=True)
+                anonymizer = Anonymizer()
+                logger.info("Scrubbing pipeline initialized")
+            except Exception as e:
+                if cloud_intent and upload_enabled:
+                    logger.error(
+                        f"Privacy deps not available — disabling uploads for safety: {e}"
+                    )
+                    disable_uploads_reason = f"Privacy deps not available: {e}"
+                    logger.warning(
+                        "Privacy dependencies are missing. "
+                        "Reinstall or update screencap."
+                    )
+                else:
+                    # Local recording: scrubbing is best-effort, don't block recording
+                    logger.warning(f"Scrubbing pipeline unavailable (non-fatal): {e}")
+                    enabled = False
+
+            # Initialize classifier/evaluator for screenshot masking
+            try:
+                from screencap.config import get_privacy_config
+                from screencap.privacy.classify import DefaultContextClassifier
+                from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
+
+                _pc = get_privacy_config()
+                # Cloud uploads must use public mode so that CHAT/EMAIL/etc.
+                # apps get MASK_WINDOW (blurred in screenshots) instead of
+                # TEXT_REDACT (which only scrubs text, not visuals).
+                if cloud_intent:
+                    from dataclasses import replace as _dc_replace
+
+                    _pc = _dc_replace(_pc, mode=PrivacyMode.PUBLIC)
+                evaluator = DefaultPolicyEvaluator(_pc)
+                classifier = DefaultContextClassifier(app_classes=_pc.app_classes)
+            except Exception as e:
+                logger.warning(f"Could not init masking classifier: {e}")
+                if cloud_intent and upload_enabled and disable_uploads_reason is None:
+                    disable_uploads_reason = f"Masking classifier init failed: {e}"
+
+        scrubber = cls(
+            capture_dir,
+            enabled=enabled,
+            pipeline=pipeline,
+            anonymizer=anonymizer,
+            evaluator=evaluator,
+            classifier=classifier,
+            pixel_ratio=pixel_ratio,
+        )
+        return scrubber, ScrubInit(disable_uploads_reason=disable_uploads_reason)
+
     @property
     def is_enabled(self) -> bool:
         """True when scrubbing should run for this recording.
@@ -58,6 +165,19 @@ class ChunkScrubber:
         to construct is not enabled.
         """
         return self._enabled and self._pipeline is not None
+
+    @property
+    def has_masking_context(self) -> bool:
+        """True iff both the masking classifier and evaluator were built.
+
+        The SCR-118 content-index fail-closed guard reads this (R7): without
+        masking context, ``blocked_intervals`` cannot represent masked-app
+        skips, so the index pass must refuse to run (otherwise masked-app
+        on-screen text — banking / email / chat — could enter the local
+        index). Exposing the predicate here keeps that guard sourced from a
+        live seam after the masking fields leave ``ChunkProcessor``.
+        """
+        return self._classifier is not None and self._evaluator is not None
 
     def scrub(
         self,

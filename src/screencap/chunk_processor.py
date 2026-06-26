@@ -186,78 +186,45 @@ class ChunkProcessor:
 
         self._content_index_enabled = get_content_index_enabled()
 
-        # Initialize scrubbing pipeline when scrubbing is enabled
-        # (cloud-intent always scrubs; local recordings scrub when user opts in)
-        _should_init_scrub = (cloud_intent and upload_enabled) or scrub_enabled
-        self._pipeline = None
-        self._anonymizer = None
-        self._masking_classifier = None
-        self._masking_evaluator = None
-        self._masking_pixel_ratio = 2.0  # safe Retina default
+        # SCR-35 (U3): the ChunkScrubber seam owns the "is scrubbing on?"
+        # decision AND all scrub/masking-config construction (redaction pipeline
+        # + anonymizer + screenshot-masking classifier/evaluator, incl. the
+        # cloud-intent PUBLIC override). The factory reports an explicit
+        # ScrubInit upload-policy fact instead of reaching back and mutating
+        # processor state. The outer guard is fail-closed: an unexpected
+        # construction failure for a cloud-intent recording disables uploads
+        # rather than letting it ship unscrubbed.
+        from screencap.chunk_scrubber import ChunkScrubber, ScrubInit
+
         self._upload_disabled_reason: str | None = None
-        if _should_init_scrub:
-            try:
-                from screencap.redaction import Anonymizer, create_default_pipeline
-                self._pipeline = create_default_pipeline(require_pii=True)
-                self._anonymizer = Anonymizer()
-                logger.info("Scrubbing pipeline initialized")
-            except Exception as e:
-                if cloud_intent and upload_enabled:
-                    logger.error(
-                        f"Privacy deps not available — disabling uploads for safety: {e}"
-                    )
-                    self._upload_enabled = False
-                    self._upload_disabled_reason = f"Privacy deps not available: {e}"
-                    logger.warning(
-                        "Privacy dependencies are missing. "
-                        "Reinstall or update screencap."
-                    )
-                else:
-                    # Local recording: scrubbing is best-effort, don't block recording
-                    logger.warning(f"Scrubbing pipeline unavailable (non-fatal): {e}")
-                    self._scrub_enabled = False
-
-            # Initialize classifier/evaluator for screenshot masking
-            try:
-                from screencap.config import get_privacy_config
-                from screencap.privacy.classify import DefaultContextClassifier
-                from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
-
-                _pc = get_privacy_config()
-                # Cloud uploads must use public mode so that CHAT/EMAIL/etc.
-                # apps get MASK_WINDOW (blurred in screenshots) instead of
-                # TEXT_REDACT (which only scrubs text, not visuals).
-                if self._cloud_intent:
-                    from dataclasses import replace as _dc_replace
-                    _pc = _dc_replace(_pc, mode=PrivacyMode.PUBLIC)
-                self._masking_evaluator = DefaultPolicyEvaluator(_pc)
-                self._masking_classifier = DefaultContextClassifier(
-                    app_classes=_pc.app_classes,
+        try:
+            self._chunk_scrubber, _scrub_init = ChunkScrubber.create(
+                self._capture_dir,
+                cloud_intent=cloud_intent,
+                upload_enabled=upload_enabled,
+                scrub_enabled=scrub_enabled,
+            )
+        except Exception as e:
+            logger.error(f"Scrub seam construction failed: {e}", exc_info=True)
+            self._chunk_scrubber = ChunkScrubber(
+                self._capture_dir, enabled=False, pipeline=None, anonymizer=None,
+                evaluator=None, classifier=None, pixel_ratio=2.0,
+            )
+            _scrub_init = ScrubInit(
+                disable_uploads_reason=(
+                    f"Scrub init failed: {e}"
+                    if (cloud_intent and upload_enabled) else None
                 )
-            except Exception as e:
-                logger.warning(f"Could not init masking classifier: {e}")
-                if cloud_intent and upload_enabled:
-                    self._upload_enabled = False
-                    if self._upload_disabled_reason is None:
-                        self._upload_disabled_reason = f"Masking classifier init failed: {e}"
+            )
 
-        # SCR-35: per-chunk scrubbing (Scrubber construction + run_chunk + audit
-        # + the "is scrubbing on?" predicate) is owned by the ChunkScrubber
-        # seam. Built from the post-downgrade _scrub_enabled so a deps-missing
-        # local recording is correctly inert. (U3 moves the masking-config
-        # construction above into this seam and replaces the upload-disable
-        # side effect with an explicit result.)
-        from screencap.chunk_scrubber import ChunkScrubber
-
-        self._chunk_scrubber = ChunkScrubber(
-            self._capture_dir,
-            enabled=self._scrub_enabled,
-            pipeline=self._pipeline,
-            anonymizer=self._anonymizer,
-            evaluator=self._masking_evaluator,
-            classifier=self._masking_classifier,
-            pixel_ratio=self._masking_pixel_ratio,
-        )
+        # Consume the upload-policy fact. _upload_enabled and
+        # _upload_disabled_reason MUST be set together: _process_chunk computes
+        # ``success = self._upload_disabled_reason is None``, so disabling
+        # uploads without the reason would mark a disabled chunk EMITTED and
+        # re-open the Bug 4 delete-with-nothing-on-GCS path.
+        if _scrub_init.disable_uploads_reason is not None:
+            self._upload_enabled = False
+            self._upload_disabled_reason = _scrub_init.disable_uploads_reason
 
         # Safety invariant: never delete local files unless uploads are enabled.
         # This covers: (1) caller passes upload_enabled=False (e.g. --no-live-upload),
@@ -1126,7 +1093,10 @@ class ChunkProcessor:
         # set cannot represent the masked-app intervals, so indexing would ingest
         # masked-app on-screen text (banking / email / chat). Index nothing in
         # that case so only ALLOW-classified frames can ever reach the store.
-        if self._masking_classifier is None or self._masking_evaluator is None:
+        # SCR-35 (R7): the masking context now lives on the ChunkScrubber seam,
+        # so the guard reads its has_masking_context predicate rather than the
+        # (removed) processor masking fields.
+        if not self._chunk_scrubber.has_masking_context:
             logger.warning(
                 f"Chunk {idx}: skipping content index — masking classification "
                 "unavailable (no evaluator/classifier), so blocked_intervals "

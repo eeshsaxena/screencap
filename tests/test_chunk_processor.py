@@ -153,22 +153,25 @@ def cloud_processor(cloud_capture_dir):
     )
 
     pipeline, anonymizer = _make_mock_pipeline()
-    cp._pipeline = pipeline
-    cp._anonymizer = anonymizer
-    # SCR-35: the per-chunk scrub seam captured its config at construction
-    # (here pipeline=None, since cloud_intent + upload_enabled=False does not
-    # init scrubbing). Rebuild it with the injected mock pipeline so tests that
-    # drive scrubbing through the seam (ChunkScrubber.scrub) behave as before.
+    # SCR-35: the masking config now lives on the ChunkScrubber seam, not on
+    # ChunkProcessor. This fixture (cloud_intent + upload_enabled=False) does not
+    # init scrubbing, so rebuild the seam with the injected mock pipeline. We
+    # also keep cp._pipeline / cp._anonymizer as test-convenience handles for the
+    # direct scrub-function tests that feed a configured (pipeline, anonymizer)
+    # pair to standalone scrub_* helpers. evaluator/classifier are None here
+    # (cloud_processor never inited masking), matching the prior behavior.
     from screencap.chunk_scrubber import ChunkScrubber
 
+    cp._pipeline = pipeline
+    cp._anonymizer = anonymizer
     cp._chunk_scrubber = ChunkScrubber(
         cloud_capture_dir,
         enabled=True,
         pipeline=pipeline,
         anonymizer=anonymizer,
-        evaluator=cp._masking_evaluator,
-        classifier=cp._masking_classifier,
-        pixel_ratio=cp._masking_pixel_ratio,
+        evaluator=None,
+        classifier=None,
+        pixel_ratio=2.0,
     )
     return cp
 
@@ -550,7 +553,8 @@ class TestCloudIntentGating:
                 cloud_intent=True,
             )
             assert cp._upload_enabled is False
-            assert cp._pipeline is None
+            # Pipeline init failed → the scrub seam is inert (SCR-35).
+            assert cp._chunk_scrubber.is_enabled is False
 
     def test_non_cloud_skips_pipeline_init(self, cloud_capture_dir):
         """Non-cloud recordings must not initialize the scrubbing pipeline."""
@@ -564,8 +568,9 @@ class TestCloudIntentGating:
             upload_enabled=True, auto_delete=False,
             cloud_intent=False,
         )
-        assert cp._pipeline is None
-        assert cp._anonymizer is None
+        # No scrub/masking init → seam inert and no masking context (SCR-35).
+        assert cp._chunk_scrubber.is_enabled is False
+        assert cp._chunk_scrubber.has_masking_context is False
 
 
 class TestCloudProcessorRequiresPiiDetection:
@@ -618,7 +623,7 @@ class TestCloudProcessorRequiresPiiDetection:
             upload_enabled=True, auto_delete=False,
             cloud_intent=False,
         )
-        assert cp._pipeline is None
+        assert cp._chunk_scrubber.is_enabled is False
         assert cp.upload_warning is None
 
 
@@ -1661,9 +1666,11 @@ class TestPrivacyFailureDataLoss:
                 cloud_intent=True,
             )
 
-        # Pipeline succeeded but masking failed → uploads disabled
+        # Pipeline succeeded but masking failed → uploads disabled, and the
+        # seam reports no masking context (SCR-35 R7: the fail-closed signal the
+        # content-index guard reads).
         assert cp._upload_enabled is False
-        assert cp._pipeline is not None  # pipeline was set before masking failed
+        assert cp._chunk_scrubber.has_masking_context is False
         assert cp.upload_warning is not None
         assert cp._auto_delete is False, (
             "_auto_delete must be False when uploads are disabled due to masking failure"

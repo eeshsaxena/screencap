@@ -97,12 +97,18 @@ def _make_cp(capture_dir: Path, *, enabled: bool = True, masking: bool = True):
     cp._content_index_enabled = enabled
     # The index pass FAILS CLOSED when masking classification is unavailable
     # (no evaluator/classifier → blocked_intervals can't represent masked-app
-    # skips). With a real scrub pipeline these are set; the test CP is built
-    # without one, so stand in non-None sentinels to exercise the index path.
-    # ``masking=False`` leaves them None to assert the fail-closed gate.
+    # skips). SCR-35 R7: that signal now lives on the ChunkScrubber seam as
+    # ``has_masking_context``. The test CP is built without a real scrub pipeline
+    # (seam inert → has_masking_context False), so for ``masking=True`` rebuild
+    # the seam with non-None evaluator/classifier sentinels to exercise the
+    # index path. ``masking=False`` leaves the inert seam to assert the gate.
     if masking:
-        cp._masking_classifier = object()
-        cp._masking_evaluator = object()
+        from screencap.chunk_scrubber import ChunkScrubber
+
+        cp._chunk_scrubber = ChunkScrubber(
+            capture_dir, enabled=False, pipeline=None, anonymizer=None,
+            evaluator=object(), classifier=object(), pixel_ratio=2.0,
+        )
     return cp
 
 
