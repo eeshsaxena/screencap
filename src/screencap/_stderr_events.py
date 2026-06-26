@@ -106,6 +106,14 @@ EVENT_TERMINATED_REASON_PERSIST_FAILED = "terminated_reason_persist_failed"
 EVENT_ENGINE_CRASHED = "engine_crashed"
 EVENT_PREVIOUS_SESSION_RECOVERED = "previous_session_recovered"
 EVENT_PREVIOUS_SESSION_FORCE_TERMINATED = "previous_session_force_terminated"
+# Cloud account-ownership mismatch (SCR-171). ADVISORY: emitted when the daemon's
+# terminal-stage resume detects a recording whose pinned owner_uid differs from
+# the now-signed-in uid (cloud convergence refused, kept local). Lifts the
+# existing startup-sweep refusal onto the bus so a subscriber reacts without
+# polling. Carries recording / owner_uid / signed_in_uid (gate-authoritative) +
+# whoami-sourced signed_in_email / stale. Never terminal — no consumer may map
+# it to a stop/teardown.
+EVENT_ACCOUNT_MISMATCH = "account_mismatch"
 EVENT_SUBSCRIBED = "subscribed"
 # Upload pipeline events (plan U1) — consumed by the SwiftUI review window's
 # UploadController to drive progress UI. Emitted from upload.py via the same
