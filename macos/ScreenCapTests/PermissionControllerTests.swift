@@ -268,6 +268,87 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertFalse(permissions.allRequiredDaemonGrantsGranted)
     }
 
+    // MARK: - SCR-143: "Finish setup" banner visibility (decoupled from launch gate)
+
+    @MainActor
+    func testFinishSetupBannerHiddenOnceRequiredPermissionsGranted() {
+        // The regression: on the CLI-fallback path the daemon-grant auto-clear
+        // never fires, so `setupDismissed` stays latched forever. The banner must
+        // not key on `setupDismissed` alone — once the app process can record
+        // (`allRequiredGranted`, the same predicate the CLI-fallback start gate
+        // uses), the "can't record" banner must disappear even with no daemon.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(true)
+        XCTAssertFalse(
+            permissions.shouldShowFinishSetupBanner,
+            "banner must clear once required permissions are granted, even with the daemon absent"
+        )
+    }
+
+    @MainActor
+    func testFinishSetupBannerShownWhenDismissedAndPermissionsMissing() {
+        // Skipped the walkthrough AND still missing a required grant: the recovery
+        // banner is the only way back into the walkthrough on CLI-fallback, so it
+        // must show — and its "enable recording" claim is truthful here.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerHiddenWhenWalkthroughNeverSkipped() {
+        // Never skipped → the launch gate owns setup; no recovery banner, even
+        // while permissions are still missing.
+        let (permissions, _) = makeController()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerShownWhenDismissedAndPermissionsNotDetermined() {
+        // Pins the real pre-TCC-poll initial state: a fresh controller has all
+        // required statuses at `.notDetermined` (no app-side TCC check has run).
+        // Dismissed + not-yet-determined still can't record, so the banner shows.
+        // A future widening of `allRequiredGranted` that treated `.notDetermined`
+        // as granted would flip this to false and fail here.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        // Deliberately do NOT call _testSetRequiredPermissionsGranted: statuses
+        // stay `.notDetermined`.
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerShownPinsAllRequiredGrantedFalse() {
+        // Pins the intermediate precondition the banner's truth depends on:
+        // dismissed + a required grant denied means `allRequiredGranted` is false,
+        // and only then is the banner's "can't record" claim truthful. Asserting
+        // the precondition guards against a sign-flip to `setupDismissed &&
+        // allRequiredGranted` passing incidentally.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertFalse(permissions.allRequiredGranted)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerClearsWhenPermissionsArriveAfterDismissal() {
+        // Exercises the runtime sequence SCR-143 targets on one controller: the
+        // user skips the walkthrough while a grant is missing (banner appears),
+        // then later grants the permissions (banner clears) — the recovery banner
+        // must track the live can-record state, not the latched dismissal alone.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+
+        permissions._testSetRequiredPermissionsGranted(true)
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
+    }
+
     // MARK: - U5: daemon-grant refresh lifecycle + row icons
 
     @MainActor
