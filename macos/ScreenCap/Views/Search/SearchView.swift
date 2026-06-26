@@ -5,10 +5,13 @@ import SwiftUI
 // as a single `List` that is the detail root (per-day `Section`s); the search
 // field is pinned with `.safeAreaInset`. A List-as-root sizes reliably inside
 // the NavigationSplitView detail — stacking a List/ScrollView below siblings in
-// a VStack does not. Selecting a result opens the Review window at that moment.
+// a VStack does not. Selecting a result opens the read-only inspect window at that moment.
 struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @Environment(\.openWindow) private var openWindow
+    /// The app-wide recordings index — cross-referenced by name to detect a stub
+    /// result (uploaded; local media deleted) before opening inspect.
+    @EnvironmentObject private var index: RecordingsIndex
 
     // SCR-177 — shared per-result-set frame resolver + thumbnail cache (one
     // cache across the whole list, not per-row).
@@ -19,6 +22,9 @@ struct SearchView: View {
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
     @State private var searchTask: Task<Void, Never>?
+    /// Stub-recording guard message — shown via an alert instead of opening an
+    /// inspect window that would fail to load (mirrors the Recordings list).
+    @State private var rowError: String?
 
     // SCR-183 U3 — focus the field when Search opens. `MainWindow.detail` builds
     // a fresh `SearchView()` per open, so `.onAppear` re-fires each time.
@@ -52,6 +58,15 @@ struct SearchView: View {
                     announceToVoiceOver(message)
                 }
             }
+            .alert("Can\u{2019}t open recording", isPresented: errorBinding) {
+                Button("OK") { rowError = nil }
+            } message: {
+                Text(rowError ?? "")
+            }
+    }
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { rowError != nil }, set: { if !$0 { rowError = nil } })
     }
 
     /// Post a VoiceOver announcement. Uses the AppKit API (macOS 10.9+) rather
@@ -181,7 +196,7 @@ struct SearchView: View {
         )
         .contentShape(Rectangle())
         .tag(item.id)   // arrow-key selection target
-        .simultaneousGesture(TapGesture(count: 2).onEnded { openReview(item) })
+        .simultaneousGesture(TapGesture(count: 2).onEnded { openInspect(item) })
     }
 
     /// SCR-183 U4 — opens the keyboard-selected result on Return. The lone
@@ -199,7 +214,7 @@ struct SearchView: View {
         if !searchFieldFocused,
            !(results.consentNeeded && !consentDeclined),
            let target = searchReviewTarget(for: selectedResultID, in: results) {
-            Button("") { openReview(target) }
+            Button("") { openInspect(target) }
                 .keyboardShortcut(.defaultAction)
                 .frame(width: 1, height: 1)
                 .opacity(0)
@@ -347,14 +362,26 @@ struct SearchView: View {
         searchTask = Task { await model.search(trimmed, contentIndexEnabled: contentIndexEnabled) }
     }
 
-    /// Opens the Review window for the result's recording and (U6) requests a
-    /// one-shot seek to the hit moment, delivered out-of-band so the window
-    /// stays keyed on the recording name.
-    private func openReview(_ item: SearchResultItem) {
-        if let anchorMs = item.anchorMs {
-            ReviewWindowOpener.shared.pendingSeekMs[item.recording] = anchorMs
+    /// Opens the read-only inspect window for the result's recording and (U6)
+    /// requests a one-shot seek to the hit moment, delivered out-of-band so the
+    /// window stays keyed on the recording name. A stub recording (uploaded;
+    /// local media deleted) has nothing to inspect, so it shows the same
+    /// friendly download message the Recordings list shows rather than opening a
+    /// window that would fail to load.
+    private func openInspect(_ item: SearchResultItem) {
+        let isStub = index.recordings.first(where: { $0.name == item.recording })?.isStub ?? false
+        switch InspectRouting.decide(
+            recording: item.recording, anchorMs: item.anchorMs, isStub: isStub
+        ) {
+        case .unavailable(let message):
+            rowError = message
+        case .open(let recording, let seekMs):
+            // Assign the (possibly nil) seek — assigning nil clears any stale
+            // entry from a prior reuse, so a later open-at-start for this
+            // recording can't inherit an old search moment.
+            InspectWindowOpener.shared.pendingSeekMs[recording] = seekMs
+            openWindow(id: InspectWindowID, value: recording)
         }
-        openWindow(id: ReviewWindowID, value: item.recording)
     }
 
     private func loadSettings() async {

@@ -112,6 +112,24 @@ struct ScreenCapApp: App {
         }
         .windowResizability(.contentSize)
 
+        // Per-recording read-only INSPECT window scene — the "just looking"
+        // surface, opened from search results and Recordings-list clicks. Like
+        // the review scene it is a `WindowGroup` keyed on the recording name
+        // (multi-window by contract — one per recording, R7; SCR-55 documents
+        // why the singleton `Window` is the wrong primitive here). It injects
+        // ONLY `index`: inspect carries no upload/consent machinery, so it needs
+        // neither `auth` nor `uploads`.
+        WindowGroup("Inspect", id: InspectWindowID, for: String.self) { $recordingName in
+            if let name = recordingName {
+                InspectWindow(recordingName: name)
+                    .environmentObject(index)
+            } else {
+                Text("Inspect window not available.")
+                    .padding()
+            }
+        }
+        .windowResizability(.contentSize)
+
         MenuBarExtra {
             MenuBarMenu()
                 .environmentObject(recorder)
@@ -186,6 +204,9 @@ private struct OpenWindowBridge: View {
                 WindowOpener.shared.openMain = { openWindow(id: MainWindowID) }
                 ReviewWindowOpener.shared.openReview = { name in
                     openWindow(id: ReviewWindowID, value: name)
+                }
+                InspectWindowOpener.shared.openInspect = { name in
+                    openWindow(id: InspectWindowID, value: name)
                 }
             }
     }
