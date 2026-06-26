@@ -135,3 +135,52 @@ def test_existing_settings_fields_unchanged():
         "recordings_dir",
     ):
         assert key in settings, f"missing {key} in settings payload"
+
+
+def _invoke_set(pair: str) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["settings", "--set", pair], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+
+def test_content_index_enabled_defaults_false_in_json():
+    """The OCR-indexing flag (SCR-174 U1) is exposed in the read payload and
+    defaults to off — the search consent trigger reads it to decide whether
+    on-screen-text indexing is active."""
+    settings = _invoke_settings_json()["settings"]
+    assert settings["content_index_enabled"] is False
+
+
+def test_content_index_enabled_set_roundtrips():
+    """`settings --set content_index_enabled=...` is writable through the
+    _BOOL_KEYS allowlist and the new value is reflected in `settings --json`.
+    This is the write/read surface the consent flow flips on consent."""
+    _invoke_set("content_index_enabled=true")
+    assert _invoke_settings_json()["settings"]["content_index_enabled"] is True
+
+    _invoke_set("content_index_enabled=false")
+    assert _invoke_settings_json()["settings"]["content_index_enabled"] is False
+
+
+def test_content_index_enabled_rejects_non_bool():
+    """A non-boolean value is rejected, matching the other _BOOL_KEYS."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["settings", "--set", "content_index_enabled=maybe"], catch_exceptions=False
+    )
+    assert result.exit_code == 1
+    assert "true or false" in result.output
+
+
+def test_content_index_consent_declined_defaults_false_in_json():
+    """The one-time-consent decision (SCR-174 U7) is exposed and defaults off.
+    Persisted separately from `content_index_enabled` so 'declined' never
+    re-prompts and isn't conflated with 'feature off'."""
+    settings = _invoke_settings_json()["settings"]
+    assert settings["content_index_consent_declined"] is False
+
+
+def test_content_index_consent_declined_set_roundtrips():
+    """The Search consent flow persists a decline via this writable bool."""
+    _invoke_set("content_index_consent_declined=true")
+    assert _invoke_settings_json()["settings"]["content_index_consent_declined"] is True

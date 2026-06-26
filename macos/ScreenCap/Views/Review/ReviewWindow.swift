@@ -78,6 +78,18 @@ struct ReviewWindow: View {
             if case .ready(let data) = newState, videoModel == nil {
                 let engine = LiveVideoPlaybackEngine(url: data.videoURL)
                 videoModel = VideoPlayerPaneModel(engine: engine)
+                // SCR-174 (U6): if this window was opened from a search result,
+                // seek to the hit moment (consumed one-shot). A null/0 startedAt
+                // falls back to the start; if the recording isn't playable the
+                // window simply opens without seeking (graceful fallback).
+                if let seekMs = ReviewWindowOpener.shared.pendingSeekMs[recordingName] {
+                    ReviewWindowOpener.shared.pendingSeekMs[recordingName] = nil
+                    videoModel?.seek(toSeconds: SearchSeek.relativeSeconds(
+                        anchorMs: seekMs,
+                        startedAt: data.startedAt,
+                        durationSeconds: data.durationSeconds
+                    ))
+                }
                 // The masked screenshots that actually upload — the primary
                 // truth view (U6). Parsed once on first ready.
                 screenshots = ScreenshotTruth.screenshots(
