@@ -28,14 +28,30 @@ func searchDayLabel(_ day: Date) -> String {
 
 struct ResultRow: View {
     let item: SearchResultItem
+    // SCR-177 U4 — the matched terms to bold in the snippet, and the shared
+    // services that resolve + decode the leading thumbnail. Optional/defaulted so
+    // a row can still render (placeholder) without them.
+    var queryTerms: [String] = []
+    var frameIndex: RecordingFrameIndex?
+    var thumbnailLoader: ThumbnailLoader?
+
+    /// The decoded thumbnail tagged with the pointer key it was loaded for. The
+    /// cell only trusts it when its key matches the current row (mirrors
+    /// `ScreenshotTruthPane`'s `loaded?.url == url` gate) so a reused row never
+    /// paints the previous recording's frame. `image == nil` = resolved but no
+    /// frame (the miss placeholder).
+    @State private var loaded: LoadedThumb?
+
+    private struct LoadedThumb {
+        let key: String
+        let image: ThumbnailImage?
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: item.streamIcon)
-                .foregroundStyle(item.streamTint)
-                .frame(width: 18)
+            thumbnailCell
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.primaryText)
+                Text(primaryText)
                     .lineLimit(2)
                 if let secondary = item.secondaryText {
                     Text(secondary)
@@ -58,6 +74,78 @@ struct ResultRow: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
+        // Re-keys on the pointer so List row-reuse reloads the right frame. On
+        // scroll-away the task is cancelled: the post-`await` `isCancelled` guards
+        // drop the stale state write, and a not-yet-started decode is skipped
+        // (ThumbnailLoader bails on a cancelled caller). A decode already in flight
+        // is detached and runs to completion, but its result is cached for reuse
+        // (mirrors ScreenshotTruthPane).
+        .task(id: thumbnailLoadKey) { await loadThumbnail() }
+    }
+
+    /// Bold the matched query terms in content/audio snippets; activity rows have
+    /// no snippet to highlight.
+    private var primaryText: AttributedString {
+        switch item.stream {
+        case .activity: return AttributedString(item.primaryText)
+        case .screen, .audio: return SnippetHighlighter.attributed(item.primaryText, terms: queryTerms)
+        }
+    }
+
+    /// ~16:9 leading cell; the loaded frame replaces the stream-icon column, the
+    /// miss state reuses the slot for the icon. Accessibility-hidden — it is a
+    /// visual recognition aid; the Button already announces the row's text + time.
+    @ViewBuilder
+    private var thumbnailCell: some View {
+        Group {
+            // Only trust `loaded` when it matches this row's current pointer; a
+            // stale (reused-row) or not-yet-loaded state shows the placeholder.
+            if loaded?.key == thumbnailLoadKey, let resolved = loaded {
+                if let image = resolved.image {
+                    Image(decorative: image.cgImage, scale: 1)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Rectangle()
+                        .fill(Color(nsColor: .separatorColor).opacity(0.4))
+                        .overlay {
+                            Image(systemName: item.streamIcon).foregroundStyle(item.streamTint)
+                        }
+                }
+            } else {
+                Rectangle().fill(Color(nsColor: .separatorColor))
+            }
+        }
+        .frame(width: 56, height: 32)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .accessibilityHidden(true)
+    }
+
+    private var thumbnailLoadKey: String {
+        "\(item.recording)|\(item.anchorMs.map(String.init) ?? "nil")"
+    }
+
+    /// Resolve the pointer to a frame and decode its thumbnail, tagging the result
+    /// with the key it was loaded for. A `nil` anchor or an over-stale snap
+    /// resolves to `nil` in U1 → the miss placeholder (never an arbitrary
+    /// frame-0); an unreadable frame → miss too (R5). Every write after an
+    /// `await` is cancellation-guarded so a reused row's cancelled load cannot
+    /// clobber the new item's state.
+    private func loadThumbnail() async {
+        let key = thumbnailLoadKey
+        guard let frameIndex, let thumbnailLoader else {
+            loaded = LoadedThumb(key: key, image: nil)
+            return
+        }
+        let url = await frameIndex.resolve(recording: item.recording, anchorMs: item.anchorMs)
+        if Task.isCancelled { return }
+        guard let url else {
+            loaded = LoadedThumb(key: key, image: nil)
+            return
+        }
+        let image = await thumbnailLoader.thumbnail(for: url)
+        if Task.isCancelled { return }
+        loaded = LoadedThumb(key: key, image: image)
     }
 }
 

@@ -9,6 +9,11 @@ struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @Environment(\.openWindow) private var openWindow
 
+    // SCR-177 — shared per-result-set frame resolver + thumbnail cache (one
+    // cache across the whole list, not per-row).
+    @State private var frameIndex = RecordingFrameIndex()
+    @State private var thumbnailLoader = ThumbnailLoader()
+
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
@@ -99,7 +104,14 @@ struct SearchView: View {
                 ForEach(days, id: \.day) { group in
                     Section(searchDayLabel(group.day)) {
                         ForEach(group.items) { item in
-                            Button { openReview(item) } label: { ResultRow(item: item) }
+                            Button { openReview(item) } label: {
+                                ResultRow(
+                                    item: item,
+                                    queryTerms: results.queryTerms,
+                                    frameIndex: frameIndex,
+                                    thumbnailLoader: thumbnailLoader
+                                )
+                            }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -107,7 +119,14 @@ struct SearchView: View {
                 if !unanchored.isEmpty {
                     Section("Heard in audio (time approximate)") {
                         ForEach(unanchored) { item in
-                            Button { openReview(item) } label: { ResultRow(item: item) }
+                            Button { openReview(item) } label: {
+                                ResultRow(
+                                    item: item,
+                                    queryTerms: results.queryTerms,
+                                    frameIndex: frameIndex,
+                                    thumbnailLoader: thumbnailLoader
+                                )
+                            }
                                 .buttonStyle(.plain)
                         }
                     }
