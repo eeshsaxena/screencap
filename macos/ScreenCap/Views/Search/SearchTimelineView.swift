@@ -74,6 +74,11 @@ struct ResultRow: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
+        // SCR-183 U2 — collapse the row's fragmented Text runs into one VoiceOver
+        // stop. The thumbnail is already `.accessibilityHidden`; `.ignore` drops
+        // the rest and the enclosing Button announces this single label + "button".
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(SearchAccessibility.resultRowLabel(item))
         // Re-keys on the pointer so List row-reuse reloads the right frame. On
         // scroll-away the task is cancelled: the post-`await` `isCancelled` guards
         // drop the stale state write, and a not-yet-started decode is skipped

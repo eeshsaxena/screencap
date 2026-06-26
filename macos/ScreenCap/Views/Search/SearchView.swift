@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // SCR-174 U5 — the in-app "ask your history" Search surface. The results render
@@ -19,6 +20,15 @@ struct SearchView: View {
     @State private var consentDeclined = false
     @State private var searchTask: Task<Void, Never>?
 
+    // SCR-183 U3 — focus the field when Search opens. `MainWindow.detail` builds
+    // a fresh `SearchView()` per open, so `.onAppear` re-fires each time.
+    @FocusState private var searchFieldFocused: Bool
+
+    // SCR-183 U4 — keyboard selection in the results list. Arrow keys move this
+    // selection; Return opens the selected result (the field keeps its own Return
+    // for running a search, gated by focus).
+    @State private var selectedResultID: SearchResultItem.ID?
+
     var body: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -30,6 +40,32 @@ struct SearchView: View {
                 .background(.bar)
             }
             .task { await loadSettings() }
+            .onAppear {
+                // A run-loop hop lets the TextField finish entering the hierarchy
+                // before focus is assigned — more reliable than a synchronous set.
+                Task { @MainActor in searchFieldFocused = true }
+            }
+            // SCR-183 U6 — announce the search outcome so a VoiceOver user who
+            // can't see the screen learns the result instead of hearing silence.
+            .onChange(of: model.phase) { phase in
+                if let message = SearchAccessibility.searchOutcomeAnnouncement(for: phase) {
+                    announceToVoiceOver(message)
+                }
+            }
+    }
+
+    /// Post a VoiceOver announcement. Uses the AppKit API (macOS 10.9+) rather
+    /// than SwiftUI's `AccessibilityNotification.Announcement`, which is macOS 14+
+    /// and unavailable on this app's 13.0 floor.
+    private func announceToVoiceOver(_ message: String) {
+        NSAccessibility.post(
+            element: (NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp) as Any,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
     }
 
     // MARK: - Search field
@@ -38,8 +74,11 @@ struct SearchView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 TextField("Search your history — e.g. \u{201C}salesforce yesterday afternoon\u{201D}", text: $query)
                     .textFieldStyle(.plain)
+                    .accessibilityLabel("Search your history")
+                    .focused($searchFieldFocused)
                     .onSubmit { runSearch() }
             }
             .padding(.vertical, 6)
@@ -48,6 +87,8 @@ struct SearchView: View {
             Label("Searches only what\u{2019}s on this Mac", systemImage: "lock.fill")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                // Keep the lock glyph visible but read only the text to VoiceOver.
+                .accessibilityLabel("Searches only what\u{2019}s on this Mac")
         }
         .padding(12)
     }
@@ -66,6 +107,7 @@ struct SearchView: View {
         case .searching:
             ProgressView().controlSize(.large)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel("Searching your history")
         case .daemonDown:
             stateMessage(
                 icon: "bolt.horizontal.circle",
@@ -82,13 +124,14 @@ struct SearchView: View {
         let unanchored = results.items.filter { $0.anchorMs == nil }
         let days = searchResultsGroupedByDay(anchored)
 
-        return List {
+        return List(selection: $selectedResultID) {
             Section {
                 if results.timeWindow != nil || results.appFilter != nil {
                     Label(interpretationText(results), systemImage: "wand.and.stars")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .listRowSeparator(.hidden)
+                        .accessibilityLabel(interpretationText(results))
                 }
                 coverageRow(results.coverage)
                     .listRowSeparator(.hidden)
@@ -113,6 +156,7 @@ struct SearchView: View {
                                 )
                             }
                                 .buttonStyle(.plain)
+                                .tag(item.id)   // U4 — arrow-key selection target
                         }
                     }
                 }
@@ -128,12 +172,34 @@ struct SearchView: View {
                                 )
                             }
                                 .buttonStyle(.plain)
+                                .tag(item.id)   // U4 — arrow-key selection target
                         }
                     }
                 }
             }
         }
         .listStyle(.inset)
+        // U4 — invisible Return handler for the keyboard-selected result.
+        .background(returnKeyHandler(results))
+    }
+
+    /// SCR-183 U4 — opens the keyboard-selected result on Return. Present only
+    /// when a result is selected AND the search field is not focused, so it does
+    /// not steal Return from the field's own run-a-search binding. The exact
+    /// arrow-navigation + Return behavior on macOS 13 (where `.onKeyPress` is
+    /// unavailable) needs on-device verification — see the plan's deferred
+    /// questions; this is the smallest mechanism that compiles and is structurally
+    /// correct.
+    @ViewBuilder
+    private func returnKeyHandler(_ results: SearchResults) -> some View {
+        if !searchFieldFocused,
+           let target = searchReviewTarget(for: selectedResultID, in: results) {
+            Button("") { openReview(target) }
+                .keyboardShortcut(.defaultAction)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+        }
     }
 
     private func interpretationText(_ results: SearchResults) -> String {
@@ -166,10 +232,15 @@ struct SearchView: View {
             EmptyView()
         } else {
             HStack(spacing: 4) {
+                // The dot encodes the state by color only — hide it and let the
+                // chip's combined label spell the state out in words instead.
                 Circle().fill(coverageColor(state)).frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
                 Text("\(label): \(coverageText(state))").font(.caption2)
             }
             .foregroundStyle(.secondary)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(SearchAccessibility.coverageChipLabel(stream: label, state: state) ?? "")
         }
     }
 
@@ -197,15 +268,21 @@ struct SearchView: View {
 
     private var consentBanner: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "text.viewfinder").foregroundStyle(.orange)
-                Text("Search on-screen text too?").font(.callout).bold()
-                Spacer()
+            // Heading + body read as one VoiceOver element (the viewfinder glyph
+            // is decorative); the two actions stay as their own buttons.
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "text.viewfinder").foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    Text("Search on-screen text too?").font(.callout).bold()
+                    Spacer()
+                }
+                Text("Turn this on to also search the text that was on your screen. Newly recorded screens become searchable \u{2014} it all stays on this Mac and is never uploaded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Text("Turn this on to also search the text that was on your screen. Newly recorded screens become searchable \u{2014} it all stays on this Mac and is never uploaded.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
             HStack {
                 Spacer()
                 Button("Not now") { declineConsent() }
@@ -237,17 +314,22 @@ struct SearchView: View {
         }
         .padding(.vertical, 8)
         .listRowSeparator(.hidden)
+        // One VoiceOver element: "No matches. Try different words…".
+        .accessibilityElement(children: .combine)
     }
 
     private func stateMessage(icon: String, title: String, detail: String) -> some View {
         VStack(spacing: 10) {
             Image(systemName: icon).font(.largeTitle).foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text(title).font(.headline)
             Text(detail).font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
+        // Read title + detail as one element; the large glyph is decorative.
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: - Actions
@@ -311,4 +393,14 @@ struct SearchView: View {
             }
         }
     }
+}
+
+/// SCR-183 U4 — which result a keyboard Return acts on, given the current
+/// selection. Pure + file-scope so it is unit-testable without the view: a `nil`
+/// selection (nothing focused) or a stale id (selection left over after a
+/// re-search) both resolve to `nil`, so Return is a safe no-op rather than
+/// opening an arbitrary row.
+func searchReviewTarget(for id: SearchResultItem.ID?, in results: SearchResults) -> SearchResultItem? {
+    guard let id else { return nil }
+    return results.items.first { $0.id == id }
 }
