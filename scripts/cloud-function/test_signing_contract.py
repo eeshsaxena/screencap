@@ -83,7 +83,7 @@ def _sign_put_url(content_type: str = "video/mp4") -> str:
     )
 
 
-def _query(url: str) -> dict:
+def _query(url: str) -> dict[str, list[str]]:
     # parse_qs lower-cases nothing; v4 params are X-Goog-*. Normalize keys to lower for
     # robust membership checks.
     raw = parse_qs(urlparse(url).query)
