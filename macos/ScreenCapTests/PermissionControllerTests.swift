@@ -306,6 +306,49 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
     }
 
+    @MainActor
+    func testFinishSetupBannerShownWhenDismissedAndPermissionsNotDetermined() {
+        // Pins the real pre-TCC-poll initial state: a fresh controller has all
+        // required statuses at `.notDetermined` (no app-side TCC check has run).
+        // Dismissed + not-yet-determined still can't record, so the banner shows.
+        // A future widening of `allRequiredGranted` that treated `.notDetermined`
+        // as granted would flip this to false and fail here.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        // Deliberately do NOT call _testSetRequiredPermissionsGranted: statuses
+        // stay `.notDetermined`.
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerShownPinsAllRequiredGrantedFalse() {
+        // Pins the intermediate precondition the banner's truth depends on:
+        // dismissed + a required grant denied means `allRequiredGranted` is false,
+        // and only then is the banner's "can't record" claim truthful. Asserting
+        // the precondition guards against a sign-flip to `setupDismissed &&
+        // allRequiredGranted` passing incidentally.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertFalse(permissions.allRequiredGranted)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerClearsWhenPermissionsArriveAfterDismissal() {
+        // Exercises the runtime sequence SCR-143 targets on one controller: the
+        // user skips the walkthrough while a grant is missing (banner appears),
+        // then later grants the permissions (banner clears) — the recovery banner
+        // must track the live can-record state, not the latched dismissal alone.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+
+        permissions._testSetRequiredPermissionsGranted(true)
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
+    }
+
     // MARK: - U5: daemon-grant refresh lifecycle + row icons
 
     @MainActor
