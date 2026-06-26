@@ -59,7 +59,9 @@ final class RecordingFrameIndexTests: XCTestCase {
         let dir = RecordingFrameIndex.screenshotsDir(root: root, recording: "rec-1")
         XCTAssertNotNil(dir)
         XCTAssertTrue(dir!.path.hasSuffix("/rec-1/screenshots"))
-        XCTAssertTrue(dir!.path.hasPrefix(root.standardizedFileURL.path))
+        // Compare against the symlink-resolved root: the guard now resolves
+        // symlinks, and the temp dir lives under /var -> /private/var on macOS.
+        XCTAssertTrue(dir!.path.hasPrefix(root.resolvingSymlinksInPath().path))
     }
 
     func testScreenshotsDirRejectsTraversalAndUnsafeNames() {
@@ -67,6 +69,24 @@ final class RecordingFrameIndexTests: XCTestCase {
         XCTAssertNil(RecordingFrameIndex.screenshotsDir(root: root, recording: ".."))
         XCTAssertNil(RecordingFrameIndex.screenshotsDir(root: root, recording: "a/b"))
         XCTAssertNil(RecordingFrameIndex.screenshotsDir(root: root, recording: ""))
+    }
+
+    func testScreenshotsDirRejectsSymlinkEscape() throws {
+        // A recording dir that is a symlink pointing outside the recordings root
+        // must be rejected. `standardizedFileURL` is lexical-only and would let it
+        // through; `resolvingSymlinksInPath` closes the gap (the daemon-side
+        // `resolve_recording_dir` uses the same realpath containment).
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scr177-outside-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: outside.appendingPathComponent("screenshots", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let link = root.appendingPathComponent("evil", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        XCTAssertNil(RecordingFrameIndex.screenshotsDir(root: root, recording: "evil"))
     }
 
     // MARK: - loadFrames

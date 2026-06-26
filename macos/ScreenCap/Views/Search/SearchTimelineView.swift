@@ -74,8 +74,12 @@ struct ResultRow: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
-        // Re-keys on the pointer so List row-reuse reloads the right frame and the
-        // load cancels on scroll-away (mirrors ScreenshotTruthPane).
+        // Re-keys on the pointer so List row-reuse reloads the right frame. On
+        // scroll-away the task is cancelled: the post-`await` `isCancelled` guards
+        // drop the stale state write, and a not-yet-started decode is skipped
+        // (ThumbnailLoader bails on a cancelled caller). A decode already in flight
+        // is detached and runs to completion, but its result is cached for reuse
+        // (mirrors ScreenshotTruthPane).
         .task(id: thumbnailLoadKey) { await loadThumbnail() }
     }
 

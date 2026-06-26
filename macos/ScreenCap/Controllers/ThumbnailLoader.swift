@@ -66,6 +66,10 @@ actor ThumbnailLoader {
     /// callers for the same URL await a single shared decode.
     func thumbnail(for url: URL) async -> ThumbnailImage? {
         if let box = cache.object(forKey: url as NSURL) { return box.image }
+        // The calling row already scrolled away before this decode's turn — skip
+        // spawning work for an off-screen frame. (Once started, the detached decode
+        // is shared across coalesced callers and cannot be cancelled per-caller.)
+        if Task.isCancelled { return nil }
         if let existing = inFlight[url] { return await existing.value }
 
         let decode = self.decode
