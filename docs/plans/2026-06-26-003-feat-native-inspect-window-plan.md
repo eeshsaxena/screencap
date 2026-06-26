@@ -1,7 +1,7 @@
 ---
 title: "feat: Native read-only inspect window (looking ≠ uploading)"
 type: feat
-status: active
+status: completed
 date: 2026-06-26
 origin: docs/brainstorms/2026-06-26-inspect-vs-upload-surface-separation-requirements.md
 ---
