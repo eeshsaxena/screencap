@@ -1286,12 +1286,18 @@ async def test_resume_terminal_stage_runs_in_thread(tmp_path, monkeypatch):
     sup = Supervisor(bus, reconcile_on_init=False)
 
     called = {}
+    # The real run_terminal_stage returns a TerminalResult; resume_terminal_stage
+    # now reads ``result.account_mismatch`` directly (typed), so the stub must
+    # mirror that shape rather than a bare sentinel.
+    from screencap import terminal_stage as ts
+
+    sentinel = ts.TerminalResult(destination="cloud")
 
     def _fake_run(recording_dir, *, non_blocking):
         import threading
         called["non_blocking"] = non_blocking
         called["thread"] = threading.current_thread().name
-        return "ran"
+        return sentinel
 
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage", _fake_run,
@@ -1301,7 +1307,7 @@ async def test_resume_terminal_stage_runs_in_thread(tmp_path, monkeypatch):
     rec_dir.mkdir()
     out = await sup.resume_terminal_stage(rec_dir)
 
-    assert out == "ran"
+    assert out is sentinel
     # Resume always uses the non-blocking lock so it can't stall the loop or
     # race a live finalize.
     assert called["non_blocking"] is True
@@ -1329,6 +1335,207 @@ async def test_resume_terminal_stage_skips_when_busy(tmp_path, monkeypatch):
     # Busy → returns None (skips), does NOT raise (the holder owns the section).
     out = await sup.resume_terminal_stage(rec_dir)
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# SCR-171 — resume_terminal_stage lifts an account-ownership mismatch onto the
+# /v0/events bus as an advisory ``account_mismatch`` event. This is the SINGLE
+# emit point for every daemon detection path (startup sweep, crash/restart
+# resume, post-engine-exit resume) since all of them funnel through this method.
+# ---------------------------------------------------------------------------
+
+
+def _mismatch_result():
+    from screencap import terminal_stage as ts
+
+    return ts.TerminalResult(
+        destination="cloud",
+        upload_warning="account mismatch — different account; cloud refused (kept local)",
+        account_mismatch=ts.AccountMismatch(owner_uid="uid-A", signed_in_uid="uid-B"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_emits_account_mismatch_event(tmp_path, monkeypatch):
+    """Happy path: a mismatch result publishes exactly one advisory event with a
+    whoami-aligned payload, and ``whoami`` runs OFF the event loop."""
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage",
+        lambda recording_dir, *, non_blocking: _mismatch_result(),
+    )
+    whoami_thread = {}
+
+    def _whoami():
+        import threading
+        whoami_thread["name"] = threading.current_thread().name
+        # Real success shape: NO ``stale`` key.
+        return {"signed_in": True, "uid": "uid-B", "email": "b@example.com"}
+
+    monkeypatch.setattr(auth, "whoami", _whoami)
+
+    await sup.resume_terminal_stage(tmp_path / "rec-A")
+
+    event = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert event["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH
+    assert event["schema_version"] == _stderr_events.EVENT_SCHEMA_VERSION
+    assert event["recording"] == "rec-A"
+    assert event["owner_uid"] == "uid-A"
+    assert event["signed_in_uid"] == "uid-B"
+    assert event["signed_in_email"] == "b@example.com"
+    # whoami omits ``stale`` on success → normalized to False.
+    assert event["stale"] is False
+    assert sub.queue.empty(), "exactly one event per detection"
+    # Enrichment ran off the asyncio loop (whoami does blocking I/O).
+    assert whoami_thread["name"] != "MainThread"
+
+
+@pytest.mark.asyncio
+async def test_resume_no_mismatch_emits_nothing(tmp_path, monkeypatch):
+    """A clean convergence result (no structured account_mismatch) publishes no
+    event — even though it may carry an unrelated upload_warning."""
+    from screencap import terminal_stage as ts
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    clean = ts.TerminalResult(destination="cloud", upload_warning="upload failed: boom")
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage",
+        lambda recording_dir, *, non_blocking: clean,
+    )
+
+    await sup.resume_terminal_stage(tmp_path / "rec")
+    assert sub.queue.empty(), "a non-account upload_warning must NOT emit account_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_resume_none_result_emits_nothing(tmp_path, monkeypatch):
+    """A None result (busy / fail-closed) publishes nothing and never raises."""
+    from screencap.daemon.supervisor import Supervisor
+    from screencap.terminal_stage import TerminalStageBusy
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    def _busy(recording_dir, *, non_blocking):
+        raise TerminalStageBusy("held")
+
+    monkeypatch.setattr("screencap.terminal_stage.run_terminal_stage", _busy)
+
+    out = await sup.resume_terminal_stage(tmp_path / "rec")
+    assert out is None
+    assert sub.queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_resume_emit_is_fail_open_on_whoami_error(tmp_path, monkeypatch):
+    """A whoami/publish failure during the advisory emit is swallowed — the
+    resume still returns its result and nothing escapes into the loop."""
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    result = _mismatch_result()
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage",
+        lambda recording_dir, *, non_blocking: result,
+    )
+
+    def _boom():
+        raise RuntimeError("keychain unavailable")
+
+    monkeypatch.setattr(auth, "whoami", _boom)
+
+    out = await sup.resume_terminal_stage(tmp_path / "rec-A")
+    assert out is result, "resume must still return its result after a failed emit"
+    assert sub.queue.empty(), "a failed emit publishes nothing"
+
+
+@pytest.mark.asyncio
+async def test_resume_emit_enrichment_stale(tmp_path, monkeypatch):
+    """When the beat-later whoami is stale (offline), email is null and stale is
+    True, but signed_in_uid stays gate-authoritative and the event still emits."""
+    from screencap import auth
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage",
+        lambda recording_dir, *, non_blocking: _mismatch_result(),
+    )
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": None, "email": None, "stale": True},
+    )
+
+    await sup.resume_terminal_stage(tmp_path / "rec-A")
+    event = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert event["signed_in_uid"] == "uid-B"  # gate-sourced, authoritative
+    assert event["signed_in_email"] is None
+    assert event["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_resume_emit_whoami_timeout_still_publishes(tmp_path, monkeypatch):
+    """A whoami that blocks past the enrichment timeout must NOT stall the resume
+    or drop the event: the bounded wait degrades email/stale, but the
+    gate-authoritative signed_in_uid still publishes (SCR-171 enrichment bound)."""
+    import threading
+    import time as _time
+
+    from screencap import auth
+    from screencap.daemon import supervisor as _sup_mod
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage",
+        lambda recording_dir, *, non_blocking: _mismatch_result(),
+    )
+    # Shrink the bound so the test is fast; whoami blocks well past it.
+    monkeypatch.setattr(_sup_mod, "_WHOAMI_ENRICH_TIMEOUT_S", 0.05)
+    started = threading.Event()
+
+    def _slow_whoami():
+        started.set()
+        _time.sleep(2.0)  # >> the 0.05s bound; would stall the sweep if unbounded
+        return {"signed_in": True, "uid": "uid-B", "email": "b@example.com"}
+
+    monkeypatch.setattr(auth, "whoami", _slow_whoami)
+
+    # The whole resume must complete well under the 2s whoami sleep.
+    await asyncio.wait_for(sup.resume_terminal_stage(tmp_path / "rec-A"), timeout=1.0)
+    assert started.is_set(), "whoami was actually invoked (then timed out)"
+
+    event = await asyncio.wait_for(sub.queue.get(), timeout=1.0)
+    assert event["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH
+    assert event["recording"] == "rec-A"
+    # Gate-authoritative fields survive the enrichment timeout ...
+    assert event["owner_uid"] == "uid-A"
+    assert event["signed_in_uid"] == "uid-B"
+    # ... while best-effort enrichment degrades on timeout.
+    assert event["signed_in_email"] is None
+    assert event["stale"] is False
+    assert sub.queue.empty(), "exactly one event even on enrichment timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -1452,6 +1659,59 @@ async def test_handle_engine_exit_skips_resume_for_local(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_engine_exit_emits_account_mismatch(tmp_path, monkeypatch):
+    """SCR-171 end-to-end via the post-engine-exit funnel: a real owner-mismatched
+    incomplete cloud recording, exited through ``_handle_engine_exit`` (which
+    dispatches the resume as a DETACHED tracked task), drives the REAL gate and
+    emits exactly one account_mismatch event once the detached resume is drained.
+    Complements the startup-sweep end-to-end test (the exit funnel is otherwise
+    only covered by spy-based wiring tests)."""
+    from screencap import auth
+    from screencap.catalog import write_owner_uid
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_incomplete_cloud_recording(
+        get_recordings_dir(), "rec-A", n_chunks=2, uploaded=(0,),
+    )
+    write_owner_uid(rec_dir, "uid-A")
+    # Signed in as a DIFFERENT account than the one that owns the recording.
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+    monkeypatch.setattr("screencap.auth.id_token_uid", lambda token: "uid-B")
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": "uid-B", "email": "b@example.com"},
+    )
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    proc = _FakeAliveProc()
+    proc._alive = False
+    sup._proc = proc
+    sup._session_state = {
+        "capture_dir": str(rec_dir), "recording_name": "rec-A",
+        "started_at": time.time(),
+    }
+    await sup._handle_engine_exit(proc, 0)
+    # The resume is dispatched detached via _track_resume — drain it before asserting.
+    await asyncio.gather(*list(sup._resume_tasks), return_exceptions=True)
+
+    # _handle_engine_exit also synthesizes a recording_finalized event; pull events
+    # until the account_mismatch one (it is the only mismatch event we assert on).
+    event = None
+    while True:
+        evt = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+        if evt["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH:
+            event = evt
+            break
+    assert event["recording"] == "rec-A"
+    assert event["owner_uid"] == "uid-A"
+    assert event["signed_in_uid"] == "uid-B"
+
+
+@pytest.mark.asyncio
 async def test_has_inflight_resume_gates_idle_shutdown(tmp_path):
     """An in-flight resume keeps the idle-shutdown watchdog 'busy' so an
     auto-spawned daemon never idle-exits mid-upload."""
@@ -1534,6 +1794,44 @@ async def test_startup_sweep_skips_scrubbed_sibling(tmp_path, monkeypatch):
     await sup._run_startup_sweep()
     assert src in resumed
     assert (recs / "rec-scrubbed") not in resumed, "scrubbed sibling must be skipped"
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_emits_account_mismatch_event(tmp_path, monkeypatch):
+    """SCR-171 end-to-end (ticket's primary path): a real owner-mismatched cloud
+    recording swept at startup drives the REAL terminal-stage gate, which
+    populates the typed signal, and the sweep emits exactly one account_mismatch
+    event on the bus. Exercises the full chain (gate → resume → publish), not a
+    mocked seam."""
+    from screencap import auth
+    from screencap.catalog import write_owner_uid
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_incomplete_cloud_recording(
+        get_recordings_dir(), "rec-A", n_chunks=2, uploaded=(0,),
+    )
+    write_owner_uid(rec_dir, "uid-A")
+    # Signed in as a DIFFERENT account than the one that owns the recording.
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+    monkeypatch.setattr("screencap.auth.id_token_uid", lambda token: "uid-B")
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": "uid-B", "email": "b@example.com"},
+    )
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    await sup._run_startup_sweep()
+
+    event = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert event["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH
+    assert event["recording"] == "rec-A"
+    assert event["owner_uid"] == "uid-A"
+    assert event["signed_in_uid"] == "uid-B"
+    assert sub.queue.empty(), "exactly one event for the one mismatched recording"
 
 
 @pytest.mark.asyncio

@@ -1014,6 +1014,11 @@ class TestSCR116AccountOwnershipGate:
         assert uploaded == [], "must not upload under the wrong account"
         assert result.sentinel_uploaded is False
         assert result.upload_warning and "account mismatch" in result.upload_warning.lower()
+        # SCR-171: the typed signal the daemon lifts onto /v0/events carries both
+        # gate-authoritative uids.
+        assert result.account_mismatch is not None
+        assert result.account_mismatch.owner_uid == "uid-A"
+        assert result.account_mismatch.signed_in_uid == "uid-B"
 
     def test_matching_account_proceeds_to_upload(self, tmp_path, monkeypatch):
         from screencap import auth
@@ -1052,6 +1057,7 @@ class TestSCR116AccountOwnershipGate:
 
         assert uploaded, "matching account must proceed to upload"
         assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())
+        assert result.account_mismatch is None
 
     def test_no_owner_pin_legacy_recording_not_refused(self, tmp_path, monkeypatch):
         """A recording with no pinned owner (legacy / local-promoted) is not gated
@@ -1085,6 +1091,7 @@ class TestSCR116AccountOwnershipGate:
 
         result = ts.run_terminal_stage(rec_dir)
         assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())
+        assert result.account_mismatch is None
 
     def test_undeterminable_current_uid_does_not_refuse(self, tmp_path, monkeypatch):
         """A pinned recording whose CURRENT uid is undeterminable (not signed in /
@@ -1128,6 +1135,44 @@ class TestSCR116AccountOwnershipGate:
 
         assert uploaded, "undeterminable current uid must not block the upload"
         assert not (result.upload_warning and "account mismatch" in result.upload_warning.lower())
+        assert result.account_mismatch is None
+
+    def test_upload_failure_warning_does_not_set_account_mismatch(
+        self, tmp_path, monkeypatch
+    ):
+        """SCR-171 discriminator: ``upload_warning`` is overloaded (scrub/upload
+        failures set it too), so the daemon drives the ``account_mismatch`` event
+        off the TYPED ``account_mismatch`` field instead. A pure upload failure
+        with no account mismatch must set ``upload_warning`` but leave
+        ``account_mismatch`` None — otherwise the daemon would emit a false event."""
+        from screencap import auth
+        from screencap import terminal_stage as ts
+        from screencap.terminal_stage import CloudCopyOutcome
+
+        rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=1)
+        # No owner pin → the account gate never fires.
+        monkeypatch.setattr(
+            auth, "get_id_token", lambda force_refresh=False: _jwt({"user_id": "uid-A"})
+        )
+        scrubbed = rec_dir.parent / f"{rec_dir.name}-scrubbed"
+        scrubbed.mkdir()
+        (scrubbed / "chunk_0000.mp4").write_bytes(b"\x00" * 32)
+        monkeypatch.setattr(
+            ts.CloudCopyProducer, "produce",
+            lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+        )
+        import screencap.upload as up
+
+        def _boom_upload(directory, **kw):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(up, "upload_recording", _boom_upload)
+        monkeypatch.setattr(ts, "_open_ledger", lambda d: None)
+
+        result = ts.run_terminal_stage(rec_dir)
+
+        assert result.upload_warning and "upload failed" in result.upload_warning.lower()
+        assert result.account_mismatch is None
 
 
 # ---------------------------------------------------------------------------

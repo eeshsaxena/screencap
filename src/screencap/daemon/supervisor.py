@@ -27,10 +27,17 @@ from screencap.pidfile import CLAIMANT_DAEMON
 
 if TYPE_CHECKING:
     from screencap.daemon.schema import RecordingStartRequest
+    from screencap.terminal_stage import TerminalResult
 
 logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
+
+# Bound the best-effort ``whoami`` enrichment in ``_maybe_emit_account_mismatch``
+# so a slow Keychain/token-refresh I/O can't pace the serial startup sweep (each
+# resume is awaited inline). On timeout the enrichment degrades to null/False
+# while the gate-authoritative ``signed_in_uid`` still publishes.
+_WHOAMI_ENRICH_TIMEOUT_S = 5.0
 
 __all__ = ["Supervisor", "_extra_output_dir_allowlist"]
 
@@ -555,7 +562,60 @@ class Supervisor:
                 )
                 return None
 
-        return await _asyncio.to_thread(_run)
+        result = await _asyncio.to_thread(_run)
+        # SCR-171: lift an account-ownership-mismatch refusal onto /v0/events. This
+        # is the single emit point for ALL daemon detection paths — startup sweep,
+        # crash/restart resume, and the post-engine-exit resume funneled here by
+        # ``_handle_engine_exit`` — since every one of them lands in this method.
+        await self._maybe_emit_account_mismatch(result, Path(recording_dir).name)
+        return result
+
+    async def _maybe_emit_account_mismatch(
+        self, result: "TerminalResult | None", recording_name: str
+    ) -> None:
+        """Publish an advisory ``account_mismatch`` /v0/events event (SCR-171).
+
+        Driven off the TYPED ``TerminalResult.account_mismatch`` field, never the
+        overloaded ``upload_warning`` (scrub/upload failures also set that), so a
+        false event is never emitted. ``signed_in_uid`` is gate-authoritative;
+        ``signed_in_email`` / ``stale`` are best-effort enrichment from ``whoami``
+        read OFF-loop (it does blocking Keychain + token-refresh I/O) a beat later,
+        bounded by a short timeout so a slow token refresh can't pace the serial
+        startup sweep — on timeout the enrichment degrades (email null / stale
+        False) while the gate-authoritative ``signed_in_uid`` still publishes.
+        ``whoami`` omits ``stale`` on success, so it is normalized to ``False``.
+        Fail-open: a whoami/publish failure is logged and swallowed so an advisory
+        emit never breaks a resume.
+        """
+        mismatch = result.account_mismatch if result is not None else None
+        if mismatch is None:
+            return
+        try:
+            from screencap import auth
+
+            try:
+                info = await asyncio.wait_for(
+                    asyncio.to_thread(auth.whoami),
+                    timeout=_WHOAMI_ENRICH_TIMEOUT_S,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                # Slow token refresh: degrade email/stale enrichment; the
+                # gate-authoritative signed_in_uid below is unaffected.
+                info = {}
+            await self._publish_daemon_event(
+                _stderr_events.EVENT_ACCOUNT_MISMATCH,
+                recording=recording_name,
+                owner_uid=mismatch.owner_uid,
+                signed_in_uid=mismatch.signed_in_uid,
+                signed_in_email=info.get("email"),
+                stale=info.get("stale", False),
+            )
+        except Exception:  # noqa: BLE001 — advisory emit must never break a resume
+            logger.warning(
+                "resume_terminal_stage: account_mismatch emit failed for %s",
+                recording_name,
+                exc_info=True,
+            )
 
     def has_inflight_resume(self) -> bool:
         """True while any crash/restart resume worker is in flight (U6).

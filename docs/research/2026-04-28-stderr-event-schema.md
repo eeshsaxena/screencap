@@ -120,7 +120,30 @@ exists, and otherwise read from the emit site.
 Published by the daemon (not the engine subprocess), riding the same schema
 version and JSON shape so tolerant clients can handle them on the same taxonomy:
 `engine_crashed`, `previous_session_recovered`, `previous_session_force_terminated`,
-`subscribed`.
+`account_mismatch`, `subscribed`.
+
+- **`account_mismatch`** (SCR-171) — **advisory, NON-terminal**, no exit code.
+  Emitted when the daemon's terminal-stage resume (startup sweep, crash/restart,
+  or post-engine-exit — all funnel through `Supervisor.resume_terminal_stage`)
+  detects a cloud recording whose pinned `owner_uid` differs from the
+  now-signed-in uid: cloud convergence is refused and the recording is kept
+  local. Lifts the existing startup-sweep refusal onto the bus so a subscriber
+  (MCP server / macOS app) reacts without polling `recording.list` + `whoami`.
+  Fields: `recording: str` (directory name), `owner_uid: str`, `signed_in_uid:
+  str` (both gate-authoritative for the comparison that fired), plus
+  `whoami`-sourced `signed_in_email: str | null` and `stale: bool` (both may be
+  null/`true` when auth is stale a beat after detection — `signed_in_uid` stays
+  authoritative; `whoami` omits `stale` on success, so it is normalized to
+  `false`). Note the converse is not diagnostic either: `stale=false` with
+  `signed_in_email=null` does **not** imply a fresh enrichment — it also occurs on
+  a post-gate sign-out or when the beat-later `whoami` enrichment times out
+  (degraded to `{}`). Only `signed_in_uid` is authoritative. Carries user identity
+  (uid/email) but stays inside the same-EUID
+  `/v0/events` trust boundary, which already exposes the same fields via
+  `/v0/auth.whoami` (see `SECURITY.md`). Additive/non-breaking —
+  `EVENT_SCHEMA_VERSION` is unchanged. No consumer may map it to a stop/teardown.
+  Surfaces the *mismatch* only; the inverse `account_resolved` (re-login → upload
+  can proceed) is a deferred follow-up.
 
 ### Upload pipeline events (plan U1)
 

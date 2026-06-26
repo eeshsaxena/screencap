@@ -147,6 +147,50 @@ async def test_events_since_in_retained_window_replays_then_lives() -> None:
 
 
 @pytest.mark.asyncio
+async def test_account_mismatch_event_replays_to_late_subscriber() -> None:
+    """SCR-171: the daemon publishes ``account_mismatch`` during the startup
+    sweep, which can run BEFORE a subscriber (MCP server / macOS app) connects.
+    A late subscriber that captured a snapshot cursor first and reconnects with
+    ``?since=<cursor>`` still receives the event via replay — the contract that
+    keeps the push signal from being missed across the connect gap. Published
+    BEFORE the subscriber joins on purpose (the production timing the replay
+    buffer exists to cover), not after."""
+    from screencap import _stderr_events
+
+    app = await _build_app()
+    # Snapshot cursor captured BEFORE the sweep publishes.
+    snapshot = app.state.event_bus.current_cursor()
+
+    await app.state.event_bus.publish(
+        {
+            "type": _stderr_events.EVENT_ACCOUNT_MISMATCH,
+            "schema_version": _stderr_events.EVENT_SCHEMA_VERSION,
+            "ts": 1.0,
+            "recording": "rec-A",
+            "owner_uid": "uid-A",
+            "signed_in_uid": "uid-B",
+            "signed_in_email": "b@example.com",
+            "stale": False,
+        }
+    )
+
+    response, lines = await _open_stream(app, f"/v0/events?since={snapshot}")
+    assert response.status_code == 200
+    subscribed = await _read_line(lines)
+    assert subscribed["type"] == "subscribed"
+
+    replayed = await _read_line(lines)
+    assert replayed["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH
+    assert replayed["cursor"] == snapshot + 1
+    assert replayed["recording"] == "rec-A"
+    assert replayed["owner_uid"] == "uid-A"
+    assert replayed["signed_in_uid"] == "uid-B"
+    assert replayed["signed_in_email"] == "b@example.com"
+    assert replayed["stale"] is False
+    await lines.aclose()
+
+
+@pytest.mark.asyncio
 async def test_events_since_zero_replays_full_retained_window() -> None:
     """``?since=0`` means "from before any event" and replays everything
     currently retained in the ring."""
