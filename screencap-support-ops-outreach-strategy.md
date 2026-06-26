@@ -92,6 +92,19 @@ Target **2–3 contacts per company** (a bullseye ops person + a champion or all
 
 Target list size to start: **100–150 companies.**
 
+### v2 refined filter stack (use once paid filters are available)
+
+The free-tier list (industry + size + title) lets in false positives — tiny point-solution startups, devtools, agencies. With the paid trial unlocked, tighten to these:
+
+- **Industry:** keep `Computer Software` + `Internet`; **exclude** `Staffing & Recruiting`, `Marketing & Advertising`, `Management Consulting`, `IT & Services`.
+- **Employee count:** raise the floor to **101–500** (drops thin-ops startups).
+- **Technologies (the accuracy unlock):** require they *use* at least one of `Salesforce`, `Zendesk`, `Looker`, `Snowflake`, `HubSpot`, `Gainsight`, `Intercom`. Confirms a real, tooled ops/CS operation; removes devtools and bare startups instantly.
+- **Funding (optional):** `Series B`+ — real ops team, budget, automation appetite.
+- **Management level:** `Director`, `VP`, `C-Suite` (also caps you to ~1–3 contacts/company).
+- **Lookalikes:** seed with the cleanest fits (e.g., Envoy, Kustomer) → "find similar."
+
+**Validation step:** after applying, spot-check 10 companies to confirm the false positives are gone before committing the list. If a devtool-type still slips through, add another required technology.
+
 ---
 
 ## 6. The sequence (Apollo cadence)
