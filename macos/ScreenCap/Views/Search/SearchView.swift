@@ -8,6 +8,9 @@ import SwiftUI
 struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @Environment(\.openWindow) private var openWindow
+    /// The app-wide recordings index — cross-referenced by name to detect a stub
+    /// result (uploaded; local media deleted) before opening inspect.
+    @EnvironmentObject private var index: RecordingsIndex
 
     // SCR-177 — shared per-result-set frame resolver + thumbnail cache (one
     // cache across the whole list, not per-row).
@@ -18,6 +21,9 @@ struct SearchView: View {
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
     @State private var searchTask: Task<Void, Never>?
+    /// Stub-recording guard message — shown via an alert instead of opening an
+    /// inspect window that would fail to load (mirrors the Recordings list).
+    @State private var rowError: String?
 
     var body: some View {
         content
@@ -30,6 +36,15 @@ struct SearchView: View {
                 .background(.bar)
             }
             .task { await loadSettings() }
+            .alert("Can\u{2019}t open recording", isPresented: errorBinding) {
+                Button("OK") { rowError = nil }
+            } message: {
+                Text(rowError ?? "")
+            }
+    }
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { rowError != nil }, set: { if !$0 { rowError = nil } })
     }
 
     // MARK: - Search field
@@ -104,7 +119,7 @@ struct SearchView: View {
                 ForEach(days, id: \.day) { group in
                     Section(searchDayLabel(group.day)) {
                         ForEach(group.items) { item in
-                            Button { openReview(item) } label: {
+                            Button { openInspect(item) } label: {
                                 ResultRow(
                                     item: item,
                                     queryTerms: results.queryTerms,
@@ -119,7 +134,7 @@ struct SearchView: View {
                 if !unanchored.isEmpty {
                     Section("Heard in audio (time approximate)") {
                         ForEach(unanchored) { item in
-                            Button { openReview(item) } label: {
+                            Button { openInspect(item) } label: {
                                 ResultRow(
                                     item: item,
                                     queryTerms: results.queryTerms,
@@ -259,14 +274,25 @@ struct SearchView: View {
         searchTask = Task { await model.search(trimmed, contentIndexEnabled: contentIndexEnabled) }
     }
 
-    /// Opens the Review window for the result's recording and (U6) requests a
-    /// one-shot seek to the hit moment, delivered out-of-band so the window
-    /// stays keyed on the recording name.
-    private func openReview(_ item: SearchResultItem) {
-        if let anchorMs = item.anchorMs {
-            ReviewWindowOpener.shared.pendingSeekMs[item.recording] = anchorMs
+    /// Opens the read-only inspect window for the result's recording and (U6)
+    /// requests a one-shot seek to the hit moment, delivered out-of-band so the
+    /// window stays keyed on the recording name. A stub recording (uploaded;
+    /// local media deleted) has nothing to inspect, so it shows the same
+    /// friendly download message the Recordings list shows rather than opening a
+    /// window that would fail to load.
+    private func openInspect(_ item: SearchResultItem) {
+        let isStub = index.recordings.first(where: { $0.name == item.recording })?.isStub ?? false
+        switch InspectRouting.decide(
+            recording: item.recording, anchorMs: item.anchorMs, isStub: isStub
+        ) {
+        case .unavailable(let message):
+            rowError = message
+        case .open(let recording, let seekMs):
+            if let seekMs {
+                InspectWindowOpener.shared.pendingSeekMs[recording] = seekMs
+            }
+            openWindow(id: InspectWindowID, value: recording)
         }
-        openWindow(id: ReviewWindowID, value: item.recording)
     }
 
     private func loadSettings() async {

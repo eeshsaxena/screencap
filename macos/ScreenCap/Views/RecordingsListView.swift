@@ -4,8 +4,10 @@ import SwiftUI
 /// newest day first. When `filterDay` is set, shows only recordings from that
 /// day; "Show all" breadcrumb clears the filter.
 ///
-/// Row click triggers Unit 14a (`screencap view <name>` link-out to the user's
-/// default browser) — replaced by the native viewer in v1.1.
+/// Row click opens the native read-only inspect window for the recording
+/// ("just looking"), replacing the old `screencap view` browser link-out. The
+/// per-row Upload button still opens the upload/consent window; the CLI
+/// `screencap view` HTML viewer is unchanged for power users.
 struct RecordingsListView: View {
     @EnvironmentObject private var index: RecordingsIndex
     @Environment(\.openWindow) private var openWindow
@@ -117,7 +119,7 @@ struct RecordingsListView: View {
     @ViewBuilder
     private func row(for rec: RecordingSummary) -> some View {
         Button {
-            openInBrowser(rec)
+            openInspect(rec)
         } label: {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -200,27 +202,19 @@ struct RecordingsListView: View {
         Self.longDateFormatter.string(from: day)
     }
 
-    /// Unit 14a: shell out to `screencap view <name>`. The Python side
-    /// regenerates `viewer.html` if needed and `open`s it in the default
-    /// browser. The `--` separator forces Click to treat the recording
-    /// name as a positional argument even if it begins with `--`.
-    ///
-    /// Uses `runAwaitingExit` (not `runDetached`) so a non-zero exit
-    /// surfaces in the row alert instead of looking like a broken click.
-    /// Stub recordings (`is_stub == true`) are pre-checked: their local
-    /// media has been deleted after upload, so `screencap view` would
-    /// fail anyway — surface the friendly explanation instead.
-    private func openInBrowser(_ rec: RecordingSummary) {
-        if rec.isStub {
-            rowError = "This recording was uploaded and the local copy was deleted. Run `screencap download \(rec.name)` to retrieve it."
-            return
-        }
-        Task {
-            do {
-                try await CLIClient.runAwaitingExit(["view", "--", rec.name], timeout: 15)
-            } catch {
-                await MainActor.run { rowError = error.localizedDescription }
-            }
+    /// Row click opens the native read-only inspect window for the recording
+    /// ("just looking"), replacing the old `screencap view` browser link-out. A
+    /// stub recording (`is_stub == true`) has had its local media deleted after
+    /// upload, so there is nothing local to inspect — surface the friendly
+    /// download message instead (shared with the search entry point via
+    /// `InspectRouting`). Opens at the recording's start (no seek). The per-row
+    /// Upload button is unchanged — it still opens the upload/consent window.
+    private func openInspect(_ rec: RecordingSummary) {
+        switch InspectRouting.decide(recording: rec.name, anchorMs: nil, isStub: rec.isStub) {
+        case .unavailable(let message):
+            rowError = message
+        case .open(let recording, _):
+            openWindow(id: InspectWindowID, value: recording)
         }
     }
 }
