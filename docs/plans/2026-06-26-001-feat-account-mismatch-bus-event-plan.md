@@ -1,7 +1,7 @@
 ---
 title: "feat: Emit /v0/events account_mismatch bus event (SCR-171)"
 type: feat
-status: active
+status: completed
 date: 2026-06-26
 deepened: 2026-06-26
 ---
