@@ -214,6 +214,9 @@ struct RecordingsListView: View {
         case .unavailable(let message):
             rowError = message
         case .open(let recording, _):
+            // Recordings open at the start — clear any stale pending seek so a
+            // reused inspect window doesn't jump to a prior search moment.
+            InspectWindowOpener.shared.pendingSeekMs[recording] = nil
             openWindow(id: InspectWindowID, value: recording)
         }
     }

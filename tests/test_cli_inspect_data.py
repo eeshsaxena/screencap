@@ -208,6 +208,33 @@ def test_events_export_failure_is_tolerated(recordings_root):
     assert envelope["video_path"].endswith("/rec-exportfail/video.mp4")
 
 
+def test_events_export_failure_with_markup_does_not_crash(recordings_root):
+    """SCR-117/169 parity: a *tolerated* events-export failure whose message
+    carries Rich-markup metacharacters (a bracketed path / SQLite identifier)
+    must not raise MarkupError out of prepare_inspect_data. Without escaping, the
+    warning's `console.print` would raise MarkupError — which is not a
+    ReviewPrepareError, so it would escape this tolerant handler and the CLI's
+    envelope guard, turning a non-fatal export failure into a raw-traceback crash
+    on the JSON channel."""
+    from rich.errors import MarkupError
+
+    rec_dir = _make_recording(recordings_root, "rec-markup")
+    _write_video(rec_dir / "video.mp4")
+
+    def boom(_d):
+        # An unbalanced ``[/]`` is the dangerous case — it makes rich raise.
+        raise RuntimeError("token=[/] in [secret] failed")
+
+    with mock.patch("screencap.review._export_canonical_events", side_effect=boom):
+        try:
+            envelope = prepare_inspect_data("rec-markup")
+        except MarkupError as e:  # pragma: no cover - the regression we guard against
+            raise AssertionError(f"markup in a tolerated export failure crashed: {e}") from e
+
+    assert envelope["ok"] is True
+    assert envelope["events_paths"] == []
+
+
 def test_nullable_timing_serialized_as_json_null(recordings_root):
     """SCR-102 parity: a playable recording with no action events still yields
     ok=True with null timing — the Swift readiness guard must not gate on it."""

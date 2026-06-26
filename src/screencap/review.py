@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from rich.console import Console
+from rich.markup import escape
 
 if TYPE_CHECKING:
     from screencap.scrubber import ScrubResult
@@ -423,7 +424,12 @@ def prepare_inspect_data(name: str) -> dict:
     try:
         _export_canonical_events(rec_dir)
     except Exception as e:  # noqa: BLE001 — tolerate any export failure (video-first)
-        console.print(f"[yellow]inspect-data: events unavailable: {e}[/yellow]")
+        # Escape the dynamic exception text (SCR-117/169): a markup
+        # metacharacter in the message (a bracketed path / SQLite identifier)
+        # would otherwise raise rich.MarkupError here, which — not being a
+        # ReviewPrepareError — would escape this tolerant handler and the CLI's
+        # envelope guard, crashing with a raw traceback on the JSON channel.
+        console.print(f"[yellow]inspect-data: events unavailable: {escape(str(e))}[/yellow]")
     event_files = _resolve_event_files(rec_dir)
     events_paths = [str(p.resolve()) for p in event_files]
 

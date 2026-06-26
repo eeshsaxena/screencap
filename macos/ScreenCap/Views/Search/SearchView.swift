@@ -288,9 +288,10 @@ struct SearchView: View {
         case .unavailable(let message):
             rowError = message
         case .open(let recording, let seekMs):
-            if let seekMs {
-                InspectWindowOpener.shared.pendingSeekMs[recording] = seekMs
-            }
+            // Assign the (possibly nil) seek — assigning nil clears any stale
+            // entry from a prior reuse, so a later open-at-start for this
+            // recording can't inherit an old search moment.
+            InspectWindowOpener.shared.pendingSeekMs[recording] = seekMs
             openWindow(id: InspectWindowID, value: recording)
         }
     }

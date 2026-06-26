@@ -1508,7 +1508,11 @@ def inspect_data_cmd(name, as_json):
     # name carrying Rich-markup metacharacters must not crash or be stripped.
     console.print(f"[bold]{escape(str(name))}[/bold]")
     console.print(f"  video:  [dim]{escape(str(envelope['video_path']))}[/dim]")
-    console.print(f"  events: [dim]{escape(str(envelope['events_path']))}[/dim]")
+    # events_path may be None for inspect (video-first: a recording with no
+    # action events still opens), so show an explicit "(no events)" rather than
+    # a bare "None".
+    events_display = envelope["events_path"] or "(no events)"
+    console.print(f"  events: [dim]{escape(str(events_display))}[/dim]")
     if envelope.get("video_pixfmt_remediated"):
         console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
 
