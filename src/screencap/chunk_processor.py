@@ -162,17 +162,15 @@ class ChunkProcessor:
         self._recording_name = recording_name or self._capture_dir.name
         self._upload_enabled = upload_enabled
         self._auto_delete = auto_delete
-        self._rest_threshold = rest_threshold
         self._flush_requested = flush_requested
         self._flush_ack_counter = flush_ack_counter
         self._flush_lock = flush_lock
         self._cloud_intent = cloud_intent
         self._privacy_mode = privacy_mode
-        self._screen_filter = screen_filter
         # SCR-35: manifest production (mode selection + blocked_intervals +
         # partial-file cleanup) is owned by the ChunkManifest seam, injected as
-        # the PipelineStageRunner manifest step. The processor no longer reads
-        # segmentation_mode itself.
+        # the PipelineStageRunner manifest step. rest_threshold and screen_filter
+        # are passed straight into the seam — the processor keeps no copy.
         from screencap.chunk_manifest import ChunkManifest
 
         self._chunk_manifest = ChunkManifest(
@@ -196,33 +194,20 @@ class ChunkProcessor:
         # SCR-35 (U3): the ChunkScrubber seam owns the "is scrubbing on?"
         # decision AND all scrub/masking-config construction (redaction pipeline
         # + anonymizer + screenshot-masking classifier/evaluator, incl. the
-        # cloud-intent PUBLIC override). The factory reports an explicit
-        # ScrubInit upload-policy fact instead of reaching back and mutating
-        # processor state. The outer guard is fail-closed: an unexpected
-        # construction failure for a cloud-intent recording disables uploads
-        # rather than letting it ship unscrubbed.
-        from screencap.chunk_scrubber import ChunkScrubber, ScrubInit
+        # cloud-intent PUBLIC override). create() reports an explicit ScrubInit
+        # upload-policy fact instead of reaching back and mutating processor
+        # state, and is total (fail-closed: an unexpected construction failure
+        # for a cloud-intent recording disables uploads rather than shipping
+        # unscrubbed).
+        from screencap.chunk_scrubber import ChunkScrubber
 
         self._upload_disabled_reason: str | None = None
-        try:
-            self._chunk_scrubber, _scrub_init = ChunkScrubber.create(
-                self._capture_dir,
-                cloud_intent=cloud_intent,
-                upload_enabled=upload_enabled,
-                scrub_enabled=scrub_enabled,
-            )
-        except Exception as e:
-            logger.error(f"Scrub seam construction failed: {e}", exc_info=True)
-            self._chunk_scrubber = ChunkScrubber(
-                self._capture_dir, enabled=False, pipeline=None, anonymizer=None,
-                evaluator=None, classifier=None, pixel_ratio=2.0,
-            )
-            _scrub_init = ScrubInit(
-                disable_uploads_reason=(
-                    f"Scrub init failed: {e}"
-                    if (cloud_intent and upload_enabled) else None
-                )
-            )
+        self._chunk_scrubber, _scrub_init = ChunkScrubber.create(
+            self._capture_dir,
+            cloud_intent=cloud_intent,
+            upload_enabled=upload_enabled,
+            scrub_enabled=scrub_enabled,
+        )
 
         # Consume the upload-policy fact. _upload_enabled and
         # _upload_disabled_reason MUST be set together: _process_chunk computes
@@ -752,14 +737,15 @@ class ChunkProcessor:
             transcript_path = artifacts.transcript
 
             # 5. Scrub text surfaces + mask screenshots when the user opted in.
-            #    ChunkScrubber owns the "is scrubbing on?" decision (SCR-35) and
-            #    returns None when off (no Scrubber constructed). The content-
-            #    index pass branches on a real ScrubResult, never on the attempt.
+            #    ChunkScrubber owns the "is scrubbing on?" decision (SCR-35). The
+            #    content-index pass branches on a real ScrubResult, never on the
+            #    attempt, so a disabled recording indexes nothing.
+            scrub_result = None
             if self._chunk_scrubber.is_enabled:
                 self._set_status("Redacting sensitive data...")
-            scrub_result = self._chunk_scrubber.scrub(
-                idx, start_ts, end_ts, transcript_path,
-            )
+                scrub_result = self._chunk_scrubber.scrub(
+                    idx, start_ts, end_ts, transcript_path,
+                )
             if scrub_result is not None:
                 # 5b. SCR-118 content index — fail-open, must never affect the
                 # chunk's status, upload, or deletion (AE1). Runs here (pre-

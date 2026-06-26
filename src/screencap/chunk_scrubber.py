@@ -81,7 +81,7 @@ class ChunkScrubber:
         construction that used to live inline in ``ChunkProcessor.__init__``:
         the redaction pipeline + anonymizer, and the screenshot-masking
         classifier/evaluator (with the cloud-intent ``PrivacyMode.PUBLIC``
-        override). The decision matrix is preserved verbatim:
+        override). The decision matrix:
 
           * cloud-intent + uploads on  → init; a deps/masking failure returns a
             non-None ``disable_uploads_reason`` (fail-closed).
@@ -89,10 +89,42 @@ class ChunkScrubber:
             scrubbing (``enabled=False``), uploads unaffected.
           * neither                    → inert seam, no heavy imports.
 
-        The init-failure → upload-disable coupling is now an explicit
-        ``ScrubInit`` the sequencer consumes, not a mutation reaching back into
-        ``ChunkProcessor`` state.
+        The init-failure → upload-disable coupling is an explicit ``ScrubInit``
+        the sequencer consumes, not a mutation reaching back into
+        ``ChunkProcessor`` state. This wrapper is **total**: any unexpected
+        construction failure falls back to an inert seam, fail-closed (uploads
+        disabled for a cloud-intent recording) so a recording never ships
+        unscrubbed because of a scrub-init crash.
         """
+        try:
+            return cls._build(
+                capture_dir,
+                cloud_intent=cloud_intent,
+                upload_enabled=upload_enabled,
+                scrub_enabled=scrub_enabled,
+            )
+        except Exception as e:
+            logger.error(f"Scrub seam construction failed: {e}", exc_info=True)
+            inert = cls(
+                capture_dir, enabled=False, pipeline=None, anonymizer=None,
+                evaluator=None, classifier=None, pixel_ratio=2.0,
+            )
+            reason = (
+                f"Scrub init failed: {e}"
+                if (cloud_intent and upload_enabled) else None
+            )
+            return inert, ScrubInit(disable_uploads_reason=reason)
+
+    @classmethod
+    def _build(
+        cls,
+        capture_dir: Path | str,
+        *,
+        cloud_intent: bool,
+        upload_enabled: bool,
+        scrub_enabled: bool,
+    ) -> tuple["ChunkScrubber", ScrubInit]:
+        """The scrub/masking-init decision matrix (wrapped by :meth:`create`)."""
         pipeline = None
         anonymizer = None
         evaluator = None
