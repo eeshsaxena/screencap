@@ -608,7 +608,7 @@ class Supervisor:
                 owner_uid=mismatch.owner_uid,
                 signed_in_uid=mismatch.signed_in_uid,
                 signed_in_email=info.get("email"),
-                stale=bool(info.get("stale", False)),
+                stale=info.get("stale", False),
             )
         except Exception:  # noqa: BLE001 — advisory emit must never break a resume
             logger.warning(
