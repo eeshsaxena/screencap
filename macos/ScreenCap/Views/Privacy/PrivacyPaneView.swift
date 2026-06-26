@@ -50,15 +50,17 @@ struct PrivacyPaneView: View {
         .padding(.vertical, 12)
     }
 
-    /// Recovery entry point for a skipped/incomplete first-run setup. Shown only
-    /// while `setupDismissed` is latched — i.e. the user tapped "Skip for now"
-    /// and setup hasn't since completed (completing it clears the flag via the
-    /// daemon-grant auto-clear). This is the always-available way back into the
-    /// walkthrough; without it a mistaken Skip is a dead end on the CLI-fallback
-    /// path, where the launch gate never re-pops.
+    /// Recovery entry point for a skipped/incomplete first-run setup. Shown while
+    /// `setupDismissed` is latched **and** a required permission is still missing
+    /// (`PermissionController.shouldShowFinishSetupBanner`, SCR-143). This is the
+    /// always-available way back into the walkthrough; without it a mistaken Skip
+    /// is a dead end on the CLI-fallback path, where the launch gate never
+    /// re-pops. It clears once the required permissions are granted — including
+    /// the CLI-fallback case where the daemon-grant auto-clear never fires — so
+    /// it never makes a stale "can't record" claim on a machine that can record.
     @ViewBuilder
     private var finishSetupBanner: some View {
-        if permissions.setupDismissed {
+        if permissions.shouldShowFinishSetupBanner {
             HStack(spacing: 12) {
                 Image(systemName: "exclamationmark.shield")
                     .font(.system(size: 18))
@@ -68,9 +70,9 @@ struct PrivacyPaneView: View {
                     // separate, content-free focus stop.
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Permission setup was skipped")
+                    Text("Finish permission setup")
                         .font(.subheadline.weight(.semibold))
-                    Text("ScreenCap can't record until the helper and its permissions are set up.")
+                    Text("Grant Screen Recording, Accessibility, and Input Monitoring to enable recording.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

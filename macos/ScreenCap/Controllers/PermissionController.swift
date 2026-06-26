@@ -215,6 +215,20 @@ final class PermissionController: ObservableObject {
             || inputMonitoring == .denied
     }
 
+    /// Whether the Privacy tab's "Finish setup" recovery banner should show
+    /// (SCR-143). Decouples "did the user skip the walkthrough" (`setupDismissed`,
+    /// the launch-gate concern) from "can this machine record" (the banner's
+    /// claim). Keying on `setupDismissed` alone strands the banner forever on the
+    /// CLI-fallback path, where the daemon-grant auto-clear (`updateDaemonGrants`)
+    /// never fires — so the orange "can't record" claim persists even after the
+    /// user has granted permissions and recording works. Requiring
+    /// `!allRequiredGranted` too mirrors the CLI-fallback recording-start gate
+    /// (`RecorderController.start`), so the banner clears exactly when the app's
+    /// own contract permits recording.
+    var shouldShowFinishSetupBanner: Bool {
+        setupDismissed && !allRequiredGranted
+    }
+
     /// Dev-only hint shown to explain the "System Settings says granted but the
     /// app says denied" confusion that ad-hoc builds cause. Gated on an *actual*
     /// denial (daemon- or app-process-reported) so a fully-granted ad-hoc build

@@ -268,6 +268,44 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertFalse(permissions.allRequiredDaemonGrantsGranted)
     }
 
+    // MARK: - SCR-143: "Finish setup" banner visibility (decoupled from launch gate)
+
+    @MainActor
+    func testFinishSetupBannerHiddenOnceRequiredPermissionsGranted() {
+        // The regression: on the CLI-fallback path the daemon-grant auto-clear
+        // never fires, so `setupDismissed` stays latched forever. The banner must
+        // not key on `setupDismissed` alone — once the app process can record
+        // (`allRequiredGranted`, the same predicate the CLI-fallback start gate
+        // uses), the "can't record" banner must disappear even with no daemon.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(true)
+        XCTAssertFalse(
+            permissions.shouldShowFinishSetupBanner,
+            "banner must clear once required permissions are granted, even with the daemon absent"
+        )
+    }
+
+    @MainActor
+    func testFinishSetupBannerShownWhenDismissedAndPermissionsMissing() {
+        // Skipped the walkthrough AND still missing a required grant: the recovery
+        // banner is the only way back into the walkthrough on CLI-fallback, so it
+        // must show — and its "enable recording" claim is truthful here.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+    }
+
+    @MainActor
+    func testFinishSetupBannerHiddenWhenWalkthroughNeverSkipped() {
+        // Never skipped → the launch gate owns setup; no recovery banner, even
+        // while permissions are still missing.
+        let (permissions, _) = makeController()
+        permissions._testSetRequiredPermissionsGranted(false)
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
+    }
+
     // MARK: - U5: daemon-grant refresh lifecycle + row icons
 
     @MainActor
