@@ -83,19 +83,33 @@ final class SearchAccessibilityTests: XCTestCase {
     func testResultRowLabelActivityLeadsWithAppThenTitleThenTime() {
         let it = item(stream: .activity, app: "Salesforce", title: "Refunds")
         let label = SearchAccessibility.resultRowLabel(it)
-        XCTAssertTrue(label.contains("Salesforce"), label)
-        XCTAssertTrue(label.contains("Refunds"), label)
-        XCTAssertTrue(label.contains(it.timeLabel), label)            // timezone-agnostic
+        // Pin the full token order ("{app}. {title}. at {time}"), not just
+        // presence — a `.contains` check would pass on a reordered label.
+        XCTAssertEqual(label, "Salesforce. Refunds. at \(it.timeLabel)")
         XCTAssertFalse(label.contains("Approximate"), label)
     }
 
     func testResultRowLabelScreenIncludesSnippetAndStream() {
         let it = item(stream: .screen, snippet: "refund error")
         let label = SearchAccessibility.resultRowLabel(it)
-        XCTAssertTrue(label.contains("refund error"), label)
-        XCTAssertTrue(label.contains("On screen"), label)
-        XCTAssertTrue(label.contains(it.timeLabel), label)
+        // Pin the full token order ("{snippet}. On screen. at {time}").
+        XCTAssertEqual(label, "refund error. On screen. at \(it.timeLabel)")
         XCTAssertFalse(label.contains("Approximate"), label)
+    }
+
+    func testResultRowLabelActivityWithNilAppFallsBackToActivityWord() {
+        // No captured app name → the row leads with the generic "Activity".
+        let it = item(stream: .activity, app: nil, title: nil)
+        let label = SearchAccessibility.resultRowLabel(it)
+        XCTAssertEqual(label, "Activity. at \(it.timeLabel)")
+    }
+
+    func testResultRowLabelActivityWithNilTitleOmitsSecondary() {
+        // A missing window title skips the secondary entirely — never speaks "nil".
+        let it = item(stream: .activity, app: "Finder", title: nil)
+        let label = SearchAccessibility.resultRowLabel(it)
+        XCTAssertFalse(label.contains("nil"), label)
+        XCTAssertEqual(label, "Finder. at \(it.timeLabel)")
     }
 
     func testResultRowLabelAudioMarksApproximate() {
@@ -141,6 +155,23 @@ final class SearchAccessibilityTests: XCTestCase {
 
     func testAnnouncementEmptyReadsNoMatches() {
         XCTAssertEqual(SearchAccessibility.searchOutcomeAnnouncement(for: loaded(0)), "No matches")
+    }
+
+    func testAnnouncementAuthoritativeEmptyReadsNothingRecorded() {
+        // A time-scoped query over a recorded-but-empty window must announce the
+        // same outcome the visible emptyRow shows ("Nothing recorded then"), not
+        // the generic "No matches".
+        let phase = SearchViewModel.Phase.loaded(SearchResults(
+            items: [],
+            coverage: CoverageReport(screen: .notRun, audio: .notRun, activity: .empty),
+            consentNeeded: false,
+            timeWindow: TimeWindow(startMs: 1_700_000_000_000, endMs: 1_700_000_600_000),
+            appFilter: nil
+        ))
+        XCTAssertEqual(
+            SearchAccessibility.searchOutcomeAnnouncement(for: phase),
+            "Nothing recorded then"
+        )
     }
 
     func testAnnouncementDaemonDown() {

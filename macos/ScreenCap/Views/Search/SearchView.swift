@@ -127,11 +127,12 @@ struct SearchView: View {
         return List(selection: $selectedResultID) {
             Section {
                 if results.timeWindow != nil || results.appFilter != nil {
-                    Label(interpretationText(results), systemImage: "wand.and.stars")
+                    let interpretation = interpretationText(results)
+                    Label(interpretation, systemImage: "wand.and.stars")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .listRowSeparator(.hidden)
-                        .accessibilityLabel(interpretationText(results))
+                        .accessibilityLabel(interpretation)
                 }
                 coverageRow(results.coverage)
                     .listRowSeparator(.hidden)
@@ -248,10 +249,10 @@ struct SearchView: View {
         switch state {
         case .notRun: return ""
         case .ok(let count): return "\(count)"
-        case .empty: return "no matches"
-        case .notIndexed: return "not indexed"
-        case .degraded: return "limited"
-        case .unavailable: return "unavailable"
+        // Count-independent words live in one place so the visible chip and the
+        // spoken label (SearchAccessibility.coverageChipLabel) can't drift.
+        case .empty, .notIndexed, .degraded, .unavailable:
+            return SearchAccessibility.coverageStatePhrase(for: state) ?? ""
         }
     }
 

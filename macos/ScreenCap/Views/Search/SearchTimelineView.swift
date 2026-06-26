@@ -76,7 +76,8 @@ struct ResultRow: View {
         .contentShape(Rectangle())
         // SCR-183 U2 — collapse the row's fragmented Text runs into one VoiceOver
         // stop. The thumbnail is already `.accessibilityHidden`; `.ignore` drops
-        // the rest and the enclosing Button announces this single label + "button".
+        // the rest so the row element announces this single combined label. (Rows
+        // are plain selectable List rows, not Buttons — see SearchView.resultRow.)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(SearchAccessibility.resultRowLabel(item))
         // Re-keys on the pointer so List row-reuse reloads the right frame. On

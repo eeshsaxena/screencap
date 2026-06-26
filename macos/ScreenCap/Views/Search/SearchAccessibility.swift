@@ -20,16 +20,27 @@ enum SearchAccessibility {
             return nil
         case .ok(let count):
             phrase = count == 1 ? "1 result" : "\(count) results"
-        case .empty:
-            phrase = "no matches"
-        case .notIndexed:
-            phrase = "not indexed"
-        case .degraded:
-            phrase = "limited"
-        case .unavailable:
-            phrase = "unavailable"
+        case .empty, .notIndexed, .degraded, .unavailable:
+            // Shared with the visible chip text (SearchView.coverageText) so the
+            // spoken and visible phrasings can't drift apart.
+            phrase = coverageStatePhrase(for: state) ?? ""
         }
         return "\(stream): \(phrase)"
+    }
+
+    /// The count-independent coverage phrase, shared by the spoken chip label and
+    /// the visible chip text so a future wording change updates both at once.
+    /// `.ok`/`.notRun` stay each caller's concern — the visible chip shows a bare
+    /// count while the spoken label spells "N results", and `.notRun` renders
+    /// nothing visible and stays silent.
+    static func coverageStatePhrase(for state: StreamState) -> String? {
+        switch state {
+        case .empty: return "no matches"
+        case .notIndexed: return "not indexed"
+        case .degraded: return "limited"
+        case .unavailable: return "unavailable"
+        case .ok, .notRun: return nil
+        }
     }
 
     /// One combined label for a result row, replacing the fragmented `Text` runs
@@ -86,7 +97,15 @@ enum SearchAccessibility {
             return "ScreenCap isn\u{2019}t running"
         case .loaded(let results):
             let count = results.items.count
-            if count == 0 { return "No matches" }
+            if count == 0 {
+                // Mirror the visible empty state: a time-scoped query over a
+                // recorded-but-empty window reads "Nothing recorded then" rather
+                // than the generic "No matches" (see SearchView.emptyRow).
+                if results.timeWindow != nil, case .empty = results.coverage.activity {
+                    return "Nothing recorded then"
+                }
+                return "No matches"
+            }
             return count == 1 ? "1 result" : "\(count) results"
         }
     }
