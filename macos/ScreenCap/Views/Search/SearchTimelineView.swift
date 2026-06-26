@@ -28,14 +28,26 @@ func searchDayLabel(_ day: Date) -> String {
 
 struct ResultRow: View {
     let item: SearchResultItem
+    // SCR-177 U4 — the matched terms to bold in the snippet, and the shared
+    // services that resolve + decode the leading thumbnail. Optional/defaulted so
+    // a row can still render (placeholder) without them.
+    var queryTerms: [String] = []
+    var frameIndex: RecordingFrameIndex?
+    var thumbnailLoader: ThumbnailLoader?
+
+    @State private var thumbState: ThumbState = .loading
+
+    private enum ThumbState {
+        case loading
+        case loaded(ThumbnailImage)
+        case miss
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: item.streamIcon)
-                .foregroundStyle(item.streamTint)
-                .frame(width: 18)
+            thumbnailCell
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.primaryText)
+                Text(primaryText)
                     .lineLimit(2)
                 if let secondary = item.secondaryText {
                     Text(secondary)
@@ -58,6 +70,67 @@ struct ResultRow: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
+        // Re-keys on the pointer so List row-reuse reloads the right frame and the
+        // load cancels on scroll-away (mirrors ScreenshotTruthPane).
+        .task(id: thumbnailLoadKey) { await loadThumbnail() }
+    }
+
+    /// Bold the matched query terms in content/audio snippets; activity rows have
+    /// no snippet to highlight.
+    private var primaryText: AttributedString {
+        switch item.stream {
+        case .activity: return AttributedString(item.primaryText)
+        case .screen, .audio: return SnippetHighlighter.attributed(item.primaryText, terms: queryTerms)
+        }
+    }
+
+    /// ~16:9 leading cell; the loaded frame replaces the stream-icon column, the
+    /// miss state reuses the slot for the icon. Accessibility-hidden — it is a
+    /// visual recognition aid; the Button already announces the row's text + time.
+    @ViewBuilder
+    private var thumbnailCell: some View {
+        Group {
+            switch thumbState {
+            case .loaded(let image):
+                Image(decorative: image.cgImage, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            case .loading:
+                Rectangle().fill(Color(nsColor: .separatorColor))
+            case .miss:
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor).opacity(0.4))
+                    .overlay {
+                        Image(systemName: item.streamIcon).foregroundStyle(item.streamTint)
+                    }
+            }
+        }
+        .frame(width: 56, height: 32)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .accessibilityHidden(true)
+    }
+
+    private var thumbnailLoadKey: String {
+        "\(item.recording)|\(item.anchorMs.map(String.init) ?? "nil")"
+    }
+
+    /// Resolve the pointer to a frame and decode its thumbnail. A `nil` anchor or
+    /// an over-stale snap resolves to `nil` in U1 → the miss placeholder (never an
+    /// arbitrary frame-0); an unreadable frame → miss too (R5).
+    private func loadThumbnail() async {
+        thumbState = .loading
+        guard let frameIndex, let thumbnailLoader,
+              let url = await frameIndex.resolve(recording: item.recording, anchorMs: item.anchorMs)
+        else {
+            thumbState = .miss
+            return
+        }
+        if Task.isCancelled { return }
+        if let image = await thumbnailLoader.thumbnail(for: url) {
+            if !Task.isCancelled { thumbState = .loaded(image) }
+        } else {
+            thumbState = .miss
+        }
     }
 }
 
