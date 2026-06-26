@@ -1467,6 +1467,52 @@ def review_data_cmd(name, as_json):
         console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
 
 
+@cli.command("inspect-data")
+@click.argument("name")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def inspect_data_cmd(name, as_json):
+    """Prepare a recording for read-only native inspection and emit a JSON envelope.
+
+    The no-scrub sibling of ``review-data``: called by the SwiftUI shell's
+    inspect window (opened from a search result or a recordings-list click —
+    "just looking", not uploading). Reads the LOCAL recording — video + events +
+    timing — from the original dir without running the scrubber, so it returns
+    in normal CLI latency rather than the minutes a scrub can take. Nothing here
+    ever leaves the device; masking is an upload concept and is absent.
+
+    The envelope shape matches ``review-data`` (the Swift decoder is shared), but
+    ``redaction``/``coverage`` are null and ``screenshots`` is empty. On failure:
+    ok=false + error + non-zero exit, never a raw traceback.
+    """
+    from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_inspect_data
+
+    try:
+        envelope = prepare_inspect_data(name)
+    except ReviewPrepareError as e:
+        err_payload = {"ok": False, "schema_version": REVIEW_SCHEMA_VERSION, "error": str(e)}
+        if as_json:
+            click.echo(json.dumps(err_payload))
+        else:
+            console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(envelope))
+        return
+
+    # Human-readable fallback for the rare CLI-direct user. The SwiftUI shell
+    # always passes --json (auto-detected via non-TTY stdout when spawned as a
+    # subprocess). Dynamic segments are escaped (SCR-117/SCR-169): a recording
+    # name carrying Rich-markup metacharacters must not crash or be stripped.
+    console.print(f"[bold]{escape(str(name))}[/bold]")
+    console.print(f"  video:  [dim]{escape(str(envelope['video_path']))}[/dim]")
+    console.print(f"  events: [dim]{escape(str(envelope['events_path']))}[/dim]")
+    if envelope.get("video_pixfmt_remediated"):
+        console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
+
+
 @cli.command("login")
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),

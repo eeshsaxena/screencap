@@ -86,18 +86,20 @@ def _export_canonical_events(rec_dir: Path) -> None:
     ensure_canonical_events(rec_dir)
 
 
-def _resolve_scrubbed_event_files(scrubbed_dir: Path) -> list[Path]:
-    """Resolve the scrubbed dir's actual event file set — the bytes that ship.
+def _resolve_event_files(rec_dir: Path) -> list[Path]:
+    """Resolve a recording dir's actual event file set.
 
-    Per-chunk ``events_*.jsonl`` when present (what a chunked recording
-    uploads), otherwise the combined ``events.jsonl``. Files renamed
-    ``*.scrub_failed`` are intentionally excluded — they are ineligible for
-    upload, so the review must not point at them either.
+    Dir-agnostic: works on the scrubbed copy (review — the bytes that ship) and
+    on the original dir (inspect — the local events to look at). Per-chunk
+    ``events_*.jsonl`` when present (what a chunked recording carries), otherwise
+    the combined ``events.jsonl``. Files renamed ``*.scrub_failed`` are
+    intentionally excluded — they are ineligible for upload, so the review must
+    not point at them either (a no-op on the original dir, which has none).
     """
-    chunk_files = sorted(scrubbed_dir.glob("events_*.jsonl"))
+    chunk_files = sorted(rec_dir.glob("events_*.jsonl"))
     if chunk_files:
         return chunk_files
-    combined = scrubbed_dir / "events.jsonl"
+    combined = rec_dir / "events.jsonl"
     return [combined] if combined.exists() else []
 
 
@@ -179,6 +181,81 @@ def _assert_within_recordings_root(path: Path, recordings_root: Path) -> None:
         )
 
 
+def _prepare_review_video(name: str) -> tuple[Path, Path, bool]:
+    """Shared local-video preparation for both ``review-data`` and
+    ``inspect-data``: resolve the recording dir and prepare the local
+    navigation video (concat ``chunk_*.mp4`` → remediate ``yuv444p`` for AVKit),
+    all in-process via PyAV on the ORIGINAL recording dir.
+
+    Returns ``(rec_dir, video_path, remediated)``. Raises ``ReviewPrepareError``
+    in the structurally distinct flavors the SwiftUI shell tells apart: an
+    invalid / path-traversal name, a missing recording, a recording carrying no
+    video to review, and a genuine "can't process this video" PyAV failure
+    (never a missing-binary message — R9). The video is a *local* navigation aid
+    that never uploads, so it is prepared from and left at the original dir.
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.engine.video import remediate_pixfmt_for_review
+    from screencap.viewer import _ensure_single_video
+
+    try:
+        rec_dir = resolve_recording_dir(name)
+    except ValueError as e:
+        # Invalid / path-traversal name — distinct from a decode failure and
+        # raised before any path emission (a bad request touches nothing).
+        raise ReviewPrepareError(str(e)) from e
+
+    if not rec_dir.exists():
+        raise ReviewPrepareError(f"Recording not found: {name}")
+
+    # fail_loud=True: a chunk-concat failure must propagate (the HTML viewer
+    # swallows it; review/inspect need correctness). The caught set spans
+    # RuntimeError/ValueError (the engine's documented failures) plus OSError
+    # (PyAV's av.error.OSError family and os.replace/mux write errors), so no
+    # failure mode escapes as a raw traceback past the envelope.
+    try:
+        _ensure_single_video(rec_dir, fail_loud=True)
+    except (RuntimeError, ValueError, OSError) as e:
+        raise ReviewPrepareError(f"can't process this video: {e}") from e
+
+    if not (rec_dir / "video.mp4").exists():
+        # No chunks and no merged/symlinked video.mp4 — the recording carries no
+        # video to review (video disabled, or an action-gated recording where no
+        # action fired). Structurally distinct from missing/decode failures.
+        raise ReviewPrepareError(f"Recording has no video to review: {name}")
+
+    try:
+        video_path, remediated = remediate_pixfmt_for_review(rec_dir)
+    except (RuntimeError, ValueError, OSError) as e:
+        raise ReviewPrepareError(f"can't process this video: {e}") from e
+
+    return rec_dir, video_path, remediated
+
+
+def _read_review_timing(
+    rec_dir: Path,
+) -> tuple[float | None, float | None, Literal["ok", "locked", "corrupt"]]:
+    """Shared timing read for the timeline pane's coordinate space, from the
+    original ``recording.db`` (scrubbing nulls content, not timestamps).
+
+    Returns ``(started_at, duration_seconds, timing_status)``. Both timing
+    values are nullable — a playable recording may have no action events
+    (``_read_recording_meta`` returns ``None``). ``timing_status`` (SCR-166)
+    disambiguates the null three ways: ``"ok"`` (clean read, including a benign
+    event-free recording or an absent DB), ``"locked"`` (a transient lock that
+    resolves once the writer releases), or ``"corrupt"`` (an unreadable DB).
+    """
+    from screencap.catalog import _read_recording_meta, find_db
+
+    db_path = find_db(rec_dir)
+    started_at: float | None = None
+    duration_seconds: float | None = None
+    timing_status: Literal["ok", "locked", "corrupt"] = "ok"
+    if db_path is not None:
+        started_at, duration_seconds, timing_status = _read_recording_meta(db_path)
+    return started_at, duration_seconds, timing_status
+
+
 def prepare_review_data(name: str) -> dict:
     """Run the full review-data preparation pipeline for ``name``.
 
@@ -205,51 +282,11 @@ def prepare_review_data(name: str) -> dict:
     (SCR-107) is kept as the back-compat boolean alias: ``True`` for both
     non-``"ok"`` states.
     """
-    from screencap.catalog import _read_recording_meta, find_db
-    from screencap.config import get_recordings_dir, resolve_recording_dir
-    from screencap.engine.video import remediate_pixfmt_for_review
-    from screencap.viewer import _ensure_single_video
+    from screencap.config import get_recordings_dir
 
-    try:
-        rec_dir = resolve_recording_dir(name)
-    except ValueError as e:
-        # Invalid / path-traversal name — distinct from a decode failure
-        # (no "can't process this video" prefix, no missing-binary text).
-        # Raised before any scrub or path emission (R11 — a bad request
-        # touches nothing).
-        raise ReviewPrepareError(str(e)) from e
-
-    if not rec_dir.exists():
-        raise ReviewPrepareError(f"Recording not found: {name}")
-
-    # Video pipeline (R15): concat chunks → remediate pixel format, all
-    # in-process via PyAV, operating on the ORIGINAL recording dir. The video
-    # is a local navigation aid that never uploads, so it is prepared from and
-    # left at the original — not the scrubbed copy. A genuine PyAV
-    # decode/process failure becomes the structural "can't process this video"
-    # state (R9) — never a missing-binary error, and distinct from the
-    # resolve/missing/no-video errors. The caught set spans
-    # RuntimeError/ValueError (the engine's documented failures) plus OSError
-    # (PyAV's av.error.OSError family and os.replace/mux write errors), so no
-    # failure mode escapes as a raw traceback past the envelope.
-    try:
-        # fail_loud=True: a chunk-concat failure must propagate here (the
-        # HTML viewer swallows it; review-data needs correctness).
-        _ensure_single_video(rec_dir, fail_loud=True)
-    except (RuntimeError, ValueError, OSError) as e:
-        raise ReviewPrepareError(f"can't process this video: {e}") from e
-
-    if not (rec_dir / "video.mp4").exists():
-        # No chunks and no merged/symlinked video.mp4 — the recording carries
-        # no video to review (video disabled, or an action-gated recording
-        # where no action fired). Structurally distinct from both a missing
-        # recording and a decode failure.
-        raise ReviewPrepareError(f"Recording has no video to review: {name}")
-
-    try:
-        video_path, remediated = remediate_pixfmt_for_review(rec_dir)
-    except (RuntimeError, ValueError, OSError) as e:
-        raise ReviewPrepareError(f"can't process this video: {e}") from e
+    # Resolve the recording dir + prepare the local navigation video (shared
+    # with inspect-data via _prepare_review_video).
+    rec_dir, video_path, remediated = _prepare_review_video(name)
 
     # Scrub-before-review (R1/R2/R7): prepare the exact post-hoc upload payload
     # — masked screenshots + scrubbed events/DB/transcript — so the bytes
@@ -279,7 +316,7 @@ def prepare_review_data(name: str) -> dict:
         # Resolve the event source to the scrubbed dir's ACTUAL file set
         # (per-chunk when chunked — what ships). Faithfulness by construction:
         # the review reads the same files the scrubbed dir contains.
-        event_files = _resolve_scrubbed_event_files(scrubbed_dir)
+        event_files = _resolve_event_files(scrubbed_dir)
         if not event_files:
             # No event files survived (e.g. all were fail-closed deleted during
             # scrub). Surface a clean, honest failure rather than an ok:true
@@ -315,12 +352,7 @@ def prepare_review_data(name: str) -> dict:
     # for corruption, instead of presenting either as a clean, event-free
     # review. `timing_error` (SCR-107) is kept as the back-compat boolean older
     # consumers read — True for both non-"ok" states.
-    db_path = find_db(rec_dir)
-    started_at: float | None = None
-    duration_seconds: float | None = None
-    timing_status: Literal["ok", "locked", "corrupt"] = "ok"
-    if db_path is not None:
-        started_at, duration_seconds, timing_status = _read_recording_meta(db_path)
+    started_at, duration_seconds, timing_status = _read_review_timing(rec_dir)
 
     return {
         "ok": True,
@@ -343,6 +375,83 @@ def prepare_review_data(name: str) -> dict:
         "timing_status": timing_status,
         # SCR-107 back-compat: True for both non-"ok" states, so an older
         # consumer that only reads this boolean still surfaces the advisory.
+        "timing_error": timing_status != "ok",
+        "video_pixfmt_remediated": remediated,
+    }
+
+
+def prepare_inspect_data(name: str) -> dict:
+    """Read-only LOCAL playback envelope — the no-scrub sibling of
+    ``prepare_review_data`` for the native inspect window ("just looking").
+
+    Same envelope *shape* the Swift decoder already understands, but sourced
+    entirely from the ORIGINAL recording dir with **no scrub**: the local
+    navigation video (shared core), the local events, and the timing coordinate
+    space. Masking is an upload concept, so this never runs the scrubber, never
+    acquires ``recording_scrub_lock``, never produces a ``<name>-scrubbed`` dir,
+    and emits no redaction/coverage evidence — the looking surface opens in
+    normal CLI latency, not the minutes a scrub can take.
+
+    Events go through ``ensure_canonical_events`` exactly as the review/upload
+    export does (``include_network`` off), so the inspect surface never shows
+    network rows the upload path excludes. ``screenshots`` is empty — the
+    inspect window is video-first and renders no masked-screenshot pane.
+
+    Raises ``ReviewPrepareError`` in the same structurally distinct flavors as
+    ``prepare_review_data`` for the video pipeline (invalid name / missing
+    recording / no video / "can't process this video"). Unlike review, a
+    recording with **no events** is not a failure — the video is still worth
+    looking at — so ``events_path`` may be ``None`` and ``events_paths`` empty,
+    and a failed events export is logged and tolerated rather than fatal; the
+    Swift readiness guard gates on the video, not the events.
+    """
+    from screencap.config import get_recordings_dir
+
+    recordings_root = get_recordings_dir()
+
+    # Resolve the recording dir + prepare the local navigation video (shared
+    # with review-data). No scrub, no lock.
+    rec_dir, video_path, remediated = _prepare_review_video(name)
+
+    # Local events from the ORIGINAL dir: ensure_canonical_events self-gates
+    # (no-op when chunked; exports the combined events.jsonl from the DB
+    # otherwise, with the same include_network=False config upload uses), then
+    # resolve the per-chunk / combined set. Inspect is video-first and
+    # read-only, so a failed export (e.g. a corrupt recording.db) is logged and
+    # tolerated — it must not block looking at the video — leaving an empty
+    # event set / timeline rather than failing the whole window.
+    try:
+        _export_canonical_events(rec_dir)
+    except Exception as e:  # noqa: BLE001 — tolerate any export failure (video-first)
+        console.print(f"[yellow]inspect-data: events unavailable: {e}[/yellow]")
+    event_files = _resolve_event_files(rec_dir)
+    events_paths = [str(p.resolve()) for p in event_files]
+
+    # Defense-in-depth: refuse to emit any path that escapes the recordings root
+    # — a symlink inside the dir could otherwise put an out-of-tree absolute
+    # path into the envelope that AVKit / the parser would then read.
+    _assert_within_recordings_root(video_path, recordings_root)
+    for p in event_files:
+        _assert_within_recordings_root(p, recordings_root)
+
+    started_at, duration_seconds, timing_status = _read_review_timing(rec_dir)
+
+    return {
+        "ok": True,
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "video_path": str(video_path.resolve()),
+        "events_path": events_paths[0] if events_paths else None,
+        "events_paths": events_paths,
+        # Video-first: the inspect window has no masked-screenshot pane, so no
+        # frame paths are emitted.
+        "screenshots": [],
+        # No scrub ran → no redaction/coverage evidence (explicitly null; the
+        # Swift Optional fields decode cleanly and inspect renders no evidence).
+        "redaction": None,
+        "coverage": None,
+        "started_at": started_at,
+        "duration_seconds": duration_seconds,
+        "timing_status": timing_status,
         "timing_error": timing_status != "ok",
         "video_pixfmt_remediated": remediated,
     }
