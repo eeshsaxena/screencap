@@ -138,9 +138,9 @@ final class PermissionController: ObservableObject {
     /// probe lands or when the daemon is unreachable.
     @Published private(set) var daemonGrants: DaemonPermissionGrants = .allIndeterminate
     /// True between the moment `relaunchApplication()` is invoked and the
-    /// process actually exits. Surfaced to the UI so the Quit & Relaunch
-    /// button can be disabled, preventing a double-click from stacking
-    /// multiple new instances.
+    /// process actually exits. Surfaced to the UI so the "Restart to apply
+    /// permissions" button can be disabled, preventing a double-click from
+    /// stacking multiple new instances.
     @Published private(set) var isRelaunching: Bool = false
     /// Persisted "permission setup dismissed" flag (U4). Once the user taps
     /// "Skip for now" with a grant still missing, the state-driven walkthrough
@@ -423,8 +423,9 @@ final class PermissionController: ObservableObject {
     /// Recomputes all four permission statuses without prompting.
     ///
     /// These APIs cache their result at process launch — a grant made after
-    /// launch does NOT show up here until the next process start. The walkthrough
-    /// surfaces a "Quit & Relaunch" button to drive the restart explicitly.
+    /// launch does NOT show up here until the next process start. On the
+    /// CLI-fallback path the walkthrough surfaces a "Restart to apply
+    /// permissions" button to drive the restart explicitly.
     func refresh() {
         screenRecording = Self.checkScreenRecording()
         accessibility = Self.checkAccessibility()
@@ -622,9 +623,9 @@ final class PermissionController: ObservableObject {
 
     // MARK: - Silent in-process checks
     //
-    // These cache at process start. The walkthrough's `Quit & Relaunch`
-    // button is what gets the user to a fresh process when they've granted
-    // a permission post-launch.
+    // These cache at process start. On the CLI-fallback path the walkthrough's
+    // "Restart to apply permissions" button is what gets the user to a fresh
+    // process when they've granted a permission post-launch.
 
     private static func checkScreenRecording() -> PermissionStatus {
         CGPreflightScreenCaptureAccess() ? .granted : .denied
