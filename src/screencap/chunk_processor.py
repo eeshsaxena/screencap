@@ -179,7 +179,6 @@ class ChunkProcessor:
             rest_threshold=rest_threshold,
             screen_filter=screen_filter,
         )
-        self._scrub_enabled = scrub_enabled
         self._show_on_website = show_on_website
 
         # SCR-118: opt-in on-screen content index (local-only sidecar, never

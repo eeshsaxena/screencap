@@ -644,10 +644,13 @@ class TestSequencerStructure:
         assert cp._chunk_manifest is not None
         assert cp._chunk_scrubber is not None
         # ...and the old inline manifest/scrub fields + methods are gone.
+        # _scrub_enabled / _rest_threshold / _screen_filter are passed straight
+        # into the seams; the processor keeps no (trap-prone) copy.
         for removed in (
             "_segmentation_mode", "_pipeline", "_anonymizer",
             "_masking_classifier", "_masking_evaluator", "_masking_pixel_ratio",
             "_generate_manifest", "_scrub_chunk_files",
+            "_scrub_enabled", "_rest_threshold", "_screen_filter",
         ):
             assert not hasattr(cp, removed), f"{removed} should be gone after SCR-35"
 
