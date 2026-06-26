@@ -7,10 +7,12 @@ the audit-entry logging, and the "is scrubbing on?" predicate (the old
 asks the seam (``is_enabled`` / ``scrub``) instead of inspecting scrub
 internals.
 
-In U2 the masking config (pipeline / anonymizer / evaluator / classifier /
-pixel_ratio) is passed in by ``ChunkProcessor``, which still builds it. U3
-moves that construction into this class behind a factory and replaces the
-init-failure → upload-disable side effect with an explicit result.
+The scrub/masking config (pipeline / anonymizer / evaluator / classifier /
+pixel_ratio) is built here behind the :meth:`create` factory; ``ChunkProcessor``
+no longer constructs or owns these objects. A scrub/masking-init failure is
+reported back as an explicit :class:`ScrubInit` upload-policy fact the
+sequencer consumes, rather than reaching back and mutating ``ChunkProcessor``
+state.
 """
 
 from __future__ import annotations
@@ -21,6 +23,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from screencap.privacy.classify import DefaultContextClassifier
+    from screencap.privacy.policy import DefaultPolicyEvaluator
+    from screencap.redaction.engine import Anonymizer, DetectionPipeline
     from screencap.scrubber import ScrubResult
 
 logger = logging.getLogger(__name__)
@@ -52,10 +57,10 @@ class ChunkScrubber:
         capture_dir: Path | str,
         *,
         enabled: bool,
-        pipeline,
-        anonymizer,
-        evaluator,
-        classifier,
+        pipeline: "DetectionPipeline | None",
+        anonymizer: "Anonymizer | None",
+        evaluator: "DefaultPolicyEvaluator | None",
+        classifier: "DefaultContextClassifier | None",
         pixel_ratio: float,
     ) -> None:
         self._capture_dir = Path(capture_dir)
@@ -208,6 +213,14 @@ class ChunkScrubber:
         on-screen text — banking / email / chat — could enter the local
         index). Exposing the predicate here keeps that guard sourced from a
         live seam after the masking fields leave ``ChunkProcessor``.
+
+        NOTE: True here does NOT imply scrubbing can run. On a cloud-intent
+        seam where pipeline init failed but masking init succeeded, this is
+        True while :attr:`is_enabled` is False (an inert seam). That latent
+        trap is harmless because the index guard also gates on
+        ``scrub_result is not None`` (in ``ChunkProcessor._process_chunk``),
+        which requires :attr:`is_enabled` — so the index pass is never reached
+        on an inert seam regardless of this predicate.
         """
         return self._classifier is not None and self._evaluator is not None
 

@@ -208,3 +208,59 @@ def test_create_cloud_intent_uses_public_masking_mode(tmp_path):
     # The evaluator is built from a config whose mode was overridden to PUBLIC.
     cfg = MockEval.call_args.args[0]
     assert cfg.mode == PrivacyMode.PUBLIC
+
+
+def test_create_cloud_intent_pipeline_fails_masking_ok_is_inert_trap(tmp_path):
+    """Latent-trap state: pipeline-init fails but masking-init succeeds.
+
+    On a cloud-intent recording, a pipeline failure disables uploads
+    (fail-closed) and leaves the seam inert (``is_enabled is False``), yet the
+    masking classifier/evaluator still build, so ``has_masking_context`` is
+    True. This documents that ``has_masking_context`` does NOT imply scrubbing
+    can run — the index guard's own ``scrub_result is not None`` gate (which
+    requires ``is_enabled``) is what keeps it safe.
+    """
+    with _patched_deps(pipeline_exc=ImportError("no privacy deps")):
+        seam, init = ChunkScrubber.create(
+            tmp_path, cloud_intent=True, upload_enabled=True, scrub_enabled=True,
+        )
+    assert seam.is_enabled is False  # inert: pipeline init failed
+    assert seam.has_masking_context is True  # but masking context still built
+    assert init.disable_uploads_reason is not None  # fail-closed for cloud intent
+
+
+# ---------------------------------------------------------------------------
+# U3 (cont.): create() OUTER fail-closed net — an *unexpected* _build crash.
+#
+# The matrix tests above trigger exceptions INSIDE _build's own try/except
+# blocks. The outer try/except in create() catches an unexpected crash of
+# _build itself; patching _build to raise makes the inner handlers
+# unreachable, so these tests provably exercise that outer net.
+# ---------------------------------------------------------------------------
+
+
+def test_create_outer_except_cloud_intent_disables_uploads(tmp_path):
+    """Unexpected _build crash, cloud-intent → inert seam, fail-closed."""
+    with patch.object(
+        ChunkScrubber, "_build", side_effect=RuntimeError("boom")
+    ):
+        seam, init = ChunkScrubber.create(
+            tmp_path, cloud_intent=True, upload_enabled=True, scrub_enabled=True,
+        )
+    assert seam.is_enabled is False
+    assert seam.has_masking_context is False
+    assert init.disable_uploads_reason is not None
+    assert "boom" in init.disable_uploads_reason
+
+
+def test_create_outer_except_local_keeps_uploads(tmp_path):
+    """Unexpected _build crash, local recording → inert seam, no policy change."""
+    with patch.object(
+        ChunkScrubber, "_build", side_effect=RuntimeError("boom")
+    ):
+        seam, init = ChunkScrubber.create(
+            tmp_path, cloud_intent=False, upload_enabled=True, scrub_enabled=True,
+        )
+    assert seam.is_enabled is False
+    assert seam.has_masking_context is False
+    assert init.disable_uploads_reason is None
