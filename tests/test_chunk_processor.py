@@ -153,8 +153,24 @@ def cloud_processor(cloud_capture_dir):
     )
 
     pipeline, anonymizer = _make_mock_pipeline()
-    cp._pipeline = pipeline
-    cp._anonymizer = anonymizer
+    # SCR-35: the masking config now lives on the ChunkScrubber seam, not on
+    # ChunkProcessor. This fixture (cloud_intent + upload_enabled=False) does not
+    # init scrubbing, so rebuild the seam with the injected mock pipeline. The
+    # direct scrub-function tests reach the (pipeline, anonymizer) pair off the
+    # seam (cp._chunk_scrubber._pipeline / ._anonymizer) — ChunkProcessor no
+    # longer carries those fields. evaluator/classifier are None here
+    # (cloud_processor never inited masking), matching the prior behavior.
+    from screencap.chunk_scrubber import ChunkScrubber
+
+    cp._chunk_scrubber = ChunkScrubber(
+        cloud_capture_dir,
+        enabled=True,
+        pipeline=pipeline,
+        anonymizer=anonymizer,
+        evaluator=None,
+        classifier=None,
+        pixel_ratio=2.0,
+    )
     return cp
 
 
@@ -535,7 +551,8 @@ class TestCloudIntentGating:
                 cloud_intent=True,
             )
             assert cp._upload_enabled is False
-            assert cp._pipeline is None
+            # Pipeline init failed → the scrub seam is inert (SCR-35).
+            assert cp._chunk_scrubber.is_enabled is False
 
     def test_non_cloud_skips_pipeline_init(self, cloud_capture_dir):
         """Non-cloud recordings must not initialize the scrubbing pipeline."""
@@ -549,8 +566,9 @@ class TestCloudIntentGating:
             upload_enabled=True, auto_delete=False,
             cloud_intent=False,
         )
-        assert cp._pipeline is None
-        assert cp._anonymizer is None
+        # No scrub/masking init → seam inert and no masking context (SCR-35).
+        assert cp._chunk_scrubber.is_enabled is False
+        assert cp._chunk_scrubber.has_masking_context is False
 
 
 class TestCloudProcessorRequiresPiiDetection:
@@ -603,8 +621,48 @@ class TestCloudProcessorRequiresPiiDetection:
             upload_enabled=True, auto_delete=False,
             cloud_intent=False,
         )
-        assert cp._pipeline is None
+        assert cp._chunk_scrubber.is_enabled is False
         assert cp.upload_warning is None
+
+
+class TestSequencerStructure:
+    """SCR-35: ChunkProcessor is a sequencer — manifest/scrub concerns live in
+    the ChunkManifest/ChunkScrubber seams, and the old inline fields/methods
+    are gone."""
+
+    def test_extracted_concerns_removed_from_processor(self, cloud_capture_dir):
+        from screencap.chunk_processor import ChunkProcessor
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="test", upload_enabled=False, auto_delete=False,
+            cloud_intent=False,
+        )
+        # The two seam handles exist...
+        assert cp._chunk_manifest is not None
+        assert cp._chunk_scrubber is not None
+        # ...and the old inline manifest/scrub fields + methods are gone.
+        # _scrub_enabled / _rest_threshold / _screen_filter are passed straight
+        # into the seams; the processor keeps no (trap-prone) copy.
+        for removed in (
+            "_segmentation_mode", "_pipeline", "_anonymizer",
+            "_masking_classifier", "_masking_evaluator", "_masking_pixel_ratio",
+            "_generate_manifest", "_scrub_chunk_files",
+            "_scrub_enabled", "_rest_threshold", "_screen_filter",
+        ):
+            assert not hasattr(cp, removed), f"{removed} should be gone after SCR-35"
+
+    def test_content_index_guard_reads_seam(self):
+        """The content-index fail-closed guard sources its signal from the seam
+        (R7), not a (removed) processor masking field."""
+        import inspect
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        src = inspect.getsource(ChunkProcessor._do_index_chunk_content)
+        assert "_chunk_scrubber.has_masking_context" in src
+        assert "_masking_classifier" not in src
+        assert "_masking_evaluator" not in src
 
 
 class TestInlineScrubbing:
@@ -626,7 +684,7 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        scrub_transcripts([txt_path, json_path], cp._pipeline, cp._anonymizer)
+        scrub_transcripts([txt_path, json_path], cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         # .txt
         txt_result = txt_path.read_text()
@@ -657,7 +715,7 @@ class TestInlineScrubbing:
         }))
 
         cp = cloud_processor
-        scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
+        scrub_manifest(manifest_path, cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         data = json.loads(manifest_path.read_text())
         task = data["tasks"][0]
@@ -681,7 +739,7 @@ class TestInlineScrubbing:
         manifest_path.write_text(json.dumps(original))
 
         cp = cloud_processor
-        scrub_manifest(manifest_path, cp._pipeline, cp._anonymizer)
+        scrub_manifest(manifest_path, cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         # File should be unchanged
         data = json.loads(manifest_path.read_text())
@@ -694,17 +752,17 @@ class TestInlineScrubbing:
         from screencap.redaction import AllDetectorsFailedError
         from screencap.scrubber import scrub_text
 
-        cloud_processor._pipeline.detect = MagicMock(
+        cloud_processor._chunk_scrubber._pipeline.detect = MagicMock(
             side_effect=AllDetectorsFailedError("all failed"),
         )
 
-        scrubbed, _ = scrub_text("some sensitive text", cloud_processor._pipeline, cloud_processor._anonymizer)
+        scrubbed, _ = scrub_text("some sensitive text", cloud_processor._chunk_scrubber._pipeline, cloud_processor._chunk_scrubber._anonymizer)
         assert scrubbed == "<SCRUB_FAILED>"
 
     def test_scrub_chunk_files_renames_on_per_file_failure(
         self, cloud_capture_dir, cloud_processor,
     ):
-        """_scrub_chunk_files must rename a file to .scrub_failed when events scrub raises."""
+        """ChunkScrubber.scrub must rename a file to .scrub_failed when events scrub raises."""
         # Write a valid events file but make the pipeline scrub raise
         events_path = cloud_capture_dir / "events_0000.jsonl"
         events_path.write_text('{"name":"click"}\n')
@@ -713,7 +771,7 @@ class TestInlineScrubbing:
             "screencap.scrubber.scrub_events_jsonl",
             side_effect=RuntimeError("simulated scrub failure"),
         ):
-            cloud_processor._scrub_chunk_files(0, 1000.0, 2000.0, None)
+            cloud_processor._chunk_scrubber.scrub(0, 1000.0, 2000.0, None)
 
         # Original file should be renamed, not uploaded
         assert not events_path.exists()
@@ -744,7 +802,7 @@ class TestInlineScrubbing:
                 f.write(json.dumps(evt) + "\n")
 
         cp = cloud_processor
-        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
+        scrub_events_jsonl(events_path, cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         key_type = scrubbed[1]
@@ -774,7 +832,7 @@ class TestInlineScrubbing:
                 f.write(json.dumps(evt) + "\n")
 
         cp = cloud_processor
-        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
+        scrub_events_jsonl(events_path, cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         assert scrubbed[1]["text"] == "hello world"
@@ -802,7 +860,7 @@ class TestInlineScrubbing:
                 f.write(json.dumps(evt) + "\n")
 
         cp = cloud_processor
-        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
+        scrub_events_jsonl(events_path, cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         shortcut = scrubbed[1]
@@ -832,7 +890,7 @@ class TestInlineScrubbing:
                 f.write(json.dumps(evt) + "\n")
 
         cp = cloud_processor
-        scrub_events_jsonl(events_path, cp._pipeline, cp._anonymizer)
+        scrub_events_jsonl(events_path, cp._chunk_scrubber._pipeline, cp._chunk_scrubber._anonymizer)
 
         scrubbed = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         ws = scrubbed[1]
@@ -843,7 +901,9 @@ class TestBlockedIntervalsInManifest:
     """Tests for Phase 6: blocked intervals in chunk manifest."""
 
     def test_generate_manifest_passes_blocked_intervals(self, cloud_capture_dir):
-        """_process_chunk passes screen_filter intervals to _generate_manifest."""
+        """_process_chunk → ChunkManifest gathers screen_filter intervals and
+        forwards them to the task_manifest renderer (SCR-35: the gathering now
+        lives in the ChunkManifest seam, so spy on the renderer it delegates to)."""
         from screencap.chunk_processor import ChunkProcessor
 
         q = multiprocessing.Queue()
@@ -860,15 +920,18 @@ class TestBlockedIntervalsInManifest:
             screen_filter=mock_filter,
         )
 
-        # Patch _generate_manifest to capture what _process_chunk passes
+        # Spy on the renderer ChunkManifest.produce delegates to, capturing the
+        # blocked_intervals it forwards. Write a real file so downstream stages
+        # see a manifest artifact.
         captured_kwargs = {}
-        original_generate = cp._generate_manifest
 
         def spy_generate(*args, **kwargs):
             captured_kwargs.update(kwargs)
-            return original_generate(*args, **kwargs)
+            p = cloud_capture_dir / f"chunk_{args[1]:04d}_manifest.json"
+            p.write_text("{}")
+            return p
 
-        with patch.object(cp, "_generate_manifest", side_effect=spy_generate), \
+        with patch("screencap.task_manifest.generate_manifest", side_effect=spy_generate), \
              patch.object(cp, "_wait_for_audio"), \
              patch.object(cp, "_transcribe", return_value=None), \
              patch.object(cp, "_trigger_flush"):
@@ -886,7 +949,7 @@ class TestBlockedIntervalsInManifest:
     def test_manifest_generation_failure_deletes_partial_file_and_fails_chunk(
         self, cloud_capture_dir,
     ):
-        """If _generate_manifest raises, any partially-written manifest must
+        """If manifest generation raises, any partially-written manifest must
         be removed so a subsequent ``screencap upload`` doesn't ship a
         truncated JSON, and the chunk must be marked failed."""
         from screencap.chunk_processor import ChunkProcessor
@@ -901,12 +964,12 @@ class TestBlockedIntervalsInManifest:
 
         partial = cloud_capture_dir / "chunk_0000_manifest.json"
 
-        def failing_generate(idx, *args, **kwargs):
+        def failing_generate(*args, **kwargs):
             # Simulate a mid-write failure that leaves a partial file on disk.
             partial.write_text('{"partial":')
             raise RuntimeError("manifest write blew up")
 
-        with patch.object(cp, "_generate_manifest", side_effect=failing_generate), \
+        with patch("screencap.task_manifest.generate_manifest", side_effect=failing_generate), \
              patch.object(cp, "_wait_for_audio"), \
              patch.object(cp, "_transcribe", return_value=None), \
              patch.object(cp, "_trigger_flush"), \
@@ -1296,7 +1359,7 @@ def _build_chunk_processor(
     # Mock side effects that aren't under test
     cp._wait_for_audio = lambda *a, **kw: True
     cp._transcribe = lambda *a, **kw: None
-    cp._generate_manifest = lambda *a, **kw: None
+    cp._chunk_manifest.produce = lambda *a, **kw: None
 
     return cp, chunk_q
 
@@ -1501,7 +1564,7 @@ class TestPrivacyFailureDataLoss:
         # Mock side effects not under test
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 7)
@@ -1545,7 +1608,7 @@ class TestPrivacyFailureDataLoss:
 
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 3)
@@ -1593,7 +1656,7 @@ class TestPrivacyFailureDataLoss:
 
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 7)
@@ -1641,9 +1704,11 @@ class TestPrivacyFailureDataLoss:
                 cloud_intent=True,
             )
 
-        # Pipeline succeeded but masking failed → uploads disabled
+        # Pipeline succeeded but masking failed → uploads disabled, and the
+        # seam reports no masking context (SCR-35 R7: the fail-closed signal the
+        # content-index guard reads).
         assert cp._upload_enabled is False
-        assert cp._pipeline is not None  # pipeline was set before masking failed
+        assert cp._chunk_scrubber.has_masking_context is False
         assert cp.upload_warning is not None
         assert cp._auto_delete is False, (
             "_auto_delete must be False when uploads are disabled due to masking failure"
@@ -1651,7 +1716,7 @@ class TestPrivacyFailureDataLoss:
 
         cp._wait_for_audio = lambda *a, **kw: True
         cp._transcribe = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
 
         cp.start()
         _enqueue_chunks(chunk_q, t0, 7)
@@ -2281,8 +2346,8 @@ class TestProcessChunkFinalAssignment:
         cp._transcribe = lambda *a, **kw: None
         cp._trigger_flush = lambda *a, **kw: None
         cp._export_events = lambda *a, **kw: None
-        cp._generate_manifest = lambda *a, **kw: None
-        cp._scrub_chunk_files = lambda *a, **kw: None
+        cp._chunk_manifest.produce = lambda *a, **kw: None
+        cp._chunk_scrubber.scrub = lambda *a, **kw: None
         cp._collect_chunk_files = lambda *a, **kw: [
             {"name": "events_0000.jsonl", "path": capture_dir / "events_0000.jsonl"},
         ]
@@ -2344,7 +2409,7 @@ class TestProcessChunkFinalAssignment:
         assert cp._chunk_results[0] == ChunkStatus.NETWORK_INCOMPLETE
 
     def test_staged_status_survives_manifest_failure(self, capture_dir):
-        """``_generate_manifest`` re-raise must not downgrade a staged
+        """A manifest-generation re-raise must not downgrade a staged
         NETWORK_INCOMPLETE to FAILED.
 
         Without the consult in the outer _run handler, the staged
@@ -2362,7 +2427,7 @@ class TestProcessChunkFinalAssignment:
         def boom(*a, **kw):
             raise RuntimeError("manifest write blew up")
 
-        cp._generate_manifest = boom
+        cp._chunk_manifest.produce = boom
 
         # _process_chunk re-raises the manifest failure (after the
         # finally block writes the final status).

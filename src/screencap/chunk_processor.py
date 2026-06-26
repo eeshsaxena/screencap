@@ -107,11 +107,18 @@ class ChunkStatus(str, Enum):
 
 
 class ChunkProcessor:
-    """Process completed recording chunks in the background.
+    """Sequence completed recording chunks in the background.
 
-    Per chunk: wait for audio ack → transcribe → export events JSONL →
-    generate task manifest → upload → delete old chunks on success.
-    Never raises — all errors caught and logged.
+    ``ChunkProcessor`` is a sequencer: per chunk it runs wait-for-audio →
+    agnostic stages (transcribe → export events → manifest) → scrub → upload →
+    evict-old-chunks. The manifest and scrub steps are owned by narrow seams
+    (SCR-35): :class:`~screencap.chunk_manifest.ChunkManifest` produces the
+    per-chunk manifest (v1/v2 mode selection, blocked_intervals, partial-file
+    cleanup), and :class:`~screencap.chunk_scrubber.ChunkScrubber` owns "scrub
+    this chunk's outputs" plus the "is scrubbing on?" decision and the
+    scrub/masking-config init. The upload/delete/eviction chain stays here,
+    delegating to terminal_stage / retention / the PipelineLedger. Never
+    raises — all errors caught and logged.
     """
 
     def __init__(
@@ -155,15 +162,23 @@ class ChunkProcessor:
         self._recording_name = recording_name or self._capture_dir.name
         self._upload_enabled = upload_enabled
         self._auto_delete = auto_delete
-        self._rest_threshold = rest_threshold
         self._flush_requested = flush_requested
         self._flush_ack_counter = flush_ack_counter
         self._flush_lock = flush_lock
         self._cloud_intent = cloud_intent
         self._privacy_mode = privacy_mode
-        self._screen_filter = screen_filter
-        self._segmentation_mode = segmentation_mode
-        self._scrub_enabled = scrub_enabled
+        # SCR-35: manifest production (mode selection + blocked_intervals +
+        # partial-file cleanup) is owned by the ChunkManifest seam, injected as
+        # the PipelineStageRunner manifest step. rest_threshold and screen_filter
+        # are passed straight into the seam — the processor keeps no copy.
+        from screencap.chunk_manifest import ChunkManifest
+
+        self._chunk_manifest = ChunkManifest(
+            self._capture_dir,
+            segmentation_mode=segmentation_mode,
+            rest_threshold=rest_threshold,
+            screen_filter=screen_filter,
+        )
         self._show_on_website = show_on_website
 
         # SCR-118: opt-in on-screen content index (local-only sidecar, never
@@ -175,60 +190,32 @@ class ChunkProcessor:
 
         self._content_index_enabled = get_content_index_enabled()
 
-        # Initialize scrubbing pipeline when scrubbing is enabled
-        # (cloud-intent always scrubs; local recordings scrub when user opts in)
-        _should_init_scrub = (cloud_intent and upload_enabled) or scrub_enabled
-        self._pipeline = None
-        self._anonymizer = None
-        self._masking_classifier = None
-        self._masking_evaluator = None
-        self._masking_pixel_ratio = 2.0  # safe Retina default
+        # SCR-35 (U3): the ChunkScrubber seam owns the "is scrubbing on?"
+        # decision AND all scrub/masking-config construction (redaction pipeline
+        # + anonymizer + screenshot-masking classifier/evaluator, incl. the
+        # cloud-intent PUBLIC override). create() reports an explicit ScrubInit
+        # upload-policy fact instead of reaching back and mutating processor
+        # state, and is total (fail-closed: an unexpected construction failure
+        # for a cloud-intent recording disables uploads rather than shipping
+        # unscrubbed).
+        from screencap.chunk_scrubber import ChunkScrubber
+
         self._upload_disabled_reason: str | None = None
-        if _should_init_scrub:
-            try:
-                from screencap.redaction import Anonymizer, create_default_pipeline
-                self._pipeline = create_default_pipeline(require_pii=True)
-                self._anonymizer = Anonymizer()
-                logger.info("Scrubbing pipeline initialized")
-            except Exception as e:
-                if cloud_intent and upload_enabled:
-                    logger.error(
-                        f"Privacy deps not available — disabling uploads for safety: {e}"
-                    )
-                    self._upload_enabled = False
-                    self._upload_disabled_reason = f"Privacy deps not available: {e}"
-                    logger.warning(
-                        "Privacy dependencies are missing. "
-                        "Reinstall or update screencap."
-                    )
-                else:
-                    # Local recording: scrubbing is best-effort, don't block recording
-                    logger.warning(f"Scrubbing pipeline unavailable (non-fatal): {e}")
-                    self._scrub_enabled = False
+        self._chunk_scrubber, _scrub_init = ChunkScrubber.create(
+            self._capture_dir,
+            cloud_intent=cloud_intent,
+            upload_enabled=upload_enabled,
+            scrub_enabled=scrub_enabled,
+        )
 
-            # Initialize classifier/evaluator for screenshot masking
-            try:
-                from screencap.config import get_privacy_config
-                from screencap.privacy.classify import DefaultContextClassifier
-                from screencap.privacy.policy import DefaultPolicyEvaluator, PrivacyMode
-
-                _pc = get_privacy_config()
-                # Cloud uploads must use public mode so that CHAT/EMAIL/etc.
-                # apps get MASK_WINDOW (blurred in screenshots) instead of
-                # TEXT_REDACT (which only scrubs text, not visuals).
-                if self._cloud_intent:
-                    from dataclasses import replace as _dc_replace
-                    _pc = _dc_replace(_pc, mode=PrivacyMode.PUBLIC)
-                self._masking_evaluator = DefaultPolicyEvaluator(_pc)
-                self._masking_classifier = DefaultContextClassifier(
-                    app_classes=_pc.app_classes,
-                )
-            except Exception as e:
-                logger.warning(f"Could not init masking classifier: {e}")
-                if cloud_intent and upload_enabled:
-                    self._upload_enabled = False
-                    if self._upload_disabled_reason is None:
-                        self._upload_disabled_reason = f"Masking classifier init failed: {e}"
+        # Consume the upload-policy fact. _upload_enabled and
+        # _upload_disabled_reason MUST be set together: _process_chunk computes
+        # ``success = self._upload_disabled_reason is None``, so disabling
+        # uploads without the reason would mark a disabled chunk EMITTED and
+        # re-open the Bug 4 delete-with-nothing-on-GCS path.
+        if _scrub_init.disable_uploads_reason is not None:
+            self._upload_enabled = False
+            self._upload_disabled_reason = _scrub_init.disable_uploads_reason
 
         # Safety invariant: never delete local files unless uploads are enabled.
         # This covers: (1) caller passes upload_enabled=False (e.g. --no-live-upload),
@@ -667,32 +654,11 @@ class ChunkProcessor:
             return result
 
         def _manifest_step(i, s, e):
+            # Status stays a processor concern; the manifest's content
+            # (mode + blocked_intervals + partial-file cleanup) is owned by
+            # the ChunkManifest seam (SCR-35).
             self._set_status("Generating manifest...")
-            blocked_intervals = None
-            if self._screen_filter is not None and hasattr(
-                self._screen_filter, "get_blocked_intervals"
-            ):
-                try:
-                    blocked_intervals = (
-                        self._screen_filter.get_blocked_intervals(s, e) or None
-                    )
-                except Exception:
-                    logger.warning(
-                        f"Failed to get blocked_intervals for chunk {i}",
-                        exc_info=True,
-                    )
-            try:
-                return self._generate_manifest(
-                    i, s, e, blocked_intervals=blocked_intervals
-                )
-            except Exception:
-                logger.exception(f"Chunk {i}: manifest generation failed")
-                # Remove any partially-written manifest so a later retry
-                # (or screencap upload) doesn't ship a truncated file.
-                (self._capture_dir / f"chunk_{i:04d}_manifest.json").unlink(
-                    missing_ok=True
-                )
-                raise
+            return self._chunk_manifest.produce(i, s, e)
 
         runner = PipelineStageRunner(
             self._capture_dir,
@@ -769,12 +735,17 @@ class ChunkProcessor:
                 return
             transcript_path = artifacts.transcript
 
-            # 5. Scrub text surfaces + mask screenshots when user opted in.
-            if self._scrub_enabled and self._pipeline is not None:
+            # 5. Scrub text surfaces + mask screenshots when the user opted in.
+            #    ChunkScrubber owns the "is scrubbing on?" decision (SCR-35). The
+            #    content-index pass branches on a real ScrubResult, never on the
+            #    attempt, so a disabled recording indexes nothing.
+            scrub_result = None
+            if self._chunk_scrubber.is_enabled:
                 self._set_status("Redacting sensitive data...")
-                scrub_result = self._scrub_chunk_files(
+                scrub_result = self._chunk_scrubber.scrub(
                     idx, start_ts, end_ts, transcript_path,
                 )
+            if scrub_result is not None:
                 # 5b. SCR-118 content index — fail-open, must never affect the
                 # chunk's status, upload, or deletion (AE1). Runs here (pre-
                 # upload, post-scrub) so force-stopped/final chunks still index.
@@ -1070,57 +1041,6 @@ class ChunkProcessor:
 
         return jsonl_path
 
-    def _generate_manifest(
-        self, idx: int, start_ts: float, end_ts: float,
-        blocked_intervals: list[dict] | None = None,
-    ) -> Path:
-        """Generate task manifest for this chunk."""
-        from screencap.task_manifest import generate_manifest
-
-        return generate_manifest(
-            self._capture_dir, idx, start_ts, end_ts,
-            rest_threshold=self._rest_threshold,
-            blocked_intervals=blocked_intervals,
-            segmentation_mode=self._segmentation_mode,
-        )
-
-    def _scrub_chunk_files(
-        self, idx: int, start_ts: float, end_ts: float,
-        transcript_path: Path | None,
-    ) -> "ScrubResult":
-        """Scrub text surfaces + mask screenshots for a single chunk.
-
-        Delegates to ``Scrubber.run_chunk()`` so the load-bearing step order
-        lives in one place; the chunk processor only owns lifecycle concerns
-        (which chunks to scrub, when, with what masking config).
-
-        Returns the ``ScrubResult`` so the caller can drive the SCR-118
-        content-index pass off its write-only ``blocked_intervals`` signal
-        (the redaction path must never branch on the return value).
-        """
-        from screencap.scrubber import Scrubber
-
-        scrubber = Scrubber(
-            self._capture_dir,
-            pipeline=self._pipeline,
-            anonymizer=self._anonymizer,
-            evaluator=self._masking_evaluator,
-            classifier=self._masking_classifier,
-            pixel_ratio=self._masking_pixel_ratio,
-        )
-        scrub_result = scrubber.run_chunk(
-            idx=idx,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            transcript_path=transcript_path,
-        )
-
-        if scrub_result.audit_entries:
-            logger.info(
-                f"Chunk {idx}: scrubbed with {len(scrub_result.audit_entries)} audit entries"
-            )
-        return scrub_result
-
     def _index_chunk_content(
         self, idx: int, start_ts: float, end_ts: float,
         scrub_result: "ScrubResult",
@@ -1165,7 +1085,10 @@ class ChunkProcessor:
         # set cannot represent the masked-app intervals, so indexing would ingest
         # masked-app on-screen text (banking / email / chat). Index nothing in
         # that case so only ALLOW-classified frames can ever reach the store.
-        if self._masking_classifier is None or self._masking_evaluator is None:
+        # SCR-35 (R7): the masking context now lives on the ChunkScrubber seam,
+        # so the guard reads its has_masking_context predicate rather than the
+        # (removed) processor masking fields.
+        if not self._chunk_scrubber.has_masking_context:
             logger.warning(
                 f"Chunk {idx}: skipping content index — masking classification "
                 "unavailable (no evaluator/classifier), so blocked_intervals "
