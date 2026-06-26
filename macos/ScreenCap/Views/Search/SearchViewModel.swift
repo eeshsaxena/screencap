@@ -139,7 +139,8 @@ final class SearchViewModel: ObservableObject {
             coverage: CoverageReport(screen: contentState, audio: transcriptState, activity: timelineState),
             consentNeeded: hasFreeText && !contentIndexEnabled,
             timeWindow: parsed.timeWindow,
-            appFilter: parsed.appFilter
+            appFilter: parsed.appFilter,
+            queryTerms: parsed.freeText.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         )
         phase = .loaded(results)
     }
@@ -277,6 +278,10 @@ struct SearchResults: Equatable, Sendable {
     /// afternoon").
     var timeWindow: TimeWindow?
     var appFilter: String?
+    /// The parsed free-text terms (SCR-177 U3) — used by `ResultRow` to highlight
+    /// matched terms in content/transcript snippets. Defaulted so existing
+    /// constructions (tests, older call sites) need not supply it.
+    var queryTerms: [String] = []
 }
 
 struct SearchResultItem: Identifiable, Equatable, Sendable {
