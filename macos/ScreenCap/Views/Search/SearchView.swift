@@ -186,13 +186,18 @@ struct SearchView: View {
 
     /// SCR-183 U4 — opens the keyboard-selected result on Return. The lone
     /// `.defaultAction` button in the window (rows are no longer Buttons), so it
-    /// unambiguously owns Return. Present only when a result is selected AND the
-    /// search field is not focused, so it never steals Return from the field's
-    /// run-a-search binding. A 1×1 (non-zero) frame keeps SwiftUI from culling it
-    /// and dropping the shortcut registration.
+    /// unambiguously owns Return. Present only when a result is selected, the
+    /// search field is not focused, AND the consent banner is not showing — so it
+    /// never steals Return from the field's run-a-search binding, nor from the
+    /// banner's prominent "Turn on" action (SCR-183 review #1). A 1×1 (non-zero)
+    /// frame keeps SwiftUI from culling it and dropping the shortcut registration.
     @ViewBuilder
     private func returnKeyHandler(_ results: SearchResults) -> some View {
+        // Stand down while the consent banner is up: its prominent "Turn on"
+        // button should own Return there, so this hidden open-the-selected-result
+        // handler must not be the window's default action (SCR-183 review #1).
         if !searchFieldFocused,
+           !(results.consentNeeded && !consentDeclined),
            let target = searchReviewTarget(for: selectedResultID, in: results) {
             Button("") { openReview(target) }
                 .keyboardShortcut(.defaultAction)
