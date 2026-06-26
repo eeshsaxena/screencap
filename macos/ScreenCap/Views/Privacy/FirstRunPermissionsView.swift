@@ -62,13 +62,16 @@ struct FirstRunPermissionsView: View {
                     .foregroundStyle(.secondary)
 
                 HStack {
-                    // "Quit & Relaunch" only helps the *app process's* TCC cache
-                    // (CLI-fallback path). On the daemon path the daemon is the
-                    // TCC subject and needs no app restart, so don't present the
-                    // relaunch as a required step there (U5). Full removal /
-                    // relabel is a deferred follow-up.
+                    // The relaunch only helps the *app process's* TCC cache
+                    // (CLI-fallback path): a grant made post-launch isn't visible
+                    // until a fresh process re-reads TCC. On the daemon path the
+                    // daemon is the TCC subject and needs no app restart, so the
+                    // affordance is hidden there (U5). The label is purpose-first
+                    // ("Restart to apply permissions") rather than "Quit &
+                    // Relaunch" so it reads as the fallback-only refresh it is,
+                    // not a required onboarding step (SCR-120 item 1 relabel).
                     if recorder.transport == .cliFallback {
-                        Button("Quit & Relaunch") {
+                        Button("Restart to apply permissions") {
                             isPreparingRelaunch = true
                             Task { @MainActor in
                                 await PermissionSheetRelaunchFlow.dismissThenRelaunch(
