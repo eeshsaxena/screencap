@@ -101,17 +101,37 @@ path fail-closes in Python regardless):
   the user operates only via the menu bar after closing the main window, the account
   line can go stale until the main window reopens (no menu-open re-check).
 
-### U5 carry-forwards (not blocking U7+, do before the function deploys)
+### U5 carry-forwards — DONE (SCR-140)
 
-- **mitmdump EFFECT test** for `REQUIRED_AUTH_IGNORE_HOSTS` — prove `--network`
-  self-recording cannot capture the bearer/refresh-token exchange end-to-end (the
-  blocklist logic + `missing_required_auth_hosts` already have unit tests). See
+All three discharged (still before any function deploy, per the pre-deploy hold above):
+
+- **mitmdump EFFECT test** for `REQUIRED_AUTH_IGNORE_HOSTS` — DONE in
+  `tests/network/test_required_auth_effect.py`. Spawns real mitmdump with the **production**
+  `ignore_hosts` (built via `build_ignore_hosts_regex`, so it tracks config drift) and proves
+  by TLS cert issuer that each auth host is CONNECT-tunneled — never TLS-intercepted — so
+  `--network` self-recording cannot capture the bearer/refresh/ID-token exchange; a non-listed
+  control host is asserted intercepted (and first asserted absent from the patterns) to rule
+  out a vacuous all-tunnel pass. Gated as a **local pre-deploy proof**, not a CI gate: opt-in
+  `SCREENCAP_NETWORK_EFFECT_TEST=1` + `mitmdump` on PATH + skip-on-unreachable (a normal
+  `pytest` run skips it with no network). The *continuous* guard against a dropped host stays
+  the always-on `missing_required_auth_hosts` unit test + the `proxy_runner` fail-closed gate.
+  **Pre-deploy EFFECT run 2026-06-25:** control `example.com` intercepted (leaf issuer CN
+  `mitmproxy` = the proxy CA); all 4 auth hosts tunneled (leaf issuer CN `WR2` = Google Trust
+  Services, NOT the proxy CA). See
   `docs/solutions/integration-issues/mitmproxy-ignore-hosts-tunneling-all-flows-2026-04-29.md`.
-- **Upload-checksum re-test** on the cloud-function side after the `firebase-admin`-
-  forced `google-cloud-storage` 3.x bump (crc32c defaults changed).
-- Minor: `config.get_sessions_dir` is now unused (vestigial, deferred cleanup); the
-  daemon could prune a stale `~/.screencap/run/engine-token-*.jwt` on startup after a
-  crash.
+- **Upload-checksum re-test** — DONE in `scripts/cloud-function/test_signing_contract.py`
+  (+ client companion `tests/test_upload.py::test_put_sends_content_type_and_no_checksum_header`).
+  The function only **signs** v4 PUT URLs and the client raw-PUTs `Content-Type` only; the gcs
+  3.x `crc32c="auto"` default applies to `upload_from_*`/`download_to_*` transfer methods, which
+  neither path uses. The test exercises the **real** 3.x `generate_signed_url` and asserts the
+  signed PUT URL is checksum-free (no `x-goog-hash`). Migration per-object crc32c verify is a
+  separate path (SCR-145).
+- **Minor cleanups — already done in `b3fc9853`:** `config.get_sessions_dir` removed (zero refs
+  remain); stale `engine-token-*.jwt` startup prune implemented
+  (`Supervisor._prune_stale_engine_token_files`) + tested
+  (`tests/daemon/test_supervisor.py::test_reconcile_prunes_stale_engine_token_file`).
+
+Plan: `docs/plans/2026-06-25-001-test-scr-140-u5-carryforward-effect-tests-plan.md`.
 
 ## Misc
 

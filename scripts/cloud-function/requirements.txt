@@ -3,8 +3,10 @@ functions-framework==3.*
 # major bump from the previous >=2.14.0 pin. The 3.x line is API-compatible for
 # generate_signed_url/list_blobs but changes checksum defaults (crc32c), enables
 # retries by default, and relocates resumable-media exceptions; the upload-
-# checksum path is re-tested in U2 and the migration's per-object crc32c verify
-# (U8) runs on this library.
+# checksum path is re-tested against the real 3.x library in test_signing_contract.py
+# (SCR-140: signing stays checksum-free — crc32c="auto" only affects upload_from_*/
+# download_to_* transfer methods, which this signing-only function never calls) and the
+# migration's per-object crc32c verify (U8) runs on this library.
 google-cloud-storage>=3.1.1
 # Offline Firebase ID-token verification (bearer -> uid). Uses ADC on Cloud Run;
 # check_revoked=False keeps verification on the hot path (no Admin-API call).
