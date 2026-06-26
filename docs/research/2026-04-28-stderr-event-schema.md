@@ -134,7 +134,11 @@ version and JSON shape so tolerant clients can handle them on the same taxonomy:
   `whoami`-sourced `signed_in_email: str | null` and `stale: bool` (both may be
   null/`true` when auth is stale a beat after detection — `signed_in_uid` stays
   authoritative; `whoami` omits `stale` on success, so it is normalized to
-  `false`). Carries user identity (uid/email) but stays inside the same-EUID
+  `false`). Note the converse is not diagnostic either: `stale=false` with
+  `signed_in_email=null` does **not** imply a fresh enrichment — it also occurs on
+  a post-gate sign-out or when the beat-later `whoami` enrichment times out
+  (degraded to `{}`). Only `signed_in_uid` is authoritative. Carries user identity
+  (uid/email) but stays inside the same-EUID
   `/v0/events` trust boundary, which already exposes the same fields via
   `/v0/auth.whoami` (see `SECURITY.md`). Additive/non-breaking —
   `EVENT_SCHEMA_VERSION` is unchanged. No consumer may map it to a stop/teardown.

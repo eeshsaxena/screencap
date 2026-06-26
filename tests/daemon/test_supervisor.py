@@ -1286,12 +1286,18 @@ async def test_resume_terminal_stage_runs_in_thread(tmp_path, monkeypatch):
     sup = Supervisor(bus, reconcile_on_init=False)
 
     called = {}
+    # The real run_terminal_stage returns a TerminalResult; resume_terminal_stage
+    # now reads ``result.account_mismatch`` directly (typed), so the stub must
+    # mirror that shape rather than a bare sentinel.
+    from screencap import terminal_stage as ts
+
+    sentinel = ts.TerminalResult(destination="cloud")
 
     def _fake_run(recording_dir, *, non_blocking):
         import threading
         called["non_blocking"] = non_blocking
         called["thread"] = threading.current_thread().name
-        return "ran"
+        return sentinel
 
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage", _fake_run,
@@ -1301,7 +1307,7 @@ async def test_resume_terminal_stage_runs_in_thread(tmp_path, monkeypatch):
     rec_dir.mkdir()
     out = await sup.resume_terminal_stage(rec_dir)
 
-    assert out == "ran"
+    assert out is sentinel
     # Resume always uses the non-blocking lock so it can't stall the loop or
     # race a live finalize.
     assert called["non_blocking"] is True
@@ -1485,6 +1491,53 @@ async def test_resume_emit_enrichment_stale(tmp_path, monkeypatch):
     assert event["stale"] is True
 
 
+@pytest.mark.asyncio
+async def test_resume_emit_whoami_timeout_still_publishes(tmp_path, monkeypatch):
+    """A whoami that blocks past the enrichment timeout must NOT stall the resume
+    or drop the event: the bounded wait degrades email/stale, but the
+    gate-authoritative signed_in_uid still publishes (SCR-171 enrichment bound)."""
+    import threading
+    import time as _time
+
+    from screencap import auth
+    from screencap.daemon import supervisor as _sup_mod
+    from screencap.daemon.supervisor import Supervisor
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    monkeypatch.setattr(
+        "screencap.terminal_stage.run_terminal_stage",
+        lambda recording_dir, *, non_blocking: _mismatch_result(),
+    )
+    # Shrink the bound so the test is fast; whoami blocks well past it.
+    monkeypatch.setattr(_sup_mod, "_WHOAMI_ENRICH_TIMEOUT_S", 0.05)
+    started = threading.Event()
+
+    def _slow_whoami():
+        started.set()
+        _time.sleep(2.0)  # >> the 0.05s bound; would stall the sweep if unbounded
+        return {"signed_in": True, "uid": "uid-B", "email": "b@example.com"}
+
+    monkeypatch.setattr(auth, "whoami", _slow_whoami)
+
+    # The whole resume must complete well under the 2s whoami sleep.
+    await asyncio.wait_for(sup.resume_terminal_stage(tmp_path / "rec-A"), timeout=1.0)
+    assert started.is_set(), "whoami was actually invoked (then timed out)"
+
+    event = await asyncio.wait_for(sub.queue.get(), timeout=1.0)
+    assert event["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH
+    assert event["recording"] == "rec-A"
+    # Gate-authoritative fields survive the enrichment timeout ...
+    assert event["owner_uid"] == "uid-A"
+    assert event["signed_in_uid"] == "uid-B"
+    # ... while best-effort enrichment degrades on timeout.
+    assert event["signed_in_email"] is None
+    assert event["stale"] is False
+    assert sub.queue.empty(), "exactly one event even on enrichment timeout"
+
+
 # ---------------------------------------------------------------------------
 # SCR-125 U6 — daemon auto-resume + startup sweep + idle-busy + fail-closed.
 # ---------------------------------------------------------------------------
@@ -1603,6 +1656,59 @@ async def test_handle_engine_exit_skips_resume_for_local(tmp_path, monkeypatch):
     await sup._handle_engine_exit(proc, 0)
     assert not sup._resume_tasks
     assert resumed == []
+
+
+@pytest.mark.asyncio
+async def test_handle_engine_exit_emits_account_mismatch(tmp_path, monkeypatch):
+    """SCR-171 end-to-end via the post-engine-exit funnel: a real owner-mismatched
+    incomplete cloud recording, exited through ``_handle_engine_exit`` (which
+    dispatches the resume as a DETACHED tracked task), drives the REAL gate and
+    emits exactly one account_mismatch event once the detached resume is drained.
+    Complements the startup-sweep end-to-end test (the exit funnel is otherwise
+    only covered by spy-based wiring tests)."""
+    from screencap import auth
+    from screencap.catalog import write_owner_uid
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_incomplete_cloud_recording(
+        get_recordings_dir(), "rec-A", n_chunks=2, uploaded=(0,),
+    )
+    write_owner_uid(rec_dir, "uid-A")
+    # Signed in as a DIFFERENT account than the one that owns the recording.
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+    monkeypatch.setattr("screencap.auth.id_token_uid", lambda token: "uid-B")
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": "uid-B", "email": "b@example.com"},
+    )
+
+    bus = EventBus()
+    sup = Supervisor(bus, reconcile_on_init=False)
+    sub = await bus.subscribe()
+
+    proc = _FakeAliveProc()
+    proc._alive = False
+    sup._proc = proc
+    sup._session_state = {
+        "capture_dir": str(rec_dir), "recording_name": "rec-A",
+        "started_at": time.time(),
+    }
+    await sup._handle_engine_exit(proc, 0)
+    # The resume is dispatched detached via _track_resume — drain it before asserting.
+    await asyncio.gather(*list(sup._resume_tasks), return_exceptions=True)
+
+    # _handle_engine_exit also synthesizes a recording_finalized event; pull events
+    # until the account_mismatch one (it is the only mismatch event we assert on).
+    event = None
+    while True:
+        evt = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+        if evt["type"] == _stderr_events.EVENT_ACCOUNT_MISMATCH:
+            event = evt
+            break
+    assert event["recording"] == "rec-A"
+    assert event["owner_uid"] == "uid-A"
+    assert event["signed_in_uid"] == "uid-B"
 
 
 @pytest.mark.asyncio
