@@ -107,11 +107,18 @@ class ChunkStatus(str, Enum):
 
 
 class ChunkProcessor:
-    """Process completed recording chunks in the background.
+    """Sequence completed recording chunks in the background.
 
-    Per chunk: wait for audio ack → transcribe → export events JSONL →
-    generate task manifest → upload → delete old chunks on success.
-    Never raises — all errors caught and logged.
+    ``ChunkProcessor`` is a sequencer: per chunk it runs wait-for-audio →
+    agnostic stages (transcribe → export events → manifest) → scrub → upload →
+    evict-old-chunks. The manifest and scrub steps are owned by narrow seams
+    (SCR-35): :class:`~screencap.chunk_manifest.ChunkManifest` produces the
+    per-chunk manifest (v1/v2 mode selection, blocked_intervals, partial-file
+    cleanup), and :class:`~screencap.chunk_scrubber.ChunkScrubber` owns "scrub
+    this chunk's outputs" plus the "is scrubbing on?" decision and the
+    scrub/masking-config init. The upload/delete/eviction chain stays here,
+    delegating to terminal_stage / retention / the PipelineLedger. Never
+    raises — all errors caught and logged.
     """
 
     def __init__(

@@ -627,6 +627,43 @@ class TestCloudProcessorRequiresPiiDetection:
         assert cp.upload_warning is None
 
 
+class TestSequencerStructure:
+    """SCR-35: ChunkProcessor is a sequencer — manifest/scrub concerns live in
+    the ChunkManifest/ChunkScrubber seams, and the old inline fields/methods
+    are gone."""
+
+    def test_extracted_concerns_removed_from_processor(self, cloud_capture_dir):
+        from screencap.chunk_processor import ChunkProcessor
+
+        cp = ChunkProcessor(
+            cloud_capture_dir, multiprocessing.Queue(), multiprocessing.Queue(),
+            recording_name="test", upload_enabled=False, auto_delete=False,
+            cloud_intent=False,
+        )
+        # The two seam handles exist...
+        assert cp._chunk_manifest is not None
+        assert cp._chunk_scrubber is not None
+        # ...and the old inline manifest/scrub fields + methods are gone.
+        for removed in (
+            "_segmentation_mode", "_pipeline", "_anonymizer",
+            "_masking_classifier", "_masking_evaluator", "_masking_pixel_ratio",
+            "_generate_manifest", "_scrub_chunk_files",
+        ):
+            assert not hasattr(cp, removed), f"{removed} should be gone after SCR-35"
+
+    def test_content_index_guard_reads_seam(self):
+        """The content-index fail-closed guard sources its signal from the seam
+        (R7), not a (removed) processor masking field."""
+        import inspect
+
+        from screencap.chunk_processor import ChunkProcessor
+
+        src = inspect.getsource(ChunkProcessor._do_index_chunk_content)
+        assert "_chunk_scrubber.has_masking_context" in src
+        assert "_masking_classifier" not in src
+        assert "_masking_evaluator" not in src
+
+
 class TestInlineScrubbing:
     """Test inline scrubbing of text surfaces."""
 
