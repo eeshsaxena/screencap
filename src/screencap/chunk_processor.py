@@ -241,6 +241,24 @@ class ChunkProcessor:
                     if self._upload_disabled_reason is None:
                         self._upload_disabled_reason = f"Masking classifier init failed: {e}"
 
+        # SCR-35: per-chunk scrubbing (Scrubber construction + run_chunk + audit
+        # + the "is scrubbing on?" predicate) is owned by the ChunkScrubber
+        # seam. Built from the post-downgrade _scrub_enabled so a deps-missing
+        # local recording is correctly inert. (U3 moves the masking-config
+        # construction above into this seam and replaces the upload-disable
+        # side effect with an explicit result.)
+        from screencap.chunk_scrubber import ChunkScrubber
+
+        self._chunk_scrubber = ChunkScrubber(
+            self._capture_dir,
+            enabled=self._scrub_enabled,
+            pipeline=self._pipeline,
+            anonymizer=self._anonymizer,
+            evaluator=self._masking_evaluator,
+            classifier=self._masking_classifier,
+            pixel_ratio=self._masking_pixel_ratio,
+        )
+
         # Safety invariant: never delete local files unless uploads are enabled.
         # This covers: (1) caller passes upload_enabled=False (e.g. --no-live-upload),
         # (2) privacy pipeline init failure sets _upload_enabled=False.
@@ -759,12 +777,16 @@ class ChunkProcessor:
                 return
             transcript_path = artifacts.transcript
 
-            # 5. Scrub text surfaces + mask screenshots when user opted in.
-            if self._scrub_enabled and self._pipeline is not None:
+            # 5. Scrub text surfaces + mask screenshots when the user opted in.
+            #    ChunkScrubber owns the "is scrubbing on?" decision (SCR-35) and
+            #    returns None when off (no Scrubber constructed). The content-
+            #    index pass branches on a real ScrubResult, never on the attempt.
+            if self._chunk_scrubber.is_enabled:
                 self._set_status("Redacting sensitive data...")
-                scrub_result = self._scrub_chunk_files(
-                    idx, start_ts, end_ts, transcript_path,
-                )
+            scrub_result = self._chunk_scrubber.scrub(
+                idx, start_ts, end_ts, transcript_path,
+            )
+            if scrub_result is not None:
                 # 5b. SCR-118 content index — fail-open, must never affect the
                 # chunk's status, upload, or deletion (AE1). Runs here (pre-
                 # upload, post-scrub) so force-stopped/final chunks still index.
@@ -1059,43 +1081,6 @@ class ChunkProcessor:
             raise
 
         return jsonl_path
-
-    def _scrub_chunk_files(
-        self, idx: int, start_ts: float, end_ts: float,
-        transcript_path: Path | None,
-    ) -> "ScrubResult":
-        """Scrub text surfaces + mask screenshots for a single chunk.
-
-        Delegates to ``Scrubber.run_chunk()`` so the load-bearing step order
-        lives in one place; the chunk processor only owns lifecycle concerns
-        (which chunks to scrub, when, with what masking config).
-
-        Returns the ``ScrubResult`` so the caller can drive the SCR-118
-        content-index pass off its write-only ``blocked_intervals`` signal
-        (the redaction path must never branch on the return value).
-        """
-        from screencap.scrubber import Scrubber
-
-        scrubber = Scrubber(
-            self._capture_dir,
-            pipeline=self._pipeline,
-            anonymizer=self._anonymizer,
-            evaluator=self._masking_evaluator,
-            classifier=self._masking_classifier,
-            pixel_ratio=self._masking_pixel_ratio,
-        )
-        scrub_result = scrubber.run_chunk(
-            idx=idx,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            transcript_path=transcript_path,
-        )
-
-        if scrub_result.audit_entries:
-            logger.info(
-                f"Chunk {idx}: scrubbed with {len(scrub_result.audit_entries)} audit entries"
-            )
-        return scrub_result
 
     def _index_chunk_content(
         self, idx: int, start_ts: float, end_ts: float,

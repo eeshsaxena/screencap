@@ -155,6 +155,21 @@ def cloud_processor(cloud_capture_dir):
     pipeline, anonymizer = _make_mock_pipeline()
     cp._pipeline = pipeline
     cp._anonymizer = anonymizer
+    # SCR-35: the per-chunk scrub seam captured its config at construction
+    # (here pipeline=None, since cloud_intent + upload_enabled=False does not
+    # init scrubbing). Rebuild it with the injected mock pipeline so tests that
+    # drive scrubbing through the seam (ChunkScrubber.scrub) behave as before.
+    from screencap.chunk_scrubber import ChunkScrubber
+
+    cp._chunk_scrubber = ChunkScrubber(
+        cloud_capture_dir,
+        enabled=True,
+        pipeline=pipeline,
+        anonymizer=anonymizer,
+        evaluator=cp._masking_evaluator,
+        classifier=cp._masking_classifier,
+        pixel_ratio=cp._masking_pixel_ratio,
+    )
     return cp
 
 
@@ -704,7 +719,7 @@ class TestInlineScrubbing:
     def test_scrub_chunk_files_renames_on_per_file_failure(
         self, cloud_capture_dir, cloud_processor,
     ):
-        """_scrub_chunk_files must rename a file to .scrub_failed when events scrub raises."""
+        """ChunkScrubber.scrub must rename a file to .scrub_failed when events scrub raises."""
         # Write a valid events file but make the pipeline scrub raise
         events_path = cloud_capture_dir / "events_0000.jsonl"
         events_path.write_text('{"name":"click"}\n')
@@ -713,7 +728,7 @@ class TestInlineScrubbing:
             "screencap.scrubber.scrub_events_jsonl",
             side_effect=RuntimeError("simulated scrub failure"),
         ):
-            cloud_processor._scrub_chunk_files(0, 1000.0, 2000.0, None)
+            cloud_processor._chunk_scrubber.scrub(0, 1000.0, 2000.0, None)
 
         # Original file should be renamed, not uploaded
         assert not events_path.exists()
@@ -2287,7 +2302,7 @@ class TestProcessChunkFinalAssignment:
         cp._trigger_flush = lambda *a, **kw: None
         cp._export_events = lambda *a, **kw: None
         cp._chunk_manifest.produce = lambda *a, **kw: None
-        cp._scrub_chunk_files = lambda *a, **kw: None
+        cp._chunk_scrubber.scrub = lambda *a, **kw: None
         cp._collect_chunk_files = lambda *a, **kw: [
             {"name": "events_0000.jsonl", "path": capture_dir / "events_0000.jsonl"},
         ]
