@@ -147,32 +147,14 @@ struct SearchView: View {
                 ForEach(days, id: \.day) { group in
                     Section(searchDayLabel(group.day)) {
                         ForEach(group.items) { item in
-                            Button { openReview(item) } label: {
-                                ResultRow(
-                                    item: item,
-                                    queryTerms: results.queryTerms,
-                                    frameIndex: frameIndex,
-                                    thumbnailLoader: thumbnailLoader
-                                )
-                            }
-                                .buttonStyle(.plain)
-                                .tag(item.id)   // U4 — arrow-key selection target
+                            resultRow(item, queryTerms: results.queryTerms)
                         }
                     }
                 }
                 if !unanchored.isEmpty {
                     Section("Heard in audio (time approximate)") {
                         ForEach(unanchored) { item in
-                            Button { openReview(item) } label: {
-                                ResultRow(
-                                    item: item,
-                                    queryTerms: results.queryTerms,
-                                    frameIndex: frameIndex,
-                                    thumbnailLoader: thumbnailLoader
-                                )
-                            }
-                                .buttonStyle(.plain)
-                                .tag(item.id)   // U4 — arrow-key selection target
+                            resultRow(item, queryTerms: results.queryTerms)
                         }
                     }
                 }
@@ -183,21 +165,39 @@ struct SearchView: View {
         .background(returnKeyHandler(results))
     }
 
-    /// SCR-183 U4 — opens the keyboard-selected result on Return. Present only
-    /// when a result is selected AND the search field is not focused, so it does
-    /// not steal Return from the field's own run-a-search binding. The exact
-    /// arrow-navigation + Return behavior on macOS 13 (where `.onKeyPress` is
-    /// unavailable) needs on-device verification — see the plan's deferred
-    /// questions; this is the smallest mechanism that compiles and is structurally
-    /// correct.
+    /// SCR-183 U4 — one result row. Plain selectable row (NOT a `Button`): a
+    /// `.plain` Button per row hijacks the window's default action, so Return
+    /// fired the *first* row's button instead of the keyboard-selected one
+    /// (verified on-device). As a plain row, single-click selects (keyboard
+    /// parity) and `returnKeyHandler` owns Return; double-click opens for the
+    /// mouse. The combined VoiceOver label lives on `ResultRow` (U2).
+    private func resultRow(_ item: SearchResultItem, queryTerms: [String]) -> some View {
+        ResultRow(
+            item: item,
+            queryTerms: queryTerms,
+            frameIndex: frameIndex,
+            thumbnailLoader: thumbnailLoader
+        )
+        .contentShape(Rectangle())
+        .tag(item.id)   // arrow-key selection target
+        .simultaneousGesture(TapGesture(count: 2).onEnded { openReview(item) })
+    }
+
+    /// SCR-183 U4 — opens the keyboard-selected result on Return. The lone
+    /// `.defaultAction` button in the window (rows are no longer Buttons), so it
+    /// unambiguously owns Return. Present only when a result is selected AND the
+    /// search field is not focused, so it never steals Return from the field's
+    /// run-a-search binding. A 1×1 (non-zero) frame keeps SwiftUI from culling it
+    /// and dropping the shortcut registration.
     @ViewBuilder
     private func returnKeyHandler(_ results: SearchResults) -> some View {
         if !searchFieldFocused,
            let target = searchReviewTarget(for: selectedResultID, in: results) {
             Button("") { openReview(target) }
                 .keyboardShortcut(.defaultAction)
+                .frame(width: 1, height: 1)
                 .opacity(0)
-                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
                 .accessibilityHidden(true)
         }
     }
