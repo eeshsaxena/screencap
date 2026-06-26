@@ -1,7 +1,7 @@
 ---
 title: "feat: Search result screenshot thumbnails + matched-text highlighting"
 type: feat
-status: active
+status: completed
 date: 2026-06-26
 origin: docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md
 ---
