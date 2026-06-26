@@ -1,11 +1,10 @@
 import SwiftUI
 
-// SCR-174 U5 — the in-app "ask your history" Search surface. Owns a
-// SearchViewModel, reads the OCR-indexing flag + chunk duration from settings,
-// renders the search field, honest coverage/empty states, and the per-day
-// timeline of pointer results. Selecting a result opens the Review window at
-// that moment (seek wired in U6). The consent affordance is a minimal note
-// here; U7 makes it interactive.
+// SCR-174 U5 — the in-app "ask your history" Search surface. The results render
+// as a single `List` that is the detail root (per-day `Section`s); the search
+// field is pinned with `.safeAreaInset`. A List-as-root sizes reliably inside
+// the NavigationSplitView detail — stacking a List/ScrollView below siblings in
+// a VStack does not. Selecting a result opens the Review window at that moment.
 struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @Environment(\.openWindow) private var openWindow
@@ -16,12 +15,16 @@ struct SearchView: View {
     @State private var searchTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(spacing: 0) {
-            searchField
-            Divider()
-            content
-        }
-        .task { await loadSettings() }
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(spacing: 0) {
+                    searchField
+                    Divider()
+                }
+                .background(.bar)
+            }
+            .task { await loadSettings() }
     }
 
     // MARK: - Search field
@@ -65,45 +68,53 @@ struct SearchView: View {
                 detail: "Start ScreenCap to search your history."
             )
         case .loaded(let results):
-            resultsView(results)
+            resultsList(results)
         }
     }
 
-    @ViewBuilder
-    private func resultsView(_ results: SearchResults) -> some View {
+    private func resultsList(_ results: SearchResults) -> some View {
         let anchored = results.items.filter { $0.anchorMs != nil }
         let unanchored = results.items.filter { $0.anchorMs == nil }
+        let days = searchResultsGroupedByDay(anchored)
 
-        VStack(alignment: .leading, spacing: 0) {
-            interpretation(results)
-            coverageBar(results.coverage)
-            if results.consentNeeded && !consentDeclined {
-                consentBanner
+        return List {
+            Section {
+                if results.timeWindow != nil || results.appFilter != nil {
+                    Label(interpretationText(results), systemImage: "wand.and.stars")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .listRowSeparator(.hidden)
+                }
+                coverageRow(results.coverage)
+                    .listRowSeparator(.hidden)
+                if results.consentNeeded && !consentDeclined {
+                    consentBanner
+                        .listRowSeparator(.hidden)
+                }
             }
-            Divider()
 
             if results.items.isEmpty {
-                emptyState(results)
+                emptyRow(results)
             } else {
-                SearchTimelineView(items: anchored) { openReview($0) }
+                ForEach(days, id: \.day) { group in
+                    Section(searchDayLabel(group.day)) {
+                        ForEach(group.items) { item in
+                            Button { openReview(item) } label: { ResultRow(item: item) }
+                                .buttonStyle(.plain)
+                        }
+                    }
+                }
                 if !unanchored.isEmpty {
-                    unanchoredSection(unanchored)
+                    Section("Heard in audio (time approximate)") {
+                        ForEach(unanchored) { item in
+                            Button { openReview(item) } label: { ResultRow(item: item) }
+                                .buttonStyle(.plain)
+                        }
+                    }
                 }
             }
         }
-    }
-
-    @ViewBuilder
-    private func interpretation(_ results: SearchResults) -> some View {
-        if results.timeWindow != nil || results.appFilter != nil {
-            HStack(spacing: 6) {
-                Image(systemName: "wand.and.stars").font(.caption2)
-                Text(interpretationText(results)).font(.caption)
-            }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-        }
+        .listStyle(.inset)
     }
 
     private func interpretationText(_ results: SearchResults) -> String {
@@ -121,15 +132,13 @@ struct SearchView: View {
 
     // MARK: - Coverage
 
-    private func coverageBar(_ coverage: CoverageReport) -> some View {
-        HStack(spacing: 10) {
+    private func coverageRow(_ coverage: CoverageReport) -> some View {
+        HStack(spacing: 12) {
             coverageChip("On screen", coverage.screen)
             coverageChip("Audio", coverage.audio)
             coverageChip("Activity", coverage.activity)
             Spacer()
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
     }
 
     @ViewBuilder
@@ -165,8 +174,7 @@ struct SearchView: View {
         }
     }
 
-    // MARK: - Consent (U7) — one-time, fires only when free-text is present and
-    // the on-screen-text flag is off; "Not now" persists so it never re-fires.
+    // MARK: - Consent (U7)
 
     private var consentBanner: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -189,43 +197,27 @@ struct SearchView: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 8)
     }
 
-    // MARK: - Unanchored (transcript hits with no resolvable time)
-
-    private func unanchoredSection(_ items: [SearchResultItem]) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Heard in audio (time approximate)")
-                .font(.caption).foregroundStyle(.secondary)
-                .padding(.horizontal, 12).padding(.top, 8)
-            ForEach(items) { item in
-                Button { openReview(item) } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "waveform").foregroundStyle(.purple)
-                        Text(item.primaryText).lineLimit(1)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    // MARK: - Empty / message states
+    // MARK: - Empty
 
     @ViewBuilder
-    private func emptyState(_ results: SearchResults) -> some View {
-        if results.timeWindow != nil, case .empty = results.coverage.activity {
-            stateMessage(icon: "calendar.badge.exclamationmark", title: "Nothing recorded then",
-                         detail: "No activity was recorded in that time range.")
-        } else {
-            stateMessage(icon: "magnifyingglass", title: "No matches",
-                         detail: "Try different words, an app name, or a time like \u{201C}yesterday\u{201D}.")
+    private func emptyRow(_ results: SearchResults) -> some View {
+        let isAuthoritativeEmpty: Bool = {
+            if results.timeWindow != nil, case .empty = results.coverage.activity { return true }
+            return false
+        }()
+        VStack(alignment: .leading, spacing: 4) {
+            Text(isAuthoritativeEmpty ? "Nothing recorded then" : "No matches")
+                .font(.headline)
+            Text(isAuthoritativeEmpty
+                 ? "No activity was recorded in that time range."
+                 : "Try different words, an app name, or a time like \u{201C}yesterday\u{201D}.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
+        .padding(.vertical, 8)
+        .listRowSeparator(.hidden)
     }
 
     private func stateMessage(icon: String, title: String, detail: String) -> some View {
@@ -249,8 +241,8 @@ struct SearchView: View {
     }
 
     /// Opens the Review window for the result's recording and (U6) requests a
-    /// one-shot seek to the hit moment. The seek is delivered out-of-band so the
-    /// window stays keyed on the recording name (no duplicate windows).
+    /// one-shot seek to the hit moment, delivered out-of-band so the window
+    /// stays keyed on the recording name.
     private func openReview(_ item: SearchResultItem) {
         if let anchorMs = item.anchorMs {
             ReviewWindowOpener.shared.pendingSeekMs[item.recording] = anchorMs
@@ -266,14 +258,12 @@ struct SearchView: View {
             consentDeclined = env.settings.contentIndexConsentDeclined ?? false
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
         } catch {
-            // Best-effort: search still works (timeline is authoritative); the
-            // consent CTA simply may show since the flag reads false.
             contentIndexEnabled = false
         }
     }
 
-    /// Consent: enable on-screen-text indexing going forward, then re-run the
-    /// query. Optimistic update with success-latch (revert on write failure).
+    /// Enable on-screen-text indexing going forward, then re-run the query.
+    /// Optimistic with success-latch (revert on write failure).
     private func enableConsent() {
         contentIndexEnabled = true
         Task {
@@ -282,15 +272,14 @@ struct SearchView: View {
                     ["settings", "--set", "content_index_enabled=true", "--json"]
                 )
             } catch {
-                contentIndexEnabled = false  // latch on success only
+                contentIndexEnabled = false
                 return
             }
             runSearch()
         }
     }
 
-    /// Decline: persist the decision so the prompt never re-fires. Optimistic
-    /// hide with revert-on-failure so a failed write can be re-offered.
+    /// Persist the decline so the prompt never re-fires (revert on failure).
     private func declineConsent() {
         consentDeclined = true
         Task {

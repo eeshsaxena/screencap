@@ -1,80 +1,32 @@
 import SwiftUI
 
-// SCR-174 U5 — renders anchored search results as a per-day timeline: a day
-// strip (days containing hits, defaulting to the most recent) over a
-// chronological list of result cards for the selected day. Selecting a card
-// opens the Review window at that moment (wired in U6).
-struct SearchTimelineView: View {
-    let items: [SearchResultItem]  // anchored only (anchorMs != nil)
-    let onOpen: (SearchResultItem) -> Void
+// SCR-174 U5 — result row + per-result display helpers for the in-app Search
+// results. The results themselves render as a `List` with per-day `Section`s
+// directly in `SearchView` (a List that is the detail root sizes reliably;
+// nesting a List/ScrollView below siblings in a VStack inside the
+// NavigationSplitView detail does not — it starves every sibling of height).
 
-    @State private var selectedDay: Date?
-
-    private var grouped: [(day: Date, items: [SearchResultItem])] {
-        let groups = Dictionary(grouping: items) { item -> Date in
-            let secs = Double(item.anchorMs ?? 0) / 1000
-            return Calendar.current.startOfDay(for: Date(timeIntervalSince1970: secs))
-        }
-        return groups
-            .map { (day: $0.key, items: $0.value.sorted { ($0.anchorMs ?? 0) > ($1.anchorMs ?? 0) }) }
-            .sorted { $0.day > $1.day }
+/// Groups anchored results into day buckets, most-recent day first, newest
+/// within each day.
+func searchResultsGroupedByDay(_ items: [SearchResultItem]) -> [(day: Date, items: [SearchResultItem])] {
+    let groups = Dictionary(grouping: items) { item -> Date in
+        let secs = Double(item.anchorMs ?? 0) / 1000
+        return Calendar.current.startOfDay(for: Date(timeIntervalSince1970: secs))
     }
-
-    private var activeDay: Date? { selectedDay ?? grouped.first?.day }
-
-    private var itemsForActiveDay: [SearchResultItem] {
-        guard let activeDay else { return [] }
-        return grouped.first { $0.day == activeDay }?.items ?? []
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if grouped.count > 1 {
-                dayStrip
-                Divider()
-            }
-            List(itemsForActiveDay) { item in
-                Button { onOpen(item) } label: { ResultRow(item: item) }
-                    .buttonStyle(.plain)
-                    .contentShape(Rectangle())
-            }
-            .listStyle(.inset)
-        }
-    }
-
-    private var dayStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(grouped, id: \.day) { group in
-                    let isActive = group.day == activeDay
-                    Button { selectedDay = group.day } label: {
-                        Text(Self.dayLabel(group.day))
-                            .font(.callout)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(
-                                isActive ? Color.accentColor.opacity(0.18) : Color.clear,
-                                in: Capsule()
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-        }
-    }
-
-    static func dayLabel(_ day: Date) -> String {
-        if Calendar.current.isDateInToday(day) { return "Today" }
-        if Calendar.current.isDateInYesterday(day) { return "Yesterday" }
-        let f = DateFormatter()
-        f.dateFormat = "EEE MMM d"
-        return f.string(from: day)
-    }
+    return groups
+        .map { (day: $0.key, items: $0.value.sorted { ($0.anchorMs ?? 0) > ($1.anchorMs ?? 0) }) }
+        .sorted { $0.day > $1.day }
 }
 
-private struct ResultRow: View {
+func searchDayLabel(_ day: Date) -> String {
+    if Calendar.current.isDateInToday(day) { return "Today" }
+    if Calendar.current.isDateInYesterday(day) { return "Yesterday" }
+    let f = DateFormatter()
+    f.dateFormat = "EEE MMM d"
+    return f.string(from: day)
+}
+
+struct ResultRow: View {
     let item: SearchResultItem
 
     var body: some View {
@@ -105,6 +57,7 @@ private struct ResultRow: View {
             }
         }
         .padding(.vertical, 4)
+        .contentShape(Rectangle())
     }
 }
 
