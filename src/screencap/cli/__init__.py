@@ -2740,6 +2740,7 @@ def settings(ctx, set_pair, as_json):
         get_auto_delete_after_upload,
         get_auto_name,
         get_chunk_duration,
+        get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
         get_recordings_dir,
@@ -2762,7 +2763,8 @@ def settings(ctx, set_pair, as_json):
         # Validate key and parse value
         _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
-                       "content_index_enabled", "content_index_consent_declined"}
+                       "content_index_enabled", "content_index_consent_declined",
+                       "content_index_backfill_declined"}
         _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
                          "segmentation_mode": ("llm", "idle")}
 
@@ -2823,6 +2825,7 @@ def settings(ctx, set_pair, as_json):
         "recordings_dir": str(get_recordings_dir()),
         "content_index_enabled": bool(get_content_index_enabled()),
         "content_index_consent_declined": bool(get_content_index_consent_declined()),
+        "content_index_backfill_declined": bool(get_content_index_backfill_declined()),
         "privacy": _build_privacy_settings_block(),
     }
 

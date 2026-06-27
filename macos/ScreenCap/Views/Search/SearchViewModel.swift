@@ -19,7 +19,73 @@ final class SearchViewModel: ObservableObject {
         case daemonDown
     }
 
+    // MARK: - SCR-178 U8 — backfill affordance state machine
+
+    /// The "also index existing recordings" affordance, modeled as its own state
+    /// container so it is **independent of `consentNeeded`**. This is load-bearing:
+    /// the moment the user taps "Turn on", `content_index_enabled` flips, so the
+    /// next search reports `consentNeeded == false` and the consent banner
+    /// disappears. If the backfill progress UI were gated on `consentNeeded` it
+    /// would vanish the instant indexing was enabled — exactly when the user
+    /// needs to watch it. Driving the UI off this enum (never `consentNeeded`)
+    /// keeps the affordance on screen across that flip.
+    enum BackfillUIState: Equatable {
+        /// Nothing shown (no offer pending, or the user skipped, or it finished
+        /// and was dismissed).
+        case hidden
+        /// "Index your existing recordings now?" with Accept / Skip.
+        case offering
+        /// Accepted; `backfillStart` issued, but no progress event yet — the
+        /// engine seeds its closed set first so `total` is briefly 0.
+        /// Indeterminate ("Preparing to index…").
+        case starting
+        /// Determinate progress once `total > 0`.
+        case indexing(done: Int, total: Int, failed: Int)
+        /// Terminal: every unit processed. `failed == 0` → clean copy;
+        /// `failed > 0` → hedged copy.
+        case done(done: Int, total: Int, failed: Int)
+        /// Terminal: budget/large-library pause — resumable. Carries a Resume.
+        case paused(done: Int, total: Int)
+        /// Terminal: user cancelled — resumable. Carries a Resume.
+        case cancelled(done: Int, total: Int)
+        /// Terminal: `backfillStart` was rejected / daemon unreachable. Search
+        /// stays fully usable; the user can retry later.
+        case startFailed
+
+        /// Whether the affordance currently owns the keyboard (Return stands
+        /// down): true while an offer is up or a run is in flight, so the hidden
+        /// open-selected-result Return handler doesn't steal the key.
+        var isActive: Bool {
+            switch self {
+            case .offering, .starting, .indexing:
+                return true
+            case .hidden, .done, .paused, .cancelled, .startFailed:
+                return false
+            }
+        }
+
+        /// Whether this state is a terminal outcome (drives the once-only
+        /// VoiceOver announcement; in-progress ticks must not announce).
+        var isTerminal: Bool {
+            switch self {
+            case .done, .paused, .cancelled, .startFailed:
+                return true
+            case .hidden, .offering, .starting, .indexing:
+                return false
+            }
+        }
+    }
+
+    @Published private(set) var backfillState: BackfillUIState = .hidden
+
     private let service: SearchService
+    private let backfill: BackfillService
+    /// Persists a `content_index_backfill_declined=true` (Skip) the same way the
+    /// consent decline is persisted (CLI `settings --set`). Injected so the
+    /// state machine is testable without spawning the CLI; the live wiring passes
+    /// the real CLI call. Throwing surfaces as a no-op (the affordance still
+    /// hides locally — see `skipBackfill`).
+    private let persistBackfillDeclined: @Sendable () async throws -> Void
     private let parser: QueryParser
     private let now: @Sendable () -> Date
     /// Recording chunk length (seconds), read once from `settings` by the live
@@ -28,14 +94,25 @@ final class SearchViewModel: ObservableObject {
     /// timeline event.
     var chunkDurationSeconds: Double
     private var inFlight = false
+    /// The live progress-consumption task — cancelled when the affordance is
+    /// dismissed or a new run starts.
+    private var backfillTask: Task<Void, Never>?
 
     init(
         service: SearchService = LiveSearchService(),
+        backfill: BackfillService = LiveBackfillService(),
+        persistBackfillDeclined: @escaping @Sendable () async throws -> Void = {
+            _ = try await CLIClient.runJSONRaw(
+                ["settings", "--set", "content_index_backfill_declined=true", "--json"]
+            )
+        },
         parser: QueryParser = QueryParser(),
         chunkDurationSeconds: Double = 300,
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.service = service
+        self.backfill = backfill
+        self.persistBackfillDeclined = persistBackfillDeclined
         self.parser = parser
         self.chunkDurationSeconds = chunkDurationSeconds
         self.now = now
@@ -143,6 +220,156 @@ final class SearchViewModel: ObservableObject {
             queryTerms: parsed.freeText.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         )
         phase = .loaded(results)
+    }
+
+    // MARK: - SCR-178 U8 — backfill affordance transitions
+
+    /// Show the "index existing recordings now?" offer. Called from
+    /// `enableConsent()` right after the flag flips — unless the user already
+    /// skipped the backfill before (then it stays hidden, no re-nag).
+    func offerBackfill(alreadyDeclined: Bool) {
+        guard !alreadyDeclined else {
+            backfillState = .hidden
+            return
+        }
+        backfillState = .offering
+    }
+
+    /// Accept the offer: subscribe to progress **before** starting the run (so
+    /// the initial events aren't missed — the late-listener race), move to
+    /// `starting`, then issue `backfillStart`. A start failure → `startFailed`
+    /// (search stays usable). Resume (from `cancelled`/`paused`) routes here too.
+    func acceptBackfill() {
+        startRun()
+    }
+
+    /// Resume a `cancelled`/`paused` run — same path as accept (the daemon
+    /// resumes from the ledger).
+    func resumeBackfill() {
+        startRun()
+    }
+
+    private func startRun() {
+        backfillTask?.cancel()
+        backfillState = .starting
+        // Subscribe FIRST so events published right after `start()` are caught
+        // (the late-listener race). `progressEvents()` is invoked here, before
+        // the `start()` call below, so the listener is attached before the run.
+        //
+        // One task — await `start()`, then drain the progress stream inline,
+        // returning on the terminal event. Deliberately NOT a nested
+        // `Task { … }` + `await consume.value`: a @MainActor task awaiting
+        // another @MainActor task's value wedges on resume (the prior run's
+        // consume never completes on a still-open stream, so its `.value`
+        // never resolves). Inlining the loop and breaking on the terminal
+        // event keeps a single, self-completing task.
+        let events = backfill.progressEvents()
+        backfillTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let status = try await self.backfill.start()
+                // Reflect the seed snapshot only if no progress event has moved
+                // us off `starting` yet (usually total==0 → stays `starting`).
+                if self.backfillState == .starting {
+                    self.applyStatus(status)
+                }
+            } catch {
+                self.setStartFailed()
+                return
+            }
+            for await event in events {
+                if Task.isCancelled { return }
+                self.applyEvent(event)
+                if event.isTerminal { return }
+            }
+        }
+    }
+
+    /// Skip the offer: persist the decline (same CLI path as consent decline) so
+    /// it doesn't re-prompt, hide the affordance, and start no job. Indexing
+    /// stays forward-only. A persistence failure still hides locally (best
+    /// effort — the offer just may reappear on a later launch).
+    func skipBackfill() {
+        backfillTask?.cancel()
+        backfillState = .hidden
+        Task { [persistBackfillDeclined] in
+            try? await persistBackfillDeclined()
+        }
+    }
+
+    /// Cancel an in-flight run. Optimistic local transition to `cancelled` with
+    /// a Resume; the daemon flushes its ledger so a resume continues cleanly.
+    func cancelBackfill() {
+        let (d, t) = currentCounts()
+        Task { [weak self] in
+            _ = try? await self?.backfill.cancel()
+        }
+        backfillState = .cancelled(done: d, total: t)
+    }
+
+    /// Retract a pending offer without persisting a decline — used when the
+    /// consent write itself failed, so the affordance shouldn't linger. No job
+    /// was started, nothing to cancel.
+    func dismissBackfillOffer() {
+        if case .offering = backfillState { backfillState = .hidden }
+    }
+
+    private func setStartFailed() {
+        backfillState = .startFailed
+    }
+
+    /// Map a streamed progress event onto the affordance state. Terminal events
+    /// land on the matching terminal state; `backfill.progress` ticks update the
+    /// determinate `indexing` (or stay `starting` until `total > 0`).
+    private func applyEvent(_ event: BackfillProgressEvent) {
+        applyStatus(BackfillStatus(
+            state: event.state,
+            done: event.done,
+            skipped: event.skipped,
+            failed: event.failed,
+            total: event.total,
+            currentUnitIndex: event.currentUnitIndex
+        ))
+    }
+
+    /// Pure-ish mapper from a daemon `BackfillStatus` snapshot to `BackfillUIState`.
+    /// Used by both the seed snapshot and each progress event. `skipped` is a
+    /// privacy-correct outcome (frames the policy blocked) — it is never surfaced
+    /// as an error; only `failed > 0` hedges the copy.
+    private func applyStatus(_ status: BackfillStatus) {
+        switch status.state {
+        case .running:
+            backfillState = status.total > 0
+                ? .indexing(done: status.done, total: status.total, failed: status.failed)
+                : .starting
+        case .completed:
+            backfillState = .done(done: status.done, total: status.total, failed: status.failed)
+        case .paused:
+            backfillState = .paused(done: status.done, total: status.total)
+        case .cancelled:
+            backfillState = .cancelled(done: status.done, total: status.total)
+        case .failed:
+            // A run that fails outright after starting reads like a start
+            // failure to the user: indexing didn't complete, search is still
+            // usable, retry later.
+            backfillState = .startFailed
+        case .idle:
+            // No run in flight — leave the current affordance untouched (a stale
+            // idle snapshot must not wipe an offer or a terminal result).
+            break
+        }
+    }
+
+    /// Best-known (done, total) for the current state — used to seed the Resume
+    /// affordance on cancel so it shows the progress reached.
+    private func currentCounts() -> (Int, Int) {
+        switch backfillState {
+        case .indexing(let d, let t, _): return (d, t)
+        case .done(let d, let t, _): return (d, t)
+        case .paused(let d, let t): return (d, t)
+        case .cancelled(let d, let t): return (d, t)
+        case .hidden, .offering, .starting, .startFailed: return (0, 0)
+        }
     }
 
     // MARK: - Fetch helpers (each maps socket-level failure to `.down`)

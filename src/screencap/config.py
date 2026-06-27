@@ -204,6 +204,24 @@ def get_content_index_consent_declined() -> bool:
     )
 
 
+def get_content_index_backfill_declined() -> bool:
+    """Return whether the user declined the one-time "index existing recordings"
+    backfill offer (SCR-178 U8).
+
+    Persisted as a settings bool, distinct from ``content_index_consent_declined``
+    (the indexing-consent decline) and ``content_index_enabled``: the backfill
+    offer is shown right after the user enables indexing, and once they enable it
+    the consent banner no longer renders — so this flag is what keeps the offer
+    from re-appearing on a later launch when an explicit re-entry point exists.
+    Same UI-honesty (not security) posture as the consent flag.
+    """
+    return _parse_bool_env(
+        "SCREENCAP_CONTENT_INDEX_BACKFILL_DECLINED",
+        "content_index_backfill_declined",
+        False,
+    )
+
+
 def get_downloads_dir() -> Path:
     """Return downloads directory, creating it if needed."""
     env = os.environ.get("SCREENCAP_DOWNLOADS_DIR")

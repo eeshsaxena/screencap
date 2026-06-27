@@ -515,6 +515,94 @@ enum DaemonClient {
         }
     }
 
+    /// Like `subscribe(...)` but yields each NDJSON line's raw UTF-8 bytes
+    /// instead of a decoded `RecorderEventLine`. SCR-178 (U8): the backfill
+    /// progress events carry count fields `RecorderEventLine` does not model, so
+    /// the affordance re-decodes the raw line through
+    /// `backfillProgressEvent(fromLine:)`. A line that fails to parse is dropped
+    /// (never throws) so an unrelated event shape can't kill the stream.
+    static func subscribeRawLines(
+        path: String = "/v0/events",
+        sinceCursor: Int? = nil,
+        socketPathOverride: String? = nil
+    ) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            let connectionBox = DaemonStreamConnectionBox()
+
+            let task = Task {
+                let queryPath: String
+                if let sinceCursor {
+                    queryPath = "\(path)?since=\(sinceCursor)"
+                } else {
+                    queryPath = path
+                }
+
+                let socket = socketPathOverride ?? socketPath()
+                guard FileManager.default.fileExists(atPath: socket) else {
+                    continuation.finish(throwing: DaemonClientError.socketUnavailable(path: socket))
+                    return
+                }
+
+                let connection = NWConnection(to: .unix(path: socket), using: .tcp)
+                connectionBox.set(connection)
+                do {
+                    try await connect(connection)
+                    try await sendRequest(connection: connection, method: "GET", path: queryPath, body: nil)
+                    let reader = ConnectionByteReader(connection: connection)
+                    let headerBytes = try await reader.readUntil(Data("\r\n\r\n".utf8))
+                    let headers = try parseHTTPHeaders(headerBytes)
+                    guard (200..<300).contains(headers.status) else {
+                        let body = try await reader.readToEOF()
+                        throw makeHTTPError(status: headers.status, body: body)
+                    }
+                    guard headers.headers["transfer-encoding"]?.lowercased().contains("chunked") == true else {
+                        throw DaemonClientError.streamClosed(reason: "missing chunked transfer encoding")
+                    }
+
+                    var lines = NDJSONLineBuffer()
+                    while !Task.isCancelled {
+                        let lengthLine = try await reader.readUntil(Data("\r\n".utf8))
+                        let hexText = String(data: lengthLine.dropLast(2), encoding: .utf8)?
+                            .split(separator: ";", maxSplits: 1)
+                            .first
+                            .map(String.init)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        guard let chunkLength = Int(hexText, radix: 16) else {
+                            throw DaemonClientError.streamClosed(reason: "invalid chunk length")
+                        }
+                        if chunkLength == 0 {
+                            _ = try? await reader.readUntil(Data("\r\n".utf8))
+                            continuation.finish()
+                            connection.cancel()
+                            return
+                        }
+
+                        let chunk = try await reader.readExactly(chunkLength)
+                        let crlf = try await reader.readExactly(2)
+                        guard crlf == Data("\r\n".utf8) else {
+                            throw DaemonClientError.streamClosed(reason: "invalid chunk terminator")
+                        }
+                        for line in try lines.feed(chunk) {
+                            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { continue }
+                            continuation.yield(data)
+                        }
+                    }
+                    connectionBox.cancel()
+                    continuation.finish()
+                } catch {
+                    connectionBox.cancel()
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+                connectionBox.cancel()
+            }
+        }
+    }
+
     static func daemonInfo() async throws -> DaemonInfoResponse {
         try await request(method: "GET", path: "/v0/daemon.info")
     }
