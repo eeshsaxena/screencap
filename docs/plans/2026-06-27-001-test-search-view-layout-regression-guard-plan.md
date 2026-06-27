@@ -1,7 +1,7 @@
 ---
 title: "test: Snapshot/UI regression guard for Search views"
 type: test
-status: active
+status: completed
 date: 2026-06-27
 origin: linear SCR-184 (https://linear.app/zk-email/issue/SCR-184)
 ---
