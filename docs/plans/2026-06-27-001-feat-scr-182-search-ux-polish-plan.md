@@ -1,7 +1,7 @@
 ---
 title: "feat: Search UX polish — live results, result count, truncation note, recent searches"
 type: feat
-status: active
+status: completed
 date: 2026-06-27
 ---
 
