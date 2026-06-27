@@ -38,6 +38,19 @@ def test_seed_marks_all_pending_with_frozen_denominator(tmp_path: Path) -> None:
     assert total == len(units)
 
 
+def test_unit_status_reflects_marks_and_unseeded(tmp_path: Path) -> None:
+    led = _ledger(tmp_path)
+    led.seed([("rec", 0), ("rec", 1)])
+
+    assert led.unit_status("rec", 0) == UnitStatus.PENDING
+    led.mark("rec", 0, UnitStatus.DONE, rows_written=4)
+    assert led.unit_status("rec", 0) == UnitStatus.DONE
+    assert led.unit_status("rec", 1) == UnitStatus.PENDING
+    # Not part of the seeded closed set → None (never widens the denominator).
+    assert led.unit_status("rec", 99) is None
+    assert led.unit_status("other", 0) is None
+
+
 def test_resume_next_pending_and_is_complete(tmp_path: Path) -> None:
     led = _ledger(tmp_path)
     led.seed([("rec", 0), ("rec", 1), ("rec", 2)])

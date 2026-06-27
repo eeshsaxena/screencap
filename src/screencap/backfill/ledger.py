@@ -306,6 +306,25 @@ class BackfillLedger:
         finally:
             conn.close()
 
+    def unit_status(self, recording: str, chunk: int) -> "UnitStatus | None":
+        """Return the status of one seeded unit, or ``None`` if not seeded.
+
+        Lets a resuming run (U4) skip already-terminal units without
+        re-deriving them, without reaching into the ledger's connection.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM backfill_unit_state "
+                "WHERE recording_dir_name=? AND chunk_index=?",
+                (str(recording), int(chunk)),
+            ).fetchone()
+            if row is None:
+                return None
+            return UnitStatus(row[0])
+        finally:
+            conn.close()
+
     def progress(self) -> tuple[int, int, int, int]:
         """Return ``(done, skipped, failed, total)`` over the frozen closed set.
 
