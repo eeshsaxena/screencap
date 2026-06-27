@@ -593,6 +593,57 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/timeline.query", body: body)
     }
 
+    // MARK: - SCR-178 content-index backfill verbs
+
+    /// Start (or resume) the content-index backfill (SCR-178). Idempotent on the
+    /// daemon side — a second `start` while a run is in flight returns the
+    /// existing job's status rather than spawning a second run. The request
+    /// carries no parameters (the backfill enumerates the local library itself),
+    /// so the body is an empty JSON object. Pointer-/count-only response — no
+    /// recording directory name (R9). On `socketUnavailable`/`connectionFailed`
+    /// the caller surfaces a "daemon not running" state; on an error envelope it
+    /// surfaces the existing `DaemonClientError.envelopeError`.
+    static func backfillStart() async throws -> BackfillStatusResponse {
+        try await request(method: "POST", path: "/v0/backfill.start", body: Data("{}".utf8))
+    }
+
+    /// Current privacy-safe backfill snapshot (SCR-178). Count-only + opaque
+    /// ordinal; no recording name (R9). Read-only — not a recording-mutating
+    /// verb (the daemon excludes it from `_ACTIVITY_PATHS`).
+    static func backfillStatus() async throws -> BackfillStatusResponse {
+        try await request(method: "GET", path: "/v0/backfill.status")
+    }
+
+    /// Signal the in-flight backfill to stop (SCR-178). The run flushes its
+    /// ledger and transitions to `cancelled` (a cancelled run does NOT
+    /// auto-resume on daemon restart — re-trigger is an explicit `backfillStart`).
+    static func backfillCancel() async throws -> BackfillStatusResponse {
+        try await request(method: "POST", path: "/v0/backfill.cancel", body: Data("{}".utf8))
+    }
+
+    /// Decode a single streamed event line into a `BackfillProgressEvent`,
+    /// returning nil for any non-`backfill.*` event or a payload that fails to
+    /// decode. The `subscribe(...)` stream yields `RecorderEventLine` (a flat
+    /// recorder-event shape that does not carry the backfill counts), so the UI
+    /// re-decodes the raw line bytes through this seam: feed each streamed line
+    /// here and act only on the non-nil results. Tolerant by design — an
+    /// unknown or malformed event is ignored, never fatal (U7 edge case).
+    static func backfillProgressEvent(fromLine line: Data) -> BackfillProgressEvent? {
+        guard let event = try? JSONDecoder().decode(BackfillProgressEvent.self, from: line),
+              event.type.hasPrefix("backfill.")
+        else {
+            return nil
+        }
+        return event
+    }
+
+    /// Convenience overload: decode a backfill progress event from a streamed
+    /// line's UTF-8 string form. Mirrors `backfillProgressEvent(fromLine:)`.
+    static func backfillProgressEvent(fromLine line: String) -> BackfillProgressEvent? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        return backfillProgressEvent(fromLine: data)
+    }
+
     private static func connect(_ connection: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let lock = NSLock()
