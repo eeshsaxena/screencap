@@ -1004,6 +1004,128 @@ async def timeline_query(request: Request) -> JSONResponse:
         )
 
 
+def _backfill_job(app: Starlette) -> Any:
+    """Lazily attach the single backfill job holder to ``app.state``.
+
+    Scoped per app instance (not module-global) so tests building fresh apps
+    don't share a job. Lazy init is asyncio-safe: the ``hasattr``/assignment
+    below never await, so two concurrent handlers can't interleave between the
+    check and the set.
+    """
+    state = app.state
+    if not hasattr(state, "backfill_job"):
+        from screencap.daemon.backfill_job import BackfillJob
+
+        state.backfill_job = BackfillJob(state.event_bus)
+    return state.backfill_job
+
+
+async def _backfill_body(request: Request) -> dict[str, Any]:
+    """Read a backfill request body tolerantly.
+
+    The three backfill verbs take no required fields, so an empty body (or no
+    body at all — a bare POST/GET) is valid. ``request.json()`` raises on an
+    empty payload, so we degrade to ``{}`` rather than 500-ing on a parameterless
+    call.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+async def backfill_start(request: Request) -> JSONResponse:
+    """``POST /v0/backfill.start`` — start (or resume) the content-index backfill.
+
+    Idempotent: a ``start`` while a run is in flight returns the existing job's
+    status snapshot rather than spawning a second task (one job at a time —
+    avoids double OCR load + content-index lock contention). The run executes the
+    U4 engine via ``asyncio.to_thread`` inside the job; progress is published on
+    ``/v0/events`` as ``backfill.progress`` (privacy-safe: opaque ordinal only,
+    never a recording dir name — R9). Deliberately NOT in ``_ACTIVITY_PATHS`` —
+    a running backfill keeps the daemon alive via ``_daemon_is_busy``, not via
+    the idle timer.
+    """
+    try:
+        body = await _backfill_body(request)
+        parsed = schema.BackfillStartRequest.model_validate(body)
+        job = _backfill_job(request.app)
+        kwargs: dict[str, Any] = {}
+        if parsed.budget_s is not None:
+            kwargs["budget_s"] = parsed.budget_s
+        if parsed.max_frames_per_recording is not None:
+            kwargs["max_frames_per_recording"] = parsed.max_frames_per_recording
+        snapshot = job.start(**kwargs)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._BACKFILL_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._BACKFILL_API_VERSION,
+            request=request,
+        )
+
+
+async def backfill_status(request: Request) -> JSONResponse:
+    """``GET /v0/backfill.status`` — current privacy-safe backfill snapshot.
+
+    Read-only. Carries ONLY ``(state, done, skipped, failed, total,
+    current_unit_index)`` — never a recording dir name (R9). NOT in
+    ``_ACTIVITY_PATHS``: status-polling must not reset the idle timer (the busy
+    predicate covers liveness while a run is active).
+    """
+    try:
+        job = _backfill_job(request.app)
+        snapshot = job.status()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._BACKFILL_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._BACKFILL_API_VERSION,
+            request=request,
+        )
+
+
+async def backfill_cancel(request: Request) -> JSONResponse:
+    """``POST /v0/backfill.cancel`` — signal the in-flight run to stop.
+
+    Sets the engine's stop flag; the run converges to ``cancelled`` (the ledger
+    records partial progress, resumable). A no-op returning the current snapshot
+    when no run is in flight.
+    """
+    try:
+        body = await _backfill_body(request)
+        schema.BackfillCancelRequest.model_validate(body)
+        job = _backfill_job(request.app)
+        snapshot = job.cancel()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._BACKFILL_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._BACKFILL_API_VERSION,
+            request=request,
+        )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -1018,6 +1140,9 @@ def build_app() -> Starlette:
             Route("/v0/content.search", content_search, methods=["POST"]),
             Route("/v0/transcript.search", transcript_search, methods=["POST"]),
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
+            Route("/v0/backfill.start", backfill_start, methods=["POST"]),
+            Route("/v0/backfill.status", backfill_status, methods=["GET"]),
+            Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

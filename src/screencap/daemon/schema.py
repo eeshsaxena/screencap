@@ -20,6 +20,8 @@ _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
 # SCR-148 cloud account-mismatch observability.
 _AUTH_WHOAMI_API_VERSION = 1
+# SCR-178 content-index backfill lifecycle verbs.
+_BACKFILL_API_VERSION = 1
 
 
 @cache
@@ -64,6 +66,11 @@ _MODEL_NAMES = {
     "TimelineRow",
     "TimelineQueryResponse",
     "WhoAmIResponse",
+    "BackfillStartRequest",
+    "BackfillStatusRequest",
+    "BackfillCancelRequest",
+    "BackfillStatusResponse",
+    "BackfillProgressEvent",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -330,6 +337,63 @@ def _load_models() -> dict[str, Any]:
         email: str | None = None
         stale: bool = False
 
+    class BackfillStartRequest(_DaemonModel):
+        """SCR-178 ``backfill.start`` input.
+
+        The request carries no required fields — the backfill enumerates the
+        user's existing recordings server-side. Optional knobs are accepted but
+        deliberately NOT exposed on the public verb (production callers send an
+        empty body); they exist so a future plan-tier / operator override can
+        bound the run without an API bump.
+        """
+
+        budget_s: float | None = None
+        max_frames_per_recording: int | None = None
+
+    class BackfillStatusRequest(_DaemonModel):
+        """SCR-178 ``backfill.status`` input (no parameters)."""
+
+    class BackfillCancelRequest(_DaemonModel):
+        """SCR-178 ``backfill.cancel`` input (no parameters)."""
+
+    class BackfillStatusResponse(EnvelopeResponse):
+        """The privacy-safe backfill status snapshot (R9).
+
+        Carries ONLY the run state + frozen-denominator counts + an OPAQUE
+        ordinal (``current_unit_index``). The recording directory name is
+        structurally absent — the EventBus is readable by any same-EUID
+        subscriber (incl. the MCP ``/v0/events`` stream), so a dir name (which
+        encodes timing/context) must never cross this boundary. ``state`` is
+        typed ``str`` (not ``Literal``) so a future run-state value decodes
+        tolerantly: one of ``idle`` / ``running`` / ``paused`` / ``cancelled`` /
+        ``completed`` / ``failed``.
+        """
+
+        state: str
+        done: int
+        skipped: int
+        failed: int
+        total: int
+        current_unit_index: int
+
+    class BackfillProgressEvent(_DaemonModel):
+        """The ``backfill.progress`` / ``backfill.<terminal>`` EventBus payload.
+
+        Same privacy-safe shape as :class:`BackfillStatusResponse` minus the
+        envelope fields — published on ``/v0/events`` for live progress. NO
+        recording directory name (R9). ``type`` is the event name
+        (``backfill.progress`` / ``backfill.completed`` / ``backfill.paused`` /
+        ``backfill.cancelled`` / ``backfill.failed``).
+        """
+
+        type: str
+        state: str
+        done: int
+        skipped: int
+        failed: int
+        total: int
+        current_unit_index: int
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -353,6 +417,11 @@ def _load_models() -> dict[str, Any]:
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
         "WhoAmIResponse": WhoAmIResponse,
+        "BackfillStartRequest": BackfillStartRequest,
+        "BackfillStatusRequest": BackfillStatusRequest,
+        "BackfillCancelRequest": BackfillCancelRequest,
+        "BackfillStatusResponse": BackfillStatusResponse,
+        "BackfillProgressEvent": BackfillProgressEvent,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -384,6 +453,7 @@ __all__ = [
     "_TRANSCRIPT_SEARCH_API_VERSION",
     "_TIMELINE_QUERY_API_VERSION",
     "_AUTH_WHOAMI_API_VERSION",
+    "_BACKFILL_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)
