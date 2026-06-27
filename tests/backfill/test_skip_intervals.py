@@ -41,6 +41,14 @@ from screencap.privacy.policy import (
 )
 from screencap.scrubber import BlockedInterval, build_scrub_context, find_blocked_interval
 
+# SCR-178: this whole module is the privacy-load-bearing skip-set derivation.
+# CI runs only ``pytest -m privacy`` (there is no general pytest lane), so mark the
+# module so the fail-closed skip logic actually runs as a CI guard rather than
+# rotting as dev-only documentation (see SCR-110 / the privacy-guards-rot doc). The
+# tests are Vision-free (real classifier + raw sqlite, no OCR), so they run on both
+# the Vision-backed and the Vision-free CI lanes.
+pytestmark = pytest.mark.privacy
+
 # --------------------------------------------------------------------------
 # DB fixture builders (raw SQL, mirroring tests/test_scrubber_class.py)
 # --------------------------------------------------------------------------

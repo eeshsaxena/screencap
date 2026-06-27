@@ -224,6 +224,10 @@ def test_max_frames_cap_truncates_candidates(env, tmp_path):
 # --------------------------------------------------------------------------
 
 
+# SCR-178: skip enforcement is a privacy invariant — mark so CI's privacy lane
+# runs it (CI has no general pytest lane). Vision-free (fake OCR, direct
+# index_range call — no ChunkProcessor), so it runs on the Vision-free lane too.
+@pytest.mark.privacy
 def test_skipped_frames_never_reach_ocr(env, tmp_path):
     cap = tmp_path / "rec"
     cap.mkdir()
@@ -317,6 +321,7 @@ def test_full_pass_reports_completed(env, tmp_path):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.privacy  # SCR-178 R9 barrier — a privacy invariant; run it on CI.
 def test_unlinked_frame_dropped_before_write(env, tmp_path):
     """A screenshot unlinked between OCR and the pre-write re-stat is dropped.
 

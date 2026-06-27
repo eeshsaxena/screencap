@@ -31,6 +31,13 @@ from screencap.backfill.engine import BackfillSummary, run_backfill
 from screencap.backfill.ledger import BackfillLedger, RunState
 from screencap.content_index import ContentIndex
 
+# SCR-178: the engine's end-to-end ALLOW-only enforcement (R2/R3) and the R9
+# resurrection barrier are privacy invariants. CI runs only ``pytest -m privacy``,
+# so mark the module so these run on CI. The tests inject a fake OCR (no Apple
+# Vision) and never construct a ChunkProcessor, so they run on both the
+# Vision-backed and the Vision-free CI lanes.
+pytestmark = pytest.mark.privacy
+
 # --------------------------------------------------------------------------
 # Fakes / fixtures
 # --------------------------------------------------------------------------
