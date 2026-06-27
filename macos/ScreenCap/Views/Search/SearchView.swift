@@ -18,10 +18,31 @@ struct SearchView: View {
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
 
+    // SCR-182 U4 — recent committed searches for the idle state. Held as a
+    // StateObject so it survives body rebuilds; the data lives in UserDefaults.
+    @StateObject private var recentStore = RecentSearchesStore()
+
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
     @State private var searchTask: Task<Void, Never>?
+    // SCR-182 U1 — the last query actually issued, used to dedupe the trailing
+    // `.onChange(of: query)` that a Return or a programmatic chip-tap `query` set
+    // produces, so the same query is never searched twice.
+    @State private var lastIssuedQuery: String?
+
+    /// SCR-182 U1 — live-search debounce. 300 ms balances responsiveness against
+    /// issuing a daemon round-trip on every keystroke.
+    private static let searchDebounceNanos: UInt64 = 300_000_000
+
+    /// SCR-182 U4 — curated example queries for the idle state, shown so a new
+    /// user sees the kinds of questions this surface answers.
+    private static let exampleQueries = [
+        "salesforce yesterday afternoon",
+        "that error message",
+        "zoom call this morning",
+        "stripe dashboard last week",
+    ]
     /// Stub-recording guard message — shown via an alert instead of opening an
     /// inspect window that would fail to load (mirrors the Recordings list).
     @State private var rowError: String?
@@ -53,7 +74,12 @@ struct SearchView: View {
             }
             // SCR-183 U6 — announce the search outcome so a VoiceOver user who
             // can't see the screen learns the result instead of hearing silence.
+            // SCR-182 U1 — live, debounced search-as-you-type.
+            .onChange(of: query) { _ in runSearch(debounced: true) }
             .onChange(of: model.phase) { phase in
+                // SCR-182 U2 — a new result set may not contain the previously
+                // selected row; reset so Return-to-open never acts on a stale id.
+                if case .loaded = phase { selectedResultID = nil }
                 if let message = SearchAccessibility.searchOutcomeAnnouncement(for: phase) {
                     announceToVoiceOver(message)
                 }
@@ -94,7 +120,7 @@ struct SearchView: View {
                     .textFieldStyle(.plain)
                     .accessibilityLabel("Search your history")
                     .focused($searchFieldFocused)
-                    .onSubmit { runSearch() }
+                    .onSubmit { submitSearch() }
             }
             .padding(.vertical, 6)
             .padding(.horizontal, 10)
@@ -114,11 +140,7 @@ struct SearchView: View {
     private var content: some View {
         switch model.phase {
         case .idle:
-            stateMessage(
-                icon: "magnifyingglass",
-                title: "Ask your history",
-                detail: "Search across what was on screen, said aloud, and which apps you used \u{2014} all locally."
-            )
+            idleState
         case .searching:
             ProgressView().controlSize(.large)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -141,6 +163,8 @@ struct SearchView: View {
 
         return List(selection: $selectedResultID) {
             Section {
+                resultsHeader(results)
+                    .listRowSeparator(.hidden)
                 if results.timeWindow != nil || results.appFilter != nil {
                     let interpretation = interpretationText(results)
                     Label(interpretation, systemImage: "wand.and.stars")
@@ -221,6 +245,35 @@ struct SearchView: View {
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
         }
+    }
+
+    // SCR-182 U3 — result-count + truncation cue. The U2 inline refresh spinner
+    // trails the count (same row, not a separate spinner screen) so an in-place
+    // refresh reads as "still showing these, fetching more" rather than a blank.
+    @ViewBuilder
+    private func resultsHeader(_ results: SearchResults) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let count = SearchAccessibility.resultCountLabel(results) {
+                HStack(spacing: 6) {
+                    Text(count)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if model.isSearching {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityHidden(true)
+                    }
+                }
+            }
+            if let note = SearchAccessibility.truncationNote(results) {
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        // Read count + truncation as one VoiceOver stop; the spoken search-outcome
+        // announcement (onChange of phase) already covers live updates.
+        .accessibilityElement(children: .combine)
     }
 
     private func interpretationText(_ results: SearchResults) -> String {
@@ -339,6 +392,66 @@ struct SearchView: View {
         .accessibilityElement(children: .combine)
     }
 
+    // MARK: - Idle state (U4)
+
+    /// SCR-182 U4 — the idle surface: the framing, curated example chips, and the
+    /// user's recent searches (when any). Example chips lead unlabeled; recents
+    /// follow under a "Recent" heading only when present (no empty placeholder).
+    private var idleState: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Ask your history").font(.headline)
+                    Text("Search across what was on screen, said aloud, and which apps you used \u{2014} all locally.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+
+                chipGroup(title: nil, queries: Self.exampleQueries)
+
+                if !recentStore.recent.isEmpty {
+                    chipGroup(title: "Recent", queries: recentStore.recent)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(24)
+        }
+    }
+
+    @ViewBuilder
+    private func chipGroup(title: String?, queries: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let title {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            FlowLayout(spacing: 8) {
+                ForEach(queries, id: \.self) { queryChip($0) }
+            }
+        }
+    }
+
+    /// A tappable query chip. A plain tappable element (NOT a `Button`) so it
+    /// never claims the window's default action — the SCR-183 row discipline,
+    /// applied here so an idle chip can't steal Return from the focused field.
+    private func queryChip(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .padding(.vertical, 5)
+            .padding(.horizontal, 10)
+            .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color(nsColor: .separatorColor)))
+            .contentShape(Capsule())
+            .onTapGesture { runChipQuery(text) }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Search \(text)")
+            .accessibilityAddTraits(.isButton)
+    }
+
     private func stateMessage(icon: String, title: String, detail: String) -> some View {
         VStack(spacing: 10) {
             Image(systemName: icon).font(.largeTitle).foregroundStyle(.secondary)
@@ -355,11 +468,46 @@ struct SearchView: View {
 
     // MARK: - Actions
 
-    private func runSearch() {
+    /// SCR-182 U1 — run a search. Debounced from the field's `.onChange`
+    /// (live search-as-you-type); immediate from Return (`.onSubmit`) and chip
+    /// taps. A single `searchTask` handle owns both the debounce delay and the
+    /// search, so cancelling it on the next keystroke can't leave a sleeping
+    /// timer to orphan-fire a stale search. `lastIssuedQuery` (set only when a
+    /// search actually issues) dedupes the trailing `.onChange` that a Return or
+    /// a programmatic chip-tap `query` set produces.
+    private func runSearch(debounced: Bool = false) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        if debounced, trimmed == lastIssuedQuery { return }
         searchTask?.cancel()
-        searchTask = Task { await model.search(trimmed, contentIndexEnabled: contentIndexEnabled) }
+        // Immediate paths claim the query synchronously so the trailing
+        // `.onChange(of: query)` a programmatic chip-tap set produces dedupes
+        // against it (the debounced path claims only after the delay, so a
+        // superseded delay can't poison the dedupe with a never-searched query).
+        if !debounced { lastIssuedQuery = trimmed }
+        searchTask = Task { @MainActor in
+            if debounced {
+                try? await Task.sleep(nanoseconds: Self.searchDebounceNanos)
+                if Task.isCancelled { return }
+                lastIssuedQuery = trimmed
+            }
+            await model.search(trimmed, contentIndexEnabled: contentIndexEnabled)
+        }
+    }
+
+    /// SCR-182 U4 — Return commits the current query: record it, then run it
+    /// immediately (the `.onSubmit` path, bypassing the live debounce).
+    private func submitSearch() {
+        recentStore.record(query)
+        runSearch()
+    }
+
+    /// SCR-182 U4 — a chip tap commits its query: fill the field, record it, and
+    /// run immediately. Setting `query` triggers `.onChange`, but `runSearch`'s
+    /// synchronous `lastIssuedQuery` claim makes that trailing change a no-op.
+    private func runChipQuery(_ text: String) {
+        query = text
+        recentStore.record(text)
+        runSearch()
     }
 
     /// Opens the read-only inspect window for the result's recording and (U6)
@@ -436,4 +584,50 @@ struct SearchView: View {
 func searchReviewTarget(for id: SearchResultItem.ID?, in results: SearchResults) -> SearchResultItem? {
     guard let id else { return nil }
     return results.items.first { $0.id == id }
+}
+
+/// SCR-182 U4 — a minimal wrapping layout for the idle-state chips so a narrow
+/// window wraps chips onto new lines instead of clipping or overflowing. Uses
+/// the macOS 13 `Layout` protocol (the app's deployment floor).
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        walk(subviews, maxWidth: proposal.width ?? .infinity) { _, _, _ in }
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {
+        _ = walk(subviews, maxWidth: bounds.width) { sub, origin, size in
+            sub.place(
+                at: CGPoint(x: bounds.minX + origin.x, y: bounds.minY + origin.y),
+                anchor: .topLeading, proposal: ProposedViewSize(size)
+            )
+        }
+    }
+
+    /// Walks subviews left-to-right, wrapping at `maxWidth`, invoking `place` for
+    /// each with its origin relative to (0, 0). Returns the bounding size. The
+    /// wrap math lives here once so the two protocol methods can't drift.
+    private func walk(
+        _ subviews: Subviews, maxWidth: CGFloat,
+        place: (LayoutSubviews.Element, CGPoint, CGSize) -> Void
+    ) -> CGSize {
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var widest: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            place(sub, CGPoint(x: x, y: y), size)
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+            widest = max(widest, x - spacing)
+        }
+        return CGSize(width: maxWidth.isFinite ? maxWidth : widest, height: y + rowHeight)
+    }
 }

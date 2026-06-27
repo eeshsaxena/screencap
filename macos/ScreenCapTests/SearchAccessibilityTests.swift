@@ -186,4 +186,61 @@ final class SearchAccessibilityTests: XCTestCase {
         XCTAssertNil(SearchAccessibility.searchOutcomeAnnouncement(for: .idle))
         XCTAssertNil(SearchAccessibility.searchOutcomeAnnouncement(for: .searching))
     }
+
+    // MARK: - SCR-182 U3: result-count + truncation helpers
+
+    private var utcCal: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(secondsFromGMT: 0)!
+        return c
+    }()
+
+    private func results(_ items: [SearchResultItem], truncated: Bool = false) -> SearchResults {
+        SearchResults(
+            items: items,
+            coverage: CoverageReport(screen: .notRun, audio: .notRun, activity: .notRun),
+            consentNeeded: false, timeWindow: nil, appFilter: nil, truncated: truncated
+        )
+    }
+
+    func testResultCountLabelAcrossDays() {
+        let d1 = 1_700_000_000_000          // 2023-11-14 22:13 UTC
+        let oneDay = 86_400_000
+        let r = results([
+            item(stream: .activity, anchorMs: d1),
+            item(stream: .screen, anchorMs: d1 + 1000),     // same UTC day
+            item(stream: .screen, anchorMs: d1 + oneDay),   // next UTC day
+        ])
+        XCTAssertEqual(SearchAccessibility.resultCountLabel(r, calendar: utcCal), "3 results across 2 days")
+    }
+
+    func testResultCountLabelSingularResultAndDay() {
+        let r = results([item(stream: .screen, anchorMs: 1_700_000_000_000)])
+        XCTAssertEqual(SearchAccessibility.resultCountLabel(r, calendar: utcCal), "1 result across 1 day")
+    }
+
+    func testResultCountLabelUnanchoredOnlyOmitsDayClause() {
+        let r = results([
+            item(stream: .audio, anchorMs: nil),
+            item(stream: .audio, anchorMs: nil),
+        ])
+        XCTAssertEqual(SearchAccessibility.resultCountLabel(r, calendar: utcCal), "2 results")
+    }
+
+    func testResultCountLabelEmptyIsNil() {
+        XCTAssertNil(SearchAccessibility.resultCountLabel(results([]), calendar: utcCal))
+    }
+
+    func testTruncationNoteOnlyWhenTruncated() {
+        XCTAssertNotNil(SearchAccessibility.truncationNote(results([item(stream: .screen)], truncated: true)))
+        XCTAssertNil(SearchAccessibility.truncationNote(results([item(stream: .screen)], truncated: false)))
+    }
+
+    func testAnnouncementAppendsTruncationCue() {
+        let items = Array(repeating: item(stream: .screen, snippet: "x"), count: 3)
+        let ann = SearchAccessibility.searchOutcomeAnnouncement(for: .loaded(results(items, truncated: true)))
+        XCTAssertNotNil(ann)
+        XCTAssertTrue(ann!.hasPrefix("3 results"), ann ?? "")
+        XCTAssertTrue(ann!.contains("narrow your search"), ann ?? "")
+    }
 }

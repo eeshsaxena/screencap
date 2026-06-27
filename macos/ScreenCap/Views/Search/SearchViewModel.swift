@@ -11,6 +11,11 @@ import Foundation
 @MainActor
 final class SearchViewModel: ObservableObject {
     @Published private(set) var phase: Phase = .idle
+    /// SCR-182 U2 — true while a search runs. When a refresh starts over an
+    /// already-`.loaded` phase, prior results stay visible and this drives a
+    /// lightweight inline indicator instead of the full-screen spinner. Only
+    /// meaningful while `phase == .loaded` (ignored in other phases).
+    @Published private(set) var isSearching = false
 
     enum Phase: Equatable {
         case idle
@@ -18,6 +23,11 @@ final class SearchViewModel: ObservableObject {
         case loaded(SearchResults)
         case daemonDown
     }
+
+    /// SCR-182 U3 — per-stream daemon fetch cap. The wire carries no `has_more`,
+    /// so a raw stream returning exactly this many rows is treated as truncated
+    /// upstream (more matched than were returned).
+    static let streamFetchLimit = 200
 
     private let service: SearchService
     private let parser: QueryParser
@@ -27,7 +37,6 @@ final class SearchViewModel: ObservableObject {
     /// a transcript chunk's wall-clock position before snapping it to a real
     /// timeline event.
     var chunkDurationSeconds: Double
-    private var inFlight = false
 
     init(
         service: SearchService = LiveSearchService(),
@@ -45,16 +54,17 @@ final class SearchViewModel: ObservableObject {
     /// consent trigger keys on the flag, not on `index_state` (which only
     /// signals an absent index file).
     func search(_ query: String, contentIndexEnabled: Bool) async {
-        guard !inFlight else { return }
         let parsed = parser.parse(query, now: now())
         guard !parsed.isEmpty else {
             phase = .idle
             return
         }
 
-        inFlight = true
-        phase = .searching
-        defer { inFlight = false }
+        isSearching = true
+        defer { isSearching = false }
+        // Keep prior results visible during an in-place refresh; only fall back to
+        // the full-screen spinner for the first search from a non-loaded state.
+        if case .loaded = phase {} else { phase = .searching }
 
         let hasFreeText = !parsed.freeText.isEmpty
 
@@ -68,6 +78,10 @@ final class SearchViewModel: ObservableObject {
         let content = await contentFetch
         let transcript = await transcriptFetch
 
+        // A superseded live-search must not publish over a newer one's result —
+        // bail at every publish point once this task has been cancelled.
+        if Task.isCancelled { return }
+
         // All three share one socket: a socket-level failure on the
         // always-attempted timeline call means the daemon is unreachable.
         if case .down = timeline {
@@ -76,6 +90,11 @@ final class SearchViewModel: ObservableObject {
         }
 
         var items: [SearchResultItem] = []
+        // SCR-182 U3 — set when any stream's RAW fetch hit the cap (before the
+        // client-side time filter below). Scoped to these main fetches only — the
+        // per-recording correlation queries always request the cap and must not
+        // feed this.
+        var truncated = false
         var idx = 0
         func nextID(_ stream: SearchResultItem.Stream, _ recording: String, _ anchor: Int?) -> String {
             defer { idx += 1 }
@@ -86,6 +105,7 @@ final class SearchViewModel: ObservableObject {
         var timelineState: StreamState = .notRun
         if case .ok(let rows) = timeline {
             timelineState = rows.isEmpty ? .empty : .ok(count: rows.count)
+            if rows.count >= Self.streamFetchLimit { truncated = true }
             for row in rows {
                 items.append(SearchResultItem(
                     id: nextID(.activity, row.recording, row.timestampMs),
@@ -101,6 +121,7 @@ final class SearchViewModel: ObservableObject {
         // Content / on-screen text (best-effort). Client-side time filter.
         var contentState: StreamState = .notRun
         if case .ok(let payload) = content {
+            if payload.hits.count >= Self.streamFetchLimit { truncated = true }
             let filtered = payload.hits.filter { inWindow($0.timestampMs, parsed.timeWindow) }
             contentState = mapContentState(payload.indexState, matched: !filtered.isEmpty)
             for hit in filtered {
@@ -119,6 +140,7 @@ final class SearchViewModel: ObservableObject {
         // captured moment via per-recording timeline.query, then time-filter.
         var transcriptState: StreamState = .notRun
         if case .ok(let hits) = transcript {
+            if hits.count >= Self.streamFetchLimit { truncated = true }
             let anchored = await correlateTranscript(hits)
             let filtered = anchored.filter { inWindow($0.anchorMs, parsed.timeWindow) }
             transcriptState = filtered.isEmpty ? .empty : .ok(count: filtered.count)
@@ -140,8 +162,12 @@ final class SearchViewModel: ObservableObject {
             consentNeeded: hasFreeText && !contentIndexEnabled,
             timeWindow: parsed.timeWindow,
             appFilter: parsed.appFilter,
-            queryTerms: parsed.freeText.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            queryTerms: parsed.freeText.split(whereSeparator: { $0.isWhitespace }).map(String.init),
+            truncated: truncated
         )
+        // Re-check after the transcript-correlation awaits: a newer search may
+        // have superseded this one while the fan-out was in flight.
+        if Task.isCancelled { return }
         phase = .loaded(results)
     }
 
@@ -160,7 +186,7 @@ final class SearchViewModel: ObservableObject {
         do {
             let resp = try await service.timelineQuery(TimelineQueryRequest(
                 startMs: p.timeWindow?.startMs, endMs: p.timeWindow?.endMs,
-                app: p.appFilter, limit: 200
+                app: p.appFilter, limit: Self.streamFetchLimit
             ))
             return .ok(resp.rows)
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
@@ -172,7 +198,7 @@ final class SearchViewModel: ObservableObject {
 
     private func fetchContent(_ freeText: String) async -> Fetched<ContentPayload> {
         do {
-            let resp = try await service.contentSearch(ContentSearchRequest(query: freeText, limit: 200))
+            let resp = try await service.contentSearch(ContentSearchRequest(query: freeText, limit: Self.streamFetchLimit))
             return .ok(ContentPayload(hits: resp.hits, indexState: resp.indexState))
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
@@ -183,7 +209,7 @@ final class SearchViewModel: ObservableObject {
 
     private func fetchTranscript(_ freeText: String) async -> Fetched<[TranscriptHit]> {
         do {
-            let resp = try await service.transcriptSearch(TranscriptSearchRequest(query: freeText, limit: 200))
+            let resp = try await service.transcriptSearch(TranscriptSearchRequest(query: freeText, limit: Self.streamFetchLimit))
             return .ok(resp.hits)
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
@@ -204,6 +230,9 @@ final class SearchViewModel: ObservableObject {
         let byRecording = Dictionary(grouping: hits, by: { $0.recording })
         var out: [AnchoredTranscript] = []
         for (recording, recHits) in byRecording {
+            // Stop issuing per-recording timeline.query calls once superseded —
+            // under live typing this fan-out is the dominant socket load.
+            if Task.isCancelled { break }
             let timestamps = await recordingTimestamps(recording)
             guard let start = timestamps.first else {
                 out.append(contentsOf: recHits.map { AnchoredTranscript(hit: $0, anchorMs: nil) })
@@ -282,6 +311,10 @@ struct SearchResults: Equatable, Sendable {
     /// matched terms in content/transcript snippets. Defaulted so existing
     /// constructions (tests, older call sites) need not supply it.
     var queryTerms: [String] = []
+    /// SCR-182 U3 — true when at least one stream's raw fetch hit `streamFetchLimit`
+    /// (more matched than were returned). Drives the "narrow your search" cue.
+    /// Defaulted so existing constructions need not supply it.
+    var truncated: Bool = false
 }
 
 struct SearchResultItem: Identifiable, Equatable, Sendable {

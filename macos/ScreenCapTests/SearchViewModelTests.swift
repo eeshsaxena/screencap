@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import ScreenCap
@@ -18,6 +19,12 @@ final class SearchViewModelTests: XCTestCase {
         /// Recording dir -> event timestamps returned for the per-recording
         /// correlation query (req.recording != nil).
         var perRecordingTimestamps: [String: [Int]] = [:]
+        /// SCR-182 U1 — fired at the top of every `timelineQuery` so a test can
+        /// cancel the surrounding search mid-flight (latest-wins coverage).
+        var onTimelineQuery: (@Sendable () -> Void)?
+        /// SCR-182 U1 — count of per-recording correlation queries issued, to
+        /// assert a superseded search abandons its transcript fan-out.
+        var perRecordingQueryCount = 0
 
         func contentSearch(_ req: ContentSearchRequest) async throws -> ContentSearchResponse {
             if let contentError { throw contentError }
@@ -30,7 +37,9 @@ final class SearchViewModelTests: XCTestCase {
         }
 
         func timelineQuery(_ req: TimelineQueryRequest) async throws -> TimelineQueryResponse {
+            onTimelineQuery?()
             if let rec = req.recording {
+                perRecordingQueryCount += 1
                 let rows = (perRecordingTimestamps[rec] ?? [])
                     .map { TimelineRow(recording: rec, timestampMs: $0, app: nil, title: nil) }
                 return TimelineQueryResponse(rows: rows, coverage: .authoritative)
@@ -38,6 +47,11 @@ final class SearchViewModelTests: XCTestCase {
             if let timelineError { throw timelineError }
             return timelineResponse ?? TimelineQueryResponse(rows: [], coverage: .authoritative)
         }
+    }
+
+    /// Holds the search `Task` so a fake-service hook can cancel it mid-flight.
+    private final class TaskHolder: @unchecked Sendable {
+        var task: Task<Void, Never>?
     }
 
     private var cal: Calendar = {
@@ -177,6 +191,7 @@ final class SearchViewModelTests: XCTestCase {
         await vm.search("today refund", contentIndexEnabled: true)
 
         XCTAssertEqual(vm.phase, .daemonDown)
+        XCTAssertFalse(vm.isSearching, "isSearching must clear on the daemon-down exit")
     }
 
     func testPartialContentErrorStillReturnsTimeline() async {
@@ -198,5 +213,145 @@ final class SearchViewModelTests: XCTestCase {
         let vm = makeVM(FakeSearchService())
         await vm.search("   ", contentIndexEnabled: true)
         XCTAssertEqual(vm.phase, .idle)
+        XCTAssertFalse(vm.isSearching, "empty-query early return must leave isSearching false")
+    }
+
+    // SCR-182 U2 — the first search from idle shows the full-screen spinner
+    // (transitions through `.searching`); isSearching clears on completion.
+    func testFirstSearchFromIdleTransitionsThroughSearching() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 3000, app: "A", title: "T")],
+            coverage: .authoritative
+        )
+        let vm = makeVM(fake)
+        var phases: [SearchViewModel.Phase] = []
+        let c = vm.$phase.dropFirst().sink { phases.append($0) }
+        defer { c.cancel() }
+
+        await vm.search("first", contentIndexEnabled: true)
+
+        XCTAssertTrue(phases.contains(.searching), "first search should flash the spinner state")
+        XCTAssertNotNil(loaded(vm))
+        XCTAssertFalse(vm.isSearching)
+    }
+
+    // SCR-182 U2 — a refresh over already-loaded results keeps the prior results
+    // visible (never transitions to `.searching`) and clears isSearching after.
+    func testRefreshOverLoadedKeepsPriorResultsVisible() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 3000, app: "A", title: "T")],
+            coverage: .authoritative
+        )
+        let vm = makeVM(fake)
+        await vm.search("first", contentIndexEnabled: true)
+        XCTAssertNotNil(loaded(vm))
+
+        var phases: [SearchViewModel.Phase] = []
+        let c = vm.$phase.dropFirst().sink { phases.append($0) }
+        defer { c.cancel() }
+
+        await vm.search("second", contentIndexEnabled: true)
+
+        XCTAssertFalse(phases.contains(.searching),
+                       "an in-place refresh must not swap to the full-screen spinner")
+        XCTAssertNotNil(loaded(vm))
+        XCTAssertFalse(vm.isSearching)
+    }
+
+    // SCR-182 U3 — a main stream returning exactly the fetch cap flags truncation.
+    func testTruncatedWhenMainStreamHitsCap() async {
+        let fake = FakeSearchService()
+        let rows = (0..<SearchViewModel.streamFetchLimit).map {
+            TimelineRow(recording: "rec", timestampMs: 1000 + $0, app: nil, title: nil)
+        }
+        fake.timelineResponse = TimelineQueryResponse(rows: rows, coverage: .authoritative)
+        let vm = makeVM(fake)
+        await vm.search("today", contentIndexEnabled: true)
+        XCTAssertEqual(loaded(vm)?.truncated, true)
+    }
+
+    func testNotTruncatedBelowCap() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 1000, app: nil, title: nil)],
+            coverage: .authoritative
+        )
+        let vm = makeVM(fake)
+        await vm.search("today", contentIndexEnabled: true)
+        XCTAssertEqual(loaded(vm)?.truncated, false)
+    }
+
+    // SCR-182 U3 — the per-recording correlation fetch always requests the cap;
+    // it must NOT feed the truncation heuristic (only the main fetches do).
+    func testPerRecordingCorrelationCapDoesNotMarkTruncated() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 5000, app: nil, title: nil)],
+            coverage: .authoritative
+        )
+        fake.transcriptResponse = TranscriptSearchResponse(
+            hits: [TranscriptHit(recording: "recX", chunkIndex: 0, snippet: "x")],
+            coverage: .bestEffort
+        )
+        fake.perRecordingTimestamps = ["recX": (0..<SearchViewModel.streamFetchLimit).map { 1000 + $0 }]
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+        XCTAssertEqual(loaded(vm)?.truncated, false,
+                       "a full per-recording correlation fetch must not flag truncation")
+    }
+
+    // SCR-182 U1 — a search cancelled mid-flight (superseded by a newer one)
+    // must not publish its result over the newer search. The fake cancels the
+    // surrounding task on the main timeline fetch; the model's pre-publish
+    // `Task.isCancelled` guard should then bail, leaving phase at `.searching`.
+    func testCancelledSearchDoesNotPublishResults() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 3000, app: "Salesforce", title: "Cases")],
+            coverage: .authoritative
+        )
+        let vm = makeVM(fake)
+        let holder = TaskHolder()
+        fake.onTimelineQuery = { holder.task?.cancel() }
+
+        holder.task = Task { @MainActor in
+            await vm.search("refund", contentIndexEnabled: true)
+        }
+        await holder.task?.value
+
+        XCTAssertNil(loaded(vm), "a cancelled search must not overwrite with .loaded")
+        XCTAssertEqual(vm.phase, .searching, "phase should remain .searching, not publish stale results")
+    }
+
+    // SCR-182 U1 — a superseded search must stop issuing per-recording
+    // timeline.query correlation calls, not run the whole fan-out to completion.
+    func testCancelledSearchStopsTranscriptCorrelationFanOut() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 3000, app: nil, title: nil)],
+            coverage: .authoritative
+        )
+        fake.transcriptResponse = TranscriptSearchResponse(
+            hits: [
+                TranscriptHit(recording: "recA", chunkIndex: 0, snippet: "x"),
+                TranscriptHit(recording: "recB", chunkIndex: 0, snippet: "y"),
+            ],
+            coverage: .bestEffort
+        )
+        let vm = makeVM(fake)
+        let holder = TaskHolder()
+        // Cancel on the main timeline fetch — correlation runs strictly after,
+        // so a cancellation-aware fan-out should issue zero per-recording calls.
+        fake.onTimelineQuery = { holder.task?.cancel() }
+
+        holder.task = Task { @MainActor in
+            await vm.search("refund", contentIndexEnabled: true)
+        }
+        await holder.task?.value
+
+        XCTAssertEqual(fake.perRecordingQueryCount, 0,
+                       "superseded search must not fan out per-recording correlation calls")
     }
 }

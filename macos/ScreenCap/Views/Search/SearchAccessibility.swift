@@ -106,7 +106,44 @@ enum SearchAccessibility {
                 }
                 return "No matches"
             }
-            return count == 1 ? "1 result" : "\(count) results"
+            let base = count == 1 ? "1 result" : "\(count) results"
+            // Append the completeness cue so a VoiceOver user learns results were
+            // capped upstream (R3/R6) — the visible header carries the same note.
+            // The spoken form stays count-only (no "across N days" day span) to
+            // keep the announcement terse; the day span is visible-only polish.
+            if let note = truncationNote(results) { return "\(base). \(note)" }
+            return base
         }
+    }
+
+    /// SCR-182 U3 — the visible results-header summary, e.g. "142 results across
+    /// 7 days". Counts every merged item (the empty state owns the zero copy, so
+    /// this returns `nil` at zero). The day count is the number of distinct local
+    /// days among *anchored* items — bucketed the same way `searchResultsGroupedByDay`
+    /// groups the visible day sections — so the header and the sections agree.
+    /// Unanchored audio hits still count toward results but have no day, so an
+    /// all-unanchored set omits the day clause rather than claiming "across 0 days".
+    static func resultCountLabel(_ results: SearchResults, calendar: Calendar = .current) -> String? {
+        let count = results.items.count
+        guard count > 0 else { return nil }
+        let resultWord = count == 1 ? "result" : "results"
+
+        let days = Set(results.items.compactMap { item -> Date? in
+            guard let ms = item.anchorMs else { return nil }
+            return calendar.startOfDay(for: Date(timeIntervalSince1970: Double(ms) / 1000))
+        }).count
+
+        guard days > 0 else { return "\(count) \(resultWord)" }
+        let dayWord = days == 1 ? "day" : "days"
+        return "\(count) \(resultWord) across \(days) \(dayWord)"
+    }
+
+    /// SCR-182 U3 — completeness cue shown when any stream hit its raw fetch cap.
+    /// Worded against the upstream fetch, never "showing first 200": each stream
+    /// caps independently and the merged/time-filtered list rarely holds 200, so
+    /// a "first 200" claim would misrepresent what's on screen.
+    static func truncationNote(_ results: SearchResults) -> String? {
+        guard results.truncated else { return nil }
+        return "Some sources hit their limit \u{2014} narrow your search to see more."
     }
 }
