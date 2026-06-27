@@ -1,7 +1,7 @@
 ---
 title: "feat: Backfill on-screen-text index for existing recordings (SCR-178)"
 type: feat
-status: active
+status: completed
 date: 2026-06-27
 deepened: 2026-06-27
 origin: https://linear.app/zk-email/issue/SCR-178/backfill-on-screen-text-index-for-existing-recordings
