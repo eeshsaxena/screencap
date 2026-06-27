@@ -7,10 +7,8 @@ upload → delete old chunks).
 
 from __future__ import annotations
 
-import bisect
 import json
 import logging
-import math
 import os
 import sqlite3
 import threading
@@ -29,18 +27,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SCR-118 content-index OCR pass tuning.
-# dHash threshold matching mask_screenshots' OCR-dedup (a false cache hit only
-# costs reused recognised text, so the tight value is intentional).
-_INDEX_DHASH_THRESHOLD = 5
-# Hard cap on OCR calls per chunk so a pathological action-burst can never
-# stall the capture-adjacent thread / upload. Excess frames are dropped with a
-# log line (no silent truncation).
-_INDEX_MAX_OCR_FRAMES = 240
-# Wall-clock budget for the per-chunk OCR pass — a second backstop (alongside
-# the frame cap and the _stop_event check) so a slow/wedged OCR engine can never
-# sit in front of this chunk's upload indefinitely.
-_INDEX_OCR_BUDGET_S = 30.0
+# SCR-118 content-index OCR pass tuning. SCR-178 U1 moved the canonical
+# definitions into ``index_core`` (the shared live/backfill core); re-export them
+# here so the existing names keep working and there is ONE source of truth. The
+# import is light (stdlib + TYPE_CHECKING only), so it stays at module level.
+from screencap.index_core import (  # noqa: E402
+    _INDEX_DHASH_THRESHOLD,
+    _INDEX_MAX_OCR_FRAMES,
+    _INDEX_OCR_BUDGET_S,
+)
 
 
 class _StageAbort(Exception):
@@ -1109,140 +1104,36 @@ class ChunkProcessor:
         if not screenshots_dir.is_dir():
             return
 
-        from PIL import Image
-
-        from screencap.content_index import (
-            ContentIndex,
-            IndexFrame,
-            content_index_write_lock,
-            default_index_path,
-        )
-        from screencap.engine.dedup import dhash, hamming_distance
-        from screencap.redaction.geometry import parse_screenshot_timestamp
-        from screencap.scrubber import find_blocked_interval
-
-        # Skip EVERY frame the policy flagged for any masking/redaction action.
-        # ``blocked_intervals`` is built with the full SCRUB_BLOCK_ACTIONS set
-        # (EXCLUDE / MASK_WINDOW / MASK_REGION / TEXT_REDACT / OCR_FALLBACK), so
-        # indexing only excludes EXCLUDE would leave MASK_WINDOW content (banking
-        # / email / chat) — which the masker blanks in the cloud copy —
-        # searchable in the local index. Skipping all of them makes the index
-        # hold only ALLOW-classified on-screen text (the R7 narrowing).
+        # SCR-178 U1: the frame-selection → dedup → OCR → write loop lives in the
+        # shared ``index_core.index_range`` so the live path and the backfill share
+        # ONE implementation of the skip/index rules. This caller still owns the
+        # policy: the ``has_masking_context`` fail-closed guard (above), the
+        # ``content_index_enabled`` gate (in ``_index_chunk_content``), and the
+        # source of ``skip_intervals`` — here, ``scrub_result.blocked_intervals``
+        # (the full SCRUB_BLOCK_ACTIONS set, so only ALLOW frames are indexed).
         #
-        # ``blocked_intervals`` is sorted by start (built via build_blocked_intervals
-        # / merge_intervals), so reuse the scrubber's bisect-backed lookup with a
-        # pre-built starts list instead of an O(n) per-frame linear scan. It also
-        # handles overlapping intervals (short secure-field nested in a long
-        # MASK_WINDOW) correctly.
-        skip_intervals = scrub_result.blocked_intervals
-        skip_starts = [iv.start for iv in skip_intervals]
+        # Store lifecycle now lives in ``index_range`` (it opens the store lazily,
+        # inside the write lock, and only when there is something to write — so an
+        # empty / fully-blocked range never creates an empty PII store). We just
+        # hand it the path.
+        from screencap.content_index import default_index_path
+        from screencap.index_core import index_range
 
-        def _skipped(ts: float) -> bool:
-            return find_blocked_interval(ts, skip_intervals, skip_starts) is not None
-
-        # Time-scope to [start_ts, end_ts); drop policy-flagged frames.
-        # Parse each filename's timestamp and sort by it (not by lexical name,
-        # which is only monotonic when the integer part has a fixed width), then
-        # bisect to the window: take only [start_ts, end_ts) and stop at the
-        # upper bound rather than scanning every later screenshot in the
-        # recording.
-        parsed: list[tuple[float, Path]] = []
-        for img_path in screenshots_dir.glob("*.jpg"):
-            ts = parse_screenshot_timestamp(img_path.name)
-            if ts is not None:
-                parsed.append((ts, img_path))
-        parsed.sort(key=lambda p: p[0])
-
-        ts_keys = [ts for ts, _ in parsed]
-        lo = bisect.bisect_left(ts_keys, start_ts)
-        candidates: list[tuple[float, Path]] = []
-        for ts, img_path in parsed[lo:]:
-            if ts >= end_ts:
-                break
-            if _skipped(ts):
-                continue
-            candidates.append((ts, img_path))
-
-        if not candidates:
-            return
-        if len(candidates) > _INDEX_MAX_OCR_FRAMES:
-            logger.info(
-                f"Chunk {idx}: capping content-index OCR at {_INDEX_MAX_OCR_FRAMES} "
-                f"of {len(candidates)} frames"
-            )
-            candidates = candidates[:_INDEX_MAX_OCR_FRAMES]
-
-        # SCR-134: hold the shared content-index write lock across the OCR READS
-        # and the write. The lock pairs with scrub_worker's retroactive-disable
-        # purge so the two can't interleave: if a disable lands mid-pass, either
-        # this write completes first and the purge then deletes it, or the purge
-        # (which unlinks the screenshots before taking the lock) runs first and
-        # the OCR reads below then find the files already gone — so just-disabled
-        # text can never be re-indexed after a purge. The OCR loop's own stop /
-        # budget bails bound how long this is held (it never blocks the disable's
-        # own row/file deletes — only the index-purge tail waits).
-        with content_index_write_lock():
-            started = time.perf_counter()
-            prev_hash: int | None = None
-            frames: list[IndexFrame] = []
-            for ts, img_path in candidates:
-                # This pass runs synchronously before this chunk's upload, so a
-                # force-stop or a slow/wedged OCR engine must not pin the capture-
-                # adjacent thread: bail on stop, and on a wall-clock budget.
-                if self._stop_event.is_set():
-                    break
-                if time.perf_counter() - started > _INDEX_OCR_BUDGET_S:
-                    logger.info(f"Chunk {idx}: content-index OCR budget hit; stopping early")
-                    break
-                # Dedup near-identical consecutive frames (same primitive + tight
-                # threshold mask_screenshots uses); keep prev_hash on a dup so we
-                # compare against the last distinct frame.
-                cur_hash: int | None = None
-                try:
-                    with Image.open(img_path) as im:
-                        cur_hash = dhash(im)
-                except Exception:
-                    cur_hash = None
-                if (
-                    cur_hash is not None
-                    and prev_hash is not None
-                    and hamming_distance(cur_hash, prev_hash) <= _INDEX_DHASH_THRESHOLD
-                ):
-                    continue
-                if cur_hash is not None:
-                    prev_hash = cur_hash
-                try:
-                    result = ocr.recognize(img_path)
-                except Exception:
-                    continue
-                text = " ".join(b.text for b in result.text_blocks if b.text).strip()
-                if text:
-                    frames.append(
-                        IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text)
-                    )
-
-            # Replace the WHOLE chunk time-range (not just the surviving frames)
-            # so a re-process where a frame is now skipped (policy/dedup) drops its
-            # stale, less-redacted row instead of leaving it behind. Range is
-            # [start, end) in ms, widened (floor/ceil) to cover any rounded frame
-            # timestamp.
-            start_ms = math.floor(start_ts * 1000)
-            end_ms = math.ceil(end_ts * 1000)
-            store_path = default_index_path()
-            # Nothing to index AND no store yet → don't create an empty PII store.
-            # (When the store exists we still run, so a re-process clears stale rows.)
-            if not frames and not store_path.exists():
-                return
-            # Key on the recording DIRECTORY name (globally unique, and what the
-            # daemon query side resolves a recording filter to) — not the display
-            # name — so the scrub_worker purge and daemon reads agree on the key.
-            with ContentIndex(store_path) as store:
-                if store.available:
-                    store.write_chunk(self._capture_dir.name, start_ms, end_ms, frames)
-            logger.info(
-                f"Chunk {idx}: content-indexed {len(frames)} frames in "
-                f"{time.perf_counter() - started:.2f}s"
-            )
+        # Key on the recording DIRECTORY name (globally unique, and what the daemon
+        # query side resolves a recording filter to) so the scrub_worker purge and
+        # daemon reads agree on the key — ``index_range`` uses ``capture_dir.name``.
+        index_range(
+            self._capture_dir,
+            start_ts,
+            end_ts,
+            scrub_result.blocked_intervals,
+            ocr=ocr,
+            store_path=default_index_path(),
+            stop_event=self._stop_event,
+            budget_s=_INDEX_OCR_BUDGET_S,
+            max_frames=_INDEX_MAX_OCR_FRAMES,
+            dhash_threshold=_INDEX_DHASH_THRESHOLD,
+        )
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.
