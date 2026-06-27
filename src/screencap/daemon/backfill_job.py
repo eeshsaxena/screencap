@@ -312,8 +312,10 @@ class BackfillJob:
         event = self._event(event_type, **fields)
         try:
             asyncio.run_coroutine_threadsafe(self._bus.publish(event), loop)
-        except RuntimeError:
-            # Loop closed/closing (daemon shutting down) — drop the telemetry.
+        except Exception:
+            # Loop closed/closing (daemon shutting down) or any other scheduling
+            # failure — fire-and-forget telemetry must never let an exception
+            # escape onto the worker thread. Drop the event.
             logger.debug("backfill progress publish skipped (loop unavailable)")
 
     @staticmethod

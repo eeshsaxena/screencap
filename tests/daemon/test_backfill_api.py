@@ -347,6 +347,12 @@ def test_should_auto_resume_only_for_paused_with_pending(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# SCR-178 R9: this is the daemon-layer guard that a recording directory name never
+# crosses the EventBus to a same-EUID subscriber (incl. MCP). CI runs only
+# `pytest -m privacy`, so mark it so the guard actually runs on CI rather than
+# rotting dev-only (the engine-layer name-free guard is separately marked). Uses a
+# fake engine (no Vision), so it runs on both the Vision-backed and Vision-free lanes.
+@pytest.mark.privacy
 @pytest.mark.asyncio
 async def test_no_event_payload_contains_recording_name(monkeypatch, tmp_path):
     secret_name = "super-secret-recording-dirname"

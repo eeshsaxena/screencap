@@ -67,7 +67,6 @@ _MODEL_NAMES = {
     "TimelineQueryResponse",
     "WhoAmIResponse",
     "BackfillStartRequest",
-    "BackfillStatusRequest",
     "BackfillCancelRequest",
     "BackfillStatusResponse",
     "BackfillProgressEvent",
@@ -347,11 +346,10 @@ def _load_models() -> dict[str, Any]:
         bound the run without an API bump.
         """
 
-        budget_s: float | None = None
-        max_frames_per_recording: int | None = None
-
-    class BackfillStatusRequest(_DaemonModel):
-        """SCR-178 ``backfill.status`` input (no parameters)."""
+        # Optional, but must be strictly positive when supplied — a non-positive
+        # budget/cap is a client error, not a "run forever / index nothing" knob.
+        budget_s: float | None = Field(default=None, gt=0)
+        max_frames_per_recording: int | None = Field(default=None, gt=0)
 
     class BackfillCancelRequest(_DaemonModel):
         """SCR-178 ``backfill.cancel`` input (no parameters)."""
@@ -418,7 +416,6 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryResponse": TimelineQueryResponse,
         "WhoAmIResponse": WhoAmIResponse,
         "BackfillStartRequest": BackfillStartRequest,
-        "BackfillStatusRequest": BackfillStatusRequest,
         "BackfillCancelRequest": BackfillCancelRequest,
         "BackfillStatusResponse": BackfillStatusResponse,
         "BackfillProgressEvent": BackfillProgressEvent,

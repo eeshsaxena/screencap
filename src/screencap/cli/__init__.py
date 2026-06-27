@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING, Any
 
 # Line-buffered stderr is part of the SwiftUI cross-language event contract
 # (todo 012). PyInstaller-frozen binaries don't always honour
@@ -30,6 +31,9 @@ from rich.markup import escape
 from rich.table import Table
 
 from screencap import __version__
+
+if TYPE_CHECKING:
+    from screencap.cli._daemon_client import DaemonHTTPClient
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -255,7 +259,6 @@ def _engine_worker_cmd(encoded_args: str) -> None:
     import multiprocessing
     import threading
     from pathlib import Path
-    from typing import Any
 
     args = json.loads(base64.b64decode(encoded_args).decode("utf-8"))
     from screencap._stderr_events import (
@@ -3561,7 +3564,7 @@ def _backfill_snapshot_line(snapshot: dict) -> str:
     )
 
 
-def _backfill_client_or_exit(*, auto_spawn: bool = True):
+def _backfill_client_or_exit(*, auto_spawn: bool = True) -> "DaemonHTTPClient":
     """Auto-spawn (F3) then return an open ``DaemonHTTPClient``, or exit.
 
     Mirrors the live-state commands: reuse ``ensure_daemon_or_spawn`` so a
@@ -3589,7 +3592,7 @@ def _backfill_client_or_exit(*, auto_spawn: bool = True):
     return DaemonHTTPClient()
 
 
-def _backfill_call_or_exit(verb_name: str, call):
+def _backfill_call_or_exit(call) -> dict[str, Any]:
     """Run a daemon verb, translating transport/schema/API failures to exits.
 
     Mirrors the live-state commands' daemon-down UX: a transport failure
@@ -3633,7 +3636,7 @@ def backfill_start_cmd() -> None:
     """
     client = _backfill_client_or_exit()
     with client:
-        snapshot = _backfill_call_or_exit("backfill.start", client.backfill_start)
+        snapshot = _backfill_call_or_exit(client.backfill_start)
 
     state = str(snapshot.get("state", "unknown"))
     if state == "running":
@@ -3665,7 +3668,7 @@ def backfill_status_cmd(as_json: bool) -> None:
     # spin one up just to report "idle" — mirror ``screencap status``.
     client = _backfill_client_or_exit(auto_spawn=False)
     with client:
-        snapshot = _backfill_call_or_exit("backfill.status", client.backfill_status)
+        snapshot = _backfill_call_or_exit(client.backfill_status)
 
     if as_json:
         payload = {
@@ -3696,7 +3699,7 @@ def backfill_cancel_cmd() -> None:
     """
     client = _backfill_client_or_exit()
     with client:
-        snapshot = _backfill_call_or_exit("backfill.cancel", client.backfill_cancel)
+        snapshot = _backfill_call_or_exit(client.backfill_cancel)
 
     state = str(snapshot.get("state", "unknown"))
     if state == "cancelled":

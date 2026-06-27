@@ -403,6 +403,9 @@ def test_element_state_null_span_skipped(tmp_path):
     amb = _blocked_at(400.0, intervals)
     assert amb is not None
     assert amb.reason == AMBIGUOUS_SECURE_FIELD
+    # The skip spans a hold window AFTER the event (end = ts + hold), mirroring the
+    # intact-secure-field case — guards against an accidental zero-width interval.
+    assert _blocked_at(400.5, intervals) is not None
 
 
 # --------------------------------------------------------------------------

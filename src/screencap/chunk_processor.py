@@ -27,16 +27,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# SCR-118 content-index OCR pass tuning. SCR-178 U1 moved the canonical
-# definitions into ``index_core`` (the shared live/backfill core); re-export them
-# here so the existing names keep working and there is ONE source of truth. The
-# import is light (stdlib + TYPE_CHECKING only), so it stays at module level.
-from screencap.index_core import (  # noqa: E402
-    _INDEX_DHASH_THRESHOLD,
-    _INDEX_MAX_OCR_FRAMES,
-    _INDEX_OCR_BUDGET_S,
-)
-
 
 class _StageAbort(Exception):
     """Internal signal: a ``_stop_event`` abort fired inside an agnostic
@@ -1122,6 +1112,9 @@ class ChunkProcessor:
         # Key on the recording DIRECTORY name (globally unique, and what the daemon
         # query side resolves a recording filter to) so the scrub_worker purge and
         # daemon reads agree on the key — ``index_range`` uses ``capture_dir.name``.
+        # budget_s / max_frames / dhash_threshold are omitted: ``index_range``
+        # defaults them to the canonical ``index_core`` tuning constants, so the
+        # call tracks those defaults automatically (no cross-module private import).
         index_range(
             self._capture_dir,
             start_ts,
@@ -1130,9 +1123,6 @@ class ChunkProcessor:
             ocr=ocr,
             store_path=default_index_path(),
             stop_event=self._stop_event,
-            budget_s=_INDEX_OCR_BUDGET_S,
-            max_frames=_INDEX_MAX_OCR_FRAMES,
-            dhash_threshold=_INDEX_DHASH_THRESHOLD,
         )
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:

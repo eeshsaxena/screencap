@@ -61,16 +61,11 @@ logger = logging.getLogger(__name__)
 # truncated (R8).
 _MAX_RECORDINGS = 200
 
-# Default per-recording OCR frame cap, passed to ``index_range`` as ``max_frames``
-# when the caller does not override it. Matches the live path's
-# ``index_core._INDEX_MAX_OCR_FRAMES`` so a backfilled recording is capped the
-# same way the live indexer caps a chunk.
-_DEFAULT_MAX_FRAMES_PER_RECORDING = 240
-
-# Per-chunk wall-clock default handed to ``index_range``. The effective per-chunk
-# budget is ``min(remaining_global_budget, this)`` so a mid-chunk bail near the
-# global deadline sets ``completed_range=False`` and leaves the unit PENDING.
-_DEFAULT_PER_CHUNK_BUDGET_S = 30.0
+# The per-recording OCR frame cap and per-chunk wall-clock budget are NOT defined
+# here — they are imported from ``index_core`` (``_INDEX_MAX_OCR_FRAMES`` /
+# ``_INDEX_OCR_BUDGET_S``) at the point of use (deferred, matching this file's
+# import style) so the backfill caps a recording exactly the way the live indexer
+# caps a chunk and the two can never drift.
 
 # Secure-field hold (mirrors privacy.policy.DEFAULT_TRANSITION_HOLD_SECONDS);
 # imported lazily where used to keep this module light. Used to bias a
@@ -149,7 +144,17 @@ def run_backfill(
             logger.debug("backfill progress_cb raised; ignoring", exc_info=True)
 
     def _finish(state: RunState) -> BackfillSummary:
-        ledger.set_run_state(state)
+        # Honor run_backfill's "never raises" contract even if the ledger write
+        # fails (e.g. SQLite busy). A stuck-RUNNING ledger would otherwise
+        # disable auto-resume, but letting set_run_state raise here is strictly
+        # worse — log at warning and continue so the caller still gets a summary.
+        try:
+            ledger.set_run_state(state)
+        except Exception:
+            logger.warning(
+                "backfill: failed to persist terminal run state %s", state,
+                exc_info=True,
+            )
         done, skipped, failed, total = ledger.progress()
         return BackfillSummary(
             state=state,
@@ -175,7 +180,9 @@ def run_backfill(
 
         store_path = default_index_path()
     if max_frames_per_recording is None:
-        max_frames_per_recording = _DEFAULT_MAX_FRAMES_PER_RECORDING
+        from screencap.index_core import _INDEX_MAX_OCR_FRAMES
+
+        max_frames_per_recording = _INDEX_MAX_OCR_FRAMES
 
     # --- Enumerate recordings + their units (deterministic, capped) --------
     rec_dirs = _enumerate_recordings(Path(recordings_dir))
@@ -199,7 +206,11 @@ def run_backfill(
             units.append(key)
             unit_info[key] = (rec_dir, start_ts, end_ts)
 
-    # Seed the closed set (idempotent on resume; never expands the denominator).
+    # Seed the closed set (idempotent on resume). Re-seeding may ADDITIVELY
+    # expand the set — a recording created between runs joins it on the next run,
+    # which is intentional (new work should be covered). What stays frozen is the
+    # per-run denominator: within a single run the total is fixed at seed time, so
+    # progress can't be skewed by survivorship as units complete.
     ledger.seed(units)
     ledger.set_run_state(RunState.RUNNING)
 
@@ -308,7 +319,7 @@ def _process_unit(
         build_classifier_evaluator,
         derive_skip_intervals,
     )
-    from screencap.index_core import index_range
+    from screencap.index_core import _INDEX_OCR_BUDGET_S, index_range
 
     # Per-recording classifier/evaluator (mode resolved from .recording_intent).
     if rec_name not in classifier_cache:
@@ -331,7 +342,7 @@ def _process_unit(
     # Per-chunk budget = min(remaining global budget, the per-chunk default) so a
     # mid-chunk bail near the global deadline sets completed_range=False and
     # leaves the unit PENDING.
-    per_chunk_budget = _DEFAULT_PER_CHUNK_BUDGET_S
+    per_chunk_budget = _INDEX_OCR_BUDGET_S
     if budget_s is not None:
         remaining = budget_s - (time.monotonic() - run_start)
         # Never hand index_range a non-positive budget — clamp to a tiny positive

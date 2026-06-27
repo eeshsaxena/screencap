@@ -300,9 +300,16 @@ final class SearchViewModel: ObservableObject {
     /// Cancel an in-flight run. Optimistic local transition to `cancelled` with
     /// a Resume; the daemon flushes its ledger so a resume continues cleanly.
     func cancelBackfill() {
+        // Stop draining progress FIRST, so a `.running` event already in flight
+        // can't land after we set `.cancelled` and clobber the optimistic
+        // transition (mirrors the cancel-first pattern in startRun/skipBackfill).
+        backfillTask?.cancel()
         let (d, t) = currentCounts()
-        Task { [weak self] in
-            _ = try? await self?.backfill.cancel()
+        // Capture the service by value (it is Sendable) rather than `[weak self]`
+        // so the daemon cancel verb isn't silently dropped if the view model is
+        // released before the await completes.
+        Task { [backfill] in
+            _ = try? await backfill.cancel()
         }
         backfillState = .cancelled(done: d, total: t)
     }

@@ -64,12 +64,20 @@ benign frame than to index masked-app on-screen text.
 Parity is "identical given identical config": re-derivation reflects the
 *current* classifier / evaluator / ``PrivacyMode``. If privacy config changed
 since capture, the re-derived set may block more (acceptable) — never less.
+
+Residual (known limitation): the "never less" guarantee holds only when the
+current ``PrivacyMode`` is at least as strict as it was at capture time. For a
+``local``-destination recording re-derived under a current config mode that has
+been RELAXED since capture, re-derivation reflects the current (looser) mode and
+could therefore block LESS than capture did. Freezing the capture-time mode into
+``.recording_intent`` is the deferred mitigation; until then this is accepted.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from screencap.privacy.actions import SCRUB_BLOCK_ACTIONS, PrivacyAction
 from screencap.privacy.policy import (
@@ -83,6 +91,10 @@ from screencap.scrubber import (
     build_scrub_context,
     merge_intervals,
 )
+
+if TYPE_CHECKING:
+    from screencap.privacy.classify import DefaultContextClassifier
+    from screencap.privacy.policy import DefaultPolicyEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +141,7 @@ def build_classifier_evaluator(
     recording_dir: Path | None = None,
     *,
     mode: PrivacyMode | None = None,
-):
+) -> tuple[DefaultContextClassifier, DefaultPolicyEvaluator]:
     """Build the (classifier, evaluator) the re-derivation uses.
 
     Mirrors ``ChunkScrubber._build``: starts from ``get_privacy_config()`` and
@@ -154,7 +166,7 @@ def build_classifier_evaluator(
     pc = get_privacy_config()
 
     resolved_mode = mode if mode is not None else _resolve_mode(recording_dir)
-    if resolved_mode is not None and resolved_mode != pc.mode:
+    if resolved_mode != pc.mode:
         pc = _dc_replace(pc, mode=resolved_mode)
 
     evaluator = DefaultPolicyEvaluator(pc)
@@ -325,11 +337,15 @@ def _derive_ambiguity_intervals(
     window_starts: list[float] = []
 
     with open_recording_db(db_path) as conn:
+        # Computed once and reused below (it is irrelevant when there are no
+        # window rows). Avoids a second has_table+has_column round-trip.
+        has_url = has_table(conn, "window_event") and has_column(
+            conn, "window_event", "browser_url"
+        )
         if not has_table(conn, "window_event"):
             # No window table — still surface action_event ambiguity below.
             window_rows = []
         else:
-            has_url = has_column(conn, "window_event", "browser_url")
             # Include the last event before range start (initial context),
             # matching build_scrub_context's scoped load.
             cols = "timestamp, app_bundle_id, title" + (", browser_url" if has_url else "")
@@ -350,10 +366,6 @@ def _derive_ambiguity_intervals(
         # Each window event spans [its ts, next event's ts) — the same interval
         # model build_blocked_intervals uses.
         n = len(window_rows)
-        has_url = (
-            has_table(conn, "window_event")
-            and has_column(conn, "window_event", "browser_url")
-        )
         for i, row in enumerate(window_rows):
             ts = float(row[0])
             window_starts.append(ts)
