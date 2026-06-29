@@ -32,6 +32,12 @@ struct SettingsEnvelope: Decodable {
         /// SCR-174: one-time consent decision, persisted as a settings bool so
         /// "declined" ≠ "off" and the prompt never re-fires (U7).
         let contentIndexConsentDeclined: Bool?
+        /// SCR-178: one-time "Skip" decision on the backfill offer, persisted as
+        /// a settings bool so the "also index existing recordings" affordance
+        /// never re-nags after the user declines it (U8). Distinct from
+        /// `contentIndexConsentDeclined`: the user may consent to forward-only
+        /// indexing yet skip the historical backfill.
+        let contentIndexBackfillDeclined: Bool?
         /// SCR-174: recording chunk length (seconds) — used to estimate a
         /// transcript chunk's wall-clock position before snapping to a real
         /// timeline event.
@@ -41,6 +47,7 @@ struct SettingsEnvelope: Decodable {
             case privacy
             case contentIndexEnabled = "content_index_enabled"
             case contentIndexConsentDeclined = "content_index_consent_declined"
+            case contentIndexBackfillDeclined = "content_index_backfill_declined"
             case chunkDuration = "chunk_duration"
         }
     }

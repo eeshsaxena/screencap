@@ -107,12 +107,38 @@ enum SearchAccessibility {
                 return "No matches"
             }
             let base = count == 1 ? "1 result" : "\(count) results"
-            // Append the completeness cue so a VoiceOver user learns results were
-            // capped upstream (R3/R6) — the visible header carries the same note.
-            // The spoken form stays count-only (no "across N days" day span) to
-            // keep the announcement terse; the day span is visible-only polish.
+            // SCR-182 U3 — append the completeness cue so a VoiceOver user learns
+            // results were capped upstream (R3/R6); the visible header carries the
+            // same note. The spoken form stays count-only (no "across N days" day
+            // span) to keep the announcement terse; the day span is visible polish.
             if let note = truncationNote(results) { return "\(base). \(note)" }
             return base
+        }
+    }
+
+    /// SCR-178 U8 — spoken announcement posted when the backfill affordance
+    /// reaches a **terminal** transition (done / paused / cancelled /
+    /// start-failed), so a VoiceOver user learns the outcome of a long indexing
+    /// run instead of hearing silence. Returns `nil` for every in-progress state
+    /// (`hidden` / `offering` / `starting` / `indexing`): in particular the
+    /// determinate `done/total` ticks do **not** announce, to avoid flooding
+    /// VoiceOver during a run. Mirrors `searchOutcomeAnnouncement` (pure builder;
+    /// the view posts the string on a terminal transition).
+    static func backfillAnnouncement(for state: SearchViewModel.BackfillUIState) -> String? {
+        switch state {
+        case .hidden, .offering, .starting, .indexing:
+            return nil
+        case .done(let done, let total, let failed):
+            if failed == 0 {
+                return "Done \u{2014} your recording history is now searchable."
+            }
+            return "Indexed \(done) of \(total) recordings. \(failed) could not be indexed."
+        case .paused(let done, let total):
+            return "Indexed \(done) of \(total) so far \u{2014} resume to continue."
+        case .cancelled:
+            return "Indexing paused \u{2014} you can resume later."
+        case .startFailed:
+            return "Couldn\u{2019}t start indexing \u{2014} try again later."
         }
     }
 
