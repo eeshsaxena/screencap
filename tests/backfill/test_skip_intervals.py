@@ -413,31 +413,69 @@ def test_element_state_null_span_skipped(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def _write_intent(rec_dir: Path, destination: str) -> None:
-    (rec_dir / ".recording_intent").write_text(
-        json.dumps({"version": 2, "destination": destination,
-                    "retention_policy": "keep_forever", "retention_params": {}})
-    )
+def _write_intent(
+    rec_dir: Path, destination: str, privacy_mode: str | None = None,
+) -> None:
+    intent = {"version": 2, "destination": destination,
+              "retention_policy": "keep_forever", "retention_params": {}}
+    if privacy_mode is not None:
+        intent["privacy_mode"] = privacy_mode
+    (rec_dir / ".recording_intent").write_text(json.dumps(intent))
 
 
 @pytest.mark.parametrize("destination", ["cloud", "both"])
 def test_mode_cloud_intent_is_public(tmp_path, destination):
     rec = tmp_path / "rec"
     rec.mkdir()
-    _write_intent(rec, destination)
+    _write_intent(rec, destination, privacy_mode="internal")
     _, evaluator = build_classifier_evaluator(recording_dir=rec)
     assert evaluator.config.mode == PrivacyMode.PUBLIC
 
 
-def test_mode_local_intent_uses_frozen_mode(tmp_path, monkeypatch):
+def test_mode_local_intent_uses_frozen_capture_mode(tmp_path, monkeypatch):
+    """SCR-190: the frozen capture-time mode wins over a relaxed current config.
+
+    Recorded under PUBLIC (strict), global config later relaxed to INTERNAL.
+    The backfill must re-derive under the frozen PUBLIC mode so it can never
+    block LESS than capture time did (the relaxed-since-capture under-block hole).
+    """
     rec = tmp_path / "rec"
     rec.mkdir()
-    _write_intent(rec, "local")
-    # The frozen (config) mode for a local recording flows through unchanged.
+    _write_intent(rec, "local", privacy_mode="public")
     import screencap.config as cfg
     from screencap.privacy.policy import PrivacyConfig as PC
 
     monkeypatch.setattr(cfg, "get_privacy_config", lambda: PC(mode=PrivacyMode.INTERNAL))
+    _, evaluator = build_classifier_evaluator(recording_dir=rec)
+    assert evaluator.config.mode == PrivacyMode.PUBLIC
+
+
+def test_mode_local_intent_missing_privacy_mode_fails_closed(tmp_path, monkeypatch):
+    """SCR-190: a local intent with no frozen privacy_mode → fail-closed to PUBLIC.
+
+    Never fall back to the (possibly relaxed) current config mode, which would
+    reintroduce the under-block hole for legacy/corrupt intents.
+    """
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    _write_intent(rec, "local")  # no privacy_mode field
+    import screencap.config as cfg
+    from screencap.privacy.policy import PrivacyConfig as PC
+
+    monkeypatch.setattr(cfg, "get_privacy_config", lambda: PC(mode=PrivacyMode.INTERNAL))
+    _, evaluator = build_classifier_evaluator(recording_dir=rec)
+    assert evaluator.config.mode == PrivacyMode.PUBLIC
+
+
+def test_mode_local_intent_internal_capture_mode_preserved(tmp_path, monkeypatch):
+    """A genuinely-INTERNAL capture is re-derived under INTERNAL, not over-blocked."""
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    _write_intent(rec, "local", privacy_mode="internal")
+    import screencap.config as cfg
+    from screencap.privacy.policy import PrivacyConfig as PC
+
+    monkeypatch.setattr(cfg, "get_privacy_config", lambda: PC(mode=PrivacyMode.PUBLIC))
     _, evaluator = build_classifier_evaluator(recording_dir=rec)
     assert evaluator.config.mode == PrivacyMode.INTERNAL
 

@@ -62,15 +62,15 @@ matches the codebase's fail-closed masking posture: better to miss indexing a
 benign frame than to index masked-app on-screen text.
 
 Parity is "identical given identical config": re-derivation reflects the
-*current* classifier / evaluator / ``PrivacyMode``. If privacy config changed
-since capture, the re-derived set may block more (acceptable) — never less.
-
-Residual (known limitation): the "never less" guarantee holds only when the
-current ``PrivacyMode`` is at least as strict as it was at capture time. For a
-``local``-destination recording re-derived under a current config mode that has
-been RELAXED since capture, re-derivation reflects the current (looser) mode and
-could therefore block LESS than capture did. Freezing the capture-time mode into
-``.recording_intent`` is the deferred mitigation; until then this is accepted.
+classifier / evaluator built for the recording's ``PrivacyMode``. The mode is
+NOT taken from the mutable current config — it is the **capture-time** mode,
+frozen into ``.recording_intent`` (``privacy_mode``) at start time and read back
+by ``_resolve_mode`` (cloud/both force ``PUBLIC``; local reads the frozen mode;
+absent/unparseable → ``PUBLIC`` fail-closed). So a global ``PrivacyMode``
+*relaxed since capture* can no longer make the re-derived set block LESS than
+capture did (SCR-190 — closes the prior relaxed-since-capture under-block hole).
+If the rest of the privacy config (app classes, exclude lists) changed since
+capture the re-derived set may still block more (acceptable) — never less.
 """
 
 from __future__ import annotations
@@ -151,8 +151,10 @@ def build_classifier_evaluator(
       * explicit ``mode=`` wins (test / caller override),
       * else read the recording's frozen ``.recording_intent``: cloud/both
         destination → ``PUBLIC`` (matching ``ChunkScrubber._build``'s
-        ``cloud_intent`` branch); local-only → the frozen (config) mode,
-      * else (``.recording_intent`` absent/unreadable) → ``PUBLIC``, the
+        ``cloud_intent`` branch); local-only → the frozen **capture-time**
+        ``privacy_mode`` (SCR-190 — never the mutable current config),
+      * else (``.recording_intent`` absent/unreadable, or a local recording
+        with no/unparseable frozen ``privacy_mode``) → ``PUBLIC``, the
         strictest fail-closed default.
 
     Returns ``(DefaultContextClassifier, DefaultPolicyEvaluator)``.
@@ -177,14 +179,19 @@ def build_classifier_evaluator(
 def _resolve_mode(recording_dir: Path | None) -> PrivacyMode:
     """Resolve the PrivacyMode for a recording from its frozen ``.recording_intent``.
 
-    cloud/both → ``PUBLIC``; local → the frozen (config) mode; absent/unreadable
-    → ``PUBLIC`` (fail-closed). Returns the mode to apply; ``None`` is never
-    returned — the caller treats a returned ``None``-config mode as "leave as-is".
+    cloud/both → ``PUBLIC``; local → the frozen **capture-time** ``privacy_mode``
+    (SCR-190); absent/unreadable/unparseable → ``PUBLIC`` (fail-closed).
+
+    Local recordings read the frozen capture-time mode — NOT the mutable current
+    ``get_privacy_config().mode`` — so a global mode *relaxed since capture* can
+    never make the re-derived skip set block less than capture-time did. If the
+    frozen ``privacy_mode`` is absent (legacy intent) or unparseable we fail
+    closed to ``PUBLIC`` rather than trusting the (possibly relaxed) global.
     """
     if recording_dir is None:
         return PrivacyMode.PUBLIC
 
-    from screencap.catalog import read_intent
+    from screencap.catalog import read_intent, read_intent_privacy_mode
 
     try:
         destination = read_intent(Path(recording_dir))
@@ -195,13 +202,17 @@ def _resolve_mode(recording_dir: Path | None) -> PrivacyMode:
     if destination in ("cloud", "both"):
         return PrivacyMode.PUBLIC
     if destination == "local":
-        # Use the frozen (config) mode — signal "leave config mode as-is".
-        from screencap.config import get_privacy_config
-
-        try:
-            return get_privacy_config().mode
-        except Exception:
-            return PrivacyMode.PUBLIC
+        # Use the frozen capture-time mode. Fail closed to PUBLIC when it is
+        # absent/unparseable — never fall back to the mutable current config.
+        frozen = read_intent_privacy_mode(Path(recording_dir))
+        if frozen is not None:
+            try:
+                return PrivacyMode(frozen)
+            except ValueError:
+                logger.debug(
+                    "Unparseable frozen privacy_mode %r; defaulting to PUBLIC", frozen,
+                )
+        return PrivacyMode.PUBLIC
     # Missing / unknown destination → strictest fail-closed default.
     return PrivacyMode.PUBLIC
 
