@@ -114,6 +114,33 @@ def read_masked_video_upload(directory: Path) -> bool | None:
     return bool(val) if isinstance(val, bool) else None
 
 
+def read_intent_privacy_mode(directory: Path) -> str | None:
+    """Read the FROZEN capture-time ``privacy_mode`` from ``.recording_intent``.
+
+    The capture-time ``PrivacyMode`` is resolved once at recording start and
+    frozen here (``engine/lock_policy._write_identity_files``, from
+    ``privacy_config.mode.value``). The SCR-178 backfill reads THIS value to
+    re-derive a ``local`` recording's skip set under the mode it was captured
+    under, so a *relaxed-since-capture* global mode can never make the backfill
+    block less than capture-time did (SCR-190).
+
+    Returns the frozen mode string (e.g. ``"public"`` / ``"internal"``), or
+    ``None`` when the file is missing/corrupt or the field is absent (a legacy
+    intent written before the field existed). The caller fails closed to
+    ``PrivacyMode.PUBLIC`` for that ``None`` case rather than trusting the
+    mutable global.
+    """
+    intent_path = directory / INTENT_FILE
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+    except Exception:
+        return None
+    val = data.get("privacy_mode")
+    return val if isinstance(val, str) and val else None
+
+
 def read_intent_policy(directory: Path):
     """Read the frozen :class:`~screencap.pipeline_policy.ResolvedPolicy`.
 
