@@ -24,6 +24,10 @@ struct SearchView: View {
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
 
+    // SCR-182 U4 — recent committed searches for the idle state. Held as a
+    // StateObject so it survives body rebuilds; the data lives in UserDefaults.
+    @StateObject private var recentStore = RecentSearchesStore()
+
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
@@ -32,6 +36,15 @@ struct SearchView: View {
     /// "Turn on" so the backfill prompt never re-nags.
     @State private var backfillDeclined = false
     @State private var searchTask: Task<Void, Never>?
+    // SCR-182 U1 — the last query actually issued, used to dedupe the trailing
+    // `.onChange(of: query)` that a Return or a programmatic chip-tap `query` set
+    // produces, so the same query is never searched twice.
+    @State private var lastIssuedQuery: String?
+
+    /// SCR-182 U1 — live-search debounce. 300 ms balances responsiveness against
+    /// issuing a daemon round-trip on every keystroke.
+    private static let searchDebounceNanos: UInt64 = 300_000_000
+
     /// Stub-recording guard message — shown via an alert instead of opening an
     /// inspect window that would fail to load (mirrors the Recordings list).
     @State private var rowError: String?
@@ -53,6 +66,8 @@ struct SearchView: View {
                 phase: model.phase,
                 consentDeclined: consentDeclined,
                 backfillState: model.backfillState,
+                isSearching: model.isSearching,
+                recentSearches: recentStore.recent,
                 selection: $selectedResultID,
                 frameIndex: frameIndex,
                 thumbnailLoader: thumbnailLoader,
@@ -63,6 +78,7 @@ struct SearchView: View {
                 onSkipBackfill: skipBackfill,
                 onCancelBackfill: model.cancelBackfill,
                 onResumeBackfill: model.resumeBackfill,
+                onRunChip: runChipQuery,
                 onOpen: openInspect
             )
         }
@@ -72,9 +88,14 @@ struct SearchView: View {
             // before focus is assigned — more reliable than a synchronous set.
             Task { @MainActor in searchFieldFocused = true }
         }
+        // SCR-182 U1 — live, debounced search-as-you-type.
+        .onChange(of: query) { _ in runSearch(debounced: true) }
         // SCR-183 U6 — announce the search outcome so a VoiceOver user who
         // can't see the screen learns the result instead of hearing silence.
         .onChange(of: model.phase) { phase in
+            // SCR-182 U2 — a new result set may not contain the previously
+            // selected row; reset so Return-to-open never acts on a stale id.
+            if case .loaded = phase { selectedResultID = nil }
             if let message = SearchAccessibility.searchOutcomeAnnouncement(for: phase) {
                 announceToVoiceOver(message)
             }
@@ -123,7 +144,7 @@ struct SearchView: View {
                     .textFieldStyle(.plain)
                     .accessibilityLabel("Search your history")
                     .focused($searchFieldFocused)
-                    .onSubmit { runSearch() }
+                    .onSubmit { submitSearch() }
             }
             .padding(.vertical, 6)
             .padding(.horizontal, 10)
@@ -139,11 +160,43 @@ struct SearchView: View {
 
     // MARK: - Actions
 
-    private func runSearch() {
+    /// SCR-182 U1 — run a search. Debounced from the field's `.onChange`
+    /// (live search-as-you-type); immediate from Return (`.onSubmit`) and chip
+    /// taps. A single `searchTask` handle owns both the debounce delay and the
+    /// search, so cancelling it on the next keystroke can't leave a sleeping
+    /// timer to orphan-fire a stale search. `lastIssuedQuery` (claimed
+    /// synchronously on immediate paths, after the delay on debounced ones)
+    /// dedupes the trailing `.onChange` that a Return or a programmatic chip-tap
+    /// `query` set produces.
+    private func runSearch(debounced: Bool = false) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        if debounced, trimmed == lastIssuedQuery { return }
         searchTask?.cancel()
-        searchTask = Task { await model.search(trimmed, contentIndexEnabled: contentIndexEnabled) }
+        if !debounced { lastIssuedQuery = trimmed }
+        searchTask = Task { @MainActor in
+            if debounced {
+                try? await Task.sleep(nanoseconds: Self.searchDebounceNanos)
+                if Task.isCancelled { return }
+                lastIssuedQuery = trimmed
+            }
+            await model.search(trimmed, contentIndexEnabled: contentIndexEnabled)
+        }
+    }
+
+    /// SCR-182 U4 — Return commits the current query: record it, then run it
+    /// immediately (the `.onSubmit` path, bypassing the live debounce).
+    private func submitSearch() {
+        recentStore.record(query)
+        runSearch()
+    }
+
+    /// SCR-182 U4 — a chip tap commits its query: fill the field, record it, and
+    /// run immediately. Setting `query` triggers `.onChange`, but `runSearch`'s
+    /// synchronous `lastIssuedQuery` claim makes that trailing change a no-op.
+    private func runChipQuery(_ text: String) {
+        query = text
+        recentStore.record(text)
+        runSearch()
     }
 
     /// Opens the read-only inspect window for the result's recording and (U6)

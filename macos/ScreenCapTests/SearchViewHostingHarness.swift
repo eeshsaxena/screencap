@@ -189,12 +189,16 @@ enum SearchFixtures {
     /// place across the layout + state tests.
     static func resultsView(
         _ phase: SearchViewModel.Phase,
-        backfillState: SearchViewModel.BackfillUIState = .hidden
+        backfillState: SearchViewModel.BackfillUIState = .hidden,
+        isSearching: Bool = false,
+        recentSearches: [String] = []
     ) -> SearchResultsView {
         SearchResultsView(
             phase: phase,
             consentDeclined: false,
             backfillState: backfillState,
+            isSearching: isSearching,
+            recentSearches: recentSearches,
             selection: .constant(nil),
             frameIndex: nil,
             thumbnailLoader: nil,
@@ -205,6 +209,7 @@ enum SearchFixtures {
             onSkipBackfill: {},
             onCancelBackfill: {},
             onResumeBackfill: {},
+            onRunChip: { _ in },
             onOpen: { _ in }
         )
     }
