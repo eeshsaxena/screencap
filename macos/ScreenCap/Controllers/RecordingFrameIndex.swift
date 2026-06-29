@@ -54,9 +54,7 @@ actor RecordingFrameIndex {
     /// sit between frames — beyond the cap we show the placeholder instead of a
     /// frame minutes from the matched moment.
     init(recordingsRoot: URL? = nil, stalenessCapMs: Int = 30_000) {
-        self.recordingsRoot = recordingsRoot
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".screencap/recordings", isDirectory: true)
+        self.recordingsRoot = recordingsRoot ?? AppPaths.recordingsRoot
         self.stalenessCapMs = stalenessCapMs
     }
 

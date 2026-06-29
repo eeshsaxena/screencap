@@ -403,7 +403,7 @@ enum DaemonClient {
            !override.isEmpty {
             return override
         }
-        return "\(NSHomeDirectory())/.screencap/run/api.sock"
+        return AppPaths.daemonSocket.path
     }
 
     static func request<T: Decodable>(
