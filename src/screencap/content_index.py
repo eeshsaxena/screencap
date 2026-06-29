@@ -162,17 +162,46 @@ def default_index_path() -> Path:
 _WRITE_LOCK = threading.Lock()
 
 
+class CrossProcessLockUnavailable(Exception):
+    """The cross-process ``fcntl.flock`` could not be acquired (SCR-191).
+
+    Raised by :func:`content_index_write_lock` only when ``require_cross_process``
+    is set and the flock cannot be established (no-flock filesystem / sandboxed
+    run dir). The in-process lock alone is insufficient for a writer in a
+    DIFFERENT process from the recorder (the backfill daemon), so such a writer
+    must decline to write rather than degrade to no cross-process serialization.
+    """
+
+
 def _write_lock_path() -> Path:
     return default_index_path().parent / "run" / "content-index.lock"
 
 
 @contextlib.contextmanager
-def content_index_write_lock() -> Iterator[None]:
+def content_index_write_lock(*, require_cross_process: bool = False) -> Iterator[None]:
     """Hold the global content-index write lock (SCR-134).
 
     Acquired by both the inline index write and the retroactive-disable purge so
     the two never interleave. Blocking (it must WAIT for the other writer, not
-    fail) and fail-open (lock-setup errors degrade to the in-process lock only).
+    fail).
+
+    Two failure postures (SCR-191):
+
+    * **Fail-open (default)** — a flock-setup error degrades to the in-process
+      lock only. Correct for the recorder-subprocess racers (live index write vs
+      retroactive-disable purge): they are same-process threads, so the
+      ``threading.Lock`` is the real serialization and the flock is a bonus.
+    * **Fail-closed (``require_cross_process=True``)** — a flock-setup error
+      raises :class:`CrossProcessLockUnavailable` instead of yielding. The
+      backfill runs in the *daemon* process, a DIFFERENT process from the
+      recorder's purge, so the in-process lock does NOT serialize them — only the
+      flock does. Rather than write without cross-process protection (which could
+      resurrect a just-purged interval), the backfill caller declines the write.
+      The flock file is one path on one filesystem, so its support is
+      all-or-nothing for every process: when flock works the purge holds it too
+      (serialized); when it does not, the backfill simply does not write, so the
+      only remaining writers are the recorder's own threads (still serialized by
+      ``_WRITE_LOCK``).
     """
     _WRITE_LOCK.acquire()
     fd: int | None = None
@@ -184,7 +213,7 @@ def content_index_write_lock() -> Iterator[None]:
                 os.chmod(lock_path.parent, 0o700)
             fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError:
+        except OSError as exc:
             # Sandboxed/read-only run dir or a filesystem without flock support:
             # the in-process lock still serializes the same-process racers, which
             # is the race that actually exists today.
@@ -192,6 +221,14 @@ def content_index_write_lock() -> Iterator[None]:
                 with contextlib.suppress(OSError):
                     os.close(fd)
                 fd = None
+            if require_cross_process:
+                # A cross-process writer (backfill) cannot rely on the in-process
+                # lock — decline rather than write unserialized. Raise here (before
+                # yield); the ``finally`` releases ``_WRITE_LOCK`` exactly once as
+                # the exception unwinds, and ``fd`` is already None so it is a no-op.
+                raise CrossProcessLockUnavailable(
+                    "content-index cross-process flock unavailable"
+                ) from exc
         yield
     finally:
         if fd is not None:

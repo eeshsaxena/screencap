@@ -30,6 +30,7 @@ from screencap.backfill.skip_intervals import (
     AMBIGUOUS_BROWSER_URL,
     AMBIGUOUS_SECURE_FIELD,
     AMBIGUOUS_TITLE,
+    ORPHAN_SCREENSHOT,
     UNCOVERED_GAP,
     build_classifier_evaluator,
     derive_skip_intervals,
@@ -607,3 +608,115 @@ def test_parity_superset_of_live_blocks(tmp_path):
     # The benign window at [200, 300) stays ALLOW under derivation (covered,
     # intact, non-ambiguous).
     assert find_blocked_interval(250.0, derived) is None
+
+
+# --------------------------------------------------------------------------
+# SCR-191 — orphan-screenshot cross-check (flat file outlived its DB row)
+# --------------------------------------------------------------------------
+
+
+def _add_screenshot_table(db: Path, rows: list[dict]) -> None:
+    """Add a ``screenshot`` table with ``rows`` (``{ts, image_path?}``).
+
+    Omitting ``image_path`` leaves it NULL (a surviving row whose file path the
+    purge could not match — the cross-check must still treat the ts as covered).
+    """
+    with contextlib.closing(sqlite3.connect(str(db))) as conn:
+        conn.execute(
+            "CREATE TABLE screenshot ("
+            "id INTEGER PRIMARY KEY, recording_id INTEGER, timestamp REAL, image_path TEXT)"
+        )
+        for i, r in enumerate(rows, start=1):
+            ip = r.get("image_path", f"screenshots/{r['ts']:.6f}.jpg")
+            conn.execute(
+                "INSERT INTO screenshot (id, recording_id, timestamp, image_path) "
+                "VALUES (?, 1, ?, ?)",
+                (i, r["ts"], ip),
+            )
+        conn.commit()
+
+
+def test_orphan_screenshot_with_purged_row_is_skipped(tmp_path):
+    """A flat screenshot whose ``screenshot`` row was purged is skipped.
+
+    Mid-recording retroactive disable deleted the covering window rows AND the
+    screenshot row, but the flat file outlived its row (table-vs-flat-dir
+    divergence). It floats under the adjacent ALLOW window's open-ended span, so
+    the uncovered-gap pass (only-before-first-window) misses it — the orphan
+    cross-check must catch it.
+    """
+    db = tmp_path / "recording.db"
+    # One ALLOW window spanning the whole range; its open-ended span would cover
+    # a frame at 250.0 if we only looked at window coverage.
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    # Surviving screenshot rows at 110 and 200 — but NOT 250 (its row was purged).
+    _add_screenshot_table(db, rows=[{"ts": 110.0}, {"ts": 200.0}])
+    classifier, evaluator = _public()
+
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[110.0, 200.0, 250.0],
+    )
+
+    # 250.0 is an orphan (flat file present, no surviving row) → skipped.
+    orphan = find_blocked_interval(250.0, intervals)
+    assert orphan is not None and orphan.reason == ORPHAN_SCREENSHOT
+    # Frames with surviving rows stay ALLOW (not over-skipped).
+    assert find_blocked_interval(110.0, intervals) is None
+    assert find_blocked_interval(200.0, intervals) is None
+
+
+def test_orphan_check_tight_pad_spares_neighbours(tmp_path):
+    """The orphan pad is tight — a surviving neighbour ~1s away is untouched."""
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    _add_screenshot_table(db, rows=[{"ts": 200.0}, {"ts": 201.0}])
+    classifier, evaluator = _public()
+
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[200.0, 200.5, 201.0],
+    )
+
+    # 200.5 is the orphan; its 200.0 / 201.0 neighbours survived → not skipped.
+    assert find_blocked_interval(200.5, intervals) is not None
+    assert find_blocked_interval(200.0, intervals) is None
+    assert find_blocked_interval(201.0, intervals) is None
+
+
+def test_null_image_path_row_still_covers_frame(tmp_path):
+    """A surviving row with NULL image_path still covers its frame by timestamp."""
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    _add_screenshot_table(db, rows=[{"ts": 150.0, "image_path": None}])
+    classifier, evaluator = _public()
+
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[150.0],
+    )
+    # Covered by the timestamp-column fallback → not flagged orphan.
+    assert find_blocked_interval(150.0, intervals) is None
+
+
+def test_no_screenshot_table_disables_orphan_check(tmp_path):
+    """Legacy schema (no ``screenshot`` table) → orphan cross-check is a no-op."""
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    classifier, evaluator = _public()
+
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[150.0],
+    )
+    # No table → cannot cross-check → frame is NOT flagged orphan (the divergence
+    # the check guards requires a purge, which only exists where the table does).
+    assert find_blocked_interval(150.0, intervals) is None

@@ -42,6 +42,16 @@ residual this module adds on top is:
    distinction. ``app_bundle_id`` is never nulled, so bundle-id-classified apps
    (password managers, banking) need no ambiguity handling.
 
+3. **Orphan-screenshot intervals (SCR-191)** — a flat ``screenshots/*.jpg`` file
+   with no surviving ``screenshot`` table row. The retroactive-disable purge
+   deletes rows AND unlinks files, but it selects via the ``screenshot`` TABLE
+   while the backfill globs the flat dir, so a file can outlive its row. Such an
+   orphan would float under the adjacent ALLOW window's open-ended span (the
+   uncovered-gap pass only catches frames *before the first* surviving window) and
+   be indexed. We cross-check each flat frame against the surviving rows (matched
+   on the timestamp the filename and ``image_path`` both encode) and skip any with
+   no surviving row — with a tight pad so legitimately-indexable neighbours stay.
+
 Tightest-safe column-dependency predicate
 -----------------------------------------
 "Is this classification column-dependent?" is decided from the *actual*
@@ -102,6 +112,7 @@ logger = logging.getLogger(__name__)
 # the canonical scrub set. Backfill-local (not in ``privacy.reasons.ReasonCode``)
 # because they describe a re-derivation artifact, not a policy decision.
 UNCOVERED_GAP = "uncovered_gap"
+ORPHAN_SCREENSHOT = "orphan_screenshot"
 AMBIGUOUS_BROWSER_URL = "ambiguous_browser_url"
 AMBIGUOUS_TITLE = "ambiguous_title"
 AMBIGUOUS_SECURE_FIELD = "ambiguous_secure_field"
@@ -112,6 +123,16 @@ AMBIGUOUS_SECURE_FIELD = "ambiguous_secure_field"
 # exceed the screenshot cadence; the exact value is not load-bearing (the
 # interval only ever drops frames from indexing).
 _GAP_PAD_SECONDS = 5.0
+
+# A tight pad around an ORPHAN screenshot (file survived, its ``screenshot`` row
+# was purged). Unlike the uncovered-gap pad, this must NOT spill onto neighbours:
+# a frame whose row survived is legitimately indexable, so we skip ONLY the
+# orphan frame itself. The frame's timestamp is bit-identical between here and
+# ``index_core`` (both parse the same flat filename), so the half-open
+# ``find_blocked_interval`` test (``start <= ts < end``) catches exactly it; the
+# tiny pad just guards float-boundary nerves and never reaches the ~1s-away
+# neighbours.
+_ORPHAN_PAD_SECONDS = 0.01
 
 # Hold window applied to an ``element_state IS NULL`` span mirrors
 # ``DEFAULT_TRANSITION_HOLD_SECONDS`` (imported above), used by
@@ -243,6 +264,14 @@ def derive_skip_intervals(
     3. **Ambiguity** intervals — NULL ``browser_url`` / ``title`` / ``element_state``
        spans whose classification genuinely depends on the null column
        (fail-closed; detected via raw SQL on the columns).
+    4. **Orphan-screenshot** intervals (SCR-191) — for each ``screenshot_timestamps``
+       entry with no surviving ``screenshot`` table row. The retroactive-disable
+       purge deletes ``screenshot`` rows AND unlinks files, but it selects via the
+       ``screenshot`` TABLE while the backfill globs the flat dir, so a file can
+       outlive its row; such an orphan would otherwise float under the adjacent
+       ALLOW window's open-ended span (the uncovered-gap pass only catches frames
+       *before the first* surviving window) and be indexed. Each orphan is skipped
+       with a TIGHT interval so legitimately-indexable neighbours are untouched.
 
     Always a superset of the live block set; never raises on a legacy schema or
     a missing/locked DB (returns whatever it could derive, fail-closed).
@@ -253,6 +282,7 @@ def derive_skip_intervals(
     canonical: list[BlockedInterval] = []
     ambiguity: list[BlockedInterval] = []
     window_starts: list[float] = []
+    surviving_screenshot_ts: set[float] | None = None
 
     db_exists = db_path.is_file()
     if db_exists:
@@ -281,14 +311,31 @@ def derive_skip_intervals(
                 "derive_skip_intervals: ambiguity derivation failed", exc_info=True,
             )
 
+        # 4. Surviving ``screenshot`` rows for the orphan cross-check (SCR-191).
+        # Fail-open on read error: None disables the cross-check (the
+        # uncovered-gap + canonical passes still apply) rather than over-skipping
+        # every frame on a transient locked-DB read.
+        try:
+            surviving_screenshot_ts = _read_surviving_screenshot_ts(db_path)
+        except Exception:
+            logger.warning(
+                "derive_skip_intervals: surviving-screenshot read failed; "
+                "orphan cross-check skipped", exc_info=True,
+            )
+
     # 2. Uncovered-gap intervals (orphan screenshots with no covering window).
     gaps: list[BlockedInterval] = []
+    orphans: list[BlockedInterval] = []
     if screenshot_timestamps:
         gaps = _derive_uncovered_gaps(
             screenshot_timestamps, window_starts, start, end,
         )
+        # 4. Orphan-screenshot intervals (flat file with no surviving DB row).
+        orphans = _derive_orphan_screenshot_intervals(
+            screenshot_timestamps, surviving_screenshot_ts, start, end,
+        )
 
-    return merge_intervals(canonical, ambiguity, gaps)
+    return merge_intervals(canonical, ambiguity, gaps, orphans)
 
 
 def _derive_uncovered_gaps(
@@ -327,6 +374,81 @@ def _derive_uncovered_gaps(
             end=ts + _GAP_PAD_SECONDS,
             action=PrivacyAction.EXCLUDE,
             reason=UNCOVERED_GAP,
+        ))
+    return out
+
+
+def _read_surviving_screenshot_ts(db_path: Path) -> set[float] | None:
+    """Return the timestamps of every surviving ``screenshot`` row (SCR-191).
+
+    The set is keyed the way the flat ``screenshots/*.jpg`` files are: each
+    surviving row contributes BOTH its parsed ``image_path`` timestamp (the exact
+    value the flat filename encodes — ``image_path`` is ``screenshots/{ts}.jpg``)
+    AND its raw ``timestamp`` column, so a row with a NULL ``image_path`` still
+    counts as coverage and a legitimately-indexable frame is never flagged orphan.
+
+    All rows are read (not range-scoped) so membership is exact regardless of a
+    chunk boundary's float precision; the per-recording row count is bounded.
+
+    Returns ``None`` — disabling the orphan cross-check — when the ``screenshot``
+    table is absent (a legacy schema predating the retroactive-disable purge, so
+    the table-vs-flat-dir divergence cannot arise).
+    """
+    from screencap.redaction.geometry import parse_screenshot_timestamp
+
+    with open_recording_db(db_path) as conn:
+        if not has_table(conn, "screenshot"):
+            return None
+        has_image_path = has_column(conn, "screenshot", "image_path")
+        cols = "timestamp" + (", image_path" if has_image_path else "")
+        rows = conn.execute(
+            f"SELECT {cols} FROM screenshot WHERE timestamp IS NOT NULL"
+        ).fetchall()
+
+    surviving: set[float] = set()
+    for row in rows:
+        if row[0] is not None:
+            surviving.add(float(row[0]))
+        if has_image_path and row[1]:
+            parsed = parse_screenshot_timestamp(row[1])
+            if parsed is not None:
+                surviving.add(parsed)
+    return surviving
+
+
+def _derive_orphan_screenshot_intervals(
+    screenshot_timestamps: list[float],
+    surviving_screenshot_ts: set[float] | None,
+    range_start: float,
+    range_end: float,
+) -> list[BlockedInterval]:
+    """Skip every in-range flat screenshot with no surviving ``screenshot`` row.
+
+    Closes the table-vs-flat-dir divergence (SCR-191): the retroactive-disable
+    purge unlinks files by selecting the ``screenshot`` TABLE, but the backfill
+    globs the flat dir, so a file can outlive its row. Such an orphan would float
+    under the adjacent ALLOW window's open-ended span and be indexed — resurrecting
+    just-disabled on-screen text. The frame's timestamp matches a surviving row's
+    parsed ``image_path`` exactly (same filename → same parse), so a frame absent
+    from ``surviving_screenshot_ts`` had its row deleted: skip it, with a TIGHT pad
+    that never reaches a neighbour whose row survived.
+
+    ``surviving_screenshot_ts`` is ``None`` when the cross-check is unavailable (no
+    ``screenshot`` table) → nothing is flagged.
+    """
+    if surviving_screenshot_ts is None:
+        return []
+    out: list[BlockedInterval] = []
+    for ts in screenshot_timestamps:
+        if not (range_start <= ts < range_end):
+            continue
+        if ts in surviving_screenshot_ts:
+            continue
+        out.append(BlockedInterval(
+            start=ts - _ORPHAN_PAD_SECONDS,
+            end=ts + _ORPHAN_PAD_SECONDS,
+            action=PrivacyAction.EXCLUDE,
+            reason=ORPHAN_SCREENSHOT,
         ))
     return out
 

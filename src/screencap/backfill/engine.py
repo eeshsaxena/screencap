@@ -217,6 +217,8 @@ def run_backfill(
     # --- Per-unit run loop -------------------------------------------------
     # Cache per-recording (classifier, evaluator) and the flat screenshot
     # timestamps so they are built ONCE per recording across its chunks.
+    from screencap.content_index import CrossProcessLockUnavailable
+
     classifier_cache: dict[str, tuple[object, object]] = {}
     timestamps_cache: dict[str, list[float]] = {}
 
@@ -263,6 +265,17 @@ def run_backfill(
                 budget_s=budget_s,
             )
             rows_written_total += rows
+        except CrossProcessLockUnavailable:
+            # SCR-191: the cross-process content-index flock is unavailable (a
+            # no-flock filesystem / sandboxed run dir). Its support is
+            # all-or-nothing per filesystem, so every remaining unit would hit
+            # the same wall. Pause the whole run (this unit is left PENDING — it
+            # was never marked — so the run is fully resumable) rather than churn
+            # through the tail or, worse, write without cross-process protection.
+            logger.warning(
+                "backfill: cross-process content-index lock unavailable; pausing run"
+            )
+            return _finish(RunState.PAUSED)
         except Exception:
             # One bad recording never aborts the run (strictly fail-open).
             logger.warning(
@@ -361,6 +374,13 @@ def _process_unit(
         stop_event=stop_event,
         budget_s=per_chunk_budget,
         max_frames=max_frames,
+        # SCR-191: the backfill runs in the daemon process, NOT the recorder, so
+        # the in-process content-index lock does not serialize it against the
+        # recorder's retroactive-disable purge — only the cross-process flock
+        # does. Require it: if it is unavailable index_range raises
+        # CrossProcessLockUnavailable (handled in the run loop) rather than
+        # writing without cross-process protection.
+        require_cross_process_lock=True,
     )
 
     # DONE-gating: mark DONE only on a complete range. A mid-chunk stop/budget
@@ -387,12 +407,50 @@ def _enumerate_recordings(recordings_dir: Path) -> list[Path]:
     boundary). A "recording dir" is any direct child directory; missing
     ``screenshots/``/``recording.db`` is handled per-unit (SKIPPED), so we do not
     filter here.
+
+    SCR-191: the recording with an ACTIVE capture is excluded. The backfill runs
+    in the daemon while capture/scrub run in the recorder subprocess; processing
+    the in-flight recording would read a half-written ``recording.db`` in
+    skip-derivation and race the live indexer's whole-range ``write_chunk`` on the
+    same ``(recording, timestamp_ms)`` keys cross-process. A later run picks it up
+    once capture finishes (re-seeding is additive).
     """
     if not recordings_dir.is_dir():
         return []
+    active = _active_recording_name()
     return sorted(
-        (d for d in recordings_dir.iterdir() if d.is_dir()), key=lambda d: d.name
+        (
+            d
+            for d in recordings_dir.iterdir()
+            if d.is_dir() and d.name != active
+        ),
+        key=lambda d: d.name,
     )
+
+
+def _active_recording_name() -> str | None:
+    """Return the directory name of the recording with a live capture, or None.
+
+    Reads the process-exclusive recording lock metadata (``screencap.pidfile`` —
+    NOT ``screencap.daemon``, so the engine's destination-agnostic boundary
+    holds). Returns the holder's ``recording_name`` only when the lock is actually
+    held by a live process (``lock_is_active`` rules out a stale lockfile whose
+    holder died). Fail-open: any error → None (process nothing-excluded rather
+    than aborting the backfill).
+    """
+    try:
+        from screencap import pidfile
+
+        if not pidfile.lock_is_active():
+            return None
+        metadata = pidfile.read_lock_metadata()
+        if not metadata:
+            return None
+        name = metadata.get("recording_name")
+        return name if isinstance(name, str) and name else None
+    except Exception:
+        logger.debug("backfill: active-recording check failed; excluding none", exc_info=True)
+        return None
 
 
 def _enumerate_chunks(rec_dir: Path) -> list[tuple[int, float, float]]:
