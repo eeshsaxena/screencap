@@ -184,18 +184,27 @@ enum SearchViewHost {
 enum SearchFixtures {
 
     /// The view under test, wired with inert defaults (no thumbnails, no
-    /// selection, no-op callbacks) so each test supplies only the `phase`. Keeps
-    /// the 9-parameter construction in one place across the layout + state tests.
-    static func resultsView(_ phase: SearchViewModel.Phase) -> SearchResultsView {
+    /// selection, no-op callbacks, backfill hidden) so each test supplies only the
+    /// `phase` (and optionally a `backfillState`). Keeps the construction in one
+    /// place across the layout + state tests.
+    static func resultsView(
+        _ phase: SearchViewModel.Phase,
+        backfillState: SearchViewModel.BackfillUIState = .hidden
+    ) -> SearchResultsView {
         SearchResultsView(
             phase: phase,
             consentDeclined: false,
+            backfillState: backfillState,
             selection: .constant(nil),
             frameIndex: nil,
             thumbnailLoader: nil,
             isSearchFieldFocused: false,
             onEnableConsent: {},
             onDeclineConsent: {},
+            onAcceptBackfill: {},
+            onSkipBackfill: {},
+            onCancelBackfill: {},
+            onResumeBackfill: {},
             onOpen: { _ in }
         )
     }

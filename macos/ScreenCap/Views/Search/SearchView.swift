@@ -27,6 +27,10 @@ struct SearchView: View {
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
+    /// SCR-178 U8 — whether the user already skipped the "index existing
+    /// recordings" offer (read from settings on load). Gates re-offering after a
+    /// "Turn on" so the backfill prompt never re-nags.
+    @State private var backfillDeclined = false
     @State private var searchTask: Task<Void, Never>?
     /// Stub-recording guard message — shown via an alert instead of opening an
     /// inspect window that would fail to load (mirrors the Recordings list).
@@ -48,12 +52,17 @@ struct SearchView: View {
             SearchResultsView(
                 phase: model.phase,
                 consentDeclined: consentDeclined,
+                backfillState: model.backfillState,
                 selection: $selectedResultID,
                 frameIndex: frameIndex,
                 thumbnailLoader: thumbnailLoader,
                 isSearchFieldFocused: searchFieldFocused,
                 onEnableConsent: enableConsent,
                 onDeclineConsent: declineConsent,
+                onAcceptBackfill: model.acceptBackfill,
+                onSkipBackfill: skipBackfill,
+                onCancelBackfill: model.cancelBackfill,
+                onResumeBackfill: model.resumeBackfill,
                 onOpen: openInspect
             )
         }
@@ -67,6 +76,14 @@ struct SearchView: View {
         // can't see the screen learns the result instead of hearing silence.
         .onChange(of: model.phase) { phase in
             if let message = SearchAccessibility.searchOutcomeAnnouncement(for: phase) {
+                announceToVoiceOver(message)
+            }
+        }
+        // SCR-178 U8 — announce the backfill outcome on a terminal transition
+        // only (done/paused/cancelled/start-failed); in-progress ticks return nil
+        // from the builder and stay silent.
+        .onChange(of: model.backfillState) { state in
+            if let message = SearchAccessibility.backfillAnnouncement(for: state) {
                 announceToVoiceOver(message)
             }
         }
@@ -151,12 +168,21 @@ struct SearchView: View {
         }
     }
 
+    /// SCR-178 U8 — skip the backfill offer: persist the decline (so it doesn't
+    /// re-prompt), remember it locally for this session, and hide the affordance.
+    /// No job runs.
+    private func skipBackfill() {
+        backfillDeclined = true
+        model.skipBackfill()
+    }
+
     private func loadSettings() async {
         do {
             let data = try await CLIClient.runJSONRaw(["settings", "--json"])
             let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
             contentIndexEnabled = env.settings.contentIndexEnabled ?? false
             consentDeclined = env.settings.contentIndexConsentDeclined ?? false
+            backfillDeclined = env.settings.contentIndexBackfillDeclined ?? false
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
         } catch {
             contentIndexEnabled = false
@@ -167,6 +193,12 @@ struct SearchView: View {
     /// Optimistic with success-latch (revert on write failure).
     private func enableConsent() {
         contentIndexEnabled = true
+        // SCR-178 U8 — offer the historical backfill the moment indexing is
+        // enabled (unless the user already skipped it). Done before the write so
+        // the offer is up immediately; the affordance lives in `model` and is
+        // independent of `consentNeeded`, so the upcoming re-search (which flips
+        // `consentNeeded` false) does not dismiss it.
+        model.offerBackfill(alreadyDeclined: backfillDeclined)
         Task {
             do {
                 _ = try await CLIClient.runJSONRaw(
@@ -174,6 +206,7 @@ struct SearchView: View {
                 )
             } catch {
                 contentIndexEnabled = false
+                model.dismissBackfillOffer()
                 return
             }
             runSearch()

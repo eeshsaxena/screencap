@@ -13,6 +13,11 @@ import SwiftUI
 struct SearchResultsView: View {
     let phase: SearchViewModel.Phase
     let consentDeclined: Bool
+    /// SCR-178 U8 — drives the "index your existing recordings" affordance, which
+    /// shares the consent banner's slot but is keyed on this state (NOT
+    /// `consentNeeded`) so it survives the "Turn on" flag flip and shows live
+    /// progress.
+    let backfillState: SearchViewModel.BackfillUIState
     @Binding var selection: SearchResultItem.ID?
     var frameIndex: RecordingFrameIndex?
     var thumbnailLoader: ThumbnailLoader?
@@ -22,6 +27,10 @@ struct SearchResultsView: View {
     let isSearchFieldFocused: Bool
     let onEnableConsent: () -> Void
     let onDeclineConsent: () -> Void
+    let onAcceptBackfill: () -> Void
+    let onSkipBackfill: () -> Void
+    let onCancelBackfill: () -> Void
+    let onResumeBackfill: () -> Void
     let onOpen: (SearchResultItem) -> Void
 
     var body: some View {
@@ -72,7 +81,16 @@ struct SearchResultsView: View {
                 }
                 coverageRow(results.coverage)
                     .listRowSeparator(.hidden)
-                if results.consentNeeded && !consentDeclined {
+                // SCR-178 U8 — the consent banner and the backfill affordance
+                // share one slot but are independent: tapping "Turn on" flips the
+                // flag (so the banner's `consentNeeded` guard goes false on the
+                // next search), and the backfill affordance — keyed on
+                // `backfillState`, NOT `consentNeeded` — takes over in place so
+                // the progress UI does not vanish the instant indexing is enabled.
+                if backfillState != .hidden {
+                    backfillAffordance
+                        .listRowSeparator(.hidden)
+                } else if results.consentNeeded && !consentDeclined {
                     consentBanner
                         .listRowSeparator(.hidden)
                 }
@@ -132,8 +150,12 @@ struct SearchResultsView: View {
         // Stand down while the consent banner is up: its prominent "Turn on"
         // button should own Return there, so this hidden open-the-selected-result
         // handler must not be the window's default action (SCR-183 review #1).
+        // Also stand down while the backfill affordance is active (offering /
+        // starting / indexing) — its prominent Accept/Cancel control should own
+        // Return there, not this hidden handler (SCR-178 U8).
         if !isSearchFieldFocused,
            !(results.consentNeeded && !consentDeclined),
+           !backfillState.isActive,
            let target = searchReviewTarget(for: selection, in: results) {
             Button("") { onOpen(target) }
                 .keyboardShortcut(.defaultAction)
@@ -235,6 +257,119 @@ struct SearchResultsView: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    // MARK: - Backfill affordance (SCR-178 U8)
+
+    /// The "also index your existing recordings" affordance. Rendered in the same
+    /// slot as `consentBanner` but driven by `backfillState` (NOT `consentNeeded`),
+    /// so it survives the "Turn on" flag flip and shows live progress, cancel,
+    /// resume, and a defined terminal state for every outcome.
+    @ViewBuilder
+    private var backfillAffordance: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch backfillState {
+            case .hidden:
+                EmptyView()
+
+            case .offering:
+                affordanceHeader("Index your existing recordings now?")
+                Text("Search the on-screen text in recordings you already made \u{2014} it all stays on this Mac and is never uploaded.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button("Skip") { onSkipBackfill() }
+                        .buttonStyle(.bordered)
+                    Button("Index now") { onAcceptBackfill() }
+                        .buttonStyle(.borderedProminent)
+                }
+
+            case .starting:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing to index\u{2026}").font(.callout)
+                    Spacer()
+                    Button("Cancel") { onCancelBackfill() }
+                        .buttonStyle(.bordered)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Preparing to index your existing recordings")
+
+            case .indexing(let done, let total, let failed):
+                affordanceHeader("Indexing your existing recordings")
+                ProgressView(value: Double(done), total: Double(max(total, 1))) {
+                    EmptyView()
+                } currentValueLabel: {
+                    Text(indexingProgressText(done: done, total: total, failed: failed))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .accessibilityLabel(indexingProgressText(done: done, total: total, failed: failed))
+                HStack {
+                    Spacer()
+                    Button("Cancel") { onCancelBackfill() }
+                        .buttonStyle(.bordered)
+                }
+
+            case .done(let done, let total, let failed):
+                affordanceHeader(failed == 0 ? "All set" : "Indexing finished")
+                Text(doneText(done: done, total: total, failed: failed))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+            case .paused(let done, let total):
+                affordanceHeader("Indexing paused")
+                Text("Indexed \(done) of \(total) so far \u{2014} resume to continue.")
+                    .font(.caption).foregroundStyle(.secondary)
+                resumeRow
+
+            case .cancelled:
+                affordanceHeader("Indexing paused")
+                Text("Indexing paused \u{2014} you can resume later.")
+                    .font(.caption).foregroundStyle(.secondary)
+                resumeRow
+
+            case .startFailed:
+                affordanceHeader("Couldn\u{2019}t start indexing")
+                Text("Couldn\u{2019}t start indexing \u{2014} try again later. You can still search what\u{2019}s already indexed.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func affordanceHeader(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.viewfinder").foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(title).font(.callout).bold()
+            Spacer()
+        }
+    }
+
+    private var resumeRow: some View {
+        HStack {
+            Spacer()
+            Button("Resume") { onResumeBackfill() }
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    /// "Indexed N of M" with the failed count appended only when non-zero
+    /// (`skipped` is a privacy-correct outcome and is never surfaced).
+    private func indexingProgressText(done: Int, total: Int, failed: Int) -> String {
+        var text = "Indexed \(done) of \(total)"
+        if failed > 0 { text += " \u{2014} \(failed) couldn\u{2019}t be indexed" }
+        return text
+    }
+
+    private func doneText(done: Int, total: Int, failed: Int) -> String {
+        if failed == 0 {
+            return "Done \u{2014} your recording history is now searchable."
+        }
+        return "Indexed \(done) of \(total) recordings. \(failed) could not be indexed."
     }
 
     // MARK: - Empty

@@ -515,6 +515,94 @@ enum DaemonClient {
         }
     }
 
+    /// Like `subscribe(...)` but yields each NDJSON line's raw UTF-8 bytes
+    /// instead of a decoded `RecorderEventLine`. SCR-178 (U8): the backfill
+    /// progress events carry count fields `RecorderEventLine` does not model, so
+    /// the affordance re-decodes the raw line through
+    /// `backfillProgressEvent(fromLine:)`. A line that fails to parse is dropped
+    /// (never throws) so an unrelated event shape can't kill the stream.
+    static func subscribeRawLines(
+        path: String = "/v0/events",
+        sinceCursor: Int? = nil,
+        socketPathOverride: String? = nil
+    ) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            let connectionBox = DaemonStreamConnectionBox()
+
+            let task = Task {
+                let queryPath: String
+                if let sinceCursor {
+                    queryPath = "\(path)?since=\(sinceCursor)"
+                } else {
+                    queryPath = path
+                }
+
+                let socket = socketPathOverride ?? socketPath()
+                guard FileManager.default.fileExists(atPath: socket) else {
+                    continuation.finish(throwing: DaemonClientError.socketUnavailable(path: socket))
+                    return
+                }
+
+                let connection = NWConnection(to: .unix(path: socket), using: .tcp)
+                connectionBox.set(connection)
+                do {
+                    try await connect(connection)
+                    try await sendRequest(connection: connection, method: "GET", path: queryPath, body: nil)
+                    let reader = ConnectionByteReader(connection: connection)
+                    let headerBytes = try await reader.readUntil(Data("\r\n\r\n".utf8))
+                    let headers = try parseHTTPHeaders(headerBytes)
+                    guard (200..<300).contains(headers.status) else {
+                        let body = try await reader.readToEOF()
+                        throw makeHTTPError(status: headers.status, body: body)
+                    }
+                    guard headers.headers["transfer-encoding"]?.lowercased().contains("chunked") == true else {
+                        throw DaemonClientError.streamClosed(reason: "missing chunked transfer encoding")
+                    }
+
+                    var lines = NDJSONLineBuffer()
+                    while !Task.isCancelled {
+                        let lengthLine = try await reader.readUntil(Data("\r\n".utf8))
+                        let hexText = String(data: lengthLine.dropLast(2), encoding: .utf8)?
+                            .split(separator: ";", maxSplits: 1)
+                            .first
+                            .map(String.init)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        guard let chunkLength = Int(hexText, radix: 16) else {
+                            throw DaemonClientError.streamClosed(reason: "invalid chunk length")
+                        }
+                        if chunkLength == 0 {
+                            _ = try? await reader.readUntil(Data("\r\n".utf8))
+                            continuation.finish()
+                            connection.cancel()
+                            return
+                        }
+
+                        let chunk = try await reader.readExactly(chunkLength)
+                        let crlf = try await reader.readExactly(2)
+                        guard crlf == Data("\r\n".utf8) else {
+                            throw DaemonClientError.streamClosed(reason: "invalid chunk terminator")
+                        }
+                        for line in try lines.feed(chunk) {
+                            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { continue }
+                            continuation.yield(data)
+                        }
+                    }
+                    connectionBox.cancel()
+                    continuation.finish()
+                } catch {
+                    connectionBox.cancel()
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+                connectionBox.cancel()
+            }
+        }
+    }
+
     static func daemonInfo() async throws -> DaemonInfoResponse {
         try await request(method: "GET", path: "/v0/daemon.info")
     }
@@ -591,6 +679,57 @@ enum DaemonClient {
     static func timelineQuery(_ req: TimelineQueryRequest) async throws -> TimelineQueryResponse {
         let body = try JSONEncoder().encode(req)
         return try await request(method: "POST", path: "/v0/timeline.query", body: body)
+    }
+
+    // MARK: - SCR-178 content-index backfill verbs
+
+    /// Start (or resume) the content-index backfill (SCR-178). Idempotent on the
+    /// daemon side — a second `start` while a run is in flight returns the
+    /// existing job's status rather than spawning a second run. The request
+    /// carries no parameters (the backfill enumerates the local library itself),
+    /// so the body is an empty JSON object. Pointer-/count-only response — no
+    /// recording directory name (R9). On `socketUnavailable`/`connectionFailed`
+    /// the caller surfaces a "daemon not running" state; on an error envelope it
+    /// surfaces the existing `DaemonClientError.envelopeError`.
+    static func backfillStart() async throws -> BackfillStatusResponse {
+        try await request(method: "POST", path: "/v0/backfill.start", body: Data("{}".utf8))
+    }
+
+    /// Current privacy-safe backfill snapshot (SCR-178). Count-only + opaque
+    /// ordinal; no recording name (R9). Read-only — not a recording-mutating
+    /// verb (the daemon excludes it from `_ACTIVITY_PATHS`).
+    static func backfillStatus() async throws -> BackfillStatusResponse {
+        try await request(method: "GET", path: "/v0/backfill.status")
+    }
+
+    /// Signal the in-flight backfill to stop (SCR-178). The run flushes its
+    /// ledger and transitions to `cancelled` (a cancelled run does NOT
+    /// auto-resume on daemon restart — re-trigger is an explicit `backfillStart`).
+    static func backfillCancel() async throws -> BackfillStatusResponse {
+        try await request(method: "POST", path: "/v0/backfill.cancel", body: Data("{}".utf8))
+    }
+
+    /// Decode a single streamed event line into a `BackfillProgressEvent`,
+    /// returning nil for any non-`backfill.*` event or a payload that fails to
+    /// decode. The `subscribe(...)` stream yields `RecorderEventLine` (a flat
+    /// recorder-event shape that does not carry the backfill counts), so the UI
+    /// re-decodes the raw line bytes through this seam: feed each streamed line
+    /// here and act only on the non-nil results. Tolerant by design — an
+    /// unknown or malformed event is ignored, never fatal (U7 edge case).
+    static func backfillProgressEvent(fromLine line: Data) -> BackfillProgressEvent? {
+        guard let event = try? JSONDecoder().decode(BackfillProgressEvent.self, from: line),
+              event.type.hasPrefix("backfill.")
+        else {
+            return nil
+        }
+        return event
+    }
+
+    /// Convenience overload: decode a backfill progress event from a streamed
+    /// line's UTF-8 string form. Mirrors `backfillProgressEvent(fromLine:)`.
+    static func backfillProgressEvent(fromLine line: String) -> BackfillProgressEvent? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        return backfillProgressEvent(fromLine: data)
     }
 
     private static func connect(_ connection: NWConnection) async throws {
