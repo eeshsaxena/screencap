@@ -96,7 +96,12 @@ final class SearchViewModel: ObservableObject {
     /// the real CLI call. Throwing surfaces as a no-op (the affordance still
     /// hides locally — see `skipBackfill`).
     private let persistBackfillDeclined: @Sendable () async throws -> Void
-    private let parser: QueryParser
+    /// `var` so SCR-179 U5 can rebuild it once per session with the index-sourced
+    /// vocabulary unioned onto the static seed (see `refreshVocabularyIfNeeded`).
+    private var parser: QueryParser
+    /// One-shot guard: the vocabulary is fetched once per session before the
+    /// first parse, never per keystroke.
+    private var vocabularyLoaded = false
     private let now: @Sendable () -> Date
     /// Recording chunk length (seconds), read once from `settings` by the live
     /// wiring (set on the view model after the settings fetch). Used to estimate
@@ -131,6 +136,11 @@ final class SearchViewModel: ObservableObject {
     /// consent trigger keys on the flag, not on `index_state` (which only
     /// signals an absent index file).
     func search(_ query: String, contentIndexEnabled: Bool) async {
+        // SCR-179 U5 — fetch the index-sourced vocabulary once before the first
+        // parse so site/app recognition reflects the user's real recordings.
+        // Runs on @MainActor, so the guard + rebuild can't race the parse below.
+        await refreshVocabularyIfNeeded()
+
         let parsed = parser.parse(query, now: now())
         guard !parsed.isEmpty else {
             phase = .idle
@@ -247,6 +257,35 @@ final class SearchViewModel: ObservableObject {
         // search may have superseded this one while the fan-out was in flight.
         if Task.isCancelled { return }
         phase = .loaded(results)
+    }
+
+    // MARK: - SCR-179 U5 — index-sourced parser vocabulary
+
+    /// Fetch `/v0/apps.list` once per session and rebuild the parser with the
+    /// index-derived vocabulary unioned onto the static seed. Strictly fail-soft:
+    /// a throw (incl. an older daemon's 404, or the daemon being down) leaves the
+    /// static-vocabulary parser in place so search stays fully usable. The
+    /// hostnames returned are a same-EUID-only browsing-profile artifact (R6) —
+    /// they are consumed here to derive recognition terms and never persisted,
+    /// re-emitted, or logged.
+    private func refreshVocabularyIfNeeded() async {
+        guard !vocabularyLoaded else { return }
+        // Set first (on @MainActor) so a second `search` during the await does
+        // not issue a duplicate fetch.
+        vocabularyLoaded = true
+        do {
+            let vocab = try await service.appsList()
+            let terms = QueryParser.vocabularyTerms(
+                appNames: vocab.appNames, hostnames: vocab.hostnames
+            )
+            guard !terms.isEmpty else { return }
+            parser = QueryParser(
+                calendar: parser.calendar,
+                knownApps: QueryParser.defaultKnownApps + terms
+            )
+        } catch {
+            // Fail-soft: keep the static-vocabulary parser.
+        }
     }
 
     // MARK: - SCR-178 U8 — backfill affordance transitions

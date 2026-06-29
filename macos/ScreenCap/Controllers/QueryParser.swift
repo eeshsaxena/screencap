@@ -26,19 +26,77 @@ struct ParsedQuery: Equatable, Sendable {
 struct QueryParser {
     var calendar: Calendar
 
-    init(calendar: Calendar = .current) {
+    /// Single-word recognized app/site terms (the matched term is emitted as the
+    /// appFilter, so each is chosen to be a SUBSTRING of the real app name /
+    /// bundle id / hostname it stands for).
+    private let recognizedSet: Set<String>
+    /// Multi-word terms ("google chrome"), matched as a phrase before single
+    /// words and longest-first so a longer phrase wins.
+    private let multiWordTerms: [String]
+    /// Friendly alias → canonical term (e.g. "gh" → "github"). Domain forms are
+    /// handled structurally by `domainBrand`, not here.
+    private let aliases: [String: String]
+
+    /// `knownApps` is the recognized vocabulary (single- and multi-word terms);
+    /// the default static seed is the fallback when no index vocabulary is
+    /// injected. SCR-179 U5 unions index-derived terms onto this seed at the
+    /// live call site, keeping the parser pure given its injected vocabulary.
+    init(
+        calendar: Calendar = .current,
+        knownApps: [String] = QueryParser.defaultKnownApps,
+        aliases: [String: String] = QueryParser.defaultAliases
+    ) {
         self.calendar = calendar
+        self.aliases = aliases
+        var single = Set<String>()
+        var multi: [String] = []
+        for term in knownApps {
+            let t = term.lowercased()
+            if t.contains(" ") { multi.append(t) } else { single.insert(t) }
+        }
+        self.recognizedSet = single
+        self.multiWordTerms = multi.sorted { $0.count > $1.count }
     }
 
-    /// Recognized app/site tokens. Deliberately conservative — ambiguous common
-    /// words (docs, mail, word, teams, sheets) are excluded so a query like
-    /// "find the docs about X" doesn't misfire into an app filter. Extensible;
-    /// full breadth is intentionally deferred (an on-device intent model is the
-    /// post-v1 destination).
-    private static let knownApps: [String] = [
+    /// Default recognized terms. Deliberately conservative — ambiguous common
+    /// words (docs, mail, word, teams, sheets — see `excludedTerms`) are NOT
+    /// here, so "find the docs about X" doesn't misfire into an app filter. Each
+    /// term is a brand substring that matches the real app name / bundle /
+    /// hostname downstream.
+    static let defaultKnownApps: [String] = [
+        // SCR-174 seed
         "salesforce", "slack", "zendesk", "gmail", "outlook", "figma", "notion",
         "looker", "jira", "confluence", "hubspot", "stripe", "github", "linear",
         "xcode", "zoom", "tableau", "airtable", "quip", "intercom", "1password",
+        // SCR-179 expansion (unambiguous brand tokens only)
+        "asana", "trello", "clickup", "miro", "loom", "dropbox", "discord",
+        "telegram", "whatsapp", "spotify", "youtube", "reddit", "linkedin",
+        "instagram", "netflix", "twitch", "gitlab", "bitbucket", "vscode",
+        "iterm", "safari", "chrome", "firefox", "postman", "datadog", "sentry",
+        "pagerduty", "okta", "workday", "quickbooks", "shopify", "mailchimp",
+        "calendly", "superhuman", "obsidian", "todoist", "gusto", "ramp",
+        // Multi-word terms
+        "google chrome", "visual studio code", "android studio", "microsoft teams",
+    ]
+
+    /// Friendly aliases → canonical term. Kept small; most site recognition is
+    /// structural (`domainBrand`) rather than enumerated here.
+    static let defaultAliases: [String: String] = [
+        "gh": "github",
+    ]
+
+    /// Ambiguous everyday words that must never become an appFilter, even if an
+    /// injected index vocabulary contains an app literally named this.
+    static let excludedTerms: Set<String> = [
+        "docs", "mail", "word", "teams", "sheets", "notes", "calendar",
+        "messages", "box", "monday", "preview", "find", "search", "meet",
+    ]
+
+    /// Second-level labels of multi-part suffixes (e.g. the "co" in
+    /// "amazon.co.uk") that are not a brand, so `domainBrand` looks one label
+    /// further left. These only ever appear as the second-to-last label.
+    private static let nonBrandLabels: Set<String> = [
+        "co", "com", "org", "net", "gov", "edu", "ac",
     ]
 
     private static let partsOfDay: [(name: String, startHour: Int, endHour: Int)] = [
@@ -49,6 +107,19 @@ struct QueryParser {
         ("sunday", 1), ("monday", 2), ("tuesday", 3), ("wednesday", 4),
         ("thursday", 5), ("friday", 6), ("saturday", 7),
     ]
+
+    /// Month names + common abbreviations → month number. ("may" has no distinct
+    /// abbreviation.) Used for explicit dates ("June 3") and date ranges.
+    private static let months: [String: Int] = [
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+        "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+        "november": 11, "december": 12,
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+        "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+    ]
+
+    /// Words separating the two endpoints of an explicit-date range.
+    private static let rangeSeparators: Set<String> = ["to", "through", "until", "-"]
 
     func parse(_ raw: String, now: Date) -> ParsedQuery {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -97,6 +168,47 @@ struct QueryParser {
                 strip(part.name)
                 return (dayPartWindow(day: now, part: part), working)
             }
+        }
+
+        // Token view of the (still-unmodified) query for the structured
+        // date/relative branches below. Nothing above has stripped on a
+        // non-returning path, so these tokens match `working`.
+        let tokens = working.split(separator: " ").map(String.init)
+
+        // Explicit-date RANGE ("june 1 to june 3") — before single dates, else
+        // the single-date branch would consume one endpoint.
+        if let r = findDateRange(tokens) {
+            strip(r.phrase)
+            return (dateRangeWindow(start: r.start, end: r.end, now: now), working)
+        }
+
+        // Single explicit date ("june 3" / "3 june").
+        if let d = findExplicitDate(tokens) {
+            strip(d.phrase)
+            return (explicitDateWindow(month: d.month, day: d.day, now: now), working)
+        }
+
+        // "<n> days ago" — a single full day N days back.
+        if let a = findDaysAgo(tokens) {
+            strip(a.phrase)
+            let day = calendar.date(byAdding: .day, value: -a.days, to: now)!
+            return (fullDayWindow(day: day), working)
+        }
+
+        // "last <n> weeks" / "last <n> days" — a trailing window of complete
+        // days up to and including today.
+        if let t = findLastN(tokens) {
+            strip(t.phrase)
+            return (trailingDaysWindow(totalDays: t.days, now: now), working)
+        }
+
+        if working.contains(" last month ") {
+            strip("last month")
+            return (monthWindow(now: now, offsetMonths: -1), working)
+        }
+        if working.contains(" this month ") {
+            strip("this month")
+            return (monthWindow(now: now, offsetMonths: 0), working)
         }
 
         if working.contains(" last week ") {
@@ -164,6 +276,143 @@ struct QueryParser {
         return fullDayWindow(day: day)
     }
 
+    private func monthWindow(now: Date, offsetMonths: Int) -> TimeWindow {
+        let comps = calendar.dateComponents([.year, .month], from: now)
+        let startOfThisMonth = calendar.date(from: comps)!
+        let start = calendar.date(byAdding: .month, value: offsetMonths, to: startOfThisMonth)!
+        let end = calendar.date(byAdding: .month, value: 1, to: start)!
+        return TimeWindow(startMs: ms(start), endMs: ms(end))
+    }
+
+    /// The start-of-day for an explicit month/day, resolved to the most recent
+    /// PAST occurrence relative to `now` (so a date that would fall in the future
+    /// this year resolves to last year — history search never points forward).
+    private func resolveExplicitDate(month: Int, day: Int, now: Date) -> Date {
+        let year = calendar.component(.year, from: now)
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = month
+        comps.day = day
+        let date = calendar.date(from: comps)!
+        if calendar.startOfDay(for: date) > now {
+            comps.year = year - 1
+            return calendar.date(from: comps)!
+        }
+        return date
+    }
+
+    private func explicitDateWindow(month: Int, day: Int, now: Date) -> TimeWindow {
+        fullDayWindow(day: resolveExplicitDate(month: month, day: day, now: now))
+    }
+
+    private func dateRangeWindow(
+        start: (month: Int, day: Int), end: (month: Int, day: Int), now: Date
+    ) -> TimeWindow {
+        let startDate = calendar.startOfDay(
+            for: resolveExplicitDate(month: start.month, day: start.day, now: now)
+        )
+        let startYear = calendar.component(.year, from: startDate)
+        var comps = DateComponents()
+        comps.year = startYear
+        comps.month = end.month
+        comps.day = end.day
+        var endDate = calendar.startOfDay(for: calendar.date(from: comps)!)
+        if endDate < startDate {  // wraps a year boundary (e.g. "dec 30 to jan 2")
+            comps.year = startYear + 1
+            endDate = calendar.startOfDay(for: calendar.date(from: comps)!)
+        }
+        let endExclusive = calendar.date(byAdding: .day, value: 1, to: endDate)!
+        return TimeWindow(startMs: ms(startDate), endMs: ms(endExclusive))
+    }
+
+    /// A trailing window of `totalDays` complete days ending with (and including)
+    /// today. "last 2 weeks" → 14 days back through end of today.
+    private func trailingDaysWindow(totalDays: Int, now: Date) -> TimeWindow {
+        let startOfToday = calendar.startOfDay(for: now)
+        let start = calendar.date(byAdding: .day, value: -(totalDays - 1), to: startOfToday)!
+        let endExclusive = calendar.date(byAdding: .day, value: 1, to: startOfToday)!
+        return TimeWindow(startMs: ms(start), endMs: ms(endExclusive))
+    }
+
+    // MARK: - Date/relative token scanners
+
+    private static func monthNumber(_ token: String) -> Int? { months[token] }
+
+    /// A 1–31 day number, tolerating an ordinal suffix ("3rd" → 3).
+    private static func dayNumber(_ token: String) -> Int? {
+        var t = token
+        for suf in ["st", "nd", "rd", "th"] where t.count > 2 && t.hasSuffix(suf) {
+            t = String(t.dropLast(2))
+            break
+        }
+        guard let n = Int(t), (1...31).contains(n) else { return nil }
+        return n
+    }
+
+    private static func positiveInt(_ token: String) -> Int? {
+        guard let n = Int(token), n > 0 else { return nil }
+        return n
+    }
+
+    private func findExplicitDate(_ tokens: [String]) -> (month: Int, day: Int, phrase: String)? {
+        for (i, tok) in tokens.enumerated() {
+            guard let m = Self.monthNumber(tok) else { continue }
+            if i + 1 < tokens.count, let d = Self.dayNumber(tokens[i + 1]) {
+                return (m, d, "\(tok) \(tokens[i + 1])")
+            }
+            if i >= 1, let d = Self.dayNumber(tokens[i - 1]) {
+                return (m, d, "\(tokens[i - 1]) \(tok)")
+            }
+        }
+        return nil
+    }
+
+    private func findDateRange(
+        _ tokens: [String]
+    ) -> (start: (month: Int, day: Int), end: (month: Int, day: Int), phrase: String)? {
+        for (i, tok) in tokens.enumerated() {
+            guard let m1 = Self.monthNumber(tok),
+                  i + 1 < tokens.count, let d1 = Self.dayNumber(tokens[i + 1]) else { continue }
+            let sep = i + 2
+            guard sep < tokens.count, Self.rangeSeparators.contains(tokens[sep]) else { continue }
+            let after = sep + 1
+            // "<m> <d> to <m> <d>"
+            if after + 1 < tokens.count,
+               let m2 = Self.monthNumber(tokens[after]),
+               let d2 = Self.dayNumber(tokens[after + 1]) {
+                return ((m1, d1), (m2, d2), tokens[i...(after + 1)].joined(separator: " "))
+            }
+            // "<m> <d> to <d>" (same month)
+            if after < tokens.count, let d2 = Self.dayNumber(tokens[after]) {
+                return ((m1, d1), (m1, d2), tokens[i...after].joined(separator: " "))
+            }
+        }
+        return nil
+    }
+
+    private func findDaysAgo(_ tokens: [String]) -> (days: Int, phrase: String)? {
+        for (i, tok) in tokens.enumerated() where tok == "ago" {
+            guard i >= 2, tokens[i - 1] == "day" || tokens[i - 1] == "days",
+                  let n = Self.positiveInt(tokens[i - 2]) else { continue }
+            return (n, "\(tokens[i - 2]) \(tokens[i - 1]) ago")
+        }
+        return nil
+    }
+
+    private func findLastN(_ tokens: [String]) -> (days: Int, phrase: String)? {
+        for (i, tok) in tokens.enumerated() where tok == "last" {
+            guard i + 2 < tokens.count, let n = Self.positiveInt(tokens[i + 1]) else { continue }
+            let unit = tokens[i + 2]
+            if unit == "weeks" || unit == "week" {
+                return (n * 7, "last \(tokens[i + 1]) \(unit)")
+            }
+            if unit == "days" || unit == "day" {
+                return (n, "last \(tokens[i + 1]) \(unit)")
+            }
+        }
+        return nil
+    }
+
     private func ms(_ date: Date) -> Int {
         Int((date.timeIntervalSince1970 * 1000).rounded())
     }
@@ -172,10 +421,72 @@ struct QueryParser {
 
     private func extractApp(from s: String) -> (String?, String) {
         var working = s
-        for app in Self.knownApps where working.contains(" \(app) ") {
-            working = working.replacingOccurrences(of: " \(app) ", with: " ")
-            return (app, working)
+        // Multi-word phrases first (longest-first), so "google chrome" wins over
+        // a bare "chrome".
+        for term in multiWordTerms where working.contains(" \(term) ") {
+            working = working.replacingOccurrences(of: " \(term) ", with: " ")
+            return (term, working)
+        }
+        // Single tokens: an exact recognized term, a friendly alias, or a domain
+        // whose brand label we can extract. Ambiguous everyday words are skipped.
+        for tok in working.split(separator: " ").map(String.init) {
+            if Self.excludedTerms.contains(tok) { continue }
+            guard let canon = canonicalApp(for: tok) else { continue }
+            working = working.replacingOccurrences(of: " \(tok) ", with: " ")
+            return (canon, working)
         }
         return (nil, working)
+    }
+
+    /// Map a single query token to a canonical appFilter term, or nil. Order:
+    /// exact recognized term → friendly alias → domain brand label. A typed
+    /// domain ("github.com") is accepted only when its brand is in the
+    /// recognized vocabulary — so an everyday "main.py" / "config.yaml" never
+    /// misfires into an app filter.
+    private func canonicalApp(for token: String) -> String? {
+        if recognizedSet.contains(token) { return token }
+        if let alias = aliases[token] { return alias }
+        if let brand = Self.domainBrand(token),
+           recognizedSet.contains(brand), !Self.excludedTerms.contains(brand) {
+            return brand
+        }
+        return nil
+    }
+
+    /// Extract the brand label from a hostname-shaped token, or nil if it
+    /// doesn't look like a domain. "github.com"→"github",
+    /// "mail.google.com"→"google", "linear.app"→"linear", "github.com/x"→"github",
+    /// "amazon.co.uk"→"amazon". (Exact eTLD+1 needs a public-suffix list — this
+    /// is the lightweight heuristic; see the plan's deferred note.)
+    static func domainBrand(_ token: String) -> String? {
+        var t = token
+        if let slash = t.firstIndex(of: "/") { t = String(t[..<slash]) }
+        let labels = t.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return nil }
+        var idx = labels.count - 2
+        if nonBrandLabels.contains(labels[idx]), idx - 1 >= 0 { idx -= 1 }
+        let brand = labels[idx]
+        guard brand.count >= 2, brand.allSatisfy({ $0.isLetter || $0.isNumber }) else {
+            return nil
+        }
+        return brand
+    }
+
+    /// Normalize raw `/v0/apps.list` values (app display names + visited
+    /// hostnames) into canonical recognized terms to union onto the seed
+    /// vocabulary (SCR-179 U5). App names contribute their lowercased whole form
+    /// (so a multi-word app name matches downstream); hostnames contribute their
+    /// brand label. Ambiguous everyday words are dropped so the index can't
+    /// reintroduce a "mail"/"docs" misfire.
+    static func vocabularyTerms(appNames: [String], hostnames: [String]) -> [String] {
+        var terms = Set<String>()
+        for name in appNames {
+            let lower = name.trimmingCharacters(in: .whitespaces).lowercased()
+            if lower.count >= 2 { terms.insert(lower) }
+        }
+        for host in hostnames {
+            if let brand = domainBrand(host) { terms.insert(brand) }
+        }
+        return terms.filter { !excludedTerms.contains($0) }.sorted()
     }
 }

@@ -681,6 +681,16 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/timeline.query", body: body)
     }
 
+    /// Query-parser vocabulary (SCR-179). Read-only GET, no parameters. Returns
+    /// distinct app names / bundle ids + bare `browser_url` hostnames — never a
+    /// full URL. A same-EUID-only browsing-profile artifact (R6): the caller must
+    /// not persist, sync, or log it. On `socketUnavailable`/`connectionFailed`
+    /// (older daemon without the route → 404) the caller falls back to the static
+    /// parser vocabulary.
+    static func appsList() async throws -> AppsListResponse {
+        try await request(method: "GET", path: "/v0/apps.list")
+    }
+
     // MARK: - SCR-178 content-index backfill verbs
 
     /// Start (or resume) the content-index backfill (SCR-178). Idempotent on the

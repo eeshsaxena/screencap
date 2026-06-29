@@ -795,6 +795,133 @@ async def test_timeline_query_app_filter_and_omits_url(
 
 
 @pytest.mark.asyncio
+async def test_timeline_query_matches_browser_url_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SCR-179: a site token matches a browser row via the browser_url hostname,
+    even though the app is just "Safari". The URL never enters the row."""
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "title": "Issues", "url": "https://github.com/org/repo/issues"},
+            {"offset": 20, "app_name": "Code", "bundle": "com.microsoft.VSCode",
+             "title": "main.py"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "github"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]
+    # Structural invariant: exactly these keys — never browser_url.
+    assert all(
+        set(r) == {"recording", "timestamp_ms", "app", "title"} for r in payload["rows"]
+    )
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_timeline_query_domain_match_never_leaks_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4: matching on browser_url must not leak the URL. The path/query (where
+    OAuth codes live) appears nowhere, and the row key set is exact."""
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "title": "Login",
+             "url": "https://app.example.com/oauth?code=SECRET_TOKEN&state=XYZ"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "example"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]  # matched via host
+    assert set(payload["rows"][0]) == {"recording", "timestamp_ms", "app", "title"}
+    assert "SECRET_TOKEN" not in response.text
+    assert "code=" not in response.text
+    assert "/oauth" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_domain_match_applies_limit_after_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The matching browser row sorts AFTER many non-matching rows — it must
+    still be returned, proving `limit` is applied after the hostname filter (the
+    naive 'filter in Python after the SQL LIMIT' would drop it)."""
+    recordings_dir = tmp_path / "recordings"
+    windows = [
+        {"offset": float(i), "app_name": "Code", "bundle": "com.microsoft.VSCode"}
+        for i in range(1, 6)
+    ]
+    windows.append(
+        {"offset": 100.0, "app_name": "Safari", "bundle": "com.apple.Safari",
+         "title": "Issues", "url": "https://github.com/x"}
+    )
+    _make_recording_with_windows(recordings_dir, "demo", windows)
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "github", "limit": 2})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_unmatched_token_excludes_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "url": "https://github.com/x"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "nonesuch"})
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == []
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_domain_match_tolerates_malformed_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Notes", "bundle": "com.apple.Notes",
+             "url": "not a url"},
+            {"offset": 20, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "url": "https://github.com/x"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    # The malformed-URL row yields no host (non-match, no crash); the valid one matches.
+    response = await _asgi_post("/v0/timeline.query", {"app": "github"})
+
+    assert response.status_code == 200
+    assert [r["app"] for r in response.json()["rows"]] == ["Safari"]
+
+
+@pytest.mark.asyncio
 async def test_timeline_query_spans_recordings_in_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -926,6 +1053,141 @@ async def test_timeline_query_rejects_traversal(
 # ---------------------------------------------------------------------------
 # SCR-118 query verbs are excluded from idle-shutdown activity (U5)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SCR-179 apps.list — query-parser vocabulary (U1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apps_list_enumerates_apps_bundles_and_hostnames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "rec-a",
+        [
+            {"offset": 10, "app_name": "Slack", "bundle": "com.tinyspeck.slackmacgap"},
+            {"offset": 20, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "url": "https://github.com/issues/1"},
+        ],
+    )
+    _make_recording_with_windows(
+        recordings_dir, "rec-b",
+        # Duplicate Slack (dedup across recordings) + a second site.
+        [
+            {"offset": 5, "app_name": "Slack", "bundle": "com.tinyspeck.slackmacgap"},
+            {"offset": 15, "app_name": "Chrome", "bundle": "com.google.Chrome",
+             "url": "https://mail.google.com/mail/u/0"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_get("/v0/apps.list")
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._APPS_LIST_API_VERSION)
+    assert set(payload["app_names"]) == {"Slack", "Safari", "Chrome"}  # deduped
+    assert "com.tinyspeck.slackmacgap" in payload["app_bundles"]
+    assert set(payload["hostnames"]) == {"github.com", "mail.google.com"}
+    assert payload["truncated"] is False
+    # Envelope validates against the additive model.
+    schema.AppsListResponse(**payload)
+
+
+@pytest.mark.asyncio
+async def test_apps_list_empty_when_no_recordings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+    response = await _asgi_get("/v0/apps.list")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["app_names"] == []
+    assert payload["app_bundles"] == []
+    assert payload["hostnames"] == []
+    assert payload["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_apps_list_tolerates_null_and_malformed_browser_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Code", "bundle": "com.microsoft.VSCode"},  # no url
+            {"offset": 20, "app_name": "Notes", "bundle": "com.apple.Notes",
+             "url": "not a url at all"},  # no extractable host
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_get("/v0/apps.list")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload["app_names"]) == {"Code", "Notes"}
+    # No host could be extracted — but no crash, and no garbage hostname.
+    assert payload["hostnames"] == []
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_apps_list_returns_bare_hostnames_never_full_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R6: a token-bearing URL contributes only its bare host. The path/query
+    (where OAuth codes / session tokens live) must appear nowhere."""
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "url": "https://app.example.com/oauth?code=SECRET_TOKEN&state=XYZ"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_get("/v0/apps.list")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["hostnames"] == ["app.example.com"]
+    # Structural guard: each hostname is a bare host — no path/query delimiters.
+    for host in payload["hostnames"]:
+        assert "/" not in host and "?" not in host and "=" not in host
+    # The secret / full URL appears nowhere in the serialized body.
+    assert "SECRET_TOKEN" not in response.text
+    assert "code=" not in response.text
+    assert "/oauth" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_apps_list_does_not_bump_idle_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """apps.list is read-only — NOT in _ACTIVITY_PATHS, so a vocabulary refresh
+    must not reset the idle-shutdown clock."""
+    from screencap.daemon import _idle_shutdown
+    from screencap.daemon.app import build_app
+
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+
+    app = build_app()
+    _idle_shutdown.attach(app, idle_seconds=600.0)
+    sentinel = 12345.0
+    app.state.idle_last_activity = sentinel
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/v0/apps.list")
+    assert resp.status_code == 200
+    assert app.state.idle_last_activity == sentinel
 
 
 @pytest.mark.asyncio

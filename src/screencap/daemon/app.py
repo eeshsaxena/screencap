@@ -770,6 +770,12 @@ async def content_search(request: Request) -> JSONResponse:
 _QUERY_MAX_RECORDINGS = 200
 _QUERY_DEFAULT_LIMIT = 50
 _QUERY_MAX_LIMIT = 200
+# SCR-179 apps.list distinct-value cap per kind (bounds the vocabulary so a huge
+# library can't drive an unbounded distinct scan; truncation is surfaced, not
+# silent). Also the internal per-recording scan cap U2 uses when the user limit
+# must be applied AFTER the Python-side hostname filter.
+_QUERY_MAX_DISTINCT = 500
+_TIMELINE_SCAN_CAP = 5000
 
 
 def _clamp_limit(limit: int | None) -> int:
@@ -857,15 +863,23 @@ def _run_timeline_query(
     """Structured app/window/time rows from window_event across recordings.
 
     Authoritative (event tables, no OCR/redaction loss). Schema-tolerant via
-    has_table/has_column; never touches OCR or the content index. ``browser_url``
-    is intentionally not selected (v1 omits it — see TimelineRow).
+    has_table/has_column; never touches OCR or the content index.
+
+    The ``app`` filter matches a token against the app name, the bundle id, OR
+    the hostname derived from ``browser_url`` (so a site like "github" matches
+    browser usage whose app is just "Safari"/"Chrome"). ``browser_url`` is read
+    internally ONLY as a filter predicate — it is never selected into a result
+    row, and only its hostname (never the path/query, where OAuth codes / session
+    tokens live) is ever inspected (see ``_safe_hostname``). The response row
+    shape stays exactly ``{recording, timestamp_ms, app, title}`` (TimelineRow).
     """
     from screencap.content_index import escape_like
     from screencap.recording_db import has_column, has_table, open_recording_db
 
     start_s = start_ms / 1000.0 if start_ms is not None else None
     end_s = end_ms / 1000.0 if end_ms is not None else None
-    app_like = f"%{escape_like(app.lower())}%" if app else None
+    app_token = app.lower() if app else None
+    app_like = f"%{escape_like(app_token)}%" if app_token else None
 
     rows: list[dict[str, Any]] = []
     for rec_dir in _iter_recording_dirs(recording):
@@ -881,43 +895,85 @@ def _run_timeline_query(
                 has_name = has_column(conn, "window_event", "app_name")
                 has_bundle = has_column(conn, "window_event", "app_bundle_id")
                 has_title = has_column(conn, "window_event", "title")
-                if app_like and not (has_name or has_bundle):
+                has_url = has_column(conn, "window_event", "browser_url")
+                # A token can match via app name, bundle id, or browser_url
+                # hostname. If none of those columns exist, this recording can
+                # never match — skip it.
+                if app_token and not (has_name or has_bundle or has_url):
                     continue
 
                 name_expr = "app_name" if has_name else "NULL"
                 bundle_expr = "app_bundle_id" if has_bundle else "NULL"
                 title_expr = "title" if has_title else "NULL"
-                sql = (
-                    f"SELECT timestamp, {name_expr}, {bundle_expr}, {title_expr} "
-                    "FROM window_event WHERE timestamp IS NOT NULL"
-                )
+
                 params: list[Any] = []
+                time_clause = ""
                 if start_s is not None:
-                    sql += " AND timestamp >= ?"
+                    time_clause += " AND timestamp >= ?"
                     params.append(start_s)
                 if end_s is not None:
-                    sql += " AND timestamp < ?"
+                    time_clause += " AND timestamp < ?"
                     params.append(end_s)
-                if app_like:
-                    clauses = []
-                    if has_name:
-                        clauses.append("lower(app_name) LIKE ? ESCAPE '\\'")
-                        params.append(app_like)
-                    if has_bundle:
-                        clauses.append("lower(app_bundle_id) LIKE ? ESCAPE '\\'")
-                        params.append(app_like)
-                    sql += " AND (" + " OR ".join(clauses) + ")"
-                sql += " ORDER BY timestamp LIMIT ?"
-                params.append(limit)
-                for ts, app_name, bundle, title in conn.execute(sql, params):
-                    rows.append({
-                        "recording": rec_dir.name,
-                        "timestamp_ms": int(float(ts) * 1000),
-                        "app": app_name or bundle,
-                        "title": title,
-                    })
+
+                if app_token and has_url:
+                    # Hostname matching can't be expressed in SQL (urlparse is
+                    # Python-only) and must never run against the full URL. So we
+                    # DROP the in-SQL app filter — otherwise a browser row whose
+                    # app_name is "Safari" is dropped before its hostname is ever
+                    # examined — scan a bounded set of time-ordered candidates
+                    # (browser_url included for INTERNAL use only), filter
+                    # app/bundle/host in Python, and apply `limit` AFTER that
+                    # filter. The internal scan cap re-establishes the DoS bound
+                    # the in-SQL LIMIT otherwise provided.
+                    sql = (
+                        f"SELECT timestamp, {name_expr}, {bundle_expr}, "
+                        f"{title_expr}, browser_url FROM window_event "
+                        "WHERE timestamp IS NOT NULL" + time_clause
+                        + " ORDER BY timestamp LIMIT ?"
+                    )
+                    params.append(_TIMELINE_SCAN_CAP)
+                    matched = 0
+                    for ts, app_name, bundle, title, url in conn.execute(sql, params):
+                        host = _safe_hostname(url) if url is not None else None
+                        if not _timeline_row_matches(app_token, app_name, bundle, host):
+                            continue
+                        rows.append({
+                            "recording": rec_dir.name,
+                            "timestamp_ms": int(float(ts) * 1000),
+                            "app": app_name or bundle,
+                            "title": title,
+                        })
+                        matched += 1
+                        if matched >= limit:
+                            break
+                else:
+                    # No token, or no browser_url column: the cheaper in-SQL
+                    # LIKE + LIMIT path (browser_url is never selected here).
+                    sql = (
+                        f"SELECT timestamp, {name_expr}, {bundle_expr}, {title_expr} "
+                        "FROM window_event WHERE timestamp IS NOT NULL" + time_clause
+                    )
+                    if app_like:
+                        clauses = []
+                        if has_name:
+                            clauses.append("lower(app_name) LIKE ? ESCAPE '\\'")
+                            params.append(app_like)
+                        if has_bundle:
+                            clauses.append("lower(app_bundle_id) LIKE ? ESCAPE '\\'")
+                            params.append(app_like)
+                        sql += " AND (" + " OR ".join(clauses) + ")"
+                    sql += " ORDER BY timestamp LIMIT ?"
+                    params.append(limit)
+                    for ts, app_name, bundle, title in conn.execute(sql, params):
+                        rows.append({
+                            "recording": rec_dir.name,
+                            "timestamp_ms": int(float(ts) * 1000),
+                            "app": app_name or bundle,
+                            "title": title,
+                        })
         except Exception:
             # A single unreadable/older recording must not fail the whole query.
+            # rec_dir.name only — never the raw browser_url (R6 log-hygiene).
             logger.debug("timeline.query skipped %s", rec_dir.name, exc_info=True)
             continue
 
@@ -925,6 +981,141 @@ def _run_timeline_query(
     # already returned ≤limit rows; take the globally-earliest `limit` without
     # a full sort of the gathered set).
     return heapq.nsmallest(limit, rows, key=lambda r: r["timestamp_ms"])
+
+
+def _safe_hostname(raw: object) -> str | None:
+    """Extract a bare lowercase hostname from a ``browser_url`` value.
+
+    The raw URL is consumed entirely inside this tight scope and never returned
+    or re-raised: any parse failure becomes ``None`` here, so the secret-bearing
+    full URL (its path/query carry OAuth codes / session tokens) can never escape
+    into a caller frame local that a logged traceback (``exc_info=True``) would
+    capture. Only the host — never the path/query — leaves this function.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(str(raw)).hostname
+    except Exception:
+        return None
+    return host.lower() if host else None
+
+
+def _timeline_row_matches(
+    token: str, app_name: object, bundle: object, host: str | None,
+) -> bool:
+    """Python-side OR-match for the timeline ``app`` filter: ``token`` (already
+    lowercased) is a case-insensitive substring of the app name, the bundle id,
+    or the browser_url hostname. ``host`` is pre-lowercased by
+    :func:`_safe_hostname`; the raw URL is never passed here."""
+    for value in (app_name, bundle):
+        if value and token in str(value).lower():
+            return True
+    return bool(host and token in host)
+
+
+def _run_apps_list() -> dict[str, Any]:
+    """Distinct app names / bundle ids / visited hostnames across recordings.
+
+    SCR-179 vocabulary source (R3). Read-only over each local ``recording.db``;
+    schema-tolerant via ``has_table``/``has_column``. Hostnames are derived from
+    ``browser_url`` through :func:`_safe_hostname` so no full URL is ever read
+    into a frame that could be logged (R6 log-hygiene). Per-kind distinct cap;
+    ``truncated`` flags a partial vocabulary instead of silently capping.
+    """
+    from screencap.recording_db import has_column, has_table, open_recording_db
+
+    app_names: set[str] = set()
+    app_bundles: set[str] = set()
+    hostnames: set[str] = set()
+
+    for rec_dir in _iter_recording_dirs(None):
+        db_path = rec_dir / "recording.db"
+        if not db_path.is_file():
+            continue
+        try:
+            with open_recording_db(db_path, read_only=True) as conn:
+                if not has_table(conn, "window_event"):
+                    continue
+                if has_column(conn, "window_event", "app_name"):
+                    for (val,) in conn.execute(
+                        "SELECT DISTINCT app_name FROM window_event "
+                        "WHERE app_name IS NOT NULL AND app_name != '' LIMIT ?",
+                        (_QUERY_MAX_DISTINCT,),
+                    ):
+                        app_names.add(str(val))
+                if has_column(conn, "window_event", "app_bundle_id"):
+                    for (val,) in conn.execute(
+                        "SELECT DISTINCT app_bundle_id FROM window_event "
+                        "WHERE app_bundle_id IS NOT NULL AND app_bundle_id != '' LIMIT ?",
+                        (_QUERY_MAX_DISTINCT,),
+                    ):
+                        app_bundles.add(str(val))
+                if has_column(conn, "window_event", "browser_url"):
+                    for (val,) in conn.execute(
+                        "SELECT DISTINCT browser_url FROM window_event "
+                        "WHERE browser_url IS NOT NULL AND browser_url != '' LIMIT ?",
+                        (_QUERY_MAX_DISTINCT,),
+                    ):
+                        host = _safe_hostname(val)
+                        if host:
+                            hostnames.add(host)
+        except Exception:
+            # One unreadable/older recording must not fail the whole query.
+            # rec_dir.name only — never the raw browser_url (R6 log-hygiene).
+            logger.debug("apps.list skipped %s", rec_dir.name, exc_info=True)
+            continue
+
+    truncated = (
+        len(app_names) > _QUERY_MAX_DISTINCT
+        or len(app_bundles) > _QUERY_MAX_DISTINCT
+        or len(hostnames) > _QUERY_MAX_DISTINCT
+    )
+
+    def _cap(values: set[str]) -> list[str]:
+        return sorted(values)[:_QUERY_MAX_DISTINCT]
+
+    return {
+        "app_names": _cap(app_names),
+        "app_bundles": _cap(app_bundles),
+        "hostnames": _cap(hostnames),
+        "truncated": truncated,
+    }
+
+
+async def apps_list(request: Request) -> JSONResponse:
+    """``GET /v0/apps.list`` — vocabulary for the in-app query parser (SCR-179).
+
+    Returns distinct ``app_name`` / ``app_bundle_id`` values and **bare
+    hostnames** from ``browser_url`` — never a full URL (the path/query, where
+    OAuth codes / session tokens live, never leaves the daemon). The hostname
+    list is a same-EUID-only *browsing-profile* artifact derived from the
+    local-only ``recording.db`` (R6).
+
+    Read-only. Like the other query verbs it is deliberately NOT in
+    ``_ACTIVITY_PATHS`` (status/vocabulary polling must not pin an auto-spawned
+    daemon) and is NOT audit-logged (it leaks no capability beyond what the
+    same-EUID caller can read from disk directly).
+    """
+    try:
+        result = await asyncio.to_thread(_run_apps_list)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._APPS_LIST_API_VERSION,
+                app_names=result["app_names"],
+                app_bundles=result["app_bundles"],
+                hostnames=result["hostnames"],
+                truncated=result["truncated"],
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._APPS_LIST_API_VERSION,
+            request=request,
+        )
 
 
 async def transcript_search(request: Request) -> JSONResponse:
@@ -1140,6 +1331,7 @@ def build_app() -> Starlette:
             Route("/v0/content.search", content_search, methods=["POST"]),
             Route("/v0/transcript.search", transcript_search, methods=["POST"]),
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
+            Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
             Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),

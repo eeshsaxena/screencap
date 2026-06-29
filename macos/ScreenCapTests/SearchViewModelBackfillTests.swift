@@ -95,6 +95,9 @@ final class SearchViewModelBackfillTests: XCTestCase {
         func timelineQuery(_ req: TimelineQueryRequest) async throws -> TimelineQueryResponse {
             TimelineQueryResponse(rows: [], coverage: .authoritative)
         }
+        func appsList() async throws -> AppsListResponse {
+            AppsListResponse(appNames: [], hostnames: [])
+        }
     }
 
     /// Poll until `predicate` holds (or time out) — the run task and stream

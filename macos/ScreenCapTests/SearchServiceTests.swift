@@ -133,6 +133,21 @@ final class SearchServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - apps.list (SCR-179)
+
+    func testAppsListFramesGETAndDecodesVocabulary() async throws {
+        _ = try startServer { request in
+            XCTAssertEqual(request.path, "/v0/apps.list")
+            XCTAssertEqual(request.method, "GET")
+            return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"app_names":["Slack","Safari"],"app_bundles":["com.tinyspeck.slackmacgap"],"hostnames":["github.com"],"truncated":false}"#)
+        }
+        let resp = try await DaemonClient.appsList()
+        XCTAssertEqual(resp.appNames, ["Slack", "Safari"])
+        XCTAssertEqual(resp.appBundles, ["com.tinyspeck.slackmacgap"])
+        XCTAssertEqual(resp.hostnames, ["github.com"])
+        XCTAssertFalse(resp.truncated)
+    }
+
     // MARK: - transport
 
     func testSearchSurfacesSocketUnavailableWhenDaemonDown() async {
