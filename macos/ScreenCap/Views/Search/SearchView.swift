@@ -58,6 +58,11 @@ struct SearchView: View {
     // for running a search, gated by focus).
     @State private var selectedResultID: SearchResultItem.ID?
 
+    // SCR-181 U3 — the day the pinned timeline shows; nil defaults to the
+    // most-recent day with a hit. Reset on a new result set so a stale day from a
+    // prior search can't show an empty axis (mirrors the selectedResultID reset).
+    @State private var selectedDay: Date?
+
     var body: some View {
         searchDetailLayout {
             searchField
@@ -69,6 +74,7 @@ struct SearchView: View {
                 isSearching: model.isSearching,
                 recentSearches: recentStore.recent,
                 selection: $selectedResultID,
+                selectedDay: $selectedDay,
                 frameIndex: frameIndex,
                 thumbnailLoader: thumbnailLoader,
                 isSearchFieldFocused: searchFieldFocused,
@@ -95,7 +101,12 @@ struct SearchView: View {
         .onChange(of: model.phase) { phase in
             // SCR-182 U2 — a new result set may not contain the previously
             // selected row; reset so Return-to-open never acts on a stale id.
-            if case .loaded = phase { selectedResultID = nil }
+            // SCR-181 U3 — also reset the timeline's day so it re-defaults to the
+            // most-recent day of the new result set, not a stale prior day.
+            if case .loaded = phase {
+                selectedResultID = nil
+                selectedDay = nil
+            }
             if let message = SearchAccessibility.searchOutcomeAnnouncement(for: phase) {
                 announceToVoiceOver(message)
             }

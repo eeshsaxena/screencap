@@ -25,6 +25,9 @@ struct SearchResultsView: View {
     /// state (after the curated examples). Empty hides the "Recent" group.
     let recentSearches: [String]
     @Binding var selection: SearchResultItem.ID?
+    /// SCR-181 U3 — the day whose axis the pinned timeline shows. Owned by
+    /// `SearchView` so it resets on a new search; nil → most-recent day with a hit.
+    @Binding var selectedDay: Date?
     var frameIndex: RecordingFrameIndex?
     var thumbnailLoader: ThumbnailLoader?
     /// A snapshot of the search field's focus (the live `@FocusState` lives in
@@ -131,8 +134,31 @@ struct SearchResultsView: View {
             }
         }
         .listStyle(.inset)
+        // SCR-181 U3 — the scrubbable per-day timeline pins ABOVE the List via
+        // `.safeAreaInset` (the same proven-safe mechanism `searchDetailLayout`
+        // uses for the search field). A VStack sibling here would reintroduce the
+        // SCR-174 detail height-starvation; the inset insets the List instead of
+        // competing with it for height. Shown only when there are anchored hits to
+        // place (the section-list below remains the companion/fallback, unchanged).
+        .safeAreaInset(edge: .top, spacing: 0) { timelineInset(days) }
         // U4 — invisible Return handler for the keyboard-selected result.
         .background(returnKeyHandler(results))
+    }
+
+    @ViewBuilder
+    private func timelineInset(_ days: [(day: Date, items: [SearchResultItem])]) -> some View {
+        if !days.isEmpty {
+            VStack(spacing: 0) {
+                SearchDayTimeline(
+                    days: days,
+                    selectedDay: $selectedDay,
+                    selection: $selection,
+                    onOpen: onOpen
+                )
+                Divider()
+            }
+            .background(.bar)
+        }
     }
 
     /// SCR-183 U4 — one result row. Plain selectable row (NOT a `Button`): a
