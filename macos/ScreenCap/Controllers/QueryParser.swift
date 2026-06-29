@@ -26,19 +26,77 @@ struct ParsedQuery: Equatable, Sendable {
 struct QueryParser {
     var calendar: Calendar
 
-    init(calendar: Calendar = .current) {
+    /// Single-word recognized app/site terms (the matched term is emitted as the
+    /// appFilter, so each is chosen to be a SUBSTRING of the real app name /
+    /// bundle id / hostname it stands for).
+    private let recognizedSet: Set<String>
+    /// Multi-word terms ("google chrome"), matched as a phrase before single
+    /// words and longest-first so a longer phrase wins.
+    private let multiWordTerms: [String]
+    /// Friendly alias → canonical term (e.g. "gh" → "github"). Domain forms are
+    /// handled structurally by `domainBrand`, not here.
+    private let aliases: [String: String]
+
+    /// `knownApps` is the recognized vocabulary (single- and multi-word terms);
+    /// the default static seed is the fallback when no index vocabulary is
+    /// injected. SCR-179 U5 unions index-derived terms onto this seed at the
+    /// live call site, keeping the parser pure given its injected vocabulary.
+    init(
+        calendar: Calendar = .current,
+        knownApps: [String] = QueryParser.defaultKnownApps,
+        aliases: [String: String] = QueryParser.defaultAliases
+    ) {
         self.calendar = calendar
+        self.aliases = aliases
+        var single = Set<String>()
+        var multi: [String] = []
+        for term in knownApps {
+            let t = term.lowercased()
+            if t.contains(" ") { multi.append(t) } else { single.insert(t) }
+        }
+        self.recognizedSet = single
+        self.multiWordTerms = multi.sorted { $0.count > $1.count }
     }
 
-    /// Recognized app/site tokens. Deliberately conservative — ambiguous common
-    /// words (docs, mail, word, teams, sheets) are excluded so a query like
-    /// "find the docs about X" doesn't misfire into an app filter. Extensible;
-    /// full breadth is intentionally deferred (an on-device intent model is the
-    /// post-v1 destination).
-    private static let knownApps: [String] = [
+    /// Default recognized terms. Deliberately conservative — ambiguous common
+    /// words (docs, mail, word, teams, sheets — see `excludedTerms`) are NOT
+    /// here, so "find the docs about X" doesn't misfire into an app filter. Each
+    /// term is a brand substring that matches the real app name / bundle /
+    /// hostname downstream.
+    static let defaultKnownApps: [String] = [
+        // SCR-174 seed
         "salesforce", "slack", "zendesk", "gmail", "outlook", "figma", "notion",
         "looker", "jira", "confluence", "hubspot", "stripe", "github", "linear",
         "xcode", "zoom", "tableau", "airtable", "quip", "intercom", "1password",
+        // SCR-179 expansion (unambiguous brand tokens only)
+        "asana", "trello", "clickup", "miro", "loom", "dropbox", "discord",
+        "telegram", "whatsapp", "spotify", "youtube", "reddit", "linkedin",
+        "instagram", "netflix", "twitch", "gitlab", "bitbucket", "vscode",
+        "iterm", "safari", "chrome", "firefox", "postman", "datadog", "sentry",
+        "pagerduty", "okta", "workday", "quickbooks", "shopify", "mailchimp",
+        "calendly", "superhuman", "obsidian", "todoist", "gusto", "ramp",
+        // Multi-word terms
+        "google chrome", "visual studio code", "android studio", "microsoft teams",
+    ]
+
+    /// Friendly aliases → canonical term. Kept small; most site recognition is
+    /// structural (`domainBrand`) rather than enumerated here.
+    static let defaultAliases: [String: String] = [
+        "gh": "github",
+    ]
+
+    /// Ambiguous everyday words that must never become an appFilter, even if an
+    /// injected index vocabulary contains an app literally named this.
+    static let excludedTerms: Set<String> = [
+        "docs", "mail", "word", "teams", "sheets", "notes", "calendar",
+        "messages", "box", "monday", "preview", "find", "search", "meet",
+    ]
+
+    /// Second-level labels of multi-part suffixes (e.g. the "co" in
+    /// "amazon.co.uk") that are not a brand, so `domainBrand` looks one label
+    /// further left. These only ever appear as the second-to-last label.
+    private static let nonBrandLabels: Set<String> = [
+        "co", "com", "org", "net", "gov", "edu", "ac",
     ]
 
     private static let partsOfDay: [(name: String, startHour: Int, endHour: Int)] = [
@@ -363,10 +421,72 @@ struct QueryParser {
 
     private func extractApp(from s: String) -> (String?, String) {
         var working = s
-        for app in Self.knownApps where working.contains(" \(app) ") {
-            working = working.replacingOccurrences(of: " \(app) ", with: " ")
-            return (app, working)
+        // Multi-word phrases first (longest-first), so "google chrome" wins over
+        // a bare "chrome".
+        for term in multiWordTerms where working.contains(" \(term) ") {
+            working = working.replacingOccurrences(of: " \(term) ", with: " ")
+            return (term, working)
+        }
+        // Single tokens: an exact recognized term, a friendly alias, or a domain
+        // whose brand label we can extract. Ambiguous everyday words are skipped.
+        for tok in working.split(separator: " ").map(String.init) {
+            if Self.excludedTerms.contains(tok) { continue }
+            guard let canon = canonicalApp(for: tok) else { continue }
+            working = working.replacingOccurrences(of: " \(tok) ", with: " ")
+            return (canon, working)
         }
         return (nil, working)
+    }
+
+    /// Map a single query token to a canonical appFilter term, or nil. Order:
+    /// exact recognized term → friendly alias → domain brand label. A typed
+    /// domain ("github.com") is accepted only when its brand is in the
+    /// recognized vocabulary — so an everyday "main.py" / "config.yaml" never
+    /// misfires into an app filter.
+    private func canonicalApp(for token: String) -> String? {
+        if recognizedSet.contains(token) { return token }
+        if let alias = aliases[token] { return alias }
+        if let brand = Self.domainBrand(token),
+           recognizedSet.contains(brand), !Self.excludedTerms.contains(brand) {
+            return brand
+        }
+        return nil
+    }
+
+    /// Extract the brand label from a hostname-shaped token, or nil if it
+    /// doesn't look like a domain. "github.com"→"github",
+    /// "mail.google.com"→"google", "linear.app"→"linear", "github.com/x"→"github",
+    /// "amazon.co.uk"→"amazon". (Exact eTLD+1 needs a public-suffix list — this
+    /// is the lightweight heuristic; see the plan's deferred note.)
+    static func domainBrand(_ token: String) -> String? {
+        var t = token
+        if let slash = t.firstIndex(of: "/") { t = String(t[..<slash]) }
+        let labels = t.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return nil }
+        var idx = labels.count - 2
+        if nonBrandLabels.contains(labels[idx]), idx - 1 >= 0 { idx -= 1 }
+        let brand = labels[idx]
+        guard brand.count >= 2, brand.allSatisfy({ $0.isLetter || $0.isNumber }) else {
+            return nil
+        }
+        return brand
+    }
+
+    /// Normalize raw `/v0/apps.list` values (app display names + visited
+    /// hostnames) into canonical recognized terms to union onto the seed
+    /// vocabulary (SCR-179 U5). App names contribute their lowercased whole form
+    /// (so a multi-word app name matches downstream); hostnames contribute their
+    /// brand label. Ambiguous everyday words are dropped so the index can't
+    /// reintroduce a "mail"/"docs" misfire.
+    static func vocabularyTerms(appNames: [String], hostnames: [String]) -> [String] {
+        var terms = Set<String>()
+        for name in appNames {
+            let lower = name.trimmingCharacters(in: .whitespaces).lowercased()
+            if lower.count >= 2 { terms.insert(lower) }
+        }
+        for host in hostnames {
+            if let brand = domainBrand(host) { terms.insert(brand) }
+        }
+        return terms.filter { !excludedTerms.contains($0) }.sorted()
     }
 }

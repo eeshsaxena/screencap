@@ -180,4 +180,70 @@ final class QueryParserTests: XCTestCase {
         XCTAssertNil(parsed.timeWindow)
         XCTAssertEqual(parsed.freeText, "june planning")
     }
+
+    // MARK: - SCR-179 U4: broadened + normalized app/site recognition
+
+    func testExpandedStaticAppIsRecognized() {
+        let parsed = parser.parse("notes obsidian today", now: now)
+        XCTAssertEqual(parsed.appFilter, "obsidian")
+        XCTAssertEqual(parsed.freeText, "notes")
+    }
+
+    func testTypedDomainNormalizesToBrand() {
+        // github.com → github (brand is in the recognized vocabulary).
+        XCTAssertEqual(parser.parse("issues github.com", now: now).appFilter, "github")
+        XCTAssertEqual(parser.parse("pr at www.github.com/org/repo", now: now).appFilter, "github")
+    }
+
+    func testUnknownDomainDoesNotMisfire() {
+        // "main.py" must not become an app filter just because it has a dot.
+        let parsed = parser.parse("edit main.py", now: now)
+        XCTAssertNil(parsed.appFilter)
+        XCTAssertEqual(parsed.freeText, "edit main.py")
+    }
+
+    func testMultiWordAppNameMatchesAsPhrase() {
+        let parsed = parser.parse("crash google chrome yesterday", now: now)
+        XCTAssertEqual(parsed.appFilter, "google chrome")
+        XCTAssertEqual(parsed.freeText, "crash")
+    }
+
+    func testAmbiguousWordIsNotAnAppFilter() {
+        let parsed = parser.parse("find the docs about pricing", now: now)
+        XCTAssertNil(parsed.appFilter)
+        XCTAssertEqual(parsed.freeText, "find the docs about pricing")
+    }
+
+    func testInjectedVocabularyIsRecognized() {
+        // A term only present in the injected vocabulary (not the static seed)
+        // is recognized; the same parser without it falls through to free text.
+        let injected = QueryParser(
+            calendar: cal,
+            knownApps: QueryParser.defaultKnownApps + ["acmecorp"]
+        )
+        XCTAssertEqual(injected.parse("acmecorp dashboard", now: now).appFilter, "acmecorp")
+        XCTAssertNil(parser.parse("acmecorp dashboard", now: now).appFilter)
+    }
+
+    func testInjectedVocabularyStillExcludesAmbiguousWords() {
+        // Even if the index yields an app literally named "Mail", it must not
+        // misfire into an app filter.
+        let injected = QueryParser(
+            calendar: cal,
+            knownApps: QueryParser.defaultKnownApps + ["mail"]
+        )
+        XCTAssertNil(injected.parse("send the mail today", now: now).appFilter)
+    }
+
+    func testVocabularyTermsNormalizesIndexValues() {
+        let terms = QueryParser.vocabularyTerms(
+            appNames: ["Superhuman", "Mail", "Google Chrome"],
+            hostnames: ["github.com", "mail.google.com", "main.py"]
+        )
+        XCTAssertTrue(terms.contains("superhuman"))
+        XCTAssertTrue(terms.contains("google chrome"))
+        XCTAssertTrue(terms.contains("github"))   // brand from github.com
+        XCTAssertTrue(terms.contains("google"))   // brand from mail.google.com
+        XCTAssertFalse(terms.contains("mail"))    // ambiguous word dropped
+    }
 }
