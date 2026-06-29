@@ -1,7 +1,7 @@
 ---
 title: "feat: SCR-49 Phase 1c (U9) — TCC migration UX + entitlement-drop honesty"
 type: feat
-status: active
+status: completed
 date: 2026-06-29
 origin: docs/plans/2026-05-08-001-feat-daemon-architecture-phase-1-plan.md
 ---
