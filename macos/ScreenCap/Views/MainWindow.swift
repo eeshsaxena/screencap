@@ -22,9 +22,18 @@ enum FirstRunSetupPresentationPolicy {
         daemonProbeCompleted: Bool,
         transport: RecorderTransport,
         daemonGrants: DaemonPermissionGrants,
-        setupDismissed: Bool
+        setupDismissed: Bool,
+        migrationNeeded: Bool
     ) -> Bool {
-        guard daemonProbeCompleted, !setupDismissed else { return false }
+        guard daemonProbeCompleted else { return false }
+        // Phase 1c (SCR-49): the one-time upgrade migration banner shows even when
+        // the daemon already reports grants, and even if the walkthrough was
+        // previously skipped — it is the upgrade explanation, shown once until
+        // migration completes (marker written). It therefore overrides
+        // `setupDismissed`. The caller's `recorder.state.isRecording` guard still
+        // suppresses the sheet over an active capture (R3).
+        if migrationNeeded { return true }
+        guard !setupDismissed else { return false }
         switch transport {
         case .cliFallback:
             return true
@@ -52,9 +61,16 @@ enum FirstRunSetupPresentationPolicy {
     static func shouldAutoCloseOnUpdate(
         transport: RecorderTransport,
         daemonGrants: DaemonPermissionGrants,
-        reopenedViaRecovery: Bool
+        reopenedViaRecovery: Bool,
+        migrationNeeded: Bool
     ) -> Bool {
-        guard !reopenedViaRecovery else { return false }
+        // Never auto-close while the one-time migration banner is still pending —
+        // it is the sheet's leading step and must not be dismissed out from under
+        // a reading user by a coincident daemon-grant refresh (which the sheet's
+        // own onAppear starts). Making the override explicit here removes the
+        // reliance on the present-check running after this one in
+        // updateFirstRunSheetPresentation (Phase 1c, SCR-49).
+        guard !reopenedViaRecovery, !migrationNeeded else { return false }
         return transport == .daemon && !daemonGrants.anyRequiredDenied
     }
 }
@@ -127,7 +143,22 @@ struct MainWindow: View {
                 }
             }
         }
-        .sheet(isPresented: $showingPermissionsSheet, onDismiss: { reopenedViaRecovery = false }) {
+        .sheet(isPresented: $showingPermissionsSheet, onDismiss: {
+            reopenedViaRecovery = false
+            // Phase 1c (SCR-49): dismissing the first-run sheet while migration is
+            // pending means the user has seen the one-time migration banner — it is
+            // the sheet's leading step whenever `migrationNeeded` (see
+            // FirstRunPermissionsView). Record completion here so the banner is
+            // truly one-time and the presentation override stops forcing the sheet
+            // open: `shouldPresentOnLaunch` returns true *unconditionally* while
+            // `migrationNeeded`, so without this a "Skip for now" / "Done" tap is
+            // immediately undone by the next daemon-grant refresh. Guarded +
+            // idempotent (a no-op when migration wasn't pending), and it also
+            // covers the already-installed upgrade cohort, whose helper never
+            // produces the `installedAndRunning` edge that otherwise writes the
+            // marker.
+            permissions.markMigrationComplete()
+        }) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
                 .environmentObject(recorder)
@@ -152,6 +183,13 @@ struct MainWindow: View {
             // (U5) can flip them while the window is open — re-evaluate so the
             // sheet appears on a newly-detected denial and closes once the
             // daemon path is satisfied.
+            updateFirstRunSheetPresentation()
+        }
+        .onChange(of: permissions.migrationNeeded) { _ in
+            // Phase 1c (SCR-49): the one-time migration marker flips this false
+            // when the helper install completes mid-sheet. Re-evaluate so the
+            // post-migration auto-close path keys on daemon grants again rather
+            // than the migration override holding the sheet open.
             updateFirstRunSheetPresentation()
         }
         .onChange(of: permissions.reopenSetupRequested) { requested in
@@ -201,7 +239,8 @@ struct MainWindow: View {
         if FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
-            reopenedViaRecovery: reopenedViaRecovery
+            reopenedViaRecovery: reopenedViaRecovery,
+            migrationNeeded: permissions.migrationNeeded
         ) {
             showingPermissionsSheet = false
         }
@@ -209,7 +248,8 @@ struct MainWindow: View {
             daemonProbeCompleted: recorder.daemonProbeCompleted,
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
-            setupDismissed: permissions.setupDismissed
+            setupDismissed: permissions.setupDismissed,
+            migrationNeeded: permissions.migrationNeeded
         ) {
             showingPermissionsSheet = true
         }

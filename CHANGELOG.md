@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Stable permissions across updates (macOS app).** ScreenCap now records
+  through a background helper that owns the Screen Recording, Accessibility, and
+  Input Monitoring permissions. Grant them once and they persist across all
+  future ScreenCap updates — no more re-granting on every update. Existing users
+  see a one-time explainer on first launch after upgrading, then complete the
+  short helper setup once (SCR-49). *This is a forward-only release: it ships
+  only after the Developer ID signing-validation runbook
+  (`docs/runbooks/developer-id-signing-validation.md`) passes the 5×-rebuild
+  TCC-persistence smoke.*
+
 ### Fixed
 
 - `screencap upload` now exits non-zero when a recording fails to upload; a
