@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING, Any
 
 # Line-buffered stderr is part of the SwiftUI cross-language event contract
 # (todo 012). PyInstaller-frozen binaries don't always honour
@@ -30,6 +31,9 @@ from rich.markup import escape
 from rich.table import Table
 
 from screencap import __version__
+
+if TYPE_CHECKING:
+    from screencap.cli._daemon_client import DaemonHTTPClient
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -56,6 +60,9 @@ _STOP_SCHEMA_VERSION = 1
 # `whoami --json` envelope (ok + schema_version + signed_in/uid/email), read by
 # the SwiftUI shell to gate the Upload affordance on auth state.
 _AUTH_SCHEMA_VERSION = 1
+# `backfill status --json` envelope (ok + schema_version + the privacy-safe
+# status snapshot the daemon publishes). SCR-178 U6.
+_BACKFILL_SCHEMA_VERSION = 1
 
 
 def _should_default_to_json() -> bool:
@@ -252,7 +259,6 @@ def _engine_worker_cmd(encoded_args: str) -> None:
     import multiprocessing
     import threading
     from pathlib import Path
-    from typing import Any
 
     args = json.loads(base64.b64decode(encoded_args).decode("utf-8"))
     from screencap._stderr_events import (
@@ -2737,6 +2743,7 @@ def settings(ctx, set_pair, as_json):
         get_auto_delete_after_upload,
         get_auto_name,
         get_chunk_duration,
+        get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
         get_recordings_dir,
@@ -2759,7 +2766,8 @@ def settings(ctx, set_pair, as_json):
         # Validate key and parse value
         _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
-                       "content_index_enabled", "content_index_consent_declined"}
+                       "content_index_enabled", "content_index_consent_declined",
+                       "content_index_backfill_declined"}
         _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
                          "segmentation_mode": ("llm", "idle")}
 
@@ -2820,6 +2828,7 @@ def settings(ctx, set_pair, as_json):
         "recordings_dir": str(get_recordings_dir()),
         "content_index_enabled": bool(get_content_index_enabled()),
         "content_index_consent_declined": bool(get_content_index_consent_declined()),
+        "content_index_backfill_declined": bool(get_content_index_backfill_declined()),
         "privacy": _build_privacy_settings_block(),
     }
 
@@ -3525,6 +3534,179 @@ _SMOKE_CHECKS = [
     _check_keyring_macos_backend,
     _check_daemon_load,
 ]
+
+
+@cli.group("backfill")
+def backfill_group() -> None:
+    """Index on-screen text from your existing recordings (SCR-178).
+
+    Thin one-shot HTTP clients of the daemon's ``backfill.*`` verbs over
+    the UNIX socket. The backfill OCR-indexes recordings made *before*
+    on-screen-text indexing was enabled, honoring the same privacy skips
+    as live indexing. It is local-only, cancellable, and resumable.
+
+    The consent-flow UI (in the macOS app) is the supported live-progress
+    surface; this CLI ships ``start`` / ``status`` / ``cancel`` for
+    headless use and scripting (poll ``status --json`` for progress).
+    """
+
+
+def _backfill_snapshot_line(snapshot: dict) -> str:
+    """Render a one-line human summary of a backfill status snapshot."""
+    state = str(snapshot.get("state", "unknown"))
+    done = snapshot.get("done", 0)
+    total = snapshot.get("total", 0)
+    skipped = snapshot.get("skipped", 0)
+    failed = snapshot.get("failed", 0)
+    return (
+        f"Backfill {escape(state)} — {done}/{total} indexed "
+        f"({skipped} skipped, {failed} failed)"
+    )
+
+
+def _backfill_client_or_exit(*, auto_spawn: bool = True) -> "DaemonHTTPClient":
+    """Auto-spawn (F3) then return an open ``DaemonHTTPClient``, or exit.
+
+    Mirrors the live-state commands: reuse ``ensure_daemon_or_spawn`` so a
+    headless install works exactly like ``screencap status``, and surface
+    the LaunchAgent-not-running kickstart hint as a non-zero exit.
+    """
+    from screencap.cli._autospawn import (
+        DaemonAutoSpawnError,
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import DaemonHTTPClient
+
+    try:
+        ensure_daemon_or_spawn(auto_spawn=auto_spawn)
+    except LaunchAgentNotRunningError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+    except DaemonAutoSpawnError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        if exc.log_tail:
+            console.print(escape(exc.log_tail))
+        raise SystemExit(1) from exc
+
+    return DaemonHTTPClient()
+
+
+def _backfill_call_or_exit(call) -> dict[str, Any]:
+    """Run a daemon verb, translating transport/schema/API failures to exits.
+
+    Mirrors the live-state commands' daemon-down UX: a transport failure
+    prints the standard "daemon not reachable" message and exits non-zero.
+    """
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    try:
+        return call()
+    except DaemonUnreachableError as exc:
+        console.print(
+            f"[red]Error:[/red] could not reach the ScreenCap daemon: "
+            f"{escape(str(exc))}"
+        )
+        raise SystemExit(1) from exc
+    except SchemaMismatchError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        console.print(
+            "Update the daemon: [bold]launchctl kickstart -kp "
+            "gui/$UID/com.screencap.daemon[/bold]"
+        )
+        raise SystemExit(1) from exc
+    except DaemonAPIError as exc:
+        code = exc.envelope.get("error", "unknown")
+        console.print(f"[red]Daemon error:[/red] {escape(str(code))}")
+        raise SystemExit(1) from exc
+
+
+@backfill_group.command("start")
+def backfill_start_cmd() -> None:
+    """Start (or resume) indexing your existing recordings.
+
+    Thin client of ``POST /v0/backfill.start``. Idempotent on the daemon
+    side — starting while a run is already in flight reports the existing
+    job's state instead of launching a second run, and a previously
+    paused/cancelled run resumes from where it left off.
+    """
+    client = _backfill_client_or_exit()
+    with client:
+        snapshot = _backfill_call_or_exit(client.backfill_start)
+
+    state = str(snapshot.get("state", "unknown"))
+    if state == "running":
+        if snapshot.get("done") or snapshot.get("skipped") or snapshot.get("failed"):
+            console.print("[#22d3ee]Backfill resumed.[/#22d3ee]")
+        else:
+            console.print("[#22d3ee]Backfill started.[/#22d3ee]")
+    elif state == "completed":
+        console.print("[green]Backfill already complete — nothing to index.[/green]")
+    else:
+        console.print(f"[#22d3ee]Backfill {escape(state)}.[/#22d3ee]")
+    console.print(f"  {_backfill_snapshot_line(snapshot)}")
+
+
+@backfill_group.command("status")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit the raw status payload as JSON to stdout (no styling). "
+                   "Auto-detected when stdout is not a TTY.")
+def backfill_status_cmd(as_json: bool) -> None:
+    """Report the current backfill state and progress.
+
+    Thin client of ``GET /v0/backfill.status``. Default prints a
+    human-readable line; ``--json`` emits the raw privacy-safe status
+    payload (state + done/skipped/failed/total/current_unit_index) for
+    scripting / polling.
+    """
+    # ``auto_spawn=False``: querying status of a missing daemon should not
+    # spin one up just to report "idle" — mirror ``screencap status``.
+    client = _backfill_client_or_exit(auto_spawn=False)
+    with client:
+        snapshot = _backfill_call_or_exit(client.backfill_status)
+
+    if as_json:
+        payload = {
+            "ok": True,
+            "schema_version": _BACKFILL_SCHEMA_VERSION,
+            "state": snapshot.get("state"),
+            "done": snapshot.get("done"),
+            "skipped": snapshot.get("skipped"),
+            "failed": snapshot.get("failed"),
+            "total": snapshot.get("total"),
+            "current_unit_index": snapshot.get("current_unit_index"),
+        }
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.stdout.flush()
+        return
+
+    console.print(_backfill_snapshot_line(snapshot))
+
+
+@backfill_group.command("cancel")
+def backfill_cancel_cmd() -> None:
+    """Cancel the in-flight backfill (resumable later).
+
+    Thin client of ``POST /v0/backfill.cancel``. The daemon signals the
+    run to stop; partial progress is preserved on disk so a later
+    ``backfill start`` resumes from where it stopped. A no-op when no run
+    is in flight.
+    """
+    client = _backfill_client_or_exit()
+    with client:
+        snapshot = _backfill_call_or_exit(client.backfill_cancel)
+
+    state = str(snapshot.get("state", "unknown"))
+    if state == "cancelled":
+        console.print("[#22d3ee]Backfill cancelled.[/#22d3ee] You can resume it later.")
+    else:
+        console.print(f"[#22d3ee]Backfill {escape(state)}.[/#22d3ee]")
+    console.print(f"  {_backfill_snapshot_line(snapshot)}")
 
 
 @cli.command("_smoke-test", hidden=True)

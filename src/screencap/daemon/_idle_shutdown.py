@@ -142,7 +142,24 @@ def _daemon_is_busy(app: Starlette) -> bool:
     # auto-spawned daemon could idle-exit mid-upload.
     if supervisor is not None and _has_inflight_resume(supervisor):
         return True
+    # SCR-178 U5: a content-index backfill run is in flight. ``backfill.*`` is
+    # deliberately NOT in ``_ACTIVITY_PATHS`` (status-polling must not reset the
+    # idle timer), so the only thing keeping the daemon alive across a long
+    # OCR run is this busy predicate.
+    job = getattr(app.state, "backfill_job", None)
+    if job is not None and _backfill_running(job):
+        return True
     return False
+
+
+def _backfill_running(job: object) -> bool:
+    getter = getattr(job, "is_running", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 — watchdog stays robust against test doubles
+        return False
 
 
 def _has_inflight_resume(supervisor: object) -> bool:

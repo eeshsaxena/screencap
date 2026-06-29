@@ -21,6 +21,10 @@ struct SearchView: View {
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var consentDeclined = false
+    /// SCR-178 U8 — whether the user already skipped the "index existing
+    /// recordings" offer (read from settings on load). Gates re-offering after a
+    /// "Turn on" so the backfill prompt never re-nags.
+    @State private var backfillDeclined = false
     @State private var searchTask: Task<Void, Never>?
     /// Stub-recording guard message — shown via an alert instead of opening an
     /// inspect window that would fail to load (mirrors the Recordings list).
@@ -55,6 +59,14 @@ struct SearchView: View {
             // can't see the screen learns the result instead of hearing silence.
             .onChange(of: model.phase) { phase in
                 if let message = SearchAccessibility.searchOutcomeAnnouncement(for: phase) {
+                    announceToVoiceOver(message)
+                }
+            }
+            // SCR-178 U8 — announce the backfill outcome on a terminal
+            // transition only (done/paused/cancelled/start-failed); in-progress
+            // ticks return nil from the builder and stay silent.
+            .onChange(of: model.backfillState) { state in
+                if let message = SearchAccessibility.backfillAnnouncement(for: state) {
                     announceToVoiceOver(message)
                 }
             }
@@ -151,7 +163,16 @@ struct SearchView: View {
                 }
                 coverageRow(results.coverage)
                     .listRowSeparator(.hidden)
-                if results.consentNeeded && !consentDeclined {
+                // The consent banner and the backfill affordance share one slot
+                // but are independent: tapping "Turn on" flips the flag (so the
+                // banner's `consentNeeded` guard goes false on the next search),
+                // and the backfill affordance — keyed on `model.backfillState`,
+                // NOT `consentNeeded` — takes over in place so the progress UI
+                // does not vanish the instant indexing is enabled (SCR-178 U8).
+                if model.backfillState != .hidden {
+                    backfillAffordance
+                        .listRowSeparator(.hidden)
+                } else if results.consentNeeded && !consentDeclined {
                     consentBanner
                         .listRowSeparator(.hidden)
                 }
@@ -211,8 +232,12 @@ struct SearchView: View {
         // Stand down while the consent banner is up: its prominent "Turn on"
         // button should own Return there, so this hidden open-the-selected-result
         // handler must not be the window's default action (SCR-183 review #1).
+        // Also stand down while the backfill affordance is active (offering /
+        // starting / indexing) — its prominent Accept/Cancel control should own
+        // Return there, not this hidden handler (SCR-178 U8).
         if !searchFieldFocused,
            !(results.consentNeeded && !consentDeclined),
+           !model.backfillState.isActive,
            let target = searchReviewTarget(for: selectedResultID, in: results) {
             Button("") { openInspect(target) }
                 .keyboardShortcut(.defaultAction)
@@ -316,6 +341,126 @@ struct SearchView: View {
         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 
+    // MARK: - Backfill affordance (SCR-178 U8)
+
+    /// The "also index your existing recordings" affordance. Rendered in the same
+    /// slot as `consentBanner` but driven by `model.backfillState` (NOT
+    /// `consentNeeded`), so it survives the "Turn on" flag flip and shows live
+    /// progress, cancel, resume, and a defined terminal state for every outcome.
+    @ViewBuilder
+    private var backfillAffordance: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch model.backfillState {
+            case .hidden:
+                EmptyView()
+
+            case .offering:
+                affordanceHeader("Index your existing recordings now?")
+                Text("Search the on-screen text in recordings you already made \u{2014} it all stays on this Mac and is never uploaded.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button("Skip") { skipBackfill() }
+                        .buttonStyle(.bordered)
+                    Button("Index now") { model.acceptBackfill() }
+                        .buttonStyle(.borderedProminent)
+                }
+
+            case .starting:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing to index\u{2026}").font(.callout)
+                    Spacer()
+                    Button("Cancel") { model.cancelBackfill() }
+                        .buttonStyle(.bordered)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Preparing to index your existing recordings")
+
+            case .indexing(let done, let total, let failed):
+                affordanceHeader("Indexing your existing recordings")
+                ProgressView(value: Double(done), total: Double(max(total, 1))) {
+                    EmptyView()
+                } currentValueLabel: {
+                    Text(indexingProgressText(done: done, total: total, failed: failed))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .accessibilityLabel(indexingProgressText(done: done, total: total, failed: failed))
+                HStack {
+                    Spacer()
+                    Button("Cancel") { model.cancelBackfill() }
+                        .buttonStyle(.bordered)
+                }
+
+            case .done(let done, let total, let failed):
+                affordanceHeader(failed == 0 ? "All set" : "Indexing finished")
+                Text(doneText(done: done, total: total, failed: failed))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+            case .paused(let done, let total):
+                affordanceHeader("Indexing paused")
+                Text("Indexed \(done) of \(total) so far \u{2014} resume to continue.")
+                    .font(.caption).foregroundStyle(.secondary)
+                resumeRow
+
+            case .cancelled:
+                affordanceHeader("Indexing paused")
+                Text("Indexing paused \u{2014} you can resume later.")
+                    .font(.caption).foregroundStyle(.secondary)
+                resumeRow
+
+            case .startFailed:
+                affordanceHeader("Couldn\u{2019}t start indexing")
+                Text("Couldn\u{2019}t start indexing \u{2014} try again later. You can still search what\u{2019}s already indexed.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func affordanceHeader(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.viewfinder").foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(title).font(.callout).bold()
+            Spacer()
+        }
+    }
+
+    private var resumeRow: some View {
+        HStack {
+            Spacer()
+            Button("Resume") { model.resumeBackfill() }
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    /// "Indexed N of M" with the failed count appended only when non-zero
+    /// (`skipped` is a privacy-correct outcome and is never surfaced).
+    private func indexingProgressText(done: Int, total: Int, failed: Int) -> String {
+        var text = "Indexed \(done) of \(total)"
+        if failed > 0 { text += " \u{2014} \(failed) couldn\u{2019}t be indexed" }
+        return text
+    }
+
+    private func doneText(done: Int, total: Int, failed: Int) -> String {
+        if failed == 0 {
+            return "Done \u{2014} your recording history is now searchable."
+        }
+        return "Indexed \(done) of \(total) recordings. \(failed) could not be indexed."
+    }
+
+    /// Skip the backfill offer: persist the decline (so it doesn't re-prompt),
+    /// remember it locally for this session, and hide the affordance. No job runs.
+    private func skipBackfill() {
+        backfillDeclined = true
+        model.skipBackfill()
+    }
+
     // MARK: - Empty
 
     @ViewBuilder
@@ -390,6 +535,7 @@ struct SearchView: View {
             let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
             contentIndexEnabled = env.settings.contentIndexEnabled ?? false
             consentDeclined = env.settings.contentIndexConsentDeclined ?? false
+            backfillDeclined = env.settings.contentIndexBackfillDeclined ?? false
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
         } catch {
             contentIndexEnabled = false
@@ -400,6 +546,12 @@ struct SearchView: View {
     /// Optimistic with success-latch (revert on write failure).
     private func enableConsent() {
         contentIndexEnabled = true
+        // SCR-178 U8 — offer the historical backfill the moment indexing is
+        // enabled (unless the user already skipped it). Done before the write so
+        // the offer is up immediately; the affordance lives in `model` and is
+        // independent of `consentNeeded`, so the upcoming re-search (which flips
+        // `consentNeeded` false) does not dismiss it.
+        model.offerBackfill(alreadyDeclined: backfillDeclined)
         Task {
             do {
                 _ = try await CLIClient.runJSONRaw(
@@ -407,6 +559,7 @@ struct SearchView: View {
                 )
             } catch {
                 contentIndexEnabled = false
+                model.dismissBackfillOffer()
                 return
             }
             runSearch()

@@ -315,6 +315,27 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/timeline.query", json_body=body)
         )
 
+    def backfill_start(self) -> dict[str, Any]:
+        """``POST /v0/backfill.start`` — start (or resume) the content-index backfill.
+
+        Idempotent on the daemon side: starting while a run is in flight
+        returns the existing job's status snapshot. The public verb takes
+        no parameters (the daemon enumerates recordings server-side).
+        """
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/backfill.start", json_body={})
+        )
+
+    def backfill_status(self) -> dict[str, Any]:
+        """``GET /v0/backfill.status`` — privacy-safe backfill status snapshot."""
+        return self._parse_ok_envelope(self._request("GET", "/v0/backfill.status"))
+
+    def backfill_cancel(self) -> dict[str, Any]:
+        """``POST /v0/backfill.cancel`` — signal the in-flight run to stop."""
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/backfill.cancel", json_body={})
+        )
+
     @contextmanager
     def events(
         self,
