@@ -1,7 +1,7 @@
 ---
 title: "feat: Search results — graphical scrubbable per-day timeline (SCR-181)"
 type: feat
-status: active
+status: completed
 date: 2026-06-29
 origin: docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md
 ---
