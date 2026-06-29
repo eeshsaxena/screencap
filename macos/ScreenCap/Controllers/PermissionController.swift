@@ -149,14 +149,17 @@ final class PermissionController: ObservableObject {
     /// start silently. Auto-cleared when all required daemon grants land (see
     /// `updateDaemonGrants`) so a later loss (recovery / F2) re-arms the sheet.
     @Published private(set) var setupDismissed: Bool
-    /// Phase 1c (SCR-49): true until the one-time daemon-helper migration banner
-    /// (`DaemonMigrationView`) has been shown and migration completed. Backed by
-    /// the `~/.screencap/.tcc-migrated-v1` marker (`MigrationMarkerStore`), read
-    /// once at construction. Drives the first-run sheet to present the upgrade
-    /// banner once — even when the daemon already reports grants, and even if the
-    /// walkthrough was previously skipped (it overrides `setupDismissed` for that
-    /// one-time banner). UX-only: never a grant oracle — the daemon's startup TCC
-    /// preflight remains the authority on actual grants (R4).
+    /// Phase 1c (SCR-49): true until the one-time daemon-helper permissions banner
+    /// (`DaemonMigrationView`) has been shown. Backed by the
+    /// `~/.screencap/.tcc-migrated-v1` marker (`MigrationMarkerStore`), read once
+    /// at construction. Drives the first-run sheet to present the banner once —
+    /// even when the daemon already reports grants, and even if the walkthrough
+    /// was previously skipped (it overrides `setupDismissed` for that one-time
+    /// banner). Keyed purely on marker absence, so it also fires for a first-time
+    /// install (no fresh-vs-upgrade discriminator); the banner copy is written to
+    /// suit both, so this is a one-time "how permissions work" explainer rather
+    /// than a strictly upgrade-only surface. UX-only: never a grant oracle — the
+    /// daemon's startup TCC preflight remains the authority on actual grants (R4).
     @Published private(set) var migrationNeeded: Bool
     /// Panes with an outstanding daemon registration round-trip (U8). While a
     /// pane is in this set the Grant button shows a disabled/spinner state and
@@ -350,18 +353,26 @@ final class PermissionController: ObservableObject {
         self.migrationNeeded = !migrationMarker.isMigrated()
     }
 
-    /// Persist that the one-time Phase 1c migration banner has been acknowledged
-    /// and migration completed (marker written), so it never shows again. Called
-    /// when the daemon install reports `installedAndRunning` during the upgrade
-    /// flow (origin upgrade-flow step 4) — not on the banner's "Continue" tap, so
-    /// a user who quits mid-install doesn't get a marker without an installed
-    /// helper. A write failure is logged and leaves `migrationNeeded` true so the
-    /// banner re-shows once next launch (harmless) rather than being lost (R4).
+    /// Record that the user has seen the one-time Phase 1c migration banner, so it
+    /// stops being forced open. Called from the sheet's `onDismiss` (MainWindow —
+    /// the primary path, covering Skip / Done / Esc) and also when the daemon
+    /// install reports `installedAndRunning`. The marker is UX-only: it suppresses
+    /// the *banner*, never the permission walkthrough, which keeps presenting
+    /// independently while the daemon reports a missing grant (R4). So "marker
+    /// recorded before grants are in place" is intentional and safe — the banner
+    /// is an explainer, not a grant gate.
     func markMigrationComplete() {
         guard migrationNeeded else { return }
+        // Clear the in-session flag unconditionally so the one-time banner can't
+        // re-pop within this session (`shouldPresentOnLaunch` returns true while
+        // `migrationNeeded`). The on-disk marker governs only whether it returns
+        // on a *future* launch: a successful write suppresses it for good; a failed
+        // write (e.g. `~/.screencap` unwritable) leaves the marker absent, so the
+        // banner shows once more next launch — the intended harmless fallback, not
+        // a same-session nag.
+        migrationNeeded = false
         do {
             try migrationMarker.markMigrated()
-            migrationNeeded = false
         } catch {
             permissionLogger.info(
                 "Failed to write TCC migration marker: \(String(describing: error), privacy: .public)"

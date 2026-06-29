@@ -61,9 +61,16 @@ enum FirstRunSetupPresentationPolicy {
     static func shouldAutoCloseOnUpdate(
         transport: RecorderTransport,
         daemonGrants: DaemonPermissionGrants,
-        reopenedViaRecovery: Bool
+        reopenedViaRecovery: Bool,
+        migrationNeeded: Bool
     ) -> Bool {
-        guard !reopenedViaRecovery else { return false }
+        // Never auto-close while the one-time migration banner is still pending —
+        // it is the sheet's leading step and must not be dismissed out from under
+        // a reading user by a coincident daemon-grant refresh (which the sheet's
+        // own onAppear starts). Making the override explicit here removes the
+        // reliance on the present-check running after this one in
+        // updateFirstRunSheetPresentation (Phase 1c, SCR-49).
+        guard !reopenedViaRecovery, !migrationNeeded else { return false }
         return transport == .daemon && !daemonGrants.anyRequiredDenied
     }
 }
@@ -232,7 +239,8 @@ struct MainWindow: View {
         if FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
-            reopenedViaRecovery: reopenedViaRecovery
+            reopenedViaRecovery: reopenedViaRecovery,
+            migrationNeeded: permissions.migrationNeeded
         ) {
             showingPermissionsSheet = false
         }

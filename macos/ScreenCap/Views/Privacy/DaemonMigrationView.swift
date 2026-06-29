@@ -31,13 +31,17 @@ struct DaemonMigrationView: View {
                     .padding(.top, 2)
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Permissions now stay put across updates")
+                    Text("Grant recording permissions once")
                         .font(.title2.bold())
+                    // Copy is written to suit both an upgrading user (whose grants
+                    // moved to the helper) and a first-time user — it states how
+                    // permissions work now without implying a prior re-granting
+                    // pain a fresh install never had.
                     Text(
-                        "ScreenCap now uses a background helper to record your "
-                        + "screen. Grant permissions once and they'll persist "
-                        + "across all future ScreenCap updates — no more "
-                        + "re-granting every time you update."
+                        "ScreenCap records through a background helper that holds "
+                        + "the screen recording, accessibility, and input-monitoring "
+                        + "permissions. Grant them once and they'll keep working "
+                        + "across every future ScreenCap update."
                     )
                     .font(.body)
                     .foregroundStyle(.secondary)

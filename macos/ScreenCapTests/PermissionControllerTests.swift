@@ -618,6 +618,31 @@ final class PermissionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testMarkMigrationCompleteClearsFlagEvenWhenWriteFails() throws {
+        // Base dir whose parent is a regular file → markMigrated() can't create
+        // it and throws. The in-session flag must still clear (no same-session
+        // re-nag); the marker stays absent so the banner returns next launch.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("screencap-permctl-blocker-\(UUID().uuidString)")
+        try Data().write(to: parent, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let blockedBase = parent.appendingPathComponent("nested", isDirectory: true)
+
+        let permissions = PermissionController(
+            migrationMarker: MigrationMarkerStore(baseDirectory: blockedBase)
+        )
+        XCTAssertTrue(permissions.migrationNeeded)
+
+        permissions.markMigrationComplete()
+
+        XCTAssertFalse(permissions.migrationNeeded, "flag clears in-session even on write failure")
+        XCTAssertFalse(
+            MigrationMarkerStore(baseDirectory: blockedBase).isMigrated(),
+            "marker did not persist, so the banner returns next launch"
+        )
+    }
+
+    @MainActor
     func testMarkMigrationCompleteIsNoOpWhenAlreadyMigrated() throws {
         let base = freshMarkerBase()
         defer { try? FileManager.default.removeItem(at: base) }

@@ -28,7 +28,22 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
             FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
                 transport: .daemon,
                 daemonGrants: notDenied,
-                reopenedViaRecovery: true
+                reopenedViaRecovery: true,
+                migrationNeeded: false
+            )
+        )
+    }
+
+    /// Phase 1c: while the one-time migration banner is pending, a satisfied
+    /// daemon must NOT auto-close the sheet — the banner is the leading step and
+    /// a coincident grant refresh must not dismiss it out from under the user.
+    func testMigrationPendingSuppressesAutoCloseOnSatisfiedDaemon() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
+                transport: .daemon,
+                daemonGrants: notDenied,
+                reopenedViaRecovery: false,
+                migrationNeeded: true
             )
         )
     }
@@ -41,7 +56,8 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
             FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
                 transport: .daemon,
                 daemonGrants: notDenied,
-                reopenedViaRecovery: false
+                reopenedViaRecovery: false,
+                migrationNeeded: false
             )
         )
     }
@@ -53,7 +69,8 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
             FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
                 transport: .cliFallback,
                 daemonGrants: notDenied,
-                reopenedViaRecovery: false
+                reopenedViaRecovery: false,
+                migrationNeeded: false
             )
         )
     }
@@ -65,7 +82,8 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
             FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
                 transport: .daemon,
                 daemonGrants: denied,
-                reopenedViaRecovery: false
+                reopenedViaRecovery: false,
+                migrationNeeded: false
             )
         )
     }
