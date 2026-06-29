@@ -136,7 +136,22 @@ struct MainWindow: View {
                 }
             }
         }
-        .sheet(isPresented: $showingPermissionsSheet, onDismiss: { reopenedViaRecovery = false }) {
+        .sheet(isPresented: $showingPermissionsSheet, onDismiss: {
+            reopenedViaRecovery = false
+            // Phase 1c (SCR-49): dismissing the first-run sheet while migration is
+            // pending means the user has seen the one-time migration banner — it is
+            // the sheet's leading step whenever `migrationNeeded` (see
+            // FirstRunPermissionsView). Record completion here so the banner is
+            // truly one-time and the presentation override stops forcing the sheet
+            // open: `shouldPresentOnLaunch` returns true *unconditionally* while
+            // `migrationNeeded`, so without this a "Skip for now" / "Done" tap is
+            // immediately undone by the next daemon-grant refresh. Guarded +
+            // idempotent (a no-op when migration wasn't pending), and it also
+            // covers the already-installed upgrade cohort, whose helper never
+            // produces the `installedAndRunning` edge that otherwise writes the
+            // marker.
+            permissions.markMigrationComplete()
+        }) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
                 .environmentObject(recorder)

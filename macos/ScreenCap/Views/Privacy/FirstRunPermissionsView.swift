@@ -50,11 +50,12 @@ struct FirstRunPermissionsView: View {
         .onChange(of: daemonInstaller.state) { state in
             if state == .installedAndRunning {
                 isDaemonInstallComplete = true
-                // Phase 1c: the helper is installed and running, so migration is
-                // complete — write the marker (idempotent) so the upgrade banner
-                // never shows again. Done here, not on the banner's Continue tap,
-                // so quitting mid-install doesn't strand a marker without an
-                // installed helper (origin upgrade-flow step 4).
+                // Phase 1c: write the migration marker as soon as the helper is
+                // confirmed running (idempotent). The sheet's `onDismiss`
+                // (MainWindow) is the primary writer and covers every dismiss
+                // path; writing it here too clears the presentation override the
+                // moment migration genuinely completes, without waiting for the
+                // sheet to close.
                 permissions.markMigrationComplete()
             }
         }
