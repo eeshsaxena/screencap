@@ -795,6 +795,133 @@ async def test_timeline_query_app_filter_and_omits_url(
 
 
 @pytest.mark.asyncio
+async def test_timeline_query_matches_browser_url_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SCR-179: a site token matches a browser row via the browser_url hostname,
+    even though the app is just "Safari". The URL never enters the row."""
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "title": "Issues", "url": "https://github.com/org/repo/issues"},
+            {"offset": 20, "app_name": "Code", "bundle": "com.microsoft.VSCode",
+             "title": "main.py"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "github"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]
+    # Structural invariant: exactly these keys — never browser_url.
+    assert all(
+        set(r) == {"recording", "timestamp_ms", "app", "title"} for r in payload["rows"]
+    )
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_timeline_query_domain_match_never_leaks_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4: matching on browser_url must not leak the URL. The path/query (where
+    OAuth codes live) appears nowhere, and the row key set is exact."""
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "title": "Login",
+             "url": "https://app.example.com/oauth?code=SECRET_TOKEN&state=XYZ"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "example"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]  # matched via host
+    assert set(payload["rows"][0]) == {"recording", "timestamp_ms", "app", "title"}
+    assert "SECRET_TOKEN" not in response.text
+    assert "code=" not in response.text
+    assert "/oauth" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_domain_match_applies_limit_after_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The matching browser row sorts AFTER many non-matching rows — it must
+    still be returned, proving `limit` is applied after the hostname filter (the
+    naive 'filter in Python after the SQL LIMIT' would drop it)."""
+    recordings_dir = tmp_path / "recordings"
+    windows = [
+        {"offset": float(i), "app_name": "Code", "bundle": "com.microsoft.VSCode"}
+        for i in range(1, 6)
+    ]
+    windows.append(
+        {"offset": 100.0, "app_name": "Safari", "bundle": "com.apple.Safari",
+         "title": "Issues", "url": "https://github.com/x"}
+    )
+    _make_recording_with_windows(recordings_dir, "demo", windows)
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "github", "limit": 2})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [r["app"] for r in payload["rows"]] == ["Safari"]
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_unmatched_token_excludes_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "url": "https://github.com/x"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/timeline.query", {"app": "nonesuch"})
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == []
+
+
+@pytest.mark.asyncio
+async def test_timeline_query_domain_match_tolerates_malformed_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _make_recording_with_windows(
+        recordings_dir, "demo",
+        [
+            {"offset": 10, "app_name": "Notes", "bundle": "com.apple.Notes",
+             "url": "not a url"},
+            {"offset": 20, "app_name": "Safari", "bundle": "com.apple.Safari",
+             "url": "https://github.com/x"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    # The malformed-URL row yields no host (non-match, no crash); the valid one matches.
+    response = await _asgi_post("/v0/timeline.query", {"app": "github"})
+
+    assert response.status_code == 200
+    assert [r["app"] for r in response.json()["rows"]] == ["Safari"]
+
+
+@pytest.mark.asyncio
 async def test_timeline_query_spans_recordings_in_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

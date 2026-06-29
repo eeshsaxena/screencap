@@ -309,9 +309,12 @@ def _load_models() -> dict[str, Any]:
     class TimelineRow(_DaemonModel):
         """A structured app/window/time row from the event tables.
 
-        ``browser_url`` is deliberately omitted in v1: it is captured
+        ``browser_url`` is deliberately omitted from the OUTPUT: it is captured
         pre-scrubber and can carry OAuth codes / session tokens, so the
-        lowest-risk timeline shape is app + window title + time.
+        lowest-risk timeline shape is app + window title + time. Since SCR-179 it
+        is read internally as a *domain filter predicate* — the ``app`` token may
+        match a hostname derived from ``browser_url`` — but only the hostname
+        (never the path/query) is inspected and the URL never enters a row.
         """
 
         recording: str
