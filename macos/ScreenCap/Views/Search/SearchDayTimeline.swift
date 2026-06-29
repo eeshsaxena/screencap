@@ -30,6 +30,13 @@ struct SearchDayTimeline: View {
     private let axisHeight: CGFloat = 52
     private let calendar = Calendar.current
 
+    // Marker dimensions, named so the dot, its selection ring (dot + 4), and the
+    // hit target stay in sync from one place (the ring/target sizes derive from
+    // these rather than repeating magic numbers).
+    private let singleDotSize: CGFloat = 9
+    private let clusterDotSize: CGFloat = 18
+    private let hitTargetWidth: CGFloat = 22
+
     /// The cluster currently disclosed inline (its members listed below the axis).
     @State private var disclosed: [SearchResultItem]?
 
@@ -150,15 +157,7 @@ struct SearchDayTimeline: View {
             pathsByStream[marker.item.stream]?.addLine(to: CGPoint(x: x, y: baselineY + half))
         }
         for (stream, path) in pathsByStream {
-            context.stroke(path, with: .color(tint(for: stream).opacity(0.6)), lineWidth: 1.5)
-        }
-    }
-
-    private func tint(for stream: SearchResultItem.Stream) -> Color {
-        switch stream {
-        case .screen: return .blue
-        case .audio: return .purple
-        case .activity: return .green
+            context.stroke(path, with: .color(stream.tint.opacity(0.6)), lineWidth: 1.5)
         }
     }
 
@@ -171,14 +170,15 @@ struct SearchDayTimeline: View {
     /// action (SCR-183). The accessibility label is applied in U4.
     private func nodeOverlay(_ node: TimelineNode, height: CGFloat) -> some View {
         let isSelected = selection.map { id in node.items.contains { $0.id == id } } ?? false
+        let ringSize = (node.isCluster ? clusterDotSize : singleDotSize) + 4
         return nodeMark(node)
             .overlay {
                 if isSelected {
                     Circle().strokeBorder(Color.primary, lineWidth: 2)
-                        .frame(width: node.isCluster ? 22 : 13, height: node.isCluster ? 22 : 13)
+                        .frame(width: ringSize, height: ringSize)
                 }
             }
-            .frame(width: 22, height: height)
+            .frame(width: hitTargetWidth, height: height)
             .contentShape(Rectangle())
             .onTapGesture { tap(node) }
             .accessibilityElement(children: .ignore)
@@ -196,11 +196,11 @@ struct SearchDayTimeline: View {
                     .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(.white)
             }
-            .frame(width: 18, height: 18)
+            .frame(width: clusterDotSize, height: clusterDotSize)
         } else {
             Circle()
-                .fill(tint(for: node.representative.stream))
-                .frame(width: 9, height: 9)
+                .fill(node.representative.stream.tint)
+                .frame(width: singleDotSize, height: singleDotSize)
         }
     }
 

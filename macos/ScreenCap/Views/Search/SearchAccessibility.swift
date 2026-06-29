@@ -8,6 +8,14 @@ import Foundation
 // verified manually.
 enum SearchAccessibility {
 
+    /// A shared "HH:mm" formatter — `clusterLabel` is called per cluster while the
+    /// timeline renders, and a fresh `DateFormatter` per call is needlessly costly.
+    private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
     /// Spoken label for a coverage chip — e.g. "On screen: 3 results",
     /// "Audio: no matches", "Activity: not indexed". Returns `nil` for `.notRun`
     /// (the chip renders no element, so there is nothing to announce). Unlike the
@@ -106,8 +114,7 @@ enum SearchAccessibility {
         guard let first = times.first, let last = times.last else {
             return "\(count) \(resultWord)"
         }
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm"
+        let f = clockFormatter
         let lo = f.string(from: Date(timeIntervalSince1970: Double(first) / 1000))
         let hi = f.string(from: Date(timeIntervalSince1970: Double(last) / 1000))
         return lo == hi
