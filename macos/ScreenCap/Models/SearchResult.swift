@@ -186,3 +186,44 @@ struct TimelineQueryResponse: Decodable, Sendable {
         case coverageRaw = "coverage"
     }
 }
+
+/// `apps.list` response (SCR-179). Vocabulary source for the query parser:
+/// distinct app names / bundle ids + bare `browser_url` hostnames (never a full
+/// URL). A same-EUID-only browsing-profile artifact — never persisted, synced,
+/// or logged by the app (R6). `truncated` flags a partial (capped) vocabulary.
+struct AppsListResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let appNames: [String]
+    let appBundles: [String]
+    let hostnames: [String]
+    let truncated: Bool
+
+    init(
+        ok: Bool = true, schemaVersion: Int = 1, daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1, appNames: [String], appBundles: [String] = [],
+        hostnames: [String], truncated: Bool = false
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.appNames = appNames
+        self.appBundles = appBundles
+        self.hostnames = hostnames
+        self.truncated = truncated
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case appNames = "app_names"
+        case appBundles = "app_bundles"
+        case hostnames
+        case truncated
+    }
+}

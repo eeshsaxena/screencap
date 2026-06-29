@@ -25,6 +25,11 @@ final class SearchViewModelTests: XCTestCase {
         /// SCR-182 U1 — count of per-recording correlation queries issued, to
         /// assert a superseded search abandons its transcript fan-out.
         var perRecordingQueryCount = 0
+        /// SCR-179 U5 — vocabulary fetch behavior + a call counter to assert the
+        /// vocabulary is fetched once per session, not per keystroke.
+        var appsListResponse: AppsListResponse?
+        var appsListError: Error?
+        var appsListCallCount = 0
 
         func contentSearch(_ req: ContentSearchRequest) async throws -> ContentSearchResponse {
             if let contentError { throw contentError }
@@ -46,6 +51,12 @@ final class SearchViewModelTests: XCTestCase {
             }
             if let timelineError { throw timelineError }
             return timelineResponse ?? TimelineQueryResponse(rows: [], coverage: .authoritative)
+        }
+
+        func appsList() async throws -> AppsListResponse {
+            appsListCallCount += 1
+            if let appsListError { throw appsListError }
+            return appsListResponse ?? AppsListResponse(appNames: [], hostnames: [])
         }
     }
 
@@ -353,5 +364,58 @@ final class SearchViewModelTests: XCTestCase {
 
         XCTAssertEqual(fake.perRecordingQueryCount, 0,
                        "superseded search must not fan out per-recording correlation calls")
+    }
+
+    // MARK: - SCR-179 U5: index-sourced parser vocabulary
+
+    func testIndexVocabularyIsInjectedIntoParser() async {
+        // "acmecorp" is not in the static seed; the injected vocabulary makes it
+        // recognized as an app filter. Proves the live path actually injects the
+        // index vocabulary — not merely that the static fallback works.
+        let fake = FakeSearchService()
+        fake.appsListResponse = AppsListResponse(appNames: ["AcmeCorp"], hostnames: [])
+        let vm = makeVM(fake)
+
+        await vm.search("acmecorp dashboard", contentIndexEnabled: false)
+
+        XCTAssertEqual(loaded(vm)?.appFilter, "acmecorp")
+        XCTAssertEqual(fake.appsListCallCount, 1)
+    }
+
+    func testVocabularyFetchFailureFallsBackToStaticParser() async {
+        // apps.list throws (older daemon 404 / daemon down) → static vocabulary;
+        // "acmecorp" is unrecognized, search still completes normally.
+        struct Boom: Error {}
+        let fake = FakeSearchService()
+        fake.appsListError = Boom()
+        let vm = makeVM(fake)
+
+        await vm.search("acmecorp dashboard", contentIndexEnabled: false)
+
+        let results = loaded(vm)
+        XCTAssertNotNil(results, "search must still complete when vocabulary fetch fails")
+        XCTAssertNil(results?.appFilter, "unknown term stays free text under static fallback")
+    }
+
+    func testVocabularyFetchedOncePerSession() async {
+        let fake = FakeSearchService()
+        fake.appsListResponse = AppsListResponse(appNames: ["acmecorp"], hostnames: [])
+        let vm = makeVM(fake)
+
+        await vm.search("acmecorp today", contentIndexEnabled: false)
+        await vm.search("slack yesterday", contentIndexEnabled: false)
+
+        XCTAssertEqual(fake.appsListCallCount, 1, "vocabulary must be fetched once per session")
+    }
+
+    func testHostnameVocabularyNormalizesToBrandFilter() async {
+        // A visited hostname becomes a recognized brand token the user can type.
+        let fake = FakeSearchService()
+        fake.appsListResponse = AppsListResponse(appNames: [], hostnames: ["acme.io"])
+        let vm = makeVM(fake)
+
+        await vm.search("acme notes", contentIndexEnabled: false)
+
+        XCTAssertEqual(loaded(vm)?.appFilter, "acme")
     }
 }
