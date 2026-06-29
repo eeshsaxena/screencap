@@ -349,3 +349,83 @@ def test_concurrent_writer_and_purge_serialize_without_deadlock(tmp_path):
     assert not errors, f"contention raised: {errors!r}"
     # Whatever the interleaving, the purged-and-unlinked 110 frame is gone.
     assert _hits(store_path, "a") == []
+
+
+# --------------------------------------------------------------------------
+# SCR-191 — cross-process flock is MANDATORY for the backfill (non-recorder) writer
+# --------------------------------------------------------------------------
+
+
+def test_require_cross_process_raises_when_flock_degraded(tmp_path, monkeypatch):
+    """``require_cross_process=True`` fails closed when the flock can't be set up.
+
+    The backfill runs in the daemon, a DIFFERENT process from the recorder purge,
+    so the in-process lock does not serialize them — only the flock does. When the
+    flock is unavailable (no-flock FS / sandboxed run dir) the lock must RAISE
+    rather than yield, so the backfill declines to write rather than risk
+    resurrecting a just-purged interval.
+    """
+    import fcntl
+
+    from screencap.content_index import (
+        CrossProcessLockUnavailable,
+        content_index_write_lock,
+    )
+
+    # Simulate a filesystem without flock support: every flock() errors.
+    def _boom(*_a, **_k):
+        raise OSError("flock unsupported")
+
+    monkeypatch.setattr(fcntl, "flock", _boom)
+
+    with pytest.raises(CrossProcessLockUnavailable):
+        with content_index_write_lock(require_cross_process=True):
+            pytest.fail("body must not run when the cross-process flock is unavailable")
+
+    # The in-process lock was released as the exception unwound: a normal
+    # (fail-open) acquisition still works and does NOT deadlock.
+    with content_index_write_lock():
+        pass
+
+
+def test_default_lock_is_fail_open_when_flock_degraded(tmp_path, monkeypatch):
+    """Default (recorder) callers stay fail-open: a flock error degrades silently."""
+    import fcntl
+
+    from screencap.content_index import content_index_write_lock
+
+    monkeypatch.setattr(fcntl, "flock", lambda *_a, **_k: (_ for _ in ()).throw(OSError()))
+
+    # No raise — the in-process lock still serializes the same-process racers.
+    with content_index_write_lock():
+        pass
+
+
+def test_index_range_propagates_lock_unavailable_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    """A backfill ``index_range`` under a degraded flock writes nothing and raises.
+
+    The exception is raised at lock acquisition (before any OCR), so no store is
+    created and the caller is free to leave the unit pending for a later retry.
+    """
+    import fcntl
+
+    from screencap.content_index import CrossProcessLockUnavailable
+    from screencap.index_core import index_range
+
+    cap = _seed_capture(tmp_path, [110.0, 120.0])
+    store_path = tmp_path / "content_index.db"
+    ocr = _FakeOcr({110_000: "alpha", 120_000: "beta"})
+
+    monkeypatch.setattr(fcntl, "flock", lambda *_a, **_k: (_ for _ in ()).throw(OSError()))
+
+    with pytest.raises(CrossProcessLockUnavailable):
+        index_range(
+            cap, 100.0, 200.0, [], ocr=ocr, store_path=store_path,
+            require_cross_process_lock=True,
+        )
+
+    # No OCR ran and no PII store was created.
+    assert ocr.calls == []
+    assert not store_path.exists()

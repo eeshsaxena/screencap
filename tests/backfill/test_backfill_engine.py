@@ -632,3 +632,91 @@ def test_progress_cb_called_with_opaque_index_no_recording_name(env):
     indices = [c[4] for c in calls]
     assert indices == sorted(indices)  # monotonic ordinals
     assert set(indices) <= {0, 1}
+
+
+# --------------------------------------------------------------------------
+# SCR-191 — skip the actively-recording recording during enumeration
+# --------------------------------------------------------------------------
+
+
+def _patch_active_recording(monkeypatch, name: str | None) -> None:
+    """Make ``pidfile`` report ``name`` as the live-capture holder (or none)."""
+    from screencap import pidfile
+
+    monkeypatch.setattr(pidfile, "lock_is_active", lambda: name is not None)
+    monkeypatch.setattr(
+        pidfile, "read_lock_metadata",
+        lambda: {"recording_name": name} if name is not None else None,
+    )
+
+
+def test_active_recording_excluded_from_enumeration(env, monkeypatch):
+    """The recording with a live capture is not enumerated/seeded (cross-process)."""
+    _make_recording(
+        env.recordings / "rec_idle",
+        windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "I"}],
+        screenshot_ts=[110.0, 120.0],
+        manifest=(100.0, 200.0),
+    )
+    _make_recording(
+        env.recordings / "rec_active",
+        windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "A"}],
+        screenshot_ts=[110.0, 120.0],
+        manifest=(100.0, 200.0),
+    )
+    ocr = _FakeOcr({110_000: "alpha", 120_000: "alpha"})
+    _patch_active_recording(monkeypatch, "rec_active")
+
+    summary = _run(env, ocr)
+
+    # Only the idle recording is in the frozen denominator and indexed.
+    assert summary.total == 1
+    assert {h.recording for h in _hits(env.store_path, "alpha")} == {"rec_idle"}
+
+
+def test_no_active_recording_processes_all(env, monkeypatch):
+    """Guard does not over-exclude: with no live capture, both are processed."""
+    for name in ("rec_a", "rec_b"):
+        _make_recording(
+            env.recordings / name,
+            windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": name}],
+            screenshot_ts=[110.0],
+            manifest=(100.0, 200.0),
+        )
+    ocr = _FakeOcr({110_000: "alpha"})
+    _patch_active_recording(monkeypatch, None)
+
+    summary = _run(env, ocr)
+
+    assert summary.total == 2
+    assert {h.recording for h in _hits(env.store_path, "alpha")} == {"rec_a", "rec_b"}
+
+
+# --------------------------------------------------------------------------
+# SCR-191 — degraded cross-process flock pauses the run (writes nothing)
+# --------------------------------------------------------------------------
+
+
+def test_degraded_flock_pauses_run_and_writes_nothing(env, monkeypatch):
+    """No-flock filesystem → run PAUSES with the unit left PENDING, nothing written."""
+    import fcntl
+
+    from screencap.backfill.ledger import UnitStatus
+
+    _make_recording(
+        env.recordings / "rec",
+        windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "X"}],
+        screenshot_ts=[110.0, 120.0],
+        manifest=(100.0, 200.0),
+    )
+    ocr = _FakeOcr({110_000: "alpha", 120_000: "alpha"})
+    _patch_active_recording(monkeypatch, None)
+    monkeypatch.setattr(fcntl, "flock", lambda *_a, **_k: (_ for _ in ()).throw(OSError()))
+
+    summary = _run(env, ocr)
+
+    assert summary.state == RunState.PAUSED
+    # The unit was never marked → resumable; no OCR ran; no store created.
+    assert env.ledger.unit_status("rec", 0) == UnitStatus.PENDING
+    assert ocr.calls == []
+    assert not env.store_path.exists()

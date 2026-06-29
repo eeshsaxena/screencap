@@ -123,6 +123,7 @@ def index_range(
     budget_s: float = _INDEX_OCR_BUDGET_S,
     max_frames: int = _INDEX_MAX_OCR_FRAMES,
     dhash_threshold: int = _INDEX_DHASH_THRESHOLD,
+    require_cross_process_lock: bool = False,
 ) -> IndexRangeResult:
     """OCR the screenshots in ``[start_ts, end_ts)`` into the store at ``store_path``.
 
@@ -138,6 +139,16 @@ def index_range(
     blocked range never creates an empty PII store (matching the pre-refactor
     inline body's ``if not frames and not store_path.exists(): return`` guard; the
     U4 backfill relies on this over fully-blocked old recordings).
+
+    ``require_cross_process_lock`` (SCR-191): when True (the backfill, which runs
+    in the *daemon* process), the ``content_index_write_lock()`` must hold the
+    cross-process ``fcntl.flock`` — the in-process lock does not serialize against
+    the recorder-subprocess purge. If the flock cannot be acquired the lock raises
+    :class:`~screencap.content_index.CrossProcessLockUnavailable` at acquisition
+    (before any OCR or write); that propagates out of this function so the caller
+    can leave the unit for a later retry rather than write without cross-process
+    protection. The live recorder path leaves this False (its same-process racers
+    are served by the in-process lock) and so never sees that exception.
 
     Returns an :class:`IndexRangeResult`. The caller owns the policy decisions:
     whether to index at all and where ``skip_intervals`` come from.
@@ -215,7 +226,7 @@ def index_range(
     # then find the files already gone — so just-disabled text can never be
     # re-indexed after a purge. The loop's own stop / budget bails bound how long
     # this is held.
-    with content_index_write_lock():
+    with content_index_write_lock(require_cross_process=require_cross_process_lock):
         started = time.perf_counter()
         prev_hash: int | None = None
         frames: list[IndexFrame] = []
