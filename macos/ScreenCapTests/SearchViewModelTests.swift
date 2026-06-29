@@ -80,7 +80,11 @@ final class SearchViewModelTests: XCTestCase {
         return nil
     }
 
-    func testAllStreamsMergeAndRankByRecency() async {
+    // SCR-180 — blended relevance + recency. The content (bm25) and transcript
+    // (text) hits now outrank the newer-but-unrelated activity row; recency
+    // orders within the relevance tier. (Pre-SCR-180 this asserted the
+    // recency-only order [.activity, .screen, .audio] — that flip is the point.)
+    func testAllStreamsMergeAndRankByRelevanceThenRecency() async {
         let fake = FakeSearchService()
         fake.timelineResponse = TimelineQueryResponse(
             rows: [TimelineRow(recording: "rec", timestampMs: 3000, app: "Salesforce", title: "Cases")],
@@ -100,9 +104,47 @@ final class SearchViewModelTests: XCTestCase {
         await vm.search("refund", contentIndexEnabled: true)
 
         let results = loaded(vm)
-        XCTAssertEqual(results?.items.map(\.anchorMs), [3000, 2000, 1000])
-        XCTAssertEqual(results?.items.map(\.stream), [.activity, .screen, .audio])
+        XCTAssertEqual(results?.items.map(\.anchorMs), [2000, 1000, 3000])
+        XCTAssertEqual(results?.items.map(\.stream), [.screen, .audio, .activity])
         XCTAssertFalse(results?.consentNeeded ?? true)
+    }
+
+    // SCR-180 R3 — end-to-end: a relevant content hit that is OLDER than an
+    // unrelated activity row still leads the results.
+    func testRelevantContentOutranksNewerActivityEndToEnd() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [TimelineRow(recording: "rec", timestampMs: 9000, app: "Slack", title: "general")],
+            coverage: .authoritative
+        )
+        fake.contentResponse = ContentSearchResponse(
+            hits: [ContentHit(recording: "rec", timestampMs: 1000, snippet: "refund policy", score: -2.0)],
+            indexState: .ok
+        )
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+
+        let items = loaded(vm)?.items ?? []
+        XCTAssertEqual(items.first?.stream, .screen, "the relevant text hit must lead despite being older")
+        XCTAssertEqual(items.map(\.anchorMs), [1000, 9000])
+    }
+
+    // SCR-180 R5 — a pure time/app query carries no relevance signal, so the
+    // blend collapses to recency-only ordering (newest first).
+    func testPureTimeQueryStaysRecencyOrdered() async {
+        let fake = FakeSearchService()
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: [
+                TimelineRow(recording: "rec", timestampMs: 1000, app: "Slack", title: nil),
+                TimelineRow(recording: "rec", timestampMs: 3000, app: "Jira", title: nil),
+                TimelineRow(recording: "rec", timestampMs: 2000, app: "Mail", title: nil),
+            ],
+            coverage: .authoritative
+        )
+        let vm = makeVM(fake)
+        await vm.search("today", contentIndexEnabled: false)
+
+        XCTAssertEqual(loaded(vm)?.items.map(\.anchorMs), [3000, 2000, 1000])
     }
 
     func testConsentNeededWhenFlagOffAndFreeTextPresent() async {

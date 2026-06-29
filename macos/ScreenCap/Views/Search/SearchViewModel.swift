@@ -504,19 +504,15 @@ final class SearchViewModel: ObservableObject {
         return ms >= window.startMs && ms < window.endMs
     }
 
-    /// Recency-first (most recent anchor leads); unanchored items sort last.
-    /// `score` (bm25, more-negative = better) breaks ties among same-instant hits.
+    /// SCR-180 — blended relevance + recency ordering. A free-text query weights
+    /// per-stream relevance (content bm25 / transcript text match) against
+    /// normalized recency so a relevant text hit outranks an unrelated, newer
+    /// activity row (origin R4), while recency still orders within a relevance
+    /// tier. With no free text every item is an activity row (relevance 0) and
+    /// the blend collapses to pure recency. The scoring + the weight-dominance
+    /// invariant live in `SearchRanking` so the blend is tunable in one place.
     private func rank(_ items: [SearchResultItem]) -> [SearchResultItem] {
-        items.sorted { a, b in
-            switch (a.anchorMs, b.anchorMs) {
-            case let (x?, y?):
-                if x != y { return x > y }
-                return a.score < b.score
-            case (_?, nil): return true
-            case (nil, _?): return false
-            case (nil, nil): return a.score < b.score
-            }
-        }
+        SearchRanking.rankBlended(items)
     }
 
     private func mapContentState(_ state: ContentIndexState, matched: Bool) -> StreamState {
