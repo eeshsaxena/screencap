@@ -183,6 +183,56 @@ def test_no_screenshots_dir_is_noop(env, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# index_range — store unavailable (SCR-192)
+# --------------------------------------------------------------------------
+
+
+def test_store_unavailable_signals_distinctly(env, tmp_path):
+    """An un-openable store must NOT report a clean completion (SCR-192).
+
+    When there ARE in-range frames to write but the store can't be opened
+    (here: a symlinked db path, which ``ContentIndex`` refuses), the loop still
+    runs to completion — so ``completed_range`` is True — but nothing is
+    written. ``store_available`` must be False so the backfill leaves the unit
+    PENDING instead of latching it DONE with zero rows. The empty-range
+    short-circuits (no store needed) keep ``store_available=True``.
+    """
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [110.0, 120.0])
+    ocr = _FakeOcr({110_000: "alpha one", 120_000: "beta two"})
+
+    # Make the store path a symlink → ContentIndex._open raises _StoreUnavailable
+    # → store.available is False. frames are non-empty, so the store IS opened.
+    env.store_path.symlink_to(tmp_path / "real_target.db")
+
+    res = index_range(cap, 100.0, 200.0, [], ocr=ocr, store_path=env.store_path)
+
+    # The frame loop completed, but the unavailable store swallowed every write.
+    assert res.completed_range is True
+    assert res.store_available is False
+    assert res.rows_written == 0
+
+
+def test_empty_range_reports_store_available(env, tmp_path):
+    """The no-store-needed short-circuit reports store_available=True (SCR-192).
+
+    Contrast with the unavailable case: an out-of-range chunk never opens the
+    store, so there is no unavailability to report — the unit should still be
+    eligible to mark DONE.
+    """
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [250.0, 300.0])  # all outside [100, 200)
+    ocr = _FakeOcr()
+
+    res = index_range(cap, 100.0, 200.0, [], ocr=ocr, store_path=env.store_path)
+
+    assert res.completed_range is True
+    assert res.store_available is True
+
+
+# --------------------------------------------------------------------------
 # index_range — dedup / cap
 # --------------------------------------------------------------------------
 
