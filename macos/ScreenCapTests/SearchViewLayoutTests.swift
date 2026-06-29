@@ -77,6 +77,39 @@ final class SearchViewLayoutTests: XCTestCase {
         XCTAssertTrue(SearchViewHost.rendersVisibleContent(in: hosted), "Audio-only results pane rendered blank")
     }
 
+    // MARK: - SCR-181 U3: timeline pins above the List without starving it
+
+    /// The scrubbable timeline pins ABOVE the results List via `.safeAreaInset`
+    /// (NOT a VStack sibling), so the List keeps its height. `multiDayResults`
+    /// spans >1 day, so the day-strip (a horizontal `ScrollView`) renders — a
+    /// detectable signal the timeline is present (the tree gains a second scroll
+    /// view) — while the results List still reports a row per result. If the pin
+    /// ever regresses to a starving sibling, the List row count collapses and this
+    /// fails; if the timeline stops rendering, the scroll-view count drops to one.
+    func testTimelinePinnedRendersAndDoesNotStarveList() {
+        let results = SearchFixtures.multiDayResults()
+        let hosted = hostLoaded(results)
+        XCTAssertGreaterThanOrEqual(
+            SearchViewHost.views(ofType: NSScrollView.self, in: hosted).count, 2,
+            "Timeline day-strip did not render — the per-day timeline is missing above the results"
+        )
+        XCTAssertGreaterThanOrEqual(
+            SearchViewHost.resultsRowCount(in: hosted), results.items.count,
+            "Results List starved when the timeline was pinned (SCR-174 regression class)"
+        )
+    }
+
+    /// An all-unanchored result set has nothing to place on a time axis, so no
+    /// timeline (day-strip) renders — only the results List. Guards against the
+    /// timeline appearing (and consuming height) when there is nothing to show.
+    func testNoTimelineForUnanchoredOnly() {
+        let hosted = hostLoaded(SearchFixtures.unanchoredOnlyResults())
+        XCTAssertEqual(
+            SearchViewHost.views(ofType: NSScrollView.self, in: hosted).count, 1,
+            "A day-strip rendered for an all-unanchored result set that has no axis placement"
+        )
+    }
+
     // MARK: - Teeth: the measurement distinguishes populated from empty
 
     /// The acceptance criterion, made reproducible: a results pane WITH results

@@ -43,4 +43,13 @@ final class SearchKeyboardNavTests: XCTestCase {
     func testEmptyResultsResolvesToNil() {
         XCTAssertNil(searchReviewTarget(for: "a", in: results([])))
     }
+
+    // SCR-181 U4 — a timeline marker selects via the SAME `selection` the Return
+    // handler reads, so selecting a node's representative resolves to that item
+    // for open — keyboard parity between the marker axis and the companion list.
+    func testTimelineNodeSelectionResolvesForReturn() {
+        let r = results(["a", "b", "c"])
+        let node = TimelineNode(items: [r.items[1]], x: 0)  // single marker for "b"
+        XCTAssertEqual(searchReviewTarget(for: node.representative.id, in: r)?.id, "b")
+    }
 }

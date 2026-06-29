@@ -8,6 +8,14 @@ import Foundation
 // verified manually.
 enum SearchAccessibility {
 
+    /// A shared "HH:mm" formatter — `clusterLabel` is called per cluster while the
+    /// timeline renders, and a fresh `DateFormatter` per call is needlessly costly.
+    private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
     /// Spoken label for a coverage chip — e.g. "On screen: 3 results",
     /// "Audio: no matches", "Activity: not indexed". Returns `nil` for `.notRun`
     /// (the chip renders no element, so there is nothing to announce). Unlike the
@@ -84,6 +92,34 @@ enum SearchAccessibility {
             label += ". Approximate, from audio"
         }
         return label
+    }
+
+    /// SCR-181 U4 — spoken label for a timeline node. A single marker reuses the
+    /// full result-row label (so a marker and its companion row read identically);
+    /// a cluster reads its count and time span, never enumerating member content
+    /// (pointer-only posture preserved). The view applies this via
+    /// `.accessibilityLabel(...)`.
+    static func timelineNodeLabel(_ node: TimelineNode) -> String {
+        node.isCluster ? clusterLabel(node.items) : resultRowLabel(node.representative)
+    }
+
+    /// SCR-181 U4 — "N results between HH:mm and HH:mm" for a density cluster (or
+    /// "…at HH:mm" when every member shares a minute). Spans earliest→latest
+    /// member time; an all-unanchored cluster (no times) omits the span. Pure +
+    /// tested; surfaces only the count + span, never raw snippet/OCR text (R6/R8).
+    static func clusterLabel(_ items: [SearchResultItem]) -> String {
+        let count = items.count
+        let resultWord = count == 1 ? "result" : "results"
+        let times = items.compactMap(\.anchorMs).sorted()
+        guard let first = times.first, let last = times.last else {
+            return "\(count) \(resultWord)"
+        }
+        let f = clockFormatter
+        let lo = f.string(from: Date(timeIntervalSince1970: Double(first) / 1000))
+        let hi = f.string(from: Date(timeIntervalSince1970: Double(last) / 1000))
+        return lo == hi
+            ? "\(count) \(resultWord) at \(lo)"
+            : "\(count) \(resultWord) between \(lo) and \(hi)"
     }
 
     /// Spoken announcement posted when a search completes, so a VoiceOver user

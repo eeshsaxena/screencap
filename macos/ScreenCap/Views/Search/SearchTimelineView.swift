@@ -155,6 +155,19 @@ struct ResultRow: View {
     }
 }
 
+extension SearchResultItem.Stream {
+    /// The tint for this stream — one source of truth shared by the result row,
+    /// the coverage glyphs, and the SCR-181 timeline markers (which key on the
+    /// `Stream` directly when batch-drawing, so the color lives on the enum).
+    var tint: Color {
+        switch self {
+        case .screen: return .blue
+        case .audio: return .purple
+        case .activity: return .green
+        }
+    }
+}
+
 extension SearchResultItem {
     var streamIcon: String {
         switch stream {
@@ -164,13 +177,7 @@ extension SearchResultItem {
         }
     }
 
-    var streamTint: Color {
-        switch stream {
-        case .screen: return .blue
-        case .audio: return .purple
-        case .activity: return .green
-        }
-    }
+    var streamTint: Color { stream.tint }
 
     /// Lead line: the on-screen/audio snippet, or the app for an activity row.
     var primaryText: String {

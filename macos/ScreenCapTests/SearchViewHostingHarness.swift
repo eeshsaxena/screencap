@@ -200,6 +200,7 @@ enum SearchFixtures {
             isSearching: isSearching,
             recentSearches: recentSearches,
             selection: .constant(nil),
+            selectedDay: .constant(nil),
             frameIndex: nil,
             thumbnailLoader: nil,
             isSearchFieldFocused: false,
