@@ -40,7 +40,17 @@ struct SearchDayTimeline: View {
     /// The cluster currently disclosed inline (its members listed below the axis).
     @State private var disclosed: [SearchResultItem]?
 
-    private var activeDay: Date? { selectedDay ?? days.first?.day }
+    /// The day whose axis is shown. Falls back to the most-recent day with a hit
+    /// whenever `selectedDay` is unset OR points at a day absent from the current
+    /// results — so a stale selection from a prior search (before SearchView's
+    /// reset propagates) can never render an empty axis, independent of update
+    /// ordering.
+    private var activeDay: Date? {
+        if let selectedDay, days.contains(where: { calendar.isDate($0.day, inSameDayAs: selectedDay) }) {
+            return selectedDay
+        }
+        return days.first?.day
+    }
 
     private var activeItems: [SearchResultItem] {
         guard let activeDay else { return [] }
