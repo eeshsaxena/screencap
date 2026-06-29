@@ -361,6 +361,45 @@ def test_resume_skips_already_done_recording(env):
     assert {h.recording for h in _hits(env.store_path, "shared")} == {"rec_a", "rec_b"}
 
 
+def test_store_unavailable_leaves_pending_then_repair_resumes(env):
+    """An un-openable store must NOT latch the unit DONE (SCR-192).
+
+    With a symlinked store path ``ContentIndex`` refuses to open, so a complete
+    OCR pass writes zero rows. The unit must stay PENDING (run PAUSED, not
+    COMPLETED) so a store repair + resume re-OCRs the whole range — rather than
+    latching DONE-with-zero-rows and never retrying.
+    """
+    _make_recording(
+        env.recordings / "rec",
+        windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "X"}],
+        screenshot_ts=[110.0, 120.0],
+        manifest=(100.0, 200.0),
+    )
+
+    # Symlink the store path → ContentIndex._open raises _StoreUnavailable →
+    # store.available is False, so the (completed) pass writes nothing.
+    env.store_path.symlink_to(env.tmp_path / "real_store_target.db")
+
+    ocr1 = _FakeOcr({110_000: "alpha apple", 120_000: "alpha apple"})
+    summary1 = _run(env, ocr1)
+
+    # Complete pass, but nothing written → unit stays PENDING, run is PAUSED
+    # (NOT COMPLETED), so a later resume will retry.
+    assert summary1.state != RunState.COMPLETED
+    assert summary1.rows_written == 0
+    assert env.ledger.next_pending() == ("rec", 0)
+
+    # Repair the store (remove the bad symlink) and resume → re-OCRs the whole
+    # range and the rows land this time.
+    env.store_path.unlink()
+    ocr2 = _FakeOcr({110_000: "alpha apple", 120_000: "alpha apple"})
+    summary2 = _run(env, ocr2)
+
+    assert summary2.state == RunState.COMPLETED
+    assert env.ledger.next_pending() is None
+    assert {h.recording for h in _hits(env.store_path, "alpha")} == {"rec"}
+
+
 # --------------------------------------------------------------------------
 # Budget → PAUSED
 # --------------------------------------------------------------------------

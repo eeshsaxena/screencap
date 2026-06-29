@@ -94,10 +94,21 @@ class IndexRangeResult:
     bailed early on the stop event or the wall-clock budget. Callers (the backfill
     ledger, U4) gate a chunk's DONE transition on ``completed_range`` so a
     mid-range bail re-runs cleanly via the whole-range replace.
+
+    ``store_available`` is ``False`` only when the store was actually opened for
+    this range (frames survived, or a store file already existed) but could not be
+    opened — ``ContentIndex.available`` was False (missing/corrupt/symlinked), so
+    every write was silently swallowed. It is ``True`` whenever the store was
+    written successfully OR was never needed (the empty / out-of-range
+    short-circuits, where no store has to exist). Callers gate DONE on it ALONGSIDE
+    ``completed_range`` (SCR-192): a present-but-unavailable store must leave the
+    unit PENDING so a store repair + resume re-OCRs, rather than latching DONE with
+    zero rows.
     """
 
     rows_written: int
     completed_range: bool
+    store_available: bool = True
 
 
 def index_range(
@@ -287,12 +298,17 @@ def index_range(
         # Otherwise open the store HERE (inside the write lock, matching SCR-134's
         # original lock-scope) and write; ``store.available`` is False when it could
         # not be opened (missing/corrupt/symlinked), in which case there is nothing
-        # to write to.
+        # to write to. SCR-192: surface that unavailability via ``store_available``
+        # so the backfill leaves the unit PENDING instead of latching it DONE with
+        # zero rows — ``store_available`` stays True when the store is never opened
+        # (the empty / out-of-range short-circuits above, where no store is needed).
         start_ms = math.floor(start_ts * 1000)
         end_ms = math.ceil(end_ts * 1000)
         rows_written = 0
+        store_available = True
         if frames or store_path.exists():
             with ContentIndex(store_path) as store:
+                store_available = store.available
                 if store.available:
                     rows_written = store.write_chunk(
                         capture_dir.name, start_ms, end_ms, frames
@@ -301,4 +317,8 @@ def index_range(
             f"content-indexed {len(frames)} frames in "
             f"{time.perf_counter() - started:.2f}s"
         )
-    return IndexRangeResult(rows_written=rows_written, completed_range=completed_range)
+    return IndexRangeResult(
+        rows_written=rows_written,
+        completed_range=completed_range,
+        store_available=store_available,
+    )

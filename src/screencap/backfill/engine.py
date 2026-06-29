@@ -12,9 +12,10 @@ index, reusing the live indexing rules exactly:
     (which holds ``content_index_write_lock()`` + the unlink-before-write barrier
     internally);
   * mark a unit ``DONE`` **only** when ``index_range`` completed the full range
-    (``completed_range``) — a mid-chunk stop/budget bail leaves it ``PENDING`` so a
-    resume re-OCRs the whole range cleanly (U1's whole-range replace makes this
-    safe);
+    (``completed_range``) AND the store was available (``store_available``) — a
+    mid-chunk stop/budget bail OR a present-but-unavailable store (SCR-192) leaves
+    it ``PENDING`` so a resume (or a store repair + resume) re-OCRs the whole range
+    cleanly (U1's whole-range replace makes this safe);
   * emit progress with an **opaque ordinal** unit index — never the recording
     directory name (R9/privacy: the daemon broadcasts these over the EventBus and
     a recording dir name encodes timing/context that must not leak to same-EUID
@@ -363,11 +364,14 @@ def _process_unit(
         max_frames=max_frames,
     )
 
-    # DONE-gating: mark DONE only on a complete range. A mid-chunk stop/budget
-    # bail leaves the unit PENDING (do NOT mark) so a resume re-OCRs the whole
-    # range cleanly via U1's whole-range replace. Marked OUTSIDE the
+    # DONE-gating: mark DONE only on a complete range AND an available store. A
+    # mid-chunk stop/budget bail (completed_range=False) leaves the unit PENDING so
+    # a resume re-OCRs the whole range cleanly via U1's whole-range replace.
+    # SCR-192: a present-but-unavailable store (store_available=False) wrote nothing
+    # despite a complete pass — also leave it PENDING so a store repair + resume
+    # re-OCRs, rather than latching DONE with zero rows. Marked OUTSIDE the
     # content-index lock (index_range released it on return).
-    if result.completed_range:
+    if result.completed_range and result.store_available:
         ledger.mark(
             rec_name, chunk_index, UnitStatus.DONE, rows_written=result.rows_written
         )
