@@ -18,6 +18,9 @@ _PERMISSION_REQUEST_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
+# SCR-179 query-parser vocabulary verb. Additive (new verb) — no global
+# API_SCHEMA_VERSION bump (mirrors the `permissions`/SCR-148 additive precedent).
+_APPS_LIST_API_VERSION = 1
 # SCR-148 cloud account-mismatch observability.
 _AUTH_WHOAMI_API_VERSION = 1
 # SCR-178 content-index backfill lifecycle verbs.
@@ -65,6 +68,7 @@ _MODEL_NAMES = {
     "TimelineQueryRequest",
     "TimelineRow",
     "TimelineQueryResponse",
+    "AppsListResponse",
     "WhoAmIResponse",
     "BackfillStartRequest",
     "BackfillCancelRequest",
@@ -320,6 +324,24 @@ def _load_models() -> dict[str, Any]:
         # 'authoritative' — event tables, no OCR/redaction recall loss.
         coverage: str
 
+    class AppsListResponse(EnvelopeResponse):
+        """SCR-179 vocabulary source for the in-app query parser.
+
+        Distinct ``app_name`` / ``app_bundle_id`` values plus **bare hostnames**
+        derived from ``browser_url`` (never a full URL — the path/query, where
+        OAuth codes / session tokens live, never leaves the daemon). The
+        hostname list is a same-EUID-only *browsing-profile* artifact derived
+        from the local-only ``recording.db``: it must never cross the EUID
+        boundary or any sync / export / telemetry path (R6). ``truncated`` flags
+        that a distinct-value cap was hit so the client knows the vocabulary is
+        partial rather than complete.
+        """
+
+        app_names: list[str]
+        app_bundles: list[str]
+        hostnames: list[str]
+        truncated: bool
+
     class WhoAmIResponse(EnvelopeResponse):
         """SCR-148: the currently signed-in cloud account on this daemon.
 
@@ -414,6 +436,7 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryRequest": TimelineQueryRequest,
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
+        "AppsListResponse": AppsListResponse,
         "WhoAmIResponse": WhoAmIResponse,
         "BackfillStartRequest": BackfillStartRequest,
         "BackfillCancelRequest": BackfillCancelRequest,
@@ -449,6 +472,7 @@ __all__ = [
     "_CONTENT_SEARCH_API_VERSION",
     "_TRANSCRIPT_SEARCH_API_VERSION",
     "_TIMELINE_QUERY_API_VERSION",
+    "_APPS_LIST_API_VERSION",
     "_AUTH_WHOAMI_API_VERSION",
     "_BACKFILL_API_VERSION",
     "daemon_version",
