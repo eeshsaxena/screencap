@@ -69,4 +69,105 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
             )
         )
     }
+
+    // MARK: - shouldPresentOnLaunch (Phase 1c migration dimension, SCR-49)
+
+    /// Nothing presents until the daemon probe completes — even an unmigrated
+    /// user (the migration override is still gated on a completed probe).
+    func testNeverPresentsBeforeProbeCompletes() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: false,
+                transport: .daemon,
+                daemonGrants: denied,
+                setupDismissed: false,
+                migrationNeeded: true
+            )
+        )
+    }
+
+    /// Phase 1c: an unmigrated user sees the one-time banner even when the daemon
+    /// already reports all grants — the migration override fires regardless of
+    /// grant state.
+    func testMigrationNeededPresentsEvenWhenDaemonSatisfied() {
+        XCTAssertTrue(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon,
+                daemonGrants: notDenied,
+                setupDismissed: false,
+                migrationNeeded: true
+            )
+        )
+    }
+
+    /// Phase 1c: the migration banner overrides a prior "Skip for now" — a
+    /// previously-dismissed user still gets the one-time upgrade explanation.
+    func testMigrationNeededOverridesSetupDismissed() {
+        XCTAssertTrue(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon,
+                daemonGrants: notDenied,
+                setupDismissed: true,
+                migrationNeeded: true
+            )
+        )
+    }
+
+    /// Once migrated, behavior is exactly the pre-Phase-1c gate: a satisfied,
+    /// non-dismissed daemon does not present.
+    func testMigratedSatisfiedDaemonDoesNotPresent() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon,
+                daemonGrants: notDenied,
+                setupDismissed: false,
+                migrationNeeded: false
+            )
+        )
+    }
+
+    /// Once migrated, a daemon reporting a required denial still presents
+    /// (unchanged U4 behavior).
+    func testMigratedDaemonDenialPresents() {
+        XCTAssertTrue(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon,
+                daemonGrants: denied,
+                setupDismissed: false,
+                migrationNeeded: false
+            )
+        )
+    }
+
+    /// Once migrated, a prior "Skip for now" suppresses the launch gate
+    /// (unchanged U4 behavior — the override only applies while migration is
+    /// pending).
+    func testMigratedSetupDismissedSuppresses() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .daemon,
+                daemonGrants: denied,
+                setupDismissed: true,
+                migrationNeeded: false
+            )
+        )
+    }
+
+    /// Once migrated, the CLI-fallback path still always presents (unchanged).
+    func testMigratedCliFallbackPresents() {
+        XCTAssertTrue(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .cliFallback,
+                daemonGrants: .allIndeterminate,
+                setupDismissed: false,
+                migrationNeeded: false
+            )
+        )
+    }
 }

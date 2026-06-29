@@ -184,6 +184,12 @@ To avoid the loop entirely, build with `DEVELOPMENT_TEAM` set (see [signing iden
 
 If a rebuild leaves the walkthrough's app-process indicators stale, click **Skip for now** or **Done** after the helper is installed to dismiss the sheet and keep testing the rest of the UI. Daemon-backed recording is enforced by the helper/engine at start time; CLI fallback still uses the app/CLI permission path.
 
+### Why `Info.plist` has no Screen Recording / Accessibility / Input Monitoring keys
+
+There is intentionally **nothing to "drop"** from `Info.plist` or `ScreenCap.entitlements` for these three services, and there never was. Unlike Camera / Microphone / Photos — which require an `NS*UsageDescription` string — macOS gates Screen Recording, Accessibility, and Input Monitoring through **TCC at request time** (`CGRequestScreenCaptureAccess`, `AXIsProcessTrustedWithOptions`, `IOHIDRequestAccess`), not through a declared plist key. So the app declaring none of them already means "the app does not pre-declare these permissions."
+
+Phase 1c (SCR-49) completes the consolidation in *code*: `PermissionController.requestAndOpenSettings` no longer issues the app-process registration calls for the three services, so the daemon helper is the sole TCC subject for them on the recording path. The app-process **probes** (`CGPreflightScreenCaptureAccess` etc. in `refresh()`) deliberately stay — the CLI-fallback path still gates recording on them when the daemon is unreachable. Do not "fix" the absent plist keys or re-add the app-process request calls; both are correct as-is.
+
 ## Killing stuck instances
 
 Ad-hoc dev builds occasionally end up in uninterruptible sleep or stack instances when relaunching. To clean up:

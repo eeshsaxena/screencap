@@ -94,13 +94,18 @@ final class PermissionControllerTests: XCTestCase {
         daemonProbeCompleted: Bool = true,
         transport: RecorderTransport,
         daemonGrants: DaemonPermissionGrants,
-        setupDismissed: Bool = false
+        setupDismissed: Bool = false,
+        migrationNeeded: Bool = false
     ) -> Bool {
+        // These truth-table tests model the already-migrated (post-Phase-1c)
+        // state by default; the migration-override cases live in
+        // FirstRunSetupPresentationPolicyTests.
         FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
             daemonProbeCompleted: daemonProbeCompleted,
             transport: transport,
             daemonGrants: daemonGrants,
-            setupDismissed: setupDismissed
+            setupDismissed: setupDismissed,
+            migrationNeeded: migrationNeeded
         )
     }
 
@@ -564,6 +569,66 @@ final class PermissionControllerTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertEqual(registered, ["screen_recording"])
+    }
+
+    // MARK: - Phase 1c migration marker (SCR-49)
+
+    /// A unique, not-yet-created temp base dir for an injected marker store.
+    private func freshMarkerBase() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("screencap-permctl-migration", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    }
+
+    @MainActor
+    func testMigrationNeededTrueWhenMarkerAbsent() {
+        let base = freshMarkerBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let permissions = PermissionController(
+            migrationMarker: MigrationMarkerStore(baseDirectory: base)
+        )
+        XCTAssertTrue(permissions.migrationNeeded, "absent marker ⇒ migration still needed")
+    }
+
+    @MainActor
+    func testMigrationNeededFalseWhenMarkerPresent() throws {
+        let base = freshMarkerBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try MigrationMarkerStore(baseDirectory: base).markMigrated()
+        let permissions = PermissionController(
+            migrationMarker: MigrationMarkerStore(baseDirectory: base)
+        )
+        XCTAssertFalse(permissions.migrationNeeded, "present marker ⇒ migration already done")
+    }
+
+    @MainActor
+    func testMarkMigrationCompleteWritesMarkerAndClearsFlag() {
+        let base = freshMarkerBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let permissions = PermissionController(
+            migrationMarker: MigrationMarkerStore(baseDirectory: base)
+        )
+        XCTAssertTrue(permissions.migrationNeeded)
+
+        permissions.markMigrationComplete()
+
+        XCTAssertFalse(permissions.migrationNeeded, "flag clears after completion")
+        // Persisted: a fresh store over the same base reads the marker.
+        XCTAssertTrue(MigrationMarkerStore(baseDirectory: base).isMigrated())
+    }
+
+    @MainActor
+    func testMarkMigrationCompleteIsNoOpWhenAlreadyMigrated() throws {
+        let base = freshMarkerBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try MigrationMarkerStore(baseDirectory: base).markMigrated()
+        let permissions = PermissionController(
+            migrationMarker: MigrationMarkerStore(baseDirectory: base)
+        )
+        XCTAssertFalse(permissions.migrationNeeded)
+        // Guard short-circuits — still false, no throw.
+        permissions.markMigrationComplete()
+        XCTAssertFalse(permissions.migrationNeeded)
     }
 
     func testGrantRowIconsAreThreeDistinctStates() {

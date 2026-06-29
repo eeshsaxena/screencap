@@ -22,9 +22,18 @@ enum FirstRunSetupPresentationPolicy {
         daemonProbeCompleted: Bool,
         transport: RecorderTransport,
         daemonGrants: DaemonPermissionGrants,
-        setupDismissed: Bool
+        setupDismissed: Bool,
+        migrationNeeded: Bool
     ) -> Bool {
-        guard daemonProbeCompleted, !setupDismissed else { return false }
+        guard daemonProbeCompleted else { return false }
+        // Phase 1c (SCR-49): the one-time upgrade migration banner shows even when
+        // the daemon already reports grants, and even if the walkthrough was
+        // previously skipped — it is the upgrade explanation, shown once until
+        // migration completes (marker written). It therefore overrides
+        // `setupDismissed`. The caller's `recorder.state.isRecording` guard still
+        // suppresses the sheet over an active capture (R3).
+        if migrationNeeded { return true }
+        guard !setupDismissed else { return false }
         switch transport {
         case .cliFallback:
             return true
@@ -154,6 +163,13 @@ struct MainWindow: View {
             // daemon path is satisfied.
             updateFirstRunSheetPresentation()
         }
+        .onChange(of: permissions.migrationNeeded) { _ in
+            // Phase 1c (SCR-49): the one-time migration marker flips this false
+            // when the helper install completes mid-sheet. Re-evaluate so the
+            // post-migration auto-close path keys on daemon grants again rather
+            // than the migration override holding the sheet open.
+            updateFirstRunSheetPresentation()
+        }
         .onChange(of: permissions.reopenSetupRequested) { requested in
             // Explicit user recovery action ("Finish setup" in the Privacy tab):
             // present the walkthrough even though `setupDismissed` would suppress
@@ -209,7 +225,8 @@ struct MainWindow: View {
             daemonProbeCompleted: recorder.daemonProbeCompleted,
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
-            setupDismissed: permissions.setupDismissed
+            setupDismissed: permissions.setupDismissed,
+            migrationNeeded: permissions.migrationNeeded
         ) {
             showingPermissionsSheet = true
         }

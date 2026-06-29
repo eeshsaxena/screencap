@@ -32,7 +32,46 @@ struct FirstRunPermissionsView: View {
     @State private var isDaemonInstallComplete = false
     @State private var openedDaemonPanes: Set<PrivacyPane> = []
 
+    /// Phase 1c (SCR-49): true once the user taps Continue on the one-time
+    /// migration banner this session. Combined with `permissions.migrationNeeded`
+    /// (the persisted marker) it gates whether the banner or the walkthrough
+    /// shows — reading `migrationNeeded` directly in the body avoids a flash of
+    /// the walkthrough before the banner on upgrade launches.
+    @State private var migrationStepAcknowledged = false
+
     var body: some View {
+        Group {
+            if permissions.migrationNeeded && !migrationStepAcknowledged {
+                DaemonMigrationView(onContinue: { migrationStepAcknowledged = true })
+            } else {
+                walkthroughContent
+            }
+        }
+        .onChange(of: daemonInstaller.state) { state in
+            if state == .installedAndRunning {
+                isDaemonInstallComplete = true
+                // Phase 1c: the helper is installed and running, so migration is
+                // complete — write the marker (idempotent) so the upgrade banner
+                // never shows again. Done here, not on the banner's Continue tap,
+                // so quitting mid-install doesn't strand a marker without an
+                // installed helper (origin upgrade-flow step 4).
+                permissions.markMigrationComplete()
+            }
+        }
+        .onAppear {
+            // Refresh the daemon's grant snapshot while the sheet is visible so
+            // the rows reflect grants the user toggles in System Settings —
+            // re-activation + a slow 5s timer (not the 1Hz app-process poll).
+            permissions.startDaemonGrantWatching {
+                await recorder.refreshDaemonGrants()
+            }
+        }
+        .onDisappear {
+            permissions.stopDaemonGrantWatching()
+        }
+    }
+
+    private var walkthroughContent: some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Set up ScreenCap")
@@ -107,22 +146,6 @@ struct FirstRunPermissionsView: View {
         }
         .padding(28)
         .frame(width: 520)
-        .onChange(of: daemonInstaller.state) { state in
-            if state == .installedAndRunning {
-                isDaemonInstallComplete = true
-            }
-        }
-        .onAppear {
-            // Refresh the daemon's grant snapshot while the sheet is visible so
-            // the rows reflect grants the user toggles in System Settings —
-            // re-activation + a slow 5s timer (not the 1Hz app-process poll).
-            permissions.startDaemonGrantWatching {
-                await recorder.refreshDaemonGrants()
-            }
-        }
-        .onDisappear {
-            permissions.stopDaemonGrantWatching()
-        }
     }
 
     /// Developer-only hint: on an ad-hoc build, TCC grants are orphaned on every

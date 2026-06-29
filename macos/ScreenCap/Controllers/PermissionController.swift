@@ -149,6 +149,15 @@ final class PermissionController: ObservableObject {
     /// start silently. Auto-cleared when all required daemon grants land (see
     /// `updateDaemonGrants`) so a later loss (recovery / F2) re-arms the sheet.
     @Published private(set) var setupDismissed: Bool
+    /// Phase 1c (SCR-49): true until the one-time daemon-helper migration banner
+    /// (`DaemonMigrationView`) has been shown and migration completed. Backed by
+    /// the `~/.screencap/.tcc-migrated-v1` marker (`MigrationMarkerStore`), read
+    /// once at construction. Drives the first-run sheet to present the upgrade
+    /// banner once — even when the daemon already reports grants, and even if the
+    /// walkthrough was previously skipped (it overrides `setupDismissed` for that
+    /// one-time banner). UX-only: never a grant oracle — the daemon's startup TCC
+    /// preflight remains the authority on actual grants (R4).
+    @Published private(set) var migrationNeeded: Bool
     /// Panes with an outstanding daemon registration round-trip (U8). While a
     /// pane is in this set the Grant button shows a disabled/spinner state and
     /// a repeat tap is a no-op — one in-flight registration per pane. Published
@@ -167,6 +176,9 @@ final class PermissionController: ObservableObject {
 
     private let defaults: UserDefaults
     private static let setupDismissedDefaultsKey = "com.screencap.macos.permissionSetupDismissed"
+    /// Backing store for `migrationNeeded` (Phase 1c). Injectable so tests point
+    /// at a temp directory instead of the real `~/.screencap`.
+    private let migrationMarker: MigrationMarkerStore
 
     /// Issues the daemon `permission.request` round-trip for a canonical
     /// permission string. Injected (nil → the live `DaemonClient` call) so tests
@@ -326,13 +338,35 @@ final class PermissionController: ObservableObject {
         defaults: UserDefaults = .standard,
         daemonRegistrar: DaemonPermissionRegistrar? = nil,
         daemonSettingsOpener: (@MainActor (PrivacyPane) -> Void)? = nil,
-        isAdHocBuild: Bool = PermissionController.detectAdHocSigned()
+        isAdHocBuild: Bool = PermissionController.detectAdHocSigned(),
+        migrationMarker: MigrationMarkerStore = MigrationMarkerStore()
     ) {
         self.defaults = defaults
         self.setupDismissed = defaults.bool(forKey: Self.setupDismissedDefaultsKey)
         self.injectedDaemonRegistrar = daemonRegistrar
         self.injectedDaemonSettingsOpener = daemonSettingsOpener
         self.isAdHocBuild = isAdHocBuild
+        self.migrationMarker = migrationMarker
+        self.migrationNeeded = !migrationMarker.isMigrated()
+    }
+
+    /// Persist that the one-time Phase 1c migration banner has been acknowledged
+    /// and migration completed (marker written), so it never shows again. Called
+    /// when the daemon install reports `installedAndRunning` during the upgrade
+    /// flow (origin upgrade-flow step 4) — not on the banner's "Continue" tap, so
+    /// a user who quits mid-install doesn't get a marker without an installed
+    /// helper. A write failure is logged and leaves `migrationNeeded` true so the
+    /// banner re-shows once next launch (harmless) rather than being lost (R4).
+    func markMigrationComplete() {
+        guard migrationNeeded else { return }
+        do {
+            try migrationMarker.markMigrated()
+            migrationNeeded = false
+        } catch {
+            permissionLogger.info(
+                "Failed to write TCC migration marker: \(String(describing: error), privacy: .public)"
+            )
+        }
     }
 
     nonisolated deinit {
@@ -513,15 +547,20 @@ final class PermissionController: ObservableObject {
         NSApp.terminate(nil)
     }
 
-    /// Triggers the system permission prompt for `pane` and then opens the
-    /// matching Privacy & Security pane. The request API is what registers
-    /// the app in the TCC database — without it, the app won't appear in the
-    /// pane's app list, so the user can't toggle anything on. After the user
-    /// returns from System Settings the 1Hz poll picks up the new state.
+    /// Triggers permission registration for `pane` and opens the matching
+    /// Privacy & Security pane.
+    ///
+    /// Phase 1c (SCR-49): the SwiftUI app no longer registers itself as a TCC
+    /// subject for Screen Recording / Accessibility / Input Monitoring — the
+    /// daemon helper is the sole subject for those three on the recording path
+    /// (R5). They route through the daemon registration round-trip below. The
+    /// app still owns the **microphone**, which it requests in-process. The
+    /// CLI-fallback path continues to *probe* the three via `refresh()` /
+    /// `allRequiredGranted` (R6) but never prompts the user from here.
     ///
     /// Microphone uses an async callback; we don't block on it because the
     /// pane should open immediately either way.
-    func requestAndOpenSettings(for pane: PrivacyPane, subject: PermissionSubject = .screenCapApp) {
+    func requestAndOpenSettings(for pane: PrivacyPane, subject: PermissionSubject = .daemon) {
         guard subject == .screenCapApp else {
             // Daemon subject (U8): the daemon must perform the registration in
             // *its own* process so the Settings entry is attributed to the
@@ -534,19 +573,12 @@ final class PermissionController: ObservableObject {
             return
         }
 
-        switch pane {
-        case .screenRecording:
-            // Triggers the "<App> would like to record this computer's screen"
-            // prompt the first time. No-op once the user has answered.
-            _ = CGRequestScreenCaptureAccess()
-        case .accessibility:
-            let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-            _ = AXIsProcessTrustedWithOptions(options)
-        case .inputMonitoring:
-            // IOHIDRequestAccess shows the prompt and registers the app in
-            // the Input Monitoring list. Returns true if granted.
-            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-        case .microphone:
+        // App-process (`.screenCapApp`) subject: only the microphone remains
+        // app-owned. The three heavy TCC services are intentionally NOT requested
+        // in-process anymore — Phase 1c drops the app's role as their TCC subject
+        // (R5). `CGRequestScreenCaptureAccess` / `AXIsProcessTrustedWithOptions`
+        // (prompt) / `IOHIDRequestAccess` are deliberately gone from this path.
+        if pane == .microphone {
             AVCaptureDevice.requestAccess(for: .audio) { _ in
                 Task { @MainActor in self.refresh() }
             }
