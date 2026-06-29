@@ -7,6 +7,48 @@ import XCTest
 /// checklist; these tests pin the spoken *strings*.
 final class SearchAccessibilityTests: XCTestCase {
 
+    // MARK: - SCR-181 U4: timeline node labels
+
+    private func tItem(_ id: String, ms: Int?, stream: SearchResultItem.Stream = .activity) -> SearchResultItem {
+        SearchResultItem(
+            id: id, stream: stream, recording: "rec", anchorMs: ms,
+            approximate: false, score: 0, snippet: nil, app: "Safari", title: "tab"
+        )
+    }
+
+    func testTimelineSingleNodeMatchesItsRowLabel() {
+        // A single marker reads identically to its companion list row.
+        let item = tItem("a", ms: 1_700_000_000_000, stream: .activity)
+        let node = TimelineNode(items: [item], x: 10)
+        XCTAssertEqual(
+            SearchAccessibility.timelineNodeLabel(node),
+            SearchAccessibility.resultRowLabel(item)
+        )
+    }
+
+    func testClusterLabelCountAndSpan() {
+        // Two hits a minute apart → "N results between A and B".
+        let node = TimelineNode(
+            items: [tItem("a", ms: 1_700_000_000_000), tItem("b", ms: 1_700_000_060_000)], x: 10
+        )
+        let label = SearchAccessibility.timelineNodeLabel(node)
+        XCTAssertTrue(label.hasPrefix("2 results between "), label)
+        XCTAssertTrue(label.contains(" and "), label)
+    }
+
+    func testClusterLabelSameMinuteReadsAt() {
+        let node = TimelineNode(
+            items: [tItem("a", ms: 1_700_000_000_000), tItem("b", ms: 1_700_000_000_000)], x: 10
+        )
+        XCTAssertTrue(SearchAccessibility.clusterLabel(node.items).hasPrefix("2 results at "))
+    }
+
+    func testClusterLabelAllUnanchoredOmitsSpan() {
+        // No member has a time → count only, never a fabricated span (R6/R8).
+        let items = [tItem("a", ms: nil), tItem("b", ms: nil)]
+        XCTAssertEqual(SearchAccessibility.clusterLabel(items), "2 results")
+    }
+
     // MARK: - U1: coverage chip labels
 
     func testCoverageChipSpellsOutResultCount() {
