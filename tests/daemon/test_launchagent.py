@@ -624,7 +624,7 @@ def test_post_permission_request_detects_200_ack(monkeypatch: pytest.MonkeyPatch
         def close(self):
             pass
 
-    monkeypatch.setattr(launchagent.socket, "socket", lambda *_a, **_k: _FakeSock())
+    monkeypatch.setattr(launchagent, "_make_unix_socket", lambda: _FakeSock())
 
     assert launchagent._post_permission_request("screen_recording") is True
     # The POST targets the permission.request verb with a JSON body.
@@ -660,6 +660,6 @@ def test_post_permission_request_returns_false_on_non_200(
         def close(self):
             pass
 
-    monkeypatch.setattr(launchagent.socket, "socket", lambda *_a, **_k: _FakeSock())
+    monkeypatch.setattr(launchagent, "_make_unix_socket", lambda: _FakeSock())
 
     assert launchagent._post_permission_request("accessibility") is False

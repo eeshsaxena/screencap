@@ -317,6 +317,14 @@ def run_proactive_setup() -> None:
             )
 
 
+def _make_unix_socket() -> socket.socket:
+    """Create a fresh AF_UNIX stream socket. A narrow seam so tests can stub the
+    proactive POST without monkeypatching the global ``socket.socket`` class
+    (which would break unrelated code that subclasses it, e.g.
+    ``screencap.daemon.socket.PeerCheckingUnixSocket``)."""
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+
 def _post_permission_request(
     permission: str, *, timeout_seconds: float = _PROACTIVE_REQUEST_TIMEOUT_SECONDS
 ) -> bool:
@@ -337,7 +345,7 @@ def _post_permission_request(
         b"Connection: close\r\n"
         b"\r\n" + body
     )
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock = _make_unix_socket()
     try:
         sock.settimeout(timeout_seconds)
         sock.connect(str(default_socket_path()))
