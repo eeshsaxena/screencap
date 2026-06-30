@@ -1,7 +1,7 @@
 ---
 title: "feat: Add daemon /v0/frame.nearest + MCP tool (nearest-frame resolution primitive)"
 type: feat
-status: active
+status: completed
 date: 2026-06-30
 deepened: 2026-06-30
 origin: https://linear.app/zk-email/issue/SCR-186/p2-add-daemon-v0-mcp-frameresolve-nearest-frame-primitive-scr-177

@@ -20,7 +20,7 @@ exception handler in `build_app()`. Update the tests that currently assert 500 o
 a validation failure (`tests/daemon/test_read_only_verbs.py`). This changes three
 verbs' wire contracts, so it wants its own PR.
 
-## 2. Harden the frame.nearest fail-closed path against canonical/coverage divergence (security, P1 / conf-50)
+## 2. Harden the frame.nearest fail-closed path against canonical/coverage divergence (security, P1 / conf-50) — tracked as SCR-198
 
 `frame_blocked.build_is_blocked` is fail-closed on a missing/unreadable
 `recording.db` and on errors that raise, but it inherits one gap from the shared
