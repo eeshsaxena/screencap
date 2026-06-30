@@ -709,4 +709,51 @@ final class PermissionControllerTests: XCTestCase {
             XCTFail("a present app icon must be used, not the fallback symbol")
         }
     }
+
+    // MARK: - SCR-200 U6 (R7): block-with-Retry heuristic
+
+    private func rowState(
+        _ grant: DaemonGrantState,
+        registering: Bool = false,
+        elapsed: TimeInterval? = nil,
+        budget: TimeInterval = 25
+    ) -> FirstRunPermissionsView.DaemonRowState {
+        FirstRunPermissionsView.daemonRowState(
+            grant: grant,
+            isRegistering: registering,
+            elapsedSinceOpened: elapsed,
+            budget: budget
+        )
+    }
+
+    func testRowStateGrantedAlwaysWins() {
+        // Granted short-circuits everything — even a long-elapsed budget.
+        XCTAssertEqual(rowState(.granted, elapsed: 999), .granted)
+    }
+
+    func testRowStateInFlightShowsRegistering() {
+        XCTAssertEqual(rowState(.denied, registering: true, elapsed: 999), .registering)
+    }
+
+    func testRowStateNeverBlocksBeforeUserReachesToggleStep() {
+        // Not opened (elapsed nil): never block, regardless of denied state.
+        XCTAssertEqual(rowState(.denied, elapsed: nil), .actionable)
+    }
+
+    func testRowStateWithinBudgetStaysActionable() {
+        // Opened + denied but inside the budget → give the user time to toggle.
+        XCTAssertEqual(rowState(.denied, elapsed: 5), .actionable)
+    }
+
+    func testRowStateBlocksWhenBudgetExhaustedAndStillDenied() {
+        // R7: opened + still denied past the budget → block-with-Retry.
+        XCTAssertEqual(rowState(.denied, elapsed: 25), .blockedWithRetry)
+        XCTAssertEqual(rowState(.denied, elapsed: 60), .blockedWithRetry)
+    }
+
+    func testRowStateIndeterminateNeverHardBlocks() {
+        // "Couldn't verify" keeps Retry available (actionable), never a hard
+        // false-block — a transient probe hiccup must not block a granted user.
+        XCTAssertEqual(rowState(.indeterminate, elapsed: 60), .actionable)
+    }
 }
