@@ -146,15 +146,15 @@ final class PrivacyBadgeStyleTests: XCTestCase {
         XCTAssertEqual(style.color, Color.scTextSecondary)
     }
 
-    func testExcludedByUserDeColorsToSecondaryTextAndIsNotOrange() {
-        // R7: advisories de-color to neutral (text-only) — guards against the
-        // overloaded `.orange` re-appearing.
+    func testExcludedByUserDeColorsToAdvisoryRoleAndIsNotOrange() {
+        // R7: advisories de-color to neutral (text-only) and route through the
+        // advisory seam — guards against the overloaded `.orange` re-appearing.
         let style = PrivacyBadgeStyle.derive(for: app(
             resolvedAction: "exclude",
             inExcludeApps: true
         ))
         XCTAssertEqual(style.kind, .excludedByUser)
-        XCTAssertEqual(style.color, Color.scTextSecondary)
+        XCTAssertEqual(style.color, Color.scAdvisoryFg)
         XCTAssertNotEqual(style.color, Color.orange)
     }
 }

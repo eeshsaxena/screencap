@@ -30,9 +30,7 @@ final class LaunchSurfaceTokenTests: XCTestCase {
     ]
 
     private func source(_ relativePath: String) throws -> String {
-        let testDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        let url = testDir.deletingLastPathComponent().appendingPathComponent(relativePath)
-        return try String(contentsOf: url, encoding: .utf8)
+        try String(contentsOf: TestSourcePaths.macosFile(relativePath), encoding: .utf8)
     }
 
     func testLaunchSurfacesContainNoBannedColorLiterals() throws {

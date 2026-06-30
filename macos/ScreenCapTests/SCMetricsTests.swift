@@ -22,18 +22,15 @@ final class SCMetricsTests: XCTestCase {
         XCTAssertLessThan(SCMetrics.radiusMd, SCMetrics.radiusLg)
     }
 
-    func testTypeScaleExposesNamedStepsAsFonts() {
-        // Each named step must be a real, distinct constant. Comparing the
-        // documented set guards against a step being dropped or duplicated.
-        let steps: [Font] = [
-            SCTypography.display,
-            SCTypography.title,
-            SCTypography.body,
-            SCTypography.labelPrimary,
-            SCTypography.labelSecondary,
-            SCTypography.metadata,
-            SCTypography.monoTimer,
-        ]
-        XCTAssertEqual(steps.count, 7, "type scale should expose exactly the named steps")
+    func testTypeScaleStepsAreDistinctFonts() {
+        // Guards against an accidental copy-paste of the same `.system(...)` across
+        // steps — e.g. `monoTimer` losing its `monospacedDigit()` and collapsing
+        // onto `labelPrimary`. Font is Equatable, so distinct steps must compare
+        // unequal.
+        XCTAssertNotEqual(SCTypography.display, SCTypography.title)
+        XCTAssertNotEqual(SCTypography.title, SCTypography.body)
+        XCTAssertNotEqual(SCTypography.body, SCTypography.labelSecondary)
+        XCTAssertNotEqual(SCTypography.labelSecondary, SCTypography.metadata)
+        XCTAssertNotEqual(SCTypography.labelPrimary, SCTypography.monoTimer)
     }
 }

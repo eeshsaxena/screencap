@@ -87,10 +87,9 @@ final class SCColorTests: XCTestCase {
     /// Parse a color set's source `Contents.json` (located relative to this test
     /// file) into its appearance-tagged entries.
     private func colorEntries(forRole role: String) throws -> [ColorEntry] {
-        let testDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        let url = testDir
-            .deletingLastPathComponent()
-            .appendingPathComponent("ScreenCap/Assets.xcassets/\(role).colorset/Contents.json")
+        let url = TestSourcePaths.macosFile(
+            "ScreenCap/Assets.xcassets/\(role).colorset/Contents.json"
+        )
         let data = try Data(contentsOf: url)
         let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         let colors = json["colors"] as! [[String: Any]]

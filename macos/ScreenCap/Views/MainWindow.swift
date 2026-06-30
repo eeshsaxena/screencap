@@ -133,12 +133,12 @@ struct MainWindow: View {
                         .padding(.top, SCMetrics.space1)
                         .transition(.opacity)
                 } else if let advisory = recorder.captureAdvisory {
-                    // Advisory, non-terminal (SCR-76). De-colored to a neutral
-                    // elevated surface (R7) — not yellow — so it reads as "FYI",
+                    // Advisory, non-terminal (SCR-76). De-colored to the neutral
+                    // advisory surface (R7) — not yellow — so it reads as "FYI",
                     // distinct from the red error surface above. Errors take priority.
                     RecorderErrorMessage(message: advisory)
                         .padding(SCMetrics.space2)
-                        .background(Color.scSurfaceElevated, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
+                        .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
                         .padding(.top, SCMetrics.space1)
                         .transition(.opacity)
                 }
