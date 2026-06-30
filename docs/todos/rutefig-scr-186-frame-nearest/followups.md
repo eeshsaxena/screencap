@@ -20,7 +20,18 @@ exception handler in `build_app()`. Update the tests that currently assert 500 o
 a validation failure (`tests/daemon/test_read_only_verbs.py`). This changes three
 verbs' wire contracts, so it wants its own PR.
 
-## 2. Harden the frame.nearest fail-closed path against canonical/coverage divergence (security, P1 / conf-50) — tracked as SCR-198
+## 2. Harden the frame.nearest fail-closed path against canonical/coverage divergence (security, P1 / conf-50) — DONE (SCR-198)
+
+> **Resolved.** `build_scrub_context` now carries a `canonical_ok` success signal
+> (set `False` on any read failure that empties/partials the canonical set);
+> `derive_skip_intervals(require_canonical=True)` raises `CanonicalDerivationError`
+> on that signal; `frame_blocked.build_is_blocked` passes `require_canonical=True`
+> so its existing `except → _always_blocked` fails closed on a partial canonical
+> read. The fail-open backfill path omits the flag and is unchanged. Tests:
+> `tests/backfill/test_skip_intervals.py` (fail-open default, raise under
+> `require_canonical`, clean-ALLOW does not raise) +
+> `tests/test_frame_blocked.py::test_partial_canonical_read_fails_closed`.
+> Original write-up retained below for context.
 
 `frame_blocked.build_is_blocked` is fail-closed on a missing/unreadable
 `recording.db` and on errors that raise, but it inherits one gap from the shared
