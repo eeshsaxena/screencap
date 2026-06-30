@@ -130,7 +130,12 @@ def test_macos_embed_script_writes_dev_aware_daemon_launcher():
     assert "PYTHONPATH" in text
     assert "sys.executable" in text
     assert "exec \"${RESOLVED}\" -m screencap" in text
-    assert "exec \"${SCRIPT_DIR}/screencap/screencap\" \"$@\"" in text
+    # SCR-196: the launcher now execs the embedded helper .app's nested binary
+    # (bundle id com.screencap.daemon), not the old bare Contents/Resources/screencap/.
+    assert (
+        "exec \"${SCRIPT_DIR}/../Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap\" \"$@\""
+        in text
+    )
     assert ".pyenv/shims" not in text
     # Dev-source branch must be gated on CONFIGURATION=Debug so release
     # builds get a launcher with only the bundled-binary exec.

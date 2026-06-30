@@ -60,20 +60,23 @@ fi
 
 APP_NAME="$(basename "${APP_PATH%.app}")"
 APP_BINARY="${APP_PATH}/Contents/MacOS/${APP_NAME}"
-CLI_DIR="${APP_PATH}/Contents/Resources/screencap"
-CLI_BINARY="${CLI_DIR}/screencap"
+# SCR-196: the daemon helper is now a nested .app (bundle id com.screencap.daemon)
+# in Contents/Library/LoginItems/, not the old bare Contents/Resources/screencap/.
+# CLI_DIR is the helper bundle (sign walk root); CLI_BINARY its nested exec.
+CLI_DIR="${APP_PATH}/Contents/Library/LoginItems/ScreencapDaemon.app"
+CLI_BINARY="${CLI_DIR}/Contents/MacOS/screencap"
 
 if [ ! -x "${APP_BINARY}" ]; then
   echo "error: main app binary not found/executable at ${APP_BINARY}." >&2
   exit 1
 fi
 
-# The embedded CLI is the daemon helper that holds the heavy TCC grants; a build
+# The embedded helper is the daemon that holds the heavy TCC grants; a build
 # without it is a dev build that must not be distributed. Fail loud rather than
 # producing a partial signature over a bundle missing its reason to exist.
 if [ ! -x "${CLI_BINARY}" ]; then
-  echo "error: embedded CLI not found at ${CLI_BINARY}." >&2
-  echo "error: this looks like a dev build with no bundled CLI. Build the" >&2
+  echo "error: embedded daemon helper not found at ${CLI_BINARY}." >&2
+  echo "error: this looks like a dev build with no bundled helper. Build the" >&2
   echo "error: PyInstaller bundle (pyinstaller/screencap.spec) and rebuild the" >&2
   echo "error: app in Release before signing for distribution." >&2
   exit 1
@@ -94,7 +97,7 @@ sign() {
   codesign --force --options runtime --timestamp --sign "${IDENTITY}" "$@"
 }
 
-echo "==> Signing nested Mach-O in embedded CLI (inside-out)"
+echo "==> Signing nested Mach-O in embedded daemon helper (inside-out)"
 # Sign every nested dylib/.so first. Signing all of them with our Developer ID
 # is what lets library validation pass; do this before the binaries that load them.
 # NUL-delimited to survive any unusual paths inside the PyInstaller bundle.
@@ -104,8 +107,13 @@ echo "==> Signing nested Mach-O in embedded CLI (inside-out)"
 find "${CLI_DIR}" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
   | xargs -0 codesign --force --options runtime --timestamp --sign "${IDENTITY}"
 
-echo "==> Signing embedded screencap CLI binary"
+echo "==> Signing embedded daemon helper binary (with entitlements)"
 sign --entitlements "${CLI_ENTITLEMENTS}" "${CLI_BINARY}"
+
+echo "==> Signing embedded daemon helper .app wrapper"
+# The helper .app must be sealed AFTER its nested code so its Info.plist
+# (CFBundleIdentifier=com.screencap.daemon) is what TCC attributes grants to.
+sign "${CLI_DIR}"
 
 # Sign any embedded frameworks/helpers if the bundle grows them later. No-op today.
 if [ -d "${APP_PATH}/Contents/Frameworks" ]; then
@@ -123,15 +131,27 @@ sign --entitlements "${APP_ENTITLEMENTS}" "${APP_PATH}"
 echo "==> Verifying signature (codesign --verify --deep --strict)"
 codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
 
-echo "==> Confirming embedded CLI shows the Team identity (not adhoc)"
+echo "==> Confirming embedded daemon helper shows the Team identity (not adhoc)"
 codesign -dvv "${CLI_BINARY}" 2>&1 | grep -E "Authority|TeamIdentifier" || true
 
-echo "==> Smoke-testing the signed embedded CLI under hardened runtime"
+# Hard gate (SCR-196): the helper's Designated Requirement MUST name
+# com.screencap.daemon. If it doesn't (e.g. an incomplete path update left the
+# nested exec ad-hoc, or the Info.plist identity is wrong), macOS will not
+# attribute TCC grants to com.screencap.daemon and the whole fix is defeated —
+# fail loudly here rather than shipping a silently-broken bundle.
+echo "==> Asserting helper Designated Requirement names com.screencap.daemon"
+if ! codesign -d -r- "${CLI_DIR}" 2>&1 | grep -q "com.screencap.daemon"; then
+  echo "error: helper Designated Requirement does not name com.screencap.daemon." >&2
+  codesign -d -r- "${CLI_DIR}" >&2 || true
+  exit 1
+fi
+
+echo "==> Smoke-testing the signed embedded daemon helper under hardened runtime"
 # Necessary but not sufficient: this is a direct exec, not the launchd/
 # SMAppService daemon path. A hardened-runtime/library-validation break that
 # only shows up via launchd surfaces on the real daemon launch (CI gate / tester).
 if ! "${CLI_BINARY}" --version >/dev/null 2>&1; then
-  echo "error: embedded CLI fails to launch after signing." >&2
+  echo "error: embedded daemon helper fails to launch after signing." >&2
   echo "error: check ${CLI_ENTITLEMENTS} against hardened-runtime needs." >&2
   exit 1
 fi

@@ -42,8 +42,9 @@ enum CLIError: LocalizedError {
 }
 
 /// Owns Process spawning, stderr line streaming, and JSON parsing for the bundled
-/// screencap CLI. Resolves the binary from `Contents/Resources/screencap/screencap`
-/// in the bundled app, with `SCREENCAP_CLI_PATH` env-var override for development.
+/// screencap CLI. Resolves the binary from the helper bundle at
+/// `Contents/Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap`
+/// (SCR-196), with `SCREENCAP_CLI_PATH` env-var override for development.
 /// Daemon-backed app flows should use `DaemonClient`; this client remains as the
 /// Phase 1 reversibility and unavailable-daemon fallback path.
 ///
@@ -102,7 +103,8 @@ enum CLIClient {
 
     /// Resolves the screencap binary path. Order:
     /// 1. `SCREENCAP_CLI_PATH` environment variable (dev override).
-    /// 2. `Contents/Resources/screencap/screencap` inside the app bundle.
+    /// 2. `Contents/Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap`
+    ///    inside the app bundle (the SCR-196 helper bundle).
     /// 3. `python -m screencap.cli` via `PYTHONPATH=src` if the repo is detectable
     ///    (dev fallback when running from Xcode without a pyinstaller build).
     static func resolveBinary() throws -> (executable: URL, leadingArgs: [String]) {
@@ -116,12 +118,15 @@ enum CLIClient {
             }
         }
 
-        if let resourceURL = Bundle.main.resourceURL {
-            let bundled = resourceURL.appendingPathComponent("screencap/screencap")
-            searched.append(bundled.path)
-            if FileManager.default.isExecutableFile(atPath: bundled.path) {
-                return (bundled, [])
-            }
+        // SCR-196: the daemon/CLI now ships as a helper .app (bundle id
+        // com.screencap.daemon) in Contents/Library/LoginItems/, so the binary
+        // lives at the bundle's Contents/MacOS/, not the old bare
+        // Contents/Resources/screencap/.
+        let bundled = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap")
+        searched.append(bundled.path)
+        if FileManager.default.isExecutableFile(atPath: bundled.path) {
+            return (bundled, [])
         }
 
         // Dev fallback: shell out to `python -m screencap.cli` with PYTHONPATH

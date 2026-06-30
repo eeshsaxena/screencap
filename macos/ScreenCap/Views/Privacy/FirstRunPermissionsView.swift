@@ -372,13 +372,13 @@ struct FirstRunPermissionsView: View {
 
     private func daemonRationale(for pane: PrivacyPane) -> String {
         let entry = pane.helperSettingsEntryName
-        // Accessibility + Input Monitoring attribute the grant to the bare
-        // `screencap` tool, so their rows read lowercase "screencap" — a distinct
-        // entry from the "ScreenCap" app row. Spell out which row to enable (and
-        // that it's the lowercase one) so the user doesn't toggle the app instead
-        // of the helper and leave the daemon's grant denied.
-        let disambiguation = entry == "screencap"
-            ? " (lowercase — the helper, not the “ScreenCap” app row)"
+        // Since SCR-196 the three daemon-owned grants attribute to the helper
+        // bundle and read "ScreenCap Helper" — a distinct entry from the
+        // "ScreenCap" app row. Spell out which row to enable (and that it's the
+        // helper, not the app) so the user doesn't toggle the app instead of the
+        // helper and leave the daemon's grant denied.
+        let disambiguation = entry == "ScreenCap Helper"
+            ? " (the helper, not the “ScreenCap” app row)"
             : ""
         return "\(pane.rationale) Enable the “\(entry)” entry in this pane\(disambiguation)."
     }
