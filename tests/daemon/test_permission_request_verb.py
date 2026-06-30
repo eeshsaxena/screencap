@@ -260,3 +260,63 @@ def test_register_permission_allowlist_matches_probe_keys() -> None:
         "accessibility",
         "input_monitoring",
     }
+
+
+# -- permission.cleanup_decoys verb (SCR-200 U4) ----------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.privacy
+async def test_cleanup_decoys_runs_sweep_and_acks(
+    audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The verb runs the identity-scoped sweep daemon-side and acks. The actual
+    # tccutil argv is asserted in test_tcc_cleanup; here we assert the verb wires
+    # run_decoy_cleanup and audits the outcome.
+    from screencap.daemon import tcc_cleanup
+
+    _stub_peer(monkeypatch)
+    calls: list[bool] = []
+    monkeypatch.setattr(tcc_cleanup, "run_decoy_cleanup", lambda: calls.append(True))
+    app = build_app()
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/v0/permission.cleanup_decoys")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+    assert calls == [True]
+
+    record = json.loads(audit_log_at.read_text(encoding="utf-8"))
+    assert record["verb"] == "permission.cleanup_decoys"
+    assert record["outcome"] == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.privacy
+async def test_cleanup_decoys_unhandled_error_audited_as_internal(
+    audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from screencap.daemon import tcc_cleanup
+
+    _stub_peer(monkeypatch)
+
+    def _boom() -> None:
+        raise RuntimeError("tccutil exploded unexpectedly")
+
+    monkeypatch.setattr(tcc_cleanup, "run_decoy_cleanup", _boom)
+    app = build_app()
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/v0/permission.cleanup_decoys")
+
+    assert response.status_code == 500
+    record = json.loads(audit_log_at.read_text(encoding="utf-8"))
+    assert record["verb"] == "permission.cleanup_decoys"
+    assert record["outcome"] == errors.ERROR_CODE_INTERNAL

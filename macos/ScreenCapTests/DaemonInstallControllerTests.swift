@@ -20,6 +20,39 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .installedAndRunning)
     }
 
+    // SCR-200 U3/U4: proactive TCC setup (register SR+Accessibility, clear
+    // decoys) fires exactly once per daemon version, not on every poll.
+    func testProactiveTccSetupFiresOncePerVersion() async {
+        let suite = "scr200-proactive-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let counter = ProactiveSetupCounter()
+
+        func makeController() -> DaemonInstallController {
+            DaemonInstallController(
+                registrationService: FakeDaemonRegistrationService(registerStatuses: [.enabled]),
+                probe: FakeDaemonProbe(results: [true], version: "9.9.9"),
+                expectedDaemonVersion: "9.9.9",
+                sleep: { _ in },
+                defaults: defaults,
+                proactiveTccSetup: { await counter.increment() }
+            )
+        }
+
+        // First install fires it (detached) — wait for the one invocation.
+        await makeController().install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+        await counter.waitForCount(atLeast: 1)
+        let afterFirst = await counter.count
+        XCTAssertEqual(afterFirst, 1)
+
+        // A second install at the SAME version is gated synchronously before any
+        // detached task spawns, so the count must not advance.
+        await makeController().install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let afterSecond = await counter.count
+        XCTAssertEqual(afterSecond, 1, "proactive setup must not re-fire for the same version")
+    }
+
     func testRequiresApprovalPollsUntilEnabledThenInstalls() async {
         let registration = FakeDaemonRegistrationService(
             registerStatuses: [.requiresApproval],
@@ -454,4 +487,18 @@ private final class FakeClock {
 private final class FakeDaemonTerminator: DaemonTerminator {
     private(set) var bootoutCount = 0
     func bootout() async { bootoutCount += 1 }
+}
+
+/// Thread-safe invocation counter for the injected proactive-setup closure.
+private actor ProactiveSetupCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+
+    /// Poll until the count reaches `target` or a bounded number of ticks elapse
+    /// (the setup runs on a detached task, so the test can't await it directly).
+    func waitForCount(atLeast target: Int) async {
+        for _ in 0..<200 where count < target {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
 }

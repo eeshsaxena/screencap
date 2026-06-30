@@ -112,6 +112,39 @@ final class DaemonInstallController: ObservableObject {
 
     static let plistName = "com.screencap.daemon.plist"
     static let registrationAttemptedKey = "com.screencap.macos.daemonInstallAttempted"
+    /// Records the daemon version for which proactive TCC setup (SCR-200 U3/U4:
+    /// register SR + Accessibility, clear decoys) last ran, so it fires once per
+    /// install/version and NOT on every `installedAndRunning` poll (which posts on
+    /// every reconnect/relaunch).
+    static let proactiveTccSetupVersionKey = "com.screencap.macos.proactiveTccSetupVersion"
+
+    /// Proactive TCC setup run once per version after the daemon comes up:
+    /// register the daemon's Screen Recording + Accessibility rows and clear
+    /// decoy/orphan rows. The default round-trips daemon verbs so registration
+    /// attributes to the daemon (R6); injectable so tests assert the once-per-
+    /// version gate without real socket calls. No-op under XCTest by default.
+    static let defaultProactiveTccSetup: @Sendable () async -> Void = {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        // Registration (R1/R6): the daemon runs each request in its own process,
+        // so the row attributes to com.screencap.daemon, not the app. Input
+        // Monitoring is excluded (out of the required flow). Best-effort — a
+        // hiccup must never strand the user; on-demand Grant + U6 block-with-Retry
+        // remain as recovery.
+        for permission in ["screen_recording", "accessibility"] {
+            do {
+                _ = try await DaemonClient.permissionRequest(permission)
+            } catch {
+                daemonInstallLogger.error("Proactive registration for \(permission, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        // Cleanup (R5/R6/R8): identity-scoped decoy removal, daemon-side (the
+        // hardened tccutil allowlist lives in tcc_cleanup).
+        do {
+            _ = try await DaemonClient.cleanupDecoys()
+        } catch {
+            daemonInstallLogger.error("Proactive decoy cleanup failed: \(String(describing: error), privacy: .public)")
+        }
+    }
 
     private let registrationService: DaemonRegistrationService
     private let probe: DaemonProbe
@@ -128,6 +161,10 @@ final class DaemonInstallController: ObservableObject {
     /// Injectable clock so the poll deadline is deterministic under test: the
     /// convergence budget (SCR-135) advances it through the stubbed `sleep`.
     private let now: () -> Date
+    /// UserDefaults backing the once-per-version proactive-setup gate (injectable
+    /// so the gate is testable in isolation).
+    private let defaults: UserDefaults
+    private let proactiveTccSetup: @Sendable () async -> Void
 
     init(
         registrationService: DaemonRegistrationService = SMAppServiceRegistration(),
@@ -137,7 +174,9 @@ final class DaemonInstallController: ObservableObject {
         sleep: @escaping (UInt64) async -> Void = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
         },
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        defaults: UserDefaults = .standard,
+        proactiveTccSetup: @escaping @Sendable () async -> Void = DaemonInstallController.defaultProactiveTccSetup
     ) {
         self.registrationService = registrationService
         self.probe = probe
@@ -145,6 +184,24 @@ final class DaemonInstallController: ObservableObject {
         self.expectedDaemonVersion = expectedDaemonVersion
         self.sleep = sleep
         self.now = now
+        self.defaults = defaults
+        self.proactiveTccSetup = proactiveTccSetup
+    }
+
+    /// SCR-200 U3/U4: once per installed daemon version, register the daemon's
+    /// Screen Recording + Accessibility rows and clear decoy/orphan rows, so the
+    /// user finds a single pre-populated "ScreenCap" row (R1/R2/R6) with no
+    /// look-alikes (R5). Gated by version because `pollDaemon` posts
+    /// `installedAndRunning` on every successful poll (app launch, reconnect,
+    /// version reconciliation), not just first install — without the gate the
+    /// resets would re-fire and could clear a row the user is mid-interaction
+    /// with. Detached + best-effort: never blocks or fails the install path.
+    func fireProactiveTccSetupIfNeeded() {
+        let version = expectedDaemonVersion ?? "unknown"
+        guard defaults.string(forKey: Self.proactiveTccSetupVersionKey) != version else { return }
+        defaults.set(version, forKey: Self.proactiveTccSetupVersionKey)
+        let setup = proactiveTccSetup
+        Task.detached { await setup() }
     }
 
     func install(
@@ -432,6 +489,9 @@ final class DaemonInstallController: ObservableObject {
                 }
                 state = .installedAndRunning
                 NotificationCenter.default.post(name: .screenCapDaemonInstalledAndRunning, object: nil)
+                // SCR-200 U3/U4: pre-populate the daemon's rows and clear decoys
+                // now that it is up — once per version (the gate lives inside).
+                fireProactiveTccSetupIfNeeded()
                 return .running
             }
             if now() >= deadline {
