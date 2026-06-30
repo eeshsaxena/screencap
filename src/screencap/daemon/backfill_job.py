@@ -176,6 +176,36 @@ class BackfillJob:
             self._stop_event.set()
         return self.status()
 
+    async def shutdown(self, *, timeout: float = 5.0) -> None:
+        """Signal an in-flight run to stop and await the worker, bounded.
+
+        Called from the daemon lifespan teardown (``app.py``). Without this, a
+        backfill OCR worker thread launched via ``asyncio.to_thread`` is orphaned
+        on shutdown: a ``to_thread`` worker is NOT cancellable from the loop side,
+        so it would keep polling frames and writing ``content_index.db`` after the
+        event loop has closed. We set the ``threading.Event`` the engine polls
+        between units/frames, then await the task within ``timeout`` so any
+        terminal event still publishes to the (still-live) bus. On timeout we stop
+        waiting and let process exit reclaim the thread — teardown must never hang.
+        A no-op when no run is in flight.
+        """
+        task = self._task
+        if task is None or task.done():
+            return
+        self._stop_event.set()
+        try:
+            await asyncio.wait_for(task, timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "backfill did not stop within %.1fs of shutdown signal; "
+                "leaving the worker thread to process exit",
+                timeout,
+            )
+        except Exception:
+            # The task's own ``_run`` swallows engine errors, but guard the await
+            # side so a teardown surprise never aborts daemon shutdown.
+            logger.debug("awaiting backfill task during shutdown raised", exc_info=True)
+
     def status(self) -> BackfillStatusSnapshot:
         """Return the current privacy-safe status snapshot.
 

@@ -30,6 +30,7 @@ import screencap.engine.dedup as dedup
 from screencap.backfill.engine import BackfillSummary, run_backfill
 from screencap.backfill.ledger import BackfillLedger, RunState
 from screencap.content_index import ContentIndex
+from screencap.daemon.backfill_job import should_auto_resume
 
 # SCR-178: the engine's end-to-end ALLOW-only enforcement (R2/R3) and the R9
 # resurrection barrier are privacy invariants. CI runs only ``pytest -m privacy``,
@@ -430,6 +431,39 @@ def test_tiny_budget_returns_paused_then_completes(env):
     summary2 = _run(env, ocr2)
     assert summary2.state == RunState.COMPLETED
     assert {h.recording for h in _hits(env.store_path, "budget")} == {"rec_a", "rec_b"}
+
+
+# --------------------------------------------------------------------------
+# R8 — library overflow → PAUSED even when every enumerated unit completes
+# --------------------------------------------------------------------------
+
+
+def test_overflow_returns_paused_even_when_all_enumerated_units_done(env, monkeypatch):
+    """A library larger than the cap returns PAUSED with an unenumerated tail.
+
+    Distinct from the budget/cancel pauses: every unit the engine *enumerated*
+    completes (``is_complete()`` is True), yet coverage is incomplete because the
+    cap dropped the rest of the library — so the run must be PAUSED, and
+    ``should_auto_resume`` must NOT re-run it (re-enumeration is an explicit
+    user-driven start, not a silent boot resume).
+    """
+    monkeypatch.setattr("screencap.backfill.engine._MAX_RECORDINGS", 1)
+    for name in ("rec_a", "rec_b"):
+        _make_recording(
+            env.recordings / name,
+            windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": name}],
+            screenshot_ts=[110.0],
+            manifest=(100.0, 200.0),
+        )
+
+    ocr = _FakeOcr({110_000: "overflow text"})
+    summary = _run(env, ocr)
+
+    # All enumerated (capped) units completed, but the library overflowed → PAUSED.
+    assert summary.state == RunState.PAUSED
+    assert env.ledger.is_complete() is True
+    # Overflow-complete must not auto-resume (the predicate keys on is_complete()).
+    assert should_auto_resume(env.ledger) is False
 
 
 # --------------------------------------------------------------------------
