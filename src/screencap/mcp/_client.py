@@ -140,6 +140,18 @@ class AsyncDaemonClient:
                 body[key] = value
         return await self._post("/v0/timeline.query", body)
 
+    async def frame_nearest(
+        self,
+        recording: str,
+        timestamp_ms: int,
+        *,
+        staleness_cap_ms: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"recording": recording, "timestamp_ms": timestamp_ms}
+        if staleness_cap_ms is not None:
+            body["staleness_cap_ms"] = staleness_cap_ms
+        return await self._post("/v0/frame.nearest", body)
+
 
 class LivenessSubscription:
     """Holds one ``/v0/events`` subscription open for the agent session.
