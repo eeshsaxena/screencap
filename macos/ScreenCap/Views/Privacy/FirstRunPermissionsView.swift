@@ -102,7 +102,7 @@ struct FirstRunPermissionsView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("After enabling ScreenCap in System Settings, return here to continue. If macOS shows a separate ScreenCap helper entry, enable that entry too.")
+                Text("After enabling the ScreenCap entry in System Settings, return here to continue.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -320,8 +320,23 @@ struct FirstRunPermissionsView: View {
                 .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("\(pane.displayName) for ScreenCap helper")
+                HStack(spacing: 6) {
+                    // R4: show the "ScreenCap" mark the user will match against the
+                    // System Settings row, with an SF Symbol fallback so an absent
+                    // app-icon image never leaves a blank frame.
+                    switch Self.helperRowIcon(appIcon: Self.helperRowAppIcon()) {
+                    case .image(let nsImage):
+                        Image(nsImage: nsImage)
+                            .resizable()
+                            .frame(width: 18, height: 18)
+                            .accessibilityLabel("ScreenCap icon")
+                    case .symbol(let name):
+                        Image(systemName: name)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("ScreenCap icon")
+                    }
+                    Text("\(pane.displayName) for ScreenCap")
                         .font(.headline)
                 }
                 Text(daemonRationale(for: pane))
@@ -375,16 +390,37 @@ struct FirstRunPermissionsView: View {
         }
     }
 
+    /// The leading "ScreenCap" mark for a permission row, resolved to either the
+    /// app/helper icon image or an SF Symbol fallback (R4). Pure so the fallback
+    /// path — the one that guarantees the row is never blank — is unit-testable.
+    enum HelperRowIcon {
+        case image(NSImage)
+        case symbol(String)
+    }
+
+    /// SF Symbol shown when the app-icon image can't be resolved. Never blank.
+    static let helperRowFallbackSymbol = "app.dashed"
+
+    static func helperRowIcon(appIcon: NSImage?) -> HelperRowIcon {
+        if let appIcon {
+            return .image(appIcon)
+        }
+        return .symbol(helperRowFallbackSymbol)
+    }
+
+    /// The app's own icon, which the helper shares as its mark (same "ScreenCap"
+    /// glyph the System Settings row shows). `nil` if it can't be loaded, driving
+    /// the SF Symbol fallback.
+    static func helperRowAppIcon() -> NSImage? {
+        NSImage(named: NSImage.applicationIconName)
+    }
+
     private func daemonRationale(for pane: PrivacyPane) -> String {
+        // SCR-200: the daemon's row reads "ScreenCap" and is the only "ScreenCap"
+        // row in this pane (the app never appears here, R6), so naming it is
+        // unambiguous — no "helper vs app" disambiguation is needed. Spell out the
+        // exact row to enable so the user toggles the right one.
         let entry = pane.helperSettingsEntryName
-        // Since SCR-196 the three daemon-owned grants attribute to the helper
-        // bundle and read "ScreenCap Helper" — a distinct entry from the
-        // "ScreenCap" app row. Spell out which row to enable (and that it's the
-        // helper, not the app) so the user doesn't toggle the app instead of the
-        // helper and leave the daemon's grant denied.
-        let disambiguation = entry == "ScreenCap Helper"
-            ? " (the helper, not the “ScreenCap” app row)"
-            : ""
-        return "\(pane.rationale) Enable the “\(entry)” entry in this pane\(disambiguation)."
+        return "\(pane.rationale) Enable the “\(entry)” entry in this pane."
     }
 }

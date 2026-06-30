@@ -676,4 +676,37 @@ final class PermissionControllerTests: XCTestCase {
         )
         XCTAssertEqual(labels.count, 3)
     }
+
+    // MARK: - SCR-200 U5: row named "ScreenCap" + icon fallback
+
+    func testHelperSettingsEntryNameIsScreenCapForEveryPane() {
+        // R3: the daemon's SR/Accessibility/Input Monitoring rows and the
+        // app-owned Microphone row all read "ScreenCap". The onboarding copy
+        // names this exact string, so the user toggles one recognizable row.
+        for pane in [PrivacyPane.screenRecording, .accessibility, .inputMonitoring, .microphone] {
+            XCTAssertEqual(pane.helperSettingsEntryName, "ScreenCap")
+        }
+    }
+
+    func testHelperRowIconFallsBackToSymbolWhenAppIconMissing() {
+        // R4: an absent app-icon image must yield the SF Symbol fallback, never a
+        // blank frame.
+        switch FirstRunPermissionsView.helperRowIcon(appIcon: nil) {
+        case .symbol(let name):
+            XCTAssertEqual(name, FirstRunPermissionsView.helperRowFallbackSymbol)
+            XCTAssertFalse(name.isEmpty)
+        case .image:
+            XCTFail("nil app icon must resolve to the SF Symbol fallback, not an image")
+        }
+    }
+
+    func testHelperRowIconUsesAppIconWhenPresent() {
+        let icon = NSImage(size: NSSize(width: 1, height: 1))
+        switch FirstRunPermissionsView.helperRowIcon(appIcon: icon) {
+        case .image:
+            break  // expected
+        case .symbol:
+            XCTFail("a present app icon must be used, not the fallback symbol")
+        }
+    }
 }

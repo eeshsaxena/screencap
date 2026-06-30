@@ -285,12 +285,24 @@ app = BUNDLE(
     info_plist={
         'CFBundleExecutable': 'screencap',
         'CFBundleIdentifier': 'com.screencap.daemon',
-        'CFBundleName': 'ScreenCap Helper',
-        # Display name is what System Settings renders for the helper's TCC row.
-        # Set it explicitly so the row reads "ScreenCap Helper" deterministically
-        # (not the .app filename or bundle id) — the onboarding copy in
-        # PermissionController.helperSettingsEntryName depends on this string.
-        'CFBundleDisplayName': 'ScreenCap Helper',
+        'CFBundleName': 'ScreenCap',
+        # Display name is what System Settings *should* render for the helper's
+        # TCC row. Set it to "ScreenCap" (matching the app's recognizable name)
+        # so a non-technical user toggles one obvious row — the onboarding copy
+        # in PermissionController.helperSettingsEntryName names this exact string
+        # (SCR-200 R3). Safe because the app never appears in the SR/Accessibility
+        # panes (R6), so there is no duplicate "ScreenCap" row to confuse.
+        #
+        # SHIP GATE (SCR-200 U1): the display-name keys are the documented lever
+        # (CFBundleDisplayName > CFBundleName > .app filename, per QA1544), but a
+        # dev-machine observation suggested the *filename* ("ScreencapDaemon")
+        # wins instead. That observation is unconfirmed (polluted TCC state), so
+        # confirm on a CLEAN machine (U7 runbook) that the row renders "ScreenCap"
+        # in BOTH the Screen Recording and Accessibility panes before release. If
+        # the filename proves to be the true lever, the contingency is the nested
+        # same-name `ScreenCap.app` rename branch (U2 rename branch) — NOT taken
+        # here. Bundle id stays com.screencap.daemon either way, so grants survive.
+        'CFBundleDisplayName': 'ScreenCap',
         'CFBundlePackageType': 'APPL',
         'LSUIElement': True,
     },
