@@ -18,6 +18,10 @@ _PERMISSION_REQUEST_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
+# SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
+# gains nullable timing fields without an API bump (mirrors the additive
+# `daemon.info` permissions precedent — older clients ignore unknown keys).
+_FRAME_NEAREST_API_VERSION = 1
 # SCR-179 query-parser vocabulary verb. Additive (new verb) — no global
 # API_SCHEMA_VERSION bump (mirrors the `permissions`/SCR-148 additive precedent).
 _APPS_LIST_API_VERSION = 1
@@ -68,6 +72,8 @@ _MODEL_NAMES = {
     "TimelineQueryRequest",
     "TimelineRow",
     "TimelineQueryResponse",
+    "FrameNearestRequest",
+    "FrameNearestResponse",
     "AppsListResponse",
     "WhoAmIResponse",
     "BackfillStartRequest",
@@ -285,11 +291,24 @@ def _load_models() -> dict[str, Any]:
     class TranscriptHit(_DaemonModel):
         """A transcript match. Pointer is chunk-granular (the scrubbed .txt has
         no fine timestamps — the rich per-word .json is an R7 leak we never
-        read); an agent correlates precise time via timeline.query."""
+        read); an agent correlates precise time via timeline.query.
+
+        SCR-186: additive nullable timing makes a hit resolvable by
+        ``frame.nearest``. ``timestamp_ms`` is the chunk's ``chunk_start``
+        (epoch ms); ``timestamp_granularity`` is ``"chunk"`` to flag the anchor
+        as coarse (chunks default to 15 min and carry no per-word timing — a
+        resolved frame is representative of the chunk, NOT the matched word);
+        ``chunk_duration_ms`` is the cap an agent should pass to ``frame.nearest``
+        so the chunk-coarse anchor resolves instead of missing the 30s default.
+        All three are null when the chunk manifest is absent/unreadable.
+        """
 
         recording: str
         chunk_index: int
         snippet: str
+        timestamp_ms: int | None = None
+        timestamp_granularity: str | None = None
+        chunk_duration_ms: int | None = None
 
     class TranscriptSearchResponse(EnvelopeResponse):
         hits: list[TranscriptHit]
@@ -326,6 +345,40 @@ def _load_models() -> dict[str, Any]:
         rows: list[TimelineRow]
         # 'authoritative' — event tables, no OCR/redaction recall loss.
         coverage: str
+
+    # SCR-186 frame.nearest input bounds. ``timestamp_ms`` is bounded to a
+    # realistic epoch ceiling (year 9999) and ``staleness_cap_ms`` to 24h —
+    # comfortably above any chunk duration — so a direct UDS caller cannot drive
+    # an unbounded cap or pass a nonsensical anchor (DoS / abuse guard at the
+    # boundary, mirroring the SCR-118 query caps).
+    _MAX_EPOCH_MS = 253_402_300_800_000  # year 9999 in unix ms
+    _MAX_STALENESS_CAP_MS = 86_400_000   # 24 hours in ms
+
+    class FrameNearestRequest(_DaemonModel):
+        """SCR-186 nearest-frame resolution input.
+
+        Maps ``(recording, timestamp_ms)`` to the nearest on-disk ALLOW frame
+        within ``staleness_cap_ms``. ``recording`` is validated by the canonical
+        name validator in the handler (traversal-safe), not via a ``Literal``.
+        """
+
+        recording: str
+        timestamp_ms: int = Field(ge=0, le=_MAX_EPOCH_MS)
+        staleness_cap_ms: int = Field(default=30_000, ge=0, le=_MAX_STALENESS_CAP_MS)
+
+    class FrameNearestResponse(EnvelopeResponse):
+        """Nearest-frame result — POINTER ONLY.
+
+        ``stem`` is the on-disk screenshot stem (e.g. ``"1719400010.000000"``),
+        never a path or image bytes (priv-R8); the agent expands it to
+        ``screenshots/<stem>.jpg`` with its same-EUID filesystem access.
+        ``delta_ms`` is signed (``frame_ms - timestamp_ms``). Both are null on a
+        legitimate miss (no ALLOW frame within cap, no frames, or indeterminate
+        blocked geometry → fail-closed).
+        """
+
+        stem: str | None
+        delta_ms: int | None
 
     class AppsListResponse(EnvelopeResponse):
         """SCR-179 vocabulary source for the in-app query parser.
@@ -439,6 +492,8 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryRequest": TimelineQueryRequest,
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
+        "FrameNearestRequest": FrameNearestRequest,
+        "FrameNearestResponse": FrameNearestResponse,
         "AppsListResponse": AppsListResponse,
         "WhoAmIResponse": WhoAmIResponse,
         "BackfillStartRequest": BackfillStartRequest,
@@ -475,6 +530,7 @@ __all__ = [
     "_CONTENT_SEARCH_API_VERSION",
     "_TRANSCRIPT_SEARCH_API_VERSION",
     "_TIMELINE_QUERY_API_VERSION",
+    "_FRAME_NEAREST_API_VERSION",
     "_APPS_LIST_API_VERSION",
     "_AUTH_WHOAMI_API_VERSION",
     "_BACKFILL_API_VERSION",

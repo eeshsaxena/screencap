@@ -972,10 +972,18 @@ async def test_transcript_search_returns_chunk_pointer(
     assert payload["coverage"] == "best_effort"
     assert len(payload["hits"]) == 1
     hit = payload["hits"][0]
-    assert set(hit) == {"recording", "chunk_index", "snippet"}
+    # SCR-186: the hit gains nullable chunk-granular timing fields.
+    assert set(hit) == {
+        "recording", "chunk_index", "snippet",
+        "timestamp_ms", "timestamp_granularity", "chunk_duration_ms",
+    }
     assert hit["recording"] == "demo"
     assert hit["chunk_index"] == 3
     assert "budget" in hit["snippet"].lower()
+    # No chunk manifest seeded -> timing is null, the hit is still returned.
+    assert hit["timestamp_ms"] is None
+    assert hit["timestamp_granularity"] is None
+    assert hit["chunk_duration_ms"] is None
 
 
 @pytest.mark.asyncio
@@ -1214,8 +1222,266 @@ async def test_query_verbs_do_not_bump_idle_activity(
             ("/v0/content.search", {"query": "anything"}),
             ("/v0/transcript.search", {"query": "anything"}),
             ("/v0/timeline.query", {}),
+            ("/v0/frame.nearest", {"recording": "none", "timestamp_ms": 0}),
         ):
             resp = await client.post(path, json=body)
             assert resp.status_code == 200, path
             # The activity middleware must have left the clock untouched.
             assert app.state.idle_last_activity == sentinel, path
+
+
+# ---------------------------------------------------------------------------
+# SCR-186 frame.nearest (U2) + transcript chunk-timing enrichment (U3)
+# ---------------------------------------------------------------------------
+
+_FRAME_T0 = 1_719_400_000.0  # epoch seconds anchor for frame fixtures
+
+
+def _seed_screenshots(recordings_dir: Path, name: str, epochs: list[float]) -> Path:
+    """Create ``<recordings_dir>/<name>/screenshots/{epoch:.6f}.jpg`` fixtures."""
+    screenshots = recordings_dir / name / "screenshots"
+    screenshots.mkdir(parents=True, exist_ok=True)
+    for e in epochs:
+        (screenshots / f"{e:.6f}.jpg").write_bytes(b"")
+    return recordings_dir / name
+
+
+def _allow_all_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the ALLOW-only filter to allow every frame (isolates verb wiring).
+
+    The fail-closed derivation itself is covered by tests/test_frame_blocked.py;
+    here we control the predicate so frame.nearest tests exercise the verb, not
+    the privacy machinery.
+    """
+    import screencap.frame_blocked as fb
+
+    monkeypatch.setattr(fb, "build_is_blocked", lambda rec_dir, tss: (lambda ts: False))
+
+
+@pytest.mark.asyncio
+async def test_frame_nearest_resolves_within_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _seed_screenshots(recordings_dir, "demo", [_FRAME_T0, _FRAME_T0 + 10.0])
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+    _allow_all_frames(monkeypatch)
+
+    # 1s after the 2nd frame (10s mark).
+    anchor_ms = int((_FRAME_T0 + 11.0) * 1000)
+    response = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": anchor_ms}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._FRAME_NEAREST_API_VERSION)
+    assert payload["stem"] == "1719400010.000000"
+    assert payload["delta_ms"] == -1000  # frame is 1s before the anchor
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_frame_nearest_response_is_pointer_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _seed_screenshots(recordings_dir, "demo", [_FRAME_T0])
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+    _allow_all_frames(monkeypatch)
+
+    response = await _asgi_post(
+        "/v0/frame.nearest",
+        {"recording": "demo", "timestamp_ms": int(_FRAME_T0 * 1000)},
+    )
+
+    assert response.status_code == 200
+    # Pointer-only: a bare stem, never a path or image bytes.
+    assert ".jpg" not in response.text
+    assert "screenshots" not in response.text
+    assert "/" not in response.json()["stem"]
+
+
+@pytest.mark.asyncio
+async def test_frame_nearest_over_cap_is_miss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    _seed_screenshots(recordings_dir, "demo", [_FRAME_T0])
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+    _allow_all_frames(monkeypatch)
+
+    anchor_ms = int((_FRAME_T0 + 120.0) * 1000)  # 2 min away, past the 30s cap
+    response = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": anchor_ms}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["stem"] is None
+    assert payload["delta_ms"] is None
+
+
+@pytest.mark.asyncio
+async def test_frame_nearest_missing_screenshots_is_miss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    (recordings_dir / "demo").mkdir(parents=True)  # no screenshots/ dir
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": int(_FRAME_T0 * 1000)}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["stem"] is None
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_frame_nearest_skips_blocked_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The nearest frame is blocked -> the nearest ALLOW frame is returned. R8:
+    # the verb never points an agent at a masked frame even when it is closest.
+    recordings_dir = tmp_path / "recordings"
+    _seed_screenshots(recordings_dir, "demo", [_FRAME_T0, _FRAME_T0 + 10.0])
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    import screencap.frame_blocked as fb
+
+    blocked_ts = _FRAME_T0 + 10.0
+    monkeypatch.setattr(
+        fb, "build_is_blocked",
+        lambda rec_dir, tss: (lambda ts: ts == blocked_ts),
+    )
+
+    anchor_ms = int((_FRAME_T0 + 11.0) * 1000)  # closest to the blocked 10s frame
+    response = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": anchor_ms}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stem"] == "1719400000.000000"  # the ALLOW frame
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_frame_nearest_fails_closed_all_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Indeterminate blocked geometry -> every frame blocked -> miss (not a frame).
+    recordings_dir = tmp_path / "recordings"
+    _seed_screenshots(recordings_dir, "demo", [_FRAME_T0, _FRAME_T0 + 10.0])
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    import screencap.frame_blocked as fb
+
+    monkeypatch.setattr(fb, "build_is_blocked", lambda rec_dir, tss: (lambda ts: True))
+
+    response = await _asgi_post(
+        "/v0/frame.nearest",
+        {"recording": "demo", "timestamp_ms": int(_FRAME_T0 * 1000)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stem"] is None
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_frame_nearest_rejects_traversal_recording() -> None:
+    response = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "../../etc", "timestamp_ms": 0}
+    )
+    assert response.status_code >= 400
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_name"
+
+
+@pytest.mark.asyncio
+async def test_frame_nearest_rejects_malformed_request() -> None:
+    # Missing required timestamp_ms.
+    r1 = await _asgi_post("/v0/frame.nearest", {"recording": "demo"})
+    assert r1.status_code == 400
+    assert r1.json()["error"] == "invalid_request"
+
+    # Over-bound staleness cap (> 24h).
+    r2 = await _asgi_post(
+        "/v0/frame.nearest",
+        {"recording": "demo", "timestamp_ms": 0, "staleness_cap_ms": 10**12},
+    )
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "invalid_request"
+
+    # Negative timestamp.
+    r3 = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": -1}
+    )
+    assert r3.status_code == 400
+    assert r3.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_enriches_with_chunk_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    (rec / "transcript_0002.txt").write_text("we discussed the quarterly budget review")
+    (rec / "chunk_0002_manifest.json").write_text(
+        json.dumps({"chunk_index": 2, "chunk_start": _FRAME_T0, "chunk_end": _FRAME_T0 + 900.0})
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/transcript.search", {"query": "budget"})
+
+    assert response.status_code == 200
+    hit = response.json()["hits"][0]
+    assert hit["chunk_index"] == 2
+    assert hit["timestamp_ms"] == int(_FRAME_T0 * 1000)
+    assert hit["timestamp_granularity"] == "chunk"
+    assert hit["chunk_duration_ms"] == 900_000
+
+
+@pytest.mark.asyncio
+async def test_transcript_to_frame_nearest_chunk_granular_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9: a transcript hit resolves to its chunk frame ONLY with a chunk-scaled
+    cap; the 30s default deliberately misses a mid-chunk anchor."""
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    (rec / "transcript_0000.txt").write_text("the budget discussion happened here")
+    (rec / "chunk_0000_manifest.json").write_text(
+        json.dumps({"chunk_index": 0, "chunk_start": _FRAME_T0, "chunk_end": _FRAME_T0 + 900.0})
+    )
+    # The only frame sits 5 min into the 15-min chunk — far from chunk_start.
+    _seed_screenshots(recordings_dir, "demo", [_FRAME_T0 + 300.0])
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+    _allow_all_frames(monkeypatch)
+
+    tr = await _asgi_post("/v0/transcript.search", {"query": "budget"})
+    hit = tr.json()["hits"][0]
+    anchor_ms = hit["timestamp_ms"]
+    chunk_cap = hit["chunk_duration_ms"]
+
+    # Chunk-scaled cap -> resolves to the chunk's frame.
+    resolved = await _asgi_post(
+        "/v0/frame.nearest",
+        {"recording": "demo", "timestamp_ms": anchor_ms, "staleness_cap_ms": chunk_cap},
+    )
+    assert resolved.json()["stem"] == "1719400300.000000"
+
+    # 30s default cap -> the mid-chunk anchor misses (the loop's whole point).
+    missed = await _asgi_post(
+        "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": anchor_ms}
+    )
+    assert missed.json()["stem"] is None

@@ -813,6 +813,36 @@ def _parse_chunk_index(name: str) -> int:
         return 0
 
 
+def _chunk_timing(recording_dir: Path, chunk_index: int) -> tuple[int, int] | None:
+    """``chunk_{idx:04d}_manifest.json`` → ``(chunk_start_ms, chunk_duration_ms)``.
+
+    SCR-186 U3: the wall-clock anchor for a chunk-granular transcript hit. Reads
+    the per-chunk manifest's ``chunk_start`` / ``chunk_end`` (epoch seconds) and
+    converts to ms with the same round-half-away-from-zero rule the frame stems
+    use (``frame_resolve._round_half_away``), so a transcript anchor and a frame
+    ms never disagree at a half-ms boundary. Local-only read; the manifest carries
+    only counts + timing + blocked intervals (no OCR/URL content — R6-safe).
+
+    Returns ``None`` when the manifest is absent/unreadable/incomplete so
+    ``transcript.search`` stays best-effort (the timing fields go null, the hit is
+    still returned).
+    """
+    from screencap.frame_resolve import _round_half_away
+
+    manifest = recording_dir / f"chunk_{chunk_index:04d}_manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    start = data.get("chunk_start")
+    end = data.get("chunk_end")
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    return _round_half_away(start * 1000.0), _round_half_away((end - start) * 1000.0)
+
+
 def _run_transcript_search(
     query: str, recording: str | None, limit: int,
 ) -> list[dict[str, Any]]:
@@ -843,10 +873,23 @@ def _run_transcript_search(
             except OSError:
                 continue
             if needle in text.lower():
+                chunk_index = _parse_chunk_index(path.name)
+                # SCR-186: enrich with the chunk's wall-clock anchor so the hit is
+                # resolvable by frame.nearest. The anchor is chunk-coarse
+                # (timestamp_granularity="chunk"): chunks default to 15 min and
+                # carry no per-word timing, so chunk_duration_ms is the cap an
+                # agent passes to frame.nearest. All three go null when the chunk
+                # manifest is absent (best-effort).
+                timing = _chunk_timing(rec_dir, chunk_index)
+                ts_ms = timing[0] if timing is not None else None
+                dur_ms = timing[1] if timing is not None else None
                 hits.append({
                     "recording": rec_dir.name,
-                    "chunk_index": _parse_chunk_index(path.name),
+                    "chunk_index": chunk_index,
                     "snippet": like_snippet(text, query, width=120, collapse_newlines=True),
+                    "timestamp_ms": ts_ms,
+                    "timestamp_granularity": "chunk" if ts_ms is not None else None,
+                    "chunk_duration_ms": dur_ms,
                 })
                 if len(hits) >= limit:
                     return hits
@@ -1195,6 +1238,94 @@ async def timeline_query(request: Request) -> JSONResponse:
         )
 
 
+def _run_frame_nearest(
+    recording: str, timestamp_ms: int, staleness_cap_ms: int,
+) -> dict[str, Any]:
+    """Resolve the nearest ALLOW frame for a recording, off the event loop.
+
+    Lists the recording's frames, derives the fail-closed blocked-frame predicate
+    (re-read per request — R7, no daemon-launch cache), filters to ALLOW frames,
+    and selects the nearest within ``staleness_cap_ms``. Returns
+    ``{"stem": None, "delta_ms": None}`` on any legitimate miss (missing dir, no
+    frames, all frames blocked / indeterminate geometry, or over cap) — never
+    raises for those, so the verb answers a miss rather than a 500.
+    """
+    from screencap import frame_blocked, frame_resolve
+    from screencap.config import resolve_recording_dir
+
+    _MISS = {"stem": None, "delta_ms": None}
+
+    rec_dir = resolve_recording_dir(recording)
+    if not rec_dir.is_dir():
+        return _MISS
+    frames = frame_resolve.load_frames(rec_dir / "screenshots")
+    if not frames:
+        return _MISS
+    # ALLOW-only filter (R8): never point an agent at a masked/excluded frame.
+    # build_is_blocked is fail-closed — an indeterminate recording.db flags every
+    # frame, so the eligible set empties and the verb returns a miss.
+    is_blocked = frame_blocked.build_is_blocked(rec_dir, [f.ts for f in frames])
+    eligible = [f for f in frames if not is_blocked(f.ts)]
+    result = frame_resolve.nearest_frame(eligible, timestamp_ms, staleness_cap_ms)
+    if result is None:
+        return _MISS
+    stem, delta_ms = result
+    return {"stem": stem, "delta_ms": delta_ms}
+
+
+async def frame_nearest(request: Request) -> JSONResponse:
+    """``POST /v0/frame.nearest`` — resolve a search pointer to the nearest ALLOW frame stem.
+
+    Read-only nearest-frame resolution (SCR-186). Pointer-only response: a bare
+    on-disk screenshot ``stem`` + signed ``delta_ms``, never a path or image bytes
+    (priv-R8) — the agent expands ``screenshots/<stem>.jpg`` itself. The frame is
+    filtered ALLOW-only (a masked/excluded/secure-field frame is never selected;
+    indeterminate blocked geometry fails closed to a miss). A malformed or
+    out-of-bounds request body returns a typed 400 (``invalid_request``); a
+    traversal recording name returns 400 ``invalid_name``; a legitimate miss
+    returns ``ok:true`` with null fields. Deliberately NOT in ``_ACTIVITY_PATHS``
+    — idle-shutdown stays alive via the MCP-held subscription.
+    """
+    from pydantic import ValidationError
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.FrameNearestRequest.model_validate(body)
+        except ValidationError:
+            return JSONResponse(
+                errors.error_envelope(
+                    schema_version=schema._FRAME_NEAREST_API_VERSION,
+                    error=errors.INVALID_REQUEST,
+                ),
+                status_code=400,
+            )
+        validate_recording_name(parsed.recording)
+        result = await asyncio.to_thread(
+            _run_frame_nearest,
+            parsed.recording, parsed.timestamp_ms, parsed.staleness_cap_ms,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._FRAME_NEAREST_API_VERSION,
+                stem=result["stem"],
+                delta_ms=result["delta_ms"],
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._FRAME_NEAREST_API_VERSION,
+            request=request,
+        )
+
+
 def _backfill_job(app: Starlette) -> Any:
     """Lazily attach the single backfill job holder to ``app.state``.
 
@@ -1331,6 +1462,7 @@ def build_app() -> Starlette:
             Route("/v0/content.search", content_search, methods=["POST"]),
             Route("/v0/transcript.search", transcript_search, methods=["POST"]),
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
+            Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
