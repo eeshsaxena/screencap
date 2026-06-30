@@ -58,14 +58,31 @@ works the same way.
 | Tool | Returns | Recall |
 |------|---------|--------|
 | `search_screen_content` | On-screen text snippets + `(recording, timestamp_ms)` | **Best-effort** |
-| `search_transcript` | Audio-transcript snippets + `(recording, chunk_index)` | **Best-effort** |
+| `search_transcript` | Audio-transcript snippets + `(recording, chunk_index)` + chunk timing | **Best-effort** |
 | `query_timeline` | Structured app / window / time rows | **Authoritative** |
+| `resolve_frame` | The nearest screenshot **stem** for a `(recording, timestamp_ms)` pointer | — |
 | `list_recordings` | Recording names + metadata, incl. cloud `owner_uid` + `upload_warning` | — |
 | `whoami` | The cloud account signed in on this machine (`uid` / `email`) | **Authoritative** |
 
-- **Text and pointers only — never pixels.** No tool returns or references a
-  screenshot, a video frame, or a file path. The pointer is a recording name
-  plus a timestamp the agent can mention back to you.
+- **Text and pointers only — never pixels.** No tool returns a screenshot or
+  video frame. A search pointer is a recording name plus a timestamp the agent
+  can mention back to you. `resolve_frame` turns such a pointer into the nearest
+  screenshot **stem** (e.g. `1719400010.000000`) — a filename component, never a
+  path or image bytes — which the agent expands to
+  `~/.screencap/recordings/<recording>/screenshots/<stem>.jpg` and reads with the
+  same-user filesystem access it already has.
+- **`resolve_frame` is ALLOW-filtered.** It never resolves to a frame the privacy
+  pipeline masked, excluded, or secure-field-redacted: a masked moment resolves to
+  the nearest unmasked frame, or to a `null` miss. If the recording's privacy
+  state can't be determined, it fails closed to a miss. This preserves the same
+  ALLOW-only guarantee the content index gives (see `SECURITY.md`).
+- **Resolving a transcript hit is chunk-granular.** A transcript hit carries
+  `timestamp_ms` (the chunk's start), `timestamp_granularity: "chunk"`, and
+  `chunk_duration_ms`. Chunks default to 15 minutes and have no per-word timing,
+  so pass `staleness_cap_ms = chunk_duration_ms` to `resolve_frame` to get a frame
+  representative of the chunk. Its `delta_ms` is the offset from the chunk start —
+  **not** the distance to the matched word. Content and timeline pointers carry an
+  exact `timestamp_ms` and need no special cap.
 - **Content recall is best-effort; the timeline is authoritative.** On-screen
   content comes from OCR over action-gated frames and is subject to OCR limits,
   frame de-duplication, and redaction — so "no result" is not "it never

@@ -21,6 +21,9 @@ INVALID_OUTPUT_DIR = "invalid_output_dir"
 PERMISSION_REQUIRED = "permission_required"
 INVALID_PERMISSION = "invalid_permission"
 INVALID_RANGE = "invalid_range"
+# SCR-186: a request body that fails model validation (missing required field or
+# an out-of-bounds value) — returned as a typed 400 rather than a generic 500.
+INVALID_REQUEST = "invalid_request"
 
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them

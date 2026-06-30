@@ -45,6 +45,9 @@ class _StubClient:
     async def timeline_query(self, *, start_ms=None, end_ms=None, app=None, recording=None, limit=None):
         return await self._reply("timeline", start_ms, end_ms, app, recording, limit)
 
+    async def frame_nearest(self, recording, timestamp_ms, *, staleness_cap_ms=None):
+        return await self._reply("frame", recording, timestamp_ms, staleness_cap_ms)
+
     async def list_recordings(self):
         return await self._reply("recordings")
 
@@ -95,6 +98,67 @@ async def test_transcript_and_timeline_tools_map(monkeypatch):
     tl = await server.query_timeline(app="safari")
     assert tl.coverage == "authoritative"
     assert tl.rows[0].app == "Safari"
+
+
+@pytest.mark.asyncio
+async def test_transcript_tool_surfaces_chunk_timing(monkeypatch):
+    # SCR-186: the new nullable chunk-timing fields reach the agent-facing model.
+    stub = _StubClient({
+        "transcript": {
+            "ok": True,
+            "hits": [{
+                "recording": "d", "chunk_index": 0, "snippet": "budget",
+                "timestamp_ms": 1_719_400_000_000,
+                "timestamp_granularity": "chunk",
+                "chunk_duration_ms": 900_000,
+            }],
+            "coverage": "best_effort",
+        },
+    })
+    _use_client(monkeypatch, stub)
+
+    tr = await server.search_transcript("budget")
+    hit = tr.hits[0]
+    assert hit.timestamp_ms == 1_719_400_000_000
+    assert hit.timestamp_granularity == "chunk"
+    assert hit.chunk_duration_ms == 900_000
+
+
+@pytest.mark.asyncio
+async def test_resolve_frame_maps_pointer(monkeypatch):
+    stub = _StubClient({
+        "frame": {"ok": True, "stem": "1719400010.000000", "delta_ms": -1000},
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.resolve_frame("demo", 1_719_400_011_000)
+    assert isinstance(result, server.FrameNearest)
+    assert result.stem == "1719400010.000000"
+    assert result.delta_ms == -1000
+    # Pointer-only by construction: a stem + delta, no path/bytes field.
+    assert set(server.FrameNearest.model_fields) == {"stem", "delta_ms"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_frame_miss_is_null(monkeypatch):
+    stub = _StubClient({"frame": {"ok": True, "stem": None, "delta_ms": None}})
+    _use_client(monkeypatch, stub)
+
+    result = await server.resolve_frame("demo", 0, staleness_cap_ms=900_000)
+    assert result.stem is None and result.delta_ms is None
+    # The chunk-scaled cap is forwarded to the daemon verb.
+    _, _rec, _ts, forwarded_cap = stub.calls[0]
+    assert forwarded_cap == 900_000
+
+
+@pytest.mark.asyncio
+async def test_resolve_frame_is_registered():
+    mcp = server.build_server()
+    names = {t.name for t in await mcp.list_tools()}
+    assert names == {
+        "search_screen_content", "search_transcript", "query_timeline",
+        "resolve_frame", "list_recordings", "whoami",
+    }
 
 
 @pytest.mark.asyncio
@@ -304,6 +368,34 @@ async def test_content_tool_round_trips_through_daemon(monkeypatch, tmp_path):
     assert result.index_state == "ok"
     assert result.hits[0].recording == "demo"
     assert "invoice" in result.hits[0].snippet.lower()
+
+
+@pytest.mark.asyncio
+async def test_resolve_frame_round_trips_through_daemon(monkeypatch, tmp_path):
+    # Seed a recording with two screenshots; the nearer one is blocked, so the
+    # real verb (ALLOW filter included) must resolve to the farther ALLOW frame.
+    import screencap.frame_blocked as fb
+
+    recordings_dir = tmp_path / "recordings"
+    screenshots = recordings_dir / "demo" / "screenshots"
+    screenshots.mkdir(parents=True)
+    t0 = 1_719_400_000.0
+    (screenshots / f"{t0:.6f}.jpg").write_bytes(b"")
+    (screenshots / f"{t0 + 10.0:.6f}.jpg").write_bytes(b"")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+    monkeypatch.setattr(
+        fb, "build_is_blocked",
+        lambda rec_dir, tss: (lambda ts: ts == t0 + 10.0),
+    )
+
+    client = _test_daemon_client()
+    _use_client(monkeypatch, client)
+    try:
+        result = await server.resolve_frame("demo", int((t0 + 11.0) * 1000))
+    finally:
+        await client.aclose()
+
+    assert result.stem == "1719400000.000000"  # the ALLOW frame, not the blocked nearer one
 
 
 async def _events_app(scope, receive, send):

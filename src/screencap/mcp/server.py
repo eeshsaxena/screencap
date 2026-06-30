@@ -1,9 +1,10 @@
 """FastMCP stdio server exposing ScreenCap's retrieval surface to an agent.
 
-Five tools — ``search_screen_content``, ``search_transcript``,
-``query_timeline``, ``list_recordings``, ``whoami`` — each forward to a daemon
-``/v0/*`` read verb and re-wrap the response as a typed, POINTER-ONLY result
-(text snippets + ``(recording, timestamp)`` pointers; never frame pixels). The
+Six tools — ``search_screen_content``, ``search_transcript``,
+``query_timeline``, ``resolve_frame``, ``list_recordings``, ``whoami`` — each
+forward to a daemon ``/v0/*`` read verb and re-wrap the response as a typed,
+POINTER-ONLY result (text snippets + ``(recording, timestamp)`` pointers and, for
+``resolve_frame``, a bare on-disk screenshot stem; never frame pixels). The
 server holds no query logic of its own (R1).
 
 stdio discipline: with the stdio transport the server owns stdout (the JSON-RPC
@@ -62,11 +63,27 @@ class TranscriptHit(BaseModel):
     recording: str
     chunk_index: int
     snippet: str
+    # SCR-186: chunk-granular wall-clock anchor (null when no chunk manifest).
+    # Resolve a representative chunk frame with
+    # resolve_frame(recording, timestamp_ms, staleness_cap_ms=chunk_duration_ms).
+    # timestamp_granularity is "chunk": the frame is representative of the chunk,
+    # NOT the exact frame of the matched word.
+    timestamp_ms: int | None = None
+    timestamp_granularity: str | None = None
+    chunk_duration_ms: int | None = None
 
 
 class TranscriptSearchResult(BaseModel):
     hits: list[TranscriptHit]
     coverage: str
+
+
+class FrameNearest(BaseModel):
+    """A resolved nearest-frame pointer (SCR-186). POINTER-ONLY — a bare on-disk
+    stem, never a path or image bytes; both fields null on a miss."""
+
+    stem: str | None
+    delta_ms: int | None
 
 
 class TimelineRow(BaseModel):
@@ -225,6 +242,35 @@ async def query_timeline(
     )
 
 
+async def resolve_frame(
+    recording: str, timestamp_ms: int, staleness_cap_ms: int | None = None,
+) -> FrameNearest:
+    """Resolve a (recording, timestamp_ms) pointer to the nearest screenshot stem.
+
+    Returns the on-disk screenshot **stem** (e.g. ``"1719400010.000000"``) of the
+    frame nearest ``timestamp_ms`` within ``staleness_cap_ms`` (default 30s) plus
+    a signed ``delta_ms`` (``frame_ms - timestamp_ms``). POINTER-ONLY: never image
+    bytes — read the file yourself at
+    ``~/.screencap/recordings/<recording>/screenshots/<stem>.jpg``.
+
+    The frame is ALLOW-filtered: a frame the privacy pipeline masked or excluded
+    is never returned (a masked moment resolves to the nearest unmasked frame, or
+    to a null miss). ``stem``/``delta_ms`` are null on a miss — no frame within
+    cap, no frames, or indeterminate privacy state (fail-closed).
+
+    For a transcript hit, pass its ``timestamp_ms`` AND
+    ``staleness_cap_ms=chunk_duration_ms``: that anchor is chunk-granular
+    (``timestamp_granularity="chunk"``), so the resolved frame is representative of
+    the whole chunk and ``delta_ms`` is the offset from the chunk start — NOT the
+    distance to the matched word. Content and timeline hits carry an exact
+    ``timestamp_ms`` and need no special cap.
+    """
+    env = await (await _client()).frame_nearest(
+        recording, timestamp_ms, staleness_cap_ms=staleness_cap_ms,
+    )
+    return FrameNearest(stem=env.get("stem"), delta_ms=env.get("delta_ms"))
+
+
 async def list_recordings() -> RecordingsResult:
     """List available recordings (name, date, duration, flags).
 
@@ -297,7 +343,7 @@ def build_server() -> FastMCP:
     )
     for fn in (
         search_screen_content, search_transcript, query_timeline,
-        list_recordings, whoami,
+        resolve_frame, list_recordings, whoami,
     ):
         mcp.tool()(fn)
     return mcp
