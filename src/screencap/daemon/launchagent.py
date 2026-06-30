@@ -264,6 +264,100 @@ def install(
     )
 
 
+# Permissions registered proactively at install (U3 / R1). Input Monitoring is
+# excluded — it cannot be registered for the helper on macOS 26.x and is out of
+# the required flow (already demoted to optional).
+_PROACTIVE_REGISTER_PERMISSIONS: tuple[str, ...] = ("screen_recording", "accessibility")
+
+# Client-side bound for the proactive registration POST. The server caps the
+# underlying TCC registration at 8s and always acks; allow a little slack so a
+# slow-but-succeeding registration still returns its ack rather than tripping the
+# socket timeout.
+_PROACTIVE_REQUEST_TIMEOUT_SECONDS = 9.0
+
+
+def run_proactive_setup() -> None:
+    """Best-effort install-time decoy cleanup (U4) + proactive TCC registration
+    (U3), run once the daemon is confirmed up.
+
+    Kept out of :func:`install` so that pure function stays side-effect-free and
+    widely testable; the CLI install command calls this explicitly after a
+    successful install.
+
+    - **Cleanup** runs in *this* process: ``tccutil reset`` targets OTHER
+      identities (the orphan + the legacy app row), so responsible-process
+      attribution does not apply.
+    - **Registration** MUST be attributed to the daemon's own TCC identity, so it
+      is round-tripped through ``/v0/permission.request`` over the socket — the
+      daemon runs the request API in *its* process (R6). Calling
+      ``register_permission`` in-process here would attribute the row to this
+      CLI's responsible process (e.g. Terminal), creating the wrong row.
+
+    Every step is fail-soft: a cleanup or registration hiccup must never fail an
+    otherwise-successful install. The on-demand Grant path remains as a fallback,
+    and U6's block-with-Retry recovers a row that never appeared (a headless/SSH
+    install may lack a GUI session and silently no-op the row).
+    """
+    if sys.platform != "darwin":
+        return
+
+    from screencap.daemon import tcc_cleanup
+
+    try:
+        tcc_cleanup.run_decoy_cleanup()
+    except Exception:
+        logger.debug("proactive decoy cleanup failed", exc_info=True)
+
+    for permission in _PROACTIVE_REGISTER_PERMISSIONS:
+        try:
+            _post_permission_request(permission)
+        except OSError:
+            logger.debug(
+                "proactive registration POST failed for %s", permission, exc_info=True
+            )
+
+
+def _post_permission_request(
+    permission: str, *, timeout_seconds: float = _PROACTIVE_REQUEST_TIMEOUT_SECONDS
+) -> bool:
+    """POST ``/v0/permission.request`` to the running daemon over the UDS.
+
+    Returns ``True`` on a 200 ack, ``False`` on any socket/HTTP error. The daemon
+    runs the registration in its own process so the row is attributed to the
+    daemon's identity (R6); this function only triggers it.
+    """
+    from screencap.daemon.socket import default_socket_path
+
+    body = json.dumps({"permission": permission}).encode("utf-8")
+    request = (
+        b"POST /v0/permission.request HTTP/1.1\r\n"
+        b"Host: screencap\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + body
+    )
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout_seconds)
+        sock.connect(str(default_socket_path()))
+        sock.sendall(request)
+        chunks: list[bytes] = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        response = b"".join(chunks)
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+    status_line = response.split(b"\r\n", 1)[0] if response else b""
+    return b" 200 " in status_line
+
+
 def uninstall(*, plist_path: Path | None = None) -> UninstallResult:
     """Stop the per-user LaunchAgent and remove its plist."""
     resolved_plist_path = (plist_path or default_plist_path()).expanduser()
