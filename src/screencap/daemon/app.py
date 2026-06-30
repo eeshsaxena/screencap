@@ -889,13 +889,19 @@ def _run_transcript_search(
                 continue
             if needle in text.lower():
                 chunk_index = _parse_chunk_index(path.name)
-                # SCR-186: enrich with the chunk's wall-clock anchor so the hit is
-                # resolvable by frame.nearest. The anchor is chunk-coarse
-                # (timestamp_granularity="chunk"): chunks default to 15 min and
-                # carry no per-word timing, so chunk_duration_ms is the cap an
-                # agent passes to frame.nearest. All three go null when the chunk
-                # manifest is absent (best-effort).
-                ts_ms, dur_ms = _chunk_timing(rec_dir, chunk_index) or (None, None)
+                # SCR-186: enrich per-chunk hits with the chunk's wall-clock anchor
+                # so the hit is resolvable by frame.nearest. The anchor is
+                # chunk-coarse (timestamp_granularity="chunk"): chunks default to
+                # 15 min and carry no per-word timing, so chunk_duration_ms is the
+                # cap an agent passes to frame.nearest. The bare whole-recording
+                # transcript.txt spans every chunk (it is NOT chunk 0 in a
+                # multi-chunk recording), so it gets no anchor — stamping it with
+                # chunk-0 timing would mislocate a late match. All fields go null
+                # when the chunk manifest is absent (best-effort).
+                if path.name == "transcript.txt":
+                    ts_ms, dur_ms = None, None
+                else:
+                    ts_ms, dur_ms = _chunk_timing(rec_dir, chunk_index) or (None, None)
                 hits.append({
                     "recording": rec_dir.name,
                     "chunk_index": chunk_index,

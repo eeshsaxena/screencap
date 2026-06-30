@@ -1297,9 +1297,15 @@ async def test_frame_nearest_response_is_pointer_only(
 
     assert response.status_code == 200
     # Pointer-only: a bare stem, never a path or image bytes.
+    payload = response.json()
     assert ".jpg" not in response.text
     assert "screenshots" not in response.text
-    assert "/" not in response.json()["stem"]
+    assert "/" not in payload["stem"]
+    # Structural lock: exactly the envelope keys + {stem, delta_ms}, nothing else.
+    assert set(payload) == {
+        "ok", "schema_version", "daemon_version", "api_schema_version",
+        "stem", "delta_ms",
+    }
 
 
 @pytest.mark.asyncio
@@ -1448,6 +1454,32 @@ async def test_transcript_search_enriches_with_chunk_timing(
     assert hit["timestamp_ms"] == int(_FRAME_T0 * 1000)
     assert hit["timestamp_granularity"] == "chunk"
     assert hit["chunk_duration_ms"] == 900_000
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_bare_txt_is_not_chunk_anchored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The bare whole-recording transcript.txt spans every chunk; it must NOT be
+    # stamped with chunk-0 timing (which would mislocate a late match), even when
+    # a chunk_0000 manifest exists.
+    recordings_dir = tmp_path / "recordings"
+    rec = recordings_dir / "demo"
+    rec.mkdir(parents=True)
+    (rec / "transcript.txt").write_text("the budget was discussed near the end")
+    (rec / "chunk_0000_manifest.json").write_text(
+        json.dumps({"chunk_index": 0, "chunk_start": _FRAME_T0, "chunk_end": _FRAME_T0 + 900.0})
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/transcript.search", {"query": "budget"})
+
+    assert response.status_code == 200
+    hit = response.json()["hits"][0]
+    assert hit["chunk_index"] == 0  # bare file parses to 0
+    assert hit["timestamp_ms"] is None  # but carries no resolvable anchor
+    assert hit["timestamp_granularity"] is None
+    assert hit["chunk_duration_ms"] is None
 
 
 @pytest.mark.asyncio
