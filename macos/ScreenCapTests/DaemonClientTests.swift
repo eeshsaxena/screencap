@@ -95,6 +95,27 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(grants.screenRecordingDenied)
     }
 
+    func testInputMonitoringDeniedDoesNotBlockRequiredGrants() async throws {
+        // SCR-196 follow-up: Input Monitoring can't be registered for the daemon
+        // helper on macOS 26.x, so it must NOT count toward the required set.
+        // With Screen Recording + Accessibility granted and IM denied, onboarding
+        // is complete: allRequiredGranted is true and anyRequiredDenied is false.
+        // (Before the fix, IM in the required set made both flip — stranding the
+        // user on a grant they could never give.)
+        _ = try startServer { _ in
+            .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0,"permissions":{"screen_recording":"granted","accessibility":"granted","input_monitoring":"denied"}}"#
+            )
+        }
+
+        let response = try await DaemonClient.daemonInfo()
+        let grants = try XCTUnwrap(response.permissions)
+        XCTAssertEqual(grants.inputMonitoring, .denied)
+        XCTAssertTrue(grants.allRequiredGranted)
+        XCTAssertFalse(grants.anyRequiredDenied)
+        XCTAssertFalse(grants.screenRecordingDenied)
+    }
+
     func testDaemonInfoPartialBlockDecodesMissingKeysToIndeterminate() async throws {
         // A block with only screen_recording present — absent sub-keys must
         // decode to indeterminate, never silently granted/denied.

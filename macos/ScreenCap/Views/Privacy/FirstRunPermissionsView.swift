@@ -89,10 +89,15 @@ struct FirstRunPermissionsView: View {
             if !isDaemonInstallComplete {
                 daemonInstallStep
             } else {
+                // Only the two required, grantable permissions are shown. Input
+                // Monitoring is intentionally omitted: on macOS 26.x the helper
+                // cannot register a toggleable IM row by any known mechanism, so
+                // a row here would be a dead end (a Grant button opening a pane
+                // with no helper entry). IM is advisory, not capture-fatal, so
+                // recording works without it. See DaemonPermissionGrants.
                 VStack(spacing: 12) {
                     daemonPermissionRow(pane: .screenRecording)
                     daemonPermissionRow(pane: .accessibility)
-                    daemonPermissionRow(pane: .inputMonitoring)
                 }
             }
 

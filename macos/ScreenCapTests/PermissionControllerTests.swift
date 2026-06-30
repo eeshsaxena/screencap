@@ -196,8 +196,13 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertTrue(permissions.setupDismissed)
 
         // All required granted re-arms the walkthrough for a future loss.
+        // Input Monitoring is DENIED here on purpose: it's not part of the
+        // required set (it can't be granted to the helper on macOS 26.x), so
+        // Screen Recording + Accessibility alone must clear the dismissal —
+        // i.e. onboarding completes without IM. This is the exact scenario from
+        // the SCR-196 follow-up bug.
         permissions.updateDaemonGrants(
-            DaemonPermissionGrants(screenRecording: .granted, accessibility: .granted, inputMonitoring: .granted)
+            DaemonPermissionGrants(screenRecording: .granted, accessibility: .granted, inputMonitoring: .denied)
         )
         XCTAssertFalse(permissions.setupDismissed)
     }
