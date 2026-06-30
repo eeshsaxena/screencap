@@ -253,3 +253,40 @@ coll = COLLECT(
     upx=False,
     name='screencap',
 )
+
+# ---------------------------------------------------------------------------
+# macOS helper .app bundle (SCR-196)
+#
+# Wrap the onedir COLLECT in a proper helper .app so the daemon is a first-class
+# TCC subject. A real CFBundleIdentifier (com.screencap.daemon) + Info.plist +
+# the executable at Contents/MacOS/ give macOS a responsible-code identity it
+# will auto-list (and that `tccutil` can target by bundle id) for Screen
+# Recording / Accessibility / Input Monitoring — the whole point of SCR-196. The
+# bare COLLECT (dist/screencap/) is still emitted for the non-.app CLI-tarball
+# consumer; this BUNDLE is the macOS-app artifact embedded by embed-cli.sh.
+#
+# - CFBundleExecutable MUST equal the EXE name ('screencap') so codesign can
+#   locate the designated executable and the synthesized DR names
+#   com.screencap.daemon (verify with `codesign -d -r-`).
+# - PyInstaller cross-links Frameworks/ <-> Resources/ inside the .app so the
+#   collected dylibs satisfy codesign's code-vs-resource placement rules; do
+#   not hand-place them.
+# - LSUIElement keeps the launchd-run helper out of the Dock / app switcher
+#   while still being a GUI-session agent able to drive TCC prompts.
+# - --onedir is retained (see header): multiprocessing.spawn re-execs this
+#   binary per capture worker. The spawn-from-inside-.app path is the U1
+#   go/no-go gate validated on-device before the rest of SCR-196 builds.
+# ---------------------------------------------------------------------------
+app = BUNDLE(
+    coll,
+    name='ScreencapDaemon.app',
+    icon=None,
+    bundle_identifier='com.screencap.daemon',
+    info_plist={
+        'CFBundleExecutable': 'screencap',
+        'CFBundleIdentifier': 'com.screencap.daemon',
+        'CFBundleName': 'ScreenCap Helper',
+        'CFBundlePackageType': 'APPL',
+        'LSUIElement': True,
+    },
+)
