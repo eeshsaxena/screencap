@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
 from screencap.redaction.geometry import parse_screenshot_timestamp
 
@@ -120,29 +120,3 @@ def nearest_frame(
     if abs(delta_ms) <= staleness_cap_ms:
         return chosen.stem, delta_ms
     return None
-
-
-def resolve_nearest(
-    recording_dir: Path,
-    timestamp_ms: int,
-    staleness_cap_ms: int = DEFAULT_STALENESS_CAP_MS,
-    *,
-    is_blocked: Callable[[float], bool] | None = None,
-) -> tuple[str, int] | None:
-    """Resolve the nearest **eligible** frame for a recording, or ``None``.
-
-    Composes :func:`load_frames` over ``recording_dir/screenshots`` with an
-    optional ALLOW-only filter and :func:`nearest_frame`. When ``is_blocked`` is
-    supplied, every frame whose ``ts`` it flags (a ``SCRUB_BLOCK_ACTIONS``
-    interval, secure field, or fail-closed indeterminate span) is dropped before
-    selection, so the resolver never points an agent at a masked/excluded frame
-    (SCR-186 R8). A fail-closed caller passes ``is_blocked=lambda ts: True`` to
-    force a miss when blocked geometry cannot be determined.
-
-    Returns ``None`` (a legitimate miss) when the screenshots dir is missing, no
-    eligible frame exists, or the nearest eligible frame is beyond the cap.
-    """
-    frames = load_frames(Path(recording_dir) / "screenshots")
-    if is_blocked is not None:
-        frames = [f for f in frames if not is_blocked(f.ts)]
-    return nearest_frame(frames, timestamp_ms, staleness_cap_ms)

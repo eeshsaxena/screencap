@@ -8,15 +8,11 @@ injected ALLOW-only blocked-frame filter (SCR-186 R8, Python-only).
 
 from __future__ import annotations
 
-import pytest
-
 from screencap.frame_resolve import (
-    DEFAULT_STALENESS_CAP_MS,
     Frame,
     _round_half_away,
     load_frames,
     nearest_frame,
-    resolve_nearest,
 )
 
 
@@ -134,68 +130,7 @@ def test_load_frames_excludes_jpeg_extension(tmp_path):
 def test_load_frames_missing_dir_is_empty(tmp_path):
     assert load_frames(tmp_path / "nope" / "screenshots") == []
 
-
-# ---------------------------------------------------------------------------
-# resolve_nearest — composition + cap + the ALLOW-only blocked filter
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_within_cap_returns_nearest_stem(tmp_path):
-    # Mirrors testResolveWithinCapReturnsNearest: anchor 1s from the 2nd frame.
-    _write_frames(tmp_path, "rec", epochs=[1_719_400_000.0, 1_719_400_010.0])
-    result = resolve_nearest(
-        tmp_path / "rec", 1_719_400_011_000, DEFAULT_STALENESS_CAP_MS
-    )
-    assert result is not None
-    stem, _ = result
-    assert stem == "1719400010.000000"
-
-
-def test_resolve_over_cap_is_none(tmp_path):
-    _write_frames(tmp_path, "rec", epochs=[1_719_400_000.0])
-    # 2 minutes away, well past the 30s cap.
-    assert (
-        resolve_nearest(tmp_path / "rec", 1_719_400_000_000 + 120_000)
-        is None
-    )
-
-
-def test_resolve_missing_screenshots_dir_is_none(tmp_path):
-    (tmp_path / "rec").mkdir()
-    assert resolve_nearest(tmp_path / "rec", 1_719_400_000_000) is None
-
-
-@pytest.mark.privacy
-def test_resolve_skips_blocked_frame_returns_nearest_allow(tmp_path):
-    # The otherwise-nearest frame is blocked -> the nearest ALLOW frame is
-    # returned instead. Pins SCR-186 R8: frame.nearest never points at a masked
-    # frame even when it is the closest.
-    _write_frames(
-        tmp_path, "rec", epochs=[1_719_400_000.0, 1_719_400_010.0]
-    )
-    blocked_ts = 1_719_400_010.0
-    result = resolve_nearest(
-        tmp_path / "rec",
-        1_719_400_011_000,  # closest to the blocked 10.0 frame
-        DEFAULT_STALENESS_CAP_MS,
-        is_blocked=lambda ts: ts == blocked_ts,
-    )
-    assert result is not None
-    stem, _ = result
-    assert stem == "1719400000.000000"  # the ALLOW frame, not the nearer blocked one
-
-
-@pytest.mark.privacy
-def test_resolve_all_blocked_is_none(tmp_path):
-    # Fail-closed sentinel: an is_blocked that flags everything -> miss, even
-    # though frames exist within cap.
-    _write_frames(tmp_path, "rec", epochs=[1_719_400_000.0, 1_719_400_010.0])
-    assert (
-        resolve_nearest(
-            tmp_path / "rec",
-            1_719_400_000_000,
-            DEFAULT_STALENESS_CAP_MS,
-            is_blocked=lambda ts: True,
-        )
-        is None
-    )
+# The recording-level composition (load_frames -> ALLOW filter -> nearest_frame),
+# the cap, and the blocked-frame / fail-closed behaviour are exercised end-to-end
+# against the real recording.db machinery in tests/daemon/test_read_only_verbs.py
+# (the frame.nearest verb) and tests/test_frame_blocked.py (the predicate).

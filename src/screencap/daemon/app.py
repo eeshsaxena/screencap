@@ -338,6 +338,21 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
     )
 
 
+def _validation_error_response(*, schema_version: int) -> JSONResponse:
+    """A malformed/out-of-bounds request body → typed 400 ``invalid_request``.
+
+    The shared seam for turning a pydantic ``ValidationError`` into a client
+    error rather than a generic 500 (SCR-186). Other read verbs still 500 on a
+    validation failure; generalizing them is deferred follow-up work.
+    """
+    return JSONResponse(
+        errors.error_envelope(
+            schema_version=schema_version, error=errors.INVALID_REQUEST,
+        ),
+        status_code=400,
+    )
+
+
 async def recording_start(request: Request) -> JSONResponse:
     from screencap.daemon import audit_log, provenance
     from screencap.daemon._name_validation import validate_recording_name
@@ -880,9 +895,7 @@ def _run_transcript_search(
                 # carry no per-word timing, so chunk_duration_ms is the cap an
                 # agent passes to frame.nearest. All three go null when the chunk
                 # manifest is absent (best-effort).
-                timing = _chunk_timing(rec_dir, chunk_index)
-                ts_ms = timing[0] if timing is not None else None
-                dur_ms = timing[1] if timing is not None else None
+                ts_ms, dur_ms = _chunk_timing(rec_dir, chunk_index) or (None, None)
                 hits.append({
                     "recording": rec_dir.name,
                     "chunk_index": chunk_index,
@@ -1240,37 +1253,31 @@ async def timeline_query(request: Request) -> JSONResponse:
 
 def _run_frame_nearest(
     recording: str, timestamp_ms: int, staleness_cap_ms: int,
-) -> dict[str, Any]:
+) -> tuple[str, int] | None:
     """Resolve the nearest ALLOW frame for a recording, off the event loop.
 
     Lists the recording's frames, derives the fail-closed blocked-frame predicate
     (re-read per request — R7, no daemon-launch cache), filters to ALLOW frames,
-    and selects the nearest within ``staleness_cap_ms``. Returns
-    ``{"stem": None, "delta_ms": None}`` on any legitimate miss (missing dir, no
-    frames, all frames blocked / indeterminate geometry, or over cap) — never
-    raises for those, so the verb answers a miss rather than a 500.
+    and selects the nearest within ``staleness_cap_ms``. Returns ``(stem,
+    delta_ms)`` or ``None`` on any legitimate miss (missing dir, no frames, all
+    frames blocked / indeterminate geometry, or over cap) — never raises for
+    those, so the verb answers a miss rather than a 500.
     """
     from screencap import frame_blocked, frame_resolve
     from screencap.config import resolve_recording_dir
 
-    _MISS = {"stem": None, "delta_ms": None}
-
     rec_dir = resolve_recording_dir(recording)
     if not rec_dir.is_dir():
-        return _MISS
+        return None
     frames = frame_resolve.load_frames(rec_dir / "screenshots")
     if not frames:
-        return _MISS
+        return None
     # ALLOW-only filter (R8): never point an agent at a masked/excluded frame.
     # build_is_blocked is fail-closed — an indeterminate recording.db flags every
     # frame, so the eligible set empties and the verb returns a miss.
     is_blocked = frame_blocked.build_is_blocked(rec_dir, [f.ts for f in frames])
     eligible = [f for f in frames if not is_blocked(f.ts)]
-    result = frame_resolve.nearest_frame(eligible, timestamp_ms, staleness_cap_ms)
-    if result is None:
-        return _MISS
-    stem, delta_ms = result
-    return {"stem": stem, "delta_ms": delta_ms}
+    return frame_resolve.nearest_frame(eligible, timestamp_ms, staleness_cap_ms)
 
 
 async def frame_nearest(request: Request) -> JSONResponse:
@@ -1297,23 +1304,20 @@ async def frame_nearest(request: Request) -> JSONResponse:
         try:
             parsed = schema.FrameNearestRequest.model_validate(body)
         except ValidationError:
-            return JSONResponse(
-                errors.error_envelope(
-                    schema_version=schema._FRAME_NEAREST_API_VERSION,
-                    error=errors.INVALID_REQUEST,
-                ),
-                status_code=400,
+            return _validation_error_response(
+                schema_version=schema._FRAME_NEAREST_API_VERSION,
             )
         validate_recording_name(parsed.recording)
         result = await asyncio.to_thread(
             _run_frame_nearest,
             parsed.recording, parsed.timestamp_ms, parsed.staleness_cap_ms,
         )
+        stem, delta_ms = result if result is not None else (None, None)
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._FRAME_NEAREST_API_VERSION,
-                stem=result["stem"],
-                delta_ms=result["delta_ms"],
+                stem=stem,
+                delta_ms=delta_ms,
             )
         )
     except errors.DaemonAPIError as exc:
