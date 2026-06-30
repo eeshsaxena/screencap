@@ -189,3 +189,17 @@ def test_backfill_status_daemon_unreachable_nonzero_exit():
         result = runner.invoke(cli, ["backfill", "status", "--json"])
     assert result.exit_code != 0
     assert "daemon" in result.output.lower()
+
+
+def test_backfill_cancel_daemon_unreachable_nonzero_exit():
+    """`cancel` against a down daemon also surfaces the transport-failure exit."""
+
+    def handler(request):
+        raise httpx.ConnectError("socket missing")
+
+    client_p, autospawn_p = _patch_backfill_daemon_client(handler)
+    runner = CliRunner()
+    with client_p, autospawn_p:
+        result = runner.invoke(cli, ["backfill", "cancel"])
+    assert result.exit_code != 0
+    assert "daemon" in result.output.lower()

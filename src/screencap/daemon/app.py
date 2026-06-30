@@ -54,6 +54,15 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         warm_task = getattr(app.state, "_grant_warm_task", None)
         if warm_task is not None and not warm_task.done():
             warm_task.cancel()
+        # Stop an in-flight backfill BEFORE closing the bus/loop: its OCR worker
+        # runs on a to_thread worker that the loop cannot cancel, so without an
+        # explicit stop it would keep writing content_index.db past loop close.
+        # Done before event_bus.shutdown() so the run's terminal event can still
+        # publish to a live bus. Lazily attached (only after a backfill verb), so
+        # it may be absent.
+        backfill_job = getattr(app.state, "backfill_job", None)
+        if backfill_job is not None:
+            await backfill_job.shutdown()
         if hasattr(app.state, "supervisor"):
             await app.state.supervisor.shutdown()
         await app.state.event_bus.shutdown()

@@ -204,6 +204,128 @@ async def test_cancel_transitions_to_cancelled(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Terminal EventBus events for cancelled / paused runs (only completed was
+# previously asserted on the bus).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_published_for_cancelled(monkeypatch, tmp_path):
+    def _cancellable_engine(*, stop_event, progress_cb, ledger, **_kw):
+        ledger.seed([("rec", 0)])
+        ledger.set_run_state(RunState.RUNNING)
+        if progress_cb is not None:
+            progress_cb(0, 0, 0, 1, 0)
+        while not stop_event.is_set():
+            time.sleep(0.005)
+        ledger.set_run_state(RunState.CANCELLED)
+        return _make_summary(RunState.CANCELLED, done=0, total=1, rows=0)
+
+    monkeypatch.setattr("screencap.backfill.engine.run_backfill", _cancellable_engine)
+    app = _build_app()
+    app.state.backfill_job = BackfillJob(
+        app.state.event_bus, ledger=BackfillLedger(tmp_path / "ledger.db")
+    )
+
+    async with _client(app) as client:
+        cursor = app.state.event_bus.current_cursor()
+        await client.post("/v0/backfill.start", json={})
+        await _wait_running(client)
+        await client.post("/v0/backfill.cancel", json={})
+        final = await _poll_until_terminal(client)
+        assert final["state"] == RunState.CANCELLED.value
+
+        events = await _drain_events(app, since=cursor)
+        types = [e.get("type") for e in events]
+        assert "backfill.cancelled" in types
+        assert "backfill.completed" not in types
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_published_for_paused(monkeypatch, tmp_path):
+    def _paused_engine(*, stop_event, progress_cb, ledger, **_kw):
+        # A unit stays PENDING (budget/cap pause) → engine returns PAUSED.
+        ledger.seed([("rec", 0), ("rec", 1)])
+        ledger.set_run_state(RunState.RUNNING)
+        ledger.mark("rec", 0, UnitStatus.DONE, rows_written=1)
+        if progress_cb is not None:
+            progress_cb(1, 0, 0, 2, 0)
+        ledger.set_run_state(RunState.PAUSED)
+        return _make_summary(RunState.PAUSED, done=1, total=2, rows=1)
+
+    monkeypatch.setattr("screencap.backfill.engine.run_backfill", _paused_engine)
+    app = _build_app()
+    app.state.backfill_job = BackfillJob(
+        app.state.event_bus, ledger=BackfillLedger(tmp_path / "ledger.db")
+    )
+
+    async with _client(app) as client:
+        cursor = app.state.event_bus.current_cursor()
+        await client.post("/v0/backfill.start", json={})
+        final = await _poll_until_terminal(client)
+        assert final["state"] == RunState.PAUSED.value
+
+        events = await _drain_events(app, since=cursor)
+        types = [e.get("type") for e in events]
+        assert "backfill.paused" in types
+        assert "backfill.completed" not in types
+
+
+# ---------------------------------------------------------------------------
+# Lifespan teardown signals an in-flight backfill's stop flag (SCR-194): without
+# it, the to_thread OCR worker is orphaned and keeps writing content_index.db
+# past loop close. ASGITransport does NOT run lifespan, so we drive it directly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_signals_backfill_stop(monkeypatch, tmp_path):
+    from screencap.daemon.app import build_app, lifespan
+
+    # Keep the test hermetic: the lifespan otherwise spawns a TCC grant probe.
+    async def _no_warm(_app):
+        return None
+
+    monkeypatch.setattr("screencap.daemon.app._warm_grant_cache", _no_warm)
+
+    started = threading.Event()
+    observed = {"stopped": False}
+
+    def _blocking_engine(*, stop_event, progress_cb, ledger, **_kw):
+        ledger.seed([("rec", 0)])
+        ledger.set_run_state(RunState.RUNNING)
+        if progress_cb is not None:
+            progress_cb(0, 0, 0, 1, 0)
+        started.set()
+        # Bug repro: if shutdown never sets stop_event, this loop never exits.
+        while not stop_event.is_set():
+            time.sleep(0.005)
+        observed["stopped"] = True
+        ledger.set_run_state(RunState.CANCELLED)
+        return _make_summary(RunState.CANCELLED, done=0, total=1, rows=0)
+
+    monkeypatch.setattr("screencap.backfill.engine.run_backfill", _blocking_engine)
+    app = build_app()
+    job = BackfillJob(
+        app.state.event_bus, ledger=BackfillLedger(tmp_path / "ledger.db")
+    )
+    app.state.backfill_job = job
+
+    async with lifespan(app):
+        job.start()
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "engine worker never started"
+        assert job.is_running() is True
+
+    # Exiting the lifespan must have signalled stop and awaited the worker.
+    assert observed["stopped"] is True
+    assert job.is_running() is False
+
+
+# ---------------------------------------------------------------------------
 # Liveness: _daemon_is_busy True while running, False once terminal.
 # ---------------------------------------------------------------------------
 
