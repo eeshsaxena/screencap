@@ -227,6 +227,111 @@ def test_synthesized_window_when_no_manifest(env):
     assert {h.recording for h in _hits(env.store_path, "synth")} == {"rec"}
 
 
+def test_no_manifest_fallback_pages_past_frame_cap(env):
+    """A long no-manifest recording is split into bounded sub-chunks (Gap 2).
+
+    Without the split a single synthesized whole-recording window would cap at
+    ``max_frames`` distinct frames, mark the unit DONE, and drop the tail. The
+    fallback now emits ≤``max_frames`` sub-windows, so every frame is indexed.
+    """
+    _make_recording(
+        env.recordings / "rec",
+        windows=[{"ts": 50.0, "bundle": "com.example.unknownbenign", "title": "X"}],
+        screenshot_ts=[100.0, 110.0, 120.0, 130.0, 140.0],
+        manifest=None,
+    )
+    ocr = _FakeOcr({ts: "frame text" for ts in (
+        100_000, 110_000, 120_000, 130_000, 140_000,
+    )})
+
+    # max_frames=2 → 5 frames split into 3 sub-windows ([100,110],[120,130],[140]),
+    # none of which hits the cap, so the whole recording is indexed.
+    summary = _run(env, ocr, max_frames_per_recording=2)
+
+    assert summary.state == RunState.COMPLETED
+    assert {h.timestamp_ms for h in _hits(env.store_path, "frame")} == {
+        100_000, 110_000, 120_000, 130_000, 140_000,
+    }
+    # 3 sub-chunk units, all DONE.
+    assert summary.done == 3 and summary.total == 3
+
+
+def test_index_deletion_resets_ledger_and_rebuilds(env):
+    """Deleting content_index.db after a backfill rebuilds it on resume (Gap 3).
+
+    The ledger and the index are separate files. Without the guard, DONE units
+    would be skipped on resume and the deleted index would stay empty. The engine
+    detects "store missing + ledger has indexed rows" and resets the ledger so the
+    index is rebuilt.
+    """
+    _make_recording(
+        env.recordings / "rec",
+        windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "X"}],
+        screenshot_ts=[110.0],
+        manifest=(100.0, 200.0),
+    )
+    ocr1 = _FakeOcr({110_000: "rebuild text"})
+    summary1 = _run(env, ocr1)
+    assert summary1.state == RunState.COMPLETED
+    assert {h.recording for h in _hits(env.store_path, "rebuild")} == {"rec"}
+
+    # Delete the content index (incl. WAL sidecars) but keep the ledger.
+    for suffix in ("", "-wal", "-shm"):
+        side = Path(str(env.store_path) + suffix)
+        if side.exists():
+            side.unlink()
+    assert env.ledger.is_complete() is True  # ledger still marks the unit DONE
+
+    # Resume: store missing + ledger has indexed rows → ledger reset → re-OCR.
+    ocr2 = _FakeOcr({110_000: "rebuild text"})
+    summary2 = _run(env, ocr2)
+    assert summary2.state == RunState.COMPLETED
+    assert ocr2.calls == [110_000]  # re-OCR'd ([] would mean the DONE was skipped)
+    assert {h.recording for h in _hits(env.store_path, "rebuild")} == {"rec"}
+
+
+def test_empty_library_completes_without_resume_churn(env):
+    """A library with nothing to index COMPLETES (not a churning PAUSED).
+
+    An empty enumeration must not leave the run PAUSED — should_auto_resume would
+    then re-run a no-op every daemon boot forever (SCR-193 review finding).
+    """
+    ocr = _FakeOcr({})
+    summary = _run(env, ocr)
+
+    assert summary.state == RunState.COMPLETED
+    assert summary.total == 0
+    assert should_auto_resume(env.ledger) is False
+
+
+def test_index_and_recordings_both_deleted_completes_no_churn(env):
+    """Index deleted AND its recordings gone → reset then COMPLETE, no churn.
+
+    The Gap-3 reset wipes the ledger; if the recordings that produced the index
+    are also gone, the re-enumeration is empty. The run must COMPLETE (nothing to
+    do) rather than PAUSE-and-auto-resume forever.
+    """
+    _make_recording(
+        env.recordings / "rec",
+        windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "X"}],
+        screenshot_ts=[110.0],
+        manifest=(100.0, 200.0),
+    )
+    assert _run(env, _FakeOcr({110_000: "gone text"})).state == RunState.COMPLETED
+
+    # Delete BOTH the index and the recording it indexed.
+    for suffix in ("", "-wal", "-shm"):
+        side = Path(str(env.store_path) + suffix)
+        if side.exists():
+            side.unlink()
+    import shutil
+    shutil.rmtree(env.recordings / "rec")
+
+    summary = _run(env, _FakeOcr({}))
+    assert summary.state == RunState.COMPLETED
+    assert should_auto_resume(env.ledger) is False
+
+
 # --------------------------------------------------------------------------
 # R2 / R3 — blocked interval + uncovered gap absent
 # --------------------------------------------------------------------------
@@ -434,21 +539,21 @@ def test_tiny_budget_returns_paused_then_completes(env):
 
 
 # --------------------------------------------------------------------------
-# R8 — library overflow → PAUSED even when every enumerated unit completes
+# SCR-193 Gap 1 — a library larger than one window pages to full coverage
 # --------------------------------------------------------------------------
 
 
-def test_overflow_returns_paused_even_when_all_enumerated_units_done(env, monkeypatch):
-    """A library larger than the cap returns PAUSED with an unenumerated tail.
+def test_library_larger_than_window_pages_to_completion(env, monkeypatch):
+    """A library exceeding the per-window cap is fully indexed by paging.
 
-    Distinct from the budget/cancel pauses: every unit the engine *enumerated*
-    completes (``is_complete()`` is True), yet coverage is incomplete because the
-    cap dropped the rest of the library — so the run must be PAUSED, and
-    ``should_auto_resume`` must NOT re-run it (re-enumeration is an explicit
-    user-driven start, not a silent boot resume).
+    Regression for the prior dead-end (SCR-193 Gap 1): a >cap library used to be
+    truncated to the first window and return a permanent PAUSED whose resume
+    re-scanned the same first window forever. The engine now pages through
+    successive windows within the run, so EVERY recording is indexed and the run
+    COMPLETES.
     """
     monkeypatch.setattr("screencap.backfill.engine._MAX_RECORDINGS", 1)
-    for name in ("rec_a", "rec_b"):
+    for name in ("rec_a", "rec_b", "rec_c"):
         _make_recording(
             env.recordings / name,
             windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": name}],
@@ -456,14 +561,61 @@ def test_overflow_returns_paused_even_when_all_enumerated_units_done(env, monkey
             manifest=(100.0, 200.0),
         )
 
-    ocr = _FakeOcr({110_000: "overflow text"})
+    ocr = _FakeOcr({110_000: "paged text"})
     summary = _run(env, ocr)
 
-    # All enumerated (capped) units completed, but the library overflowed → PAUSED.
-    assert summary.state == RunState.PAUSED
+    assert summary.state == RunState.COMPLETED
     assert env.ledger.is_complete() is True
-    # Overflow-complete must not auto-resume (the predicate keys on is_complete()).
+    # All three recordings — across three windows — were indexed, not just the
+    # first window's.
+    assert {h.recording for h in _hits(env.store_path, "paged")} == {
+        "rec_a", "rec_b", "rec_c",
+    }
+    assert summary.done == 3 and summary.total == 3
+    # Complete → nothing left to auto-resume.
     assert should_auto_resume(env.ledger) is False
+
+
+def test_paging_resume_reaches_tail_after_cancel(env, monkeypatch):
+    """A cancel in window 1 leaves the tail PENDING; a resume reaches it.
+
+    Proves the resume frontier advances past already-covered recordings (the
+    Gap 1 guarantee): the cancelled run indexes only rec_a, and the resume picks
+    up rec_b/rec_c — the tail the old truncating cap could never reach — without
+    re-OCRing rec_a.
+    """
+    monkeypatch.setattr("screencap.backfill.engine._MAX_RECORDINGS", 1)
+    for name in ("rec_a", "rec_b", "rec_c"):
+        _make_recording(
+            env.recordings / name,
+            windows=[{"ts": 100.0, "bundle": "com.example.unknownbenign", "title": name}],
+            screenshot_ts=[110.0],
+            manifest=(100.0, 200.0),
+        )
+
+    # Cancel right after rec_a's only frame is OCR'd → window 1 done, tail PENDING.
+    stop = threading.Event()
+
+    class _StopAfterRecA(_FakeOcr):
+        def recognize(self, path, **kw):
+            res = super().recognize(path, **kw)
+            if "rec_a" in str(path):
+                stop.set()
+            return res
+
+    ocr1 = _StopAfterRecA({110_000: "paged text"})
+    summary1 = _run(env, ocr1, stop_event=stop)
+    assert summary1.state == RunState.CANCELLED
+    assert {h.recording for h in _hits(env.store_path, "paged")} == {"rec_a"}
+
+    # Resume: rec_a is covered and skipped; rec_b + rec_c (the tail) are indexed.
+    ocr2 = _FakeOcr({110_000: "paged text"})
+    summary2 = _run(env, ocr2)
+    assert summary2.state == RunState.COMPLETED
+    assert ocr2.calls == [110_000, 110_000]  # rec_b + rec_c only, NOT rec_a again
+    assert {h.recording for h in _hits(env.store_path, "paged")} == {
+        "rec_a", "rec_b", "rec_c",
+    }
 
 
 # --------------------------------------------------------------------------
