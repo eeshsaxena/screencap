@@ -122,6 +122,22 @@ final class SCColorTests: XCTestCase {
         }
     }
 
+    func testOnAccentLabelIsADarkToken() {
+        // AuroraButtonStyle paints its label with `scOnAccent` (never .white /
+        // .primary) so dark-text-on-lime/amber contrast holds (SCR-197 U3). Assert
+        // the token is genuinely dark rather than white.
+        for appearance in [light, dark] {
+            guard let onAccent = resolve("SCOnAccent", appearance) else {
+                XCTFail("scOnAccent did not resolve")
+                continue
+            }
+            XCTAssertLessThan(
+                relativeLuminance(onAccent), 0.2,
+                "scOnAccent must be a dark label token"
+            )
+        }
+    }
+
     func testErrorForegroundAndSurfaceAreDistinct() {
         // Guards the fg/surface split from re-collapsing into one role (R2 contract).
         for appearance in [light, dark] {
