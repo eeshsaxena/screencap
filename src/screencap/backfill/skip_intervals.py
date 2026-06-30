@@ -108,6 +108,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class CanonicalDerivationError(Exception):
+    """The canonical ``SCRUB_BLOCK_ACTIONS`` pass could not be fully derived.
+
+    Raised by :func:`derive_skip_intervals` only when ``require_canonical=True``
+    and ``build_scrub_context`` either raised or signalled a partial read
+    (``ScrubContext.canonical_ok is False``). It lets the *fail-closed*
+    ``frame.nearest`` surface distinguish a genuine all-ALLOW recording (empty
+    canonical set, no error) from a partial ``recording.db`` read that *under*-
+    blocked, and fall closed on the latter (SCR-198). The fail-open backfill path
+    omits the flag and never sees this.
+    """
+
+
 # Reason codes for the fail-closed residual intervals this module adds on top of
 # the canonical scrub set. Backfill-local (not in ``privacy.reasons.ReasonCode``)
 # because they describe a re-derivation artifact, not a policy decision.
@@ -250,6 +264,7 @@ def derive_skip_intervals(
     evaluator,
     time_range: tuple[float, float],
     screenshot_timestamps: list[float] | None = None,
+    require_canonical: bool = False,
 ) -> list[BlockedInterval]:
     """Return the merged/sorted union of skip intervals for ``[start, end)``.
 
@@ -273,8 +288,19 @@ def derive_skip_intervals(
        *before the first* surviving window) and be indexed. Each orphan is skipped
        with a TIGHT interval so legitimately-indexable neighbours are untouched.
 
-    Always a superset of the live block set; never raises on a legacy schema or
-    a missing/locked DB (returns whatever it could derive, fail-closed).
+    Always a superset of the live block set; by default never raises on a legacy
+    schema or a missing/locked DB (returns whatever it could derive, fail-closed
+    via the gap/ambiguity residual) — the fail-open backfill posture.
+
+    ``require_canonical`` (fail-*closed* callers, e.g. ``frame.nearest`` via
+    :mod:`screencap.frame_blocked`): when True, raise :class:`CanonicalDerivationError`
+    if the canonical ``build_scrub_context`` pass did not fully succeed — it raised,
+    or it signalled a partial read (``ScrubContext.canonical_ok is False``). An
+    empty canonical set from a *clean* read (a genuine all-ALLOW recording) does
+    NOT raise. This closes the SCR-198 hole where a partial read empties the
+    canonical set while the independent ambiguity read still yields
+    ``window_starts`` (so the uncovered-gap pass adds nothing), silently
+    *under*-blocking a genuinely-masked frame.
     """
     db_path = Path(db_path)
     start, end = time_range
@@ -285,20 +311,45 @@ def derive_skip_intervals(
     surviving_screenshot_ts: set[float] | None = None
 
     db_exists = db_path.is_file()
+    if require_canonical and not db_exists:
+        # A missing/unreadable recording.db is the most extreme canonical failure:
+        # build_scrub_context is never even called below. Fail-closed callers must
+        # see that as a raise at this seam, not depend on the uncovered-gap pass
+        # (which only fires when screenshot_timestamps is supplied) (SCR-198).
+        raise CanonicalDerivationError(
+            "recording.db missing/unreadable; canonical block set is underivable"
+        )
     if db_exists:
         # 1. Canonical SCRUB_BLOCK_ACTIONS intervals (incl. secure-field).
+        canonical_failed = False
         try:
             # build_scrub_context already builds its blocked_intervals with
             # ``actions=SCRUB_BLOCK_ACTIONS`` internally (the scrub-time set) and
-            # merges secure-field intervals — no actions kwarg to pass.
+            # merges secure-field intervals — no actions kwarg to pass. It fails
+            # *gracefully* (empty/partial blocked_intervals, no raise), signalling
+            # a partial read via ``canonical_ok`` rather than raising (SCR-198).
             ctx = build_scrub_context(
                 db_path, evaluator, classifier, time_range=time_range,
             )
             canonical = list(ctx.blocked_intervals)
+            # Direct attribute access (not getattr-with-default): ScrubContext
+            # always declares canonical_ok, and a default of True would fail
+            # *open* — the wrong direction for this fail-closed seam. If the
+            # contract ever broke, the AttributeError surfaces as a fail-closed
+            # miss via frame_blocked's except, not a silent under-block.
+            canonical_failed = not ctx.canonical_ok
         except Exception:
+            canonical_failed = True
             logger.warning(
                 "derive_skip_intervals: canonical build_scrub_context failed; "
                 "relying on gap/ambiguity residual only", exc_info=True,
+            )
+        if require_canonical and canonical_failed:
+            # Fail-closed caller: an under-blocked canonical set is unsafe to
+            # trust, so refuse rather than silently return it. The caller
+            # (frame_blocked) turns this into the all-blocked sentinel.
+            raise CanonicalDerivationError(
+                "canonical build_scrub_context did not fully succeed"
             )
 
         # 3. Ambiguity intervals (raw SQL on the columns).

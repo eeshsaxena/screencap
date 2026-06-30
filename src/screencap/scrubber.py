@@ -171,6 +171,17 @@ class ScrubContext:
     classifier: object | None = None  # DefaultContextClassifier
     pixel_ratio: float = 2.0
 
+    # True iff every read feeding ``blocked_intervals`` completed without error.
+    # ``build_scrub_context`` fails *gracefully* (returns an empty/partial
+    # ``blocked_intervals`` without raising) so the fail-open scrub/backfill paths
+    # keep running; an empty set is also the legitimate shape of an all-ALLOW
+    # recording, so callers cannot tell a partial read from a clean ALLOW pass
+    # by inspecting ``blocked_intervals`` alone. This flag carries that
+    # distinction so the *fail-closed* ``frame.nearest`` surface can fall closed
+    # on a partial canonical read instead of under-blocking (SCR-198). Fail-open
+    # callers ignore it.
+    canonical_ok: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Shared scrub_text()
@@ -822,12 +833,18 @@ def build_scrub_context(
                                 browser_url=raw_url or None,
                             ))
                 except Exception:
+                    # Partial read: the canonical pass empties (no window events →
+                    # no blocked intervals) while other reads may still succeed.
+                    # Flag it so fail-closed callers don't mistake this for a
+                    # genuine all-ALLOW recording (SCR-198).
+                    ctx.canonical_ok = False
                     logger.debug("Failed to load scoped window events", exc_info=True)
             else:
                 # Full load for scrubber path
                 try:
                     ctx.window_events = load_window_events(db_path)
                 except Exception:
+                    ctx.canonical_ok = False
                     logger.debug("Failed to load window events", exc_info=True)
 
             # Build blocked-app intervals using scrub-time action set.
@@ -862,6 +879,7 @@ def build_scrub_context(
         # mouse.move drops, no drag-coord nulling). Operators must see
         # this in logs to investigate the underlying cause (busy SQLite,
         # missing window_event table on older recordings, OOM, etc.).
+        ctx.canonical_ok = False
         logger.warning(
             "build_scrub_context failed; pointer suppression DISABLED "
             "for this recording: %s",

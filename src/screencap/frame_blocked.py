@@ -16,8 +16,11 @@ uncovered-gap / ambiguity / orphan residual, and the same capture-time
 resolve-time skip can never drift from the index-time skip.
 
 **Fail-closed.** When blocked geometry cannot be determined — a missing /
-unreadable ``recording.db`` (every frame becomes an uncovered gap) or any failure
-building the privacy machinery — the predicate flags *every* frame, so
+unreadable ``recording.db`` (every frame becomes an uncovered gap), any failure
+building the privacy machinery, or a *partial* ``recording.db`` read that
+under-builds the canonical block set (SCR-198: ``derive_skip_intervals`` is
+called with ``require_canonical=True`` so it raises rather than silently
+returning the under-blocked set) — the predicate flags *every* frame, so
 ``frame.nearest`` returns a miss rather than risk surfacing a sensitive frame.
 This is the one place the system is deliberately fail-*closed* (the rest of the
 content-index path is fail-open): a resolution that could point at a masked frame
@@ -81,6 +84,13 @@ def build_is_blocked(
             evaluator=evaluator,
             time_range=(start, end),
             screenshot_timestamps=list(frame_tss),
+            # Fail closed on a partial canonical read: build_scrub_context empties
+            # the canonical set gracefully (no raise) on a partial recording.db
+            # read, which is indistinguishable from a genuine all-ALLOW recording.
+            # require_canonical makes derive_skip_intervals raise instead, so the
+            # except below maps it to the all-blocked sentinel rather than
+            # surfacing an under-blocked frame (SCR-198).
+            require_canonical=True,
         )
         # derive_skip_intervals returns a merged, start-sorted list; pre-build the
         # starts list for the bisect-backed membership test (mirrors index_core).
@@ -91,6 +101,13 @@ def build_is_blocked(
 
         return is_blocked
     except Exception:
+        # MUST stay broad enough to catch CanonicalDerivationError — that is the
+        # signal a partial canonical read raises (require_canonical=True above),
+        # and mapping it to _always_blocked is what fails closed (SCR-198). Do not
+        # narrow this to a specific type set without keeping that error in it.
+        # (CanonicalDerivationError is not imported at module top on purpose: that
+        # would pull the heavy skip_intervals/scrubber stack into this otherwise-
+        # light module — so it is matched via Exception, not by name.)
         logger.warning(
             "frame.nearest: blocked-interval derivation failed for %s; failing "
             "closed (all frames treated as blocked)",

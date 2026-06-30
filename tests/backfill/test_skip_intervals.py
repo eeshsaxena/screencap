@@ -32,6 +32,7 @@ from screencap.backfill.skip_intervals import (
     AMBIGUOUS_TITLE,
     ORPHAN_SCREENSHOT,
     UNCOVERED_GAP,
+    CanonicalDerivationError,
     build_classifier_evaluator,
     derive_skip_intervals,
 )
@@ -40,7 +41,12 @@ from screencap.privacy.policy import (
     FrameMetadata,
     PrivacyMode,
 )
-from screencap.scrubber import BlockedInterval, build_scrub_context, find_blocked_interval
+from screencap.scrubber import (
+    BlockedInterval,
+    ScrubContext,
+    build_scrub_context,
+    find_blocked_interval,
+)
 
 # SCR-178: this whole module is the privacy-load-bearing skip-set derivation.
 # CI runs only ``pytest -m privacy`` (there is no general pytest lane), so mark the
@@ -720,3 +726,122 @@ def test_no_screenshot_table_disables_orphan_check(tmp_path):
     # No table → cannot cross-check → frame is NOT flagged orphan (the divergence
     # the check guards requires a purge, which only exists where the table does).
     assert find_blocked_interval(150.0, intervals) is None
+
+
+# --------------------------------------------------------------------------
+# SCR-198 — partial canonical read (build_scrub_context silent-empty)
+# --------------------------------------------------------------------------
+
+
+def _make_canonical_empty_partial_read(monkeypatch):
+    """Simulate a partial recording.db read: ``build_scrub_context`` empties the
+    canonical set and signals it via ``canonical_ok=False`` *without raising*.
+
+    The separate raw-SQL ambiguity read in ``derive_skip_intervals`` opens its
+    own connection on the real DB and is untouched, reproducing the exact SCR-198
+    shape: an empty canonical set while ``window_starts`` is still populated (so
+    the uncovered-gap pass adds nothing for a covered frame).
+    """
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.build_scrub_context",
+        lambda *a, **k: ScrubContext(canonical_ok=False),
+    )
+
+
+def test_partial_canonical_read_fail_open_by_default(tmp_path, monkeypatch):
+    """Default (backfill) stays fail-open: a partial canonical read does NOT raise.
+
+    A masked 1password window spans [100, 200). With the canonical pass emptied
+    by a partial read, the frame at 150 silently under-blocks — the fail-open
+    posture the backfill must keep (better to miss-index a benign frame than to
+    over-skip every frame on a transient read error).
+    """
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.1password.1password", "title": "Vault"},
+        {"ts": 200.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    classifier, evaluator = _public()
+    _make_canonical_empty_partial_read(monkeypatch)
+
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[150.0],
+    )
+    # No raise; the canonical hole means the masked frame is (under-)allowed. The
+    # ambiguity read still saw window 100 → 150 is "covered" → no gap residual.
+    assert find_blocked_interval(150.0, intervals) is None
+
+
+def test_partial_canonical_read_require_canonical_raises(tmp_path, monkeypatch):
+    """Fail-closed caller: ``require_canonical=True`` raises on a partial read.
+
+    Same setup as the fail-open test, but the fail-closed ``frame.nearest`` caller
+    refuses the under-blocked set rather than trusting it (SCR-198).
+    """
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.1password.1password", "title": "Vault"},
+        {"ts": 200.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    classifier, evaluator = _public()
+    _make_canonical_empty_partial_read(monkeypatch)
+
+    with pytest.raises(CanonicalDerivationError):
+        derive_skip_intervals(
+            db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+            screenshot_timestamps=[150.0],
+            require_canonical=True,
+        )
+
+
+def test_require_canonical_clean_allow_does_not_raise(tmp_path):
+    """A genuine all-ALLOW recording (clean read, empty canonical) must NOT raise.
+
+    The whole point of the ``canonical_ok`` signal: an empty canonical set from a
+    *successful* read is the legitimate shape of an all-ALLOW recording and must
+    survive ``require_canonical=True`` (else the common happy path would break).
+    """
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    classifier, evaluator = _public()
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[150.0],
+        require_canonical=True,
+    )
+    # No raise, and the benign covered frame stays ALLOW.
+    assert find_blocked_interval(150.0, intervals) is None
+
+
+def test_require_canonical_missing_db_raises_at_seam(tmp_path):
+    """Missing recording.db + require_canonical raises *at the seam* (SCR-198).
+
+    A missing DB is the most extreme canonical failure: build_scrub_context is
+    never called. The fail-closed contract must hold here without depending on the
+    uncovered-gap pass (which only fires when screenshot_timestamps is supplied),
+    so the raise is self-contained — even with no screenshot_timestamps.
+    """
+    classifier, evaluator = _public()
+    missing = tmp_path / "nonexistent" / "recording.db"
+    with pytest.raises(CanonicalDerivationError):
+        derive_skip_intervals(
+            missing, classifier=classifier, evaluator=evaluator,
+            time_range=(0.0, 1000.0),
+            require_canonical=True,
+        )
+
+
+def test_missing_db_fail_open_by_default_no_raise(tmp_path):
+    """Default (backfill) over a missing DB still returns gracefully (no raise)."""
+    classifier, evaluator = _public()
+    missing = tmp_path / "nonexistent" / "recording.db"
+    intervals = derive_skip_intervals(
+        missing, classifier=classifier, evaluator=evaluator,
+        time_range=(0.0, 1000.0),
+        screenshot_timestamps=[150.0],
+    )
+    # Fail-open: every supplied frame is an uncovered gap (no window events).
+    assert find_blocked_interval(150.0, intervals) is not None
