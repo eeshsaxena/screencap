@@ -62,6 +62,22 @@ enum PrivacyPane: String, CaseIterable {
         self != .microphone
     }
 
+    /// The exact name macOS shows for the *helper's* row in this pane's Privacy
+    /// list. Screen Recording attributes the grant to the containing app bundle,
+    /// so its row reads "ScreenCap"; Accessibility and Input Monitoring attribute
+    /// to the bare daemon tool (`Contents/Resources/screencap/screencap`, no
+    /// bundle id), so their rows read lowercase "screencap". Naming the exact row
+    /// stops the user enabling the wrong same-named entry — the "ScreenCap" app
+    /// row instead of the "screencap" helper row, which leaves the daemon's grant
+    /// denied even though System Settings *looks* granted. See
+    /// docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md.
+    var helperSettingsEntryName: String {
+        switch self {
+        case .screenRecording, .microphone: return "ScreenCap"
+        case .accessibility, .inputMonitoring: return "screencap"
+        }
+    }
+
     /// Maps the `permission` string emitted by `_check_permissions_now`
     /// (recorder.py) — one of `screen_recording` / `accessibility` /
     /// `input_monitoring` — to the matching pane. Microphone is intentionally

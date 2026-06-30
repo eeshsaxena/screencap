@@ -2,7 +2,7 @@
 title: "Ad-hoc-signed dev builds appear as a new app to TCC on every rebuild — orphaning prior grants"
 slug: macos-ad-hoc-signing-tcc-rebuild-treadmill
 date: 2026-05-01
-updated: 2026-06-15
+updated: 2026-06-30
 category: build-errors
 severity: medium
 problem_type: dev-environment-friction
@@ -142,11 +142,25 @@ codesign -dv --verbose=2 <App>.app/Contents/Resources/screencap/screencap
 ungranted-or-wrong-entry, fixed below.
 
 **3. Account for three quirks that make a correct grant *look* broken:**
-- **Per-pane name divergence.** Screen Recording attributes to the containing
-  bundle, so its entry shows as **"ScreenCap"** (capitalized). Accessibility and
-  Input Monitoring attribute to the bare tool, so their entries show as lowercase
-  **`screencap`**. You enable differently-named rows in different panes — "it
-  never shows anything" is usually looking for the wrong name in the wrong pane.
+- **Per-pane name divergence — the two-row trap (canonical example).** Screen
+  Recording attributes to the containing bundle, so its entry shows as
+  **"ScreenCap"** (capitalized). Accessibility and Input Monitoring attribute to
+  the bare tool, so their entries show as lowercase **`screencap`**. The
+  Accessibility pane therefore lists **two** rows that look like the same app:
+
+  | Row (Accessibility pane)         | Icon            | Is the grant the daemon needs? |
+  |----------------------------------|-----------------|--------------------------------|
+  | `screencap` (lowercase)          | terminal "exec" | **YES** — the daemon's TCC subject (the bare helper tool) |
+  | `ScreenCap` (capitalized)        | app grid icon   | No — the app bundle, *not* the recorder |
+
+  The natural-but-wrong move is to enable **`ScreenCap`** (looks like "the app"),
+  which leaves the lowercase **`screencap`** row OFF — so `daemon.info` keeps
+  reporting `accessibility: denied` while System Settings *looks* granted, and
+  **restarting the daemon does not help** (the grant genuinely isn't there for the
+  helper's subject). Fix: enable the **lowercase `screencap`** row. As of the
+  walkthrough copy fix, the "Set up ScreenCap" rows now name the exact entry per
+  pane (`PrivacyPane.helperSettingsEntryName`) and flag the lowercase one, so this
+  trap is called out in-product instead of relying on this note.
 - **Default OFF + stale pane.** A freshly-registered entry is **default OFF**, and
   the Screen Recording pane does **not** live-refresh. Quit System Settings
   (`Cmd+Q`) and reopen to see and toggle the new entry.
