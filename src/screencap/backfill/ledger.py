@@ -368,6 +368,60 @@ class BackfillLedger:
         finally:
             conn.close()
 
+    def is_recording_covered(self, recording: str) -> bool:
+        """True iff this recording has >=1 seeded unit and ALL of them are terminal.
+
+        Drives the SCR-193 cross-window paging: a library larger than one
+        seed-window is processed window-by-window, and a recording whose every
+        chunk is already terminal (``DONE`` / ``SKIPPED`` / ``FAILED``) must be
+        skipped when building the next window so the run advances to the tail
+        instead of re-scanning the same first window forever. Returns False for
+        a recording with no seeded units (never started → still work to do) and
+        False while ANY of its chunks is ``PENDING`` (a partial recording is
+        re-selected so its remaining chunks finish first).
+        """
+        conn = self._connect()
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM backfill_unit_state WHERE recording_dir_name=?",
+                (str(recording),),
+            ).fetchone()[0]
+            if not total:
+                return False
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM backfill_unit_state "
+                "WHERE recording_dir_name=? AND status=?",
+                (str(recording), UnitStatus.PENDING.value),
+            ).fetchone()[0]
+            return pending == 0
+        finally:
+            conn.close()
+
+    def has_done_with_rows(self) -> bool:
+        """True iff any unit is ``DONE`` with ``rows_written > 0``.
+
+        Drives the SCR-193 content-index-deletion guard: the ledger
+        (``backfill_state.db``) and the index (``content_index.db``) are separate
+        files, so deleting the index after a backfill would otherwise leave DONE
+        units that are skipped forever on resume — the index stays empty for
+        them. A DONE unit with ``rows_written > 0`` is positive proof that rows
+        were written to the index; if the index file is then missing, the engine
+        resets the ledger and re-OCRs. The ``> 0`` guard is deliberate: a fully
+        privacy-blocked / empty recording is legitimately DONE with zero rows and
+        never created the store (``index_range``'s empty-store guard), so its
+        absence is expected and must NOT trigger a reset.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM backfill_unit_state "
+                "WHERE status=? AND rows_written>0 LIMIT 1",
+                (UnitStatus.DONE.value,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------------
     # Run-level state (for the U5 auto-resume rule).
     # ------------------------------------------------------------------

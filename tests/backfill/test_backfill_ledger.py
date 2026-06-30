@@ -76,6 +76,46 @@ def test_is_complete_false_on_empty_ledger(tmp_path: Path) -> None:
     assert led.is_complete() is False
 
 
+def test_is_recording_covered_tracks_per_recording_terminality(tmp_path: Path) -> None:
+    """SCR-193 Gap 1 paging frontier: covered iff seeded AND all chunks terminal."""
+    led = _ledger(tmp_path)
+    # Unseeded recording → not covered (still work to do).
+    assert led.is_recording_covered("rec") is False
+
+    led.seed([("rec", 0), ("rec", 1)])
+    assert led.is_recording_covered("rec") is False  # both PENDING
+
+    led.mark("rec", 0, UnitStatus.DONE, rows_written=2)
+    assert led.is_recording_covered("rec") is False  # one chunk still PENDING
+
+    # Any terminal status counts (DONE / SKIPPED / FAILED) — covered once none pend.
+    led.mark("rec", 1, UnitStatus.SKIPPED)
+    assert led.is_recording_covered("rec") is True
+    # Coverage is per recording — an unrelated recording is independent.
+    assert led.is_recording_covered("other") is False
+
+
+def test_has_done_with_rows_only_for_positive_row_counts(tmp_path: Path) -> None:
+    """SCR-193 Gap 3 guard: True only for a DONE unit that actually wrote rows."""
+    led = _ledger(tmp_path)
+    led.seed([("rec", 0)])
+    assert led.has_done_with_rows() is False  # PENDING
+
+    # A DONE unit with zero rows (fully-blocked / empty range) must NOT count —
+    # such a recording legitimately never created the store.
+    led.mark("rec", 0, UnitStatus.DONE, rows_written=0)
+    assert led.has_done_with_rows() is False
+
+    led.mark("rec", 0, UnitStatus.DONE, rows_written=5)
+    assert led.has_done_with_rows() is True
+
+    # A SKIPPED unit with a (hypothetical) row count is not DONE → does not count.
+    led.reset()
+    led.seed([("rec", 0)])
+    led.mark("rec", 0, UnitStatus.SKIPPED)
+    assert led.has_done_with_rows() is False
+
+
 def test_seed_idempotent_no_denominator_drift_or_duplicates(tmp_path: Path) -> None:
     led = _ledger(tmp_path)
     units = [("rec-a", 0), ("rec-a", 1)]

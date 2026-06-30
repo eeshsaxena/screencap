@@ -21,15 +21,25 @@ index, reusing the live indexing rules exactly:
     a recording dir name encodes timing/context that must not leak to same-EUID
     subscribers, including the MCP ``/v0/events`` subscription).
 
+Cross-window paging (SCR-193)
+-----------------------------
+A library larger than one seed-window (``_MAX_RECORDINGS``) is **paged through
+within a single run**: the engine seeds + processes one window of not-yet-covered
+recordings, then advances to the next window until the whole library is covered
+(or budget/cancel intervenes). The seed denominator grows per window
+(cumulative); ``is_recording_covered`` (ledger) is the resume frontier so a
+re-run skips already-finished recordings and starts at the tail rather than
+re-scanning the same first window forever. ``COMPLETED`` therefore means the
+*entire* library was indexed — overflow is no longer a permanent ``PAUSED``.
+
 Strictly fail-open
 ------------------
 Per-recording exceptions degrade to a ``FAILED`` unit and the run continues
-(one bad recording never aborts the run). Budget exhaustion / large-library
-overflow returns ``PAUSED`` with a pending remainder (NOT a misleading
-``COMPLETED`` — U8 must be able to show "N pending, resume to continue"). A
-``stop_event`` set returns ``CANCELLED`` promptly. The engine **never raises**;
-every exit returns a :class:`BackfillSummary` and the ledger is already persisted
-per-mark.
+(one bad recording never aborts the run). Budget exhaustion returns ``PAUSED``
+with a real pending remainder (NOT a misleading ``COMPLETED`` — U8 must be able
+to show "N pending, resume to continue"). A ``stop_event`` set returns
+``CANCELLED`` promptly. The engine **never raises**; every exit returns a
+:class:`BackfillSummary` and the ledger is already persisted per-mark.
 
 Local-only & read-only
 -----------------------
@@ -55,11 +65,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Mirror the daemon's ``_QUERY_MAX_RECORDINGS`` (daemon/app.py) WITHOUT importing
-# from ``screencap.daemon`` (package boundary — the engine is destination
-# agnostic). A library larger than this is processed up to the cap and the run
-# returns PAUSED with the tail still PENDING, so coverage is never silently
-# truncated (R8).
+# Per-window seed-batch size. Mirrors the daemon's ``_QUERY_MAX_RECORDINGS``
+# (daemon/app.py) WITHOUT importing from ``screencap.daemon`` (package boundary —
+# the engine is destination agnostic). A library larger than this is NOT
+# truncated: the run pages through successive windows of this size until the whole
+# library is covered (SCR-193). The cap only bounds per-window seed/memory work
+# and makes progress checkpoints granular for huge libraries.
 _MAX_RECORDINGS = 200
 
 # The per-recording OCR frame cap and per-chunk wall-clock budget are NOT defined
@@ -185,118 +196,169 @@ def run_backfill(
 
         max_frames_per_recording = _INDEX_MAX_OCR_FRAMES
 
-    # --- Enumerate recordings + their units (deterministic, capped) --------
-    rec_dirs = _enumerate_recordings(Path(recordings_dir))
-    overflowed = len(rec_dirs) > _MAX_RECORDINGS
-    if overflowed:
+    # --- SCR-193: content-index-deletion guard -----------------------------
+    # The ledger (backfill_state.db) and the content index (content_index.db) are
+    # separate files. If the index was deleted after a (partial or full) backfill,
+    # DONE units would be skipped on resume and the index would stay empty for
+    # them. Detect that exact case — the store file is genuinely GONE yet the
+    # ledger holds a DONE unit that wrote rows — and reset the ledger so the
+    # deleted index is rebuilt from scratch. The rows>0 guard (in
+    # has_done_with_rows) avoids a needless reset when the store legitimately never
+    # existed (an all-blocked / empty library never creates it, per index_range's
+    # empty-store guard). The ``not is_symlink()`` guard scopes this to a true
+    # deletion: a present-but-unopenable store (dangling/symlinked/corrupt) is left
+    # to index_range's per-unit ``store_available`` gate (SCR-192), which leaves
+    # units PENDING without discarding ledger progress — so a transient store
+    # problem can never wipe a completed run's bookkeeping.
+    store_p = Path(store_path)
+    if (
+        not store_p.exists()
+        and not store_p.is_symlink()
+        and ledger.has_done_with_rows()
+    ):
         logger.info(
-            "backfill: library has %d recordings; processing first %d (cap)",
-            len(rec_dirs),
-            _MAX_RECORDINGS,
+            "backfill: content index missing but ledger has indexed units; "
+            "resetting ledger to rebuild from scratch"
         )
-        rec_dirs = rec_dirs[:_MAX_RECORDINGS]
+        ledger.reset()
 
-    # Build the ordered closed set of (recording_dir_name, chunk_index) units and
-    # remember each recording's dir + chunk window for the run loop.
-    units: list[tuple[str, int]] = []
-    # unit_key -> (rec_dir, start_ts, end_ts)
-    unit_info: dict[tuple[str, int], tuple[Path, float, float]] = {}
-    for rec_dir in rec_dirs:
-        for chunk_index, start_ts, end_ts in _enumerate_chunks(rec_dir):
-            key = (rec_dir.name, chunk_index)
-            units.append(key)
-            unit_info[key] = (rec_dir, start_ts, end_ts)
+    # --- Enumerate recordings (deterministic) ------------------------------
+    all_rec_dirs = _enumerate_recordings(Path(recordings_dir))
 
-    # Seed the closed set (idempotent on resume). Re-seeding may ADDITIVELY
-    # expand the set — a recording created between runs joins it on the next run,
-    # which is intentional (new work should be covered). What stays frozen is the
-    # per-run denominator: within a single run the total is fixed at seed time, so
-    # progress can't be skewed by survivorship as units complete.
-    ledger.seed(units)
-    ledger.set_run_state(RunState.RUNNING)
-
-    # --- Per-unit run loop -------------------------------------------------
-    # Cache per-recording (classifier, evaluator) and the flat screenshot
-    # timestamps so they are built ONCE per recording across its chunks.
+    # Cache per-recording (classifier, evaluator) + flat screenshot timestamps so
+    # they are built ONCE per recording across its chunks (and across windows).
     from screencap.content_index import CrossProcessLockUnavailable
 
     classifier_cache: dict[str, tuple[object, object]] = {}
     timestamps_cache: dict[str, list[float]] = {}
 
-    for unit_index, key in enumerate(units):
-        # Poll cancel + budget between units (the core also polls per-frame).
-        if _cancelled():
-            return _finish(RunState.CANCELLED)
-        if _budget_exhausted():
-            return _finish(RunState.PAUSED)
+    # --- Cross-window paging loop (SCR-193 Gap 1) --------------------------
+    # Page through the library window-by-window. Each window is the next
+    # _MAX_RECORDINGS recordings NOT already covered in the ledger; seed + process
+    # it, then advance until no uncovered recording remains (full coverage →
+    # COMPLETED) or budget/cancel intervenes. ``is_recording_covered`` is the
+    # resume frontier, so a re-run skips finished recordings and reaches the tail
+    # — fixing the prior dead-end where a >cap library re-scanned the same first
+    # window forever.
+    ledger.set_run_state(RunState.RUNNING)
+    unit_ordinal = 0  # opaque, monotonic across windows (R9: never a dir name)
+    cursor = 0
+    n = len(all_rec_dirs)
+    while cursor < n:
+        # Build the next window of not-yet-covered recordings + their units.
+        window_units: list[tuple[str, int]] = []
+        window_info: dict[tuple[str, int], tuple[Path, float, float]] = {}
+        window_recordings = 0
+        while cursor < n and window_recordings < _MAX_RECORDINGS:
+            rec_dir = all_rec_dirs[cursor]
+            cursor += 1
+            # Skip recordings already fully terminal (a prior window/run) so the
+            # run advances to the tail rather than re-scanning the same first
+            # window. A partial recording (any PENDING chunk) is NOT covered, so
+            # it is re-selected and its remaining chunks finish first.
+            if ledger.is_recording_covered(rec_dir.name):
+                continue
+            chunks = _enumerate_chunks(rec_dir, max_frames=max_frames_per_recording)
+            if not chunks:
+                # No indexable content (no manifests + no screenshots) — nothing
+                # to cover; do not consume a window slot.
+                continue
+            window_recordings += 1
+            for chunk_index, start_ts, end_ts in chunks:
+                key = (rec_dir.name, chunk_index)
+                window_units.append(key)
+                window_info[key] = (rec_dir, start_ts, end_ts)
 
-        status = ledger.unit_status(key[0], key[1])
-        if status is not None and status != UnitStatus.PENDING:
-            # Already terminal on resume — skip, but still surface progress.
-            _emit(unit_index)
+        if not window_units:
+            # This slice was all already-covered / empty recordings — keep paging.
             continue
 
-        rec_dir, start_ts, end_ts = unit_info[key]
-        rec_name = key[0]
+        # Seed this window's closed set (idempotent on resume). The denominator
+        # grows per window — cumulative coverage; within a window it is frozen, so
+        # progress can't be skewed by survivorship as units complete.
+        ledger.seed(window_units)
 
-        # A retention-evicted / malformed recording (no screenshots or no DB) is a
-        # normal SKIPPED, not a FAILED.
-        if not (rec_dir / "screenshots").is_dir() or not (
-            rec_dir / "recording.db"
-        ).is_file():
-            ledger.mark(rec_name, key[1], UnitStatus.SKIPPED)
-            _emit(unit_index)
-            continue
+        for key in window_units:
+            # Poll cancel + budget between units (the core also polls per-frame).
+            if _cancelled():
+                return _finish(RunState.CANCELLED)
+            if _budget_exhausted():
+                return _finish(RunState.PAUSED)
 
-        try:
-            rows = _process_unit(
-                rec_dir=rec_dir,
-                rec_name=rec_name,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                ledger=ledger,
-                chunk_index=key[1],
-                classifier_cache=classifier_cache,
-                timestamps_cache=timestamps_cache,
-                ocr=ocr,
-                store_path=store_path,
-                stop_event=stop_event,
-                max_frames=max_frames_per_recording,
-                run_start=run_start,
-                budget_s=budget_s,
-            )
-            rows_written_total += rows
-        except CrossProcessLockUnavailable:
-            # SCR-191: the cross-process content-index flock is unavailable (a
-            # no-flock filesystem / sandboxed run dir). Its support is
-            # all-or-nothing per filesystem, so every remaining unit would hit
-            # the same wall. Pause the whole run (this unit is left PENDING — it
-            # was never marked — so the run is fully resumable) rather than churn
-            # through the tail or, worse, write without cross-process protection.
-            logger.warning(
-                "backfill: cross-process content-index lock unavailable; pausing run"
-            )
-            return _finish(RunState.PAUSED)
-        except Exception:
-            # One bad recording never aborts the run (strictly fail-open).
-            logger.warning(
-                "backfill: unit failed (recording omitted from log for privacy)",
-                exc_info=True,
-            )
-            ledger.mark(rec_name, key[1], UnitStatus.FAILED)
+            status = ledger.unit_status(key[0], key[1])
+            if status is not None and status != UnitStatus.PENDING:
+                # Already terminal on resume — skip, but still surface progress.
+                _emit(unit_ordinal)
+                unit_ordinal += 1
+                continue
 
-        _emit(unit_index)
+            rec_dir, start_ts, end_ts = window_info[key]
+            rec_name = key[0]
+
+            # A retention-evicted / malformed recording (no screenshots or no DB)
+            # is a normal SKIPPED, not a FAILED.
+            if not (rec_dir / "screenshots").is_dir() or not (
+                rec_dir / "recording.db"
+            ).is_file():
+                ledger.mark(rec_name, key[1], UnitStatus.SKIPPED)
+                _emit(unit_ordinal)
+                unit_ordinal += 1
+                continue
+
+            try:
+                rows = _process_unit(
+                    rec_dir=rec_dir,
+                    rec_name=rec_name,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    ledger=ledger,
+                    chunk_index=key[1],
+                    classifier_cache=classifier_cache,
+                    timestamps_cache=timestamps_cache,
+                    ocr=ocr,
+                    store_path=store_path,
+                    stop_event=stop_event,
+                    max_frames=max_frames_per_recording,
+                    run_start=run_start,
+                    budget_s=budget_s,
+                )
+                rows_written_total += rows
+            except CrossProcessLockUnavailable:
+                # SCR-191: the cross-process content-index flock is unavailable (a
+                # no-flock filesystem / sandboxed run dir). Its support is
+                # all-or-nothing per filesystem, so every remaining unit would hit
+                # the same wall. Pause the whole run (this unit is left PENDING — it
+                # was never marked — so the run is fully resumable) rather than
+                # churn through the tail or write without cross-process protection.
+                logger.warning(
+                    "backfill: cross-process content-index lock unavailable; pausing run"
+                )
+                return _finish(RunState.PAUSED)
+            except Exception:
+                # One bad recording never aborts the run (strictly fail-open).
+                logger.warning(
+                    "backfill: unit failed (recording omitted from log for privacy)",
+                    exc_info=True,
+                )
+                ledger.mark(rec_name, key[1], UnitStatus.FAILED)
+
+            _emit(unit_ordinal)
+            unit_ordinal += 1
 
     # --- Terminal disposition ---------------------------------------------
     if _cancelled():
         return _finish(RunState.CANCELLED)
-    if ledger.is_complete():
-        # Even a full pass returns PAUSED if the library overflowed the cap —
-        # there is a tail we never enumerated, so coverage is incomplete (R8).
-        if overflowed:
-            return _finish(RunState.PAUSED)
+    # No PENDING unit remains → COMPLETED: every seeded unit across every window is
+    # terminal AND the paging loop drained the library (or there was nothing to
+    # index at all). Keyed on next_pending() rather than is_complete() (which is
+    # False on an EMPTY ledger) so an empty library — including one left empty by
+    # the content-index-deletion reset above when its recordings are also gone —
+    # completes cleanly instead of a churning PAUSED that should_auto_resume would
+    # re-run every boot. A unit left PENDING without a bail (e.g. SCR-192 store
+    # unavailable) still falls through to PAUSED below.
+    if ledger.next_pending() is None:
         return _finish(RunState.COMPLETED)
-    # Units remain PENDING but we exited the loop — budget/cap pause.
+    # Units remain PENDING but we exited the loop — budget pause.
     return _finish(RunState.PAUSED)
 
 
@@ -334,6 +396,7 @@ def _process_unit(
         derive_skip_intervals,
     )
     from screencap.index_core import _INDEX_OCR_BUDGET_S, index_range
+    from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
 
     # Per-recording classifier/evaluator (mode resolved from .recording_intent).
     if rec_name not in classifier_cache:
@@ -345,11 +408,23 @@ def _process_unit(
         timestamps_cache[rec_name] = _screenshot_timestamps(rec_dir)
     screenshot_timestamps = timestamps_cache[rec_name]
 
+    # Derive the skip set over a range biased OUTWARD by the secure-field hold,
+    # while index_range below scopes FRAMES to the exact [start_ts, end_ts). This
+    # keeps a secure-field event up to ``hold`` before this unit's start — whose
+    # mask extends into this unit's first frames — inside the skip set even when
+    # the unit is a bounded sub-chunk of a longer recording (SCR-193 Gap 2: the
+    # no-manifest fallback is split into ≤max_frames sub-chunks, creating internal
+    # boundaries a hold can straddle). Widening only ADDS skip intervals (a
+    # superset — never a subset), matching the module's fail-closed contract; for
+    # the recording's outer edges it subsumes the old whole-window outward bias.
     skip = derive_skip_intervals(
         rec_dir / "recording.db",
         classifier=classifier,
         evaluator=evaluator,
-        time_range=(start_ts, end_ts),
+        time_range=(
+            start_ts - DEFAULT_TRANSITION_HOLD_SECONDS,
+            end_ts + DEFAULT_TRANSITION_HOLD_SECONDS,
+        ),
         screenshot_timestamps=screenshot_timestamps,
     )
 
@@ -457,15 +532,41 @@ def _active_recording_name() -> str | None:
         return None
 
 
-def _enumerate_chunks(rec_dir: Path) -> list[tuple[int, float, float]]:
+def _enumerate_chunks(
+    rec_dir: Path, *, max_frames: int
+) -> list[tuple[int, float, float]]:
     """Return ``(chunk_index, start_ts, end_ts)`` units for one recording.
 
     From the chunk manifests (``sorted(d.glob("chunk_*_manifest.json"))``, reading
     the ``chunk_index``/``chunk_start``/``chunk_end`` keys). When no manifests
-    exist, synthesize a single whole-recording window (chunk_index 0) from the
-    min/max ``screenshots/*.jpg`` timestamps, biased OUTWARD by the secure-field
-    hold-seconds so a secure-field event near the synthesized boundary stays fully
-    inside the derived skip set.
+    exist, synthesize whole-recording sub-windows from the ``screenshots/*.jpg``
+    timestamps, **split into consecutive groups of at most ``max_frames`` frames**
+    (SCR-193 Gap 2). Splitting matters because ``index_range`` caps at
+    ``max_frames`` distinct frames per range and reports the capped range as a
+    *complete* pass — so a single whole-recording window over a long legacy
+    recording would be marked DONE with everything past the first ~``max_frames``
+    frames permanently un-indexed. Bounding each synthesized sub-window to
+    ``max_frames`` frames guarantees no sub-window ever hits the cap, so the whole
+    recording is indexed across multiple independently-resumable units.
+
+    The sub-window ranges are contiguous and non-overlapping (each group's
+    half-open ``[group[0], next_group[0])``; the final group runs past its last
+    frame so that frame is in range), so every frame falls in exactly one unit.
+    The secure-field outward bias is applied at skip-derivation time in
+    ``_process_unit`` (which widens the derive range by the hold on both ends), so
+    a secure-field event straddling a sub-window boundary still skips the right
+    frames — it is not handled here.
+
+    REPLACE-overlap ordering invariant: ``index_range`` clears its range with a
+    whole-range REPLACE whose ms bounds are ``floor(start*1000)`` /
+    ``ceil(end*1000)``, so two adjacent sub-windows sharing a boundary frame ``F``
+    can overlap by up to 1ms — group N's REPLACE may delete F (the FIRST frame of
+    group N+1) when F's fractional ms rounds down. This is safe because sub-windows
+    of one recording are always processed in ASCENDING order and a DONE sub-window
+    is never reprocessed before a later one (resume skips DONE units; the Gap-3
+    reset reprocesses the whole recording from group 0 up): group N+1 always
+    (re)writes F after any earlier overlap-delete. Were that ordering ever broken,
+    F could be lost — so keep sub-window processing strictly ascending.
     """
     import json
 
@@ -484,17 +585,27 @@ def _enumerate_chunks(rec_dir: Path) -> list[tuple[int, float, float]]:
     if out:
         return out
 
-    # Fallback: synthesize a whole-recording window from screenshot timestamps.
+    # Fallback: synthesize bounded whole-recording sub-windows from screenshot
+    # timestamps, ≤ max_frames frames each (defensive: never a non-positive step).
     timestamps = _screenshot_timestamps(rec_dir)
     if not timestamps:
         return []
-    from screencap.privacy.policy import DEFAULT_TRANSITION_HOLD_SECONDS
-
-    start_ts = min(timestamps) - DEFAULT_TRANSITION_HOLD_SECONDS
-    # end is half-open; widen past the last frame + the hold so a trailing
-    # secure-field interval stays inside, and the last frame itself is in range.
-    end_ts = max(timestamps) + DEFAULT_TRANSITION_HOLD_SECONDS + 1.0
-    return [(0, start_ts, end_ts)]
+    step = max(1, max_frames)
+    n = len(timestamps)
+    chunks: list[tuple[int, float, float]] = []
+    for chunk_index, lo in enumerate(range(0, n, step)):
+        hi = min(lo + step, n)
+        start_ts = timestamps[lo]
+        if hi < n:
+            # Internal boundary: half-open up to the next group's first frame, so
+            # the two sub-windows are contiguous and never overlap.
+            end_ts = timestamps[hi]
+        else:
+            # Final group: widen past the last frame so it falls in the half-open
+            # range (index_range's own end-bias is the +1.0 here).
+            end_ts = timestamps[hi - 1] + 1.0
+        chunks.append((chunk_index, start_ts, end_ts))
+    return chunks
 
 
 def _screenshot_timestamps(rec_dir: Path) -> list[float]:
