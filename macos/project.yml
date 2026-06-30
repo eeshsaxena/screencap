@@ -35,8 +35,8 @@ targets:
       path: ScreenCap/Info.plist
       properties:
         CFBundleDisplayName: ScreenCap
-        CFBundleShortVersionString: "0.1.1"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "0.1.2"
+        CFBundleVersion: "3"
         LSMinimumSystemVersion: "13.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSMicrophoneUsageDescription: "ScreenCap can record audio alongside your screen capture."
