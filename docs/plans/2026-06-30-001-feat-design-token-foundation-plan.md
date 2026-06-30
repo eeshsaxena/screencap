@@ -1,7 +1,7 @@
 ---
 title: "feat: Design-token foundation for the macOS app"
 type: feat
-status: active
+status: completed
 date: 2026-06-30
 origin: docs/brainstorms/2026-06-30-design-token-foundation-requirements.md
 ---
