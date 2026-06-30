@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
-# Xcode build phase: copies the PyInstaller `dist/screencap/` directory into
-# Contents/Resources/screencap/ so the bundled CLIClient can resolve the binary.
+# Xcode build phase: embeds the PyInstaller `dist/ScreencapDaemon.app` helper
+# bundle into Contents/Library/LoginItems/ and writes the daemon launcher so the
+# LaunchAgent execs the helper bundle's nested binary.
+#
+# SCR-196: the daemon now runs from a proper helper .app (bundle id
+# com.screencap.daemon, exec at Contents/MacOS/screencap, its own Info.plist)
+# rather than a bare nested Mach-O. Running from a binary that carries an
+# Info.plist is what makes macOS treat the daemon as a first-class TCC subject
+# (auto-listed, tccutil-targetable by bundle id) for Screen Recording /
+# Accessibility / Input Monitoring. The launcher indirection is preserved (it
+# carries the Debug dev-source fast-path); after the launcher `exec`s the nested
+# binary the process image IS that bundled binary, so TCC attributes to
+# com.screencap.daemon regardless of the launcher hop.
 #
 # Tolerant of missing dist/ in dev: emits a warning so the .app still launches
 # (CLIClient falls back to SCREENCAP_CLI_PATH or SCREENCAP_DEV_REPO_ROOT).
@@ -9,16 +20,26 @@ set -euo pipefail
 
 # Resolve repo root: macos/ is one level below the repo root.
 REPO_ROOT="${SRCROOT}/.."
-SOURCE_DIR="${SCREENCAP_CLI_DIST_DIR:-${REPO_ROOT}/dist/screencap}"
-DEST_DIR="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/screencap"
+# The helper .app produced by `pyinstaller pyinstaller/screencap.spec` (BUNDLE step).
+SOURCE_APP="${SCREENCAP_CLI_APP_DIR:-${REPO_ROOT}/dist/ScreencapDaemon.app}"
+CONTENTS_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}"
+# Apple-conventional home for an embedded SMAppService helper bundle.
+DEST_APP="${CONTENTS_DIR}/Library/LoginItems/ScreencapDaemon.app"
+# The launched daemon executable inside the embedded helper bundle.
+HELPER_BIN="${DEST_APP}/Contents/MacOS/screencap"
 LAUNCHER="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/screencap-daemon-launcher"
 
 write_daemon_launcher() {
     mkdir -p "$(dirname "${LAUNCHER}")"
+    # The launcher lives in Contents/Resources/ and reaches the embedded helper
+    # binary at a fixed path relative to itself
+    # (../Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap), so the
+    # heredocs stay fully literal (<<'EOF') — no build-time interpolation needed.
+    #
     # The dev-source branch lets the LaunchAgent exec the in-repo `screencap`
     # module directly, bypassing the PyInstaller bundle for fast iteration.
     # We only emit it for Debug builds — release builds get a launcher that
-    # only execs the bundled binary, so SCREENCAP_DAEMON_USE_DEV_SOURCE is
+    # only execs the bundled helper binary, so SCREENCAP_DAEMON_USE_DEV_SOURCE is
     # an inert env var in shipped clients.
     if [ "${CONFIGURATION:-}" = "Debug" ]; then
         cat >"${LAUNCHER}" <<'EOF'
@@ -68,7 +89,7 @@ if [ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" = "1" ] && [ -n "${SCREENCAP_DEV_RE
     # Dev-source path requested but unusable — fall through to bundled exec.
 fi
 
-exec "${SCRIPT_DIR}/screencap/screencap" "$@"
+exec "${SCRIPT_DIR}/../Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap" "$@"
 EOF
     else
         cat >"${LAUNCHER}" <<'EOF'
@@ -77,7 +98,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
-exec "${SCRIPT_DIR}/screencap/screencap" "$@"
+exec "${SCRIPT_DIR}/../Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap" "$@"
 EOF
     fi
     chmod 0755 "${LAUNCHER}"
@@ -85,15 +106,15 @@ EOF
 
 write_daemon_launcher
 
-if [ ! -d "${SOURCE_DIR}" ]; then
-    echo "warning: dist/screencap/ not found at ${SOURCE_DIR}"
-    echo "warning: ScreenCap.app will NOT have a bundled CLI."
-    echo "warning: Set SCREENCAP_CLI_PATH or run \`pyinstaller pyinstaller/screencap.spec\` from the repo root."
+if [ ! -d "${SOURCE_APP}" ]; then
+    echo "warning: dist/ScreencapDaemon.app not found at ${SOURCE_APP}"
+    echo "warning: ScreenCap.app will NOT have a bundled daemon helper."
+    echo "warning: Set SCREENCAP_CLI_APP_DIR or run \`pyinstaller pyinstaller/screencap.spec\` from the repo root."
     exit 0
 fi
 
-if [ ! -x "${SOURCE_DIR}/screencap" ]; then
-    echo "warning: ${SOURCE_DIR}/screencap is not executable. Skipping embed."
+if [ ! -x "${SOURCE_APP}/Contents/MacOS/screencap" ]; then
+    echo "warning: ${SOURCE_APP}/Contents/MacOS/screencap is not executable. Skipping embed."
     exit 0
 fi
 
@@ -103,18 +124,18 @@ fi
 # which would otherwise ship a .app whose every CLI call exits 1. `--version`
 # is offline and exits immediately, but still exercises the full PyInstaller
 # bootstrap that was broken.
-if ! "${SOURCE_DIR}/screencap" --version >/dev/null 2>&1; then
-    echo "error: ${SOURCE_DIR}/screencap does not launch — refusing to embed a broken bundle." >&2
+if ! "${SOURCE_APP}/Contents/MacOS/screencap" --version >/dev/null 2>&1; then
+    echo "error: ${SOURCE_APP}/Contents/MacOS/screencap does not launch — refusing to embed a broken bundle." >&2
     echo "error: likely a PyInstaller bootloader/loader version mismatch; rebuild with a clean cache (rm -rf build dist)." >&2
-    "${SOURCE_DIR}/screencap" --version || true
+    "${SOURCE_APP}/Contents/MacOS/screencap" --version || true
     exit 1
 fi
 
-mkdir -p "$(dirname "${DEST_DIR}")"
-rm -rf "${DEST_DIR}"
-ditto "${SOURCE_DIR}" "${DEST_DIR}"
+mkdir -p "$(dirname "${DEST_APP}")"
+rm -rf "${DEST_APP}"
+ditto "${SOURCE_APP}" "${DEST_APP}"
 
-echo "Embedded screencap CLI from ${SOURCE_DIR} -> ${DEST_DIR}"
+echo "Embedded screencap daemon helper from ${SOURCE_APP} -> ${DEST_APP}"
 
 cli_version_from_binary() {
     # parse must match daemon.info.daemon_version; keep in sync with the sibling
@@ -123,18 +144,19 @@ cli_version_from_binary() {
 }
 
 stamp_bundled_cli_version() {
-    # Record the bundled CLI's version next to it so DaemonInstallController can
-    # tell, at install time, whether the daemon answering api.sock is actually
-    # the version this app bundles — vs a stale/foreign daemon squatting the
-    # socket (SCR-121). `screencap --version` prints "screencap, version X.Y.Z";
-    # we keep the last whitespace-delimited field. The daemon reports the same
-    # value as daemon.info.daemon_version, so the two compare directly.
+    # Record the bundled CLI's version in Contents/Resources/ so
+    # DaemonInstallController can tell, at install time, whether the daemon
+    # answering api.sock is actually the version this app bundles — vs a
+    # stale/foreign daemon squatting the socket (SCR-121). `screencap --version`
+    # prints "screencap, version X.Y.Z"; we keep the last whitespace-delimited
+    # field. The daemon reports the same value as daemon.info.daemon_version, so
+    # the two compare directly.
     local version_file version
-    version_file="$(dirname "${DEST_DIR}")/screencap-cli-version"
+    version_file="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/screencap-cli-version"
     # `|| true`: under `set -euo pipefail` a non-zero `screencap --version`
     # (broken bundle) would otherwise abort the build at this assignment instead
     # of reaching the safe-fallback `else` below.
-    version="$(cli_version_from_binary "${DEST_DIR}/screencap" || true)"
+    version="$(cli_version_from_binary "${HELPER_BIN}" || true)"
     if [ -n "${version}" ]; then
         printf '%s' "${version}" >"${version_file}"
         echo "Stamped bundled CLI version ${version} -> ${version_file}"
@@ -148,22 +170,24 @@ stamp_bundled_cli_version() {
 
 stamp_bundled_cli_version
 
-sign_embedded_cli() {
+sign_embedded_helper() {
     # PyInstaller emits an ad-hoc signature, so the embedded daemon binary has no
     # stable code identity. macOS TCC then keys the daemon's Screen Recording /
     # Accessibility / Input Monitoring grants on the binary's cdhash, which changes
     # on every rebuild — the "TCC treadmill" that forces the user to re-grant after
-    # each build. Xcode signs the .app wrapper + main executable but does NOT
-    # recurse into Contents/Resources/, so without this step the embedded binary
-    # keeps its ad-hoc signature. Re-signing every nested Mach-O + the `screencap`
-    # exe with the app's team identity gives the daemon a stable Designated
-    # Requirement (Team ID + identifier), so grants persist across rebuilds.
-    # Hardened runtime + screencap-cli.entitlements keep it notarization-ready.
-    # See docs/research/2026-06-05-daemon-tcc-registration-spike.md.
+    # each build. Xcode signs the outer .app wrapper + main executable but does NOT
+    # recurse into Contents/Library/LoginItems/, so without this step the embedded
+    # helper keeps its ad-hoc signature. Re-signing inside-out (nested Mach-O ->
+    # helper exec with entitlements -> the helper .app) with the app's team
+    # identity gives the daemon a stable Designated Requirement
+    # (com.screencap.daemon + Team ID), so grants persist across rebuilds and
+    # macOS lists it as a real TCC subject. Hardened runtime +
+    # screencap-cli.entitlements keep it notarization-ready.
+    # See docs/research/2026-06-05-daemon-tcc-registration-spike.md (SCR-196).
     local identity="${EXPANDED_CODE_SIGN_IDENTITY:-}"
     if [ -z "${identity}" ] || [ "${identity}" = "-" ]; then
         echo "note: no team signing identity (EXPANDED_CODE_SIGN_IDENTITY unset/ad-hoc);"
-        echo "note: leaving the embedded CLI ad-hoc — TCC grants will reset on rebuild."
+        echo "note: leaving the embedded helper ad-hoc — TCC grants will reset on rebuild."
         echo "note: set DEVELOPMENT_TEAM (see macos/README.md) to make grants persist."
         return
     fi
@@ -174,20 +198,31 @@ sign_embedded_cli() {
     local timestamp_flag="--timestamp"
     [ "${CONFIGURATION:-}" = "Debug" ] && timestamp_flag="--timestamp=none"
 
-    echo "Signing embedded screencap CLI (${EXPANDED_CODE_SIGN_IDENTITY_NAME:-${identity}}, hardened runtime)..."
-    # Sign nested Mach-O first, then the exe last (inner-to-outer).
-    find "${DEST_DIR}" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
+    echo "Signing embedded daemon helper (${EXPANDED_CODE_SIGN_IDENTITY_NAME:-${identity}}, hardened runtime)..."
+    # Inside-out: nested Mach-O first, then the helper exe (with entitlements),
+    # then the helper .app wrapper last. No `--deep` (deprecated for signing).
+    find "${DEST_APP}" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
         | xargs -0 codesign --force --options runtime "${timestamp_flag}" --sign "${identity}"
     codesign --force --options runtime "${timestamp_flag}" \
-        --entitlements "${entitlements}" --sign "${identity}" "${DEST_DIR}/screencap"
+        --entitlements "${entitlements}" --sign "${identity}" "${HELPER_BIN}"
+    codesign --force --options runtime "${timestamp_flag}" \
+        --sign "${identity}" "${DEST_APP}"
 
     # Fail loud if signing broke the bundle (entitlements/hardened-runtime mismatch).
-    if ! "${DEST_DIR}/screencap" --version >/dev/null 2>&1; then
-        echo "error: embedded screencap CLI fails to launch after signing." >&2
+    if ! "${HELPER_BIN}" --version >/dev/null 2>&1; then
+        echo "error: embedded daemon helper fails to launch after signing." >&2
         echo "error: check screencap-cli.entitlements against hardened-runtime needs." >&2
         exit 1
     fi
-    echo "Signed embedded screencap CLI with team identity (TCC grants now persist across rebuilds)."
+    # Verify the helper carries the expected bundle identity — a wrong/missing
+    # Designated Requirement here means macOS will not attribute TCC grants to
+    # com.screencap.daemon (the whole point of SCR-196).
+    if ! codesign -d -r- "${DEST_APP}" 2>&1 | grep -q "com.screencap.daemon"; then
+        echo "error: signed helper Designated Requirement does not name com.screencap.daemon." >&2
+        codesign -d -r- "${DEST_APP}" >&2 || true
+        exit 1
+    fi
+    echo "Signed embedded daemon helper with team identity (DR names com.screencap.daemon; grants persist)."
 }
 
-sign_embedded_cli
+sign_embedded_helper
