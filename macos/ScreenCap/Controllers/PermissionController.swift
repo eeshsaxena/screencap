@@ -63,18 +63,23 @@ enum PrivacyPane: String, CaseIterable {
     }
 
     /// The exact name macOS shows for the *helper's* row in this pane's Privacy
-    /// list. Screen Recording attributes the grant to the containing app bundle,
-    /// so its row reads "ScreenCap"; Accessibility and Input Monitoring attribute
-    /// to the bare daemon tool (`Contents/Resources/screencap/screencap`, no
-    /// bundle id), so their rows read lowercase "screencap". Naming the exact row
-    /// stops the user enabling the wrong same-named entry — the "ScreenCap" app
-    /// row instead of the "screencap" helper row, which leaves the daemon's grant
-    /// denied even though System Settings *looks* granted. See
-    /// docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md.
+    /// list. Since SCR-196 the recording daemon ships as a proper helper bundle
+    /// (`com.screencap.daemon`, `CFBundleDisplayName` "ScreenCap Helper"), so the
+    /// three daemon-owned grants — Screen Recording, Accessibility, Input
+    /// Monitoring — all attribute to that one bundle and read "ScreenCap Helper"
+    /// (deterministic via the display name set in the PyInstaller spec). Only the
+    /// microphone stays app-owned, reading "ScreenCap". Naming the exact row stops
+    /// the user enabling the wrong same-named entry (the "ScreenCap" app row vs the
+    /// "ScreenCap Helper" daemon row), which would leave the daemon's grant denied
+    /// even though System Settings *looks* granted.
+    ///
+    /// NOTE: the precise row string is an on-device fact — confirm in the U8
+    /// validation runbook that macOS renders "ScreenCap Helper" (not the bundle id
+    /// or the `.app` filename) before shipping; it is a one-line fix if it differs.
     var helperSettingsEntryName: String {
         switch self {
-        case .screenRecording, .microphone: return "ScreenCap"
-        case .accessibility, .inputMonitoring: return "screencap"
+        case .microphone: return "ScreenCap"
+        case .screenRecording, .accessibility, .inputMonitoring: return "ScreenCap Helper"
         }
     }
 

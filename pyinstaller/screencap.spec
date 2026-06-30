@@ -286,6 +286,11 @@ app = BUNDLE(
         'CFBundleExecutable': 'screencap',
         'CFBundleIdentifier': 'com.screencap.daemon',
         'CFBundleName': 'ScreenCap Helper',
+        # Display name is what System Settings renders for the helper's TCC row.
+        # Set it explicitly so the row reads "ScreenCap Helper" deterministically
+        # (not the .app filename or bundle id) — the onboarding copy in
+        # PermissionController.helperSettingsEntryName depends on this string.
+        'CFBundleDisplayName': 'ScreenCap Helper',
         'CFBundlePackageType': 'APPL',
         'LSUIElement': True,
     },
