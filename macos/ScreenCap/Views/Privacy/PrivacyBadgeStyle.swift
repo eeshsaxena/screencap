@@ -28,11 +28,16 @@ struct PrivacyBadgeStyle: Equatable {
         case captured
     }
 
+    /// Maps each badge kind to a semantic color role (SCR-197 U3). `excludedByUser`
+    /// is an advisory, so it routes through the `scAdvisoryFg` seam — text-only,
+    /// no distinct hue (R7), retiring the old overloaded `.orange`. It resolves to
+    /// the same neutral as `captured` today, but keeping the advisory role named
+    /// means a future re-color follows here without touching `captured`.
     var color: Color {
         switch kind {
-        case .blockedBySecurity: return .red
-        case .excludedByUser:    return .orange
-        case .captured:          return .secondary
+        case .blockedBySecurity: return .scErrorFg
+        case .excludedByUser:    return .scAdvisoryFg
+        case .captured:          return .scTextSecondary
         }
     }
 

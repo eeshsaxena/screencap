@@ -158,8 +158,9 @@ struct FirstRunPermissionsView: View {
     private var adHocDevBuildCallout: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "hammer.fill")
-                .font(.system(size: 16))
-                .foregroundStyle(.orange)
+                .font(SCTypography.labelPrimary)
+                // Developer advisory — de-colored to neutral (R7), not orange.
+                .foregroundStyle(Color.scAdvisoryFg)
                 .padding(.top, 2)
                 // Decorative — the adjacent warning text conveys the full
                 // meaning, so keep VoiceOver from announcing the symbol as a
@@ -173,8 +174,8 @@ struct FirstRunPermissionsView: View {
         }
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color.orange.opacity(0.12))
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .fill(Color.scAdvisorySurface)
         )
     }
 
@@ -183,7 +184,7 @@ struct FirstRunPermissionsView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: daemonInstallIconName)
-                    .font(.system(size: 22))
+                    .font(SCTypography.title)
                     .foregroundStyle(daemonInstallIconColor)
                     .frame(width: 24)
 
@@ -226,8 +227,8 @@ struct FirstRunPermissionsView: View {
         }
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .controlBackgroundColor))
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .fill(Color.scSurfaceElevated)
         )
     }
 
@@ -247,11 +248,12 @@ struct FirstRunPermissionsView: View {
     private var daemonInstallIconColor: Color {
         switch daemonInstaller.state {
         case .installedAndRunning:
-            return .green
+            return .scSuccessFg
         case .installFailed, .pollingFailed:
-            return .red
+            return .scErrorFg
         case .registering, .polling, .requiresApproval:
-            return .orange
+            // In-progress = advisory, de-colored to neutral (R7).
+            return .scAdvisoryFg
         case .idle:
             return .secondary
         }
@@ -307,7 +309,7 @@ struct FirstRunPermissionsView: View {
         let opened = openedDaemonPanes.contains(pane)
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: icon.systemName)
-                .font(.system(size: 20))
+                .font(SCTypography.title)
                 .foregroundStyle(icon.color)
                 .accessibilityLabel(icon.accessibilityLabel)
                 .padding(.top, 2)
@@ -327,7 +329,7 @@ struct FirstRunPermissionsView: View {
             if state == .granted {
                 Text("Granted")
                     .font(.subheadline)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Color.scSuccessFg)
             } else if permissions.isDaemonRegistering(pane) {
                 // U8: a daemon registration round-trip is in flight for this
                 // pane. Mirror the helper-install step's spinner so the user
@@ -344,22 +346,25 @@ struct FirstRunPermissionsView: View {
         }
         .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .controlBackgroundColor))
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .fill(Color.scSurfaceElevated)
         )
     }
 
     /// Map the tri-state daemon grant to a row icon. Indeterminate is "couldn't
     /// verify" — a muted dashed circle with its own accessibility label, never
-    /// confused with granted (check) or denied (needs-action).
+    /// confused with granted (check) or denied (needs-action). Color follows the
+    /// state roles (R7): granted = success green; denied = de-colored advisory,
+    /// the `exclamationmark` *shape* carrying the "needs action" meaning rather
+    /// than a warning hue; indeterminate stays muted secondary.
     static func grantRowIcon(
         for state: DaemonGrantState
     ) -> (systemName: String, color: Color, accessibilityLabel: String) {
         switch state {
         case .granted:
-            return ("checkmark.circle.fill", .green, "Granted")
+            return ("checkmark.circle.fill", .scSuccessFg, "Granted")
         case .denied:
-            return ("exclamationmark.circle.fill", .orange, "Needs action")
+            return ("exclamationmark.circle.fill", .scAdvisoryFg, "Needs action")
         case .indeterminate:
             return ("circle.dashed", .secondary, "Couldn't verify")
         }

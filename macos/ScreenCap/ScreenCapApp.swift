@@ -136,55 +136,26 @@ struct ScreenCapApp: App {
                 .environmentObject(auth)
                 .environmentObject(uploads)
         } label: {
-            MenuBarLabel(
-                isRecording: recorder.state.isRecording,
-                privacyAttention: privacy.bannerActive
-            )
+            MenuBarLabel(isRecording: recorder.state.isRecording)
         }
         .menuBarExtraStyle(.menu)
     }
 }
 
-/// MenuBarExtra label composition. `record.circle` base layer is always
-/// rendered; the recording state drives the fill, and the privacy-attention
-/// badge is overlaid in the upper-right corner when the first-run banner is
-/// active. Color and corner position keep the attention dot visually
-/// distinct from the recording red dot — co-existing while recording is the
-/// expected case during the first-launch window.
+/// MenuBarExtra label. The `record.circle` glyph carries the Aurora accent when
+/// idle and the warm-amber recording role when live (SCR-197 U4). The former
+/// orange privacy-attention pip is retired: the in-window first-run banner and
+/// the permissions sheet already surface that signal, and a scarce-color menubar
+/// holds the "calm instrument" discipline — advisories de-color, color is reserved
+/// for the recording state and the brand accent (R7).
 private struct MenuBarLabel: View {
     let isRecording: Bool
-    let privacyAttention: Bool
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(isRecording ? Color.red : Color.primary)
-            if privacyAttention {
-                Circle()
-                    .fill(Color.orange)
-                    .frame(width: 5, height: 5)
-                    .overlay(
-                        // `Color.primary` adapts to the menu bar appearance so
-                        // the hairline shows up against both light and dark
-                        // menu bar wallpapers — a hardcoded black/white stroke
-                        // disappears in one of the two modes.
-                        Circle().stroke(Color.primary.opacity(0.4), lineWidth: 0.5)
-                    )
-                    .offset(x: 2, y: -2)
-                    .accessibilityHidden(true)
-            }
-        }
-        .accessibilityLabel(accessibilityDescription)
-    }
-
-    private var accessibilityDescription: String {
-        switch (isRecording, privacyAttention) {
-        case (true, true):   return "ScreenCap, recording — privacy setup needed"
-        case (true, false):  return "ScreenCap, recording"
-        case (false, true):  return "ScreenCap — privacy setup needed"
-        case (false, false): return "ScreenCap"
-        }
+        Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(isRecording ? Color.scRecording : Color.scAccent)
+            .accessibilityLabel(isRecording ? "ScreenCap, recording" : "ScreenCap")
     }
 }
 

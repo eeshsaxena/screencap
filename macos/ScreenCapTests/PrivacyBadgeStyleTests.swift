@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import ScreenCap
 
@@ -130,5 +131,30 @@ final class PrivacyBadgeStyleTests: XCTestCase {
         ))
         XCTAssertEqual(style.text, "Captured (window masked)")
         XCTAssertNil(style.tooltip)
+    }
+
+    // MARK: - Color role mapping (SCR-197 U3) — net-new coverage; the existing
+    // tests above cover kind/text/tooltip but never asserted `color`.
+
+    func testBlockedBySecurityMapsToErrorRole() {
+        let style = PrivacyBadgeStyle.derive(for: app(isMatrixExclude: true))
+        XCTAssertEqual(style.color, Color.scErrorFg)
+    }
+
+    func testCapturedMapsToSecondaryTextRole() {
+        let style = PrivacyBadgeStyle.derive(for: app(resolvedAction: "allow"))
+        XCTAssertEqual(style.color, Color.scTextSecondary)
+    }
+
+    func testExcludedByUserDeColorsToAdvisoryRoleAndIsNotOrange() {
+        // R7: advisories de-color to neutral (text-only) and route through the
+        // advisory seam — guards against the overloaded `.orange` re-appearing.
+        let style = PrivacyBadgeStyle.derive(for: app(
+            resolvedAction: "exclude",
+            inExcludeApps: true
+        ))
+        XCTAssertEqual(style.kind, .excludedByUser)
+        XCTAssertEqual(style.color, Color.scAdvisoryFg)
+        XCTAssertNotEqual(style.color, Color.orange)
     }
 }

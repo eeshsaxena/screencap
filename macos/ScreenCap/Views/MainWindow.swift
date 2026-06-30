@@ -128,17 +128,18 @@ struct MainWindow: View {
             .overlay(alignment: .top) {
                 if let err = recorder.lastError {
                     RecorderErrorMessage(message: err)
-                        .padding(8)
-                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
-                        .padding(.top, 4)
+                        .padding(SCMetrics.space2)
+                        .background(Color.scErrorSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
+                        .padding(.top, SCMetrics.space1)
                         .transition(.opacity)
                 } else if let advisory = recorder.captureAdvisory {
-                    // Advisory, non-terminal (SCR-76) — distinct yellow tint so
-                    // it doesn't read as a terminal error. Errors take priority.
+                    // Advisory, non-terminal (SCR-76). De-colored to the neutral
+                    // advisory surface (R7) — not yellow — so it reads as "FYI",
+                    // distinct from the red error surface above. Errors take priority.
                     RecorderErrorMessage(message: advisory)
-                        .padding(8)
-                        .background(.yellow.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
-                        .padding(.top, 4)
+                        .padding(SCMetrics.space2)
+                        .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
+                        .padding(.top, SCMetrics.space1)
                         .transition(.opacity)
                 }
             }
@@ -317,7 +318,6 @@ struct MainWindow: View {
                 Label("Stop", systemImage: "stop.circle.fill")
             }
             .help("Stop recording")
-            .tint(.red)
         } else if recorder.state.isRecording {
             // .starting or .stopping — surface progress, don't offer an
             // action that would re-enter the state machine.
@@ -396,7 +396,9 @@ struct MainWindow: View {
         VStack(spacing: 16) {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 36))
-                .foregroundStyle(.orange)
+                // Genuine load failure: red foreground + triangle shape is the
+                // reserved error treatment (R7), distinct from de-colored advisories.
+                .foregroundStyle(Color.scErrorFg)
             Text("Couldn't load recordings")
                 .font(.headline)
             Text(message)

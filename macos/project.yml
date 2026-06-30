@@ -52,6 +52,11 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: ScreenCap/ScreenCap.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Aurora signature accent (SCR-197). The global accent propagates the
+        # derived solid spring-teal to every `.tint` / `.accentColor` site for
+        # free, including surfaces not yet tokenized — preventing a
+        # designed-next-to-stock split. Regenerate with `xcodegen generate`.
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ENABLE_PREVIEWS: YES
         GENERATE_INFOPLIST_FILE: NO
     preBuildScripts:

@@ -12,9 +12,11 @@ struct RecordingBanner: View {
 
     var body: some View {
         if recorder.state.isRecording {
-            HStack(spacing: 12) {
+            HStack(spacing: SCMetrics.space3) {
                 Circle()
-                    .fill(Color.red)
+                    // Warm-amber recording fill (R7) — distinguished from error
+                    // (red triangle) by both hue and shape.
+                    .fill(Color.scRecording)
                     .frame(width: 10, height: 10)
                     .opacity(pulsing ? 1.0 : 0.35)
                     .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulsing)
@@ -22,20 +24,18 @@ struct RecordingBanner: View {
                     .onDisappear { pulsing = false }
 
                 Text(label)
-                    .font(.headline)
-                    .monospacedDigit()
+                    .font(SCTypography.monoTimer)
 
                 Spacer()
 
                 if let remaining = recorder.quitProgressSecondsRemaining {
                     Text("Finalizing — \(remaining)s remaining")
-                        .font(.caption)
+                        .font(SCTypography.metadata)
                         .foregroundStyle(.secondary)
                 }
 
                 Button("Stop") { recorder.stop() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
+                    .buttonStyle(AuroraButtonStyle())
                     .disabled({
                         // `stop()` only acts on `.recording`. During `.starting`
                         // (before the `started` stderr event) and `.stopping`
@@ -46,15 +46,15 @@ struct RecordingBanner: View {
                         }
                     }())
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .padding(.horizontal, SCMetrics.space4)
+            .padding(.vertical, SCMetrics.space3)
             .background(
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(nsColor: .controlBackgroundColor))
+                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                    .fill(Color.scSurfaceElevated)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(Color.red.opacity(0.4), lineWidth: 1)
+                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                    .stroke(Color.scRecording.opacity(0.4), lineWidth: 1)
             )
         }
     }
