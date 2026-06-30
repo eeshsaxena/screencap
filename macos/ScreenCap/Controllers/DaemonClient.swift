@@ -121,14 +121,21 @@ struct DaemonPermissionGrants: Decodable, Equatable, Sendable {
         inputMonitoring: .indeterminate
     )
 
-    /// All three required daemon grants are confirmed granted (microphone is
-    /// not a daemon-required permission and is excluded). Indeterminate is NOT
-    /// granted — this is the positive "everything's good" predicate that drives
-    /// auto-close of the walkthrough.
+    /// The required daemon grants — Screen Recording + Accessibility — are
+    /// confirmed granted. Indeterminate is NOT granted; this is the positive
+    /// "everything's good" predicate that drives auto-close of the walkthrough.
+    ///
+    /// Input Monitoring is deliberately excluded (SCR-196 follow-up): on
+    /// macOS 26.x the daemon helper cannot register a toggleable Input
+    /// Monitoring row by any mechanism (request API, the `CGEventTapCreate`
+    /// listen-only touch, or a real capture's tap — all verified on-device to
+    /// produce no row), so requiring it stranded every user on a grant that is
+    /// impossible to obtain. IM is advisory, not capture-fatal (the worker's
+    /// `FreshScreenWatch` gates capture on Screen Recording alone), so it is
+    /// treated like the microphone: optional, never blocking onboarding.
     var allRequiredGranted: Bool {
         screenRecording == .granted
             && accessibility == .granted
-            && inputMonitoring == .granted
     }
 
     /// Screen Recording specifically reports denied — the one permission fatal
@@ -138,12 +145,15 @@ struct DaemonPermissionGrants: Decodable, Equatable, Sendable {
         screenRecording == .denied
     }
 
-    /// Any required grant reports denied — drives whether the walkthrough is
-    /// surfaced (R3).
+    /// A required grant (Screen Recording or Accessibility) reports denied —
+    /// drives whether the walkthrough is surfaced (R3). Input Monitoring is
+    /// excluded for the same reason as `allRequiredGranted`: it can't be
+    /// registered for the helper on macOS 26.x, so keying on it kept the
+    /// walkthrough/recovery banner surfaced forever even after the user had
+    /// granted everything that is actually grantable.
     var anyRequiredDenied: Bool {
         screenRecording == .denied
             || accessibility == .denied
-            || inputMonitoring == .denied
     }
 }
 

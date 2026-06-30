@@ -58,11 +58,13 @@ class TestCheckPermissionsNow:
     @pytest.mark.parametrize("revoked,expected_name", [
         ("Screen Recording", "screen_recording"),
         ("Accessibility", "accessibility"),
-        ("Input Monitoring", "input_monitoring"),
     ])
     def test_revoked_permission_reported(self, monkeypatch, revoked, expected_name):
         """Post-todo-002: revoke a single TCC permission via the fresh-subprocess
-        helper and assert the watcher reports it."""
+        helper and assert the watcher reports it.
+
+        Input Monitoring is intentionally excluded — see
+        ``test_input_monitoring_denial_does_not_trigger_revocation``."""
         from screencap import recorder
 
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -75,6 +77,28 @@ class TestCheckPermissionsNow:
         ok, missing = recorder._check_permissions_now()
         assert ok is False
         assert missing == expected_name
+
+    def test_input_monitoring_denial_does_not_trigger_revocation(self, monkeypatch):
+        """Input Monitoring is advisory and, on macOS 26.x, cannot be granted to
+        the daemon helper at all (no toggleable row registers by any mechanism).
+        So a denied IM must NOT be reported as a revocation — otherwise every
+        recording would be torn down on the first poll. Only Screen Recording
+        and Accessibility are capture-required. This pins the SCR-196 follow-up
+        that demoted IM to optional across the daemon, CLI, and Swift onboarding.
+        """
+        from screencap import recorder
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        # IM denied, the two required permissions granted.
+        def _fresh(name: str) -> bool:
+            return name != "Input Monitoring"
+
+        monkeypatch.setattr(recorder, "_check_permission_fresh", _fresh)
+
+        ok, missing = recorder._check_permissions_now()
+        assert ok is True
+        assert missing is None
 
     def test_screen_recording_takes_priority(self, monkeypatch):
         """When multiple are revoked, screen_recording is reported first

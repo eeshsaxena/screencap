@@ -58,8 +58,14 @@ enum PrivacyPane: String, CaseIterable {
         }
     }
 
+    /// Whether a missing grant should block onboarding/recording. Only Screen
+    /// Recording and Accessibility qualify. Microphone is optional (audio loss
+    /// must not abort a video-only capture), and Input Monitoring is optional
+    /// too: on macOS 26.x the helper cannot register a toggleable IM row by any
+    /// known mechanism, and IM is advisory (not capture-fatal), so requiring it
+    /// would strand users on an ungrantable permission.
     var isRequired: Bool {
-        self != .microphone
+        self == .screenRecording || self == .accessibility
     }
 
     /// The exact name macOS shows for the *helper's* row in this pane's Privacy
@@ -239,16 +245,18 @@ final class PermissionController: ObservableObject {
     /// True while the daemon-grant refresh lifecycle is active (sheet visible).
     var isDaemonGrantWatching: Bool { daemonGrantTimer != nil }
 
+    /// App-process view of the required grants (CLI-fallback path). Mirrors
+    /// `DaemonPermissionGrants.allRequiredGranted`: Input Monitoring is excluded
+    /// because it can't be registered for the helper on macOS 26.x and is
+    /// advisory, not capture-fatal — see that property for the full rationale.
     var allRequiredGranted: Bool {
         screenRecording == .granted
             && accessibility == .granted
-            && inputMonitoring == .granted
     }
 
     var anyDenied: Bool {
         screenRecording == .denied
             || accessibility == .denied
-            || inputMonitoring == .denied
     }
 
     /// Whether the Privacy tab's "Finish setup" recovery banner should show

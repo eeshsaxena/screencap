@@ -417,9 +417,12 @@ def _check_macos_permissions() -> None:
     """Check macOS permissions and guide the user through granting them.
 
     Walks through each missing permission one at a time:
-    1. Non-restart permissions first (Accessibility, Input Monitoring) —
-       triggers the native prompt, opens System Settings, polls until granted.
+    1. Non-restart permissions first (Accessibility) — triggers the native
+       prompt, opens System Settings, polls until granted.
     2. Screen Recording last — requires a terminal restart, so we exit.
+
+    Input Monitoring is intentionally not preflighted (it can't be granted to
+    the daemon helper on macOS 26.x and is advisory) — see ``all_permissions``.
 
     Polling uses a fresh subprocess for each check because macOS caches
     permission state within a process lifetime.
@@ -433,11 +436,16 @@ def _check_macos_permissions() -> None:
         return
 
     # (name, check_fn, request_fn, pane, needs_restart)
+    #
+    # Input Monitoring is intentionally NOT preflighted here. On macOS 26.x the
+    # daemon helper cannot register a toggleable Input Monitoring row by any
+    # known mechanism, so polling for it would block this preflight on a grant
+    # the user has no way to give. IM is advisory (not capture-fatal); listen-
+    # only gesture capture degrades gracefully without it. Keep this list in
+    # sync with the Swift onboarding's required set (DaemonPermissionGrants).
     all_permissions = [
         ("Accessibility", DarwinPlatform.is_accessibility_enabled,
          DarwinPlatform.request_accessibility_access, "Privacy_Accessibility", False),
-        ("Input Monitoring", DarwinPlatform.is_input_monitoring_enabled,
-         DarwinPlatform.request_input_monitoring_access, "Privacy_ListenEvent", False),
         ("Screen Recording", DarwinPlatform.is_screen_recording_enabled,
          DarwinPlatform.request_screen_recording_access, "Privacy_ScreenCapture", True),
     ]
@@ -496,12 +504,17 @@ def _check_macos_permissions() -> None:
 
 
 def _check_permissions_now() -> tuple[bool, str | None]:
-    """Probe the three TCC permissions; return (all_ok, missing_name).
+    """Probe the capture-required TCC permissions; return (all_ok, missing_name).
 
     Designed to run on the recorder's main loop every ~5s. Returns
-    (False, "screen_recording" | "accessibility" | "input_monitoring") on
-    the first detected revocation. Microphone is intentionally NOT polled
-    here — audio loss should not abort a video-only capture.
+    (False, "screen_recording" | "accessibility") on the first detected
+    revocation. Microphone is intentionally NOT polled here — audio loss
+    should not abort a video-only capture. Input Monitoring is likewise not
+    polled: it is advisory (listen-only gesture capture degrades gracefully
+    without it) and on macOS 26.x cannot be granted to the daemon helper at
+    all, so treating its absence as a revocation would tear down every
+    recording. Keep this set in sync with `_check_macos_permissions` and the
+    Swift onboarding's required set.
 
     Uses fresh subprocesses (todo 002) instead of in-process PyObjC calls
     because macOS caches TCC state per-process — an in-process call from
@@ -525,7 +538,6 @@ def _check_permissions_now() -> tuple[bool, str | None]:
     for tcc_name, missing_label in (
         ("Screen Recording", "screen_recording"),
         ("Accessibility", "accessibility"),
-        ("Input Monitoring", "input_monitoring"),
     ):
         try:
             granted = _check_permission_fresh(tcc_name)

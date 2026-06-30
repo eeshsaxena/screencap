@@ -253,13 +253,17 @@ class TestPermissionPrompting:
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
         assert "not granted" in all_output.lower()
 
-    def test_two_immediate_permissions_step_by_step(self):
-        """Accessibility then Input Monitoring: each gets its own step and Settings pane."""
+    def test_input_monitoring_not_preflighted_even_when_denied(self):
+        """Input Monitoring is no longer preflighted (SCR-196 follow-up): it
+        can't be granted to the daemon helper on macOS 26.x and is advisory.
+        So with both Accessibility and IM denied, only Accessibility is stepped
+        — IM's Settings pane is never opened and its request fn is never called.
+        """
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=True, accessibility=False, input_monitoring=False)
-        # Each permission: True (poll granted), True (verify)
-        fresh_results = [True, True, True, True]
+        # Only Accessibility steps: poll-granted, then verify.
+        fresh_results = [True, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
@@ -275,24 +279,28 @@ class TestPermissionPrompting:
             mock_sys.platform = "darwin"
             _check_macos_permissions()
 
-        # Settings opened twice (via subprocess.run for 'open' command)
+        # Only the Accessibility pane is opened — not Input Monitoring.
         open_calls = [
             call for call in mock_subprocess.run.call_args_list
             if call[0][0][0] == "open"
         ]
-        assert len(open_calls) == 2
+        assert len(open_calls) == 1
         assert "Privacy_Accessibility" in open_calls[0][0][0][1]
-        assert "Privacy_ListenEvent" in open_calls[1][0][0][1]
+        assert not any("Privacy_ListenEvent" in c[0][0][1] for c in open_calls)
+        platform.request_input_monitoring_access.assert_not_called()
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
-        assert "[1/2]" in all_output
-        assert "[2/2]" in all_output
+        assert "[1/1]" in all_output
 
-    def test_all_missing_steps_through_immediate_then_exits_for_screen(self):
-        """All missing: steps through Accessibility, Input Monitoring, then exits for Screen Recording."""
+    def test_all_missing_steps_through_accessibility_then_exits_for_screen(self):
+        """All missing: steps through Accessibility, then exits for Screen
+        Recording. Input Monitoring is no longer preflighted (SCR-196 follow-up),
+        so its request fn is never called and the step count is 2, not 3.
+        """
         from screencap.recorder import _check_macos_permissions
 
         platform = self._make_platform_mock(screen=False, accessibility=False, input_monitoring=False)
-        fresh_results = [True, True, True, True]
+        # Accessibility steps (poll-granted, verify); Screen Recording exits.
+        fresh_results = [True, True]
 
         with (
             mock.patch("screencap.recorder.sys") as mock_sys,
@@ -311,12 +319,11 @@ class TestPermissionPrompting:
                 _check_macos_permissions()
 
         platform.request_accessibility_access.assert_called_once()
-        platform.request_input_monitoring_access.assert_called_once()
+        platform.request_input_monitoring_access.assert_not_called()
         platform.request_screen_recording_access.assert_called_once()
         all_output = " ".join(str(c) for c in mock_console.print.call_args_list)
-        assert "[1/3]" in all_output
-        assert "[2/3]" in all_output
-        assert "[3/3]" in all_output
+        assert "[1/2]" in all_output
+        assert "[2/2]" in all_output
         assert "terminal restart" in all_output.lower()
 
     def test_check_permission_fresh_runs_subprocess(self):
