@@ -517,3 +517,149 @@ def test_daemon_smoke_check_imports_and_finds_required_routes():
     from screencap.cli import _check_daemon_load
 
     assert _check_daemon_load() == ("daemon_load", True, "")
+
+
+# -- U3/U4: proactive install-time setup -----------------------------------
+
+
+@pytest.mark.privacy
+def test_run_proactive_setup_is_noop_off_darwin(monkeypatch: pytest.MonkeyPatch):
+    from screencap.daemon import launchagent, tcc_cleanup
+
+    monkeypatch.setattr(launchagent.sys, "platform", "linux")
+
+    def _should_not_run(*_a, **_k):
+        raise AssertionError("proactive setup must not run off darwin")
+
+    monkeypatch.setattr(tcc_cleanup, "run_decoy_cleanup", _should_not_run)
+    monkeypatch.setattr(launchagent, "_post_permission_request", _should_not_run)
+
+    launchagent.run_proactive_setup()  # must be a clean no-op
+
+
+@pytest.mark.privacy
+def test_run_proactive_setup_cleans_then_registers_sr_and_accessibility(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # U3/U4: cleanup runs once; registration is round-tripped for exactly
+    # screen_recording + accessibility (NOT input_monitoring), via the socket
+    # POST — never an in-process register_permission call (R6 attribution guard).
+    from screencap.daemon import launchagent, permission_register, tcc_cleanup
+
+    monkeypatch.setattr(launchagent.sys, "platform", "darwin")
+
+    cleanup_calls: list[bool] = []
+    monkeypatch.setattr(
+        tcc_cleanup, "run_decoy_cleanup", lambda: cleanup_calls.append(True)
+    )
+
+    posted: list[str] = []
+    monkeypatch.setattr(
+        launchagent,
+        "_post_permission_request",
+        lambda permission: posted.append(permission) or True,
+    )
+
+    def _attribution_violation(_permission: str) -> bool:
+        raise AssertionError(
+            "registration must round-trip the daemon verb, never run in-process"
+        )
+
+    monkeypatch.setattr(
+        permission_register, "register_permission", _attribution_violation
+    )
+
+    launchagent.run_proactive_setup()
+
+    assert cleanup_calls == [True]
+    assert posted == ["screen_recording", "accessibility"]
+    assert "input_monitoring" not in posted
+
+
+@pytest.mark.privacy
+def test_run_proactive_setup_is_fail_soft(monkeypatch: pytest.MonkeyPatch):
+    # A cleanup raise and a registration POST OSError must both be swallowed so
+    # an otherwise-successful install is never failed by the proactive step.
+    from screencap.daemon import launchagent, tcc_cleanup
+
+    monkeypatch.setattr(launchagent.sys, "platform", "darwin")
+
+    def _cleanup_boom():
+        raise RuntimeError("tccutil exploded")
+
+    def _post_boom(_permission: str) -> bool:
+        raise OSError("socket gone")
+
+    monkeypatch.setattr(tcc_cleanup, "run_decoy_cleanup", _cleanup_boom)
+    monkeypatch.setattr(launchagent, "_post_permission_request", _post_boom)
+
+    launchagent.run_proactive_setup()  # must not raise
+
+
+@pytest.mark.privacy
+def test_post_permission_request_detects_200_ack(monkeypatch: pytest.MonkeyPatch):
+    from screencap.daemon import launchagent
+
+    sent: dict[str, bytes] = {}
+
+    class _FakeSock:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, data):
+            sent["request"] = data
+
+        def recv(self, _n):
+            if "drained" in sent:
+                return b""
+            sent["drained"] = b""
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(launchagent, "_make_unix_socket", lambda: _FakeSock())
+
+    assert launchagent._post_permission_request("screen_recording") is True
+    # The POST targets the permission.request verb with a JSON body.
+    assert b"POST /v0/permission.request HTTP/1.1" in sent["request"]
+    assert b'"permission": "screen_recording"' in sent["request"]
+
+
+@pytest.mark.privacy
+def test_post_permission_request_returns_false_on_non_200(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from screencap.daemon import launchagent
+
+    class _FakeSock:
+        def __init__(self, *_a, **_k):
+            self._drained = False
+
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, _data):
+            pass
+
+        def recv(self, _n):
+            if self._drained:
+                return b""
+            self._drained = True
+            return b"HTTP/1.1 500 Internal Server Error\r\n\r\n"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(launchagent, "_make_unix_socket", lambda: _FakeSock())
+
+    assert launchagent._post_permission_request("accessibility") is False

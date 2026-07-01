@@ -301,6 +301,22 @@ struct RecordingStopResponse: Decodable {
     }
 }
 
+/// Ack for the SCR-200 decoy-cleanup verb. The envelope carries no payload
+/// beyond the standard fields — the sweep is fire-and-forget on the daemon.
+struct CleanupDecoysResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+    }
+}
+
 /// Body for the on-demand daemon-driven registration verb (U8). `permission`
 /// is one of the canonical strings (`screen_recording` / `accessibility` /
 /// `input_monitoring`); the daemon validates it against the allowlist and
@@ -662,6 +678,20 @@ enum DaemonClient {
             method: "POST",
             path: "/v0/permission.request",
             body: body,
+            timeout: 10
+        )
+    }
+
+    /// SCR-200 (U4): trigger the daemon's identity-scoped decoy/orphan TCC
+    /// cleanup so exactly one "ScreenCap" row remains per pane (R5/R6/R8). The
+    /// hardened `tccutil` allowlist lives daemon-side (`tcc_cleanup`), so the app
+    /// never carries a second copy of the destructive reset logic. Best-effort:
+    /// the daemon swallows individual `tccutil` failures and acks once the sweep
+    /// has run. No request body — the verb resets a fixed, allowlisted set.
+    static func cleanupDecoys() async throws -> CleanupDecoysResponse {
+        return try await request(
+            method: "POST",
+            path: "/v0/permission.cleanup_decoys",
             timeout: 10
         )
     }

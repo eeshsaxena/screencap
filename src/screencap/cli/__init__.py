@@ -179,6 +179,11 @@ def serve(
         if install:
             result = launchagent.install()
             if result.state == launchagent.STATE_INSTALLED_AND_RUNNING:
+                # Proactively register the daemon's Screen Recording +
+                # Accessibility rows and clear decoy/orphan rows now that the
+                # daemon is up (U3/U4). Best-effort: never let this fail the
+                # otherwise-successful install.
+                launchagent.run_proactive_setup()
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return
             if result.state == launchagent.STATE_INSTALL_FAILED_ALREADY_RUNNING:

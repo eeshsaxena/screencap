@@ -602,6 +602,51 @@ async def permission_request(request: Request) -> JSONResponse:
         )
 
 
+async def permission_cleanup_decoys(request: Request) -> JSONResponse:
+    """SCR-200 (U4): identity-scoped decoy/orphan TCC cleanup, daemon-side.
+
+    Removes the orphaned bare ``screencap`` identity and the legacy app's stray
+    Screen Recording / Accessibility rows so exactly one "ScreenCap" row remains
+    per pane (R5/R6/R8). The destructive ``tccutil`` argv is built through the
+    hardened allowlists in ``tcc_cleanup`` — the single source of truth, so the
+    GUI install path does not carry a second copy of the reset logic.
+
+    A mutating verb on the same trust boundary as ``permission.request``: audited
+    on every exit path. Idempotent and best-effort — a ``tccutil`` non-zero exit
+    is swallowed by ``run_decoy_cleanup`` itself, so the verb acks ``ok`` once the
+    sweep has run. Callers gate it behind their own first-install/once-per-version
+    one-shot so it does not re-fire on every reconnect.
+    """
+    from screencap.daemon import audit_log, provenance, tcc_cleanup
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "permission.cleanup_decoys",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        # Off the event loop: tccutil can block briefly. run_decoy_cleanup is
+        # itself fail-soft, so this only raises on a truly unexpected error.
+        await asyncio.to_thread(tcc_cleanup.run_decoy_cleanup)
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(schema_version=schema._PERMISSION_CLEANUP_API_VERSION)
+        )
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._PERMISSION_CLEANUP_API_VERSION,
+            request=request,
+        )
+
+
 def _ndjson(payload: dict) -> bytes:
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -1478,6 +1523,7 @@ def build_app() -> Starlette:
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
+            Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
             Route("/v0/content.search", content_search, methods=["POST"]),
             Route("/v0/transcript.search", transcript_search, methods=["POST"]),
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),

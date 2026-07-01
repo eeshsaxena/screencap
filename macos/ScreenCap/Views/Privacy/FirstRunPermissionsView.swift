@@ -31,6 +31,10 @@ struct FirstRunPermissionsView: View {
     @State private var isPreparingRelaunch = false
     @State private var isDaemonInstallComplete = false
     @State private var openedDaemonPanes: Set<PrivacyPane> = []
+    /// When the user first opened each pane (= reached the toggle step). Drives
+    /// U6's grant-state-timeout heuristic: the block-with-Retry state can only
+    /// fire after the user has had a real chance to toggle (R7).
+    @State private var openedDaemonPaneAt: [PrivacyPane: Date] = [:]
 
     /// Phase 1c (SCR-49): true once the user taps Continue on the one-time
     /// migration banner this session. Combined with `permissions.migrationNeeded`
@@ -102,7 +106,7 @@ struct FirstRunPermissionsView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("After enabling ScreenCap in System Settings, return here to continue. If macOS shows a separate ScreenCap helper entry, enable that entry too.")
+                Text("After enabling the ScreenCap entry in System Settings, return here to continue.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -320,8 +324,23 @@ struct FirstRunPermissionsView: View {
                 .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("\(pane.displayName) for ScreenCap helper")
+                HStack(spacing: 6) {
+                    // R4: show the "ScreenCap" mark the user will match against the
+                    // System Settings row, with an SF Symbol fallback so an absent
+                    // app-icon image never leaves a blank frame.
+                    switch Self.helperRowIcon(appIcon: Self.helperRowAppIcon()) {
+                    case .image(let nsImage):
+                        Image(nsImage: nsImage)
+                            .resizable()
+                            .frame(width: 18, height: 18)
+                            .accessibilityLabel("ScreenCap icon")
+                    case .symbol(let name):
+                        Image(systemName: name)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("ScreenCap icon")
+                    }
+                    Text("\(pane.displayName) for ScreenCap")
                         .font(.headline)
                 }
                 Text(daemonRationale(for: pane))
@@ -331,19 +350,50 @@ struct FirstRunPermissionsView: View {
 
             Spacer()
 
-            if state == .granted {
+            // U6 (R7): resolve the row's trailing control from the registration-
+            // outcome + grant-state-timeout heuristic. The block-with-Retry state
+            // only fires once the user has opened the pane (reached the toggle
+            // step) and a budget has elapsed without the grant resolving.
+            let elapsed = openedDaemonPaneAt[pane].map { Date().timeIntervalSince($0) }
+            let rowState = Self.daemonRowState(
+                grant: state,
+                isRegistering: permissions.isDaemonRegistering(pane),
+                elapsedSinceOpened: elapsed,
+                budget: Self.daemonRowBlockBudget
+            )
+            switch rowState {
+            case .granted:
                 Text("Granted")
                     .font(.subheadline)
                     .foregroundStyle(Color.scSuccessFg)
-            } else if permissions.isDaemonRegistering(pane) {
+            case .registering:
                 // U8: a daemon registration round-trip is in flight for this
                 // pane. Mirror the helper-install step's spinner so the user
                 // sees the Grant action is working and a repeat tap is a no-op.
                 ProgressView()
                     .controlSize(.small)
-            } else {
+            case .blockedWithRetry:
+                // R7: the row never became grantable within the budget — block
+                // with a clear state + Retry that re-fires registration. Never a
+                // manual "+" add, never a silent advance.
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("Couldn't set this up")
+                        .font(.caption)
+                        .foregroundStyle(Color.scAdvisoryFg)
+                    Button("Retry") {
+                        openedDaemonPaneAt[pane] = Date()  // restart the budget
+                        permissions.requestAndOpenSettings(for: pane, subject: .daemon)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(pane.displayName) couldn't be set up. Retry.")
+            case .actionable:
                 Button(opened ? "Open Again" : "Grant") {
                     openedDaemonPanes.insert(pane)
+                    if openedDaemonPaneAt[pane] == nil {
+                        openedDaemonPaneAt[pane] = Date()
+                    }
                     permissions.requestAndOpenSettings(for: pane, subject: .daemon)
                 }
                 .buttonStyle(.borderedProminent)
@@ -375,16 +425,78 @@ struct FirstRunPermissionsView: View {
         }
     }
 
+    /// The leading "ScreenCap" mark for a permission row, resolved to either the
+    /// app/helper icon image or an SF Symbol fallback (R4). Pure so the fallback
+    /// path — the one that guarantees the row is never blank — is unit-testable.
+    enum HelperRowIcon {
+        case image(NSImage)
+        case symbol(String)
+    }
+
+    /// SF Symbol shown when the app-icon image can't be resolved. Never blank.
+    static let helperRowFallbackSymbol = "app.dashed"
+
+    static func helperRowIcon(appIcon: NSImage?) -> HelperRowIcon {
+        if let appIcon {
+            return .image(appIcon)
+        }
+        return .symbol(helperRowFallbackSymbol)
+    }
+
+    /// The app's own icon, which the helper shares as its mark (same "ScreenCap"
+    /// glyph the System Settings row shows). `nil` if it can't be loaded, driving
+    /// the SF Symbol fallback.
+    static func helperRowAppIcon() -> NSImage? {
+        NSImage(named: NSImage.applicationIconName)
+    }
+
+    /// The trailing control state for a daemon permission row (SCR-200 U6 / R7).
+    enum DaemonRowState: Equatable {
+        case granted
+        case registering       // a daemon round-trip is in flight
+        case actionable        // normal Grant / Open Again — not (yet) blocked
+        case blockedWithRetry  // budget exhausted with the row still not granted
+    }
+
+    /// Budget after the user opens a pane before a still-denied row is treated as
+    /// "couldn't set this up" (R7). Generous so a slow-but-normal toggle never
+    /// false-blocks; the exact value is on-device-tuned (U7 leg F).
+    static let daemonRowBlockBudget: TimeInterval = 25
+
+    /// Resolve a daemon row's trailing control from the registration-outcome +
+    /// grant-state-timeout heuristic (R7). There is **no** public, non-SIP API for
+    /// TCC row *presence* — an absent row and a present-but-OFF row both read
+    /// `denied`, and TCC.db is SIP-protected — so "the row never appeared" is
+    /// *inferred*, not read: the pane was opened (registration fired) AND the
+    /// grant has not resolved to `granted` within `budget` after the user reached
+    /// the toggle step. The block is gated on `elapsedSinceOpened` so it never
+    /// fires before the user has had a real chance to toggle (no immediate
+    /// post-install false-block). `indeterminate` ("couldn't verify") keeps Retry
+    /// available rather than hard-blocking, so a transient probe hiccup can't
+    /// false-block a user who is actually granted.
+    static func daemonRowState(
+        grant: DaemonGrantState,
+        isRegistering: Bool,
+        elapsedSinceOpened: TimeInterval?,
+        budget: TimeInterval
+    ) -> DaemonRowState {
+        if grant == .granted { return .granted }
+        if isRegistering { return .registering }
+        // Not yet opened → the user hasn't reached the toggle step; never block.
+        guard let elapsed = elapsedSinceOpened else { return .actionable }
+        // Couldn't verify → keep Retry available, don't hard-block.
+        if grant == .indeterminate { return .actionable }
+        // Opened + still denied past the budget → the row didn't take.
+        if elapsed >= budget { return .blockedWithRetry }
+        return .actionable
+    }
+
     private func daemonRationale(for pane: PrivacyPane) -> String {
+        // SCR-200: the daemon's row reads "ScreenCap" and is the only "ScreenCap"
+        // row in this pane (the app never appears here, R6), so naming it is
+        // unambiguous — no "helper vs app" disambiguation is needed. Spell out the
+        // exact row to enable so the user toggles the right one.
         let entry = pane.helperSettingsEntryName
-        // Since SCR-196 the three daemon-owned grants attribute to the helper
-        // bundle and read "ScreenCap Helper" — a distinct entry from the
-        // "ScreenCap" app row. Spell out which row to enable (and that it's the
-        // helper, not the app) so the user doesn't toggle the app instead of the
-        // helper and leave the daemon's grant denied.
-        let disambiguation = entry == "ScreenCap Helper"
-            ? " (the helper, not the “ScreenCap” app row)"
-            : ""
-        return "\(pane.rationale) Enable the “\(entry)” entry in this pane\(disambiguation)."
+        return "\(pane.rationale) Enable the “\(entry)” entry in this pane."
     }
 }

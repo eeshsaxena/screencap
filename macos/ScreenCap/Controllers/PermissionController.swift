@@ -68,25 +68,28 @@ enum PrivacyPane: String, CaseIterable {
         self == .screenRecording || self == .accessibility
     }
 
-    /// The exact name macOS shows for the *helper's* row in this pane's Privacy
+    /// The exact name macOS shows for the daemon's row in this pane's Privacy
     /// list. Since SCR-196 the recording daemon ships as a proper helper bundle
-    /// (`com.screencap.daemon`, `CFBundleDisplayName` "ScreenCap Helper"), so the
-    /// three daemon-owned grants — Screen Recording, Accessibility, Input
-    /// Monitoring — all attribute to that one bundle and read "ScreenCap Helper"
-    /// (deterministic via the display name set in the PyInstaller spec). Only the
-    /// microphone stays app-owned, reading "ScreenCap". Naming the exact row stops
-    /// the user enabling the wrong same-named entry (the "ScreenCap" app row vs the
-    /// "ScreenCap Helper" daemon row), which would leave the daemon's grant denied
-    /// even though System Settings *looks* granted.
+    /// (`com.screencap.daemon`), so the three daemon-owned grants — Screen
+    /// Recording, Accessibility, Input Monitoring — all attribute to that one
+    /// bundle. SCR-200 names that row "ScreenCap" (the recognizable app name) via
+    /// the helper's `CFBundleDisplayName` in the PyInstaller spec, so a
+    /// non-technical user toggles one obvious row. This is unambiguous because the
+    /// app (`com.screencap.macos`) never appears in the SR/Accessibility panes
+    /// (R6) — the only "ScreenCap" row there is the daemon's. The microphone row
+    /// (app-owned) also reads "ScreenCap", but it lives in a different pane, so
+    /// there is never a duplicate within one pane.
     ///
-    /// NOTE: the precise row string is an on-device fact — confirm in the U8
-    /// validation runbook that macOS renders "ScreenCap Helper" (not the bundle id
-    /// or the `.app` filename) before shipping; it is a one-line fix if it differs.
+    /// SHIP GATE (SCR-200 U1/U7): the precise row string is an on-device fact —
+    /// confirm on a CLEAN machine that macOS renders "ScreenCap" (not the bundle
+    /// id or the `.app` filename) in BOTH the SR and Accessibility panes before
+    /// release. If the filename proves to be the lever, the row label and this
+    /// string must move together (the rename contingency); the bundle id is
+    /// stable so grants survive either way.
     var helperSettingsEntryName: String {
-        switch self {
-        case .microphone: return "ScreenCap"
-        case .screenRecording, .accessibility, .inputMonitoring: return "ScreenCap Helper"
-        }
+        // One name for every daemon-owned pane and the app-owned microphone row:
+        // "ScreenCap". See the doc comment for why this is collision-free.
+        return "ScreenCap"
     }
 
     /// Maps the `permission` string emitted by `_check_permissions_now`
