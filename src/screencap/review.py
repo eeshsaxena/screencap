@@ -195,7 +195,7 @@ def _prepare_recording_video(name: str) -> tuple[Path, Path, bool]:
     (never a missing-binary message — R9). The video is a *local* navigation aid
     that never uploads, so it is prepared from and left at the original dir.
     """
-    from screencap.config import resolve_recording_dir
+    from screencap.config import get_recordings_dir, resolve_recording_dir
     from screencap.engine.video import remediate_pixfmt_for_review
     from screencap.viewer import _ensure_single_video
 
@@ -229,6 +229,13 @@ def _prepare_recording_video(name: str) -> tuple[Path, Path, bool]:
         video_path, remediated = remediate_pixfmt_for_review(rec_dir)
     except (RuntimeError, ValueError, OSError) as e:
         raise ReviewPrepareError(f"can't process this video: {e}") from e
+
+    # Defense-in-depth path containment, applied once here so BOTH review-data
+    # and inspect-data inherit it (SCR-189): refuse to emit a video_path that
+    # escapes the recordings root via a symlink inside the recording dir — the
+    # AVKit player would otherwise be handed an out-of-tree absolute path. Runs
+    # before any scrub, so review-data fails fast on an escape.
+    _assert_within_recordings_root(video_path, get_recordings_dir())
 
     return rec_dir, video_path, remediated
 
@@ -433,10 +440,11 @@ def prepare_inspect_data(name: str) -> dict:
     event_files = _resolve_event_files(rec_dir)
     events_paths = [str(p.resolve()) for p in event_files]
 
-    # Defense-in-depth: refuse to emit any path that escapes the recordings root
-    # — a symlink inside the dir could otherwise put an out-of-tree absolute
-    # path into the envelope that AVKit / the parser would then read.
-    _assert_within_recordings_root(video_path, recordings_root)
+    # Defense-in-depth: refuse to emit any event path that escapes the
+    # recordings root — a symlink inside the dir could otherwise put an
+    # out-of-tree absolute path into the envelope that the parser would read.
+    # (video_path is guarded once in _prepare_recording_video, shared with
+    # review-data — SCR-189.)
     for p in event_files:
         _assert_within_recordings_root(p, recordings_root)
 

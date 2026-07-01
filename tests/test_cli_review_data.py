@@ -1010,6 +1010,29 @@ def test_event_set_outside_recordings_root_is_rejected(recordings_root):
             prepare_review_data("rec-escape")
 
 
+def test_video_symlink_outside_recordings_root_is_rejected(recordings_root, tmp_path):
+    """Defense-in-depth, video branch: a ``video.mp4`` symlinked to a real video
+    OUTSIDE the recordings root is refused before its path is emitted. Mirrors
+    ``test_event_set_outside_recordings_root_is_rejected`` (the scrubbed-dir arm)
+    and the inspect-data test of the same name — exercising the ``video_path``
+    arm of ``_assert_within_recordings_root`` now shared by both verbs via
+    ``_prepare_recording_video``, so review-data no longer hands AVKit an
+    out-of-tree absolute path. The escape is caught before the scrub runs."""
+    rec_dir = _make_recording(recordings_root, "rec-videscape")
+    # A valid events file so that, absent the video guard, the pipeline would
+    # emit a clean ok:true envelope carrying the escaped video_path — the miss
+    # this test pins. With the guard, the escape is rejected before the scrub.
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+    # A real, AVKit-safe (yuv420p → no remediation) video living outside the
+    # root; the in-dir video.mp4 symlinks to it, so the resolved path escapes.
+    outside = tmp_path / "outside.mp4"
+    _write_video(outside, pix_fmt="yuv420p")
+    (rec_dir / "video.mp4").symlink_to(outside)
+
+    with pytest.raises(ReviewPrepareError, match="outside the recordings root"):
+        prepare_review_data("rec-videscape")
+
+
 # ---------------------------------------------------------------------------
 # Shared canonical-events export helper (review + upload must not drift)
 # ---------------------------------------------------------------------------
