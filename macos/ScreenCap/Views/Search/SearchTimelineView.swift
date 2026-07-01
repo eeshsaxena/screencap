@@ -31,9 +31,16 @@ struct ResultRow: View {
     // SCR-177 U4 — the matched terms to bold in the snippet, and the shared
     // services that resolve + decode the leading thumbnail. Optional/defaulted so
     // a row can still render (placeholder) without them.
-    var queryTerms: [String] = []
-    var frameIndex: RecordingFrameIndex?
-    var thumbnailLoader: ThumbnailLoader?
+    let queryTerms: [String]
+    let frameIndex: RecordingFrameIndex?
+    let thumbnailLoader: ThumbnailLoader?
+
+    /// SCR-187 — the highlighted lead line, computed once per row identity in
+    /// `init` and stored, so the `SnippetHighlighter` pass does NOT re-run on
+    /// every `body` evaluation (notably the re-render when `loaded` flips as the
+    /// thumbnail decode finishes). Its inputs (`item` + `queryTerms`) are fixed
+    /// per row identity, so a new result set re-creates the row and recomputes.
+    private let primaryText: AttributedString
 
     /// The decoded thumbnail tagged with the pointer key it was loaded for. The
     /// cell only trusts it when its key matches the current row (mirrors
@@ -45,6 +52,19 @@ struct ResultRow: View {
     private struct LoadedThumb {
         let key: String
         let image: ThumbnailImage?
+    }
+
+    init(
+        item: SearchResultItem,
+        queryTerms: [String] = [],
+        frameIndex: RecordingFrameIndex? = nil,
+        thumbnailLoader: ThumbnailLoader? = nil
+    ) {
+        self.item = item
+        self.queryTerms = queryTerms
+        self.frameIndex = frameIndex
+        self.thumbnailLoader = thumbnailLoader
+        self.primaryText = Self.makePrimaryText(item: item, queryTerms: queryTerms)
     }
 
     var body: some View {
@@ -90,8 +110,10 @@ struct ResultRow: View {
     }
 
     /// Bold the matched query terms in content/audio snippets; activity rows have
-    /// no snippet to highlight.
-    private var primaryText: AttributedString {
+    /// no snippet to highlight. Static + pure so the highlight is computed exactly
+    /// once in `init` (stored in `primaryText`) rather than on every `body` read,
+    /// and so the per-stream dispatch is unit-testable without a render.
+    static func makePrimaryText(item: SearchResultItem, queryTerms: [String]) -> AttributedString {
         switch item.stream {
         case .activity: return AttributedString(item.primaryText)
         case .screen, .audio: return SnippetHighlighter.attributed(item.primaryText, terms: queryTerms)
