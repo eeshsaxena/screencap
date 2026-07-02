@@ -1457,6 +1457,11 @@ def review_data_cmd(name, as_json):
     try:
         envelope = prepare_review_data(name)
     except ReviewPrepareError as e:
+        # A busy terminal_lock surfaces here as ReviewPrepareBusy (a subclass);
+        # the review window (unlike inspect) has no auto-retry consumer, so it is
+        # handled uniformly as a hard failure — no retryable flag is emitted
+        # (it would be dead on the review surface). Wiring review-window retry is
+        # a deliberate follow-up, not part of this inspect-focused fix.
         err_payload = {"ok": False, "schema_version": REVIEW_SCHEMA_VERSION, "error": str(e)}
         if as_json:
             click.echo(json.dumps(err_payload))
@@ -1494,13 +1499,38 @@ def inspect_data_cmd(name, as_json):
     ever leaves the device; masking is an upload concept and is absent.
 
     The envelope shape matches ``review-data`` (the Swift decoder is shared), but
-    ``redaction``/``coverage`` are null and ``screenshots`` is empty. On failure:
-    ok=false + error + non-zero exit, never a raw traceback.
+    ``redaction``/``coverage`` are null and ``screenshots`` is empty. On a hard
+    failure: ok=false + error + non-zero exit, never a raw traceback. The ONE
+    exception is the transient "still finalizing" case (``ReviewPrepareBusy``),
+    which exits ZERO with ``retryable=true`` — see below.
     """
-    from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_inspect_data
+    from screencap.review import (
+        REVIEW_SCHEMA_VERSION,
+        ReviewPrepareBusy,
+        ReviewPrepareError,
+        prepare_inspect_data,
+    )
 
     try:
         envelope = prepare_inspect_data(name)
+    except ReviewPrepareBusy as e:
+        # Recording still finalizing (the terminal_lock is held right after
+        # stop): a TRANSIENT "not ready yet", not a command failure. Exit ZERO
+        # with retryable=true so the SwiftUI shell actually RECEIVES the
+        # envelope and auto-retries — ``CLIClient.runJSONRaw`` throws on a
+        # non-zero exit and DISCARDS stdout, so a non-zero exit here would drop
+        # the retryable envelope on the floor and surface the very "Could not
+        # load this recording." failure this exists to prevent. Must precede the
+        # generic ``ReviewPrepareError`` arm (it is a subclass).
+        payload = {
+            "ok": False, "schema_version": REVIEW_SCHEMA_VERSION,
+            "error": str(e), "retryable": True,
+        }
+        if as_json:
+            click.echo(json.dumps(payload))
+        else:
+            console.print(f"[yellow]{escape(str(e))}[/yellow]")
+        return
     except ReviewPrepareError as e:
         err_payload = {"ok": False, "schema_version": REVIEW_SCHEMA_VERSION, "error": str(e)}
         if as_json:

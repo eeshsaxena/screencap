@@ -70,6 +70,25 @@ class ReviewPrepareError(RuntimeError):
     """A non-recoverable failure during review-data preparation."""
 
 
+class ReviewPrepareBusy(ReviewPrepareError):
+    """A *transient* failure: the recording is still being finalized.
+
+    Raised when the local navigation video can't be materialized because the
+    terminal stage holds the per-recording ``terminal_lock`` (post-stop
+    finalization). Unlike a plain ``ReviewPrepareError`` (a genuine "can't
+    process this video" corruption), this resolves on its own once finalization
+    completes — the CLI marks the envelope ``retryable`` so the caller retries
+    instead of surfacing a scary "could not load" failure. A subclass so every
+    existing ``except ReviewPrepareError`` site still catches it.
+    """
+
+
+# The read-only inspect path waits only briefly for the ``terminal_lock``: a
+# view opened right after stop races the (usually sub-second) finalization, so
+# failing fast + retrying beats blocking on the full concat/eviction ceiling.
+_INSPECT_LOCK_TIMEOUT = 5.0
+
+
 def _export_canonical_events(rec_dir: Path) -> None:
     """Export the canonical combined ``events.jsonl`` into the *source* dir
     before scrub, so the scrubbed copy contains the exact event set
@@ -182,7 +201,9 @@ def _assert_within_recordings_root(path: Path, recordings_root: Path) -> None:
         )
 
 
-def _prepare_recording_video(name: str) -> tuple[Path, Path, bool]:
+def _prepare_recording_video(
+    name: str, *, lock_timeout: float | None = None
+) -> tuple[Path, Path, bool]:
     """Shared local-video preparation for both ``review-data`` and
     ``inspect-data``: resolve the recording dir and prepare the local
     navigation video (concat ``chunk_*.mp4`` → remediate ``yuv444p`` for AVKit),
@@ -192,11 +213,20 @@ def _prepare_recording_video(name: str) -> tuple[Path, Path, bool]:
     in the structurally distinct flavors the SwiftUI shell tells apart: an
     invalid / path-traversal name, a missing recording, a recording carrying no
     video to review, and a genuine "can't process this video" PyAV failure
-    (never a missing-binary message — R9). The video is a *local* navigation aid
-    that never uploads, so it is prepared from and left at the original dir.
+    (never a missing-binary message — R9). A ``ReviewPrepareBusy`` (a subclass)
+    is raised instead when the ``terminal_lock`` is held by an in-flight
+    finalization — a *transient* "still finalizing" condition the caller retries,
+    NOT a corruption. The video is a *local* navigation aid that never uploads,
+    so it is prepared from and left at the original dir.
+
+    ``lock_timeout`` (seconds) bounds the wait for ``_ensure_single_video``'s
+    ``terminal_lock``; ``None`` keeps the viewer/concat default. The inspect path
+    passes a short value so a view opened DURING post-stop finalization fails
+    fast as ``ReviewPrepareBusy`` (retried) rather than blocking on the lock.
     """
     from screencap.config import get_recordings_dir, resolve_recording_dir
     from screencap.engine.video import remediate_pixfmt_for_review
+    from screencap.terminal_stage import TerminalStageBusy
     from screencap.viewer import _ensure_single_video
 
     try:
@@ -214,8 +244,18 @@ def _prepare_recording_video(name: str) -> tuple[Path, Path, bool]:
     # RuntimeError/ValueError (the engine's documented failures) plus OSError
     # (PyAV's av.error.OSError family and os.replace/mux write errors), so no
     # failure mode escapes as a raw traceback past the envelope.
+    #
+    # TerminalStageBusy is caught FIRST (it is a RuntimeError, so the generic
+    # arm below would otherwise mislabel a still-finalizing recording as
+    # "can't process this video" corruption): re-raise it as the transient,
+    # retryable ReviewPrepareBusy so the caller waits it out instead.
+    lock_kw = {} if lock_timeout is None else {"lock_timeout": lock_timeout}
     try:
-        _ensure_single_video(rec_dir, fail_loud=True)
+        _ensure_single_video(rec_dir, fail_loud=True, **lock_kw)
+    except TerminalStageBusy as e:
+        raise ReviewPrepareBusy(
+            "Recording is still finalizing — try again in a moment."
+        ) from e
     except (RuntimeError, ValueError, OSError) as e:
         raise ReviewPrepareError(f"can't process this video: {e}") from e
 
@@ -418,8 +458,13 @@ def prepare_inspect_data(name: str) -> dict:
     recordings_root = get_recordings_dir()
 
     # Resolve the recording dir + prepare the local navigation video (shared
-    # with review-data). No scrub, no lock.
-    rec_dir, video_path, remediated = _prepare_recording_video(name)
+    # with review-data). No scrub, no scrub-lock. The short ``_INSPECT_LOCK_TIMEOUT``
+    # makes a view opened during post-stop finalization fail fast as
+    # ``ReviewPrepareBusy`` (retried by the shell) instead of hanging on the
+    # terminal_lock the finalization holds.
+    rec_dir, video_path, remediated = _prepare_recording_video(
+        name, lock_timeout=_INSPECT_LOCK_TIMEOUT
+    )
 
     # Local events from the ORIGINAL dir: ensure_canonical_events self-gates
     # (no-op when chunked; exports the combined events.jsonl from the DB

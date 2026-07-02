@@ -624,6 +624,32 @@ class RecordingCollaborators:
         # post-upload (replaces the old stub_recording delete).
         result["stubbed"] = bool(tr.evicted)
 
+        # Pre-materialize the derived single-file video.mp4 now — the terminal
+        # stage has just released the per-recording terminal_lock, so this
+        # acquires it uncontended and leaves the recording immediately viewable.
+        # Without it, the FIRST inspect/review opened right after stop must take
+        # that same lock to build video.mp4 lazily and, if it races an in-flight
+        # finalization, times out with a spurious "could not load" (the
+        # view-during-finalization race).
+        #
+        # ONLY the single-chunk case (a cheap symlink) is done here: a 2+-chunk
+        # concat is a full PyAV re-mux whose cost scales with recording length,
+        # and finalize runs inside the daemon's bounded stop budget (see the
+        # finalize_uploads docstring). Multi-chunk first-views instead fall back
+        # to lazy on-demand derivation, which the shell's retry-on-"finalizing"
+        # loop already tolerates. Best-effort: skip when local media was evicted
+        # (nothing to view) and never break finalize on failure.
+        if not tr.evicted and len(list(capture_dir.glob("chunk_*.mp4"))) == 1:
+            try:
+                from screencap.viewer import _ensure_single_video
+
+                _ensure_single_video(capture_dir)
+            except Exception as exc:  # noqa: BLE001 — never break finalize
+                if console is not None:
+                    console.print(
+                        f"[dim]video.mp4 pre-materialize skipped: {exc}[/dim]"
+                    )
+
     def _write_upload_followup(
         self,
         capture_dir: Path,

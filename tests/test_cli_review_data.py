@@ -671,9 +671,11 @@ def test_concat_busy_lock_warns_in_viewer_path(recordings_root):
 
 def test_concat_busy_lock_propagates_in_review_path(recordings_root):
     """The ``review-data`` path (``fail_loud=True``) propagates a contended lock
-    as a clean failure (TerminalStageBusy is a RuntimeError, caught by
-    prepare_review_data into the R9 'can't process this video' envelope) — never
-    a partial ``video.mp4`` treated as complete."""
+    as ``TerminalStageBusy`` — never a partial ``video.mp4`` treated as complete.
+    ``_prepare_recording_video`` maps that to the TRANSIENT, retryable
+    ``ReviewPrepareBusy`` (a "still finalizing" condition), distinct from the R9
+    'can't process this video' corruption failure — see
+    ``test_prepare_recording_video_busy_lock_raises_review_prepare_busy``."""
     from screencap.terminal_stage import TerminalStageBusy
     from screencap.viewer import _ensure_single_video
 
@@ -692,6 +694,35 @@ def test_concat_busy_lock_propagates_in_review_path(recordings_root):
         with pytest.raises(TerminalStageBusy):
             _ensure_single_video(rec_dir, fail_loud=True)
     assert not (rec_dir / "video.mp4").exists()
+
+
+def test_prepare_recording_video_busy_lock_raises_review_prepare_busy(recordings_root):
+    """A contended terminal_lock (finalization still in flight) surfaces the
+    TRANSIENT ``ReviewPrepareBusy`` from ``_prepare_recording_video`` — NOT the
+    corrupt-video 'can't process this video' failure. This is what lets the shell
+    show a 'still finalizing' retry instead of a hard "could not load". Regression
+    for the view-during-finalization race."""
+    import contextlib
+
+    from screencap.review import ReviewPrepareBusy, _prepare_recording_video
+    from screencap.terminal_stage import TerminalStageBusy
+
+    rec_dir = _make_recording(recordings_root, "rec-busy-prepare")
+    # Multi-chunk with no video.mp4 forces the concat to take the lock.
+    _write_video(rec_dir / "chunk_0001.mp4", (200, 0, 0))
+    _write_video(rec_dir / "chunk_0002.mp4", (0, 200, 0))
+
+    @contextlib.contextmanager
+    def busy_lock(name, **kwargs):
+        raise TerminalStageBusy("held by terminal stage")
+        yield  # pragma: no cover
+
+    with mock.patch("screencap.terminal_stage.terminal_lock", busy_lock):
+        with pytest.raises(ReviewPrepareBusy) as exc:
+            _prepare_recording_video("rec-busy-prepare")
+
+    assert "can't process this video" not in str(exc.value)
+    assert "finalizing" in str(exc.value).lower()
 
 
 def test_legacy_single_file_renders_without_concat_or_lock(recordings_root):

@@ -6,6 +6,10 @@ import XCTest
 final class FakeInspectDataLoader: InspectDataLoader {
     var nextEnvelope: ReviewDataEnvelope?
     var nextError: Error?
+    /// Envelopes returned in order, one per `load` call, before falling back to
+    /// `nextEnvelope`/the default success. Lets a test script a "still finalizing
+    /// then ready" sequence for the auto-retry path.
+    var envelopeQueue: [ReviewDataEnvelope] = []
     private(set) var loadCallCount = 0
 
     func load(name: String) async throws -> ReviewDataEnvelope {
@@ -13,6 +17,9 @@ final class FakeInspectDataLoader: InspectDataLoader {
         if let err = nextError {
             nextError = nil
             throw err
+        }
+        if !envelopeQueue.isEmpty {
+            return envelopeQueue.removeFirst()
         }
         return nextEnvelope ?? .init(
             ok: true,
@@ -28,6 +35,20 @@ final class FakeInspectDataLoader: InspectDataLoader {
     }
 }
 
+/// An `ok=false` + `retryable` envelope — the "recording is still finalizing"
+/// transient the CLI emits when the terminal_lock is held right after stop.
+@MainActor
+private func busyFinalizingEnvelope() -> ReviewDataEnvelope {
+    .init(
+        ok: false, schemaVersion: 3,
+        videoPath: nil, eventsPath: nil,
+        startedAt: nil, durationSeconds: nil,
+        videoPixfmtRemediated: nil,
+        error: "Recording is still finalizing — try again in a moment.",
+        retryable: true
+    )
+}
+
 private enum FakeInspectLoadError: Error, LocalizedError {
     case boom
     var errorDescription: String? { "loader exploded" }
@@ -36,8 +57,18 @@ private enum FakeInspectLoadError: Error, LocalizedError {
 @MainActor
 final class InspectWindowViewModelTests: XCTestCase {
 
-    private func makeModel(loader: FakeInspectDataLoader) -> InspectWindowViewModel {
-        InspectWindowViewModel(recordingName: "rec-001", loader: loader)
+    private func makeModel(
+        loader: FakeInspectDataLoader,
+        retryDelaySeconds: TimeInterval = 0,
+        maxRetryableAttempts: Int = 8
+    ) -> InspectWindowViewModel {
+        // retryDelaySeconds: 0 keeps the auto-retry loop instant in tests.
+        InspectWindowViewModel(
+            recordingName: "rec-001",
+            loader: loader,
+            retryDelaySeconds: retryDelaySeconds,
+            maxRetryableAttempts: maxRetryableAttempts
+        )
     }
 
     func test_startsInPreparing() {
@@ -177,6 +208,45 @@ final class InspectWindowViewModelTests: XCTestCase {
             return XCTFail("expected failed, got \(model.state)")
         }
         XCTAssertEqual(message, "loader exploded")
+    }
+
+    /// The view-during-finalization fix: a `retryable` ("still finalizing")
+    /// envelope must NOT surface `.failed` — the model stays in `preparing` and
+    /// auto-retries until finalization completes, then lands `.ready`. Regression
+    /// for the spurious "Could not load this recording." right after stop.
+    func test_retryableStillFinalizing_autoRetriesThenLandsReady() async {
+        let loader = FakeInspectDataLoader()
+        // Two "still finalizing" responses, then the queue drains to the default
+        // success envelope on the third call.
+        loader.envelopeQueue = [busyFinalizingEnvelope(), busyFinalizingEnvelope()]
+        let model = makeModel(loader: loader)
+
+        await model.loadInspectData()
+
+        XCTAssertEqual(loader.loadCallCount, 3, "must retry past the finalizing responses")
+        guard case .ready = model.state else {
+            return XCTFail("still-finalizing must retry to ready, got \(model.state)")
+        }
+    }
+
+    /// A recording that never finishes finalizing (always `retryable`) gives up
+    /// after the bounded attempt count and surfaces the finalizing message —
+    /// never an infinite retry loop.
+    func test_retryableStillFinalizing_exhaustsToFailed() async {
+        let loader = FakeInspectDataLoader()
+        loader.nextEnvelope = busyFinalizingEnvelope()  // every call is "busy"
+        let model = makeModel(loader: loader, maxRetryableAttempts: 3)
+
+        await model.loadInspectData()
+
+        XCTAssertEqual(loader.loadCallCount, 3, "must stop after maxRetryableAttempts")
+        guard case .failed(let message) = model.state else {
+            return XCTFail("exhausted retries must fail, got \(model.state)")
+        }
+        XCTAssertTrue(
+            message.lowercased().contains("finalizing"),
+            "the surfaced message should explain it is still finalizing, got: \(message)"
+        )
     }
 
     func test_retryAfterFailure_resetsToPreparingAndReloads() async {

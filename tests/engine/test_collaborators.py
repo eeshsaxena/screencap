@@ -923,6 +923,72 @@ class TestU4FinalizeConvergence:
         )
 
 
+def test_finalize_pre_materializes_video_for_immediate_view(tmp_path):
+    """View-during-finalization fix (Part A): finalize derives ``video.mp4``
+    right after the terminal stage releases the per-recording lock, so the FIRST
+    inspect/review opened immediately after stop finds it present and returns
+    instantly — instead of having to take that same lock to build it lazily and
+    timing out against an in-flight finalization. A single chunk is symlinked."""
+    from screencap.engine.collaborators import RecordingCollaborators
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.screen_recorder import (
+        IpcChannels,
+        LegacyOptions,
+        RecordingRequest,
+    )
+    from screencap.terminal_stage import TerminalResult
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    (capture_dir / "chunk_0000_manifest.json").write_text("{}")
+    # A real chunk file so _ensure_single_video can symlink it into video.mp4 (a
+    # single chunk is symlinked, not decoded, so a stub byte-string suffices).
+    (capture_dir / "chunk_0000.mp4").write_bytes(b"stub-mp4")
+
+    request = RecordingRequest(name="rec", config=RecordingConfig(), cloud_intent=False)
+    helper = RecordingCollaborators(
+        request=request,
+        legacy=LegacyOptions(live_upload=False),
+        channels=IpcChannels.create(),
+    )
+    helper._chunk_processor = _StubChunkProcessor(all_uploaded=True, summary=(1, 1))
+
+    # Non-evicted local convergence: media stays on disk, so it must be viewable.
+    tr = TerminalResult(
+        destination="local", routed=True, sentinel_uploaded=False, evicted=[],
+    )
+    with mock.patch("screencap.terminal_stage.run_terminal_stage", return_value=tr):
+        helper.finalize_uploads(
+            capture_dir=capture_dir, stop_reason="graceful", recording_name="rec",
+        )
+
+    video = capture_dir / "video.mp4"
+    assert video.is_symlink(), "finalize must pre-materialize video.mp4 (symlinked single chunk)"
+    assert video.resolve() == (capture_dir / "chunk_0000.mp4").resolve()
+
+
+def test_finalize_pre_materialize_skips_when_evicted(tmp_path):
+    """The pre-materialize step is skipped when the retention floor evicted local
+    media — there is nothing to view, and symlinking a just-deleted chunk would
+    leave a dangling ``video.mp4``."""
+    from screencap.terminal_stage import TerminalResult
+
+    capture_dir = tmp_path / "rec"
+    capture_dir.mkdir()
+    (capture_dir / "chunk_0000_manifest.json").write_text("{}")
+
+    tr = TerminalResult(
+        destination="cloud", routed=True, sentinel_uploaded=True, evicted=[0],
+    )
+    with mock.patch("screencap.terminal_stage.run_terminal_stage", return_value=tr):
+        helper = _make_cloud_helper(all_uploaded=True, summary=(1, 1))
+        helper.finalize_uploads(
+            capture_dir=capture_dir, stop_reason="graceful", recording_name="rec",
+        )
+
+    assert not (capture_dir / "video.mp4").exists()
+
+
 def test_finalize_uploads_freezes_chunks_expected_at_closed_set(tmp_path):
     """SCR-123: finalize MUST freeze the ledger's chunks_expected at the closed
     set, otherwise the AE8 promotion guard + finalize gate are inert in
