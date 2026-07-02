@@ -46,11 +46,17 @@ looked fine. That is the reported asymmetry.
 
 This overturns the SCR-196/200 mental model that assumed all three daemon-owned
 permissions (SR, Accessibility, Input Monitoring) attribute to the daemon helper.
-Only Accessibility and Input Monitoring do. The 2026-06-08 spike concluded SR
-registers under the daemon identity — that was **true for the pre-SCR-196 bare
-binary in `Contents/Resources/` with no app ancestor**, and **false once the
-daemon became a nested LoginItem** with a responsible-app ancestor. This is
-exactly the "responsible-process caveat" the spike itself flagged, only realized.
+Only Accessibility and Input Monitoring do. The rollup was not new — the ad-hoc
+signing treadmill doc already recorded that "Screen Recording attributes to the
+containing bundle" (shown as "ScreenCap") while Accessibility/IM attribute to the
+helper (`docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md`,
+quirk #3). That was pre-SCR-196 (bare `screencap` helper); this doc confirms the
+rollup **persisted** across the migration, now with `com.screencap.daemon` /
+"ScreencapDaemon" as the helper identity. The SCR-196/200 work simply lost that
+knowledge: the 2026-06-08 spike concluded SR registers under the daemon identity —
+**true for the pre-SCR-196 bare binary in `Contents/Resources/` with no app
+ancestor, false once the daemon became a nested LoginItem** with a responsible-app
+ancestor. This is exactly the "responsible-process caveat" the spike itself flagged.
 
 ## What didn't work
 
@@ -143,4 +149,6 @@ Removing it from the cleanup lets the row registration creates survive.
 - [PR #323](https://github.com/proteus-computer-use/screencap/pull/323) — the fix (Closes SCR-201).
 - Follow-up SCR-211 — block-with-Retry doesn't re-fire SR registration (version-gated + once-per-process).
 - `docs/solutions/build-errors/daemon-tcc-identity-migration-2026-06-30.md` — the SCR-196 bare-binary → helper-bundle identity migration that introduced the responsible-app ancestor.
+- `docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md` — prior art (quirk #3): first recorded SR attributing to the containing bundle (pre-SCR-196).
+- `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md` — the per-process TCC cache that makes a long-lived daemon report stale grant state (the restart-to-re-test technique above).
 - `docs/research/2026-06-05-daemon-tcc-registration-spike.md` — the U7 spike whose "responsible-process caveat" this bug realized.

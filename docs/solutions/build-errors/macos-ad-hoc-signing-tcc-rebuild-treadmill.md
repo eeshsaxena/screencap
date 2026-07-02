@@ -215,6 +215,7 @@ The pragmatic answer until a real Developer ID lands: accept the `tccutil reset`
 
 - `macos/README.md` — "TCC permissions on dev builds" (the user-facing version of this lesson; now documents both TCC subjects + the per-service reset).
 - `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md` — the in-process cache problem (separate concern, same domain: that one is "granted but a *running* process can't see it"; this one is "denied because the *wrong subject* was granted").
+- `docs/solutions/integration-issues/macos-screen-recording-tcc-host-app-rollup-2026-07-02.md` — the SR→containing-bundle rollup in quirk #3 above, confirmed to **persist post-SCR-196** (now `com.screencap.daemon` / "ScreencapDaemon" as the helper) and the bug it caused when a decoy cleanup wiped the app's rolled-up SR row (SCR-201).
 - `docs/solutions/build-errors/env-export-prefix-silently-disables-team-signing.md` — a `.env` `export ` prefix silently dropping `DEVELOPMENT_TEAM`, which lands you back on the ad-hoc treadmill.
 - `docs/research/2026-06-05-daemon-tcc-registration-spike.md` — the source-of-truth spike (daemon identity, per-pane registration, Input-Monitoring-under-launchd, responsible-process attribution).
 - `docs/solutions/design-patterns/fallback-path-recovery-and-exit-code-signaling-2026-06-15.md` — related permission-onboarding UX from the same work (PR #232, SCR-142).
