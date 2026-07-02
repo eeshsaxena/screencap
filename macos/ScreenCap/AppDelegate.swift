@@ -13,6 +13,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         DaemonInstallController.registerDaemonOnFirstLaunchIfNeeded()
+        // After an app update the old daemon process keeps serving the previous
+        // on-disk bundle; its lazy imports then break (HTTP 500 "Couldn't load
+        // recordings"). Restart it if it predates the freshly installed bundle —
+        // the SCR-121 version gate can't see this because the daemon version
+        // string is unchanged across an app update.
+        Task { await DaemonInstallController.restartStaleDaemonIfNeeded() }
         // Switch to .accessory whenever the main window closes; keep the menu
         // bar item alive so the user can reopen the app from there.
         windowCloseObserver = NotificationCenter.default.addObserver(

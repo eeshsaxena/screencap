@@ -385,6 +385,102 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .installedAndRunning)
     }
 
+    // MARK: - Stale daemon after app update (version-string-blind restart)
+
+    // A daemon whose PROCESS predates the freshly installed bundle is running the
+    // OLD on-disk code — its lazy imports 500 ("Couldn't load recordings"). The
+    // SCR-121 version gate can't see this (same version string across an app
+    // update), so we detect it by start-time-vs-bundle-mtime and restart in place.
+    func testStaleDaemonPredatingBundleIsRestarted() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { .init(startedAt: 1000, isRecording: false) },
+            bundleModifiedAt: { Date(timeIntervalSince1970: 2000) },  // bundle newer than daemon
+            restart: { restarted = true; return true }
+        )
+        XCTAssertTrue(triggered)
+        XCTAssertTrue(restarted)
+    }
+
+    // A daemon that started AFTER its bundle was written is the fresh one launchd
+    // just spawned — never restart it (that would be an infinite bounce loop).
+    func testDaemonNewerThanBundleIsNotRestarted() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { .init(startedAt: 3000, isRecording: false) },  // daemon newer than bundle
+            bundleModifiedAt: { Date(timeIntervalSince1970: 2000) },
+            restart: { restarted = true; return true }
+        )
+        XCTAssertFalse(triggered)
+        XCTAssertFalse(restarted)
+    }
+
+    // Never kill an in-flight recording, even to heal a stale daemon — the next
+    // launch (or the recording ending) reheals it.
+    func testStaleDaemonMidRecordingIsNotRestarted() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { .init(startedAt: 1000, isRecording: true) },
+            bundleModifiedAt: { Date(timeIntervalSince1970: 2000) },
+            restart: { restarted = true; return true }
+        )
+        XCTAssertFalse(triggered)
+        XCTAssertFalse(restarted, "must not restart a daemon that is mid-recording")
+    }
+
+    // Fail-safe: no daemon answered → nothing to restart.
+    func testUnreachableDaemonIsNoOp() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { nil },
+            bundleModifiedAt: { Date(timeIntervalSince1970: 2000) },
+            restart: { restarted = true; return true }
+        )
+        XCTAssertFalse(triggered)
+        XCTAssertFalse(restarted)
+    }
+
+    // Fail-safe: an undeterminable bundle mtime must never trigger a false
+    // restart of a healthy daemon.
+    func testUndeterminableBundleTimeIsNoOp() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { .init(startedAt: 1000, isRecording: false) },
+            bundleModifiedAt: { nil },
+            restart: { restarted = true; return true }
+        )
+        XCTAssertFalse(triggered)
+        XCTAssertFalse(restarted)
+    }
+
+    // Fail-safe: a bundle mtime in the FUTURE relative to now (clock skew, or an
+    // updater preserving a future timestamp) is untrusted — never restart, so we
+    // don't churn the daemon on every launch.
+    func testFutureBundleTimeIsNoOp() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { .init(startedAt: 1000, isRecording: false) },  // would look "stale"...
+            bundleModifiedAt: { Date(timeIntervalSince1970: 5000) },
+            restart: { restarted = true; return true },
+            now: { Date(timeIntervalSince1970: 3000) }              // ...but bundle mtime is in the future
+        )
+        XCTAssertFalse(triggered)
+        XCTAssertFalse(restarted)
+    }
+
+    // Boundary: a daemon that started exactly at the bundle mtime is treated as
+    // fresh (strict `<`), not restarted.
+    func testDaemonStartEqualToBundleTimeIsNotRestarted() async {
+        var restarted = false
+        let triggered = await DaemonInstallController.restartStaleDaemonIfNeeded(
+            probe: { .init(startedAt: 2000, isRecording: false) },
+            bundleModifiedAt: { Date(timeIntervalSince1970: 2000) },
+            restart: { restarted = true; return true }
+        )
+        XCTAssertFalse(triggered)
+        XCTAssertFalse(restarted)
+    }
+
     // Fail-safe: when the expected version can't be determined (no bundled CLI,
     // dev-source mode, unreadable stamp) we preserve the historical
     // reachable-implies-running behavior rather than risk a false "out of date".
