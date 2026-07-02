@@ -60,6 +60,9 @@ _STOP_SCHEMA_VERSION = 1
 # `whoami --json` envelope (ok + schema_version + signed_in/uid/email), read by
 # the SwiftUI shell to gate the Upload affordance on auth state.
 _AUTH_SCHEMA_VERSION = 1
+# `cloud grant` / `cloud entitlements` --json envelope (ok + schema_version +
+# plan/active/expires), driven by the in-app cloud-setup flow (U7).
+_ENTITLEMENTS_SCHEMA_VERSION = 1
 # `backfill status --json` envelope (ok + schema_version + the privacy-safe
 # status snapshot the daemon publishes). SCR-178 U6.
 _BACKFILL_SCHEMA_VERSION = 1
@@ -1633,6 +1636,79 @@ def whoami_cmd(as_json):
         console.print("Not signed in. Run [bold]screencap login[/bold] to upload to the cloud.")
 
 
+@cli.group()
+def cloud():
+    """Cloud entitlement operations (in-app onboarding drives these).
+
+    ``cloud grant`` provisions the founding entitlement for the signed-in
+    account; ``cloud entitlements`` reports the current plan. Local recording
+    never requires any of this.
+    """
+
+
+@cloud.command("grant")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def cloud_grant_cmd(as_json):
+    """Provision the founding cloud entitlement for the signed-in account (U7).
+
+    Self-service in v1 (founding is free). Grants the plan server-side, then
+    force-refreshes the ID token so the new claim is present for the first
+    upload. Requires a signed-in account (run ``screencap login`` first).
+    """
+    from screencap.entitlements import grant_founding
+
+    try:
+        entitlement = grant_founding()
+    except RuntimeError as e:
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _ENTITLEMENTS_SCHEMA_VERSION, "error": str(e)}
+            ))
+        else:
+            console.print(f"[red]Cloud setup failed:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps({
+            "ok": True, "schema_version": _ENTITLEMENTS_SCHEMA_VERSION, **entitlement,
+        }))
+        return
+    console.print(
+        f"[green]Cloud ready[/green] — plan: [bold]{escape(str(entitlement.get('plan')))}[/bold]."
+    )
+
+
+@cloud.command("entitlements")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def cloud_entitlements_cmd(as_json):
+    """Show the signed-in account's cloud plan (plan / active / expires)."""
+    from screencap import auth
+
+    try:
+        entitlement = auth.get_entitlements()
+    except Exception as e:  # get_entitlements is built not to raise; be safe
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _ENTITLEMENTS_SCHEMA_VERSION, "error": str(e)}
+            ))
+            sys.exit(1)
+        console.print(f"[red]Error checking plan:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps({
+            "ok": True, "schema_version": _ENTITLEMENTS_SCHEMA_VERSION, **entitlement,
+        }))
+        return
+    plan = entitlement.get("plan", "free")
+    if entitlement.get("active"):
+        console.print(f"Cloud plan: [bold]{escape(str(plan))}[/bold] (active).")
+    else:
+        console.print(f"Cloud plan: [bold]{escape(str(plan))}[/bold] — no active cloud plan.")
+
+
 @cli.command()
 @click.argument("name", required=False, default=None)
 @click.option("--all", "all_recordings", is_flag=True, help="Export all recordings.")
@@ -2767,6 +2843,7 @@ def settings(ctx, set_pair, as_json):
       audio_default      Record audio by default (true/false)
       auto_name          LLM auto-naming after recording (true/false)
       upload_default     Default destination (local/cloud/both/ask)
+      training_contribution  Contribute scrubbed data to training (true/false)
       content_index_enabled  Index on-screen text for local search (true/false)
     """
     if ctx.invoked_subcommand is not None:
@@ -2784,6 +2861,7 @@ def settings(ctx, set_pair, as_json):
         get_recordings_dir,
         get_rest_threshold,
         get_show_on_website,
+        get_training_contribution,
         get_upload_default,
         invalidate_config_cache,
     )
@@ -2802,7 +2880,7 @@ def settings(ctx, set_pair, as_json):
         _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
                        "content_index_enabled", "content_index_consent_declined",
-                       "content_index_backfill_declined"}
+                       "content_index_backfill_declined", "training_contribution"}
         _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
                          "segmentation_mode": ("llm", "idle")}
 
@@ -2826,19 +2904,22 @@ def settings(ctx, set_pair, as_json):
             console.print(f"[dim]Available: {', '.join(all_keys)}[/dim]")
             raise SystemExit(1)
 
-        from screencap.setup_wizard import _load_config_toml, _save_config_atomic
-
-        doc = _load_config_toml(_CONFIG_PATH)
-        # upload_default lives under [privacy], others are top-level
+        # upload_default and training_contribution live under [privacy] and have
+        # dedicated config setters (U5) that own the atomic write + cache
+        # invalidation; route through them so the onboarding/settings toggles and
+        # the CLI share one write path. Other keys are top-level.
         if key == "upload_default":
-            import tomlkit
-            if "privacy" not in doc:
-                doc.add("privacy", tomlkit.table())
-            doc["privacy"]["upload_default"] = value
+            from screencap.config import set_upload_default
+            set_upload_default(value)
+        elif key == "training_contribution":
+            from screencap.config import set_training_contribution
+            set_training_contribution(value)
         else:
+            from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+            doc = _load_config_toml(_CONFIG_PATH)
             doc[key] = value
-        _save_config_atomic(_CONFIG_PATH, doc)
-        invalidate_config_cache()
+            _save_config_atomic(_CONFIG_PATH, doc)
+            invalidate_config_cache()
         console.print(f"  [bold]{escape(str(key))}[/bold] = {escape(str(value))}")
         return
 
@@ -2855,6 +2936,7 @@ def settings(ctx, set_pair, as_json):
     settings_payload = {
         "show_on_website": bool(show),
         "upload_default": str(get_upload_default()),
+        "training_contribution": bool(get_training_contribution()),
         "audio_default": bool(get_audio_default()),
         "auto_name": bool(get_auto_name()),
         "chunk_duration": float(chunk),
