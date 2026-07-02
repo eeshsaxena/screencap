@@ -10,9 +10,12 @@ block the public demo reads; the in-code gate is the only boundary, backed by a
 CI contract test asserting no tokenless request reaches any ``users/`` code path.
 
 Token-gated actions (Bearer required):
-- (default/no action) / ``upload`` — signed PUT URLs under the caller's namespace
+- (default/no action) / ``upload`` — signed PUT URLs under the caller's namespace,
+  gated on an active cloud entitlement (U2)
 - ``list`` — list the caller's own recordings
 - ``sign-download`` — signed GET URLs for one of the caller's own recordings
+- ``grant-founding`` — grant the caller the founding cloud entitlement (U1;
+  self-service in v1, must move behind the payment webhook when billing lands)
 
 Deploy (project: proteus-photos, region: southamerica-east1):
     # The function runs as a dedicated SA and signs v4 URLs via the IAM
@@ -72,6 +75,7 @@ import google.auth
 import google.auth.exceptions
 import google.auth.transport.requests
 from auth import AuthInvalid, AuthUnavailable, verify_bearer
+from entitlements import EntitlementUnavailable, grant_founding, read_entitlement
 from flask import jsonify
 from google.cloud import storage
 from paths import PrefixResolutionError, is_valid_name, resolve_prefix
@@ -159,6 +163,7 @@ def get_upload_urls(request):
     - (default) / "upload": POST {"recording": "...", "files": [...]}
     - "list":               POST {"action": "list"}
     - "sign-download":      POST {"action": "sign-download", "recording": "..."}
+    - "grant-founding":     POST {"action": "grant-founding"}
     """
     if request.method == "OPTIONS":
         return ("", 204, CORS_HEADERS)
@@ -185,6 +190,8 @@ def get_upload_urls(request):
         return _handle_list(request, data)
     if action == "sign-download":
         return _handle_sign_download(request, data)
+    if action == "grant-founding":
+        return _handle_grant_founding(request, data)
 
     # Strict allow-list: unknown / removed actions are rejected, never silently
     # handled. ``get-index`` is gone — it read sessions/_index.json, a path the
@@ -369,11 +376,57 @@ def _handle_sign_download(request, data):
     return _cors(jsonify({"urls": urls, "gcs_prefix": f"gs://{BUCKET}/{prefix}"}))
 
 
-def _handle_upload(request, data):
-    """Generate signed PUT URLs under the caller's own namespace."""
+def _handle_grant_founding(request, data):
+    """Grant the founding plan to the authenticated caller (U1).
+
+    Token-gated like every users/-scoped action: ``_authenticate`` runs FIRST so
+    no entitlement is ever written without a verified uid. v1 founding is free
+    and self-authorized; when billing activates this grant MUST move behind the
+    payment-processor webhook / server-side eligibility check and must not remain
+    client-callable (plan Definition of Done). Idempotent — a repeat grant re-sets
+    the same claim. A transient Firebase failure is a 503 (retryable), never a
+    partial success.
+    """
     uid, err = _authenticate(request)
     if err:
         return err
+    try:
+        entitlement = grant_founding(uid)
+    except EntitlementUnavailable as exc:
+        logger.warning("founding grant failed: %s", exc)
+        return _cors((jsonify({"error": "Entitlement grant temporarily unavailable"}), 503))
+    return _cors(jsonify({"entitlement": entitlement}))
+
+
+def _handle_upload(request, data):
+    """Generate signed PUT URLs under the caller's own namespace.
+
+    The authoritative entitlement gate (U2) lives here: after the uid is
+    resolved, the caller's plan is read LIVE (``read_entitlement`` ->
+    ``get_user``) — never off the already-verified token, whose claims are
+    discarded — and a non-entitled caller is rejected with 403 (a hard, permanent
+    block) BEFORE any URL is signed. A lookup failure is 503 (transient) so the
+    client can tell a permanent block from something retryable and fail closed.
+    This is the trust boundary; the daemon-side pre-check (U4) is only a friendly
+    fast-fail and is never the gate.
+    """
+    uid, err = _authenticate(request)
+    if err:
+        return err
+
+    try:
+        entitlement = read_entitlement(uid)
+    except EntitlementUnavailable as exc:
+        logger.warning("entitlement lookup failed: %s", exc)
+        return _cors(
+            (jsonify({"error": "Entitlement verification temporarily unavailable"}), 503)
+        )
+    if not entitlement["active"]:
+        # Signed in but no active plan: fail-closed, no URLs signed. 403 (not 401)
+        # so the client distinguishes "not entitled" from "not authenticated".
+        return _cors(
+            (jsonify({"error": "Cloud upload requires an active plan", "plan": entitlement["plan"]}), 403)
+        )
 
     recording = data.get("recording")
     files = data.get("files")

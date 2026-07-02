@@ -72,6 +72,23 @@ def gcs():
         yield fake
 
 
+@pytest.fixture(autouse=True)
+def entitled_by_default():
+    """Default every upload caller to an active founding entitlement (U2).
+
+    The entitlement gate in ``_handle_upload`` now reads the caller's plan LIVE
+    via ``read_entitlement`` -> ``get_user``. Existing upload tests assert
+    signing behaviour, not authorization, so default them to entitled; the
+    dedicated U2 gate tests below override this to free / lookup-error. Harmless
+    for the non-upload actions (list/sign-download/demo), which never read it.
+    """
+    with mock.patch.object(
+        main, "read_entitlement",
+        return_value={"plan": "founding", "active": True, "expires": None},
+    ) as read:
+        yield read
+
+
 # --------------------------------------------------------------------------
 # Request / dispatch helpers
 # --------------------------------------------------------------------------
@@ -457,3 +474,80 @@ def test_resolve_project_id_ignores_ambient_google_cloud_project(monkeypatch):
     assert main._resolve_project_id() == "proteus-photos"
     monkeypatch.setenv("SCREENCAP_PROJECT_ID", "explicit-project")
     assert main._resolve_project_id() == "explicit-project"
+
+
+# ==========================================================================
+# U2 — entitlement is the authoritative server-side upload gate
+# ==========================================================================
+#
+# The gate reads the caller's plan LIVE (read_entitlement -> get_user) AFTER the
+# uid is resolved and BEFORE any URL is signed. Free/no-claim -> 403 (permanent
+# block, no URLs); lookup failure -> 503 (transient, fail-closed); entitled ->
+# signs. `entitled_by_default` (autouse) is overridden per-test here.
+
+
+def _free():
+    return mock.patch.object(
+        main, "read_entitlement",
+        return_value={"plan": "free", "active": False, "expires": None},
+    )
+
+
+def test_u2_free_uid_rejected_403_no_urls(gcs):
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA"), _free():
+        status, payload = _invoke(_req(body))
+    assert status == 403
+    assert "urls" not in payload
+    # The gate runs BEFORE any signing work: no blob was ever touched.
+    assert gcs.blob_calls == []
+    assert gcs.list_calls == []
+
+
+def test_u2_default_action_free_uid_also_rejected_403(gcs):
+    # The gate applies to the default (actionless) upload dispatch too.
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA"), _free():
+        status, _ = _invoke(_req(body))
+    assert status == 403
+
+
+def test_u2_entitled_uid_signs_put_urls(gcs):
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA"):  # entitled_by_default active
+        status, payload = _invoke(_req(body))
+    assert status == 200
+    assert payload["urls"]["video.mp4"] and "m=PUT" in payload["urls"]["video.mp4"]
+
+
+def test_u2_entitlement_lookup_error_returns_503(gcs):
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA"), mock.patch.object(
+        main, "read_entitlement",
+        side_effect=main.EntitlementUnavailable("firebase outage"),
+    ):
+        status, payload = _invoke(_req(body))
+    assert status == 503
+    assert "error" in payload
+    assert gcs.blob_calls == []  # fail-closed: nothing signed
+
+
+def test_u2_gate_does_not_bypass_cross_user_scoping(gcs):
+    # An entitled userA still only ever gets URLs under their OWN prefix — the
+    # entitlement gate authorizes uploading, it does not widen scope.
+    body = {"recording": "shared", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA"):
+        status, payload = _invoke(_req(body))
+    assert status == 200
+    assert payload["gcs_prefix"] == f"gs://{main.BUCKET}/users/userA/recordings/shared/"
+    assert all("users/userA/recordings/shared/" in n for n in gcs.blob_calls)
+
+
+def test_u2_free_uid_auth_still_first(gcs):
+    # A tokenless upload is still 401 (auth precedes the entitlement gate); the
+    # entitlement lookup is never reached without a verified uid.
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(exc=AuthInvalid("no token")), mock.patch.object(main, "read_entitlement") as read:
+        status, _ = _invoke(_req(body))
+    assert status == 401
+    read.assert_not_called()
