@@ -106,7 +106,10 @@ def _chunk_offsets_for_concat(rec_dir: Path) -> dict[int, float] | None:
     return offsets
 
 
-def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
+def _ensure_single_video(
+    rec_dir: Path, *, fail_loud: bool = False,
+    lock_timeout: float = _CONCAT_LOCK_TIMEOUT,
+) -> None:
     """If only chunked videos exist, concatenate them into ``rec_dir/video.mp4``.
 
     ``video.mp4`` is a **derived, on-demand artifact** — never the canonical
@@ -145,6 +148,12 @@ def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     command (U4) passes ``True`` to propagate ``concat_video_chunks``'s error,
     which it translates into the R9 "can't process this video" envelope — it
     needs correctness, not graceful degradation.
+
+    ``lock_timeout`` bounds how long to wait for the ``terminal_lock`` before
+    giving up (raising ``TerminalStageBusy`` when ``fail_loud``). The default
+    tolerates a slow eviction; the read-only inspect path passes a short value so
+    a view opened DURING post-stop finalization fails fast and is retried by the
+    caller (a "still finalizing" transient) instead of hanging on the lock.
     """
     chunks = sorted(rec_dir.glob("chunk_*.mp4"))
     if not chunks:
@@ -167,7 +176,7 @@ def _ensure_single_video(rec_dir: Path, *, fail_loud: bool = False) -> None:
     from screencap.terminal_stage import TerminalStageBusy, terminal_lock
 
     try:
-        with terminal_lock(rec_dir.name, timeout=_CONCAT_LOCK_TIMEOUT):
+        with terminal_lock(rec_dir.name, timeout=lock_timeout):
             # Re-check under the lock: a concurrent concat (another `view`, or
             # the terminal stage's own derive) may have completed while we
             # waited, and the chunk set may have shifted under eviction.

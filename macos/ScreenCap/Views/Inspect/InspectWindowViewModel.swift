@@ -77,63 +77,108 @@ final class InspectWindowViewModel: ObservableObject {
 
     let recordingName: String
     private let loader: InspectDataLoader
+    /// How long to wait between auto-retries while a recording is still
+    /// finalizing (a `retryable` envelope). Injectable so tests need not sleep.
+    private let retryDelaySeconds: TimeInterval
+    /// How many times to auto-retry a `retryable` (still-finalizing) envelope
+    /// before giving up and surfacing the message. Post-stop finalization is
+    /// normally sub-second; this rides out a slower one without hanging forever.
+    private let maxRetryableAttempts: Int
 
     init(
         recordingName: String,
-        loader: InspectDataLoader = LiveInspectDataLoader()
+        loader: InspectDataLoader = LiveInspectDataLoader(),
+        retryDelaySeconds: TimeInterval = 1.2,
+        maxRetryableAttempts: Int = 8
     ) {
         self.recordingName = recordingName
         self.loader = loader
+        self.retryDelaySeconds = retryDelaySeconds
+        self.maxRetryableAttempts = maxRetryableAttempts
     }
 
     /// Drives `preparing → ready` (or `preparing → failed`). Called from the
     /// view's `.task` on first appear, and re-entrant on a Try-Again retry.
+    ///
+    /// A view opened right after stop can race the post-stop finalization, which
+    /// briefly holds the recording's `terminal_lock` — the CLI reports that as a
+    /// `retryable` envelope. That is NOT a failure (the recording is fine, just
+    /// not ready), so we stay in `preparing` and auto-retry until finalization
+    /// releases the lock, rather than flashing "Could not load this recording."
     func loadInspectData() async {
         // Concurrent-entry guard: a re-tap of Try-Again (or a `.task` that races
         // a retry) while a load is still in flight is a no-op, so two fetches
-        // can't interleave and clobber `state` out of order.
+        // can't interleave and clobber `state` out of order. Held across the
+        // whole retry loop below, so an auto-retry sequence is one logical load.
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
         // Re-entrancy: a retry after a failure comes back through here; reset to
         // preparing so the spinner shows while the second call runs.
         if case .failed = state { state = .preparing }
-        do {
-            let envelope = try await loader.load(name: recordingName)
-            // Inspect is video-first: gate readiness on `ok` + the VIDEO only.
-            // Unlike review (which also requires events for the upload payload),
-            // a recording with no events is still worth looking at, so the
-            // events path is NOT part of the guard. Null timing is likewise not
-            // a failure (SCR-102) — fall back to 0, which the panes handle.
-            guard envelope.ok, let videoPath = envelope.videoPath else {
-                state = .failed(
-                    message: envelope.error ?? "Could not load this recording."
+
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                let envelope = try await loader.load(name: recordingName)
+                // Still finalizing → wait and retry (bounded). Only the
+                // ok=false + retryable shape loops; every other outcome is
+                // handled below exactly as before.
+                if !envelope.ok, envelope.retryable == true, attempt < maxRetryableAttempts {
+                    state = .preparing
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: UInt64(retryDelaySeconds * 1_000_000_000)
+                        )
+                    } catch {
+                        return  // window closed / task cancelled — stop retrying
+                    }
+                    continue
+                }
+                // Inspect is video-first: gate readiness on `ok` + the VIDEO only.
+                // Unlike review (which also requires events for the upload payload),
+                // a recording with no events is still worth looking at, so the
+                // events path is NOT part of the guard. Null timing is likewise not
+                // a failure (SCR-102) — fall back to 0, which the panes handle.
+                guard envelope.ok, let videoPath = envelope.videoPath else {
+                    state = .failed(
+                        message: envelope.error ?? "Could not load this recording."
+                    )
+                    return
+                }
+                let eventsURLs: [URL]
+                if let paths = envelope.eventsPaths {
+                    eventsURLs = paths.map { URL(fileURLWithPath: $0) }
+                } else if let single = envelope.eventsPath {
+                    eventsURLs = [URL(fileURLWithPath: single)]
+                } else {
+                    eventsURLs = []
+                }
+                let data = InspectData(
+                    videoURL: URL(fileURLWithPath: videoPath),
+                    eventsURLs: eventsURLs,
+                    startedAt: envelope.startedAt ?? 0,
+                    durationSeconds: envelope.durationSeconds ?? 0,
+                    timingStatus: ReviewTimingStatus.resolve(
+                        status: envelope.timingStatus, legacyError: envelope.timingError
+                    )
                 )
+                state = .ready(data)
+                return
+            } catch {
+                // Teardown/reload cancellation is not a user-facing failure: the
+                // `.task` was cancelled (window closed, or SwiftUI recreated the
+                // task) and CLIClient SIGTERM'd the child, so the thrown error is
+                // a consequence of going away — stop silently instead of flashing
+                // a spurious "failed" on a window that is closing or reloading.
+                if Task.isCancelled { return }
+                inspectLogger.error(
+                    "inspect-data load failed: \(error.localizedDescription, privacy: .public)"
+                )
+                state = .failed(message: error.localizedDescription)
                 return
             }
-            let eventsURLs: [URL]
-            if let paths = envelope.eventsPaths {
-                eventsURLs = paths.map { URL(fileURLWithPath: $0) }
-            } else if let single = envelope.eventsPath {
-                eventsURLs = [URL(fileURLWithPath: single)]
-            } else {
-                eventsURLs = []
-            }
-            let data = InspectData(
-                videoURL: URL(fileURLWithPath: videoPath),
-                eventsURLs: eventsURLs,
-                startedAt: envelope.startedAt ?? 0,
-                durationSeconds: envelope.durationSeconds ?? 0,
-                timingStatus: ReviewTimingStatus.resolve(
-                    status: envelope.timingStatus, legacyError: envelope.timingError
-                )
-            )
-            state = .ready(data)
-        } catch {
-            inspectLogger.error(
-                "inspect-data load failed: \(error.localizedDescription, privacy: .public)"
-            )
-            state = .failed(message: error.localizedDescription)
         }
     }
 }

@@ -355,3 +355,78 @@ def test_cli_cant_process_emits_error_envelope(recordings_root):
     assert payload["schema_version"] == REVIEW_SCHEMA_VERSION
     assert "can't process this video" in payload["error"]
     assert "ffmpeg" not in payload["error"].lower()
+
+
+def test_cli_cant_process_is_not_retryable(recordings_root):
+    """A genuine decode failure is NOT retryable — retrying a corrupt video will
+    never succeed, so the envelope must not carry the retryable flag (only the
+    transient 'still finalizing' busy condition does)."""
+    rec_dir = _make_recording(recordings_root, "rec-cli-bad2")
+    (rec_dir / "video.mp4").write_bytes(b"not a real mp4")
+
+    result = CliRunner().invoke(cli, ["inspect-data", "--json", "rec-cli-bad2"])
+
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload.get("retryable") is not True
+
+
+# ---------------------------------------------------------------------------
+# View-during-finalization race: a first view opened while the terminal stage
+# holds the per-recording lock must be a TRANSIENT, retryable condition, not the
+# corrupt-video failure that renders "Could not load this recording."
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_busy_terminal_stage_raises_retryable_busy(recordings_root, monkeypatch):
+    """When the ``terminal_lock`` is held (finalization still in flight),
+    ``prepare_inspect_data`` raises the transient ``ReviewPrepareBusy`` — a
+    subclass of ``ReviewPrepareError`` — rather than the corrupt-video
+    ``can't process this video`` flavor. Regression for the
+    view-during-finalization race."""
+    from screencap import review as review_mod
+    from screencap.review import ReviewPrepareBusy
+    from screencap.terminal_stage import terminal_lock
+
+    # Fail fast in the test rather than waiting the real inspect ceiling.
+    monkeypatch.setattr(review_mod, "_INSPECT_LOCK_TIMEOUT", 0.1)
+
+    rec_dir = _make_recording(recordings_root, "rec-busy")
+    # A chunk with NO video.mp4 forces _ensure_single_video to acquire the lock
+    # (it early-returns when video.mp4 already exists), reproducing a first view.
+    _write_video(rec_dir / "chunk_0000.mp4")
+
+    with terminal_lock("rec-busy"):
+        with pytest.raises(ReviewPrepareBusy) as exc:
+            prepare_inspect_data("rec-busy")
+
+    # Transient, not corruption — the message must not read as a hard failure.
+    assert "can't process this video" not in str(exc.value)
+    assert "finalizing" in str(exc.value).lower()
+
+
+def test_cli_busy_emits_retryable_envelope_with_zero_exit(recordings_root, monkeypatch):
+    """The CLI translates ``ReviewPrepareBusy`` into ``ok=false`` +
+    ``retryable=true`` and — critically — exits ZERO.
+
+    The SwiftUI ``CLIClient.runJSONRaw`` throws on a non-zero exit and DISCARDS
+    stdout, so a non-zero exit here would drop the retryable envelope before the
+    shell could decode it and auto-retry — reintroducing the exact 'Could not
+    load this recording.' race this fix removes. Exit 0 is the contract that lets
+    the transient envelope reach the decoder."""
+    from screencap import review as review_mod
+    from screencap.terminal_stage import terminal_lock
+
+    monkeypatch.setattr(review_mod, "_INSPECT_LOCK_TIMEOUT", 0.1)
+
+    rec_dir = _make_recording(recordings_root, "rec-cli-busy")
+    _write_video(rec_dir / "chunk_0000.mp4")
+
+    with terminal_lock("rec-cli-busy"):
+        result = CliRunner().invoke(cli, ["inspect-data", "--json", "rec-cli-busy"])
+
+    assert result.exit_code == 0, "a transient/retryable result must exit 0 so stdout survives"
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["retryable"] is True
+    assert "can't process this video" not in payload["error"]

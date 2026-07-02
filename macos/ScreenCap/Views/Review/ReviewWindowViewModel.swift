@@ -95,6 +95,14 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     /// future status); `ReviewTimingStatus.resolve` maps it, falling back to
     /// `timingError` when an older envelope omits it. Absent → nil.
     var timingStatus: String? = nil
+    /// `true` only on a `ok=false` envelope whose failure is TRANSIENT — the
+    /// recording is still being finalized (the CLI could not take the
+    /// per-recording `terminal_lock`), so retrying will succeed once
+    /// finalization completes. Distinguishes a "still finalizing" condition from
+    /// a genuine "can't process this video" failure so the shell shows a
+    /// finalizing retry instead of "Could not load this recording." Absent
+    /// (older CLI / any success) → nil → treated as non-retryable.
+    var retryable: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -111,6 +119,7 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case coverage
         case timingError = "timing_error"
         case timingStatus = "timing_status"
+        case retryable
     }
 }
 
