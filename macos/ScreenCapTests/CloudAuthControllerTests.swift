@@ -596,4 +596,13 @@ final class CloudAuthControllerTests: XCTestCase {
         controller.dismissAccountMismatch()
         XCTAssertNil(controller.accountMismatch)
     }
+
+    /// The live 410 reconciler short-circuits (no daemon call) when signed out —
+    /// a mismatch needs a signed-in uid to compare against. Guards the reconcile
+    /// wiring so it can never false-prompt on an unauthenticated app.
+    func testReconcileInFlightMismatchNilWhenSignedOut() async {
+        let controller = CloudAuthController(service: FakeCloudAuthService())  // signed out
+        let result = await controller.reconcileInFlightMismatch()
+        XCTAssertNil(result)
+    }
 }

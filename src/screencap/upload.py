@@ -381,7 +381,15 @@ def request_signed_urls(
             auth.get_id_token(force_refresh=True)
             resp = auth.authed_post(requests.post, url, json=payload, timeout=30)
         except auth.AuthError:
+            # A transient auth failure on the forced re-mint: keep the 403 resp so
+            # the caller sees the "active plan" message below rather than a raw
+            # traceback.
             pass
+        except (requests.ConnectionError, requests.Timeout) as e:
+            # A network failure on the RETRY must map to the same clean, retryable
+            # RuntimeError the primary call gives — never propagate a raw
+            # requests exception (which the CLI path would surface as a traceback).
+            raise RuntimeError(f"Upload service unavailable; try again: {e}")
         if resp.status_code == 403:
             detail = _describe_response_error(resp) or "an active plan is required"
             raise RuntimeError(f"Cloud upload needs an active plan: {detail}")

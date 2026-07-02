@@ -13,8 +13,11 @@ import SwiftUI
 ///  - done / already active → `onComplete`.
 struct CloudSetupView: View {
     @ObservedObject var auth: CloudAuthController
-    /// Fired once the account is entitled and authorized to upload.
-    let onComplete: () -> Void
+    /// Fired once the account is entitled and authorized to upload. `didGrant` is
+    /// true when THIS flow performed the grant, false when the account was already
+    /// entitled on open — so a caller only mutates config (e.g. destination) on an
+    /// actual grant, never merely because the sheet was opened.
+    let onComplete: (_ didGrant: Bool) -> Void
     /// Fired when the user cancels — leaves no partial entitlement.
     let onDismiss: () -> Void
 
@@ -37,7 +40,7 @@ struct CloudSetupView: View {
         .onAppear { settleIfEntitled() }
         .onChange(of: auth.entitlementStatus) { _ in settleIfEntitled() }
         .onChange(of: auth.cloudSetupState) { state in
-            if state == .done { settle() }
+            if state == .done { settle(didGrant: true) }
         }
     }
 
@@ -149,13 +152,14 @@ struct CloudSetupView: View {
     // MARK: - Settle / cancel
 
     private func settleIfEntitled() {
-        if auth.entitlementStatus.isActive { settle() }
+        // Already entitled on open (didGrant: false) — no config is mutated.
+        if auth.entitlementStatus.isActive { settle(didGrant: false) }
     }
 
-    private func settle() {
+    private func settle(didGrant: Bool) {
         guard !didComplete else { return }
         didComplete = true
-        onComplete()
+        onComplete(didGrant)
     }
 
     private func cancel() {

@@ -122,6 +122,10 @@ struct MainWindow: View {
     @State private var showingPlanChoiceSheet = false
     /// The shared cloud-setup sheet (U7), reached from the plan choice or an upsell.
     @State private var showingCloudSetupSheet = false
+    /// Set when "Set up cloud" is chosen in the plan choice, so the cloud-setup
+    /// sheet is presented from the plan-choice sheet's `onDismiss` — one sheet
+    /// transition per runloop tick (SwiftUI presents only one sheet reliably).
+    @State private var pendingCloudSetup = false
     /// True while the walkthrough sheet is open because the user explicitly tapped
     /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
     /// the recovery latch presents the sheet, cleared when the sheet dismisses
@@ -207,7 +211,14 @@ struct MainWindow: View {
                 .environmentObject(permissions)
                 .environmentObject(recorder)
         }
-        .sheet(isPresented: $showingPlanChoiceSheet) {
+        .sheet(isPresented: $showingPlanChoiceSheet, onDismiss: {
+            // Chain the cloud-setup sheet AFTER the plan-choice sheet has fully
+            // dismissed, so only one sheet transition happens per tick.
+            if pendingCloudSetup {
+                pendingCloudSetup = false
+                showingCloudSetupSheet = true
+            }
+        }) {
             FirstRunPlanChoiceView(
                 onKeepLocal: {
                     // Start free, all-local (R2): persist local + record the choice.
@@ -217,19 +228,22 @@ struct MainWindow: View {
                 },
                 onChooseCloud: {
                     // Opt into cloud (R1): record the choice and funnel into the one
-                    // shared setup flow (R4).
+                    // shared setup flow (R4), presented from this sheet's onDismiss.
                     cloudDecision.markDecided()
+                    pendingCloudSetup = true
                     showingPlanChoiceSheet = false
-                    showingCloudSetupSheet = true
                 }
             )
         }
         .sheet(isPresented: $showingCloudSetupSheet) {
             CloudSetupView(
                 auth: auth,
-                onComplete: {
+                onComplete: { didGrant in
                     Task {
-                        _ = await auth.setUploadDestination("cloud")
+                        // Only steer the destination to cloud on an actual grant —
+                        // never merely because the sheet opened for an already-
+                        // entitled account.
+                        if didGrant { _ = await auth.setUploadDestination("cloud") }
                         await auth.refreshEntitlements()
                     }
                     showingCloudSetupSheet = false

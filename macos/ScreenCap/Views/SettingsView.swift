@@ -49,12 +49,15 @@ struct SettingsView: View {
         .sheet(isPresented: $showingSetup) {
             CloudSetupView(
                 auth: auth,
-                onComplete: {
+                onComplete: { didGrant in
                     showingSetup = false
                     Task {
-                        // A cloud user's destination follows their choice.
-                        _ = await auth.setUploadDestination("cloud")
-                        destination = "cloud"
+                        // A cloud user's destination follows an actual grant, not
+                        // merely opening the sheet on an already-entitled account.
+                        if didGrant {
+                            _ = await auth.setUploadDestination("cloud")
+                            destination = "cloud"
+                        }
                         await auth.refreshEntitlements()
                     }
                 },

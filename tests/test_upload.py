@@ -607,6 +607,29 @@ def test_request_signed_urls_403_forces_refresh_and_retries_once_then_succeeds(m
 
 
 @pytest.mark.privacy
+def test_request_signed_urls_403_retry_transient_network_error_maps_to_retryable(monkeypatch):
+    # A network failure on the 403 force-refresh RETRY must surface as a clean,
+    # retryable RuntimeError — never a raw requests exception (which the CLI path
+    # would render as a traceback).
+    import requests as req
+
+    from screencap.upload import request_signed_urls
+
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    r403 = mock.MagicMock(status_code=403)
+    r403.json.return_value = {"error": "Cloud upload requires an active plan"}
+
+    with mock.patch(
+        "screencap.upload.requests.post",
+        side_effect=[r403, req.ConnectionError("boom")],
+    ):
+        with pytest.raises(RuntimeError, match="unavailable|try again"):
+            request_signed_urls("rec1", files)
+
+
+@pytest.mark.privacy
 def test_request_signed_urls_403_persists_after_refresh_raises_active_plan(monkeypatch):
     # A genuinely-unentitled account: the 403 survives the refresh+retry, and the
     # error clearly says an active plan is required (not a generic service error).

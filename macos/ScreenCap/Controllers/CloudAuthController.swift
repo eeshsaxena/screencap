@@ -472,20 +472,33 @@ final class CloudAuthController: ObservableObject {
     /// entitlement (U1) — whose Python side force-refreshes the token so the new
     /// claim is present before the first upload. Drives `cloudSetupState`;
     /// `entitlementStatus` reflects the granted plan on success.
+    /// Bumped whenever the setup flow is reset/cancelled, so an in-flight grant
+    /// task (up to ~60s) that finishes after the sheet is gone cannot clobber a
+    /// fresh entry's `cloudSetupState` (it would otherwise auto-complete the next
+    /// setup with a stale `.done`).
+    private var cloudSetupGeneration = 0
+
     func completeCloudSetup(trainingOptIn: Bool) async {
         guard status.isSignedIn else {
             cloudSetupState = .failed("Sign in first to set up cloud.")
             return
         }
+        cloudSetupGeneration &+= 1
+        let generation = cloudSetupGeneration
         cloudSetupState = .working
         do {
             try await service.setTrainingContribution(trainingOptIn)
             let granted = try await service.grantFounding()
+            // The grant is a durable fact — reflect the entitlement regardless of
+            // whether this attempt was superseded; only the UI flow state is
+            // generation-guarded.
             entitlementStatus = granted
+            guard generation == cloudSetupGeneration else { return }
             cloudSetupState = granted.isActive
                 ? .done
                 : .failed("Cloud setup didn't complete. Try again.")
         } catch {
+            guard generation == cloudSetupGeneration else { return }
             let reason = (error as? CloudSetupError)?.message
                 ?? "Cloud setup failed. Try again."
             cloudSetupState = .failed(reason)
@@ -494,7 +507,9 @@ final class CloudAuthController: ObservableObject {
 
     /// Reset the setup flow to idle (e.g. when the setup surface is dismissed or
     /// re-entered), so a stale `.done`/`.failed` doesn't leak into a fresh entry.
+    /// Also invalidates any in-flight grant attempt's pending state write.
     func resetCloudSetup() {
+        cloudSetupGeneration &+= 1
         cloudSetupState = .idle
     }
 
@@ -542,7 +557,10 @@ final class CloudAuthController: ObservableObject {
 
     /// Start the long-lived `/v0/events` account-mismatch monitor (U9). Seams are
     /// injectable for tests; the live wiring captures the bus cursor off
-    /// `session.snapshot` and subscribes since it (replay-cursor pattern). Idempotent.
+    /// `session.snapshot` and subscribes since it (replay-cursor pattern). When no
+    /// `reconcile` is supplied it wires the LIVE 410 reconciler
+    /// (`reconcileInFlightMismatch`) so the cursor-aged-out backstop is real in
+    /// the shipping app, not a no-op. Idempotent.
     func startAccountMismatchMonitoring(
         captureCursor: @escaping CloudEventsMonitor.CursorSource = {
             try await DaemonClient.sessionSnapshot().cursor
@@ -550,16 +568,39 @@ final class CloudAuthController: ObservableObject {
         subscribe: @escaping CloudEventsMonitor.EventStream = { since in
             DaemonClient.subscribe(sinceCursor: since)
         },
-        reconcile: @escaping CloudEventsMonitor.Reconciler = { nil }
+        reconcile: CloudEventsMonitor.Reconciler? = nil
     ) {
         guard mismatchTask == nil else { return }
+        let liveReconcile: CloudEventsMonitor.Reconciler =
+            reconcile ?? { [weak self] in await self?.reconcileInFlightMismatch() }
         let monitor = CloudEventsMonitor(
             captureCursor: captureCursor,
             subscribe: subscribe,
-            reconcile: reconcile,
+            reconcile: liveReconcile,
             onMismatch: { [weak self] mismatch in self?.handleAccountMismatch(mismatch) }
         )
         mismatchTask = Task { await monitor.run() }
+    }
+
+    /// The live 410 reconcile (KTD7): when the ephemeral `account_mismatch` aged
+    /// out of the replay ring, compare the signed-in uid (our own `status`)
+    /// against the in-flight cloud recording's pinned `owner_uid` (from
+    /// `recording.list`). Returns a mismatch only when both are present and
+    /// differ. Best-effort — any missing/failed lookup yields `nil` (no false
+    /// prompt).
+    func reconcileInFlightMismatch() async -> AccountMismatch? {
+        guard case let .signedIn(_, signedInUid?, _) = status else { return nil }
+        guard let snapshot = try? await DaemonClient.sessionSnapshot(),
+              snapshot.isRecording == true,
+              let name = snapshot.recordingName,
+              let list = try? await DaemonClient.recordingList(),
+              let owner = list.recordings.first(where: { $0.name == name })?.ownerUid
+        else { return nil }
+        return AccountMismatch.reconcile(
+            ownerUid: owner,
+            signedInUid: signedInUid,
+            signedInEmail: status.accountLabel
+        )
     }
 
     /// Stop the account-mismatch monitor (teardown).

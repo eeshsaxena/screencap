@@ -26,6 +26,10 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     /// Unit 13 uses `drops?.values.reduce(0, +) ?? 0 > 0` for the row's
     /// drop indicator.
     let drops: [String: Int]?
+    /// The account that owns this cloud recording, pinned at start (SCR-148).
+    /// Emitted by the daemon `recording.list` verb; absent from the CLI list and
+    /// on legacy/unpinned recordings. Used to reconcile an account mismatch (U9).
+    let ownerUid: String?
 
     var id: String { name }
 
@@ -68,6 +72,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         case startedAt = "started_at"
         case durationSeconds = "duration_seconds"
         case drops
+        case ownerUid = "owner_uid"
     }
 
     init(from decoder: Decoder) throws {
@@ -86,6 +91,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         startedAt = try c.decodeIfPresent(Double.self, forKey: .startedAt)
         durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds)
         drops = try c.decodeIfPresent([String: Int].self, forKey: .drops)
+        ownerUid = try c.decodeIfPresent(String.self, forKey: .ownerUid)
     }
 
     /// Newest-first comparator. Recordings without a `startedAt` sort to the
