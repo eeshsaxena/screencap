@@ -7,6 +7,8 @@ description: Bump version, build, and release screencap locally. Mirrors the /re
 
 Bump version, update changelog, commit, tag, push, then build a PyInstaller binary locally and publish to GCS + GitHub Releases. Mirrors the `/release` flow but builds on the local Mac instead of triggering GitHub Actions.
 
+**This is the CLI / daemon track** (`vX.Y.Z`, the headless `install.sh` channel). The **macOS app** is a separate track (`macos-app-vX.Y.Z`, a signed/notarized `.dmg`) — use the **`macos-app-release`** skill for that. Run Step 0 first to confirm which track (or both) actually needs a release.
+
 ## Handling Args
 
 | Usage | Effect |
@@ -53,6 +55,14 @@ file "$PY_UNIVERSAL" | grep -q "x86_64" || { echo "$PY_UNIVERSAL lacks x86_64 sl
 If this fails, stop and tell the user to install the python.org universal2 Python 3.12 installer. Do NOT attempt an x86_64 build with Homebrew Python — it is arm64-only and will silently produce an arm64 binary labelled x86_64.
 
 ## Instructions
+
+### Step 0: Confirm what needs releasing
+
+```bash
+bash scripts/what-needs-releasing.sh
+```
+
+This diffs HEAD against the last tag of each track and reports whether the CLI, the app, or both warrant a release. Proceed with this skill only if the **CLI / daemon** track says a release is warranted. If the **macOS app** track also (or only) needs one, hand off to the `macos-app-release` skill — and when both are due, cut this CLI release first so the app can embed a published daemon version.
 
 ### Step 1: Determine New Version and Arch
 
