@@ -677,15 +677,25 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertEqual(labels.count, 3)
     }
 
-    // MARK: - SCR-200 U5: row named "ScreenCap" + icon fallback
+    // MARK: - SCR-201: row label is per-pane (SR rolls up to the app)
 
-    func testHelperSettingsEntryNameIsScreenCapForEveryPane() {
-        // R3: the daemon's SR/Accessibility/Input Monitoring rows and the
-        // app-owned Microphone row all read "ScreenCap". The onboarding copy
-        // names this exact string, so the user toggles one recognizable row.
-        for pane in [PrivacyPane.screenRecording, .accessibility, .inputMonitoring, .microphone] {
-            XCTAssertEqual(pane.helperSettingsEntryName, "ScreenCap")
-        }
+    func testHelperSettingsEntryNameIsPerPane() {
+        // SCR-201 on-device fact: the panes do NOT share one row label.
+        // - Screen Recording attributes to the responsible host app
+        //   (com.screencap.macos) via the LoginItem rollup, so the row renders
+        //   under the app's name, "ScreenCap".
+        // - Accessibility and Input Monitoring attribute to the daemon's own
+        //   identity (com.screencap.daemon), whose row renders as the helper
+        //   bundle's filename, "ScreencapDaemon" (CFBundleDisplayName does not
+        //   override it — SCR-200 U2).
+        // - Microphone is app-owned → "ScreenCap".
+        // The onboarding copy names the exact per-pane string so the user
+        // toggles the right row (Accessibility has BOTH a "ScreenCap" decoy and
+        // the real "ScreencapDaemon" row, so naming it precisely matters).
+        XCTAssertEqual(PrivacyPane.screenRecording.helperSettingsEntryName, "ScreenCap")
+        XCTAssertEqual(PrivacyPane.accessibility.helperSettingsEntryName, "ScreencapDaemon")
+        XCTAssertEqual(PrivacyPane.inputMonitoring.helperSettingsEntryName, "ScreencapDaemon")
+        XCTAssertEqual(PrivacyPane.microphone.helperSettingsEntryName, "ScreenCap")
     }
 
     func testHelperRowIconFallsBackToSymbolWhenAppIconMissing() {

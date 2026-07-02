@@ -68,28 +68,32 @@ enum PrivacyPane: String, CaseIterable {
         self == .screenRecording || self == .accessibility
     }
 
-    /// The exact name macOS shows for the daemon's row in this pane's Privacy
-    /// list. Since SCR-196 the recording daemon ships as a proper helper bundle
-    /// (`com.screencap.daemon`), so the three daemon-owned grants — Screen
-    /// Recording, Accessibility, Input Monitoring — all attribute to that one
-    /// bundle. SCR-200 names that row "ScreenCap" (the recognizable app name) via
-    /// the helper's `CFBundleDisplayName` in the PyInstaller spec, so a
-    /// non-technical user toggles one obvious row. This is unambiguous because the
-    /// app (`com.screencap.macos`) never appears in the SR/Accessibility panes
-    /// (R6) — the only "ScreenCap" row there is the daemon's. The microphone row
-    /// (app-owned) also reads "ScreenCap", but it lives in a different pane, so
-    /// there is never a duplicate within one pane.
+    /// The exact name macOS shows for the row the user must enable in this pane's
+    /// Privacy list. **The label is per-pane** (SCR-201 on-device finding), not
+    /// one shared string, because the panes attribute to different identities:
     ///
-    /// SHIP GATE (SCR-200 U1/U7): the precise row string is an on-device fact —
-    /// confirm on a CLEAN machine that macOS renders "ScreenCap" (not the bundle
-    /// id or the `.app` filename) in BOTH the SR and Accessibility panes before
-    /// release. If the filename proves to be the lever, the row label and this
-    /// string must move together (the rename contingency); the bundle id is
-    /// stable so grants survive either way.
+    /// - **Screen Recording** → "ScreenCap". On the nested-LoginItem helper
+    ///   layout (SCR-196) macOS attributes the daemon's SR request *and* capture
+    ///   to the responsible host app (`com.screencap.macos`), so the SR row
+    ///   renders under the app's name. This is the row that actually gates
+    ///   capture — enabling it is correct, not a decoy (see `tcc_cleanup`).
+    /// - **Accessibility / Input Monitoring** → "ScreencapDaemon". These attribute
+    ///   to the daemon's own identity (`com.screencap.daemon`), whose row renders
+    ///   as the helper bundle's `.app` filename. `CFBundleDisplayName` does NOT
+    ///   override it (SCR-200 U2 / SCR-201 U1), so the label is the filename.
+    ///   Accessibility also shows a stray "ScreenCap" app decoy alongside the real
+    ///   "ScreencapDaemon" row, which is exactly why naming it precisely matters.
+    /// - **Microphone** → "ScreenCap" (app-owned, in its own pane).
     var helperSettingsEntryName: String {
-        // One name for every daemon-owned pane and the app-owned microphone row:
-        // "ScreenCap". See the doc comment for why this is collision-free.
-        return "ScreenCap"
+        switch self {
+        case .screenRecording, .microphone:
+            // SR rolls up to the host app; Microphone is app-owned. Both render
+            // under the app's name.
+            return "ScreenCap"
+        case .accessibility, .inputMonitoring:
+            // Daemon-identity rows render as the helper bundle filename.
+            return "ScreencapDaemon"
+        }
     }
 
     /// Maps the `permission` string emitted by `_check_permissions_now`
