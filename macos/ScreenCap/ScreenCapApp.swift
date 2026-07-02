@@ -15,6 +15,8 @@ struct ScreenCapApp: App {
     @StateObject private var privacy = PrivacyController()
     @StateObject private var uploads: UploadCoordinator
     @StateObject private var auth: CloudAuthController
+    /// Persists the first-run cloud plan choice (U6) so it is shown once.
+    @StateObject private var cloudDecision = CloudDecisionStore()
 
     init() {
         // Upload bookkeeping lives in its own app-wide observable; the auth
@@ -52,6 +54,7 @@ struct ScreenCapApp: App {
                 .environmentObject(privacy)
                 .environmentObject(auth)
                 .environmentObject(uploads)
+                .environmentObject(cloudDecision)
                 .frame(minWidth: 880, minHeight: 560)
                 .background(OpenWindowBridge())
                 .onAppear {
@@ -67,6 +70,10 @@ struct ScreenCapApp: App {
                     // never gated on auth (R3).
                     if !isRunningUnderTests {
                         await auth.refresh()
+                        // Live plan status (U9) + the account-mismatch monitor
+                        // (R16). Both are best-effort and never gate recording.
+                        await auth.refreshEntitlements()
+                        auth.startAccountMismatchMonitoring()
                     }
                 }
                 .task {
@@ -139,6 +146,14 @@ struct ScreenCapApp: App {
             MenuBarLabel(isRecording: recorder.state.isRecording)
         }
         .menuBarExtraStyle(.menu)
+
+        // Account & Cloud settings (U8, R15). The standard Settings scene gives
+        // the app the conventional ⌘, window; it hosts the plan status, the
+        // destination + training toggles, the shared cloud-setup entry, and
+        // sign-out.
+        Settings {
+            SettingsView(auth: auth, uploads: uploads)
+        }
     }
 }
 

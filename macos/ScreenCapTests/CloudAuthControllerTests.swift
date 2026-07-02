@@ -61,6 +61,41 @@ final class FakeCloudAuthService: CloudAuthService {
         signOutCount += 1
         if let logoutThrows { throw logoutThrows }
     }
+
+    // entitlements + cloud setup (U7/U9)
+    var entitlements: EntitlementStatus = .free
+    private(set) var fetchEntitlementsCount = 0
+    var grantResult: EntitlementStatus = .active(plan: "founding")
+    var grantThrows: Error?
+    private(set) var grantCount = 0
+    var trainingThrows: Error?
+    private(set) var lastTrainingOptIn: Bool?
+    var uploadDefaultThrows: Error?
+    private(set) var lastUploadDefault: String?
+
+    func fetchEntitlements() async -> EntitlementStatus {
+        fetchEntitlementsCount += 1
+        return entitlements
+    }
+
+    func grantFounding() async throws -> EntitlementStatus {
+        grantCount += 1
+        if let grantThrows { throw grantThrows }
+        return grantResult
+    }
+
+    func setTrainingContribution(_ optIn: Bool) async throws {
+        if let trainingThrows { throw trainingThrows }
+        lastTrainingOptIn = optIn
+    }
+
+    func setUploadDefault(_ value: String) async throws {
+        if let uploadDefaultThrows { throw uploadDefaultThrows }
+        lastUploadDefault = value
+    }
+
+    var cloudSettings = CloudSettings(destination: "local", trainingContribution: false)
+    func fetchCloudSettings() async -> CloudSettings { cloudSettings }
 }
 
 enum FakeCloudAuthError: Error, LocalizedError {
@@ -473,5 +508,92 @@ final class CloudAuthControllerTests: XCTestCase {
         await controller.signOut()
 
         XCTAssertEqual(controller.status, .signedOut)
+    }
+
+    // MARK: - U7 shared cloud-setup flow + U9 entitlement
+
+    /// The full flow (from a signed-in account): persists the training choice,
+    /// grants founding, and lands `.done` with an active entitlement.
+    func testCompleteCloudSetupPersistsTrainingGrantsAndBecomesActive() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        service.grantResult = .active(plan: "founding")
+        let controller = CloudAuthController(service: service)
+        await controller.refresh()  // signed in
+
+        await controller.completeCloudSetup(trainingOptIn: true)
+
+        XCTAssertEqual(service.lastTrainingOptIn, true)
+        XCTAssertEqual(service.grantCount, 1)
+        XCTAssertTrue(controller.entitlementStatus.isActive)
+        XCTAssertEqual(controller.cloudSetupState, .done)
+    }
+
+    /// A grant failure surfaces `.failed` for a retry and grants no entitlement.
+    func testCompleteCloudSetupGrantFailureSurfacesRetry() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        service.grantThrows = CloudSetupError.failed("Cloud service unavailable.")
+        let controller = CloudAuthController(service: service)
+        await controller.refresh()
+
+        await controller.completeCloudSetup(trainingOptIn: false)
+
+        if case .failed = controller.cloudSetupState {} else {
+            XCTFail("expected .failed, got \(controller.cloudSetupState)")
+        }
+        XCTAssertFalse(controller.entitlementStatus.isActive)
+    }
+
+    /// Setup cannot proceed without a signed-in account (fail-safe).
+    func testCompleteCloudSetupRequiresSignIn() async {
+        let service = FakeCloudAuthService()
+        let controller = CloudAuthController(service: service)  // signed out
+
+        await controller.completeCloudSetup(trainingOptIn: true)
+
+        XCTAssertEqual(service.grantCount, 0)
+        if case .failed = controller.cloudSetupState {} else {
+            XCTFail("expected .failed when signed out")
+        }
+    }
+
+    /// Refreshing entitlement reads through the service and publishes the status.
+    func testRefreshEntitlementsPublishesStatus() async {
+        let service = FakeCloudAuthService()
+        service.entitlements = .active(plan: "founding")
+        let controller = CloudAuthController(service: service)
+
+        await controller.refreshEntitlements()
+
+        XCTAssertEqual(controller.entitlementStatus, .active(plan: "founding"))
+        XCTAssertEqual(service.fetchEntitlementsCount, 1)
+    }
+
+    /// Signing out drops the entitlement immediately (no stale "founding").
+    func testSignOutClearsEntitlement() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        service.entitlements = .active(plan: "founding")
+        let controller = CloudAuthController(service: service)
+        await controller.refresh()
+        await controller.refreshEntitlements()
+        XCTAssertTrue(controller.entitlementStatus.isActive)
+
+        await controller.signOut()
+
+        XCTAssertEqual(controller.entitlementStatus, .free)
+    }
+
+    /// A published account mismatch drives (and clears) the re-login prompt.
+    func testAccountMismatchPublishAndDismiss() {
+        let controller = CloudAuthController(service: FakeCloudAuthService())
+        XCTAssertNil(controller.accountMismatch)
+
+        controller.handleAccountMismatch(AccountMismatch(ownerUid: "A", signedInUid: "B", signedInEmail: "b@x.com"))
+        XCTAssertEqual(controller.accountMismatch?.ownerUid, "A")
+
+        controller.dismissAccountMismatch()
+        XCTAssertNil(controller.accountMismatch)
     }
 }

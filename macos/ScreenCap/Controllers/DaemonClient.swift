@@ -195,6 +195,29 @@ struct ListResponse: Decodable {
     }
 }
 
+/// `/v0/auth.entitlements` (U3). The plan tier, whether it authorizes upload,
+/// and `expires` (always null in v1). Every plan-bearing field is optional so a
+/// nullable-contract value never fails the decode or gates UI readiness (KTD7).
+struct AuthEntitlementsResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let plan: String?
+    let active: Bool?
+    let expires: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case plan
+        case active
+        case expires
+    }
+}
+
 struct SessionSnapshotResponse: Decodable {
     let ok: Bool
     let schemaVersion: Int
@@ -639,6 +662,12 @@ enum DaemonClient {
 
     static func sessionSnapshot() async throws -> SessionSnapshotResponse {
         try await request(method: "GET", path: "/v0/session.snapshot")
+    }
+
+    /// The signed-in account's cloud entitlement (U3). Read-only; fails open to
+    /// free/inactive server-side, so a reachable daemon never 500s here.
+    static func authEntitlements() async throws -> AuthEntitlementsResponse {
+        try await request(method: "GET", path: "/v0/auth.entitlements")
     }
 
     static func recordingStart(_ req: RecordingStartRequest) async throws -> RecordingStartResponse {

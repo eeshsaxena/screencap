@@ -58,6 +58,13 @@ struct RecorderEventLine: Decodable {
     /// Absent on every other event type.
     let reader: String?
     let ts: Double?
+    /// `account_mismatch` (SCR-171 / U9) fields: the uid that owns the in-flight
+    /// cloud recording (`ownerUid`) vs. the uid currently signed in on the daemon
+    /// (`signedInUid`, gate-authoritative), plus a best-effort email for the
+    /// re-login prompt. Absent on every other event type.
+    let ownerUid: String?
+    let signedInUid: String?
+    let signedInEmail: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -71,6 +78,9 @@ struct RecorderEventLine: Decodable {
         case reason
         case reader
         case ts
+        case ownerUid = "owner_uid"
+        case signedInUid = "signed_in_uid"
+        case signedInEmail = "signed_in_email"
     }
 }
 

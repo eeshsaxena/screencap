@@ -73,6 +73,28 @@ enum FirstRunSetupPresentationPolicy {
         guard !reopenedViaRecovery, !migrationNeeded else { return false }
         return transport == .daemon && !daemonGrants.anyRequiredDenied
     }
+
+    /// Decide whether to present the first-run plan choice — "keep everything
+    /// local (free)" vs "set up cloud" (U6, R1/R2). Hybrid onboarding: the choice
+    /// is shown once, AFTER the permission steps, and never again once a cloud
+    /// decision has been made (the `cloudDecisionMade` axis). Starting free is the
+    /// default, so a user who never decides just stays local (R2).
+    ///
+    /// Gated so it never stacks over the permission walkthrough (it follows it),
+    /// never shows over an active capture (R3), and only once the daemon probe has
+    /// completed (so onboarding state is settled).
+    static func shouldPresentPlanChoice(
+        daemonProbeCompleted: Bool,
+        cloudDecisionMade: Bool,
+        permissionsSheetShowing: Bool,
+        isRecording: Bool
+    ) -> Bool {
+        guard daemonProbeCompleted else { return false }
+        guard !cloudDecisionMade else { return false }
+        guard !permissionsSheetShowing else { return false }
+        guard !isRecording else { return false }
+        return true
+    }
 }
 
 /// Top-level window content. Sidebar (Calendar / Recordings / Privacy) +
@@ -86,6 +108,8 @@ struct MainWindow: View {
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var privacy: PrivacyController
+    @EnvironmentObject private var auth: CloudAuthController
+    @EnvironmentObject private var cloudDecision: CloudDecisionStore
 
     enum SidebarSection: Hashable { case calendar, recordings, search, privacy }
 
@@ -93,6 +117,11 @@ struct MainWindow: View {
     @State private var selectedDate: Date?
     @State private var visibleMonth: Date = startOfCurrentMonth()
     @State private var showingPermissionsSheet = false
+    /// U6 first-run plan choice ("keep local" vs "set up cloud"), shown once after
+    /// the permission steps until a cloud decision is made.
+    @State private var showingPlanChoiceSheet = false
+    /// The shared cloud-setup sheet (U7), reached from the plan choice or an upsell.
+    @State private var showingCloudSetupSheet = false
     /// True while the walkthrough sheet is open because the user explicitly tapped
     /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
     /// the recovery latch presents the sheet, cleared when the sheet dismisses
@@ -170,10 +199,56 @@ struct MainWindow: View {
             // produces the `installedAndRunning` edge that otherwise writes the
             // marker.
             permissions.markMigrationComplete()
+            // The plan choice follows the permission steps — re-evaluate now that
+            // the permission sheet has closed (U6).
+            updatePlanChoicePresentation()
         }) {
             FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
                 .environmentObject(permissions)
                 .environmentObject(recorder)
+        }
+        .sheet(isPresented: $showingPlanChoiceSheet) {
+            FirstRunPlanChoiceView(
+                onKeepLocal: {
+                    // Start free, all-local (R2): persist local + record the choice.
+                    Task { _ = await auth.setUploadDestination("local") }
+                    cloudDecision.markDecided()
+                    showingPlanChoiceSheet = false
+                },
+                onChooseCloud: {
+                    // Opt into cloud (R1): record the choice and funnel into the one
+                    // shared setup flow (R4).
+                    cloudDecision.markDecided()
+                    showingPlanChoiceSheet = false
+                    showingCloudSetupSheet = true
+                }
+            )
+        }
+        .sheet(isPresented: $showingCloudSetupSheet) {
+            CloudSetupView(
+                auth: auth,
+                onComplete: {
+                    Task {
+                        _ = await auth.setUploadDestination("cloud")
+                        await auth.refreshEntitlements()
+                    }
+                    showingCloudSetupSheet = false
+                },
+                onDismiss: { showingCloudSetupSheet = false }
+            )
+        }
+        .alert(
+            "Signed in to a different account",
+            isPresented: accountMismatchPresented,
+            presenting: auth.accountMismatch
+        ) { _ in
+            Button("Sign In Again") {
+                auth.dismissAccountMismatch()
+                auth.startSignIn { _ in }
+            }
+            Button("Later", role: .cancel) { auth.dismissAccountMismatch() }
+        } message: { mismatch in
+            Text("A cloud recording belongs to a different account\(mismatch.signedInEmail.map { " than \($0)" } ?? ""). Sign in with the owning account to upload it.")
         }
         .sheet(isPresented: matrixDisclosurePresented) {
             if let disclosure = recorder.matrixDisclosure {
@@ -183,9 +258,11 @@ struct MainWindow: View {
         }
         .onAppear {
             updateFirstRunSheetPresentation()
+            updatePlanChoicePresentation()
         }
         .onChange(of: recorder.daemonProbeCompleted) { _ in
             updateFirstRunSheetPresentation()
+            updatePlanChoicePresentation()
         }
         .onChange(of: recorder.transport) { _ in
             updateFirstRunSheetPresentation()
@@ -265,6 +342,28 @@ struct MainWindow: View {
         ) {
             showingPermissionsSheet = true
         }
+    }
+
+    /// Present the first-run plan choice (U6) once the permission steps are done
+    /// and no cloud decision has been made. Keyed on the same signals as the
+    /// permission gate, but a distinct sheet so it never stacks over it.
+    private func updatePlanChoicePresentation() {
+        guard FirstRunSetupPresentationPolicy.shouldPresentPlanChoice(
+            daemonProbeCompleted: recorder.daemonProbeCompleted,
+            cloudDecisionMade: cloudDecision.decisionMade,
+            permissionsSheetShowing: showingPermissionsSheet,
+            isRecording: recorder.state.isRecording
+        ) else { return }
+        showingPlanChoiceSheet = true
+    }
+
+    /// Binding that presents the account-mismatch re-login alert whenever the
+    /// controller publishes a live mismatch (U9 / R16).
+    private var accountMismatchPresented: Binding<Bool> {
+        Binding(
+            get: { auth.accountMismatch != nil },
+            set: { if !$0 { auth.dismissAccountMismatch() } }
+        )
     }
 
     private var matrixDisclosurePresented: Binding<Bool> {

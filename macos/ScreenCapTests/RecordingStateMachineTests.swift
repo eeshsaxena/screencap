@@ -559,7 +559,10 @@ final class RecordingStateMachineTests: XCTestCase {
         cursor: Int? = nil,
         reason: String? = nil,
         reader: String? = nil,
-        ts: Double? = nil
+        ts: Double? = nil,
+        ownerUid: String? = nil,
+        signedInUid: String? = nil,
+        signedInEmail: String? = nil
     ) -> RecorderEventLine {
         RecorderEventLine(
             type: type,
@@ -572,7 +575,10 @@ final class RecordingStateMachineTests: XCTestCase {
             cursor: cursor,
             reason: reason,
             reader: reader,
-            ts: ts
+            ts: ts,
+            ownerUid: ownerUid,
+            signedInUid: signedInUid,
+            signedInEmail: signedInEmail
         )
     }
 }

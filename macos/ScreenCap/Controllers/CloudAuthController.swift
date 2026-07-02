@@ -41,6 +41,61 @@ protocol CloudAuthService {
     /// Runs `screencap logout` (best-effort; the CLI swallows the common
     /// "nothing stored" case and exits zero).
     func signOut() async throws
+
+    /// Reads the signed-in account's cloud entitlement (U3) via the daemon
+    /// `/v0/auth.entitlements` verb. Fails OPEN to `.free` — a read never blocks
+    /// UI readiness and a client read never authorizes an upload.
+    func fetchEntitlements() async -> EntitlementStatus
+
+    /// Provisions the founding entitlement (U7) via `screencap cloud grant`,
+    /// which grants server-side and force-refreshes the token so the returned
+    /// status reflects the new claim. Throws `CloudSetupError` on failure.
+    func grantFounding() async throws -> EntitlementStatus
+
+    /// Persists the training-contribution consent flag (U5/U12) via
+    /// `settings --set training_contribution=…`.
+    func setTrainingContribution(_ optIn: Bool) async throws
+
+    /// Persists the upload destination (U5) via `settings --set upload_default=…`.
+    func setUploadDefault(_ value: String) async throws
+
+    /// Reads the current cloud-related settings (U8) via `settings --json`, so
+    /// the settings surface can render the destination + training toggles at
+    /// their persisted values.
+    func fetchCloudSettings() async -> CloudSettings
+}
+
+/// The cloud-related settings the account/cloud surface renders (U8).
+struct CloudSettings: Equatable {
+    /// Upload destination: "local" / "cloud" / "both" / "ask".
+    var destination: String
+    /// Training-contribution consent.
+    var trainingContribution: Bool
+
+    /// The conservative default when the read fails: all-local, no contribution.
+    static let fallback = CloudSettings(destination: "local", trainingContribution: false)
+}
+
+/// Minimal decode of the `settings --json` envelope — only the cloud fields.
+private struct CloudSettingsReadEnvelope: Decodable {
+    struct Payload: Decodable {
+        let uploadDefault: String?
+        let trainingContribution: Bool?
+        enum CodingKeys: String, CodingKey {
+            case uploadDefault = "upload_default"
+            case trainingContribution = "training_contribution"
+        }
+    }
+    let settings: Payload?
+}
+
+/// A cloud-setup failure with a user-facing message (grant / persistence).
+enum CloudSetupError: LocalizedError {
+    case failed(String)
+    var errorDescription: String? { message }
+    var message: String {
+        switch self { case .failed(let m): return m }
+    }
 }
 
 @MainActor
@@ -74,6 +129,55 @@ final class LiveCloudAuthService: CloudAuthService {
         // (not decoding) is the right primitive.
         try await CLIClient.runAwaitingExit(["logout"], timeout: 15)
     }
+
+    func fetchEntitlements() async -> EntitlementStatus {
+        // U8: read via the daemon verb (not the CLI) so a plan-status poll is a
+        // cheap socket round-trip. Fail OPEN to `.free` on any error.
+        do {
+            let r = try await DaemonClient.authEntitlements()
+            return r.active == true ? .active(plan: r.plan ?? "founding") : .free
+        } catch {
+            authLogger.debug("entitlements read failed: \(error.localizedDescription, privacy: .public); treating as free")
+            return .free
+        }
+    }
+
+    func grantFounding() async throws -> EntitlementStatus {
+        // The grant + token force-refresh both happen Python-side; a generous
+        // timeout covers the network round-trips.
+        let data = try await CLIClient.runJSONRaw(["cloud", "grant", "--json"], timeout: 60)
+        let env = AuthEntitlementsEnvelope.parse(data)
+        if let env, env.ok == false {
+            throw CloudSetupError.failed(env.error ?? "Cloud setup failed. Try again.")
+        }
+        return EntitlementStatus.from(envelope: env)
+    }
+
+    func setTrainingContribution(_ optIn: Bool) async throws {
+        try await CLIClient.runAwaitingExit(
+            ["settings", "--set", "training_contribution=\(optIn)"], timeout: 15
+        )
+    }
+
+    func setUploadDefault(_ value: String) async throws {
+        try await CLIClient.runAwaitingExit(
+            ["settings", "--set", "upload_default=\(value)"], timeout: 15
+        )
+    }
+
+    func fetchCloudSettings() async -> CloudSettings {
+        do {
+            let data = try await CLIClient.runJSONRaw(["settings", "--json"], timeout: 15)
+            let env = try JSONDecoder().decode(CloudSettingsReadEnvelope.self, from: data)
+            return CloudSettings(
+                destination: env.settings?.uploadDefault ?? CloudSettings.fallback.destination,
+                trainingContribution: env.settings?.trainingContribution ?? false
+            )
+        } catch {
+            authLogger.debug("settings read failed: \(error.localizedDescription, privacy: .public)")
+            return .fallback
+        }
+    }
 }
 
 /// Owns cloud sign-in state for the app shell (plan U6). Surfaces:
@@ -88,10 +192,31 @@ final class LiveCloudAuthService: CloudAuthService {
 /// Token handling lives entirely in the Python layer; this controller only
 /// triggers `login`/`logout`/`whoami` and reads their JSON. Local recording is
 /// never gated on any of this (R3).
+/// The shared cloud-setup flow's state (U7): confirm founding plan + training
+/// toggle → grant → done. Distinct from `SignInFlowState` (the sign-in leg).
+enum CloudSetupState: Equatable {
+    case idle
+    /// The grant round-trip is in flight (`cloud grant` + token refresh).
+    case working
+    /// The grant / persistence failed. Carries a short reason for the re-prompt.
+    case failed(String)
+    /// The account is entitled and authorized to upload.
+    case done
+}
+
 @MainActor
 final class CloudAuthController: ObservableObject {
     @Published private(set) var status: AuthStatus = .unknown
     @Published private(set) var signInFlow: SignInFlowState = .idle
+    /// The signed-in account's cloud entitlement (U9), populated from
+    /// `/v0/auth.entitlements`. Contract-optional fields decode as optional so
+    /// this never lands on a failed state that would gate readiness (KTD7).
+    @Published private(set) var entitlementStatus: EntitlementStatus = .unknown
+    /// The shared cloud-setup flow state (U7).
+    @Published private(set) var cloudSetupState: CloudSetupState = .idle
+    /// A live account mismatch (U9 / R16): the signed-in account no longer owns
+    /// an in-flight cloud recording. Non-nil drives the re-login prompt.
+    @Published private(set) var accountMismatch: AccountMismatch?
 
     private let service: CloudAuthService
     /// Read-only window onto the upload count that gates Sign Out. Owned by the
@@ -325,5 +450,121 @@ final class CloudAuthController: ObservableObject {
             authLogger.warning("logout shell-out failed: \(error.localizedDescription, privacy: .public)")
         }
         status = .signedOut
+        // Signing out drops any cloud entitlement — reflect it immediately so the
+        // UI never shows a stale "founding" for a signed-out account.
+        entitlementStatus = .free
+        cloudSetupState = .idle
+    }
+
+    // MARK: - Entitlement (U9)
+
+    /// Refreshes `entitlementStatus` from `/v0/auth.entitlements`. Never throws —
+    /// a failed read resolves to `.free` so a polling caller stays on its happy
+    /// path and a conservative read never wrongly authorizes.
+    func refreshEntitlements() async {
+        entitlementStatus = await service.fetchEntitlements()
+    }
+
+    // MARK: - Shared cloud-setup flow (U7)
+
+    /// Complete the shared cloud-setup flow for an already-signed-in account:
+    /// persist the training-contribution consent (U5), then grant the founding
+    /// entitlement (U1) — whose Python side force-refreshes the token so the new
+    /// claim is present before the first upload. Drives `cloudSetupState`;
+    /// `entitlementStatus` reflects the granted plan on success.
+    func completeCloudSetup(trainingOptIn: Bool) async {
+        guard status.isSignedIn else {
+            cloudSetupState = .failed("Sign in first to set up cloud.")
+            return
+        }
+        cloudSetupState = .working
+        do {
+            try await service.setTrainingContribution(trainingOptIn)
+            let granted = try await service.grantFounding()
+            entitlementStatus = granted
+            cloudSetupState = granted.isActive
+                ? .done
+                : .failed("Cloud setup didn't complete. Try again.")
+        } catch {
+            let reason = (error as? CloudSetupError)?.message
+                ?? "Cloud setup failed. Try again."
+            cloudSetupState = .failed(reason)
+        }
+    }
+
+    /// Reset the setup flow to idle (e.g. when the setup surface is dismissed or
+    /// re-entered), so a stale `.done`/`.failed` doesn't leak into a fresh entry.
+    func resetCloudSetup() {
+        cloudSetupState = .idle
+    }
+
+    // MARK: - Cloud settings (U8)
+
+    /// Read the current cloud settings (destination + training) for the settings
+    /// surface. Fails open to the all-local fallback.
+    func fetchCloudSettings() async -> CloudSettings {
+        await service.fetchCloudSettings()
+    }
+
+    /// Persist the upload destination (U5). Returns true on success so the caller
+    /// can revert a toggle it optimistically flipped.
+    func setUploadDestination(_ value: String) async -> Bool {
+        do { try await service.setUploadDefault(value); return true }
+        catch {
+            authLogger.warning("set upload_default failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    /// Persist the training-contribution consent (U5/U12). Returns true on success.
+    func setTrainingContribution(_ optIn: Bool) async -> Bool {
+        do { try await service.setTrainingContribution(optIn); return true }
+        catch {
+            authLogger.warning("set training_contribution failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    // MARK: - Account mismatch (U9 / R16)
+
+    private var mismatchTask: Task<Void, Never>?
+
+    /// Surface an account mismatch (called by the events monitor). Published so
+    /// the app can present a re-login prompt.
+    func handleAccountMismatch(_ mismatch: AccountMismatch) {
+        accountMismatch = mismatch
+    }
+
+    /// Dismiss the re-login prompt (the user acknowledged / re-logged in).
+    func dismissAccountMismatch() {
+        accountMismatch = nil
+    }
+
+    /// Start the long-lived `/v0/events` account-mismatch monitor (U9). Seams are
+    /// injectable for tests; the live wiring captures the bus cursor off
+    /// `session.snapshot` and subscribes since it (replay-cursor pattern). Idempotent.
+    func startAccountMismatchMonitoring(
+        captureCursor: @escaping CloudEventsMonitor.CursorSource = {
+            try await DaemonClient.sessionSnapshot().cursor
+        },
+        subscribe: @escaping CloudEventsMonitor.EventStream = { since in
+            DaemonClient.subscribe(sinceCursor: since)
+        },
+        reconcile: @escaping CloudEventsMonitor.Reconciler = { nil }
+    ) {
+        guard mismatchTask == nil else { return }
+        let monitor = CloudEventsMonitor(
+            captureCursor: captureCursor,
+            subscribe: subscribe,
+            reconcile: reconcile,
+            onMismatch: { [weak self] mismatch in self?.handleAccountMismatch(mismatch) }
+        )
+        mismatchTask = Task { await monitor.run() }
+    }
+
+    /// Stop the account-mismatch monitor (teardown).
+    func stopAccountMismatchMonitoring() {
+        mismatchTask?.cancel()
+        mismatchTask = nil
     }
 }
