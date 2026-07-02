@@ -275,6 +275,118 @@ final class DaemonInstallController: ObservableObject {
         }
     }
 
+    /// A reachable daemon's process-start time plus whether it is mid-recording.
+    /// Returned by the stale-daemon probe; a `nil` probe result means "no daemon
+    /// answered", which short-circuits the staleness check to a no-op.
+    struct StaleDaemonProbe: Equatable {
+        /// Unix seconds the daemon PROCESS started (`daemon.info.started_at`).
+        let startedAt: Double
+        /// A daemon-owned recording is in flight — restarting would drop it.
+        let isRecording: Bool
+    }
+
+    /// Live probe: `daemon.info` for the process-start time and `session.snapshot`
+    /// for an in-flight recording. Both are non-lazy-import verbs, so a stale
+    /// daemon (whose lazy-import verbs 500) still answers them. Returns nil when
+    /// no daemon is reachable, and no-ops under XCTest so the app-hosted unit
+    /// suite never reaches a real socket (tests inject their own probe).
+    static let liveStaleDaemonProbe: () async -> StaleDaemonProbe? = {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return nil }
+        do {
+            let info = try await DaemonClient.daemonInfo()
+            // Best-effort: a stale daemon answers session.snapshot, so a failure
+            // here is a genuine transport blip (or the daemon is already down) —
+            // treat as "not recording" rather than let it block healing.
+            let recording = (try? await DaemonClient.sessionSnapshot())
+                .map { $0.isRecording == true && $0.daemonOwned } ?? false
+            return StaleDaemonProbe(startedAt: info.startedAt, isRecording: recording)
+        } catch {
+            daemonInstallLogger.debug("stale-daemon probe: no daemon reachable: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    /// mtime of the daemon executable this app would run — the embedded LoginItem
+    /// helper. An app update rewrites it, so a daemon that started before this
+    /// timestamp is running the PREVIOUS bundle. Returns nil (→ skip the check)
+    /// when the path can't be resolved or stat'd, so an unexpected bundle layout
+    /// never triggers a false restart.
+    static let liveDaemonBundleModifiedAt: () -> Date? = {
+        let helper = Bundle.main.bundleURL.appendingPathComponent(
+            "Contents/Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap"
+        )
+        guard
+            let attrs = try? FileManager.default.attributesOfItem(atPath: helper.path),
+            let mtime = attrs[.modificationDate] as? Date
+        else { return nil }
+        return mtime
+    }
+
+    /// Restart the daemon in place via `launchctl kickstart -k` so it reloads the
+    /// current on-disk bundle. Returns true on a clean kickstart. No-ops under
+    /// XCTest (defense-in-depth against an app-hosted test tearing down a real
+    /// daemon; tests inject their own restart).
+    static let liveKickstartRestart: () async -> Bool = {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return false }
+        do {
+            let result = try await runLaunchctl(["kickstart", "-k", "gui/\(getuid())/com.screencap.daemon"])
+            if result.terminationStatus != 0 {
+                daemonInstallLogger.error("stale-daemon restart: launchctl kickstart -k exit \(result.terminationStatus, privacy: .public): \(result.stderr, privacy: .public)")
+                return false
+            }
+            return true
+        } catch {
+            daemonInstallLogger.error("stale-daemon restart: launchctl spawn failed: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    /// Restart the daemon if it predates the installed bundle (SCR: stale daemon
+    /// after app update).
+    ///
+    /// After an app update the previously-running daemon keeps serving the OLD
+    /// on-disk bundle — SMAppService does not restart the LoginItem on update.
+    /// PyInstaller loads deferred (lazy) imports from the archive at request
+    /// time, so once the bundle is replaced underneath the old process, every
+    /// verb that lazy-imports (recording.list, apps.list, content.search,
+    /// transcript.search, timeline.query) raises ImportError → HTTP 500 → the
+    /// "Couldn't load recordings" the user hits. The SCR-121 version gate misses
+    /// this because the daemon *version string* is unchanged across an app update
+    /// (the app version and the daemon/CLI version are separate schemes), so the
+    /// gate adopts the same-version stale process as healthy.
+    ///
+    /// Detect it directly and version-independently: a reachable daemon whose
+    /// PROCESS start predates the daemon binary we would run is running the old
+    /// bundle — restart it in place so it reloads the fresh code. Runs on every
+    /// launch; best-effort and fail-safe — an unreachable daemon, an
+    /// undeterminable bundle time, or an active recording each short-circuit to a
+    /// no-op. Returns whether a restart was triggered (for the caller and tests).
+    @discardableResult
+    static func restartStaleDaemonIfNeeded(
+        probe: () async -> StaleDaemonProbe? = liveStaleDaemonProbe,
+        bundleModifiedAt: () -> Date? = liveDaemonBundleModifiedAt,
+        restart: () async -> Bool = liveKickstartRestart,
+        now: () -> Date = Date.init
+    ) async -> Bool {
+        guard let bundleMTime = bundleModifiedAt() else { return false }
+        // A bundle mtime in the FUTURE (build-machine clock skew, or an updater
+        // that preserved a future archive timestamp) can't be trusted as a
+        // staleness reference: it would make even a just-restarted daemon look
+        // stale and re-trigger a restart on every launch. Skip rather than churn.
+        guard bundleMTime <= now() else { return false }
+        guard let info = await probe() else { return false }
+        let daemonStart = Date(timeIntervalSince1970: info.startedAt)
+        // A fresh daemon starts AFTER its binary was written; only a daemon that
+        // predates the current binary is running a superseded bundle.
+        guard daemonStart < bundleMTime else { return false }
+        if info.isRecording {
+            daemonInstallLogger.info("Stale daemon detected (started \(daemonStart, privacy: .public), bundle \(bundleMTime, privacy: .public)) but a recording is active; deferring restart")
+            return false
+        }
+        daemonInstallLogger.error("Daemon started \(daemonStart, privacy: .public) predates installed bundle \(bundleMTime, privacy: .public); restarting stale daemon after app update")
+        return await restart()
+    }
+
     static func openLoginItemsSettings() {
         if #available(macOS 14.0, *) {
             SMAppService.openSystemSettingsLoginItems()
