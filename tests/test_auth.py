@@ -212,7 +212,7 @@ def test_logout_deletes_and_whoami_reports_signed_out(fake_keyring):
     fake_keyring[_KEY] = "rt"
     assert a.logout() is True
     assert _KEY not in fake_keyring
-    assert a.whoami() == {"signed_in": False}
+    assert a.whoami() == {"signed_in": False, "plan": "free"}
 
 
 def test_logout_when_not_signed_in_returns_false(fake_keyring):
@@ -221,11 +221,25 @@ def test_logout_when_not_signed_in_returns_false(fake_keyring):
 
 def test_whoami_signed_in(fake_keyring, monkeypatch):
     fake_keyring[_KEY] = "rt"
+    # A plain (claimless) ID token → plan defaults to "free".
     monkeypatch.setattr(
         a, "_ensure_fresh",
         lambda: a.AuthState("id", "rt", time.time() + 3600, "uid1", "e@x.com"),
     )
-    assert a.whoami() == {"signed_in": True, "uid": "uid1", "email": "e@x.com"}
+    assert a.whoami() == {
+        "signed_in": True, "uid": "uid1", "email": "e@x.com", "plan": "free",
+    }
+
+
+def test_whoami_signed_in_surfaces_founding_plan(fake_keyring, monkeypatch):
+    # KTD7 "extended whoami": the plan claim rides on the (unverified) ID token.
+    fake_keyring[_KEY] = "rt"
+    token = _jwt({"user_id": "uid1", "email": "e@x.com", "plan": "founding"})
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda: a.AuthState(token, "rt", time.time() + 3600, "uid1", "e@x.com"),
+    )
+    assert a.whoami()["plan"] == "founding"
 
 
 def test_whoami_offline_reports_stale_not_crash(fake_keyring, monkeypatch):
@@ -245,6 +259,68 @@ def test_pkce_challenge_is_url_safe_sha256():
     challenge = a._code_challenge(verifier)
     assert "=" not in challenge and "+" not in challenge and "/" not in challenge
     assert 43 <= len(verifier) <= 128
+
+
+# --------------------------------------------------------------------------
+# U3 — entitlement read surface (auth.get_entitlements)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_get_entitlements_founding_active(fake_keyring, monkeypatch):
+    # A founding claim on the freshly-minted token → active, expires always null.
+    token = _jwt({"user_id": "uid1", "plan": "founding"})
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda force=False: a.AuthState(token, "rt", time.time() + 3600, "uid1"),
+    )
+    assert a.get_entitlements() == {"plan": "founding", "active": True, "expires": None}
+
+
+@pytest.mark.privacy
+def test_get_entitlements_no_claim_reads_free_inactive(fake_keyring, monkeypatch):
+    token = _jwt({"user_id": "uid1"})  # no plan claim
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda force=False: a.AuthState(token, "rt", time.time() + 3600, "uid1"),
+    )
+    assert a.get_entitlements() == {"plan": "free", "active": False, "expires": None}
+
+
+@pytest.mark.privacy
+def test_get_entitlements_signed_out_is_free_inactive(fake_keyring, monkeypatch):
+    def _not_signed_in(force=False):
+        raise a.NotSignedIn("no token")
+
+    monkeypatch.setattr(a, "_ensure_fresh", _not_signed_in)
+    assert a.get_entitlements() == {"plan": "free", "active": False, "expires": None}
+
+
+@pytest.mark.privacy
+def test_get_entitlements_offline_fails_open_to_free(fake_keyring, monkeypatch):
+    # A transient refresh failure (offline) must not raise from a read surface;
+    # it conservatively reads free (a client read never authorizes an upload).
+    def _offline(force=False):
+        raise a.AuthError("offline")
+
+    monkeypatch.setattr(a, "_ensure_fresh", _offline)
+    assert a.get_entitlements() == {"plan": "free", "active": False, "expires": None}
+
+
+@pytest.mark.privacy
+def test_get_entitlements_force_refreshes_for_fresh_claim(fake_keyring, monkeypatch):
+    # KTD2: the read FORCE-refreshes so a claim granted by another process (the
+    # `cloud setup` CLI) is visible to the daemon's own token on the first poll.
+    calls = {}
+    token = _jwt({"user_id": "uid1", "plan": "founding"})
+
+    def _capture(force=False):
+        calls["force"] = force
+        return a.AuthState(token, "rt", time.time() + 3600, "uid1")
+
+    monkeypatch.setattr(a, "_ensure_fresh", _capture)
+    a.get_entitlements()
+    assert calls["force"] is True
 
 
 # --------------------------------------------------------------------------

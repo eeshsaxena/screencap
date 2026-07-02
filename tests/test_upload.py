@@ -540,6 +540,89 @@ def test_request_signed_urls_not_signed_in_raises_sign_in_message(monkeypatch):
             request_signed_urls("rec1", files)
 
 
+# ---------------------------------------------------------------------------
+# U4 — client-side entitlement pre-check + Cloud Function 403 handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_request_signed_urls_not_entitled_raises_before_contacting_cf(monkeypatch):
+    # Signed in but no active plan: the pre-check fails fast and NEVER contacts
+    # the Cloud Function (fail-closed; the caller retains all local files).
+    from screencap import auth
+    from screencap.upload import request_signed_urls
+
+    def _not_entitled():
+        raise auth.NotEntitled("Cloud upload needs an active plan.")
+
+    monkeypatch.setattr("screencap.auth.assert_entitled_to_upload", _not_entitled)
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    with mock.patch("screencap.upload.requests.post") as post:
+        with pytest.raises(RuntimeError, match="active plan"):
+            request_signed_urls("rec1", files)
+    post.assert_not_called()  # gate ran before any Cloud Function call
+
+
+@pytest.mark.privacy
+def test_request_signed_urls_entitled_proceeds_to_request_urls(monkeypatch):
+    # The default _signed_in fixture already stubs assert_entitled to a no-op
+    # (entitled); the request reaches the Cloud Function and returns URLs.
+    from screencap.upload import request_signed_urls
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    r200 = mock.MagicMock(status_code=200)
+    r200.json.return_value = {"urls": {"video.mp4": "u"}, "gcs_prefix": "p"}
+    with mock.patch("screencap.upload.requests.post", return_value=r200) as post:
+        urls, _ = request_signed_urls("rec1", files)
+    assert urls == {"video.mp4": "u"}
+    post.assert_called_once()
+
+
+@pytest.mark.privacy
+def test_request_signed_urls_403_forces_refresh_and_retries_once_then_succeeds(monkeypatch):
+    # A just-granted account whose token predated the grant: the Cloud Function
+    # gate 403s, the client forces one ID-token refresh and retries the single
+    # call, and the retry succeeds.
+    from screencap.upload import request_signed_urls
+
+    token_calls: list[bool] = []
+    monkeypatch.setattr(
+        "screencap.auth.get_id_token",
+        lambda force_refresh=False: (token_calls.append(force_refresh), "tok")[1],
+    )
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    r403 = mock.MagicMock(status_code=403)
+    r403.json.return_value = {"error": "Cloud upload requires an active plan", "plan": "free"}
+    r200 = mock.MagicMock(status_code=200)
+    r200.json.return_value = {"urls": {"video.mp4": "u"}, "gcs_prefix": "p"}
+
+    with mock.patch("screencap.upload.requests.post", side_effect=[r403, r200]) as post:
+        urls, _ = request_signed_urls("rec1", files)
+
+    assert urls == {"video.mp4": "u"}
+    assert post.call_count == 2
+    assert True in token_calls  # a forced refresh happened before the retry
+
+
+@pytest.mark.privacy
+def test_request_signed_urls_403_persists_after_refresh_raises_active_plan(monkeypatch):
+    # A genuinely-unentitled account: the 403 survives the refresh+retry, and the
+    # error clearly says an active plan is required (not a generic service error).
+    from screencap.upload import request_signed_urls
+
+    monkeypatch.setattr("screencap.auth.get_id_token", lambda force_refresh=False: "tok")
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+    r403 = mock.MagicMock(status_code=403)
+    r403.json.return_value = {"error": "Cloud upload requires an active plan"}
+
+    with mock.patch("screencap.upload.requests.post", return_value=r403):
+        with pytest.raises(RuntimeError, match="active plan"):
+            request_signed_urls("rec1", files)
+
+
 def test_request_signed_urls_transient_autherror_on_refresh_maps_to_retryable(monkeypatch):
     """A transient AuthError raised by the forced refresh on the 401 retry must
     surface as a clean, retryable RuntimeError — never a raw AuthError traceback."""

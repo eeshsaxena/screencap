@@ -1738,13 +1738,17 @@ def _auth_failure_exc(kind: str) -> Exception:
     token is threaded through ``request_signed_urls`` (U5c)."""
     import keyring.errors
 
-    from screencap.auth import AuthError, NotSignedIn
+    from screencap.auth import AuthError, NotEntitled, NotSignedIn
 
     return {
         "not_signed_in": NotSignedIn("not signed in"),
         "transient_auth": AuthError("token refresh temporarily failed"),
         "keyring_error": keyring.errors.KeyringError("keychain locked"),
         "service_error": RuntimeError("Upload service unavailable"),
+        # U4: signed in but no active cloud entitlement — the client pre-check
+        # raises NotEntitled inside request_signed_urls, which must route to the
+        # same FAILED-chunk / media-preserved fail-closed path.
+        "not_entitled": NotEntitled("Cloud upload needs an active plan."),
     }[kind]
 
 
@@ -1764,8 +1768,10 @@ class TestAuthFailureFailClosed:
     same machinery already routes to FAILED.
     """
 
+    @pytest.mark.privacy
     @pytest.mark.parametrize(
-        "kind", ["not_signed_in", "transient_auth", "keyring_error", "service_error"]
+        "kind",
+        ["not_signed_in", "transient_auth", "keyring_error", "service_error", "not_entitled"],
     )
     @mock.patch("screencap.chunk_processor.time.sleep")
     def test_auth_failure_marks_failed_and_preserves_media(self, _mock_sleep, tmp_path, kind):

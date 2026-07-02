@@ -475,6 +475,84 @@ async def test_auth_whoami_signed_in(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload["stale"] is False
 
 
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_auth_whoami_forwards_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KTD7 "extended whoami": the daemon envelope carries the plan tier."""
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": "u", "email": "e@b.com", "plan": "founding"},
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["plan"] == "founding"
+
+
+# --------------------------------------------------------------------------
+# U3 — /v0/auth.entitlements read verb
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_auth_entitlements_founding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A founding account reads back active with a null (serialized) expires."""
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "get_entitlements",
+        lambda: {"plan": "founding", "active": True, "expires": None},
+    )
+    response = await _asgi_get("/v0/auth.entitlements")
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._AUTH_ENTITLEMENTS_API_VERSION)
+    assert payload["plan"] == "founding"
+    assert payload["active"] is True
+    # Nullable field serialized as JSON null, NOT omitted (the Swift decoder
+    # must see the contract field — the nullable-JSON-contract learning).
+    assert "expires" in payload
+    assert payload["expires"] is None
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_auth_entitlements_signed_out_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "get_entitlements",
+        lambda: {"plan": "free", "active": False, "expires": None},
+    )
+    response = await _asgi_get("/v0/auth.entitlements")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["plan"] == "free"
+    assert payload["active"] is False
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_auth_entitlements_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A get_entitlements() raise degrades to free/inactive — never a 500."""
+    from screencap import auth
+
+    def _boom() -> dict[str, Any]:
+        raise RuntimeError("keychain locked")
+
+    monkeypatch.setattr(auth, "get_entitlements", _boom)
+    response = await _asgi_get("/v0/auth.entitlements")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["plan"] == "free"
+    assert payload["active"] is False
+    assert payload["expires"] is None
+
+
 @pytest.mark.asyncio
 async def test_auth_whoami_signed_out(monkeypatch: pytest.MonkeyPatch) -> None:
     """Signed-out reports signed_in=false and null uid/email (never raises)."""

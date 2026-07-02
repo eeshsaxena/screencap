@@ -194,6 +194,16 @@ class NotSignedIn(AuthError):
     """
 
 
+class NotEntitled(AuthError):
+    """Signed in, but the account holds no active cloud entitlement (founding/paid).
+
+    Distinct from :class:`NotSignedIn` so the upload path can say "set up cloud /
+    upgrade" instead of "sign in", and distinct from a transient AuthError so it
+    is not treated as retryable. The Cloud Function (U2) is the authoritative
+    upload gate — this is the client-side fast-fail (U4, KTD5).
+    """
+
+
 @dataclass
 class AuthState:
     id_token: str
@@ -201,6 +211,16 @@ class AuthState:
     expires_at: float  # epoch seconds
     uid: str
     email: str | None = None
+
+
+# Cloud plan tiers the client understands, kept in sync with the Cloud Function's
+# entitlements module (``scripts/cloud-function/entitlements.py``). "free" is the
+# ABSENCE of a ``plan`` custom claim; "founding" is the v1 grant. The server
+# (Cloud Function, U2) is the authoritative gate — these client-side reads are
+# fail-fast UX only and never authorize an upload on their own.
+PLAN_FREE = "free"
+PLAN_FOUNDING = "founding"
+ENTITLED_PLANS = frozenset({PLAN_FOUNDING})
 
 
 class WhoAmI(TypedDict, total=False):
@@ -213,6 +233,21 @@ class WhoAmI(TypedDict, total=False):
     uid: str | None
     email: str | None
     stale: bool
+    plan: str  # cloud plan tier off the (unverified) ID-token claim; "free" default
+
+
+class Entitlements(TypedDict):
+    """The cloud entitlement contract read by the app (U3 ``/v0/auth.entitlements``).
+
+    Mirrors the Cloud Function's ``entitlement_from_plan`` shape so both halves of
+    the boundary speak the same fields. ``expires`` is always ``None`` in v1
+    (forward-compat; populated when billing adds lapse) — a nullable contract
+    field the Swift side decodes as optional and must not gate readiness on
+    (KTD7; the nullable-JSON-contract learning)."""
+
+    plan: str
+    active: bool
+    expires: float | None
 
 
 # In-memory cache of the current session. The ID token is NEVER persisted; only
@@ -330,6 +365,21 @@ def _decode_id_token_claims(id_token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(payload_b64))
     except Exception:
         return {}
+
+
+def _plan_from_id_token(id_token: str) -> str:
+    """Best-effort cloud plan tier from an (UNVERIFIED) ID token's ``plan`` claim.
+
+    The token is NOT verified here — the Cloud Function remains the verifier and
+    authoritative gate — so this only ever drives UX (show plan status, fast-fail
+    an upload). Returns ``PLAN_FREE`` for an empty/malformed token or one carrying
+    no ``plan`` claim.
+    """
+    if not id_token:
+        return PLAN_FREE
+    claims = _decode_id_token_claims(id_token)
+    plan = claims.get("plan")
+    return plan if plan else PLAN_FREE
 
 
 def id_token_uid(id_token: str) -> str | None:
@@ -715,20 +765,88 @@ def whoami() -> WhoAmI:
     """Report sign-in state without forcing a refresh failure to crash.
 
     Returns {"signed_in": False} when no credential is stored. When signed in,
-    returns uid/email; if a refresh is needed but fails (e.g. offline), reports
-    signed_in=True with stale=True rather than raising.
+    returns uid/email plus the best-effort cloud ``plan`` tier read off the
+    current (non-forced) ID-token claim; if a refresh is needed but fails (e.g.
+    offline), reports signed_in=True with stale=True rather than raising. The
+    authoritative, freshest plan read is :func:`get_entitlements` — ``whoami``'s
+    ``plan`` is additive UX (KTD7 "extended whoami") and stays cheap.
     """
     try:
         refresh_token = _load_refresh_token()
     except Exception:
         refresh_token = None
     if not refresh_token:
-        return {"signed_in": False}
+        return {"signed_in": False, "plan": PLAN_FREE}
     try:
         state = _ensure_fresh()
-        return {"signed_in": True, "uid": state.uid, "email": state.email}
+        return {
+            "signed_in": True,
+            "uid": state.uid,
+            "email": state.email,
+            "plan": _plan_from_id_token(state.id_token),
+        }
     except NotSignedIn:
-        return {"signed_in": False}
+        return {"signed_in": False, "plan": PLAN_FREE}
     except AuthError:
         # We have a refresh token but couldn't refresh right now (e.g. offline).
-        return {"signed_in": True, "uid": None, "email": None, "stale": True}
+        # Plan is unknown offline; report the conservative "free" (a client read
+        # never authorizes an upload — the Cloud Function gate is authoritative).
+        return {"signed_in": True, "uid": None, "email": None, "stale": True, "plan": PLAN_FREE}
+
+
+def get_entitlements() -> Entitlements:
+    """Resolve the signed-in user's cloud entitlement for the app read surface (U3).
+
+    Derives the plan tier from the ID-token ``plan`` claim, ``active`` from
+    whether that tier authorizes upload, and ``expires`` = ``None`` (always, in
+    v1). The Cloud Function (U2) remains the authoritative gate; this is the
+    friendly client read the app shows and U4 fast-fails on.
+
+    Freshness (KTD2): this FORCE-refreshes the ID token before reading the claim.
+    A custom claim only appears in a freshly minted token, and the daemon that
+    serves ``/v0/auth.entitlements`` runs in a DIFFERENT process from the
+    ``cloud setup`` grant — its in-memory token can be time-fresh yet carry a
+    stale (pre-grant) claim. Re-minting from the Keychain refresh token always
+    reflects the current server-side claim, so a just-granted account reads as
+    founding on the first poll.
+
+    Fails OPEN to free/inactive when signed out, or when the refresh can't
+    complete (offline / transient) — never raises, so the read verb stays on its
+    happy path and a conservative read never wrongly authorizes.
+    """
+    try:
+        state = _ensure_fresh(force=True)
+    except (NotSignedIn, AuthError):
+        return {"plan": PLAN_FREE, "active": False, "expires": None}
+    plan = _plan_from_id_token(state.id_token)
+    return {"plan": plan, "active": plan in ENTITLED_PLANS, "expires": None}
+
+
+def assert_entitled_to_upload() -> None:
+    """Fail-fast, fail-closed client entitlement gate for the upload path (U4).
+
+    Reads the current ID token's ``plan`` claim; if it is already entitled,
+    returns immediately (the common case pays no extra network). Otherwise it
+    forces ONE token re-mint and re-checks — so a just-granted account whose
+    cached token predates the grant (made in another process or the app's
+    ``cloud setup`` flow) is not blocked by a stale claim — before concluding.
+
+    Raises :class:`NotSignedIn` (no credential), a transient :class:`AuthError`
+    (refresh network failure), or :class:`NotEntitled` (signed in, no active
+    plan). Returns ``None`` when entitled. This is UX fast-fail only — the Cloud
+    Function (U2) remains the authoritative gate — and it neither reads nor
+    writes any local recording, so it can never affect fail-closed data handling.
+
+    In the daemon-spawned engine context ``force_refresh`` is a no-op (only the
+    daemon re-mints), so a token that predates the grant correctly fails closed
+    (the chunk is retried once the daemon supplies a token carrying the claim).
+    """
+    token = get_id_token()
+    if _plan_from_id_token(token) in ENTITLED_PLANS:
+        return
+    token = get_id_token(force_refresh=True)
+    if _plan_from_id_token(token) in ENTITLED_PLANS:
+        return
+    raise NotEntitled(
+        "Cloud upload needs an active plan. Set up cloud in ScreenCap to upload."
+    )

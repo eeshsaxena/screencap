@@ -117,6 +117,114 @@ def test_set_audio_default_creates_file(tmp_path):
         assert get_audio_default() is False
 
 
+# ---------------------------------------------------------------------------
+# U5 — destination + training-consent setters
+# ---------------------------------------------------------------------------
+
+
+def _clean_env(*drop):
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+def test_set_upload_default_round_trip_and_invalidates_cache(tmp_path):
+    import screencap.config as cfg
+    from screencap.config import get_upload_default, set_upload_default
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("# header comment\n[privacy]\nupload_default = \"ask\"\n")
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(os.environ, _clean_env("SCREENCAP_UPLOAD_DEFAULT"), clear=True),
+    ):
+        cfg._config_cache = None
+        assert get_upload_default() == "ask"
+
+        set_upload_default("cloud")
+        # Cache invalidated → same-process read observes the write.
+        assert get_upload_default() == "cloud"
+        text = cfg_path.read_text()
+        assert "# header comment" in text  # tomlkit preserved the comment
+        assert "upload_default = \"cloud\"" in text
+
+        set_upload_default("both")
+        assert get_upload_default() == "both"
+
+
+def test_set_upload_default_creates_privacy_section_when_absent(tmp_path):
+    import screencap.config as cfg
+    from screencap.config import get_upload_default, set_upload_default
+
+    cfg_path = tmp_path / "config.toml"  # does not exist
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(os.environ, _clean_env("SCREENCAP_UPLOAD_DEFAULT"), clear=True),
+    ):
+        cfg._config_cache = None
+        set_upload_default("local")
+        assert cfg_path.exists()
+        assert get_upload_default() == "local"
+
+
+def test_set_upload_default_rejects_invalid_value(tmp_path):
+    import screencap.config as cfg
+    from screencap.config import set_upload_default
+
+    cfg_path = tmp_path / "config.toml"
+    with mock.patch.object(cfg, "_CONFIG_PATH", cfg_path):
+        with pytest.raises(ValueError, match="upload_default"):
+            set_upload_default("evil")
+        # Nothing persisted on rejection.
+        assert not cfg_path.exists()
+
+
+def test_set_training_contribution_round_trip(tmp_path):
+    import screencap.config as cfg
+    from screencap.config import get_training_contribution, set_training_contribution
+
+    cfg_path = tmp_path / "config.toml"
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(os.environ, _clean_env("SCREENCAP_TRAINING_CONTRIBUTION"), clear=True),
+    ):
+        cfg._config_cache = None
+        # Default is opt-out (R11/R12: opt-in, revocable).
+        assert get_training_contribution() is False
+
+        set_training_contribution(True)
+        assert get_training_contribution() is True
+        assert "training_contribution = true" in cfg_path.read_text()
+
+        # Revocable.
+        set_training_contribution(False)
+        assert get_training_contribution() is False
+
+
+def test_upload_default_and_training_are_independent_keys(tmp_path):
+    # Writing one privacy key must not disturb the other (both live under [privacy]).
+    import screencap.config as cfg
+    from screencap.config import (
+        get_training_contribution,
+        get_upload_default,
+        set_training_contribution,
+        set_upload_default,
+    )
+
+    cfg_path = tmp_path / "config.toml"
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(
+            os.environ,
+            _clean_env("SCREENCAP_UPLOAD_DEFAULT", "SCREENCAP_TRAINING_CONTRIBUTION"),
+            clear=True,
+        ),
+    ):
+        cfg._config_cache = None
+        set_upload_default("cloud")
+        set_training_contribution(True)
+        assert get_upload_default() == "cloud"
+        assert get_training_contribution() is True
+
+
 # --- disk threshold config tests ---
 
 

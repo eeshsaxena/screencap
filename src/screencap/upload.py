@@ -341,6 +341,22 @@ def request_signed_urls(
         "recording": recording_name,
         "files": [{"name": f.name, "content_type": f.content_type} for f in files],
     }
+
+    # U4: fail-fast, fail-closed client entitlement pre-check (KTD5 — an explicit
+    # call here, NOT routed through pipeline_policy.set_default_override). Reads
+    # the freshest plan claim before contacting the Cloud Function; a signed-in
+    # account with no active plan fails with a clear upgrade message and never
+    # reaches the gate. The Cloud Function (U2) stays authoritative. This touches
+    # no local files, so the caller's fail-closed chunk path retains everything.
+    try:
+        auth.assert_entitled_to_upload()
+    except auth.NotEntitled as e:
+        raise RuntimeError(str(e))
+    except auth.NotSignedIn:
+        raise RuntimeError("Sign in to upload to the cloud: run `screencap login`.")
+    except auth.AuthError as e:
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+
     try:
         resp = auth.authed_post(requests.post, url, json=payload, timeout=30)
     except auth.NotSignedIn:
@@ -355,16 +371,34 @@ def request_signed_urls(
     except requests.Timeout:
         raise RuntimeError("Upload service timed out. Try again later.")
 
-    if resp.status_code != 200:
-        detail = ""
+    if resp.status_code == 403:
+        # The Cloud Function's authoritative entitlement gate rejected us. If our
+        # token predated a founding grant, a forced re-mint may now carry the
+        # claim — force one refresh and retry the single call (mirrors
+        # authed_post's 401 path) so a just-granted account isn't blocked by a
+        # stale claim. A transient refresh failure falls through to the 403 map.
         try:
-            detail = resp.json().get("error", resp.text)
-        except Exception:
-            detail = resp.text
-        raise RuntimeError(f"Upload service error: {detail}")
+            auth.get_id_token(force_refresh=True)
+            resp = auth.authed_post(requests.post, url, json=payload, timeout=30)
+        except auth.AuthError:
+            pass
+        if resp.status_code == 403:
+            detail = _describe_response_error(resp) or "an active plan is required"
+            raise RuntimeError(f"Cloud upload needs an active plan: {detail}")
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Upload service error: {_describe_response_error(resp)}")
 
     data = resp.json()
     return data.get("urls", {}), data.get("gcs_prefix", "")
+
+
+def _describe_response_error(resp: requests.Response) -> str:
+    """Best-effort human detail from a non-200 Cloud Function response body."""
+    try:
+        return resp.json().get("error", resp.text)
+    except Exception:
+        return resp.text
 
 
 class _ProgressFile:

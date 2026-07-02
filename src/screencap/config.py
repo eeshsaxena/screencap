@@ -484,6 +484,71 @@ def get_upload_default() -> str:
     return "ask"
 
 
+def set_upload_default(value: str) -> None:
+    """Persist the default recording destination to ``config.toml`` (U5).
+
+    Writes the same ``privacy.upload_default`` key that :func:`get_upload_default`
+    reads, mirroring :func:`set_audio_default` (tomlkit atomic write preserving
+    comments + in-process cache invalidation). Backs the onboarding plan-choice
+    (U6) and the settings destination toggle (U8).
+
+    The v1 toggles offer only 'local' / 'cloud' / 'both'; 'ask' remains a valid
+    stored value (just not offered in the toggle), so all four are accepted here.
+    An invalid value raises ``ValueError`` rather than persisting a bad config.
+    """
+    import tomlkit
+
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    valid = ("local", "cloud", "both", "ask")
+    normalized = value.strip().lower() if isinstance(value, str) else value
+    if normalized not in valid:
+        raise ValueError(f"upload_default must be one of {valid}, got: {value!r}")
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    if "privacy" not in doc:
+        doc.add("privacy", tomlkit.table())
+    doc["privacy"]["upload_default"] = normalized
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
+def get_training_contribution() -> bool:
+    """Return whether the user opted into contributing scrubbed/masked data to the
+    computer-use training corpus. Default ``False`` — opt-in and revocable (R11/R12).
+
+    Priority: ``SCREENCAP_TRAINING_CONTRIBUTION`` env var >
+    ``privacy.training_contribution`` config > ``False``.
+    """
+    env = os.environ.get("SCREENCAP_TRAINING_CONTRIBUTION")
+    if env is not None:
+        return env.lower() in _BOOL_TRUE
+    section = _load_toml().get("privacy", {})
+    if isinstance(section, dict):
+        return bool(section.get("training_contribution", False))
+    return False
+
+
+def set_training_contribution(value: bool) -> None:
+    """Persist the training-contribution consent flag to ``config.toml`` (U5).
+
+    Writes ``privacy.training_contribution`` (tomlkit atomic write + cache
+    invalidation, mirroring :func:`set_audio_default`). This captures the opt-in
+    consent ONLY — v1 ships no contribution pipeline (R11/R12 land as consent
+    capture). Explicit and revocable: ``True`` opts in, ``False`` revokes.
+    """
+    import tomlkit
+
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    if "privacy" not in doc:
+        doc.add("privacy", tomlkit.table())
+    doc["privacy"]["training_contribution"] = bool(value)
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
 def get_privacy_config():
     """Return a PrivacyConfig parsed from [privacy] in config.toml.
 

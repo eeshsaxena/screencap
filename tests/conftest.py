@@ -73,17 +73,23 @@ def _install_provisioned(monkeypatch, mod: types.ModuleType | None) -> None:
 
 @pytest.fixture
 def _signed_in(monkeypatch):
-    """Default a test to "signed in" so the cloud paths attach a bearer token
-    without touching the Keychain.
+    """Default a test to "signed in" AND cloud-entitled so the cloud paths attach
+    a bearer token and clear the U4 upload pre-check without touching the Keychain.
 
     Shared by the upload / download / CLI / upload-events suites (each opts in via
     a thin per-module autouse wrapper). It is deliberately NOT globally autouse:
     ``tests/test_auth.py`` exercises the real ``get_id_token`` refresh/rotation
     logic and must not have it stubbed out. Tests covering the not-signed-in / 401
-    paths override this with their own ``monkeypatch.setattr`` (which wins)."""
+    paths override this with their own ``monkeypatch.setattr`` (which wins).
+
+    The entitlement pre-check (``auth.assert_entitled_to_upload``, U4) is stubbed
+    to a no-op here so "signed in" implies "on an active plan" by default — the
+    happy-path assumption every existing upload test was written under. Tests that
+    exercise the pre-check itself override this stub (or test it in test_auth.py)."""
     monkeypatch.setattr(
         "screencap.auth.get_id_token", lambda force_refresh=False: "test-id-token"
     )
+    monkeypatch.setattr("screencap.auth.assert_entitled_to_upload", lambda: None)
 
 
 @pytest.fixture(autouse=True)

@@ -30,6 +30,8 @@ _FRAME_NEAREST_API_VERSION = 1
 _APPS_LIST_API_VERSION = 1
 # SCR-148 cloud account-mismatch observability.
 _AUTH_WHOAMI_API_VERSION = 1
+# In-app cloud onboarding: entitlement read surface (U3).
+_AUTH_ENTITLEMENTS_API_VERSION = 1
 # SCR-178 content-index backfill lifecycle verbs.
 _BACKFILL_API_VERSION = 1
 
@@ -79,6 +81,7 @@ _MODEL_NAMES = {
     "FrameNearestResponse",
     "AppsListResponse",
     "WhoAmIResponse",
+    "AuthEntitlementsResponse",
     "BackfillStartRequest",
     "BackfillCancelRequest",
     "BackfillStatusResponse",
@@ -416,6 +419,24 @@ def _load_models() -> dict[str, Any]:
         uid: str | None = None
         email: str | None = None
         stale: bool = False
+        # In-app cloud onboarding (KTD7 "extended whoami"): the cloud plan tier
+        # off the ID-token claim ("free" default). Additive; older Swift builds
+        # ignore it. The authoritative, freshest read is auth.entitlements.
+        plan: str = "free"
+
+    class AuthEntitlementsResponse(EnvelopeResponse):
+        """The cloud entitlement the app reads via ``/v0/auth.entitlements`` (U3).
+
+        Mirrors ``auth.get_entitlements``: the plan tier, whether it authorizes
+        upload (``active``), and ``expires`` (always ``null`` in v1 — a nullable
+        contract field the Swift side decodes as optional and must NOT gate UI
+        readiness on; the nullable-JSON-contract learning). The Cloud Function
+        (U2) is the authoritative upload gate — this read is fast-fail UX only.
+        """
+
+        plan: str
+        active: bool
+        expires: float | None = None
 
     class BackfillStartRequest(_DaemonModel):
         """SCR-178 ``backfill.start`` input.
@@ -499,6 +520,7 @@ def _load_models() -> dict[str, Any]:
         "FrameNearestResponse": FrameNearestResponse,
         "AppsListResponse": AppsListResponse,
         "WhoAmIResponse": WhoAmIResponse,
+        "AuthEntitlementsResponse": AuthEntitlementsResponse,
         "BackfillStartRequest": BackfillStartRequest,
         "BackfillCancelRequest": BackfillCancelRequest,
         "BackfillStatusResponse": BackfillStatusResponse,
@@ -537,6 +559,7 @@ __all__ = [
     "_FRAME_NEAREST_API_VERSION",
     "_APPS_LIST_API_VERSION",
     "_AUTH_WHOAMI_API_VERSION",
+    "_AUTH_ENTITLEMENTS_API_VERSION",
     "_BACKFILL_API_VERSION",
     "daemon_version",
     "envelope",

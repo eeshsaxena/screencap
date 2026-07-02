@@ -226,6 +226,39 @@ async def auth_whoami(request: Request) -> JSONResponse:
             uid=info.get("uid"),
             email=info.get("email"),
             stale=info.get("stale", False),
+            plan=info.get("plan", "free"),
+        )
+    )
+
+
+async def auth_entitlements(request: Request) -> JSONResponse:
+    """Report the signed-in account's cloud entitlement (U3).
+
+    Read-only and same-EUID gated like every other ``/v0`` verb, and NOT in
+    ``_ACTIVITY_PATHS`` (a plan-status poll must not pin an auto-spawned daemon
+    alive). The app reads this to render plan status and to fast-fail an upload
+    when unentitled — the Cloud Function (U2) remains the authoritative gate, so
+    this read never authorizes on its own.
+
+    Fails OPEN to free/inactive (never a 500): ``auth.get_entitlements`` is built
+    not to raise, but an unexpected error must degrade to the conservative,
+    fail-closed answer rather than drop a polling client to its error path. The
+    nullable ``expires`` is serialized as JSON ``null`` (not omitted) so the
+    Swift decoder sees the contract field.
+    """
+    from screencap import auth
+
+    try:
+        ent = await asyncio.to_thread(auth.get_entitlements)
+    except Exception:  # noqa: BLE001 — a read verb must never 500
+        logger.warning("auth.entitlements probe failed", exc_info=True)
+        ent = {"plan": "free", "active": False, "expires": None}
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema._AUTH_ENTITLEMENTS_API_VERSION,
+            plan=ent.get("plan", "free"),
+            active=bool(ent.get("active", False)),
+            expires=ent.get("expires"),
         )
     )
 
@@ -1518,6 +1551,7 @@ def build_app() -> Starlette:
             Route("/v0/daemon.info", daemon_info, methods=["GET"]),
             Route("/v0/recording.list", recording_list, methods=["GET"]),
             Route("/v0/auth.whoami", auth_whoami, methods=["GET"]),
+            Route("/v0/auth.entitlements", auth_entitlements, methods=["GET"]),
             Route("/v0/session.snapshot", session_snapshot, methods=["GET"]),
             Route("/v0/events", events_stream, methods=["GET"]),
             Route("/v0/recording.start", recording_start, methods=["POST"]),

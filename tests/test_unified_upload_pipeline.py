@@ -490,8 +490,14 @@ def test_scr131_real_http_chain_ships_video_never_recording_db(tmp_path, monkeyp
     monkeypatch.setattr("screencap.upload.requests.post", gcs.post)
     monkeypatch.setattr("screencap.upload.requests.put", gcs.put)
     # No real Keychain/daemon credential in tests; the uid stays unpinned
-    # (``read_owner_uid`` is None) so the account-ownership gate is a no-op.
-    monkeypatch.setattr(auth, "get_id_token", lambda force_refresh=False: "test-token")
+    # (``read_owner_uid`` is None) so the account-ownership gate is a no-op. The
+    # token carries a founding `plan` claim so the real U4 entitlement pre-check
+    # (assert_entitled_to_upload) passes and the upload proceeds.
+    from tests._jwt import _jwt
+    monkeypatch.setattr(
+        auth, "get_id_token",
+        lambda force_refresh=False: _jwt({"user_id": "uid-pipeline", "plan": "founding"}),
+    )
     # ``scrub_recording`` resolves the recording + its ``-scrubbed`` sibling via
     # ``get_recordings_dir`` (the dir name -> path lookup), so point it at tmp.
     monkeypatch.setattr("screencap.config.get_recordings_dir", lambda: tmp_path)

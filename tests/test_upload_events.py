@@ -526,9 +526,13 @@ def test_sigterm_delivered_to_real_subprocess_emits_interrupted(tmp_path):
     env["PYTHONUNBUFFERED"] = "1"
     # The child can't see the parent's monkeypatch, so deliver a token via the
     # out-of-band engine channel: auth.get_id_token reads this 0600 file instead
-    # of the Keychain, so request_signed_urls attaches a bearer and proceeds.
+    # of the Keychain, so request_signed_urls attaches a bearer and proceeds. The
+    # token carries a founding `plan` claim so the child's real U4 entitlement
+    # pre-check (assert_entitled_to_upload) passes and the upload proceeds.
+    from tests._jwt import _jwt
+
     token_file = tmp_path / "engine-token.jwt"
-    token_file.write_text("test-id-token")
+    token_file.write_text(_jwt({"user_id": "uid-sigterm", "plan": "founding"}))
     env["SCREENCAP_ENGINE_TOKEN_FILE"] = str(token_file)
 
     proc = subprocess.Popen(
