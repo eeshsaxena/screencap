@@ -102,45 +102,56 @@ struct MainWindow: View {
     @State private var reopenedViaRecovery = false
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            VStack(spacing: 0) {
-                if privacy.bannerActive {
-                    FirstRunPrivacyBanner(
-                        onReview: {
-                            section = .privacy
-                            Task { await privacy.markSetupComplete() }
-                        },
-                        onDismiss: {
-                            Task { await privacy.markSetupComplete() }
-                        }
-                    )
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
-                    .transition(.opacity)
-                }
-                RecordingBanner()
-                    .padding(.horizontal, 16)
-                    .padding(.top, recorder.state.isRecording ? 12 : 0)
-                detail
+        // The first-run privacy banner lives here — a sibling ABOVE the
+        // NavigationSplitView, NOT inside its detail column. It must stay out of
+        // the split view's subtree: the banner's multiline `.fixedSize(...)` text
+        // (FirstRunPrivacyBanner) drives a runaway/oscillating height when it
+        // participates in NavigationSplitView's column-height negotiation, which
+        // balloons the sidebar List's height and pushes its rows off-screen — the
+        // sidebar visibly "disappears" ~1–2s after launch, the moment `bannerActive`
+        // flips true. Rendering the banner above the split view (full-window width)
+        // decouples its layout and keeps the sidebar stable.
+        VStack(spacing: 0) {
+            if privacy.bannerActive {
+                FirstRunPrivacyBanner(
+                    onReview: {
+                        section = .privacy
+                        Task { await privacy.markSetupComplete() }
+                    },
+                    onDismiss: {
+                        Task { await privacy.markSetupComplete() }
+                    }
+                )
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .transition(.opacity)
             }
-            .overlay(alignment: .top) {
-                if let err = recorder.lastError {
-                    RecorderErrorMessage(message: err)
-                        .padding(SCMetrics.space2)
-                        .background(Color.scErrorSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
-                        .padding(.top, SCMetrics.space1)
-                        .transition(.opacity)
-                } else if let advisory = recorder.captureAdvisory {
-                    // Advisory, non-terminal (SCR-76). De-colored to the neutral
-                    // advisory surface (R7) — not yellow — so it reads as "FYI",
-                    // distinct from the red error surface above. Errors take priority.
-                    RecorderErrorMessage(message: advisory)
-                        .padding(SCMetrics.space2)
-                        .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
-                        .padding(.top, SCMetrics.space1)
-                        .transition(.opacity)
+            NavigationSplitView {
+                sidebar
+            } detail: {
+                VStack(spacing: 0) {
+                    RecordingBanner()
+                        .padding(.horizontal, 16)
+                        .padding(.top, recorder.state.isRecording ? 12 : 0)
+                    detail
+                }
+                .overlay(alignment: .top) {
+                    if let err = recorder.lastError {
+                        RecorderErrorMessage(message: err)
+                            .padding(SCMetrics.space2)
+                            .background(Color.scErrorSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
+                            .padding(.top, SCMetrics.space1)
+                            .transition(.opacity)
+                    } else if let advisory = recorder.captureAdvisory {
+                        // Advisory, non-terminal (SCR-76). De-colored to the neutral
+                        // advisory surface (R7) — not yellow — so it reads as "FYI",
+                        // distinct from the red error surface above. Errors take priority.
+                        RecorderErrorMessage(message: advisory)
+                            .padding(SCMetrics.space2)
+                            .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
+                            .padding(.top, SCMetrics.space1)
+                            .transition(.opacity)
+                    }
                 }
             }
         }
