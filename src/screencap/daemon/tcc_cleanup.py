@@ -1,18 +1,27 @@
 """Identity-scoped TCC decoy/orphan cleanup at install (U4 / R5, R6, R8).
 
 After the daemon helper bundle migration (SCR-196) the Privacy panes can show
-look-alike decoy rows next to the daemon's real "ScreenCap" row:
+look-alike decoy rows next to the daemon's real rows:
 
 - ``screencap`` — the orphaned **bare** pre-SCR-196 identity whose binary no
   longer ships (dead rows in ``TCC.db``).
-- ``com.screencap.macos`` — the app's own stray Screen Recording / Accessibility
-  rows, left over from older dev builds.
+- ``com.screencap.macos`` — the app's own stray **Accessibility** row, left over
+  from older dev builds.
 
-A non-technical user faced with three near-identical entries can toggle the
-wrong one (the app's, or the orphan's) and leave the daemon ungranted — a
-silent recording degradation. This module removes those two decoy identities so
-exactly one correct "ScreenCap" row remains per pane (R5), the app never appears
-in these panes (R6), and the revoke path is therefore unambiguous (R8).
+A non-technical user faced with near-identical entries can toggle the wrong one
+(the app's, or the orphan's) and leave the daemon ungranted — a silent recording
+degradation. This module removes those decoy identities so the correct row
+remains per pane (R5) and the revoke path is unambiguous (R8).
+
+**Screen Recording is the exception (SCR-201).** On the nested-LoginItem helper
+layout, macOS attributes the daemon's SR request *and* its capture to the
+responsible host app (``com.screencap.macos``) — the row renders under the app's
+name in the SR pane and is the daemon's *real* SR identity, not a decoy. So we
+must NOT reset the app's ``ScreenCapture`` row: doing so deleted the very row the
+proactive registration had just created, which is why no SR row auto-appeared.
+Accessibility is unaffected — ``AXIsProcessTrustedWithOptions`` attributes to the
+daemon's own identity (``com.screencap.daemon``, "ScreencapDaemon"), so the app's
+Accessibility row genuinely is a stray decoy and is still cleared.
 
 **This is a destructive surface.** ``tccutil reset`` with the wrong scope wipes
 unrelated apps' grants — an untargeted ``tccutil reset ScreenCapture`` clears
@@ -28,22 +37,23 @@ What we deliberately do NOT do:
 - We never ``reset All`` anything but the orphan bare ``screencap`` identity —
   ``All`` is only safe for an identity that no longer ships, so clearing every
   service cannot strip a grant a live process relies on.
-- We never reset any service for the app *except* ``ScreenCapture`` and
-  ``Accessibility`` (the only two stray rows), and always per-bundle-id — its
-  Microphone grant is untouched.
+- We never reset any service for the app *except* ``Accessibility`` (its one
+  genuine stray row), and always per-bundle-id — its Microphone grant is
+  untouched, and its Screen Recording row (the daemon's real SR identity) is
+  left alone (SCR-201).
 - We never emit a bare ``tccutil reset <service>`` with no bundle id (that wipes
   every app).
 - We never target ``com.screencap.daemon`` — resetting it would wipe the
   daemon's *real* grants, the opposite of the goal.
 
-App-row recreation (resolved on-device): the **shipped** app only ever *reads*
-its permission state — ``CGPreflightScreenCaptureAccess()`` and
-``AXIsProcessTrustedWithOptions({prompt: false})`` are read-only and do not
-create a TCC row; the request APIs are gone from the app path (see
-``PermissionController.checkScreenRecording``/``checkAccessibility`` and the
-comment at ``requestDaemonPermission``). So clearing the app's rows is hygiene
-that is a no-op on shipped builds — there is no app code path that recreates
-them, hence nothing to gate for R6.
+App SR-row provenance (SCR-201, resolved on-device): the shipped **app** process
+never creates its own rows — ``CGPreflightScreenCaptureAccess()`` and
+``AXIsProcessTrustedWithOptions({prompt: false})`` are read-only. But the
+**daemon's** ``CGRequestScreenCaptureAccess()`` registers under the host app's
+identity via the responsible-app rollup, so the app's SR row *is* (re)created by
+registration — which is exactly why clearing it here broke onboarding. We keep
+it. The app's Accessibility row has no such recreation path, so clearing it stays
+a harmless one-time hygiene step.
 
 The cleanup is best-effort and fail-soft: a non-zero ``tccutil`` exit (e.g. "No
 such bundle identifier" when a decoy row never existed) is tolerated and never
@@ -82,9 +92,15 @@ DAEMON_IDENTITY = "com.screencap.daemon"
 # (``Microphone``) is intentionally absent: the app keeps that grant.
 SCREEN_CAPTURE_SERVICE = "ScreenCapture"
 ACCESSIBILITY_SERVICE = "Accessibility"
-ALLOWED_SERVICES_FOR_APP: frozenset[str] = frozenset(
-    {SCREEN_CAPTURE_SERVICE, ACCESSIBILITY_SERVICE}
-)
+# Only ``Accessibility`` may be reset for the app. ``ScreenCapture`` is
+# deliberately excluded (SCR-201): on the nested-LoginItem helper layout,
+# macOS attributes the daemon's Screen Recording request/capture to the
+# responsible host app (``com.screencap.macos``), so the app's SR row IS the
+# daemon's real SR identity — not a decoy. Resetting it deletes the very row
+# the proactive registration just created. Accessibility is unaffected because
+# ``AXIsProcessTrustedWithOptions`` attributes to the daemon's own identity, so
+# the app's Accessibility row genuinely is a stray decoy.
+ALLOWED_SERVICES_FOR_APP: frozenset[str] = frozenset({ACCESSIBILITY_SERVICE})
 
 _TCCUTIL_TIMEOUT_SECONDS = 10.0
 
@@ -114,10 +130,11 @@ def _all_reset_command(identity: str) -> list[str]:
 def _service_reset_command(service: str, identity: str) -> list[str]:
     """``tccutil reset <service> <identity>`` — per-service, per-bundle-id.
 
-    Permitted only for the legacy app identity and only for the two stray
-    services. Refuses the daemon's own identity outright, and refuses any
-    service outside the app allowlist (so Microphone / a bare ``All`` can never
-    slip through).
+    Permitted only for the legacy app identity and only for its one genuine
+    stray service (Accessibility). Refuses the daemon's own identity outright,
+    and refuses any service outside the app allowlist (so Microphone, a bare
+    ``All``, or the app's Screen Recording row — the daemon's real SR identity
+    via the SCR-201 rollup — can never slip through).
     """
     if identity == DAEMON_IDENTITY:
         raise _CleanupGuardError(
@@ -141,13 +158,16 @@ def build_cleanup_commands() -> list[list[str]]:
     """Build the exact, allowlist-checked ``tccutil`` argv list run at install.
 
     Order: clear the orphan bare identity wholesale, then strip the legacy app's
-    two stray rows per-service. Every argv is validated against the allowlists in
-    the builders, so an over-broad reset raises :class:`_CleanupGuardError` here
-    instead of executing.
+    one genuine stray row (Accessibility). Every argv is validated against the
+    allowlists in the builders, so an over-broad reset raises
+    :class:`_CleanupGuardError` here instead of executing.
+
+    The app's **Screen Recording** row is intentionally left alone (SCR-201): it
+    is the daemon's real SR identity via the host-app attribution rollup, so
+    resetting it would delete the row the proactive registration just created.
     """
     return [
         _all_reset_command(ORPHAN_BARE_IDENTITY),
-        _service_reset_command(SCREEN_CAPTURE_SERVICE, APP_IDENTITY),
         _service_reset_command(ACCESSIBILITY_SERVICE, APP_IDENTITY),
     ]
 

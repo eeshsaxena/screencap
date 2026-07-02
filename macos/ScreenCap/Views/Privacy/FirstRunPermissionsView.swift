@@ -492,10 +492,11 @@ struct FirstRunPermissionsView: View {
     }
 
     private func daemonRationale(for pane: PrivacyPane) -> String {
-        // SCR-200: the daemon's row reads "ScreenCap" and is the only "ScreenCap"
-        // row in this pane (the app never appears here, R6), so naming it is
-        // unambiguous — no "helper vs app" disambiguation is needed. Spell out the
-        // exact row to enable so the user toggles the right one.
+        // SCR-201: the exact row label differs per pane — Screen Recording rolls
+        // up to the host app ("ScreenCap"), while Accessibility renders the
+        // daemon's own row ("ScreencapDaemon") alongside a stray "ScreenCap" app
+        // decoy. `helperSettingsEntryName` returns the correct per-pane string, so
+        // spelling it out here points the user at the right row to enable.
         let entry = pane.helperSettingsEntryName
         return "\(pane.rationale) Enable the “\(entry)” entry in this pane."
     }
