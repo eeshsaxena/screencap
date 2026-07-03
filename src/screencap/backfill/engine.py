@@ -610,18 +610,9 @@ def _enumerate_chunks(
 
 def _screenshot_timestamps(rec_dir: Path) -> list[float]:
     """Return the parsed, sorted flat ``screenshots/*.jpg`` timestamps."""
-    from screencap.redaction.geometry import parse_screenshot_timestamp
+    from screencap.redaction.geometry import list_screenshot_timestamps
 
-    shots = rec_dir / "screenshots"
-    if not shots.is_dir():
-        return []
-    out: list[float] = []
-    for img in shots.glob("*.jpg"):
-        ts = parse_screenshot_timestamp(img.name)
-        if ts is not None:
-            out.append(ts)
-    out.sort()
-    return out
+    return list_screenshot_timestamps(rec_dir)
 
 
 def _default_ocr() -> object:

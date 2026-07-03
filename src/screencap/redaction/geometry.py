@@ -56,6 +56,26 @@ def parse_screenshot_timestamp(filename: str) -> float | None:
         return None
 
 
+def list_screenshot_timestamps(rec_dir: Path) -> list[float]:
+    """Return the parsed, sorted flat ``screenshots/*.jpg`` timestamps for a
+    recording dir (the uncovered-gap / orphan-frame pass inputs).
+
+    Shared by the SCR-178 backfill and the U3 day-timeline surface so the flat
+    frame enumeration can't drift; lives here (a light module) rather than in the
+    OCR-heavy backfill engine.
+    """
+    shots = rec_dir / "screenshots"
+    if not shots.is_dir():
+        return []
+    out: list[float] = []
+    for img in shots.glob("*.jpg"):
+        ts = parse_screenshot_timestamp(img.name)
+        if ts is not None:
+            out.append(ts)
+    out.sort()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Nearest-event lookup
 # ---------------------------------------------------------------------------

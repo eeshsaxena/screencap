@@ -74,28 +74,6 @@ def day_bounds(date_str: str, tz_offset_seconds: int) -> tuple[float, float]:
     return float(day_start), float(day_start + _DAY_SECONDS)
 
 
-def _screenshot_timestamps(rec_dir: Path) -> list[float]:
-    """Parsed, sorted flat ``screenshots/*.jpg`` timestamps.
-
-    Feeds ``derive_skip_intervals``' uncovered-gap / orphan passes. Mirrors
-    ``backfill.engine._screenshot_timestamps`` but stays a light local reader
-    (reusing the canonical filename parser) so this read surface does not pull in
-    the OCR-heavy backfill engine.
-    """
-    from screencap.redaction.geometry import parse_screenshot_timestamp
-
-    shots = rec_dir / "screenshots"
-    if not shots.is_dir():
-        return []
-    out: list[float] = []
-    for img in shots.glob("*.jpg"):
-        ts = parse_screenshot_timestamp(img.name)
-        if ts is not None:
-            out.append(ts)
-    out.sort()
-    return out
-
-
 def _clip_ms(
     start_s: float, end_s: float, win_start_s: float, win_end_s: float
 ) -> tuple[int, int] | None:
@@ -117,11 +95,15 @@ def _blocked_intervals(
     must never 500 on one bad recording.db). The proven/unverifiable split is by
     the interval's ``reason`` (residual reasons → unverifiable).
     """
+    from screencap.redaction.geometry import list_screenshot_timestamps
+
     proven: list[dict[str, int]] = []
     unverifiable: list[dict[str, int]] = []
     try:
         classifier, evaluator = build_classifier_evaluator(rec_dir)
-        shots = [t for t in _screenshot_timestamps(rec_dir) if win_start <= t < win_end]
+        shots = [
+            t for t in list_screenshot_timestamps(rec_dir) if win_start <= t < win_end
+        ]
         intervals = derive_skip_intervals(
             db_path,
             classifier=classifier,
@@ -181,19 +163,15 @@ def day_segments(
     if not recordings_dir.exists():
         return result
 
-    # Reuse U2's derived state / stable id (one scan). Keyed by directory name.
-    meta_by_name = {r.name: r for r in catalog.list_recordings(recordings_dir)}
-
-    for d in sorted(recordings_dir.iterdir()):
-        if not d.is_dir():
-            continue
-        db = catalog.find_db(d)
-        if db is None:
-            continue
-        started, duration, _status = catalog._read_recording_meta(db)
+    # Single library scan: `list_recordings` already carries each recording's span
+    # (`started_at` / `duration_seconds`), stable id, and derived state, so this
+    # reads them straight off rather than re-walking the dir and re-opening every
+    # recording.db a second time (`list_recordings` is the expensive pass).
+    for meta in catalog.list_recordings(recordings_dir):
+        started = meta.started_at
         if started is None:
             continue
-        end = started + (duration or 0.0)
+        end = started + (meta.duration_seconds or 0.0)
 
         # Half-open overlap with the day window (a midnight-spanning recording
         # overlaps both days and is clamped into each).
@@ -202,14 +180,16 @@ def day_segments(
         clamped_start = max(started, win_start)
         clamped_end = max(min(end, win_end), clamped_start)
 
-        proven, unverifiable = _blocked_intervals(d, db, clamped_start, clamped_end)
+        rec_dir = recordings_dir / meta.name
+        proven, unverifiable = _blocked_intervals(
+            rec_dir, rec_dir / "recording.db", clamped_start, clamped_end
+        )
 
-        meta = meta_by_name.get(d.name)
         result["recordings"].append(
             {
-                "name": d.name,
-                "recording_id": meta.recording_id if meta else None,
-                "state": meta.state if meta else "ready",
+                "name": meta.name,
+                "recording_id": meta.recording_id,
+                "state": meta.state,
                 "start_ms": int(round(clamped_start * 1000)),
                 "end_ms": int(round(clamped_end * 1000)),
                 "blocked_proven": proven,

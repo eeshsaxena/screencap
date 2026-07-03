@@ -214,7 +214,7 @@ class RecordingInfo(NamedTuple):
     size_bytes: int = 0
     summary: str | None = None
     title: str = ""
-    state: str = "ready"
+    state: Literal["recording", "processing", "ready"] = "ready"
     recording_id: str | None = None
 
 
@@ -324,26 +324,34 @@ def _active_recording_name() -> str | None:
     return name if isinstance(name, str) and name else None
 
 
-def _ledger_completion_probe(
-    db_path: Path,
-) -> tuple[bool, int, int | None] | None:
-    """READ-ONLY ledger probe for KTD-7 state derivation.
+class _LedgerProbe(NamedTuple):
+    """READ-ONLY snapshot of a recording's ``pipeline_chunk_state`` ledger (U2)."""
 
-    Returns ``(has_failed, done_count, chunks_expected)``:
+    # ≥1 chunk confirmed UPLOADED. An EVICTED chunk keeps its UPLOADED upload_state
+    # per the U1 contract, so an uploaded-then-evicted recording still reads True.
+    has_uploaded: bool
+    # ≥1 chunk FAILED — blocks the completeness sentinel forever, so state must
+    # fall to `ready` rather than eternal `processing`.
+    has_failed: bool
+    # Chunks in a terminal "done" lifecycle (local_done/uploaded/evicted/skipped),
+    # mirroring PipelineLedger.all_complete.
+    done_count: int
+    # The FROZEN closed-set count, or None when not yet frozen.
+    chunks_expected: int | None
 
-    * ``has_failed`` — any chunk in a ``FAILED`` lifecycle/upload_state (a FAILED
-      chunk blocks the completeness sentinel forever, so state must fall to
-      ``ready`` rather than eternal ``processing``).
-    * ``done_count`` — chunks in a terminal "done" lifecycle
-      (``local_done``/``uploaded``/``evicted``/``skipped``), mirroring
-      ``PipelineLedger.all_complete``.
-    * ``chunks_expected`` — the FROZEN closed-set count, or ``None`` when not yet
-      frozen.
 
-    Returns ``None`` when there is no ledger to consult (legacy / not-yet-seeded
-    recording, or an unreadable DB). Never migrates the schema — listing is
-    read-only and must not ALTER a recording.db (mirrors
-    :func:`_ledger_has_uploaded_chunk`).
+def _ledger_probe(db_path: Path) -> _LedgerProbe | None:
+    """READ-ONLY probe of the U1 pipeline ledger — one open, everything the
+    catalog needs (the ``uploaded`` flag AND KTD-7 state derivation).
+
+    Returns ``None`` when there is no ledger to consult — the table does not exist
+    (legacy / not-yet-seeded recording) or the DB is unreadable — so callers fall
+    back to the file-presence heuristics (R14). Opens ``mode=ro`` (not
+    ``open_recording_db``) and never migrates the schema: catalog listing must
+    never ALTER a recording.db (that would change its content hash and defeat the
+    scrubbed-copy reuse check on the upload path, mirroring
+    ``terminal_stage._open_ledger_readonly``). ``mode=ro`` is also required for the
+    post-upload/evicted state where the ``-wal``/``-shm`` sidecars are gone.
     """
     import sqlite3
 
@@ -352,12 +360,15 @@ def _ledger_completion_probe(
     except sqlite3.Error:
         return None
     try:
-        has_ledger = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='pipeline_chunk_state'"
-        ).fetchone()
-        if has_ledger is None:
-            return None
+        if not has_table(conn, "pipeline_chunk_state"):
+            return None  # no ledger — fall back to file-presence heuristics.
+        has_uploaded = (
+            conn.execute(
+                "SELECT 1 FROM pipeline_chunk_state "
+                "WHERE upload_state='uploaded' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
         has_failed = (
             conn.execute(
                 "SELECT 1 FROM pipeline_chunk_state "
@@ -378,7 +389,7 @@ def _ledger_completion_probe(
                 expected = int(row[0])
         except sqlite3.Error:
             expected = None
-        return has_failed, int(done_count), expected
+        return _LedgerProbe(has_uploaded, has_failed, int(done_count), expected)
     except sqlite3.Error:
         return None
     finally:
@@ -387,12 +398,12 @@ def _ledger_completion_probe(
 
 def _derive_state(
     directory: Path,
-    db_path: Path,
     *,
     is_active: bool,
     is_stub: bool,
     intent: str | None,
-) -> str:
+    probe: _LedgerProbe | None,
+) -> Literal["recording", "processing", "ready"]:
     """Derive the recording's lifecycle state per KTD-7.
 
     ``recording`` while the pidfile lock names this dir; after stop, route by the
@@ -402,14 +413,14 @@ def _derive_state(
     terminal "done" lifecycle — the LOCAL route never writes the sentinel, so it is
     deliberately NOT consulted for local). A FAILED chunk, a legacy recording (no
     ledger), or an uploaded-then-evicted stub map to ``ready`` rather than eternal
-    ``processing``.
+    ``processing``. ``probe`` is the recording's :func:`_ledger_probe` result,
+    read once by the caller.
     """
     if is_active:
         return "recording"
 
-    probe = _ledger_completion_probe(db_path)
     # A FAILED chunk blocks completion forever — never sit in eternal processing.
-    if probe is not None and probe[0]:
+    if probe is not None and probe.has_failed:
         return "ready"
 
     if intent in ("cloud", "both"):
@@ -429,10 +440,9 @@ def _derive_state(
     # local or legacy(None): the ledger gate over the frozen closed set.
     if probe is None:
         return "ready"  # no ledger — legacy / not seeded
-    _has_failed, done_count, expected = probe
-    if expected is None:
+    if probe.chunks_expected is None:
         return "ready"  # no frozen count — don't sit in eternal processing
-    return "ready" if done_count >= expected else "processing"
+    return "ready" if probe.done_count >= probe.chunks_expected else "processing"
 
 
 def read_drops(directory: Path) -> dict[str, int] | None:
@@ -456,47 +466,6 @@ def find_db(directory: Path) -> Path | None:
     if p.exists():
         return p
     return None
-
-
-def _ledger_has_uploaded_chunk(db_path: Path) -> bool | None:
-    """True iff the U1 pipeline ledger records ≥1 confirmed-uploaded chunk.
-
-    READ-ONLY probe of the ``pipeline_chunk_state`` table: ``upload_state ==
-    'uploaded'`` (an ``EVICTED`` chunk keeps its ``UPLOADED`` upload_state per
-    the U1 contract, so an uploaded-then-evicted recording still reads True).
-
-    Returns ``None`` when there is no ledger to consult — the table does not
-    exist (legacy / not-yet-seeded recording) or the DB is unreadable — so the
-    caller falls back to the file-presence heuristics (R14). Deliberately does
-    NOT migrate the schema: catalog listing is read-only and must never ALTER a
-    recording.db (that would change its content hash and defeat the
-    scrubbed-copy reuse check on the upload path, mirroring
-    ``terminal_stage._open_ledger_readonly``).
-    """
-    import sqlite3
-
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return None
-    try:
-        has_ledger = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='pipeline_chunk_state'"
-        ).fetchone()
-        if has_ledger is None:
-            return None  # no ledger — fall back to file-presence heuristics.
-        return (
-            conn.execute(
-                "SELECT 1 FROM pipeline_chunk_state "
-                "WHERE upload_state='uploaded' LIMIT 1"
-            ).fetchone()
-            is not None
-        )
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
 
 
 def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
@@ -651,15 +620,15 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # these -> is_chunked False and stays listable/readable via video.mp4.
         is_chunked = chunks_total > 0
 
-        # Consult the U1 ledger (read-only) when present: the unified pipeline
-        # uploads from the source dir and records confirmed uploads in
-        # `pipeline_chunk_state`, so a chunked recording can be genuinely
-        # uploaded (and later evicted) WITHOUT the legacy `.chunk_*_status.json`
-        # markers the file heuristics key off. `None` = no ledger (legacy / not
-        # seeded) -> fall back to file-presence only (R14).
-        ledger_uploaded = bool(
-            db is not None and _ledger_has_uploaded_chunk(db)
-        )
+        # Consult the U1 ledger (read-only) once — one open serves both the
+        # `uploaded` flag and the KTD-7 `state` gate. The unified pipeline uploads
+        # from the source dir and records confirmed uploads in
+        # `pipeline_chunk_state`, so a chunked recording can be genuinely uploaded
+        # (and later evicted) WITHOUT the legacy `.chunk_*_status.json` markers the
+        # file heuristics key off. `None` = no ledger (legacy / not seeded) -> fall
+        # back to file-presence only (R14).
+        ledger = _ledger_probe(db)
+        ledger_uploaded = bool(ledger and ledger.has_uploaded)
 
         uploaded = uploaded_legacy or chunks_uploaded > 0 or ledger_uploaded
 
@@ -709,10 +678,15 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
 
         # U2 additive fields. Compute bytes once and format from it (was two
         # rglob passes); derive the lifecycle state from the active-session
-        # probe + destination-routed completion gate (KTD-7).
+        # probe + destination-routed completion gate (KTD-7), reusing the single
+        # ledger probe read above.
         total_bytes = _dir_size_bytes(d)
         state = _derive_state(
-            d, db, is_active=(d.name == active_name), is_stub=is_stub, intent=intent
+            d,
+            is_active=(d.name == active_name),
+            is_stub=is_stub,
+            intent=intent,
+            probe=ledger,
         )
 
         results.append(
