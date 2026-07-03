@@ -455,18 +455,20 @@ final class PrivacyControllerTests: XCTestCase {
 
     // MARK: - setUploadDefault (U12, KTD-11)
 
-    /// The keep-local write ships exactly the CLI vector the Python side
-    /// expects — `settings --set upload_default=<value> --json` (the same
-    /// surface U11's local storage pick uses with "local").
+    /// The upload-default write ships exactly the CLI vector the Python side
+    /// expects — `settings --set upload_default=<value> --json`. "local" is
+    /// U11's storage-pick write; "ask" is U12's keep-local OFF write (KTD-11).
     func testSetUploadDefaultIssuesExpectedArgv() async {
-        let fake = FakeInvoker()
-        let controller = PrivacyController(invoke: fake.invoker())
+        for value in ["local", "ask"] {
+            let fake = FakeInvoker()
+            let controller = PrivacyController(invoke: fake.invoker())
 
-        let ok = await controller.setUploadDefault("ask")
+            let ok = await controller.setUploadDefault(value)
 
-        XCTAssertTrue(ok)
-        XCTAssertEqual(fake.calls, [["settings", "--set", "upload_default=ask", "--json"]])
-        XCTAssertEqual(controller.uploadDefault, "ask")
+            XCTAssertTrue(ok)
+            XCTAssertEqual(fake.calls, [["settings", "--set", "upload_default=\(value)", "--json"]])
+            XCTAssertEqual(controller.uploadDefault, value)
+        }
     }
 
     /// Optimistic flip + revert-on-failure (KTD-11): a nonzero exit restores
