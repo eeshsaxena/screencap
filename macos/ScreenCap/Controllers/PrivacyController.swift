@@ -17,6 +17,13 @@ final class PrivacyController: ObservableObject {
     @Published private(set) var status: PrivacyStatus?
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
+    /// U12 (KTD-11): the four-valued `upload_default` (`local`/`ask`/`cloud`/
+    /// `both`). nil until the first `refreshStatus()` (or on an older CLI that
+    /// omits it) — the keep-local toggle renders OFF with an "unknown" caption
+    /// rather than guessing.
+    @Published private(set) var uploadDefault: String?
+    /// U12: the configured recordings directory (storage row). nil-tolerant.
+    @Published private(set) var recordingsDir: String?
 
     /// Pluggable CLI invoker. Tests inject a fixture closure; production
     /// resolves to `CLIClient.runJSONRaw`. Keeping the seam at the controller
@@ -30,6 +37,11 @@ final class PrivacyController: ObservableObject {
     /// during the CLI round-trip would otherwise fire two writes against the
     /// same bundle and leave the UI optimistic state out of sync with disk.
     private var pendingToggles: Set<String> = []
+
+    /// Serializes `setUploadDefault` writes — a double-tap on the keep-local
+    /// toggle mid-round-trip would otherwise race two `--set` writes and leave
+    /// the optimistic value pointing at whichever landed last.
+    private var uploadDefaultWriteInFlight: Bool = false
 
     /// Latches once `ensureFirstLaunchModeWritten()` has finished its work
     /// (either confirmed the section exists, or succeeded in writing it).
@@ -94,6 +106,11 @@ final class PrivacyController: ObservableObject {
         do {
             let data = try await invoke(["settings", "--json"])
             let envelope = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
+            // Captured before the privacy-block guard: these are top-level
+            // settings fields (U12) that a payload without the v2 privacy
+            // block can still carry.
+            uploadDefault = envelope.settings.uploadDefault
+            recordingsDir = envelope.settings.recordingsDir
             guard let p = envelope.settings.privacy else { return }
             status = p
             lastError = nil
@@ -127,6 +144,49 @@ final class PrivacyController: ObservableObject {
         // optimistic toggle from disk so the user doesn't see a toggle
         // position that contradicts the configured state.
         await refreshApps()
+    }
+
+    /// Toggle `allow_apps` membership for `bundleId` (U13's Record segment on a
+    /// matrix-masked app). Same idempotent-CLI + refresh-both-paths contract as
+    /// `toggleExclude`; shares the per-bundle in-flight guard so a rapid
+    /// Record/Block double-tap can't interleave writes against one app.
+    func toggleAllow(bundleId: String, allowed: Bool) async {
+        guard !pendingToggles.contains(bundleId) else { return }
+        pendingToggles.insert(bundleId)
+        defer { pendingToggles.remove(bundleId) }
+
+        let op = allowed ? "add" : "remove"
+        do {
+            _ = try await invoke(["settings", "privacy", "allow_apps", op, bundleId, "--json"])
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+        }
+        await refreshApps()
+    }
+
+    /// Set `upload_default` (KTD-11). Optimistic flip + revert-on-failure: the
+    /// published value flips immediately so the keep-local toggle tracks the
+    /// tap; a CLI failure restores the previous value and surfaces the error,
+    /// so the toggle never rests in a position that contradicts disk. Returns
+    /// success so the pane can show an inline error.
+    @discardableResult
+    func setUploadDefault(_ value: String) async -> Bool {
+        guard !uploadDefaultWriteInFlight else { return false }
+        uploadDefaultWriteInFlight = true
+        defer { uploadDefaultWriteInFlight = false }
+
+        let previous = uploadDefault
+        uploadDefault = value
+        do {
+            _ = try await invoke(["settings", "--set", "upload_default=\(value)", "--json"])
+            lastError = nil
+            return true
+        } catch {
+            uploadDefault = previous
+            lastError = error.localizedDescription
+            return false
+        }
     }
 
     /// Mark first-run setup complete (`setup_skipped = true`). Both banner
