@@ -54,7 +54,9 @@ final class RecordingStateMachineTests: XCTestCase {
 
         XCTAssertEqual(machine.state, .recording(elapsed: 12))
         XCTAssertEqual(machine.recordingStartedAt, startedAt)
-        XCTAssertEqual(effects, [.startElapsedTimer])
+        // U7: attaching to an active session shows the HUD but leaves the main
+        // window alone (the user may have just opened it to check on the recording).
+        XCTAssertEqual(effects, [.startElapsedTimer, .showHUD])
     }
 
     func testRestoreRecordingAfterStopFailureUsesStartedAt() {
@@ -113,7 +115,8 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertEqual(machine.state, .recording(elapsed: 0))
         XCTAssertNil(machine.pendingStartCursor)
         XCTAssertEqual(machine.recordingStartedAt, now)
-        XCTAssertEqual(effects, [.startElapsedTimer])
+        // U7: going live floats the HUD and hides the main window.
+        XCTAssertEqual(effects, [.startElapsedTimer, .showHUD, .hideMainWindow])
     }
 
     func testDuplicateStartedEventWhileRecordingIsIgnored() {
@@ -173,6 +176,8 @@ final class RecordingStateMachineTests: XCTestCase {
             .surfaceError("engine crashed"),
             .resolveAwaiting(.finalized, success: true),
             .resolveAwaiting(.stopped, success: false),
+            .hideHUD,
+            .restoreMainWindow,
         ])
     }
 
@@ -186,7 +191,21 @@ final class RecordingStateMachineTests: XCTestCase {
             .surfaceError("Recording failed."),
             .resolveAwaiting(.finalized, success: true),
             .resolveAwaiting(.stopped, success: false),
+            .hideHUD,
+            .restoreMainWindow,
         ])
+    }
+
+    // MARK: - enterIdle (U7 HUD teardown)
+
+    func testEnterIdleEmitsHUDTeardownAndIdles() {
+        var machine = RecordingStateMachine()
+        machine.forceState(.stopping(quitting: false))
+
+        let effects = machine.enterIdle()
+
+        XCTAssertEqual(machine.state, .idle)
+        XCTAssertEqual(effects, [.hideHUD, .restoreMainWindow])
     }
 
     // MARK: - Event: permission_lost, disk_full, stopped
@@ -346,7 +365,7 @@ final class RecordingStateMachineTests: XCTestCase {
         let effects = machine.handle(event: event(type: "started", schemaVersion: 99))
 
         XCTAssertEqual(machine.state, .recording(elapsed: 0))
-        XCTAssertEqual(effects, [.startElapsedTimer])
+        XCTAssertEqual(effects, [.startElapsedTimer, .showHUD, .hideMainWindow])
     }
 
     // MARK: - Process termination
@@ -358,11 +377,15 @@ final class RecordingStateMachineTests: XCTestCase {
         let effects = machine.processTerminated(exitCode: 0)
 
         XCTAssertEqual(machine.state, .idle)
+        // U7: terminating from an active (`.stopping`) state closes the HUD and
+        // restores the main window.
         XCTAssertEqual(effects, [
             .stopElapsedTimer,
             .stopPermissionWatchdog,
             .resolveAwaiting(.finalized, success: false),
             .resolveAwaiting(.stopped, success: false),
+            .hideHUD,
+            .restoreMainWindow,
         ])
     }
 
@@ -379,6 +402,8 @@ final class RecordingStateMachineTests: XCTestCase {
                 .stopPermissionWatchdog,
                 .resolveAwaiting(.finalized, success: false),
                 .resolveAwaiting(.stopped, success: false),
+                .hideHUD,
+                .restoreMainWindow,
             ], "exit code \(exitCode) should match graceful-exit effect list")
         }
     }

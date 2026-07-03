@@ -1,0 +1,80 @@
+import SwiftUI
+
+// U5 — the Library grid's pure model layer: the filter chips, the card status
+// badge, and the visible-rows derivation. Factored out of `LibraryView` so the
+// KTD-6 chip semantics and the KTD-9 honesty-substituted badge copy are directly
+// unit-testable (LibraryFilterTests) without a render.
+
+/// The Library filter chips (design 355–359, logic 691–700), remapped to local
+/// storage semantics per KTD-6: the prototype's "Mine"/"Shared" become
+/// "Local"/"Uploaded" until team semantics exist (SCR-221, KTD-9). Ordered as the
+/// row renders them.
+enum LibraryChip: String, CaseIterable, Identifiable, Hashable {
+    case all = "All"
+    case local = "Local"
+    case uploaded = "Uploaded"
+    case needsReview = "Needs review"
+
+    var id: String { rawValue }
+    var label: String { rawValue }
+
+    /// Whether `rec` belongs under this chip (KTD-6): Local = not uploaded;
+    /// Uploaded = uploaded to the user's own cloud; Needs review = still
+    /// processing/draft (anything not yet `ready`, including an in-progress
+    /// recording). `.all` matches everything.
+    ///
+    /// The predicates deliberately overlap the way the prototype's do — a
+    /// processing local recording appears under both Local and Needs review,
+    /// mirroring the design's draft card, which is both `kind: 'Mine'` and a
+    /// `Needs review` match (logic 710–711).
+    func matches(_ rec: RecordingSummary) -> Bool {
+        switch self {
+        case .all: return true
+        case .local: return !rec.uploaded
+        case .uploaded: return rec.uploaded
+        case .needsReview: return !rec.isReady
+        }
+    }
+}
+
+/// A Library card's status badge (design 370, logic 702–710). The copy is the
+/// honesty-substituted vocabulary (KTD-9): the prototype's "shared · encrypted"
+/// becomes "uploaded" — this type never emits "shared" or "encrypted". Pure; the
+/// view maps `tone` to the design's border/foreground colors so the mapping is
+/// testable without SwiftUI `Color`.
+struct LibraryBadge: Equatable {
+    enum Tone: Equatable {
+        /// Teal outline — uploaded to the user's own cloud.
+        case uploaded
+        /// Amber outline — still processing / draft (or actively recording).
+        case draft
+        /// Muted outline — a finished local-only recording.
+        case local
+    }
+
+    let text: String
+    let tone: Tone
+
+    /// uploaded → teal "uploaded"; not-yet-`ready` (processing / recording) →
+    /// amber "draft · local"; else muted "local" (U5 approach). Uploaded wins
+    /// over draft so a cloud recording still finishing reads as "uploaded",
+    /// matching the sidebar's `allLocal` gate.
+    static func forRecording(_ rec: RecordingSummary) -> LibraryBadge {
+        if rec.uploaded { return LibraryBadge(text: "uploaded", tone: .uploaded) }
+        if !rec.isReady { return LibraryBadge(text: "draft · local", tone: .draft) }
+        return LibraryBadge(text: "local", tone: .local)
+    }
+}
+
+/// Pure derivations for the grid, kept out of the view so ordering + identity are
+/// assertable.
+enum LibraryGrid {
+    /// The rows visible for `chip`, newest-first. The draft / actively-recording
+    /// row carries the most-recent `startedAt`, so it lands at the grid head —
+    /// the design's draft-card injection (logic 710). The grid `ForEach` keys on
+    /// each row's `stableID` (recording_id), so the post-stop auto-name directory
+    /// rename updates a card in place instead of spawning a duplicate.
+    static func visible(_ recordings: [RecordingSummary], chip: LibraryChip) -> [RecordingSummary] {
+        recordings.filter(chip.matches).sorted(by: RecordingSummary.newestFirst)
+    }
+}

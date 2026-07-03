@@ -42,6 +42,14 @@ struct SettingsEnvelope: Decodable {
         /// transcript chunk's wall-clock position before snapping to a real
         /// timeline event.
         let chunkDuration: Double?
+        /// U6: the persisted default microphone choice — seeds the New-recording
+        /// sheet's mic toggle. Optional/tolerant — older daemons omit it (→ the
+        /// sheet defaults the toggle on).
+        let audioDefault: Bool?
+        /// U6/U12: the four-valued upload default (`local` | `ask` | `cloud` |
+        /// `both`, KTD-11) — drives the sheet's "stays on this Mac" header copy
+        /// and (later) the Privacy pane's keep-local toggle.
+        let uploadDefault: String?
 
         enum CodingKeys: String, CodingKey {
             case privacy
@@ -49,6 +57,8 @@ struct SettingsEnvelope: Decodable {
             case contentIndexConsentDeclined = "content_index_consent_declined"
             case contentIndexBackfillDeclined = "content_index_backfill_declined"
             case chunkDuration = "chunk_duration"
+            case audioDefault = "audio_default"
+            case uploadDefault = "upload_default"
         }
     }
 

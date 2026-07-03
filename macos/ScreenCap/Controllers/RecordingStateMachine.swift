@@ -64,6 +64,17 @@ struct RecordingStateMachine {
         case handlePermissionRequired(missing: [String])
         case handleCaptureUnhealthy(reason: String?, reader: String?)
         case handleCaptureRecovered(reader: String?)
+        // U7 — window lifecycle around the recording HUD. The orchestrator routes
+        // these to the injected `WindowLifecycle` seam (the live app manages the
+        // floating NSPanel + the main-window orderOut/restore; tests get a no-op).
+        /// Show the floating recording HUD panel.
+        case showHUD
+        /// Close the recording HUD panel.
+        case hideHUD
+        /// Hide (orderOut) the main window while recording.
+        case hideMainWindow
+        /// Restore the main window after a recording ends and route to Library.
+        case restoreMainWindow
     }
 
     private(set) var state: RecordingState = .idle
@@ -121,7 +132,10 @@ struct RecordingStateMachine {
         pendingStartCursor = nil
         recordingStartedAt = startedAt
         state = .recording(elapsed: now.timeIntervalSince(startedAt))
-        return [.startElapsedTimer]
+        // Show the HUD for the active recording, but do NOT hide the main window:
+        // this attaches to an already-running session (app relaunch / snapshot
+        // recovery), often because the user just opened the app to check on it.
+        return [.startElapsedTimer, .showHUD]
     }
 
     /// Transition into a stopping state (in-app Stop or Cmd+Q).
@@ -157,10 +171,12 @@ struct RecordingStateMachine {
         state = .recording(elapsed: elapsed)
     }
 
-    /// Final transition to `.idle` after a stop completes. Idempotent.
-    mutating func enterIdle() {
+    /// Final transition to `.idle` after a stop completes. Idempotent. Emits the
+    /// HUD close + main-window restore (U7); harmless if the HUD was never shown.
+    mutating func enterIdle() -> [Effect] {
         startedSessionID = nil
         state = .idle
+        return [.hideHUD, .restoreMainWindow]
     }
 
     /// Update the displayed elapsed seconds. No-op outside `.recording`.
@@ -203,7 +219,9 @@ struct RecordingStateMachine {
             pendingStartCursor = nil
             recordingStartedAt = now
             state = .recording(elapsed: 0)
-            return [.startElapsedTimer]
+            // U7: the recording is live — float the HUD and hide the main window
+            // (the design's window-disappears-behind-the-HUD behavior).
+            return [.startElapsedTimer, .showHUD, .hideMainWindow]
 
         case "chunk_finalized":
             // Informational — no UI change needed.
@@ -227,10 +245,14 @@ struct RecordingStateMachine {
             pendingStartCursor = nil
             startedSessionID = nil
             state = .idle
+            // U7: an async failure while the main window is hidden must close the
+            // HUD and bring the window back so the surfaced error is visible.
             return [
                 .surfaceError(event.reason ?? "Recording failed."),
                 .resolveAwaiting(.finalized, success: true),
                 .resolveAwaiting(.stopped, success: false),
+                .hideHUD,
+                .restoreMainWindow,
             ]
 
         case "permission_lost":
@@ -402,6 +424,10 @@ struct RecordingStateMachine {
 
         if state.isRecording {
             state = .idle
+            // U7: the recording process is gone — close the HUD and restore the
+            // main window (a mid-recording crash or the clean-stop process exit).
+            effects.append(.hideHUD)
+            effects.append(.restoreMainWindow)
         }
         return effects
     }

@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 enum FirstRunSetupPresentationPolicy {
@@ -98,6 +99,10 @@ struct MainWindow: View {
     /// coincident daemon-grant / transport update can't dismiss the just-reopened
     /// sheet before the user acts (SCR-144).
     @State private var reopenedViaRecovery = false
+    /// U6: the New-recording sheet is an in-window overlay (KTD-4), presented
+    /// from the Library header. Kept here (not in LibraryView) so it layers over
+    /// the whole shell like the prototype's z-41 overlay.
+    @State private var showingNewRecording = false
 
     var body: some View {
         // The first-run privacy banner lives here — a sibling ABOVE the
@@ -153,6 +158,13 @@ struct MainWindow: View {
                 }
             }
         }
+        .overlay {
+            // U6: New-recording sheet as an in-window overlay (KTD-4), layered
+            // over the whole shell like the prototype's z-41 overlay.
+            if showingNewRecording {
+                NewRecordingSheet(isPresented: $showingNewRecording)
+            }
+        }
         .sheet(isPresented: $showingPermissionsSheet, onDismiss: {
             reopenedViaRecovery = false
             // Phase 1c (SCR-49): dismissing the first-run sheet while migration is
@@ -181,6 +193,11 @@ struct MainWindow: View {
         }
         .onAppear {
             updateFirstRunSheetPresentation()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .screenCapRecordingDidEnd)) { _ in
+            // U7: a recording ended and the main window was restored — land on
+            // Library (with the fresh draft card).
+            route = .library
         }
         .onChange(of: recorder.daemonProbeCompleted) { _ in
             updateFirstRunSheetPresentation()
@@ -343,23 +360,19 @@ struct MainWindow: View {
         case .timeline:
             comingSoon(title: "Day timeline", note: "The day timeline arrives in a later update.")
         case .library:
-            libraryDetail
+            // U5: the prototype card grid. It owns its own loading / error /
+            // empty / zero-match states over the recordings index. The
+            // New-recording pill opens U6's in-window sheet (KTD-4), gated so it
+            // never opens over an active recording (logic 780).
+            LibraryView(onNewRecording: presentNewRecording)
         }
     }
 
-    /// Library is the one route whose content is the recordings index, so it keeps
-    /// the load / error / content gate. Routes to the legacy list until U5's grid.
-    @ViewBuilder
-    private var libraryDetail: some View {
-        if index.isLoading && index.recordings.isEmpty {
-            loadingState
-        } else if let error = index.lastError {
-            errorState(error)
-        } else {
-            // Legacy list, unfiltered (Calendar is retired from the shell). U5
-            // swaps this for the card grid.
-            RecordingsListView(filterDay: .constant(nil)) { _ in }
-        }
+    /// Present the New-recording sheet unless a recording is already in flight —
+    /// the pure gate lives in `NewRecordingSheetPolicy` (U6).
+    private func presentNewRecording() {
+        guard NewRecordingSheetPolicy.canPresent(recorderState: recorder.state) else { return }
+        showingNewRecording = true
     }
 
     /// Uniform placeholder for a sidebar route whose surface lands in a later unit
@@ -379,47 +392,5 @@ struct MainWindow: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(SCMetrics.space8)
-    }
-
-    private var loadingState: some View {
-        VStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.large)
-            Text("Loading recordings…")
-                .foregroundStyle(.secondary)
-                .font(.callout)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func errorState(_ message: String) -> some View {
-        VStack(spacing: 16) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 36))
-                // Genuine load failure: red foreground + triangle shape is the
-                // reserved error treatment (R7), distinct from de-colored advisories.
-                .foregroundStyle(Color.scErrorFg)
-            Text("Couldn't load recordings")
-                .font(.headline)
-            Text(message)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
-            HStack(spacing: 8) {
-                Button("Retry") {
-                    Task { await index.refresh() }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(index.isLoading)
-
-                Button("Dismiss") {
-                    index.clearError()
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(40)
     }
 }
