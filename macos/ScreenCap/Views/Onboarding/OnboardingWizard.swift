@@ -88,8 +88,8 @@ struct OnboardingWizard: View {
         }
         .onChange(of: daemonInstaller.state) { state in
             // Helper confirmed running mid-wizard: record the one-time
-            // migration explainer as satisfied (mirrors FirstRunPermissionsView)
-            // so the legacy sheet's banner never pops after the wizard.
+            // migration explainer as satisfied (mirrors PermissionSetupTakeover)
+            // so the migration banner never pops after the wizard.
             if state == .installedAndRunning {
                 permissions.markMigrationComplete()
             }

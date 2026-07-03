@@ -234,8 +234,6 @@ final class PermissionController: ObservableObject {
     // open the replacement app or time out before we re-enable the UI.
     nonisolated private static let relaunchWatchdogDelayNanoseconds: UInt64 = 11_000_000_000
 
-    private var pollTimer: Timer?
-    private var workspaceObserver: NSObjectProtocol?
     private var relaunchWatchdog: Task<Void, Never>?
     // U5: separate, slower (~5s) daemon-grant refresh lifecycle. Distinct from
     // the 1Hz app-process `startWatching` poll because each daemon refresh costs
@@ -424,46 +422,16 @@ final class PermissionController: ObservableObject {
         // (Timer.invalidate and NSWorkspace.removeObserver tolerate cross-
         // thread calls in practice, but the compiler is strict for a reason.)
         MainActor.assumeIsolated {
-            pollTimer?.invalidate()
             daemonGrantTimer?.invalidate()
             relaunchWatchdog?.cancel()
-            if let workspaceObserver {
-                NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
-            }
             if let daemonGrantWorkspaceObserver {
                 NSWorkspace.shared.notificationCenter.removeObserver(daemonGrantWorkspaceObserver)
             }
         }
     }
 
-    /// Starts the live polling loop used by FirstRunPermissionsView while it is visible.
-    func startWatching() {
-        stopWatching()
-        let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        pollTimer = timer
-
-        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-    }
-
-    func stopWatching() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-        if let workspaceObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
-            self.workspaceObserver = nil
-        }
-    }
-
-    /// Begin refreshing the *daemon* grant snapshot while the walkthrough sheet
-    /// is visible (U5): on app re-activation and on a slow ~5s timer. `refresh`
+    /// Begin refreshing the *daemon* grant snapshot while a permission-setup
+    /// surface is visible (U5): on app re-activation and on a slow ~5s timer. `refresh`
     /// performs the actual `daemon.info` round-trip (owned by RecorderController);
     /// an in-flight guard collapses overlapping ticks so a re-activation landing
     /// on a timer tick can't double-spawn the daemon probe. An immediate refresh
