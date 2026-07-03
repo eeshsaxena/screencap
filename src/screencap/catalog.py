@@ -419,6 +419,11 @@ def _derive_state(
         # cleaned away with the media.
         if is_stub:
             return "ready"
+        # `processing` requires evidence of in-flight work (a seeded ledger). A
+        # cloud recording with NO ledger and no sentinel has nothing converging it,
+        # so treat it as `ready` rather than trapping it in eternal `processing`.
+        if probe is None:
+            return "ready"
         return "processing"
 
     # local or legacy(None): the ledger gate over the frozen closed set.
