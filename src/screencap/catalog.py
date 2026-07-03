@@ -430,10 +430,12 @@ def _derive_state(
         # cleaned away with the media.
         if is_stub:
             return "ready"
-        # `processing` requires evidence of in-flight work (a seeded ledger). A
-        # cloud recording with NO ledger and no sentinel has nothing converging it,
-        # so treat it as `ready` rather than trapping it in eternal `processing`.
-        if probe is None:
+        # `processing` requires a real path to the completeness sentinel — a seeded
+        # ledger with a FROZEN `chunks_expected` the terminal stage can gate on.
+        # Neither a missing ledger nor an unfrozen `chunks_expected` can ever
+        # produce a sentinel, so both map to `ready` rather than eternal
+        # `processing` (mirrors the local branch's unfrozen-count guard below).
+        if probe is None or probe.chunks_expected is None:
             return "ready"
         return "processing"
 
@@ -681,13 +683,18 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # probe + destination-routed completion gate (KTD-7), reusing the single
         # ledger probe read above.
         total_bytes = _dir_size_bytes(d)
+        is_active = d.name == active_name
         state = _derive_state(
             d,
-            is_active=(d.name == active_name),
+            is_active=is_active,
             is_stub=is_stub,
             intent=intent,
             probe=ledger,
         )
+        # The namer writes `task_description` only AFTER stop, and the active
+        # recording holds a write lock — so reading it here can't yield a summary
+        # and would just block up to the 500ms busy_timeout on every scan. Skip it.
+        summary = None if is_active else _read_task_description(db)
 
         results.append(
             RecordingInfo(
@@ -709,7 +716,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 owner_uid=owner_uid,
                 upload_warning=upload_warning,
                 size_bytes=total_bytes,
-                summary=_read_task_description(db),
+                summary=summary,
                 title=_humanize_name(d.name),
                 state=state,
                 recording_id=read_recording_id(d),

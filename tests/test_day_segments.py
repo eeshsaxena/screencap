@@ -182,6 +182,21 @@ def test_midnight_spanning_recording_appears_in_both_days_clamped(tmp_path):
     assert prev["end_ms"] == int(_DAY_START * 1000)             # clamped to midnight
 
 
+def test_recording_ending_exactly_at_midnight_belongs_only_to_previous_day(tmp_path):
+    """A recording ending exactly at local midnight is entirely within the previous
+    day — it must NOT appear as a zero-width span at the start of the next day
+    (half-open `end > win_start`, not `>=`)."""
+    rec = tmp_path / "ends-at-midnight"
+    _make_recording_db(
+        rec, started=_DAY_START - 600, end=_DAY_START,
+        windows=[{"ts": _DAY_START - 600, "bundle": "com.example.unknownbenign"}],
+    )
+    assert _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "ends-at-midnight") is None
+    prev = _find(day_segments.day_segments("2026-07-02", 0, recordings_dir=tmp_path), "ends-at-midnight")
+    assert prev is not None
+    assert prev["end_ms"] == int(_DAY_START * 1000)
+
+
 def test_recording_outside_the_day_is_excluded(tmp_path):
     rec = tmp_path / "other-day"
     _make_recording_db(

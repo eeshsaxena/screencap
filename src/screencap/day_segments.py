@@ -174,8 +174,11 @@ def day_segments(
         end = started + (meta.duration_seconds or 0.0)
 
         # Half-open overlap with the day window (a midnight-spanning recording
-        # overlaps both days and is clamped into each).
-        if not (started < win_end and end >= win_start):
+        # overlaps both days and is clamped into each). Both bounds are exclusive
+        # of the far edge — `end > win_start`, not `>=`, so a recording that ends
+        # exactly at local midnight belongs only to the previous day, not as a
+        # zero-width span at the start of this one (matches `_clip_ms`'s convention).
+        if not (started < win_end and end > win_start):
             continue
         clamped_start = max(started, win_start)
         clamped_end = max(min(end, win_end), clamped_start)

@@ -100,9 +100,22 @@ async def test_start_echoes_audio_true():
 @pytest.mark.asyncio
 async def test_start_echoes_audio_on_by_default_when_unspecified():
     """No audio field → the daemon resolves the audio-on default so the app has a
-    definite value (matching the mic row's default-on state)."""
+    definite value (matching the mic row's default-on state). `get_audio_default()`
+    defaults True."""
     body = await _start(build_app(), {"name": "demo"})
     assert body["audio"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_echoes_configured_audio_default_when_unspecified(monkeypatch):
+    """An unspecified request echoes the ENGINE's actual resolution
+    (`config.get_audio_default()`), not a hardcoded True — so a user who set
+    `audio_default=false` sees the mic reported off, matching what the engine records."""
+    from screencap import config
+
+    monkeypatch.setattr(config, "get_audio_default", lambda: False)
+    body = await _start(build_app(), {"name": "demo"})
+    assert body["audio"] is False
 
 
 @pytest.mark.asyncio

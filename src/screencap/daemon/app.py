@@ -445,11 +445,17 @@ async def recording_start(request: Request) -> JSONResponse:
 
         result = await request.app.state.supervisor.spawn(parsed)
         # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what
-        # the engine did. The app always sends an explicit bool; an unspecified
-        # (None) request resolves to the audio-on default, matching the app's mic
-        # row. A stale daemon omits this field entirely — the app treats a
-        # missing/mismatched echo as audio-on.
-        result["audio"] = parsed.audio if parsed.audio is not None else True
+        # the engine did. An unspecified (None) request resolves the SAME way the
+        # engine does for it — `config.get_audio_default()` (screen_recorder) — so
+        # the echo stays truthful when a user set `audio_default=false` rather than
+        # falsely reporting audio-on. A stale daemon omits the field entirely; the
+        # app treats a missing echo as audio-on.
+        if parsed.audio is not None:
+            result["audio"] = parsed.audio
+        else:
+            from screencap.config import get_audio_default
+
+            result["audio"] = get_audio_default()
         _audit("ok")
         return JSONResponse(
             schema.envelope(

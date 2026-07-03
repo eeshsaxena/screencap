@@ -447,6 +447,9 @@ def test_uploaded_then_evicted_chunked_recording_is_a_legitimate_stub(recordings
     assert info.is_chunked is True
     assert info.uploaded is True, "ledger UPLOADED state makes it uploaded"
     assert info.is_stub is True, "uploaded + media evicted = legitimate stub"
+    # The merged _ledger_probe serves both `uploaded` and `state`; pin state so a
+    # future edit that touches only one of its SQL branches is caught.
+    assert info.state == "ready"
 
 
 def test_ledger_failed_chunk_is_not_a_false_stub(recordings_dir):
@@ -469,6 +472,7 @@ def test_ledger_failed_chunk_is_not_a_false_stub(recordings_dir):
     info = list_recordings(recordings_dir)[0]
     assert info.uploaded is False, "FAILED chunks are never UPLOADED"
     assert info.is_stub is False, "fail-closed local media preserved -> not a stub"
+    assert info.state == "ready", "a FAILED chunk maps to ready, not eternal processing"
 
 
 def test_locally_evicted_recording_is_not_a_stub(recordings_dir):
@@ -491,6 +495,7 @@ def test_locally_evicted_recording_is_not_a_stub(recordings_dir):
     info = list_recordings(recordings_dir)[0]
     assert info.uploaded is False, "local recording was never uploaded"
     assert info.is_stub is False, "local eviction is not a stub (R11)"
+    assert info.state == "ready", "all frozen chunks terminal (LOCAL_DONE->EVICTED) -> ready"
 
 
 def test_pre_u1_recording_without_ledger_table_classifies_via_files(recordings_dir):
@@ -889,6 +894,47 @@ def test_state_failed_chunk_maps_to_ready_not_eternal_processing(recordings_dir)
     led.seed_chunk(0)
     led.freeze_chunks_expected(1)
     led.mark_failed(0, detail="video_mask FAILED")
+    assert list_recordings(recordings_dir)[0].state == "ready"
+
+
+def test_state_cloud_stub_without_sentinel_is_ready(recordings_dir):
+    """An uploaded-then-evicted cloud recording is `ready` even without a
+    completeness sentinel — the stub short-circuit (its media is gone, so nothing
+    is converging it)."""
+    d = _make_recording(recordings_dir, "cloud-stub", duration=10)
+    (d / ".recording_intent").write_text(
+        json.dumps({"version": 1, "destination": "cloud", "privacy_mode": "public"})
+    )
+    (d / "chunk_0000_manifest.json").write_text("{}")  # manifest survives eviction
+    _seed_ledger(d, 1, uploaded=True, evicted=True)
+    assert not (d / "recording_complete.json").exists()
+    info = list_recordings(recordings_dir)[0]
+    assert info.is_stub is True
+    assert info.state == "ready"
+
+
+def test_state_cloud_without_frozen_completion_gate_is_ready(recordings_dir):
+    """A cloud recording with no completeness sentinel AND no frozen
+    `chunks_expected` (an empty/unfrozen ledger, or none at all) has no path to a
+    sentinel, so it reports `ready`, not eternal `processing`."""
+    d = _make_recording(recordings_dir, "cloud-noledger", duration=10)
+    (d / ".recording_intent").write_text(
+        json.dumps({"version": 1, "destination": "cloud", "privacy_mode": "public"})
+    )
+    # `_make_recording` leaves an empty (unfrozen) pipeline_chunk_state table.
+    assert list_recordings(recordings_dir)[0].state == "ready"
+
+
+def test_state_ledger_seeded_but_unfrozen_is_ready(recordings_dir):
+    """A local recording with a seeded ledger whose `chunks_expected` was never
+    frozen has no gate to wait on, so it reports `ready` rather than `processing`."""
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "unfrozen", duration=10)
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    led.seed_chunk(0)  # seeded but deliberately NOT frozen
     assert list_recordings(recordings_dir)[0].state == "ready"
 
 
