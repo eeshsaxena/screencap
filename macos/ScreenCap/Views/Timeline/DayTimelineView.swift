@@ -127,12 +127,24 @@ struct DayTimelineView: View {
         case .daemonUnavailable: return "day view needs the background helper — start ScreenCap's helper and retry"
         case .ready:
             switch reason {
-            case .nothingCaptured: return "nothing captured at this time"
+            case .nothingCaptured:
+                // R7 both ways: inside a recording span, activity *was*
+                // captured — only the video frame is missing (e.g. the moment
+                // precedes the first written frame), so "nothing captured"
+                // would over-claim in the other direction.
+                return playheadInsideRecordingSpan
+                    ? "no video frames for this moment"
+                    : "nothing captured at this time"
             // R7: the moment existed but its local media was evicted after
             // upload — "nothing captured" would be a false claim.
             case .mediaUnavailable: return "local media removed after upload"
             }
         }
+    }
+
+    private var playheadInsideRecordingSpan: Bool {
+        guard let ms = engine.currentDayMs else { return false }
+        return spans.contains { $0.startMs <= ms && ms < $0.endMs }
     }
 
     private var timestampChip: some View {

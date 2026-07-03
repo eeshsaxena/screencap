@@ -172,17 +172,26 @@ struct DayStripView: View {
             ctx.fill(track, with: .color(.scCanvas))
             ctx.stroke(track, with: .color(.scBorderWarm), lineWidth: 1)
 
-            for segment in segments {
+            // Greedy left-to-right label placement: a label is skipped when it
+            // would overlap the previously drawn one (recordings minutes apart
+            // would otherwise paint on top of each other). Every segment still
+            // exposes its title via the accessibility overlay.
+            var lastLabelEndX = -CGFloat.greatestFiniteMagnitude
+            for segment in segments.sorted(by: { $0.startMs < $1.startMs }) {
                 let rect = bandRect(startMs: segment.startMs, endMs: segment.endMs, width: width)
                 let path = Path(roundedRect: rect, cornerRadius: 4)
                 ctx.fill(path, with: .color(.scTeal.opacity(0.25)))
                 ctx.stroke(path, with: .color(.scTeal.opacity(0.33)), lineWidth: 1)
                 // Segment label above the band (design 451–453) — recording
                 // title until SCR-214's task labels.
-                ctx.draw(
-                    Text(segment.title).font(SCTypography.mono(size: 9.5)).foregroundColor(.scTeal),
-                    in: CGRect(x: rect.minX, y: 0, width: max(rect.width, 120), height: 14)
+                let label = ctx.resolve(
+                    Text(segment.title).font(SCTypography.mono(size: 9.5)).foregroundColor(.scTeal)
                 )
+                let size = label.measure(in: CGSize(width: 220, height: 14))
+                if rect.minX >= lastLabelEndX + 8 {
+                    ctx.draw(label, in: CGRect(x: rect.minX, y: 0, width: size.width, height: 14))
+                    lastLabelEndX = rect.minX + size.width
+                }
             }
 
             for band in blockedBands {

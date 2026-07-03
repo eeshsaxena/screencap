@@ -122,6 +122,35 @@ final class DayPlaybackEngineTests: XCTestCase {
         XCTAssertNil(DayMediaMap.nextChunk(afterMs: 240_000, in: chunks))
     }
 
+    // MARK: - Initial landing snap (engine.load)
+
+    /// A card click seeds the timeline at `started_at`, which precedes the
+    /// first written frame under action-gated capture — the initial landing
+    /// snaps forward to the first playable frame when it is near, instead of
+    /// parking on a dead placeholder.
+    @MainActor
+    func testLoadSnapsInitialSeekForwardToNearbyPlayableFrame() {
+        let engine = DayPlaybackEngine()
+        // Recording span starts at 100s but chunk 0 opens at 107s, first frame 110s.
+        let chunks = [chunk(start: 107_000, end: 200_000, anchor: 110_000)]
+        engine.load(chunks: chunks, seekToMs: 100_000)
+        XCTAssertEqual(engine.target, .media(chunk: chunks[0], offsetSeconds: 0))
+        XCTAssertEqual(engine.currentDayMs, 110_000)
+        engine.tearDown()
+    }
+
+    /// The snap is capped: a seek into a genuinely long gap stays on the
+    /// honest placeholder rather than teleporting to media minutes away.
+    @MainActor
+    func testLoadDoesNotSnapAcrossALongGap() {
+        let engine = DayPlaybackEngine()
+        let chunks = [chunk(start: 500_000, end: 600_000, anchor: 500_000)]
+        engine.load(chunks: chunks, seekToMs: 100_000)
+        XCTAssertEqual(engine.target, .placeholder(.nothingCaptured))
+        XCTAssertEqual(engine.currentDayMs, 100_000)
+        engine.tearDown()
+    }
+
     // MARK: - Disk loader (fixture dirs)
 
     private func makeRecordingDir(_ root: URL, name: String) throws -> URL {

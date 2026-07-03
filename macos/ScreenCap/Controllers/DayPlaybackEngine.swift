@@ -282,11 +282,21 @@ final class DayPlaybackEngine: ObservableObject {
     /// The recording under the playhead (for "Share from here").
     var currentRecording: String? { currentChunk?.recording }
 
+    /// How far the *initial* landing may snap forward to reach a playable
+    /// frame. Covers a card click at a recording's `started_at`, which under
+    /// action-gated capture precedes the first written frame — without
+    /// teleporting a search hit that genuinely sits in a long gap.
+    private static let initialSnapCapMs = 120_000
+
     func load(chunks: [DayPlayableChunk], seekToMs: Int?) {
         self.chunks = chunks.sorted { $0.startMs < $1.startMs }
         startObservingIfNeeded()
-        if let ms = seekToMs ?? self.chunks.first?.anchorMs {
-            seek(toDayMs: ms)
+        guard let ms = seekToMs ?? self.chunks.first?.anchorMs else { return }
+        seek(toDayMs: ms)
+        if case .placeholder(.nothingCaptured) = target,
+           let next = DayMediaMap.nextChunk(afterMs: ms, in: self.chunks),
+           let anchor = next.anchorMs, anchor - ms <= Self.initialSnapCapMs {
+            seek(toDayMs: anchor)
         }
     }
 
