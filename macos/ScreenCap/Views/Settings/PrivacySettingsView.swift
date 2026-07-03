@@ -22,6 +22,11 @@ struct PrivacySettingsView: View {
     /// Inline error under the keep-local row after a failed CLI write (the
     /// optimistic flip has already been reverted by the controller).
     @State private var keepLocalError: String?
+    /// Locks the keep-local toggle while a write round-trips (the AppRulesView
+    /// pendingSegments pattern). Without it a double-tap hits the controller's
+    /// in-flight guard, whose `false` return would render as a false
+    /// "Couldn't save" error for a write that actually succeeded.
+    @State private var keepLocalWriteInFlight = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -123,6 +128,7 @@ struct PrivacySettingsView: View {
                     on: PrivacySettingsPolicy.keepLocalToggleOn(uploadDefault: privacy.uploadDefault),
                     action: toggleKeepLocal
                 )
+                .disabled(keepLocalWriteInFlight)
             }
             if let keepLocalError {
                 Text(keepLocalError)
@@ -135,12 +141,15 @@ struct PrivacySettingsView: View {
     }
 
     private func toggleKeepLocal() {
+        guard !keepLocalWriteInFlight else { return }
         let target = !PrivacySettingsPolicy.keepLocalToggleOn(uploadDefault: privacy.uploadDefault)
         keepLocalError = nil
+        keepLocalWriteInFlight = true
         Task {
             let ok = await privacy.setUploadDefault(
                 PrivacySettingsPolicy.uploadDefaultValue(togglingTo: target)
             )
+            keepLocalWriteInFlight = false
             if !ok {
                 keepLocalError = privacy.lastError.map { "Couldn't save: \($0)" }
                     ?? "Couldn't save the setting."

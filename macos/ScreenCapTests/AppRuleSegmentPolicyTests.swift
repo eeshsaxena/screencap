@@ -113,6 +113,23 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         )
     }
 
+    /// The defensive resolved-exclude shape (matrix EXCLUDE without the user's
+    /// own entry and without `is_matrix_exclude` — a hand-edited config):
+    /// rendered blocked but writable, and crucially Record maps to allowAdd —
+    /// an excludeRemove here would be a silent no-op CLI write (the bundle is
+    /// not in exclude_apps).
+    func testResolvedExcludeDefensiveRow() {
+        let handEdited = app(contextClass: "banking", resolvedAction: "exclude")
+        let policy = AppRuleSegmentPolicy.derive(for: handEdited)
+        XCTAssertEqual(policy.selection, .block)
+        XCTAssertTrue(policy.recordEnabled)
+        XCTAssertTrue(policy.blockEnabled)
+        XCTAssertNil(policy.lockedReason)
+        XCTAssertEqual(policy.note, "blocked · banking")
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: handEdited, tapping: .record), .allowAdd)
+        XCTAssertNil(AppRuleSegmentPolicy.transition(for: handEdited, tapping: .block), "already blocked")
+    }
+
     // MARK: - Row ordering (stable under rule changes)
 
     /// Live-QA regression: ranking rows by their user-toggleable rule made a

@@ -391,6 +391,10 @@ struct MainWindow: View {
             onReplayOnboarding: {
                 // U11: re-enter the wizard read-only — live grant states,
                 // current storage selection, finish writes nothing (KTD-10).
+                // Never seize the window mid-recording (the menu bar can
+                // restore the hidden main window while capture runs) — the
+                // same gate the automatic takeover applies.
+                guard !recorder.state.isRecording else { return }
                 onboarding = .replay
             }
         )

@@ -147,7 +147,10 @@ struct AppInitialsTile: View {
         if words.count > 1, let secondWordChar = words[1].first {
             return String(firstChar).uppercased() + String(secondWordChar).uppercased()
         }
+        // The second character keeps its original case — the design's tiles
+        // read "1P" (1Password) and "Me" (Messages), so lowercasing here
+        // would contradict both documented examples.
         let second = first.count > 1 ? String(first[first.index(after: first.startIndex)]) : ""
-        return String(firstChar).uppercased() + second.lowercased()
+        return String(firstChar).uppercased() + second
     }
 }

@@ -176,12 +176,15 @@ final class OnboardingStepPolicyTests: XCTestCase {
         XCTAssertFalse(all.contains("shared team library"))
     }
 
-    /// The welcome cards (the design's "Encrypted sharing … Always." card) and
+    /// The welcome cards (the design's "Encrypted sharing … Always." card),
     /// the step-2 footer (the design's "Private browser windows always pause
-    /// recording") also carry no untrue claims.
-    func testWelcomeAndAppRulesCopyCarriesNoForbiddenClaims() {
+    /// recording"), and the team-setup step (the design's "one shared,
+    /// encrypted library") also carry no untrue claims.
+    func testWelcomeAppRulesAndTeamCopyCarriesNoForbiddenClaims() {
         var strings = OnboardingCopy.welcomeCards.flatMap { [$0.title, $0.body] }
         strings.append(OnboardingCopy.appRulesFooter)
+        strings.append(OnboardingCopy.teamHeadline)
+        strings.append(OnboardingCopy.teamSub)
         let all = strings.joined(separator: " ").lowercased()
         for forbidden in ["encrypt", "e2e", "always pause", "pause recording"] {
             XCTAssertFalse(all.contains(forbidden), "copy contains \"\(forbidden)\"")
