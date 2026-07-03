@@ -1,13 +1,14 @@
 import SwiftUI
 
-/// The detail routes the shell can display (U4). `library` and `privacy` route to
-/// their legacy panes until U5/U12 swap them; `journal` (U8), `appRules` (U13),
-/// and `timeline` (U9) are not yet built, so the sidebar renders them disabled
-/// until their unit lands.
+/// The detail routes the shell can display (U4). `privacy` routes to its legacy
+/// pane until U12 swaps it; `appRules` (U13) is not yet built, so the sidebar
+/// renders it disabled until its unit lands. `timeline` has no sidebar row — it
+/// is reached from Journal day links and recording cards (U9), optionally
+/// carrying a wall-clock seek anchor.
 enum ShellRoute: Hashable {
     case library
     case journal
-    case timeline(Date)
+    case timeline(day: Date, seekMs: Int?)
     case privacy
     case appRules
 }
@@ -51,8 +52,7 @@ enum ShellSidebarModel {
 
     static let primaryNav: [ShellNavItem] = [
         ShellNavItem(id: "library", label: "Library", route: .library, availability: .enabled),
-        // Journal is built in U8; disabled until then (no legacy counterpart).
-        ShellNavItem(id: "journal", label: "Journal", route: .journal, availability: .comingInLaterUnit),
+        ShellNavItem(id: "journal", label: "Journal", route: .journal, availability: .enabled),
     ]
 
     /// The design's COLLECTIONS list is mock data ("Payroll walkthroughs" etc.,

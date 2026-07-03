@@ -5,10 +5,9 @@ import SwiftUI
 // pill, and the empty / error / zero-match states the prototype omits. Replaces
 // the legacy `RecordingsListView` in the shell's Library route.
 //
-// The New-recording pill fires `onNewRecording`; U6 swaps that callback to
-// present the New-recording sheet (until then MainWindow points it at the
-// existing start path). The search pill presents the existing Search surface
-// until U10's Recall palette lands (KTD-13).
+// The New-recording pill fires `onNewRecording` (U6's in-window sheet); the
+// search pill fires `onOpenSearch` (U10's Recall palette, KTD-13); a card click
+// fires `onOpenTimeline` (U9's day view).
 struct LibraryView: View {
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var recorder: RecorderController
@@ -18,13 +17,17 @@ struct LibraryView: View {
     /// path via MainWindow; the closure keeps LibraryView independent of the
     /// sheet that lands in U6.
     var onNewRecording: () -> Void
+    /// U10: the header search pill opens the Recall palette (KTD-13).
+    var onOpenSearch: () -> Void
+    /// U9: a card click lands on the Day timeline seeked to the recording
+    /// (day, wall-clock ms). Inspect stays reachable from the context menu.
+    var onOpenTimeline: (Date, Int?) -> Void
 
     @State private var selectedChip: LibraryChip = .all
     // One frame resolver + thumbnail cache shared across every card (not one per
     // card), mirroring SearchView's SCR-177 wiring.
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
-    @State private var showingSearch = false
     @State private var rowError: String?
     @State private var restarting = false
 
@@ -34,7 +37,6 @@ struct LibraryView: View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.scPaper)
-            .sheet(isPresented: $showingSearch) { SearchView() }
             .alert("Can't open recording", isPresented: rowErrorBinding) {
                 Button("OK") { rowError = nil }
             } message: {
@@ -87,6 +89,7 @@ struct LibraryView: View {
                             frameIndex: frameIndex,
                             thumbnailLoader: thumbnailLoader,
                             onOpen: { open(rec) },
+                            onInspect: { openInspect(rec) },
                             onReview: { openWindow(id: ReviewWindowID, value: rec.name) }
                         )
                     }
@@ -114,7 +117,7 @@ struct LibraryView: View {
 
     private var searchPill: some View {
         Button {
-            showingSearch = true
+            onOpenSearch()
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
@@ -306,10 +309,21 @@ struct LibraryView: View {
 
     // MARK: - Actions
 
-    /// Card tap → Day timeline in U9; the read-only Inspect window until then.
-    /// A stub recording (uploaded, local media deleted) surfaces the friendly
-    /// download message rather than opening an empty inspect window.
+    /// Card tap → Day timeline seeked to the recording (U9). Recordings whose
+    /// start day can't be derived fall back to the Inspect window. Stubs
+    /// (uploaded, local media deleted) route to the timeline too — it renders
+    /// their span with the honest evicted-media placeholder.
     private func open(_ rec: RecordingSummary) {
+        guard let day = rec.startedDay else {
+            openInspect(rec)
+            return
+        }
+        onOpenTimeline(day, rec.startedAt.map { Int($0 * 1000) })
+    }
+
+    /// The read-only Inspect window (context menu; KTD-4). A stub recording
+    /// surfaces the friendly download message rather than an empty window.
+    private func openInspect(_ rec: RecordingSummary) {
         switch InspectRouting.decide(recording: rec.name, anchorMs: nil, isStub: rec.isStub) {
         case .unavailable(let message):
             rowError = message
