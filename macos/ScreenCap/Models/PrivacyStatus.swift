@@ -48,8 +48,11 @@ struct SettingsEnvelope: Decodable {
         let audioDefault: Bool?
         /// U6/U12: the four-valued upload default (`local` | `ask` | `cloud` |
         /// `both`, KTD-11) — drives the sheet's "stays on this Mac" header copy
-        /// and (later) the Privacy pane's keep-local toggle.
+        /// and the Privacy pane's keep-local toggle.
         let uploadDefault: String?
+        /// U12: the configured recordings directory, rendered on the Privacy
+        /// pane's storage row. Optional/tolerant — older CLIs omit it.
+        let recordingsDir: String?
 
         enum CodingKeys: String, CodingKey {
             case privacy
@@ -59,6 +62,7 @@ struct SettingsEnvelope: Decodable {
             case chunkDuration = "chunk_duration"
             case audioDefault = "audio_default"
             case uploadDefault = "upload_default"
+            case recordingsDir = "recordings_dir"
         }
     }
 

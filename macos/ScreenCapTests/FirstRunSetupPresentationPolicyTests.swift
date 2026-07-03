@@ -188,4 +188,23 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
             )
         )
     }
+
+    // MARK: - shouldPresentOnLaunch (U11 onboarding-takeover dimension)
+
+    /// U11: while the onboarding wizard owns the window, the sheet never
+    /// presents — not even under the migration override, which is otherwise
+    /// unconditional and would fire on every fresh install (whose migration
+    /// marker is also absent) right over the wizard's welcome step.
+    func testOnboardingTakeoverSuppressesSheetEvenWithMigrationPending() {
+        XCTAssertFalse(
+            FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+                daemonProbeCompleted: true,
+                transport: .cliFallback,
+                daemonGrants: denied,
+                setupDismissed: false,
+                migrationNeeded: true,
+                onboardingTakeoverActive: true
+            )
+        )
+    }
 }

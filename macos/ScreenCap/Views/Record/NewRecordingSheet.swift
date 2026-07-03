@@ -170,7 +170,10 @@ struct NewRecordingSheet: View {
                     .padding(.leading, 17)
             }
             Spacer(minLength: 8)
-            StubToggle(on: true)
+            // Decorative "on" state (soft teal, design line 643) — the shared
+            // pill renders locked via `action: nil`.
+            SettingsToggle(on: true, onFill: .scTealSoft, action: nil)
+                .accessibilityHidden(true)
         }
         .optionRowChrome()
         .opacity(0.7)
@@ -324,21 +327,6 @@ private struct MicLevelBars: View {
     private func color(forBar index: Int) -> Color {
         guard active else { return Color.scBorderWarm }
         return level * 5 > Double(index) ? Color.scTeal : Color.scBorderWarm
-    }
-}
-
-/// A disabled "on" toggle for a stubbed row (KTD-8) — rendered per the design's
-/// switch (line 643) but non-interactive.
-private struct StubToggle: View {
-    let on: Bool
-    var body: some View {
-        Capsule()
-            .fill(on ? Color.scTealSoft : Color.scBorderWarm)
-            .frame(width: 38, height: 22)
-            .overlay(alignment: on ? .trailing : .leading) {
-                Circle().fill(Color.scPaper).frame(width: 18, height: 18).padding(2)
-            }
-            .accessibilityHidden(true)
     }
 }
 

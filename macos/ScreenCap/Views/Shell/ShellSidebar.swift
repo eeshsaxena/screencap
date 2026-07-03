@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// The detail routes the shell can display (U4). `privacy` routes to its legacy
-/// pane until U12 swaps it; `appRules` (U13) is not yet built, so the sidebar
-/// renders it disabled until its unit lands. `timeline` has no sidebar row — it
-/// is reached from Journal day links and recording cards (U9), optionally
-/// carrying a wall-clock seek anchor.
+/// The detail routes the shell can display (U4). `privacy` renders the
+/// prototype Privacy settings pane (U12) and `appRules` the App rules pane
+/// (U13). `timeline` has no sidebar row — it is reached from Journal day links
+/// and recording cards (U9), optionally carrying a wall-clock seek anchor.
 enum ShellRoute: Hashable {
     case library
     case journal
@@ -18,12 +17,8 @@ enum ShellRoute: Hashable {
 struct ShellNavItem: Identifiable, Hashable {
     /// Why a row is (un)available, which decides its enabled state + help text.
     enum Availability: Hashable {
-        /// Routes now (its pane exists — legacy or new).
+        /// Routes now (its pane exists).
         case enabled
-        /// In-scope but not yet built in this plan's unit sequence (Journal U8,
-        /// App rules U13). Disabled with a plain "Coming soon" — NOT an SCR stub,
-        /// because these are plan units, not deferred capabilities.
-        case comingInLaterUnit
         /// A deferred capability (KTD-8): disabled with "Coming soon — SCR-NNN".
         case stub(ticket: String)
     }
@@ -40,7 +35,6 @@ struct ShellNavItem: Identifiable, Hashable {
     var helpText: String? {
         switch availability {
         case .enabled: return nil
-        case .comingInLaterUnit: return "Coming soon"
         case .stub(let ticket): return "Coming soon — \(ticket)"
         }
     }
@@ -65,8 +59,7 @@ enum ShellSidebarModel {
 
     static let settingsNav: [ShellNavItem] = [
         ShellNavItem(id: "privacy", label: "Privacy", route: .privacy, availability: .enabled),
-        // App rules is built in U13; disabled until then.
-        ShellNavItem(id: "appRules", label: "App rules", route: .appRules, availability: .comingInLaterUnit),
+        ShellNavItem(id: "appRules", label: "App rules", route: .appRules, availability: .enabled),
     ]
 
     /// The status-footer storage summary. `allLocal` gates the "all local ·"

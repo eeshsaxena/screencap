@@ -43,9 +43,15 @@ final class PrivacyControllerTests: XCTestCase {
         return try! JSONSerialization.data(withJSONObject: envelope, options: [])
     }
 
-    private func settingsEnvelope(privacy: [String: Any]?) -> Data {
+    private func settingsEnvelope(
+        privacy: [String: Any]?,
+        uploadDefault: String? = nil,
+        recordingsDir: String? = nil
+    ) -> Data {
         var settings: [String: Any] = [:]
         if let privacy { settings["privacy"] = privacy }
+        if let uploadDefault { settings["upload_default"] = uploadDefault }
+        if let recordingsDir { settings["recordings_dir"] = recordingsDir }
         let envelope: [String: Any] = [
             "ok": true,
             "schema_version": 2,
@@ -445,5 +451,80 @@ final class PrivacyControllerTests: XCTestCase {
         let controller = PrivacyController(invoke: fake.invoker())
         await controller.refreshStatus()
         XCTAssertFalse(controller.bannerActive)
+    }
+
+    // MARK: - setUploadDefault (U12, KTD-11)
+
+    /// The upload-default write ships exactly the CLI vector the Python side
+    /// expects — `settings --set upload_default=<value> --json`. "local" is
+    /// U11's storage-pick write; "ask" is U12's keep-local OFF write (KTD-11).
+    func testSetUploadDefaultIssuesExpectedArgv() async {
+        for value in ["local", "ask"] {
+            let fake = FakeInvoker()
+            let controller = PrivacyController(invoke: fake.invoker())
+
+            let ok = await controller.setUploadDefault(value)
+
+            XCTAssertTrue(ok)
+            XCTAssertEqual(fake.calls, [["settings", "--set", "upload_default=\(value)", "--json"]])
+            XCTAssertEqual(controller.uploadDefault, value)
+        }
+    }
+
+    /// Optimistic flip + revert-on-failure (KTD-11): a nonzero exit restores
+    /// the previous value and surfaces the error, so the toggle never rests in
+    /// a position that contradicts disk.
+    func testSetUploadDefaultRevertsOnFailure() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] args in
+            if args.first == "settings", args.contains("--set") {
+                throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
+            }
+            return self?.settingsEnvelope(privacy: nil, uploadDefault: "cloud")
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+        await controller.refreshStatus()
+        XCTAssertEqual(controller.uploadDefault, "cloud")
+
+        let ok = await controller.setUploadDefault("ask")
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(controller.uploadDefault, "cloud", "failed write must revert the optimistic flip")
+        XCTAssertEqual(controller.lastError, "boom")
+    }
+
+    /// `refreshStatus` also captures the top-level `upload_default` and
+    /// `recordings_dir` (U12's toggle + storage row), even when the payload
+    /// has no v2 privacy block.
+    func testRefreshStatusCapturesUploadDefaultAndRecordingsDir() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] _ in
+            self?.settingsEnvelope(
+                privacy: nil, uploadDefault: "both", recordingsDir: "/tmp/recs"
+            )
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.refreshStatus()
+
+        XCTAssertEqual(controller.uploadDefault, "both")
+        XCTAssertEqual(controller.recordingsDir, "/tmp/recs")
+        XCTAssertNil(controller.status)
+    }
+
+    // MARK: - toggleAllow (U13's Record segment)
+
+    /// Record on a matrix-masked app ships the allow_apps add vector; the app
+    /// list refreshes afterward so the row converges with disk truth.
+    func testToggleAllowIssuesAddArgvAndRefreshes() async {
+        let fake = FakeInvoker()
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.toggleAllow(bundleId: "com.tinyspeck.slackmacgap", allowed: true)
+
+        XCTAssertEqual(fake.calls.first, [
+            "settings", "privacy", "allow_apps", "add", "com.tinyspeck.slackmacgap", "--json",
+        ])
+        XCTAssertEqual(fake.calls.last, ["apps", "--json"])
     }
 }
