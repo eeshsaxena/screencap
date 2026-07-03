@@ -59,6 +59,19 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertEqual(effects, [.startElapsedTimer, .showHUD])
     }
 
+    /// U7: the cursor-unknown recovery of a session we just started hides the main
+    /// window too, so the window-hide is consistent whether the `started` event or
+    /// the snapshot-recovery path wins the race.
+    func testObserveActiveDaemonSessionHidesWindowWhenStartedByUs() {
+        var machine = RecordingStateMachine()
+        let effects = machine.observeActiveDaemonSession(
+            startedAt: Date(timeIntervalSince1970: 100),
+            now: Date(timeIntervalSince1970: 105),
+            hideMainWindow: true
+        )
+        XCTAssertEqual(effects, [.startElapsedTimer, .showHUD, .hideMainWindow])
+    }
+
     func testRestoreRecordingAfterStopFailureUsesStartedAt() {
         var machine = RecordingStateMachine()
         let startedAt = Date(timeIntervalSince1970: 50)

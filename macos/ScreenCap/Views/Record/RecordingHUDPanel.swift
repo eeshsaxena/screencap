@@ -162,6 +162,20 @@ final class RecordingHUDPanelController {
 
     func show(recorder: RecorderController) {
         let panel = ensurePanel(recorder: recorder)
+        // Size the panel to the pill ONCE, after the hosting view has laid out
+        // inside the window (its `fittingSize` is degenerate before that — the
+        // cause of the earlier collapsed-pill). A single measure-then-set is
+        // safe because the content is `.fixedSize()` (width-independent), so the
+        // resize can't feed back into another layout pass. (An
+        // NSHostingController with `.preferredContentSize` DID feed back — an
+        // infinite Auto Layout recursion that overflowed the stack.)
+        panel.layoutIfNeeded()
+        if let content = panel.contentView {
+            let fit = content.fittingSize
+            if fit.width > 1, fit.height > 1 {
+                panel.setContentSize(fit)
+            }
+        }
         reposition(panel)
         panel.orderFrontRegardless()
     }
@@ -179,10 +193,11 @@ final class RecordingHUDPanelController {
     private func ensurePanel(recorder: RecorderController) -> NSPanel {
         if let panel { return panel }
         let hosting = NSHostingView(rootView: RecordingHUDView(recorder: recorder))
-        hosting.setFrameSize(hosting.fittingSize)
 
+        // A generous initial size the pill lays out within; `show()` shrinks the
+        // panel to the pill's measured `fittingSize` after the first layout pass.
         let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: hosting.fittingSize),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 100),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -199,7 +214,6 @@ final class RecordingHUDPanelController {
         // Exclude the HUD from screen capture so it never appears in the recording.
         panel.sharingType = .none
         panel.contentView = hosting
-        panel.setContentSize(hosting.fittingSize)
         self.panel = panel
         return panel
     }

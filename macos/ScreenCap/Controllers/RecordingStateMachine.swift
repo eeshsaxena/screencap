@@ -128,14 +128,24 @@ struct RecordingStateMachine {
 
     /// Attach to a daemon-owned session discovered via snapshot. Skips the
     /// `.starting` intermediate state since the recording is already running.
-    mutating func observeActiveDaemonSession(startedAt: Date, now: Date = Date()) -> [Effect] {
+    /// `hideMainWindow`: whether this active-session promotion should also hide
+    /// the main window. `false` for a genuine attach (app relaunch / probe found
+    /// a running session — the user likely just opened the app to check on it, so
+    /// leave the window up). `true` for the cursor-unknown recovery of a session
+    /// WE just started (the `started` event was missed) — that is a real "start"
+    /// and must hide the window like the `started` path, so the window-hide is
+    /// consistent regardless of which path wins the race (U7).
+    mutating func observeActiveDaemonSession(
+        startedAt: Date,
+        now: Date = Date(),
+        hideMainWindow: Bool = false
+    ) -> [Effect] {
         pendingStartCursor = nil
         recordingStartedAt = startedAt
         state = .recording(elapsed: now.timeIntervalSince(startedAt))
-        // Show the HUD for the active recording, but do NOT hide the main window:
-        // this attaches to an already-running session (app relaunch / snapshot
-        // recovery), often because the user just opened the app to check on it.
-        return [.startElapsedTimer, .showHUD]
+        var effects: [Effect] = [.startElapsedTimer, .showHUD]
+        if hideMainWindow { effects.append(.hideMainWindow) }
+        return effects
     }
 
     /// Transition into a stopping state (in-app Stop or Cmd+Q).

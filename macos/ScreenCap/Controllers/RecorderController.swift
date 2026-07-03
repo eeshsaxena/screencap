@@ -645,7 +645,13 @@ final class RecorderController: ObservableObject {
                         // regress `.recording` (clobbering elapsed) or `.stopping`.
                         guard let self else { return }
                         if case .starting = self.state {
-                            self.apply(self.machine.observeActiveDaemonSession(startedAt: startedAt))
+                            // We started this session (`.starting`) but missed the
+                            // `started` event (cursor-unknown recovery); treat it as
+                            // a real start and hide the main window too, so the
+                            // window-hide doesn't depend on which path wins (U7).
+                            self.apply(self.machine.observeActiveDaemonSession(
+                                startedAt: startedAt, hideMainWindow: true
+                            ))
                         }
                     }
                 )
