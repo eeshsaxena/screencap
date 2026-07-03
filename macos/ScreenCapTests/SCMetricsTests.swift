@@ -22,6 +22,37 @@ final class SCMetricsTests: XCTestCase {
         XCTAssertLessThan(SCMetrics.radiusMd, SCMetrics.radiusLg)
     }
 
+    func testSpacingRampExtendsToOnboardingGutter() {
+        XCTAssertLessThan(SCMetrics.space7, SCMetrics.space8)
+        XCTAssertEqual(SCMetrics.space8, 40)
+    }
+
+    /// The prototype radius ramp is pinned to the design's exact values, and its
+    /// numeric steps 4 → 16 are strictly increasing (the token tests' contract).
+    func testPrototypeRadiiPinnedToDesignValues() {
+        XCTAssertEqual(SCMetrics.radiusPill, 999)
+        XCTAssertEqual(SCMetrics.radiusHairline, 4)
+        XCTAssertEqual(SCMetrics.radiusTight, 6)
+        XCTAssertEqual(SCMetrics.radiusInner, 8)
+        XCTAssertEqual(SCMetrics.radiusChip, 10)
+        XCTAssertEqual(SCMetrics.radiusControl, 12)
+        XCTAssertEqual(SCMetrics.radiusPanel, 14)
+        XCTAssertEqual(SCMetrics.radiusCard, 16)
+        XCTAssertEqual(SCMetrics.radiusWindow, 12)
+    }
+
+    func testPrototypeRadiusRampIsStrictlyIncreasing() {
+        let ramp = [
+            SCMetrics.radiusHairline, SCMetrics.radiusTight, SCMetrics.radiusInner,
+            SCMetrics.radiusChip, SCMetrics.radiusControl, SCMetrics.radiusPanel,
+            SCMetrics.radiusCard,
+        ]
+        for (a, b) in zip(ramp, ramp.dropFirst()) {
+            XCTAssertLessThan(a, b, "prototype radius ramp must be strictly increasing")
+        }
+        XCTAssertGreaterThan(SCMetrics.radiusPill, SCMetrics.radiusCard)
+    }
+
     func testTypeScaleStepsAreDistinctFonts() {
         // Guards against an accidental copy-paste of the same `.system(...)` across
         // steps — e.g. `monoTimer` losing its `monospacedDigit()` and collapsing

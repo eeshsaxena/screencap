@@ -27,8 +27,19 @@ targets:
         excludes:
           - "Scripts/**"
           - "Resources/com.screencap.daemon.plist"
+          - "Resources/Fonts"
+          - "Resources/Fonts/**"
           - "Info.plist"
           - "ScreenCap.entitlements"
+      # Bundled typefaces (KTD-3) as a `type: folder` folder-reference (blue
+      # folder), which preserves the `Fonts/` directory in `Contents/Resources/`.
+      # The flat sweep above is told to skip these files (excludes) because the
+      # default flat resource handling would scatter them into
+      # `Contents/Resources/` and leave `ATSApplicationFontsPath: Fonts` pointing
+      # at a nonexistent directory — making registration a silent no-op.
+      - path: ScreenCap/Resources/Fonts
+        type: folder
+        buildPhase: resources
     resources:
       - path: ScreenCap/Assets.xcassets
     info:
@@ -39,6 +50,10 @@ targets:
         CFBundleVersion: "6"
         LSMinimumSystemVersion: "13.0"
         LSApplicationCategoryType: public.app-category.productivity
+        # Bundled typefaces live in Contents/Resources/Fonts (folder reference
+        # above). macOS registers them at launch; SCFonts.registerBundledFonts()
+        # is the belt-and-suspenders programmatic path (KTD-3).
+        ATSApplicationFontsPath: Fonts
         NSMicrophoneUsageDescription: "ScreenCap can record audio alongside your screen capture."
         NSCameraUsageDescription: "ScreenCap does not use the camera; this entry exists for permission-pane completeness."
         # NSAppleEventsUsageDescription is intentionally absent — PR1 doesn't send

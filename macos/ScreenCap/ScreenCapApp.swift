@@ -17,6 +17,12 @@ struct ScreenCapApp: App {
     @StateObject private var auth: CloudAuthController
 
     init() {
+        // Register the four bundled typefaces before any view renders (KTD-3).
+        // `ATSApplicationFontsPath` also registers them at launch; this is the
+        // belt-and-suspenders programmatic path so a folder-reference packaging
+        // slip can't silently drop the design's type. Idempotent.
+        SCFonts.registerBundledFonts()
+
         // Upload bookkeeping lives in its own app-wide observable; the auth
         // controller reads its in-flight flag (for `canSignOut`) without owning
         // the count. Build the coordinator first, then hand the auth controller
