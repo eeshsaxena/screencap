@@ -252,7 +252,9 @@ struct OnboardingPermissionsStep: View {
 
     /// The design's mono status line, resolved from the daemon's tri-state
     /// grant (honest: indeterminate is "couldn't verify", never granted or
-    /// waiting).
+    /// waiting). While the helper isn't running yet, indeterminate is
+    /// expected — say so, instead of a "couldn't verify" that reads like a
+    /// failure when the real prerequisite is the approve-helper step above.
     private func daemonStatusLine(for pane: PrivacyPane) -> (text: String, color: Color) {
         switch permissions.daemonGrant(for: pane) {
         case .granted:
@@ -260,6 +262,9 @@ struct OnboardingPermissionsStep: View {
         case .denied:
             return ("required · waiting", .scAmberText)
         case .indeterminate:
+            if showInstallRow {
+                return ("required · approve the helper above first", .scInkMuted)
+            }
             return ("required · couldn't verify yet", .scInkMuted)
         }
     }
@@ -276,7 +281,7 @@ struct OnboardingPermissionsStep: View {
 
     private var illustrationPanel: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("ENABLE SCREENCAP IN SYSTEM SETTINGS")
+            Text("DRAG THE ICON INTO SYSTEM SETTINGS")
                 .font(SCTypography.metaMonoSmall)
                 .tracking(1.05)
                 .foregroundStyle(Color.scInkMuted)
@@ -287,7 +292,12 @@ struct OnboardingPermissionsStep: View {
                 arrowGlyph
                 miniSettingsWindow
             }
-            .padding(.bottom, 22)
+            .padding(.bottom, 14)
+
+            // Accessibility attributes to the helper's own identity (SCR-201),
+            // so that pane needs the *helper* bundle dropped in, not the app.
+            helperDragChip
+                .padding(.bottom, 18)
 
             // SCR-201: the row label differs per pane — Screen & System Audio
             // rolls up to the app ("ScreenCap"); Accessibility renders the
@@ -295,9 +305,9 @@ struct OnboardingPermissionsStep: View {
             // ScreenCap decoy. Spelling both out here points the user at the
             // right rows; the row may also take a moment to appear.
             Text(
-                "In Screen & System Audio Recording, switch on “ScreenCap”. "
-                + "In Accessibility, switch on “ScreencapDaemon” — that's the helper's own row. "
-                + "If a row hasn't appeared yet, give it a moment and reopen the pane."
+                "Drag the big icon onto the Screen & System Audio Recording list, then switch on “ScreenCap”. "
+                + "For Accessibility, drag the “ScreencapDaemon” chip instead — that pane lists the helper's own row. "
+                + "Or click the pane preview to open System Settings; if a row hasn't appeared yet, give it a moment and reopen the pane."
             )
             .font(SCTypography.sans(size: 12.5))
             .foregroundStyle(Color.scInkMuted)
@@ -332,6 +342,12 @@ struct OnboardingPermissionsStep: View {
         return ("listening for permission change…", .scAmberText)
     }
 
+    /// The draggable app tile (design 124–127). The drag payload is the real
+    /// app bundle URL — macOS Privacy panes accept an .app dropped onto their
+    /// list, so the design's "drag the icon" interaction works for real for
+    /// the app-attributed panes (Screen & System Audio rolls up to the host
+    /// app). Accessibility needs the helper bundle instead — see
+    /// `helperDragChip`.
     private var appIconTile: some View {
         RoundedRectangle(cornerRadius: 20)
             .fill(Color.scCanvas)
@@ -343,7 +359,44 @@ struct OnboardingPermissionsStep: View {
             .overlay(ShellLogoMark(size: 44))
             .shadow(color: Color.scInk.opacity(0.18), radius: 12, y: 10)
             .rotationEffect(.degrees(-4))
-            .accessibilityHidden(true)
+            .onDrag { NSItemProvider(object: Bundle.main.bundleURL as NSURL) }
+            .help("Drag onto the Screen & System Audio Recording list in System Settings")
+            .accessibilityLabel("ScreenCap app icon — drag into the System Settings permission list")
+    }
+
+    /// `Contents/Library/LoginItems/ScreencapDaemon.app` inside the app
+    /// bundle — the TCC subject the Accessibility pane lists (SCR-201). nil
+    /// when the dev build shipped without an embedded helper.
+    private static var helperBundleURL: URL? {
+        let url = Bundle.main.bundleURL.appendingPathComponent(
+            "Contents/Library/LoginItems/ScreencapDaemon.app", isDirectory: true
+        )
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// A compact drag source for the helper bundle — the payload Accessibility
+    /// actually needs. Hidden when no helper is embedded (some dev builds).
+    @ViewBuilder
+    private var helperDragChip: some View {
+        if let helperURL = Self.helperBundleURL {
+            HStack(spacing: 8) {
+                ShellLogoMark(size: 14)
+                Text("ScreencapDaemon.app — drag me for Accessibility")
+                    .font(SCTypography.mono(size: 10.5))
+                    .foregroundStyle(Color.scInkSecondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.scCanvas, in: Capsule())
+            .overlay(
+                Capsule().strokeBorder(
+                    Color.scBorderWarm, style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                )
+            )
+            .onDrag { NSItemProvider(object: helperURL as NSURL) }
+            .help("Drag onto the Accessibility list in System Settings — that pane lists the helper's own row")
+            .accessibilityLabel("ScreencapDaemon helper — drag into the Accessibility permission list")
+        }
     }
 
     private var arrowGlyph: some View {
