@@ -264,9 +264,7 @@ struct PrivacySettingsView: View {
     }
 
     static func abbreviateHome(_ path: String) -> String {
-        let home = NSHomeDirectory()
-        guard path.hasPrefix(home) else { return path }
-        return "~" + path.dropFirst(home.count)
+        (path as NSString).abbreviatingWithTildeInPath
     }
 
     private func chip(_ label: String, color: Color) -> some View {
@@ -281,9 +279,12 @@ struct PrivacySettingsView: View {
 
 /// The design's 38×22 pill toggle (logic 737–742). `action == nil` renders it
 /// locked (non-interactive) — used for the always-on mask row and the stub
-/// rows, which display a state but take no input.
+/// rows/sheets, which display a state but take no input. `onFill` covers the
+/// design's two on-state fills: live teal, and soft teal for stubbed "on"
+/// states (the sheet's MCP row, the team-setup domain toggle).
 struct SettingsToggle: View {
     let on: Bool
+    var onFill: Color = .scTeal
     let action: (() -> Void)?
 
     var body: some View {
@@ -291,7 +292,7 @@ struct SettingsToggle: View {
             action?()
         } label: {
             Capsule()
-                .fill(on ? Color.scTeal : Color.scBorderWarm)
+                .fill(on ? onFill : Color.scBorderWarm)
                 .frame(width: 38, height: 22)
                 .overlay(alignment: on ? .trailing : .leading) {
                     Circle().fill(Color.scPaper).frame(width: 18, height: 18).padding(2)

@@ -66,8 +66,12 @@ struct OnboardingWizard: View {
                 await recorder.refreshDaemonGrants()
             }
             Task {
-                await privacy.refreshApps()   // seeds step 2's pre-blocked list
-                await privacy.refreshStatus() // seeds replay's storage selection
+                // Independent CLI reads — run concurrently (each spawns its
+                // own subprocess): apps seeds step 2's pre-blocked list,
+                // status seeds replay's storage selection.
+                async let apps: Void = privacy.refreshApps()
+                async let status: Void = privacy.refreshStatus()
+                _ = await (apps, status)
             }
         }
         .onDisappear {

@@ -30,7 +30,7 @@ struct OnboardingMarkerStore {
     private let defaults: UserDefaults
 
     init(
-        baseDirectory: URL = MigrationMarkerStore.defaultBaseDirectory,
+        baseDirectory: URL = AppPaths.screencapHome,
         launchAgentsDirectory: URL = OnboardingMarkerStore.defaultLaunchAgentsDirectory,
         fileManager: FileManager = .default,
         defaults: UserDefaults = .standard

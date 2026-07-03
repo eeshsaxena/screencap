@@ -121,43 +121,33 @@ final class PrivacyController: ObservableObject {
 
     // MARK: - Writes
 
-    /// Toggle `exclude_apps` membership for `bundleId`. Idempotent at the CLI
-    /// layer — `add` of an already-present value is a no-op exit 0, ditto for
-    /// `remove` of an absent value. On success the app list is refreshed so
-    /// the row's optimistic state converges with disk truth; on failure the
-    /// error is surfaced and the caller's optimistic toggle gets reseeded
-    /// when the next `refreshApps` overwrites the row.
+    /// Toggle `exclude_apps` membership for `bundleId`.
     func toggleExclude(bundleId: String, excluded: Bool) async {
-        guard !pendingToggles.contains(bundleId) else { return }
-        pendingToggles.insert(bundleId)
-        defer { pendingToggles.remove(bundleId) }
-
-        let op = excluded ? "add" : "remove"
-        do {
-            _ = try await invoke(["settings", "privacy", "exclude_apps", op, bundleId, "--json"])
-            lastError = nil
-        } catch {
-            lastError = error.localizedDescription
-        }
-        // Refresh after both success and failure paths: success ensures
-        // `in_exclude_apps` reflects the write; failure reseeds the row's
-        // optimistic toggle from disk so the user doesn't see a toggle
-        // position that contradicts the configured state.
-        await refreshApps()
+        await toggleMembership(key: "exclude_apps", bundleId: bundleId, add: excluded)
     }
 
     /// Toggle `allow_apps` membership for `bundleId` (U13's Record segment on a
-    /// matrix-masked app). Same idempotent-CLI + refresh-both-paths contract as
-    /// `toggleExclude`; shares the per-bundle in-flight guard so a rapid
-    /// Record/Block double-tap can't interleave writes against one app.
+    /// matrix-masked app).
     func toggleAllow(bundleId: String, allowed: Bool) async {
+        await toggleMembership(key: "allow_apps", bundleId: bundleId, add: allowed)
+    }
+
+    /// Shared body for the privacy-list writers. Idempotent at the CLI layer —
+    /// `add` of an already-present value is a no-op exit 0, ditto for `remove`
+    /// of an absent value. The per-bundle in-flight guard means a rapid
+    /// double-tap (or a Record/Block pair against one app) can't interleave
+    /// writes. The app list refreshes after both success and failure paths:
+    /// success ensures the membership flags reflect the write; failure reseeds
+    /// the caller's optimistic toggle from disk so the user never sees a
+    /// position that contradicts the configured state.
+    private func toggleMembership(key: String, bundleId: String, add: Bool) async {
         guard !pendingToggles.contains(bundleId) else { return }
         pendingToggles.insert(bundleId)
         defer { pendingToggles.remove(bundleId) }
 
-        let op = allowed ? "add" : "remove"
+        let op = add ? "add" : "remove"
         do {
-            _ = try await invoke(["settings", "privacy", "allow_apps", op, bundleId, "--json"])
+            _ = try await invoke(["settings", "privacy", key, op, bundleId, "--json"])
             lastError = nil
         } catch {
             lastError = error.localizedDescription

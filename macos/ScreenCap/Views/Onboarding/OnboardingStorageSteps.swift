@@ -349,12 +349,7 @@ struct OnboardingTeamStep: View {
                 .font(SCTypography.sans(size: 13))
                 .foregroundStyle(Color.scInkSecondary)
             Spacer(minLength: 8)
-            Capsule()
-                .fill(Color.scTealSoft)
-                .frame(width: 38, height: 22)
-                .overlay(alignment: .trailing) {
-                    Circle().fill(Color.scPaper).frame(width: 18, height: 18).padding(2)
-                }
+            SettingsToggle(on: true, onFill: .scTealSoft, action: nil)
                 .accessibilityHidden(true)
         }
         .padding(.horizontal, 16)
