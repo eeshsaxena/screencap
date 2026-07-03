@@ -234,15 +234,23 @@ struct SessionSnapshotResponse: Decodable {
 struct RecordingStartRequest: Encodable {
     let name: String?
     let startedBy: String?
+    /// U6: explicit audio choice from the New-recording sheet. `nil` omits the
+    /// field so the daemon falls back to `audio_default` (the plain toolbar /
+    /// menu-bar start path); `true`/`false` force the engine's audio on/off. A
+    /// stale daemon ignores the unknown field and its response omits the echo —
+    /// the app then treats the effective state as audio-on.
+    let audio: Bool?
 
-    init(name: String? = nil, startedBy: String? = nil) {
+    init(name: String? = nil, startedBy: String? = nil, audio: Bool? = nil) {
         self.name = name
         self.startedBy = startedBy
+        self.audio = audio
     }
 
     enum CodingKeys: String, CodingKey {
         case name
         case startedBy = "started_by"
+        case audio
     }
 }
 
@@ -262,6 +270,11 @@ struct RecordingStartResponse: Decodable {
     /// `/v0/events?since=<cursor>` to receive the `started` event without
     /// an extra `session.snapshot` round-trip.
     let cursor: Int
+    /// U6: the EFFECTIVE audio state the engine started with (echo of the
+    /// request's `audio`, or the daemon's `audio_default` when the request left
+    /// it unspecified). `nil` when a stale daemon omits the field entirely — the
+    /// app then assumes audio-on.
+    let audio: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -272,6 +285,7 @@ struct RecordingStartResponse: Decodable {
         case startedAt = "started_at"
         case enginePID = "engine_pid"
         case cursor
+        case audio
     }
 }
 

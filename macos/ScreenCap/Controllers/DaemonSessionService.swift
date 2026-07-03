@@ -66,6 +66,9 @@ enum DaemonSession {
     struct StartedRecording: Equatable {
         let cursor: Int
         let sessionID: String
+        /// U6: the effective audio state echoed by the daemon, or `nil` when a
+        /// stale daemon omitted it — the orchestrator treats `nil` as audio-on.
+        let audioEcho: Bool?
     }
 
     /// Error returned by `reload()` so the orchestrator can build the
@@ -113,7 +116,7 @@ enum DaemonSession {
 protocol DaemonSessionService {
     func probe() async -> DaemonSession.ProbeOutcome
     func snapshot() async -> DaemonSession.SnapshotOutcome
-    func startRecording(name: String?) async throws -> DaemonSession.StartedRecording
+    func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording
     func stopRecording(force: Bool) async throws
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome
     func reload() async -> Result<Void, DaemonSession.ReloadError>
@@ -162,11 +165,15 @@ final class LiveDaemonSessionService: DaemonSessionService {
         }
     }
 
-    func startRecording(name: String?) async throws -> DaemonSession.StartedRecording {
+    func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording {
         let response = try await DaemonClient.recordingStart(
-            RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon")
+            RecordingStartRequest(name: name, startedBy: "swiftui-via-daemon", audio: audio)
         )
-        return DaemonSession.StartedRecording(cursor: response.cursor, sessionID: response.sessionID)
+        return DaemonSession.StartedRecording(
+            cursor: response.cursor,
+            sessionID: response.sessionID,
+            audioEcho: response.audio
+        )
     }
 
     func stopRecording(force: Bool) async throws {

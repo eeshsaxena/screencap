@@ -407,6 +407,134 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertFalse(recorder.state.isRecording)
     }
 
+    // MARK: - HUD / window lifecycle (U7)
+
+    /// The `started` event floats the HUD and hides the main window.
+    func testStartedEventShowsHUDAndHidesMainWindow() {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(windowLifecycle: fake)
+        recorder._testSetPresentation(state: .starting)
+
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+
+        XCTAssertEqual(fake.showHUDCount, 1)
+        XCTAssertEqual(fake.hideMainWindowCount, 1)
+        XCTAssertEqual(fake.hideHUDCount, 0)
+    }
+
+    /// An async `recording_failed` while recording closes the HUD, restores the
+    /// main window, posts the route-to-Library signal, and surfaces the error.
+    /// Drives through `started` first so the window was genuinely hidden (the
+    /// restore is gated on that — see `mainWindowHidden`).
+    func testRecordingFailedRestoresWindowAndRoutesToLibrary() {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(windowLifecycle: fake)
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        XCTAssertEqual(fake.hideMainWindowCount, 1)  // window really hidden
+
+        let routed = expectation(forNotification: .screenCapRecordingDidEnd, object: nil)
+
+        recorder._testHandleStderrLine(#"{"type":"recording_failed","schema_version":1,"reason":"engine crashed"}"#)
+
+        wait(for: [routed], timeout: 1)
+        XCTAssertEqual(fake.hideHUDCount, 1)
+        XCTAssertEqual(fake.restoreMainWindowCount, 1)
+        XCTAssertEqual(recorder.lastError, "engine crashed")
+        XCTAssertFalse(recorder.state.isRecording)
+    }
+
+    /// A start that fails in `.starting` (pre-HUD) — e.g. the daemon→CLI fallback
+    /// path — must NOT restore/reroute, since the main window was never hidden.
+    func testStartingFailureDoesNotRestoreOrRoute() {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(windowLifecycle: fake)
+        recorder._testSetPresentation(state: .starting)
+
+        // Process exits 1 at start time (no `started` was ever observed).
+        recorder._testHandleProcessTerminated(exitCode: 1)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertEqual(fake.hideMainWindowCount, 0)
+        XCTAssertEqual(fake.restoreMainWindowCount, 0, "no window was hidden, so none is restored")
+    }
+
+    // MARK: - Audio flag (U6)
+
+    /// CLI fallback: an explicit audio-off threads `--no-audio` into the argv and
+    /// the effective state is audio-off.
+    func testCLIFallbackAudioFalseThreadsNoAudioArg() {
+        let cliService = CapturingCLIRecorderService()
+        let recorder = RecorderController(cliService: cliService)
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "demo", audio: false)
+
+        XCTAssertEqual(cliService.capturedArgs, ["start", "demo", "--no-audio"])
+        XCTAssertFalse(recorder.audioEnabled)
+    }
+
+    /// CLI fallback: audio-on omits `--no-audio` (the CLI defers to
+    /// `audio_default`); the HUD reflects audio-on.
+    func testCLIFallbackAudioTrueOmitsNoAudioArg() {
+        let cliService = CapturingCLIRecorderService()
+        let recorder = RecorderController(cliService: cliService)
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "demo", audio: true)
+
+        XCTAssertEqual(cliService.capturedArgs, ["start", "demo"])
+        XCTAssertTrue(recorder.audioEnabled)
+    }
+
+    /// CLI fallback: the plain (nil) start path — toolbar / menu bar — never adds
+    /// `--no-audio` and is treated as audio-on.
+    func testCLIFallbackAudioNilOmitsNoAudioArg() {
+        let cliService = CapturingCLIRecorderService()
+        let recorder = RecorderController(cliService: cliService)
+        recorder._testSetTransport(.cliFallback)
+
+        recorder.start(name: "demo")
+
+        XCTAssertEqual(cliService.capturedArgs, ["start", "demo"])
+        XCTAssertTrue(recorder.audioEnabled)
+    }
+
+    /// Daemon path: the audio choice threads into the request body and the
+    /// effective state mirrors the daemon's echo.
+    func testDaemonAudioThreadsToBodyAndReflectsEcho() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "demo", audioEcho: false)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+
+        recorder.start(name: "demo", audio: false)
+
+        await waitUntil { daemon.startRecordingCalled }
+        XCTAssertEqual(daemon.capturedAudio, false)
+        XCTAssertFalse(recorder.audioEnabled)
+        await recorder._testCancelDaemonTask()
+    }
+
+    /// Daemon path: a stale daemon that omits the `audio` echo is treated as
+    /// audio-on even when audio-off was requested (the stale daemon ignored the
+    /// flag and recorded with audio).
+    func testDaemonMissingEchoTreatedAsAudioOn() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "demo", audioEcho: nil)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+
+        recorder.start(name: "demo", audio: false)
+
+        await waitUntil { daemon.startRecordingCalled }
+        XCTAssertEqual(daemon.capturedAudio, false)
+        XCTAssertTrue(recorder.audioEnabled)
+        await recorder._testCancelDaemonTask()
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(
@@ -481,15 +609,65 @@ final class CapturingCLIRecorderService: CLIRecorderService {
     var currentProcess: SpawnedProcessHandle?
     private(set) var capturedEvent: (@MainActor @Sendable (RecorderEventLine) -> Void)?
     private(set) var capturedTerminated: (@MainActor @Sendable (Int32) -> Void)?
+    /// U6: the argv the orchestrator spawned with, so a test can assert the
+    /// `--no-audio` threading.
+    private(set) var capturedArgs: [String]?
 
     func start(
         args: [String],
         onEvent: @escaping @MainActor @Sendable (RecorderEventLine) -> Void,
         onTerminated: @escaping @MainActor @Sendable (Int32) -> Void
     ) throws {
+        capturedArgs = args
         capturedEvent = onEvent
         capturedTerminated = onTerminated
     }
+}
+
+/// U6: minimal `DaemonSessionService` fake that captures the `audio` body flag
+/// and returns a configurable start result (incl. a `nil` `audioEcho` to model a
+/// stale daemon). The event stream returns immediately so `startViaDaemon` settles
+/// without a live long-poll.
+@MainActor
+final class CapturingDaemonSessionService: DaemonSessionService {
+    var startResult: DaemonSession.StartedRecording
+    private(set) var capturedAudio: Bool?
+    private(set) var startRecordingCalled = false
+
+    init(startResult: DaemonSession.StartedRecording) {
+        self.startResult = startResult
+    }
+
+    func probe() async -> DaemonSession.ProbeOutcome { .daemon(grants: .allIndeterminate) }
+    func snapshot() async -> DaemonSession.SnapshotOutcome { .noActiveSession }
+
+    func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording {
+        startRecordingCalled = true
+        capturedAudio = audio
+        return startResult
+    }
+
+    func stopRecording(force: Bool) async throws {}
+    func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome { .other(localizedDescription: "") }
+    func reload() async -> Result<Void, DaemonSession.ReloadError> { .success(()) }
+    func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome {
+        .shutdown
+    }
+}
+
+/// U7: records the window-lifecycle calls so controller tests can assert the HUD
+/// / main-window effects without touching AppKit.
+@MainActor
+final class FakeWindowLifecycle: WindowLifecycle {
+    private(set) var showHUDCount = 0
+    private(set) var hideHUDCount = 0
+    private(set) var hideMainWindowCount = 0
+    private(set) var restoreMainWindowCount = 0
+
+    func showHUD(for recorder: RecorderController) { showHUDCount += 1 }
+    func hideHUD() { hideHUDCount += 1 }
+    func hideMainWindow() { hideMainWindowCount += 1 }
+    func restoreMainWindow() { restoreMainWindowCount += 1 }
 }
 
 /// Fake `StopPolicyCoordinator` that returns a fixed `StopPolicyOutcome`

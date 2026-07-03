@@ -80,6 +80,23 @@ actor RecordingFrameIndex {
         return chosen.url
     }
 
+    /// The recording's earliest captured frame URL — the Library card thumbnail
+    /// (U5), or `nil` when the recording has no frames yet / its dir is
+    /// unreadable (→ the hatched placeholder, R5). Unlike `resolve`, there is no
+    /// anchor and no staleness cap: a card wants the first real frame however old,
+    /// not a moment near a search anchor. Reuses the same cached enumeration and
+    /// the empty-not-retained policy so a still-processing recording that gains
+    /// frames after a first miss isn't stuck on the placeholder for the session.
+    func firstFrameURL(recording: String) async -> URL? {
+        let task = framesTask(for: recording)
+        let frames = await task.value
+        if frames.isEmpty {
+            if cache[recording] == task { cache[recording] = nil }
+            return nil
+        }
+        return frames.first?.url
+    }
+
     /// The cached (or freshly started) enumeration task for a recording. The disk
     /// listing runs in a detached task so a recording with many frames never
     /// blocks the actor; concurrent resolves for the same recording share it.

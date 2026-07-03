@@ -85,6 +85,12 @@ struct PrivacyMatrixDisclosure: Equatable, Identifiable {
     let optOutCommandExamples: [String]
 }
 
+extension Notification.Name {
+    /// U7: posted when a recording ends and the main window is restored, so
+    /// `MainWindow` routes the reopened shell to Library.
+    static let screenCapRecordingDidEnd = Notification.Name("com.screencap.recording.didEnd")
+}
+
 @MainActor
 final class RecorderController: ObservableObject {
     static let requiredPermissionsErrorMessage =
@@ -126,6 +132,22 @@ final class RecorderController: ObservableObject {
     /// Surfaced in the menu bar dropdown during a Cmd+Q stop. Counts down
     /// from 300s while we wait for the `stopped` event.
     @Published private(set) var quitProgressSecondsRemaining: Int?
+    /// U6/U7: the EFFECTIVE audio state of the current recording — read by the
+    /// HUD's mic indicator. Set at start from the daemon's `audio` echo (or the
+    /// CLI's deterministic `--no-audio` choice); a stale daemon that omits the
+    /// echo is treated as audio-on. Defaults to `true` between recordings.
+    @Published private(set) var audioEnabled: Bool = true
+    /// U7: the provisional recording name shown on the HUD title (the daemon
+    /// session id / CLI name — the directory slug until post-stop auto-naming
+    /// renames it; user rename is SCR-223). `nil` → the HUD shows "Recording".
+    @Published private(set) var currentRecordingName: String?
+    /// U7: true only after `.hideMainWindow` was actually applied (the live
+    /// `started` path), so a teardown restores + routes to Library ONLY when the
+    /// window was really hidden. Without this, a failure in `.starting` (which is
+    /// `state.isRecording` but pre-HUD — e.g. the daemon→CLI fallback) or a stop
+    /// of a HUD-only attach session would spuriously re-activate an already-visible
+    /// window and yank the user to Library.
+    private var mainWindowHidden = false
 
     private weak var index: RecordingsIndex?
     private weak var permissions: PermissionController?
@@ -140,6 +162,10 @@ final class RecorderController: ObservableObject {
     private let cliService: CLIRecorderService
     private let daemonService: DaemonSessionService
     private let stopPolicy: StopPolicyCoordinator
+    /// U7: HUD panel + main-window hide/restore seam. Defaults to no-op under
+    /// XCTest (see `WindowLifecycleFactory`) so controller tests never spawn a
+    /// real panel; the app gets the live implementation.
+    private let windowLifecycle: WindowLifecycle
 
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
@@ -158,13 +184,15 @@ final class RecorderController: ObservableObject {
         alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter(),
         cliService: CLIRecorderService = LiveCLIRecorderService(),
         daemonService: DaemonSessionService = LiveDaemonSessionService(),
-        stopPolicy: StopPolicyCoordinator = LiveStopPolicyCoordinator()
+        stopPolicy: StopPolicyCoordinator = LiveStopPolicyCoordinator(),
+        windowLifecycle: WindowLifecycle = WindowLifecycleFactory.makeDefault()
     ) {
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
         self.cliService = cliService
         self.daemonService = daemonService
         self.stopPolicy = stopPolicy
+        self.windowLifecycle = windowLifecycle
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -195,7 +223,12 @@ final class RecorderController: ObservableObject {
     // MARK: - Public surface
 
     /// Spawn `screencap start [<name>]` and start consuming stderr events.
-    func start(name: String? = nil) {
+    ///
+    /// `audio` is the New-recording sheet's explicit choice (U6): `nil` defers to
+    /// the persisted `audio_default` (the plain toolbar / menu-bar path), `false`
+    /// forces audio off (daemon `audio:false` / CLI `--no-audio`), `true` forces
+    /// it on via the daemon body.
+    func start(name: String? = nil, audio: Bool? = nil) {
         guard !state.isRecording else { return }
         if transport == .cliFallback, let permissions, !permissions.allRequiredGranted {
             lastError = Self.requiredPermissionsErrorMessage
@@ -217,10 +250,30 @@ final class RecorderController: ObservableObject {
 
         switch transport {
         case .daemon:
-            Task { await startViaDaemon(name: name) }
+            Task { await startViaDaemon(name: name, audio: audio) }
         case .cliFallback:
-            startViaCLI(name: name)
+            startViaCLI(name: name, audio: audio)
         }
+    }
+
+    /// U6: the inline pre-spawn block reason for the New-recording sheet, or
+    /// `nil` if start would proceed. Mirrors `start()`'s pre-spawn permission
+    /// gates WITHOUT side effects (no modal, no state change) so the sheet can
+    /// render the failing permission inline (KTD-8) rather than popping a modal
+    /// over itself. The daemon path blocks only on a denied Screen Recording
+    /// grant (the one permission fatal to capture); CLI-fallback requires all.
+    func newRecordingBlockReason() -> String? {
+        switch transport {
+        case .cliFallback:
+            if let permissions, !permissions.allRequiredGranted {
+                return Self.requiredPermissionsErrorMessage
+            }
+        case .daemon:
+            if let permissions, permissions.daemonGrants.screenRecordingDenied {
+                return Self.permissionRequiredErrorMessage(for: [.screenRecording])
+            }
+        }
+        return nil
     }
 
     func probeDaemon() async {
@@ -302,7 +355,7 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    private func startViaCLI(name: String? = nil) {
+    private func startViaCLI(name: String? = nil, audio: Bool? = nil) {
         // Same shape as the outer guard in start(name:), but it covers the
         // case where `handleDaemonOperationFailure` flips transport to
         // .cliFallback and invokes us as a fallback — at that point the
@@ -316,6 +369,16 @@ final class RecorderController: ObservableObject {
 
         var args = ["start"]
         if let name { args.append(name) }
+        // The CLI can only force audio OFF (`--no-audio`); an unspecified or
+        // `true` choice defers to `audio_default`. Reflect the deterministic
+        // part: a `false` choice is a definite audio-off, everything else is
+        // treated as audio-on for the HUD (U7) — matching the daemon path's
+        // "missing echo → audio-on".
+        if audio == false { args.append("--no-audio") }
+        audioEnabled = (audio == false) ? false : true
+        // Provisional HUD title (U7): the CLI name if supplied, else "Recording"
+        // (the engine auto-names an unnamed CLI capture; we learn it post-stop).
+        currentRecordingName = name
 
         do {
             try cliService.start(
@@ -337,9 +400,16 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    private func startViaDaemon(name: String? = nil) async {
+    private func startViaDaemon(name: String? = nil, audio: Bool? = nil) async {
         do {
-            let started = try await daemonService.startRecording(name: name)
+            let started = try await daemonService.startRecording(name: name, audio: audio)
+            // Reflect the effective audio state for the HUD (U7). A stale daemon
+            // omits the echo → treat as audio-on (it ignored the flag and
+            // recorded with audio).
+            audioEnabled = started.audioEcho ?? true
+            // The daemon's session id is the recording directory name (contract in
+            // supervisor.py) — the HUD's provisional title (U7).
+            currentRecordingName = started.sessionID
             machine.setPendingStartCursor(started.cursor)
             // Bind the started session's identity so a `cursor_unknown`
             // snapshot promotion can't attribute the UI to a foreign session
@@ -353,7 +423,7 @@ final class RecorderController: ObservableObject {
             }
         } catch {
             handleDaemonOperationFailure(error, fallback: {
-                self.startViaCLI(name: name)
+                self.startViaCLI(name: name, audio: audio)
             })
         }
     }
@@ -493,8 +563,9 @@ final class RecorderController: ObservableObject {
     /// the machine to `.idle`, and (for Cmd+Q) tell AppKit it may terminate.
     private func finalizeStop(quitting: Bool) {
         if quitting { quitProgressSecondsRemaining = nil }
-        machine.enterIdle()
-        state = machine.state
+        // enterIdle() emits the HUD close + main-window restore (U7); apply drains
+        // them and mirrors the machine's `.idle` into `state`.
+        apply(machine.enterIdle())
         if quitting { NSApp.reply(toApplicationShouldTerminate: true) }
     }
 
@@ -541,6 +612,16 @@ final class RecorderController: ObservableObject {
                 handleCaptureUnhealthy(reason: reason, reader: reader)
             case .handleCaptureRecovered(let reader):
                 handleCaptureRecovered(reader: reader)
+            case .showHUD:
+                windowLifecycle.showHUD(for: self)
+            case .hideHUD:
+                windowLifecycle.hideHUD()
+            case .hideMainWindow:
+                windowLifecycle.hideMainWindow()
+                mainWindowHidden = true
+            case .restoreMainWindow:
+                currentRecordingName = nil
+                restoreMainWindowIfHidden()
             }
         }
         state = machine.state
@@ -564,7 +645,13 @@ final class RecorderController: ObservableObject {
                         // regress `.recording` (clobbering elapsed) or `.stopping`.
                         guard let self else { return }
                         if case .starting = self.state {
-                            self.apply(self.machine.observeActiveDaemonSession(startedAt: startedAt))
+                            // We started this session (`.starting`) but missed the
+                            // `started` event (cursor-unknown recovery); treat it as
+                            // a real start and hide the main window too, so the
+                            // window-hide doesn't depend on which path wins (U7).
+                            self.apply(self.machine.observeActiveDaemonSession(
+                                startedAt: startedAt, hideMainWindow: true
+                            ))
                         }
                     }
                 )
@@ -600,8 +687,32 @@ final class RecorderController: ObservableObject {
     /// Use after transport-level rollbacks (foreign claimant, daemon failure,
     /// stream loss) that don't flow through the effect channel.
     private func transitionToIdle() {
+        // U7: if a recording was active, an abnormal end (foreign claimant, daemon
+        // failure, stream loss) must also close the HUD and restore the main
+        // window. Gated on `wasRecording` so a defensive transitionToIdle outside a
+        // recording doesn't touch the HUD; the restore itself is further gated on
+        // `mainWindowHidden` so a `.starting` failure (pre-HUD) or a HUD-only
+        // attach session doesn't spuriously re-activate + reroute.
+        let wasRecording = machine.state.isRecording
         machine.forceState(.idle)
         state = machine.state
+        if wasRecording {
+            windowLifecycle.hideHUD()
+            currentRecordingName = nil
+            restoreMainWindowIfHidden()
+        }
+    }
+
+    /// Restore the main window + route to Library ONLY when it was actually hidden
+    /// (the live `started` path set `mainWindowHidden`). No-op otherwise, so a
+    /// `.starting` failure or a HUD-only attach-session stop leaves the user's
+    /// visible window and navigation untouched (U7). Idempotent.
+    private func restoreMainWindowIfHidden() {
+        guard mainWindowHidden else { return }
+        mainWindowHidden = false
+        windowLifecycle.restoreMainWindow()
+        // Route the reopened window to Library (U7) — MainWindow observes.
+        NotificationCenter.default.post(name: .screenCapRecordingDidEnd, object: nil)
     }
 
     private func handleDaemonOperationFailure(_ error: Error, fallback: (() -> Void)? = nil) {

@@ -143,4 +143,34 @@ final class RecordingFrameIndexTests: XCTestCase {
         XCTAssertNotNil(a)
         XCTAssertEqual(a, b)
     }
+
+    // MARK: - firstFrameURL (U5 Library thumbnails)
+
+    /// The Library card thumbnail resolves to the recording's *earliest* frame,
+    /// regardless of how old — no staleness cap (unlike `resolve`).
+    func testFirstFrameURLReturnsEarliestFrame() async throws {
+        try makeFrames("rec", epochs: [1_719_400_002.0, 1_719_400_000.0, 1_719_400_001.0])
+        let index = RecordingFrameIndex(recordingsRoot: root)
+        let url = await index.firstFrameURL(recording: "rec")
+        XCTAssertEqual(url?.deletingPathExtension().lastPathComponent, "1719400000.000000")
+    }
+
+    /// A recording with no frames yet (still processing) → nil → the hatched
+    /// placeholder (R5). The empty listing is not retained, so a later call after
+    /// frames appear resolves.
+    func testFirstFrameURLMissingIsNilAndNotStuck() async throws {
+        let index = RecordingFrameIndex(recordingsRoot: root)
+        let miss = await index.firstFrameURL(recording: "rec")
+        XCTAssertNil(miss)
+        try makeFrames("rec", epochs: [1_719_400_000.0])
+        let hit = await index.firstFrameURL(recording: "rec")
+        XCTAssertEqual(hit?.deletingPathExtension().lastPathComponent, "1719400000.000000")
+    }
+
+    /// A traversal / unsafe name never reads outside the recordings tree.
+    func testFirstFrameURLTraversalNameIsNil() async {
+        let index = RecordingFrameIndex(recordingsRoot: root)
+        let url = await index.firstFrameURL(recording: "../../etc")
+        XCTAssertNil(url)
+    }
 }
