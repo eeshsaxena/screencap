@@ -21,6 +21,7 @@ _PERMISSION_CLEANUP_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
+_TIMELINE_DAY_API_VERSION = 1
 # SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
 # gains nullable timing fields without an API bump (mirrors the additive
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
@@ -75,6 +76,7 @@ _MODEL_NAMES = {
     "TimelineQueryRequest",
     "TimelineRow",
     "TimelineQueryResponse",
+    "TimelineDayRequest",
     "FrameNearestRequest",
     "FrameNearestResponse",
     "AppsListResponse",
@@ -365,6 +367,17 @@ def _load_models() -> dict[str, Any]:
         # 'authoritative' — event tables, no OCR/redaction recall loss.
         coverage: str
 
+    class TimelineDayRequest(_DaemonModel):
+        """U3 day-timeline input: a local calendar day + its UTC offset.
+
+        ``date`` is ``YYYY-MM-DD`` (format validated in the handler → typed 400).
+        ``tz_offset_seconds`` is seconds EAST of UTC, bounded to ±14h (the widest
+        real-world offset) as a boundary abuse guard.
+        """
+
+        date: str = Field(max_length=32)
+        tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
+
     # SCR-186 frame.nearest input bounds. ``timestamp_ms`` is bounded to a
     # realistic epoch ceiling (year 9999) and ``staleness_cap_ms`` to 24h —
     # comfortably above any chunk duration — so a direct UDS caller cannot drive
@@ -511,6 +524,7 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryRequest": TimelineQueryRequest,
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
+        "TimelineDayRequest": TimelineDayRequest,
         "FrameNearestRequest": FrameNearestRequest,
         "FrameNearestResponse": FrameNearestResponse,
         "AppsListResponse": AppsListResponse,
