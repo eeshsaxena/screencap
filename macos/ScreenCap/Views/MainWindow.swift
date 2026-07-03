@@ -79,7 +79,7 @@ enum FirstRunSetupPresentationPolicy {
         // a reading user by a coincident daemon-grant refresh (which the sheet's
         // own onAppear starts). Making the override explicit here removes the
         // reliance on the present-check running after this one in
-        // updateFirstRunSheetPresentation (Phase 1c, SCR-49).
+        // updatePermissionSetupPresentation (Phase 1c, SCR-49).
         guard !reopenedViaRecovery, !migrationNeeded else { return false }
         return transport == .daemon && !daemonGrants.anyRequiredDenied
     }
@@ -92,9 +92,11 @@ enum FirstRunSetupPresentationPolicy {
 /// (U13) are live.
 ///
 /// The recording banner overlays the top of the detail area. Fresh installs get
-/// the onboarding wizard takeover (U11, KTD-10) instead of the shell; upgrade
-/// users keep the migration-interstitial walkthrough sheet, which also remains
-/// the permission-loss recovery surface after onboarding.
+/// the onboarding wizard takeover (U11, KTD-10) instead of the shell; after
+/// onboarding, permission loss and the upgrade migration interstitial present
+/// the same onboarding permissions screen as a window takeover
+/// (`PermissionSetupTakeover`, U14 — the retired walkthrough sheet's
+/// replacement).
 struct MainWindow: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
@@ -112,13 +114,16 @@ struct MainWindow: View {
     @State private var route: ShellRoute = .library
     /// Non-nil while the onboarding wizard owns the window content (U11).
     @State private var onboarding: OnboardingMode?
-    @State private var showingPermissionsSheet = false
-    /// True while the walkthrough sheet is open because the user explicitly tapped
+    /// True while the permission-setup takeover owns the window content (U14 —
+    /// the onboarding permissions screen doubling as the recovery surface;
+    /// replaces the retired modal walkthrough sheet).
+    @State private var showingPermissionSetup = false
+    /// True while the permission setup is open because the user explicitly tapped
     /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
-    /// the recovery latch presents the sheet, cleared when the sheet dismisses
-    /// (`onDismiss`). Suppresses `updateFirstRunSheetPresentation`'s auto-close so a
+    /// the recovery latch presents the takeover, cleared when it closes.
+    /// Suppresses `updatePermissionSetupPresentation`'s auto-close so a
     /// coincident daemon-grant / transport update can't dismiss the just-reopened
-    /// sheet before the user acts (SCR-144).
+    /// surface before the user acts (SCR-144).
     @State private var reopenedViaRecovery = false
     /// U6: the New-recording sheet is an in-window overlay (KTD-4), presented
     /// from the Library header. Kept here (not in LibraryView) so it layers over
@@ -139,31 +144,16 @@ struct MainWindow: View {
                 OnboardingWizard(replay: mode == .replay) { destination in
                     onboarding = nil
                     route = destination == .appRules ? .appRules : .library
-                    updateFirstRunSheetPresentation()
+                    updatePermissionSetupPresentation()
                 }
+            } else if showingPermissionSetup {
+                // U14: permission repair reuses the onboarding permissions
+                // screen as a window takeover (the retired walkthrough sheet's
+                // replacement) — one permission surface everywhere.
+                PermissionSetupTakeover(onClose: closePermissionSetup)
             } else {
                 shellContent
             }
-        }
-        .sheet(isPresented: $showingPermissionsSheet, onDismiss: {
-            reopenedViaRecovery = false
-            // Phase 1c (SCR-49): dismissing the first-run sheet while migration is
-            // pending means the user has seen the one-time migration banner — it is
-            // the sheet's leading step whenever `migrationNeeded` (see
-            // FirstRunPermissionsView). Record completion here so the banner is
-            // truly one-time and the presentation override stops forcing the sheet
-            // open: `shouldPresentOnLaunch` returns true *unconditionally* while
-            // `migrationNeeded`, so without this a "Skip for now" / "Done" tap is
-            // immediately undone by the next daemon-grant refresh. Guarded +
-            // idempotent (a no-op when migration wasn't pending), and it also
-            // covers the already-installed upgrade cohort, whose helper never
-            // produces the `installedAndRunning` edge that otherwise writes the
-            // marker.
-            permissions.markMigrationComplete()
-        }) {
-            FirstRunPermissionsView(isPresented: $showingPermissionsSheet)
-                .environmentObject(permissions)
-                .environmentObject(recorder)
         }
         .sheet(isPresented: matrixDisclosurePresented) {
             if let disclosure = recorder.matrixDisclosure {
@@ -173,7 +163,7 @@ struct MainWindow: View {
         }
         .onAppear {
             decideOnboardingTakeover()
-            updateFirstRunSheetPresentation()
+            updatePermissionSetupPresentation()
         }
         .onReceive(NotificationCenter.default.publisher(for: .screenCapRecordingDidEnd)) { _ in
             // U7: a recording ended and the main window was restored — land on
@@ -181,24 +171,24 @@ struct MainWindow: View {
             route = .library
         }
         .onChange(of: recorder.daemonProbeCompleted) { _ in
-            updateFirstRunSheetPresentation()
+            updatePermissionSetupPresentation()
         }
         .onChange(of: recorder.transport) { _ in
-            updateFirstRunSheetPresentation()
+            updatePermissionSetupPresentation()
         }
         .onChange(of: permissions.daemonGrants) { _ in
             // The gate keys on daemon-reported grants now (U4), and a refresh
             // (U5) can flip them while the window is open — re-evaluate so the
             // sheet appears on a newly-detected denial and closes once the
             // daemon path is satisfied.
-            updateFirstRunSheetPresentation()
+            updatePermissionSetupPresentation()
         }
         .onChange(of: permissions.migrationNeeded) { _ in
             // Phase 1c (SCR-49): the one-time migration marker flips this false
             // when the helper install completes mid-sheet. Re-evaluate so the
             // post-migration auto-close path keys on daemon grants again rather
             // than the migration override holding the sheet open.
-            updateFirstRunSheetPresentation()
+            updatePermissionSetupPresentation()
         }
         .onChange(of: permissions.reopenSetupRequested) { requested in
             // Explicit user recovery action ("Finish setup" in the Privacy tab):
@@ -206,11 +196,11 @@ struct MainWindow: View {
             // the launch gate. This is the way back from a mistaken "Skip for
             // now". Consume the latch so it doesn't re-present on later updates.
             guard requested else { return }
-            // Mark this as a recovery-latched open so updateFirstRunSheetPresentation
+            // Mark this as a recovery-latched open so updatePermissionSetupPresentation
             // won't auto-close it out from under the user (SCR-144). Cleared in the
             // sheet's onDismiss.
             reopenedViaRecovery = true
-            showingPermissionsSheet = true
+            showingPermissionSetup = true
             permissions.consumeReopenSetupRequest()
         }
     }
@@ -328,7 +318,7 @@ struct MainWindow: View {
         }
     }
 
-    private func updateFirstRunSheetPresentation() {
+    private func updatePermissionSetupPresentation() {
         // U11: the onboarding wizard embeds the install + grant machinery —
         // never pop (or auto-close bookkeeping for) the walkthrough sheet while
         // the takeover owns the window.
@@ -349,18 +339,19 @@ struct MainWindow: View {
         // If the flag is still set while the sheet is no longer showing, that clear
         // was missed — reset it here so a later satisfied-daemon update auto-closes
         // normally. (Durable fix: fold both sheets into one enum-driven binding.)
-        if reopenedViaRecovery, !showingPermissionsSheet {
+        if reopenedViaRecovery, !showingPermissionSetup {
             reopenedViaRecovery = false
         }
         // Auto-close decision lives in FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate
-        // (see its doc-comment); suppressed while the sheet was reopened via the recovery latch.
-        if FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
+        // (see its doc-comment); suppressed while the takeover was reopened via
+        // the recovery latch.
+        if showingPermissionSetup, FirstRunSetupPresentationPolicy.shouldAutoCloseOnUpdate(
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
             reopenedViaRecovery: reopenedViaRecovery,
             migrationNeeded: permissions.migrationNeeded
         ) {
-            showingPermissionsSheet = false
+            closePermissionSetup()
         }
         if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
             daemonProbeCompleted: recorder.daemonProbeCompleted,
@@ -370,8 +361,24 @@ struct MainWindow: View {
             migrationNeeded: permissions.migrationNeeded,
             onboardingTakeoverActive: onboarding != nil
         ) {
-            showingPermissionsSheet = true
+            showingPermissionSetup = true
         }
+    }
+
+    /// The takeover's single close path — the step's Continue and the policy
+    /// auto-close both land here. Carries the retired sheet's `onDismiss`
+    /// bookkeeping: clear the recovery latch (SCR-144) and record migration
+    /// completion (Phase 1c, SCR-49 — guarded + idempotent, a no-op when
+    /// migration wasn't pending; also covers the already-installed upgrade
+    /// cohort whose helper never produces the `installedAndRunning` edge that
+    /// otherwise writes the marker). Without the marker write,
+    /// `shouldPresentOnLaunch` returns true *unconditionally* while
+    /// `migrationNeeded` and a close would be immediately undone by the next
+    /// daemon-grant refresh.
+    private func closePermissionSetup() {
+        reopenedViaRecovery = false
+        permissions.markMigrationComplete()
+        showingPermissionSetup = false
     }
 
     private var matrixDisclosurePresented: Binding<Bool> {
@@ -400,54 +407,13 @@ struct MainWindow: View {
         )
         .navigationSplitViewColumnWidth(248)
         .navigationTitle("ScreenCap")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                recordingToolbarControl
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    Task { await index.refresh() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Refresh recordings")
-            }
-        }
-    }
-
-    /// Persistent Start / Stop control in the window toolbar so the user can
-    /// reach it without going to the menu bar once the calendar is populated
-    /// (the empty-state Start button only renders when totalCount == 0).
-    /// State branches mirror MenuBarMenu so the two surfaces stay in lockstep.
-    @ViewBuilder
-    private var recordingToolbarControl: some View {
-        if recorder.quitProgressSecondsRemaining != nil {
-            // Non-actionable during a Cmd+Q-driven shutdown — the menu bar
-            // already shows the countdown line.
-            Label("Finalizing…", systemImage: "hourglass")
-                .labelStyle(.titleAndIcon)
-                .foregroundStyle(.secondary)
-        } else if case .recording = recorder.state {
-            Button {
-                recorder.stop()
-            } label: {
-                Label("Stop", systemImage: "stop.circle.fill")
-            }
-            .help("Stop recording")
-        } else if recorder.state.isRecording {
-            // .starting or .stopping — surface progress, don't offer an
-            // action that would re-enter the state machine.
-            Label(recorder.state.isStopping ? "Stopping…" : "Starting…", systemImage: "hourglass")
-                .labelStyle(.titleAndIcon)
-                .foregroundStyle(.secondary)
-        } else {
-            Button {
-                recorder.start()
-            } label: {
-                Label("Start", systemImage: "record.circle")
-            }
-            .help("Start a new recording")
-        }
+        // The prototype has no window toolbar (U14 fidelity pass): the old
+        // toolbar Start/Stop duplicated the Library header pill (which flips
+        // to "Stop recording" while capture runs, U6), the menu bar, and the
+        // HUD; refresh happens on recording events and from the Library error
+        // state. Hiding the toolbar also drops the sidebar-collapse control —
+        // the design's sidebar is fixed.
+        .toolbar(.hidden, for: .windowToolbar)
     }
 
     @ViewBuilder

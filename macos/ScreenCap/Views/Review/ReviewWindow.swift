@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Stable scene id for the per-recording review `WindowGroup`. Shared by the
-/// scene declaration in `ScreenCapApp` and the row-button callsite in
-/// `RecordingsListView` so producer and consumers can't drift.
+/// scene declaration in `ScreenCapApp` and the Library card's "Review &
+/// upload…" callsite so producer and consumers can't drift.
 let ReviewWindowID = "review"
 
 /// Per-recording review window (plan U3 scaffolded, U8 composed). A

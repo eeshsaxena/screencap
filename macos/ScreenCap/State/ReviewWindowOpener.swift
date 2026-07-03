@@ -7,10 +7,11 @@ import Foundation
 /// tests that have no `@Environment(\.openWindow)` available can still open
 /// a review window — or substitute a fake to assert the call.
 ///
-/// Production callsite is the Upload button in `RecordingsListView`, which
-/// has the SwiftUI environment available and calls `openWindow(...)` directly.
-/// This singleton exists for parity with `WindowOpener` and for the unit-test
-/// observability the plan calls out under U3.
+/// The Library card's "Review & upload…" action (U5) has the SwiftUI
+/// environment available and calls `openWindow(...)` directly; the Inspect
+/// window's Review deep link goes through this seam. The singleton also
+/// exists for parity with `WindowOpener` and for the unit-test observability
+/// the plan calls out under U3.
 @MainActor
 final class ReviewWindowOpener: ObservableObject {
     static let shared = ReviewWindowOpener()

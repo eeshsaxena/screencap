@@ -43,7 +43,7 @@ struct OnboardingWizard: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            trafficLights
+            windowControlsSlot
             stepContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             progressDots
@@ -88,8 +88,8 @@ struct OnboardingWizard: View {
         }
         .onChange(of: daemonInstaller.state) { state in
             // Helper confirmed running mid-wizard: record the one-time
-            // migration explainer as satisfied (mirrors FirstRunPermissionsView)
-            // so the legacy sheet's banner never pops after the wizard.
+            // migration explainer as satisfied (mirrors PermissionSetupTakeover)
+            // so the migration banner never pops after the wizard.
             if state == .installedAndRunning {
                 permissions.markMigrationComplete()
             }
@@ -283,16 +283,14 @@ struct OnboardingWizard: View {
 
     // MARK: - Chrome
 
-    private var trafficLights: some View {
-        HStack(spacing: SCMetrics.space2) {
-            Circle().fill(Color.scTrafficRed).frame(width: 12, height: 12)
-            Circle().fill(Color.scTrafficYellow).frame(width: 12, height: 12)
-            Circle().fill(Color.scTrafficGreen).frame(width: 12, height: 12)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 18)
-        .accessibilityHidden(true)
+    /// The design's mock traffic-light dots are the prototype's fake window
+    /// chrome. The window uses `.hiddenTitleBar`, so the REAL controls overlay
+    /// this slot while the takeover owns the window content — reserve the
+    /// row's height instead of drawing a second set (U14 fidelity pass).
+    private var windowControlsSlot: some View {
+        Color.clear
+            .frame(height: 12)
+            .padding(.vertical, 18)
     }
 
     private var progressDots: some View {
@@ -318,6 +316,8 @@ struct OnboardingWizard: View {
 struct OnboardingPrimaryButton: View {
     let title: String
     var enabled: Bool = true
+    /// Optional key binding (the migration banner's Continue is `.defaultAction`).
+    var shortcut: KeyboardShortcut?
     let action: () -> Void
 
     var body: some View {
@@ -331,6 +331,7 @@ struct OnboardingPrimaryButton: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .keyboardShortcut(shortcut)
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.5)
     }

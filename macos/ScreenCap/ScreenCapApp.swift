@@ -90,6 +90,12 @@ struct ScreenCapApp: App {
                     }
                 }
         }
+        // The prototype has no title bar: content fills the window and the
+        // real traffic lights overlay the sidebar's reserved chrome slot
+        // (design 300–304 draws mock dots there; see ShellSidebarView). The
+        // window keeps `.titled` in its styleMask, so the SCR-55 reopen/focus
+        // guards (AppDelegate, MenuBarMenu) are unaffected.
+        .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
         .commands {
             CommandGroup(replacing: .newItem) {}

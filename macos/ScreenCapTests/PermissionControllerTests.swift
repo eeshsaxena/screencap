@@ -17,21 +17,6 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertEqual(permissions.microphone, .notDetermined)
     }
 
-    @MainActor
-    func testPermissionSheetDismissesBeforeRelaunching() async {
-        var events: [String] = []
-
-        await PermissionSheetRelaunchFlow.dismissThenRelaunch(
-            dismiss: { events.append("dismiss") },
-            relaunch: { events.append("relaunch") },
-            sleep: { nanoseconds in
-                XCTAssertEqual(nanoseconds, PermissionSheetRelaunchFlow.sheetDismissalDelayNanoseconds)
-                events.append("delay")
-            }
-        )
-
-        XCTAssertEqual(events, ["dismiss", "delay", "relaunch"])
-    }
 
     func testRelaunchHelperExitsOnTimeoutInsteadOfOpeningNewInstance() {
         let script = PermissionController.relaunchHelperShellScript(
@@ -661,21 +646,6 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertFalse(permissions.migrationNeeded)
     }
 
-    func testGrantRowIconsAreThreeDistinctStates() {
-        // Indeterminate must read as "couldn't verify" — never a granted check
-        // or a denied needs-action. All three labels must be distinct.
-        XCTAssertEqual(FirstRunPermissionsView.grantRowIcon(for: .granted).accessibilityLabel, "Granted")
-        XCTAssertEqual(FirstRunPermissionsView.grantRowIcon(for: .denied).accessibilityLabel, "Needs action")
-        XCTAssertEqual(
-            FirstRunPermissionsView.grantRowIcon(for: .indeterminate).accessibilityLabel,
-            "Couldn't verify"
-        )
-        let labels = Set(
-            [DaemonGrantState.granted, .denied, .indeterminate]
-                .map { FirstRunPermissionsView.grantRowIcon(for: $0).accessibilityLabel }
-        )
-        XCTAssertEqual(labels.count, 3)
-    }
 
     // MARK: - SCR-201: row label is per-pane (SR rolls up to the app)
 
@@ -698,37 +668,16 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertEqual(PrivacyPane.microphone.helperSettingsEntryName, "ScreenCap")
     }
 
-    func testHelperRowIconFallsBackToSymbolWhenAppIconMissing() {
-        // R4: an absent app-icon image must yield the SF Symbol fallback, never a
-        // blank frame.
-        switch FirstRunPermissionsView.helperRowIcon(appIcon: nil) {
-        case .symbol(let name):
-            XCTAssertEqual(name, FirstRunPermissionsView.helperRowFallbackSymbol)
-            XCTAssertFalse(name.isEmpty)
-        case .image:
-            XCTFail("nil app icon must resolve to the SF Symbol fallback, not an image")
-        }
-    }
-
-    func testHelperRowIconUsesAppIconWhenPresent() {
-        let icon = NSImage(size: NSSize(width: 1, height: 1))
-        switch FirstRunPermissionsView.helperRowIcon(appIcon: icon) {
-        case .image:
-            break  // expected
-        case .symbol:
-            XCTFail("a present app icon must be used, not the fallback symbol")
-        }
-    }
-
-    // MARK: - SCR-200 U6 (R7): block-with-Retry heuristic
+    // MARK: - SCR-200 U6 (R7): block-with-Retry heuristic (lives on the
+    // permissions screen since the walkthrough sheet's retirement, U14)
 
     private func rowState(
         _ grant: DaemonGrantState,
         registering: Bool = false,
         elapsed: TimeInterval? = nil,
         budget: TimeInterval = 25
-    ) -> FirstRunPermissionsView.DaemonRowState {
-        FirstRunPermissionsView.daemonRowState(
+    ) -> OnboardingPermissionsStep.DaemonRowState {
+        OnboardingPermissionsStep.daemonRowState(
             grant: grant,
             isRegistering: registering,
             elapsedSinceOpened: elapsed,

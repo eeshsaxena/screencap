@@ -1,17 +1,23 @@
 import SwiftUI
 
-/// U11 step 1 — permissions (design 87–151). Left column: heading + the three
-/// permission rows with live mono status; right column: the design's drag-icon
-/// panel rendered as an instructional illustration wired to the real "Open
-/// System Settings" flow, with the watchdog "listening…" footer.
+/// The permissions screen (design 87–151) — U11 wizard step 1 AND, since the
+/// modal walkthrough sheet's retirement (U14), the app's only permission
+/// surface: `PermissionSetupTakeover` presents this same screen for the
+/// launch gate and the Privacy pane's "Finish setup" recovery. Left column:
+/// heading + the three permission rows with live mono status; right column:
+/// the design's drag-icon panel rendered as an instructional illustration
+/// wired to the real "Open System Settings" flow, with the watchdog
+/// "listening…" footer.
 ///
 /// The daemon-install sub-states (install-needed / installing / failed) embed
 /// above the rows — the helper must exist before its TCC rows can be granted.
-/// Row semantics reuse the walkthrough's hard-won rules: daemon-subject
+/// Row semantics carry the retired sheet's hard-won rules: daemon-subject
 /// registration before the pane opens (SCR-200 AE2), per-pane row labels
 /// (SCR-201 — the Accessibility row is "ScreencapDaemon", not "ScreenCap"),
-/// tri-state grants where indeterminate never blocks, and the CLI-fallback
-/// "Restart to apply permissions" escape hatch (TCC per-process caching).
+/// tri-state grants where indeterminate never blocks, the grant-state-timeout
+/// heuristic (SCR-200 U6 / R7 — `daemonRowState`), the ad-hoc dev-build
+/// advisory, and the CLI-fallback "Restart to apply permissions" escape hatch
+/// (TCC per-process caching).
 struct OnboardingPermissionsStep: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
@@ -19,6 +25,11 @@ struct OnboardingPermissionsStep: View {
     let onContinue: () -> Void
 
     @State private var isPreparingRelaunch = false
+    /// When the user last opened each daemon pane (= reached the toggle step).
+    /// Drives the SCR-200 U6 grant-state-timeout heuristic: the row can only
+    /// flip to "couldn't set this up" after the user has had a real chance to
+    /// toggle (R7). Re-tapping the row restarts the budget (the retry).
+    @State private var openedDaemonPaneAt: [PrivacyPane: Date] = [:]
 
     var body: some View {
         HStack(alignment: .top, spacing: 44) {
@@ -49,7 +60,7 @@ struct OnboardingPermissionsStep: View {
 
             VStack(spacing: 10) {
                 if showInstallRow {
-                    installRow
+                    HelperInstallCard(daemonInstaller: daemonInstaller)
                 }
                 permissionRow(
                     title: "Screen & system audio",
@@ -57,7 +68,7 @@ struct OnboardingPermissionsStep: View {
                     granted: permissions.daemonGrant(for: .screenRecording) == .granted,
                     registering: permissions.isDaemonRegistering(.screenRecording)
                 ) {
-                    permissions.requestAndOpenSettings(for: .screenRecording, subject: .daemon)
+                    openDaemonPane(.screenRecording)
                 }
                 permissionRow(
                     title: "Accessibility",
@@ -65,7 +76,7 @@ struct OnboardingPermissionsStep: View {
                     granted: permissions.daemonGrant(for: .accessibility) == .granted,
                     registering: permissions.isDaemonRegistering(.accessibility)
                 ) {
-                    permissions.requestAndOpenSettings(for: .accessibility, subject: .daemon)
+                    openDaemonPane(.accessibility)
                 }
                 permissionRow(
                     title: "Microphone",
@@ -78,11 +89,16 @@ struct OnboardingPermissionsStep: View {
                 }
             }
 
+            if permissions.showAdHocDevBuildWarning {
+                adHocDevBuildCallout
+                    .padding(.top, 10)
+            }
+
             Spacer(minLength: SCMetrics.space5)
 
             HStack(spacing: 16) {
                 OnboardingPrimaryButton(title: "Open System Settings") {
-                    permissions.requestAndOpenSettings(for: .screenRecording, subject: .daemon)
+                    openDaemonPane(.screenRecording)
                 }
                 OnboardingLinkButton(title: "Continue", action: onContinue)
             }
@@ -112,91 +128,8 @@ struct OnboardingPermissionsStep: View {
         daemonInstaller.state != .installedAndRunning && recorder.transport != .daemon
     }
 
-    private var installRow: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("ScreenCap helper")
-                        .font(SCTypography.sans(size: 13.5, weight: .semibold))
-                        .foregroundStyle(Color.scInk)
-                    Text(installStatusText)
-                        .font(SCTypography.mono(size: 10.5))
-                        .foregroundStyle(installStatusColor)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
-            }
-            HStack(spacing: 8) {
-                switch daemonInstaller.state {
-                case .idle, .installFailed, .pollingFailed:
-                    smallActionButton("Approve helper") {
-                        Task { await daemonInstaller.install() }
-                    }
-                case .requiresApproval:
-                    smallActionButton("Open Login Items") {
-                        DaemonInstallController.openLoginItemsSettings()
-                    }
-                    smallActionButton("Retry") {
-                        Task { await daemonInstaller.retry() }
-                    }
-                case .registering, .polling:
-                    ProgressView().controlSize(.small)
-                case .installedAndRunning:
-                    EmptyView()
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 13)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.scPaper, in: RoundedRectangle(cornerRadius: SCMetrics.radiusChip))
-        .overlay(
-            RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
-                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
-        )
-    }
-
-    private var installStatusText: String {
-        switch daemonInstaller.state {
-        case .idle:
-            return "recording runs through a background helper — approve it first"
-        case .registering:
-            return "starting helper…"
-        case .requiresApproval:
-            return "approve ScreenCap in System Settings → Login Items"
-        case .polling:
-            return "waiting for the helper to start…"
-        case .installedAndRunning:
-            return "helper running"
-        case .pollingFailed(let reason):
-            return reason.lowercased()
-        case .installFailed:
-            return "the helper could not be installed — retry"
-        }
-    }
-
-    private var installStatusColor: Color {
-        switch daemonInstaller.state {
-        case .installFailed, .pollingFailed: return .scRust
-        case .installedAndRunning: return .scTeal
-        default: return .scAmberText
-        }
-    }
-
-    private func smallActionButton(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(SCTypography.sans(size: 12, weight: .semibold))
-                .foregroundStyle(Color.scTeal)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .overlay(Capsule().strokeBorder(Color.scTeal.opacity(0.5), lineWidth: 1))
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Permission rows (design 94–120)
+    // MARK: - Permission rows (design 94–120; pill chrome + install card shared
+    // with the walkthrough sheet via PermissionSetupUI)
 
     private func permissionRow(
         title: String,
@@ -218,31 +151,14 @@ struct OnboardingPermissionsStep: View {
                 Spacer(minLength: 8)
                 if registering {
                     ProgressView().controlSize(.small)
-                } else if granted {
-                    Circle()
-                        .fill(Color.scTeal)
-                        .frame(width: 20, height: 20)
-                        .overlay(
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(Color.scCanvas)
-                        )
-                        .accessibilityLabel("Granted")
                 } else {
-                    Circle()
-                        .strokeBorder(Color.scBorderWarm, lineWidth: 2)
-                        .frame(width: 20, height: 20)
-                        .accessibilityLabel("Not granted")
+                    GrantStateBadge(
+                        granted: granted,
+                        accessibilityLabel: granted ? "Granted" : "Not granted"
+                    )
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 13)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.scPaper, in: RoundedRectangle(cornerRadius: SCMetrics.radiusChip))
-            .overlay(
-                RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
-                    .strokeBorder(Color.scBorderWarm, lineWidth: 1)
-            )
+            .permissionPillChrome()
             .contentShape(RoundedRectangle(cornerRadius: SCMetrics.radiusChip))
         }
         .buttonStyle(.plain)
@@ -250,13 +166,35 @@ struct OnboardingPermissionsStep: View {
         .help(granted ? "" : "Open the matching System Settings pane")
     }
 
+    /// Open a daemon pane: daemon-subject registration + System Settings
+    /// (SCR-200 AE2). Every tap (re)starts the SCR-200 U6 heuristic budget —
+    /// re-tapping a blocked row IS the retry.
+    private func openDaemonPane(_ pane: PrivacyPane) {
+        openedDaemonPaneAt[pane] = Date()
+        permissions.requestAndOpenSettings(for: pane, subject: .daemon)
+    }
+
     /// The design's mono status line, resolved from the daemon's tri-state
     /// grant (honest: indeterminate is "couldn't verify", never granted or
     /// waiting). While the helper isn't running yet, indeterminate is
     /// expected — say so, instead of a "couldn't verify" that reads like a
     /// failure when the real prerequisite is the approve-helper step above.
+    /// A row the user opened that never became grantable within the budget
+    /// flips to "couldn't set this up" with the row tap as the retry
+    /// (SCR-200 U6 / R7 — never a manual "+" add, never a silent advance).
     private func daemonStatusLine(for pane: PrivacyPane) -> (text: String, color: Color) {
-        switch permissions.daemonGrant(for: pane) {
+        let grant = permissions.daemonGrant(for: pane)
+        let elapsed = openedDaemonPaneAt[pane].map { Date().timeIntervalSince($0) }
+        let rowState = Self.daemonRowState(
+            grant: grant,
+            isRegistering: permissions.isDaemonRegistering(pane),
+            elapsedSinceOpened: elapsed,
+            budget: Self.daemonRowBlockBudget
+        )
+        if rowState == .blockedWithRetry {
+            return ("couldn't set this up · click to retry", .scRust)
+        }
+        switch grant {
         case .granted:
             return ("granted", .scTeal)
         case .denied:
@@ -267,6 +205,79 @@ struct OnboardingPermissionsStep: View {
             }
             return ("required · couldn't verify yet", .scInkMuted)
         }
+    }
+
+    /// The trailing state of a daemon permission row (SCR-200 U6 / R7),
+    /// carried over from the retired walkthrough sheet.
+    enum DaemonRowState: Equatable {
+        case granted
+        case registering       // a daemon round-trip is in flight
+        case actionable        // normal open/grant — not (yet) blocked
+        case blockedWithRetry  // budget exhausted with the row still not granted
+    }
+
+    /// Budget after the user opens a pane before a still-denied row is treated
+    /// as "couldn't set this up" (R7). Generous so a slow-but-normal toggle
+    /// never false-blocks; the exact value is on-device-tuned.
+    static let daemonRowBlockBudget: TimeInterval = 25
+
+    /// Resolve a daemon row's state from the registration-outcome +
+    /// grant-state-timeout heuristic (R7). There is **no** public, non-SIP API
+    /// for TCC row *presence* — an absent row and a present-but-OFF row both
+    /// read `denied`, and TCC.db is SIP-protected — so "the row never
+    /// appeared" is *inferred*, not read: the pane was opened (registration
+    /// fired) AND the grant has not resolved to `granted` within `budget`
+    /// after the user reached the toggle step. The block is gated on
+    /// `elapsedSinceOpened` so it never fires before the user has had a real
+    /// chance to toggle (no immediate post-install false-block).
+    /// `indeterminate` ("couldn't verify") keeps the row actionable rather
+    /// than blocking, so a transient probe hiccup can't false-block a user
+    /// who is actually granted.
+    static func daemonRowState(
+        grant: DaemonGrantState,
+        isRegistering: Bool,
+        elapsedSinceOpened: TimeInterval?,
+        budget: TimeInterval
+    ) -> DaemonRowState {
+        if grant == .granted { return .granted }
+        if isRegistering { return .registering }
+        // Not yet opened → the user hasn't reached the toggle step; never block.
+        guard let elapsed = elapsedSinceOpened else { return .actionable }
+        // Couldn't verify → keep the row actionable, don't hard-block.
+        if grant == .indeterminate { return .actionable }
+        // Opened + still denied past the budget → the row didn't take.
+        if elapsed >= budget { return .blockedWithRetry }
+        return .actionable
+    }
+
+    /// Developer-only hint: on an ad-hoc build, TCC grants are orphaned on
+    /// every rebuild, so the rows can read "waiting" even though System
+    /// Settings shows an earlier build as granted. Explains the cause and the
+    /// fix so a developer doesn't chase a phantom permission bug. Never
+    /// renders on a signed build (see
+    /// `PermissionController.showAdHocDevBuildWarning`).
+    private var adHocDevBuildCallout: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "hammer.fill")
+                .font(SCTypography.sans(size: 12))
+                // Developer advisory — de-colored to neutral (R7), not orange.
+                .foregroundStyle(Color.scAdvisoryFg)
+                .padding(.top, 2)
+                // Decorative — the adjacent warning text conveys the full
+                // meaning; keep VoiceOver from announcing the symbol as a
+                // separate, content-free focus stop.
+                .accessibilityHidden(true)
+            Text(PermissionController.adHocDevBuildWarning)
+                .font(SCTypography.sans(size: 11.5))
+                .foregroundStyle(Color.scInkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .fill(Color.scAdvisorySurface)
+        )
     }
 
     private var microphoneStatusLine: (text: String, color: Color) {
@@ -426,7 +437,7 @@ struct OnboardingPermissionsStep: View {
                     .font(SCTypography.sans(size: 11))
                     .foregroundStyle(Color.scInkSecondary)
                 Button {
-                    permissions.requestAndOpenSettings(for: .screenRecording, subject: .daemon)
+                    openDaemonPane(.screenRecording)
                 } label: {
                     HStack(spacing: 8) {
                         ShellLogoMark(size: 16).opacity(0.45)

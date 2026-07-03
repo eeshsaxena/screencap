@@ -15,7 +15,8 @@ final class LaunchSurfaceTokenTests: XCTestCase {
         "ScreenCap/ScreenCapApp.swift",
         "ScreenCap/Views/RecordingBanner.swift",
         "ScreenCap/Views/MainWindow.swift",
-        "ScreenCap/Views/Privacy/FirstRunPermissionsView.swift",
+        "ScreenCap/Views/Privacy/PermissionSetupTakeover.swift",
+        "ScreenCap/Views/Onboarding/OnboardingPermissionsStep.swift",
     ]
 
     /// Color literals that R7 retires. `.primary` / `.secondary` are intentionally

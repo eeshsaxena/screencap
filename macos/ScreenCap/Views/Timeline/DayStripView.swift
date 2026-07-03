@@ -3,9 +3,9 @@ import SwiftUI
 // U9 — the horizontal day strip (design 444–467): labeled recording segment
 // bands over a neutral base track, hatched provably-blocked bands, amber
 // search-match markers, a black playhead, hour labels, and the legend. The
-// geometry lives in the pure `DayStripLayout` (adapting SearchTimelineLayout)
-// so time→x mapping and the dynamic axis bounds are unit-testable without a
-// render (DayStripLayoutTests).
+// geometry lives in the pure `DayStripLayout` (adapted from the retired
+// SearchTimelineLayout) so time→x mapping and the dynamic axis bounds are
+// unit-testable without a render (DayStripLayoutTests).
 
 /// A recording span placed on the strip (from `/v0/timeline.day`), labeled with
 /// the recording *title* — agent task labels arrive with SCR-214.
@@ -78,7 +78,7 @@ enum DayStripLayout {
 
     /// Map a wall-clock ms to an x in `[0, width]`, clamped to the bounds. A
     /// non-positive width or span maps everything to 0 — no NaN, no
-    /// divide-by-zero (mirrors SearchTimelineLayout.placeMarkers).
+    /// divide-by-zero (the retired SearchTimelineLayout's placeMarkers rule).
     static func x(forMs ms: Int, bounds: Bounds, width: CGFloat) -> CGFloat {
         let span = Double(bounds.spanMs)
         guard width > 0, span > 0 else { return 0 }
@@ -101,8 +101,9 @@ enum DayStripLayout {
         return stride(from: bounds.startMs, through: bounds.endMs, by: step).map { $0 }
     }
 
-    /// Collapse marker xs by single-linkage chaining (the SearchTimelineLayout
-    /// clustering contract, same 14pt default threshold): walking left-to-right,
+    /// Collapse marker xs by single-linkage chaining (the retired
+    /// SearchTimelineLayout's clustering contract, same 14pt default
+    /// threshold): walking left-to-right,
     /// an x joins the current cluster when within `thresholdPx` of the previous
     /// one; the cluster renders at the mean x. Keeps a dense day's markers
     /// legible instead of painting dozens of overlapping bars.
@@ -244,7 +245,7 @@ struct DayStripView: View {
     }
 
     /// Invisible positioned elements so VoiceOver announces segment titles, the
-    /// blocked caption, and the playhead time (reusing the SearchDayTimeline
+    /// blocked caption, and the playhead time (the retired SearchDayTimeline's
     /// overlay pattern — Canvas content is opaque to accessibility).
     private func accessibilityOverlays(width: CGFloat) -> some View {
         ZStack(alignment: .topLeading) {

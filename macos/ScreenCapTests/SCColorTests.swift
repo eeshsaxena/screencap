@@ -55,7 +55,6 @@ final class SCColorTests: XCTestCase {
         "SCTeal", "SCTealHover", "SCTealSoft",
         "SCAmber", "SCAmberText", "SCAmberHUD", "SCRust",
         "SCDarkCanvas", "SCHUDSurface", "SCHUDSurfaceRaised", "SCHUDMuted",
-        "SCTrafficRed", "SCTrafficYellow", "SCTrafficGreen",
         "SCTile1", "SCTile2", "SCTile3", "SCTile4", "SCTile5",
     ]
 

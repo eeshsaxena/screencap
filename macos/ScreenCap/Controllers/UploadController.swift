@@ -37,8 +37,8 @@ final class LiveUploadService: UploadService {
     /// The `screencap upload` argv for the interactive path. Extracted so the
     /// `--lock-timeout` injection is unit-testable (the `UploadService` seam
     /// otherwise hides argv from `FakeUploadService`). The trailing `--`
-    /// matches the RecordingsListView "view" callsite: forces Click to treat
-    /// the recording name as a positional argument even if it begins with `--`.
+    /// forces Click to treat the recording name as a positional argument even
+    /// if it begins with `--`.
     static func uploadArgs(name: String) -> [String] {
         ["upload", "--lock-timeout", String(interactiveLockTimeoutSeconds), "--", name]
     }
