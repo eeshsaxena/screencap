@@ -27,7 +27,33 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     /// drop indicator.
     let drops: [String: Int]?
 
+    // U2 (prototype UI) additive fields. All tolerate an older daemon that omits
+    // them (nullable-timing contract): readiness is never gated on their presence.
+    /// Numeric byte total behind `sizeMB` — the sidebar footer sums this.
+    let sizeBytes: Int
+    /// The namer's `task_description` — a 2–3 sentence summary, or nil when the
+    /// namer hasn't run / the DB was locked at scan time.
+    let summary: String?
+    /// Humanized display title (the namer's slug). Falls back to the raw
+    /// directory `name` when an older daemon omits it.
+    let title: String
+    /// Derived lifecycle: `recording` | `processing` | `ready` (KTD-7). Defaults
+    /// to `ready` so a missing value never traps a card in a spinner.
+    let state: String
+    /// Stable identity pinned at recording start — survives the post-stop
+    /// auto-name directory rename (unlike `name`). nil for legacy recordings.
+    let recordingId: String?
+
     var id: String { name }
+
+    /// Identity that survives the post-stop auto-name rename. Consumers that must
+    /// hold a card in place across the rename (U5's grid diffing, the draft card)
+    /// key on this rather than `name`. Falls back to `name` for legacy recordings.
+    var stableID: String { recordingId ?? name }
+
+    var isActivelyRecording: Bool { state == "recording" }
+    var isProcessing: Bool { state == "processing" }
+    var isReady: Bool { state == "ready" }
 
     /// Local-timezone calendar day derived from `startedAt`. Falls back to the
     /// legacy `date` string ("YYYY-MM-DD") if `startedAt` is missing.
@@ -68,6 +94,11 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         case startedAt = "started_at"
         case durationSeconds = "duration_seconds"
         case drops
+        case sizeBytes = "size_bytes"
+        case summary
+        case title
+        case state
+        case recordingId = "recording_id"
     }
 
     init(from decoder: Decoder) throws {
@@ -86,6 +117,11 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         startedAt = try c.decodeIfPresent(Double.self, forKey: .startedAt)
         durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds)
         drops = try c.decodeIfPresent([String: Int].self, forKey: .drops)
+        sizeBytes = try c.decodeIfPresent(Int.self, forKey: .sizeBytes) ?? 0
+        summary = try c.decodeIfPresent(String.self, forKey: .summary)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? name
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? "ready"
+        recordingId = try c.decodeIfPresent(String.self, forKey: .recordingId)
     }
 
     /// Newest-first comparator. Recordings without a `startedAt` sort to the

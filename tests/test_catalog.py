@@ -736,3 +736,166 @@ def test_list_recordings_tolerates_corrupt_db(tmp_path):
     assert len(result) == 1
     assert result[0].name == "rec-corrupt"
     assert result[0].date == "—"
+
+
+# ---------------------------------------------------------------------------
+# U2 (prototype UI): additive fields — size_bytes, summary, title,
+# recording_id, and the derived lifecycle state (KTD-7).
+# ---------------------------------------------------------------------------
+
+
+def _set_task_description(d: Path, text: str) -> None:
+    conn = sqlite3.connect(str(d / "recording.db"))
+    try:
+        conn.execute("UPDATE recording SET task_description = ?", (text,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_size_bytes_is_numeric_and_matches_dir(recordings_dir):
+    d = _make_recording(recordings_dir, "sized", duration=10)
+    (d / "blob.bin").write_bytes(b"\x00" * 4096)
+    info = list_recordings(recordings_dir)[0]
+    expected = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+    assert isinstance(info.size_bytes, int)
+    assert info.size_bytes == expected
+    assert info.size_bytes > 0
+    # The formatted string is derived from the same byte total.
+    assert info.size_mb.endswith("KB") or info.size_mb.endswith("MB")
+
+
+def test_summary_from_task_description(recordings_dir):
+    d = _make_recording(recordings_dir, "summ", duration=10)
+    _set_task_description(d, "User debugged Stripe webhooks in Django.")
+    info = list_recordings(recordings_dir)[0]
+    assert info.summary == "User debugged Stripe webhooks in Django."
+
+
+def test_summary_none_when_task_description_absent(recordings_dir):
+    _make_recording(recordings_dir, "nosumm", duration=10)
+    info = list_recordings(recordings_dir)[0]
+    assert info.summary is None
+
+
+def test_summary_none_when_db_locked(recordings_dir):
+    """A locked DB yields a null summary, never an exception (nullable-timing)."""
+    d = _make_recording(recordings_dir, "lockedsumm", duration=10)
+    _set_task_description(d, "should not be read while the DB is locked")
+    db_path = d / "recording.db"
+    holder = sqlite3.connect(str(db_path))
+    holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("UPDATE recording SET timestamp = timestamp")  # hold write lock
+    try:
+        info = list_recordings(recordings_dir)[0]
+    finally:
+        holder.rollback()
+        holder.close()
+    assert info.summary is None
+
+
+def test_title_humanizes_slug(recordings_dir):
+    _make_recording(recordings_dir, "stripe-webhook-debugging", duration=10)
+    info = list_recordings(recordings_dir)[0]
+    assert info.title == "Stripe Webhook Debugging"
+
+
+def test_recording_id_stable_across_directory_rename(recordings_dir):
+    """`.recording_id` is pinned at start and moves with the dir, so it is stable
+    across the post-stop auto-name rename even as `name` changes."""
+    d = _make_recording(recordings_dir, "temp-capture-name", duration=10)
+    (d / ".recording_id").write_text("temp-capture-name")
+    info = list_recordings(recordings_dir)[0]
+    assert info.recording_id == "temp-capture-name"
+
+    d.rename(recordings_dir / "final-slug")  # the namer's rename
+    info2 = list_recordings(recordings_dir)[0]
+    assert info2.name == "final-slug"
+    assert info2.recording_id == "temp-capture-name"
+
+
+def test_recording_id_none_when_sidecar_absent(recordings_dir):
+    _make_recording(recordings_dir, "legacy-noid", duration=10)
+    info = list_recordings(recordings_dir)[0]
+    assert info.recording_id is None
+
+
+def test_state_active_recording_reports_recording(recordings_dir, monkeypatch):
+    from screencap import catalog
+
+    _make_recording(recordings_dir, "live-rec", duration=10)
+    monkeypatch.setattr(catalog, "_active_recording_name", lambda: "live-rec")
+    info = list_recordings(recordings_dir)[0]
+    assert info.state == "recording"
+
+
+def test_state_legacy_no_ledger_is_ready(recordings_dir):
+    _make_recording(recordings_dir, "legacy-ready", duration=10)
+    info = list_recordings(recordings_dir)[0]
+    assert info.state == "ready"
+
+
+def test_state_local_processing_until_all_chunks_local_done(recordings_dir):
+    """A stopped local recording is `processing` until every frozen
+    `chunks_expected` chunk is `LOCAL_DONE`, then flips to `ready` — no sentinel
+    involved (KTD-7)."""
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "local-proc", duration=10)
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    for i in range(2):
+        led.seed_chunk(i)
+    led.freeze_chunks_expected(2)
+    led.mark_local_done(0)  # one of two done
+    assert list_recordings(recordings_dir)[0].state == "processing"
+    led.mark_local_done(1)  # now all done
+    assert list_recordings(recordings_dir)[0].state == "ready"
+
+
+def test_state_cloud_ready_on_completeness_sentinel(recordings_dir):
+    """A cloud-routed recording is `ready` only once its completeness sentinel
+    (`recording_complete.json`) exists — the local ledger gate is not consulted."""
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "cloud-rec", duration=10)
+    (d / ".recording_intent").write_text(
+        json.dumps({"version": 1, "destination": "cloud", "privacy_mode": "public"})
+    )
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    led.seed_chunk(0)
+    led.freeze_chunks_expected(1)
+    assert list_recordings(recordings_dir)[0].state == "processing"
+    (d / "recording_complete.json").write_text("{}")
+    assert list_recordings(recordings_dir)[0].state == "ready"
+
+
+def test_state_failed_chunk_maps_to_ready_not_eternal_processing(recordings_dir):
+    """A recording with a FAILED chunk maps to `ready` rather than sitting forever
+    in `processing` — the FAILED short-circuit runs before the cloud sentinel wait."""
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "failed-state", duration=10)
+    (d / ".recording_intent").write_text(
+        json.dumps({"version": 1, "destination": "cloud", "privacy_mode": "public"})
+    )
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    led.seed_chunk(0)
+    led.freeze_chunks_expected(1)
+    led.mark_failed(0, detail="video_mask FAILED")
+    assert list_recordings(recordings_dir)[0].state == "ready"
+
+
+def test_asdict_includes_all_u2_fields(recordings_dir):
+    """The new fields serialize via `_asdict()` so `list --json` and the daemon
+    field-parity assertion both pick them up."""
+    _make_recording(recordings_dir, "u2-fields", duration=10)
+    d = list_recordings(recordings_dir)[0]._asdict()
+    for key in ("size_bytes", "summary", "title", "state", "recording_id"):
+        assert key in d

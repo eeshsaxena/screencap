@@ -159,6 +159,17 @@ def _load_models() -> dict[str, Any]:
         # clients ignore unknown keys, so no _LIST_API_VERSION bump is required.
         owner_uid: str | None = None
         upload_warning: str | None = None
+        # U2 (prototype UI): additive fields the new SwiftUI surfaces render. Kept
+        # in EXACT sync with catalog.RecordingInfo (recording.list asserts field
+        # parity). Additive on the wire — no _LIST_API_VERSION bump. Swift decoders
+        # must NOT gate readiness on them (nullable-timing contract): decode
+        # each with `decodeIfPresent` so an older daemon that omits them still
+        # decodes.
+        size_bytes: int = 0
+        summary: str | None = None
+        title: str = ""
+        state: str = "ready"
+        recording_id: str | None = None
 
     class ListResponse(EnvelopeResponse):
         recordings: list[RecordingSummary]
@@ -224,6 +235,11 @@ def _load_models() -> dict[str, Any]:
         # subscribe to /v0/events?since=<cursor> after start to receive the
         # `started` event without an extra `session.snapshot` round-trip.
         cursor: int
+        # U2 (prototype UI): echo the EFFECTIVE audio state so U6/U7 reflect what
+        # the engine actually did. Additive — a STALE daemon omits it, and the app
+        # treats a missing/mismatched echo as audio-on (its default). Optional on
+        # the wire for exactly that back-compat reason.
+        audio: bool | None = None
 
     class RecordingStopRequest(_DaemonModel):
         force: bool = False

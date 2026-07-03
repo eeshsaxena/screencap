@@ -444,6 +444,12 @@ async def recording_start(request: Request) -> JSONResponse:
             )
 
         result = await request.app.state.supervisor.spawn(parsed)
+        # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what
+        # the engine did. The app always sends an explicit bool; an unspecified
+        # (None) request resolves to the audio-on default, matching the app's mic
+        # row. A stale daemon omits this field entirely — the app treats a
+        # missing/mismatched echo as audio-on.
+        result["audio"] = parsed.audio if parsed.audio is not None else True
         _audit("ok")
         return JSONResponse(
             schema.envelope(
