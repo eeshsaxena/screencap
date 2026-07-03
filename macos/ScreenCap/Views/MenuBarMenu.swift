@@ -1,6 +1,13 @@
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    /// U10 — posted by the menu-bar "Search…" item after focusing/opening the
+    /// main window; MainWindow observes it and opens the Recall palette
+    /// (KTD-13: the ⌘⇧F shortcut itself stays window-scoped, no global tap).
+    static let screenCapOpenRecallPalette = Notification.Name("com.screencap.recallPalette.open")
+}
+
 /// Menu bar dropdown. Start / Stop bind to `RecorderController` (wired in
 /// Unit 13); icon swap (idle vs recording) lives in `ScreenCapApp`. While a
 /// Cmd+Q-driven shutdown is finalizing, the menu surfaces a countdown line
@@ -46,6 +53,13 @@ struct MenuBarMenu: View {
         Divider()
 
         Button("Open ScreenCap") { openMainWindow() }
+
+        Button("Search…") {
+            // U10: open (or focus) the main window with the palette pre-opened.
+            openMainWindow()
+            NotificationCenter.default.post(name: .screenCapOpenRecallPalette, object: nil)
+        }
+        .keyboardShortcut("f", modifiers: [.command, .shift])
 
         Divider()
 

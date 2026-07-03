@@ -425,6 +425,90 @@ struct TimelineQueryRequest: Encodable {
     }
 }
 
+/// `timeline.day` input (U3/U9): a local calendar date plus the caller's UTC
+/// offset so the daemon computes the same local-midnight window the UI shows.
+struct TimelineDayRequest: Encodable {
+    let date: String
+    let tzOffsetSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case tzOffsetSeconds = "tz_offset_seconds"
+    }
+}
+
+/// A blocked span on the day timeline, absolute unix ms.
+struct DayBlockedInterval: Decodable, Sendable, Hashable {
+    let startMs: Int
+    let endMs: Int
+
+    init(startMs: Int, endMs: Int) {
+        self.startMs = startMs
+        self.endMs = endMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+    }
+}
+
+/// One recording's day-clamped span + honest blocked-interval split (U3).
+/// `blockedProven` may be hatched "blocked"; `unverifiable` must render as a
+/// neutral gap, never labelled "blocked" (R7).
+struct DaySegmentRecording: Decodable, Sendable, Hashable {
+    let name: String
+    let recordingId: String?
+    let state: String
+    let startMs: Int
+    let endMs: Int
+    let blockedProven: [DayBlockedInterval]
+    let unverifiable: [DayBlockedInterval]
+
+    init(
+        name: String, recordingId: String? = nil, state: String = "ready",
+        startMs: Int, endMs: Int,
+        blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = []
+    ) {
+        self.name = name
+        self.recordingId = recordingId
+        self.state = state
+        self.startMs = startMs
+        self.endMs = endMs
+        self.blockedProven = blockedProven
+        self.unverifiable = unverifiable
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case recordingId = "recording_id"
+        case state
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case blockedProven = "blocked_proven"
+        case unverifiable
+    }
+}
+
+/// `timeline.day` response.
+struct TimelineDayResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let date: String
+    let recordings: [DaySegmentRecording]
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case date
+        case recordings
+    }
+}
+
 private struct APIEnvelopeProbe: Decodable {
     let ok: Bool?
     let apiSchemaVersion: Int?
@@ -733,6 +817,15 @@ enum DaemonClient {
     static func timelineQuery(_ req: TimelineQueryRequest) async throws -> TimelineQueryResponse {
         let body = try JSONEncoder().encode(req)
         return try await request(method: "POST", path: "/v0/timeline.query", body: body)
+    }
+
+    /// Day-scoped spans + honest blocked-interval split for the Day timeline
+    /// (U3/U9). Read-only; a malformed date surfaces as a typed 400 envelope
+    /// error, and `socketUnavailable`/`connectionFailed` puts the day view in
+    /// its daemon-unavailable state (no CLI fallback for this verb).
+    static func timelineDay(_ req: TimelineDayRequest) async throws -> TimelineDayResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/timeline.day", body: body)
     }
 
     /// Query-parser vocabulary (SCR-179). Read-only GET, no parameters. Returns

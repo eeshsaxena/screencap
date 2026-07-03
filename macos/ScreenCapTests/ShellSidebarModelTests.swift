@@ -26,15 +26,19 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertNil(privacy.helpText)
     }
 
-    /// Journal (U8) and App rules (U13) have no legacy pane, so they render
-    /// disabled with a plain "Coming soon" — not an SCR stub (they are plan units).
+    func testJournalRoutesAndIsEnabled() {
+        let journal = item(ShellSidebarModel.primaryNav, "journal")
+        XCTAssertEqual(journal.route, .journal)
+        XCTAssertTrue(journal.isEnabled, "Journal routes to its pane since U8")
+        XCTAssertNil(journal.helpText)
+    }
+
+    /// App rules (U13) has no legacy pane, so it renders disabled with a plain
+    /// "Coming soon" — not an SCR stub (it is a plan unit).
     func testUnlandedSurfacesAreDisabledWithComingSoon() {
-        for (items, id) in [(ShellSidebarModel.primaryNav, "journal"),
-                            (ShellSidebarModel.settingsNav, "appRules")] {
-            let row = item(items, id)
-            XCTAssertFalse(row.isEnabled, "\(id) must be disabled until its unit lands")
-            XCTAssertEqual(row.helpText, "Coming soon")
-        }
+        let row = item(ShellSidebarModel.settingsNav, "appRules")
+        XCTAssertFalse(row.isEnabled, "appRules must be disabled until its unit lands")
+        XCTAssertEqual(row.helpText, "Coming soon")
     }
 
     /// Collections is a deferred capability — disabled with the SCR-222 tooltip,

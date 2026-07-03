@@ -78,9 +78,10 @@ enum FirstRunSetupPresentationPolicy {
 
 /// Top-level window content (U4). The prototype sidebar (`ShellSidebarView`)
 /// replaces the legacy four-pane `List` sidebar inside the existing singleton
-/// `Window` scene (KTD-1). The detail routes on `ShellRoute`: Library and Privacy
-/// render their legacy panes until U5/U12 swap them; Journal/App-rules/day-timeline
-/// are disabled in the sidebar until U8/U13/U9 land.
+/// `Window` scene (KTD-1). The detail routes on `ShellRoute`: Privacy renders
+/// its legacy pane until U12 swaps it; App-rules is disabled in the sidebar
+/// until U13 lands. Library (U5), Journal (U8), and the Day timeline (U9) are
+/// live.
 ///
 /// The recording banner overlays the top of the detail area; the first-run
 /// permission-walkthrough machinery stays until U11's onboarding wizard swaps it.
@@ -103,6 +104,10 @@ struct MainWindow: View {
     /// from the Library header. Kept here (not in LibraryView) so it layers over
     /// the whole shell like the prototype's z-41 overlay.
     @State private var showingNewRecording = false
+    /// U10: the Recall palette — an in-window overlay (KTD-4) opened by the
+    /// window-scoped ⌘⇧F (KTD-13), the Library/Journal search pills, and the
+    /// menu-bar "Search…" item (via notification).
+    @State private var showingPalette = false
 
     var body: some View {
         // The first-run privacy banner lives here — a sibling ABOVE the
@@ -164,6 +169,28 @@ struct MainWindow: View {
             if showingNewRecording {
                 NewRecordingSheet(isPresented: $showingNewRecording)
             }
+        }
+        .overlay {
+            // U10: the Recall palette overlay (the prototype's z-40/41 scrim +
+            // panel). ↵ on a hit routes to the Day timeline at that moment.
+            if showingPalette {
+                RecallPaletteView(
+                    isPresented: $showingPalette,
+                    onJump: { day, seekMs in route = .timeline(day: day, seekMs: seekMs) }
+                )
+            }
+        }
+        .background(
+            // KTD-13: ⌘⇧F is window-scoped — a hidden in-window shortcut
+            // anchor, not a global event tap. Opening over the New-recording
+            // sheet is harmless (the palette layers above and esc unwinds it).
+            Button("") { showingPalette = true }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .opacity(0)
+                .accessibilityHidden(true)
+        )
+        .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenRecallPalette)) { _ in
+            showingPalette = true
         }
         .sheet(isPresented: $showingPermissionsSheet, onDismiss: {
             reopenedViaRecovery = false
@@ -354,17 +381,29 @@ struct MainWindow: View {
         case .privacy:
             PrivacyPaneView()
         case .journal:
-            comingSoon(title: "Journal", note: "The day-grouped Journal arrives in a later update.")
+            // U8: day-grouped Journal. The search pill opens the Recall palette (U10).
+            JournalView(
+                onOpenSearch: { showingPalette = true },
+                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
+            )
         case .appRules:
             comingSoon(title: "App rules", note: "Per-app recording rules arrive in a later update.")
-        case .timeline:
-            comingSoon(title: "Day timeline", note: "The day timeline arrives in a later update.")
+        case .timeline(let day, let seekMs):
+            // U9: the day view. `.id(day)` gives each date a fresh engine +
+            // search scope rather than mutating one view's state across days.
+            DayTimelineView(date: day, initialSeekMs: seekMs, onBack: { route = .journal })
+                .id(day)
         case .library:
             // U5: the prototype card grid. It owns its own loading / error /
             // empty / zero-match states over the recordings index. The
             // New-recording pill opens U6's in-window sheet (KTD-4), gated so it
-            // never opens over an active recording (logic 780).
-            LibraryView(onNewRecording: presentNewRecording)
+            // never opens over an active recording (logic 780). Card clicks land
+            // on the Day timeline seeked to the recording (U9).
+            LibraryView(
+                onNewRecording: presentNewRecording,
+                onOpenSearch: { showingPalette = true },
+                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
+            )
         }
     }
 

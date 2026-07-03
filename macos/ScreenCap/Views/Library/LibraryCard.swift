@@ -35,23 +35,13 @@ struct LibraryCard: View {
     let recording: RecordingSummary
     let frameIndex: RecordingFrameIndex
     let thumbnailLoader: ThumbnailLoader
-    /// Primary tap — opens the recording (Day timeline in U9; the read-only
-    /// Inspect window until then).
+    /// Primary tap — opens the recording on the Day timeline (U9).
     var onOpen: () -> Void
+    /// Open the read-only Inspect window (context menu, KTD-4).
+    var onInspect: () -> Void
     /// Open the Review-before-upload consent window (eligible recordings only).
     var onReview: () -> Void
 
-    /// A resolved thumbnail tagged with the recording it was loaded for, so a
-    /// recycled card can't show a stale frame.
-    private struct Loaded: Equatable {
-        let key: String
-        let image: ThumbnailImage?
-        static func == (lhs: Loaded, rhs: Loaded) -> Bool {
-            lhs.key == rhs.key && (lhs.image?.cgImage === rhs.image?.cgImage)
-        }
-    }
-
-    @State private var loaded: Loaded?
     @State private var hovering = false
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
@@ -68,46 +58,19 @@ struct LibraryCard: View {
         .contextMenu { contextMenu }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(recording.title), \(recording.duration), \(badge.text)")
-        .task(id: recording.stableID) { await loadThumbnail() }
     }
 
     // MARK: - Thumbnail
 
     private var thumbnail: some View {
-        thumbnailContent
-            .frame(maxWidth: .infinity)
-            .aspectRatio(16.0 / 9.6, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: SCMetrics.radiusChip))
-            .overlay(
-                RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
-                    .strokeBorder(hovering ? Color.scTeal : Color.scBorderWarm, lineWidth: 1)
-            )
-            .overlay(alignment: .bottomTrailing) { durationChip }
-            .onHover { hovering = $0 }
-    }
-
-    @ViewBuilder
-    private var thumbnailContent: some View {
-        if loaded?.key == recording.stableID, let image = loaded?.image {
-            Image(decorative: image.cgImage, scale: 1)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-        } else {
-            // Not-yet-loaded and resolved-miss both render the neutral hatch, so
-            // the card never flashes an arbitrary frame (R5).
-            LibraryHatchPlaceholder()
-        }
-    }
-
-    private var durationChip: some View {
-        Text(recording.duration)
-            .font(SCTypography.mono(size: 10.5))
-            .foregroundStyle(Color.scCanvas)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Color.scInk.opacity(0.85), in: RoundedRectangle(cornerRadius: SCMetrics.radiusHairline))
-            .padding(8)
-            .accessibilityHidden(true)
+        RecordingCardThumbnail(
+            recording: recording,
+            frameIndex: frameIndex,
+            thumbnailLoader: thumbnailLoader,
+            aspectRatio: 16.0 / 9.6,
+            borderColor: hovering ? Color.scTeal : Color.scBorderWarm
+        )
+        .onHover { hovering = $0 }
     }
 
     // MARK: - Text
@@ -148,24 +111,11 @@ struct LibraryCard: View {
     @ViewBuilder
     private var contextMenu: some View {
         Button("Open") { onOpen() }
+        Button("Inspect…") { onInspect() }
         if recording.isUploadEligible {
             Divider()
             Button("Review & upload…") { onReview() }
         }
-    }
-
-    // MARK: - Loading
-
-    private func loadThumbnail() async {
-        let key = recording.stableID
-        guard let url = await frameIndex.firstFrameURL(recording: recording.name) else {
-            if Task.isCancelled { return }
-            loaded = Loaded(key: key, image: nil)
-            return
-        }
-        let image = await thumbnailLoader.thumbnail(for: url)
-        if Task.isCancelled { return }
-        loaded = Loaded(key: key, image: image)
     }
 }
 
