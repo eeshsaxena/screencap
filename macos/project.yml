@@ -46,8 +46,8 @@ targets:
       path: ScreenCap/Info.plist
       properties:
         CFBundleDisplayName: ScreenCap
-        CFBundleShortVersionString: "0.1.5"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "0.2.0"
+        CFBundleVersion: "7"
         LSMinimumSystemVersion: "13.0"
         LSApplicationCategoryType: public.app-category.productivity
         # Bundled typefaces live in Contents/Resources/Fonts (folder reference
