@@ -193,7 +193,7 @@ struct RecallPaletteView: View {
         isPresented = false
     }
 
-    // MARK: - Settings + consent (the SearchView wiring, palette-scoped)
+    // MARK: - Settings + consent (inherited from the retired SearchView, palette-scoped)
 
     private func loadSettings() async {
         do {
@@ -209,7 +209,8 @@ struct RecallPaletteView: View {
     }
 
     /// Enable on-screen-text indexing going forward, then re-run the query —
-    /// optimistic with revert-on-failure (mirrors SearchView.enableConsent).
+    /// optimistic with revert-on-failure (the retired SearchView's
+    /// enableConsent pattern).
     private func enableConsent() {
         contentIndexEnabled = true
         model.offerBackfill(alreadyDeclined: backfillDeclined)
@@ -367,7 +368,7 @@ struct RecallPaletteContent: View {
         .padding(20)
     }
 
-    // MARK: - Consent banner (copy shared with SearchResultsView)
+    // MARK: - Consent banner (copy carried over from the retired Search pane)
 
     private var consentBanner: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -579,8 +580,8 @@ struct RecallPaletteRow: View {
         }
     }
 
-    /// Bold title: window title / app / recording — the design's "Zoom — 1:1
-    /// with John Meyer" line, from what the daemon actually returns.
+    /// Bold title: window title / app / recording — the design's sample
+    /// meeting-title lead line, from what the daemon actually returns.
     private var titleText: String {
         item.title ?? item.app ?? item.recording
     }
@@ -592,7 +593,7 @@ struct RecallPaletteRow: View {
         return SnippetHighlighter.attributed("\u{201C}\(raw)\u{201D}", terms: queryTerms)
     }
 
-    /// The design's "task: Weekly 1:1" chip claims task labels that arrive with
+    /// The design's task-label chip claims task names that arrive with
     /// SCR-214 — until then the chip states the hit's stream honestly.
     private var streamChipText: String {
         switch item.stream {

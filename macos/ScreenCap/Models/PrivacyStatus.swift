@@ -2,7 +2,7 @@ import Foundation
 
 /// The `privacy` block emitted by `screencap settings --json` (SCR-17,
 /// settings schema v2). Drives the SwiftUI first-run banner state machine
-/// and the read-only mode header in `PrivacyPaneView`.
+/// and the Privacy settings pane (U12).
 ///
 /// `hasPrivacySection` distinguishes "never written" from "present with
 /// default values" — only the former triggers the first-launch fail-closed

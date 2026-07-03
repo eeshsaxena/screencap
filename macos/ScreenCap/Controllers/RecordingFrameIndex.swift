@@ -29,8 +29,8 @@ enum FrameSelection {
 }
 
 /// Resolves search pointers to local frame URLs, caching each recording's frame
-/// listing for the lifetime of the `SearchView` instance (the cache is shared
-/// across every result set while Search is open, not reset per search). An
+/// listing for the lifetime of the owning view (the Recall palette shares the
+/// cache across every result set while it is open, not reset per search). An
 /// `actor` so cache access is serialized; each recording's directory enumeration
 /// runs in a detached task off the actor (cached as the in-flight `Task` so
 /// concurrent resolves for one recording coalesce instead of blocking the actor).

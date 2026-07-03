@@ -8,10 +8,11 @@ extension Notification.Name {
     static let screenCapOpenRecallPalette = Notification.Name("com.screencap.recallPalette.open")
 }
 
-/// Menu bar dropdown. Start / Stop bind to `RecorderController` (wired in
-/// Unit 13); icon swap (idle vs recording) lives in `ScreenCapApp`. While a
-/// Cmd+Q-driven shutdown is finalizing, the menu surfaces a countdown line
-/// instead of the Stop button so the user sees progress.
+/// Menu bar dropdown — Start Recording, Stop, account, Open ScreenCap,
+/// Search… (U14 parity with the in-window surfaces). Icon swap (idle vs
+/// recording) lives in `ScreenCapApp`. While a Cmd+Q-driven shutdown is
+/// finalizing, the menu surfaces a countdown line instead of the Stop button
+/// so the user sees progress.
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var auth: CloudAuthController
@@ -30,6 +31,10 @@ struct MenuBarMenu: View {
             // that would re-enter the state machine.
             Text(recorder.state.isStopping ? "Stopping…" : "Starting…")
         } else {
+            // U14: starts with the New-recording sheet's last-used options —
+            // `audio: nil` defers to the persisted `audio_default`, which is
+            // exactly the sheet's initial mic state (NewRecordingSheetPolicy
+            // .initialAudioOn), so the two Start paths cannot drift.
             Button("Start Recording") { recorder.start() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
         }

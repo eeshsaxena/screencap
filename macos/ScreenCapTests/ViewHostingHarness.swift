@@ -3,10 +3,10 @@ import SwiftUI
 import XCTest
 @testable import ScreenCap
 
-// SCR-184 U2 — the first SwiftUI view-hosting test utility in this repo. Hosts a
-// view in an NSHostingView inside an offscreen window, forces a layout pass, and
-// exposes traversal + measurement helpers over the resulting AppKit tree. The
-// regression guard (U3) and state coverage (U4) build on this.
+// SCR-184 U2 — the SwiftUI view-hosting test utility (born for the retired
+// sidebar Search pane's layout guards; the Recall palette state tests build on
+// it now). Hosts a view in an NSHostingView inside an offscreen window, forces
+// a layout pass, and exposes a rendered-content check over the result.
 //
 // Why an offscreen window: NSHostingView lays out its SwiftUI content reliably
 // only once it is in a window and a layout pass is forced; a detached host can
@@ -15,14 +15,10 @@ import XCTest
 //
 // Measurement strategy (resolved empirically during implementation): SwiftUI's
 // accessibility tree is not readable from this unit-test host, and `.accessibility-
-// Identifier` does not reliably land on a discrete NSView. The dependable signals
-// are therefore the AppKit backing controls (a `List` backs to `NSScrollView` +
-// `NSTableView`; a `ProgressView` to `NSProgressIndicator`) and a non-blank render
-// check. Row count from the backing `NSTableView` — not document-view height,
-// which fills the viewport regardless of content — is what distinguishes a
-// populated results pane from an empty one.
+// Identifier` does not reliably land on a discrete NSView. The dependable signal
+// is therefore a non-blank render check over the raw bitmap.
 @MainActor
-enum SearchViewHost {
+enum ViewHost {
 
     static let defaultSize = CGSize(width: 800, height: 600)
 
@@ -32,10 +28,6 @@ enum SearchViewHost {
     final class Hosted {
         let window: NSWindow
         let root: NSHostingView<AnyView>
-        /// The flattened AppKit subtree, computed once after layout and reused by
-        /// every finder (`views(ofType:)`, `resultsScrollView`, `resultsRowCount`)
-        /// so a single test doesn't re-walk the whole tree several times.
-        lazy var allDescendants: [NSView] = SearchViewHost.descendants(of: root)
         init(window: NSWindow, root: NSHostingView<AnyView>) {
             self.window = window
             self.root = root
@@ -47,11 +39,10 @@ enum SearchViewHost {
     ///
     /// The view is hosted in an offscreen window (the window backs SwiftUI's
     /// layout/render path) and the run loop is spun briefly so SwiftUI commits a
-    /// render pass: a `List`'s backing table only reports its row count, and a
-    /// view only rasterizes its content, once that pass has run. The window is
-    /// NOT ordered front or made key — it stays out of `NSApp`'s window list, so
-    /// nothing leaks across the test suite — and is held only by the returned
-    /// `Hosted`, so it deallocates with it.
+    /// render pass: a view only rasterizes its content once that pass has run.
+    /// The window is NOT ordered front or made key — it stays out of `NSApp`'s
+    /// window list, so nothing leaks across the test suite — and is held only by
+    /// the returned `Hosted`, so it deallocates with it.
     static func host<V: View>(_ view: V, size: CGSize = defaultSize) -> Hosted {
         let root = NSHostingView(rootView: AnyView(view))
         root.frame = CGRect(origin: .zero, size: size)
@@ -63,72 +54,21 @@ enum SearchViewHost {
             defer: false
         )
         window.isReleasedWhenClosed = false
+        // Pin the light appearance: the design under test is the fixed
+        // warm-cream system, and the anti-blank render check reads raw pixels —
+        // on a Dark-mode machine the unpinned offscreen window rendered the
+        // palette variants as a uniform bitmap and failed every render check
+        // (U14, reproduced on main).
+        window.appearance = NSAppearance(named: .aqua)
         window.contentView = root
 
         // Force a full layout pass, then let SwiftUI commit a render so the
-        // backing table populates and the content rasterizes.
+        // content rasterizes.
         root.needsLayout = true
         root.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         root.layoutSubtreeIfNeeded()
         return Hosted(window: window, root: root)
-    }
-
-    /// Wrap content the way `MainWindow` does: nested below a sibling in a
-    /// `VStack` inside a `NavigationSplitView` detail column. This reproduces the
-    /// detail-column height-proposal behavior that produced the SCR-174
-    /// starvation — a bare fixed frame hands every child a definite height and so
-    /// does NOT reproduce the bug. The `Color.clear` sibling stands in for the
-    /// `RecordingBanner` that sits above `SearchView` in the real detail.
-    static func detailColumn<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        NavigationSplitView {
-            Color.clear
-        } detail: {
-            VStack(spacing: 0) {
-                Color.clear.frame(height: 40)
-                content()
-            }
-        }
-    }
-
-    // MARK: - NSView traversal
-
-    static func descendants(of root: NSView) -> [NSView] {
-        var out: [NSView] = []
-        for sub in root.subviews {
-            out.append(sub)
-            out.append(contentsOf: descendants(of: sub))
-        }
-        return out
-    }
-
-    static func views<T: NSView>(ofType type: T.Type, in hosted: Hosted) -> [T] {
-        hosted.allDescendants.compactMap { $0 as? T }
-    }
-
-    /// The backing scroll view for the results `List`, if present. The tallest
-    /// scroll view is the results region (the only `List` in the Search tree).
-    static func resultsScrollView(in hosted: Hosted) -> NSScrollView? {
-        views(ofType: NSScrollView.self, in: hosted)
-            .max(by: { $0.bounds.height < $1.bounds.height })
-    }
-
-    /// The number of rows the results List's backing table reports. This is the
-    /// reliable "are results actually rendering content?" signal: a SwiftUI List's
-    /// document view fills the viewport regardless of content (so its *height* is
-    /// useless here), but the backing `NSTableView`'s `numberOfRows` reflects the
-    /// logical row count from the data source — coverage row + section headers +
-    /// one row per result. Returns 0 when there is no results List. Falls back to
-    /// an `NSCollectionView` item count for SwiftUI list backings that use one.
-    static func resultsRowCount(in hosted: Hosted) -> Int {
-        let all = hosted.allDescendants
-        if let table = all.compactMap({ $0 as? NSTableView }).first {
-            return table.numberOfRows
-        }
-        if let collection = all.compactMap({ $0 as? NSCollectionView }).first {
-            return collection.numberOfItems(inSection: 0)
-        }
-        return 0
     }
 
     // MARK: - Rendered-content (anti-blank) check
@@ -177,43 +117,11 @@ enum SearchViewHost {
 
 // MARK: - Fixtures
 
-/// SCR-184 U2 — builders for the view-facing result types so each layout/state
-/// test reads as one clear arrange step. These mirror what `SearchViewModel`
+/// SCR-184 U2 — builders for the view-facing result types so each state test
+/// reads as one clear arrange step. These mirror what `SearchViewModel`
 /// produces, constructed directly (no daemon, no socket).
 @MainActor
 enum SearchFixtures {
-
-    /// The view under test, wired with inert defaults (no thumbnails, no
-    /// selection, no-op callbacks, backfill hidden) so each test supplies only the
-    /// `phase` (and optionally a `backfillState`). Keeps the construction in one
-    /// place across the layout + state tests.
-    static func resultsView(
-        _ phase: SearchViewModel.Phase,
-        backfillState: SearchViewModel.BackfillUIState = .hidden,
-        isSearching: Bool = false,
-        recentSearches: [String] = []
-    ) -> SearchResultsView {
-        SearchResultsView(
-            phase: phase,
-            consentDeclined: false,
-            backfillState: backfillState,
-            isSearching: isSearching,
-            recentSearches: recentSearches,
-            selection: .constant(nil),
-            selectedDay: .constant(nil),
-            frameIndex: nil,
-            thumbnailLoader: nil,
-            isSearchFieldFocused: false,
-            onEnableConsent: {},
-            onDeclineConsent: {},
-            onAcceptBackfill: {},
-            onSkipBackfill: {},
-            onCancelBackfill: {},
-            onResumeBackfill: {},
-            onRunChip: { _ in },
-            onOpen: { _ in }
-        )
-    }
 
     /// One anchored result on the given day-offset and clock time.
     static func item(
@@ -272,44 +180,6 @@ enum SearchFixtures {
             coverage: CoverageReport(screen: .notRun, audio: .notRun, activity: .ok(count: 3)),
             consentNeeded: false,
             timeWindow: nil,
-            appFilter: nil,
-            queryTerms: []
-        )
-    }
-
-    /// A single anchored result (one day).
-    static func singleResult() -> SearchResults {
-        SearchResults(
-            items: [item(daysAgo: 0, hour: 12, idSuffix: "only")],
-            coverage: CoverageReport(screen: .notRun, audio: .notRun, activity: .ok(count: 1)),
-            consentNeeded: false,
-            timeWindow: nil,
-            appFilter: nil,
-            queryTerms: []
-        )
-    }
-
-    /// Results containing only unanchored audio items (the "Heard in audio"
-    /// section, no per-day sections).
-    static func unanchoredOnlyResults() -> SearchResults {
-        SearchResults(
-            items: [unanchoredAudioItem(idSuffix: "a"), unanchoredAudioItem(recording: "rec-003", idSuffix: "b")],
-            coverage: CoverageReport(screen: .notRun, audio: .ok(count: 2), activity: .notRun),
-            consentNeeded: false,
-            timeWindow: nil,
-            appFilter: nil,
-            queryTerms: ["salesforce"]
-        )
-    }
-
-    /// Authoritative empty: a time window was given and activity came back empty
-    /// → "Nothing recorded then".
-    static func authoritativeEmptyResults() -> SearchResults {
-        SearchResults(
-            items: [],
-            coverage: CoverageReport(screen: .notRun, audio: .notRun, activity: .empty),
-            consentNeeded: false,
-            timeWindow: TimeWindow(startMs: anchorMs(daysAgo: 1, hour: 9), endMs: anchorMs(daysAgo: 1, hour: 17)),
             appFilter: nil,
             queryTerms: []
         )

@@ -1,55 +1,13 @@
 import Foundation
 
-// SCR-183 — pure, unit-testable VoiceOver-label builders for the in-app Search
-// surface. Deliberately free of SwiftUI so `ScreenCapTests` can assert the exact
-// spoken strings (mirrors the `PrivacyBadgeStyle.derive` / `SnippetHighlighter`
-// pattern). The views apply these via `.accessibilityLabel(...)`; the behavioral
+// SCR-183 — pure, unit-testable VoiceOver-label builders for the search
+// surface. Deliberately free of SwiftUI so `ScreenCapTests` can assert the
+// exact spoken strings (mirrors the `SnippetHighlighter` pattern). The Recall
+// palette (U10) applies these via `.accessibilityLabel(...)`; the behavioral
 // shell (focus, key events, announcement posting) stays in the view and is
-// verified manually.
+// verified manually. The retired sidebar Search pane's chip/announcement
+// builders were deleted with it (U14) — only the result-row label survives.
 enum SearchAccessibility {
-
-    /// A shared "HH:mm" formatter — `clusterLabel` is called per cluster while the
-    /// timeline renders, and a fresh `DateFormatter` per call is needlessly costly.
-    private static let clockFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm"
-        return f
-    }()
-
-    /// Spoken label for a coverage chip — e.g. "On screen: 3 results",
-    /// "Audio: no matches", "Activity: not indexed". Returns `nil` for `.notRun`
-    /// (the chip renders no element, so there is nothing to announce). Unlike the
-    /// compact visible text, the count is spelled out ("3 results") and the label
-    /// never leans on the color dot, which carries the state visually only.
-    static func coverageChipLabel(stream: String, state: StreamState) -> String? {
-        let phrase: String
-        switch state {
-        case .notRun:
-            return nil
-        case .ok(let count):
-            phrase = count == 1 ? "1 result" : "\(count) results"
-        case .empty, .notIndexed, .degraded, .unavailable:
-            // Shared with the visible chip text (SearchView.coverageText) so the
-            // spoken and visible phrasings can't drift apart.
-            phrase = coverageStatePhrase(for: state) ?? ""
-        }
-        return "\(stream): \(phrase)"
-    }
-
-    /// The count-independent coverage phrase, shared by the spoken chip label and
-    /// the visible chip text so a future wording change updates both at once.
-    /// `.ok`/`.notRun` stay each caller's concern — the visible chip shows a bare
-    /// count while the spoken label spells "N results", and `.notRun` renders
-    /// nothing visible and stays silent.
-    static func coverageStatePhrase(for state: StreamState) -> String? {
-        switch state {
-        case .empty: return "no matches"
-        case .notIndexed: return "not indexed"
-        case .degraded: return "limited"
-        case .unavailable: return "unavailable"
-        case .ok, .notRun: return nil
-        }
-    }
 
     /// One combined label for a result row, replacing the fragmented `Text` runs
     /// VoiceOver would otherwise read as separate stops. Surfaces only what the
@@ -93,119 +51,21 @@ enum SearchAccessibility {
         }
         return label
     }
+}
 
-    /// SCR-181 U4 — spoken label for a timeline node. A single marker reuses the
-    /// full result-row label (so a marker and its companion row read identically);
-    /// a cluster reads its count and time span, never enumerating member content
-    /// (pointer-only posture preserved). The view applies this via
-    /// `.accessibilityLabel(...)`.
-    static func timelineNodeLabel(_ node: TimelineNode) -> String {
-        node.isCluster ? clusterLabel(node.items) : resultRowLabel(node.representative)
-    }
-
-    /// SCR-181 U4 — "N results between HH:mm and HH:mm" for a density cluster (or
-    /// "…at HH:mm" when every member shares a minute). Spans earliest→latest
-    /// member time; an all-unanchored cluster (no times) omits the span. Pure +
-    /// tested; surfaces only the count + span, never raw snippet/OCR text (R6/R8).
-    static func clusterLabel(_ items: [SearchResultItem]) -> String {
-        let count = items.count
-        let resultWord = count == 1 ? "result" : "results"
-        let times = items.compactMap(\.anchorMs).sorted()
-        guard let first = times.first, let last = times.last else {
-            return "\(count) \(resultWord)"
-        }
-        let f = clockFormatter
-        let lo = f.string(from: Date(timeIntervalSince1970: Double(first) / 1000))
-        let hi = f.string(from: Date(timeIntervalSince1970: Double(last) / 1000))
-        return lo == hi
-            ? "\(count) \(resultWord) at \(lo)"
-            : "\(count) \(resultWord) between \(lo) and \(hi)"
-    }
-
-    /// Spoken announcement posted when a search completes, so a VoiceOver user
-    /// who can't see the screen learns the outcome instead of hearing silence.
-    /// Returns `nil` for phases that should not announce (`.idle`, `.searching`).
-    static func searchOutcomeAnnouncement(for phase: SearchViewModel.Phase) -> String? {
-        switch phase {
-        case .idle, .searching:
-            return nil
-        case .daemonDown:
-            return "ScreenCap isn\u{2019}t running"
-        case .loaded(let results):
-            let count = results.items.count
-            if count == 0 {
-                // Mirror the visible empty state: a time-scoped query over a
-                // recorded-but-empty window reads "Nothing recorded then" rather
-                // than the generic "No matches" (see SearchView.emptyRow).
-                if results.timeWindow != nil, case .empty = results.coverage.activity {
-                    return "Nothing recorded then"
-                }
-                return "No matches"
-            }
-            let base = count == 1 ? "1 result" : "\(count) results"
-            // SCR-182 U3 — append the completeness cue so a VoiceOver user learns
-            // results were capped upstream (R3/R6); the visible header carries the
-            // same note. The spoken form stays count-only (no "across N days" day
-            // span) to keep the announcement terse; the day span is visible polish.
-            if let note = truncationNote(results) { return "\(base). \(note)" }
-            return base
+extension SearchResultItem {
+    /// Lead line: the on-screen/audio snippet, or the app for an activity row.
+    var primaryText: String {
+        switch stream {
+        case .activity: return app ?? "Activity"
+        case .screen, .audio: return (snippet?.isEmpty == false ? snippet! : "(no preview)")
         }
     }
 
-    /// SCR-178 U8 — spoken announcement posted when the backfill affordance
-    /// reaches a **terminal** transition (done / paused / cancelled /
-    /// start-failed), so a VoiceOver user learns the outcome of a long indexing
-    /// run instead of hearing silence. Returns `nil` for every in-progress state
-    /// (`hidden` / `offering` / `starting` / `indexing`): in particular the
-    /// determinate `done/total` ticks do **not** announce, to avoid flooding
-    /// VoiceOver during a run. Mirrors `searchOutcomeAnnouncement` (pure builder;
-    /// the view posts the string on a terminal transition).
-    static func backfillAnnouncement(for state: SearchViewModel.BackfillUIState) -> String? {
-        switch state {
-        case .hidden, .offering, .starting, .indexing:
-            return nil
-        case .done(let done, let total, let failed):
-            if failed == 0 {
-                return "Done \u{2014} your recording history is now searchable."
-            }
-            return "Indexed \(done) of \(total) recordings. \(failed) could not be indexed."
-        case .paused(let done, let total):
-            return "Indexed \(done) of \(total) so far \u{2014} resume to continue."
-        case .cancelled:
-            return "Indexing paused \u{2014} you can resume later."
-        case .startFailed:
-            return "Couldn\u{2019}t start indexing \u{2014} try again later."
-        }
-    }
-
-    /// SCR-182 U3 — the visible results-header summary, e.g. "142 results across
-    /// 7 days". Counts every merged item (the empty state owns the zero copy, so
-    /// this returns `nil` at zero). The day count is the number of distinct local
-    /// days among *anchored* items — bucketed the same way `searchResultsGroupedByDay`
-    /// groups the visible day sections — so the header and the sections agree.
-    /// Unanchored audio hits still count toward results but have no day, so an
-    /// all-unanchored set omits the day clause rather than claiming "across 0 days".
-    static func resultCountLabel(_ results: SearchResults, calendar: Calendar = .current) -> String? {
-        let count = results.items.count
-        guard count > 0 else { return nil }
-        let resultWord = count == 1 ? "result" : "results"
-
-        let days = Set(results.items.compactMap { item -> Date? in
-            guard let ms = item.anchorMs else { return nil }
-            return calendar.startOfDay(for: Date(timeIntervalSince1970: Double(ms) / 1000))
-        }).count
-
-        guard days > 0 else { return "\(count) \(resultWord)" }
-        let dayWord = days == 1 ? "day" : "days"
-        return "\(count) \(resultWord) across \(days) \(dayWord)"
-    }
-
-    /// SCR-182 U3 — completeness cue shown when any stream hit its raw fetch cap.
-    /// Worded against the upstream fetch, never "showing first 200": each stream
-    /// caps independently and the merged/time-filtered list rarely holds 200, so
-    /// a "first 200" claim would misrepresent what's on screen.
-    static func truncationNote(_ results: SearchResults) -> String? {
-        guard results.truncated else { return nil }
-        return "Some sources hit their limit \u{2014} narrow your search to see more."
+    var timeLabel: String {
+        guard let anchorMs else { return "—" }
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(anchorMs) / 1000))
     }
 }

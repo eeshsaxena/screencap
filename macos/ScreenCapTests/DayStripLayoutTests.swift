@@ -83,8 +83,8 @@ final class DayStripLayoutTests: XCTestCase {
 
     // MARK: - Marker clustering
 
-    /// Same single-linkage contract as SearchTimelineLayout.cluster: chained
-    /// neighbors within the threshold collapse to their mean x.
+    /// Same single-linkage contract as the retired SearchTimelineLayout's
+    /// cluster: chained neighbors within the threshold collapse to their mean x.
     func testMarkerClusteringChainsWithinThreshold() {
         XCTAssertEqual(DayStripLayout.clusterXs([10, 20, 30, 200], thresholdPx: 14), [20, 200])
         XCTAssertEqual(DayStripLayout.clusterXs([5], thresholdPx: 14), [5])

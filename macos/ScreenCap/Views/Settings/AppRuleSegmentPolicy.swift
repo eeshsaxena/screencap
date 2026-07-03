@@ -3,8 +3,8 @@ import Foundation
 /// U13 — pure mapping from an `apps --json` row to the App-rules segmented
 /// control: which of Record / Mask / Block is selected, which segments accept
 /// interaction, the mono note under the app name, and the CLI transition a tap
-/// issues. Mirrors `PrivacyBadgeStyle.derive`'s resolution priority so the two
-/// surfaces can't drift:
+/// issues. Resolution priority (inherited from the retired Privacy pane's
+/// `PrivacyBadgeStyle.derive`, now the single owner):
 ///
 ///   1. `is_matrix_exclude` — always blocked; the whole row is locked.
 ///   2. `in_exclude_apps`   — Block selected; Record un-blocks.
@@ -106,7 +106,7 @@ struct AppRuleSegmentPolicy: Equatable {
             )
         default:
             // "allow" and any unknown future action render as recorded rather
-            // than blanking the row (mirrors PrivacyBadgeStyle's fallback).
+            // than blanking the row.
             return AppRuleSegmentPolicy(
                 selection: .record,
                 recordEnabled: true,

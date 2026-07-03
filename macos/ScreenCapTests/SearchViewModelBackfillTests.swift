@@ -6,7 +6,8 @@ import XCTest
 /// against a fake `BackfillService` (no live socket, no daemon). Covers the
 /// offer → accept → starting → indexing → terminal flow, the `skipped`-is-not-an-
 /// error rule, cancel + resume, paused, start-failure, subscribe-before-start
-/// ordering, Skip persistence, and the terminal-only VoiceOver announcement.
+/// ordering, and Skip persistence. The Recall palette renders these states
+/// (U10); the retired Search pane's VoiceOver announcement builder is gone.
 @MainActor
 final class SearchViewModelBackfillTests: XCTestCase {
 
@@ -144,7 +145,7 @@ final class SearchViewModelBackfillTests: XCTestCase {
         XCTAssertEqual(vm.backfillState, .starting)
     }
 
-    func testPartialFailureRendersHedgedDoneAndSkippedIsNotError() async {
+    func testPartialFailureReachesDoneWithFailedCountAndSkippedIsNotError() async {
         let fake = FakeBackfillService()
         let vm = makeVM(fake)
         vm.acceptBackfill()
@@ -154,13 +155,10 @@ final class SearchViewModelBackfillTests: XCTestCase {
         fake.emit(progress("backfill.progress", state: .running, done: 2, skipped: 5, total: 4))
         await wait(for: vm) { $0 == .indexing(done: 2, total: 4, failed: 0) }
 
+        // The failed count rides the done state (the palette renders the
+        // hedged copy from it); skipped never appears as an error.
         fake.emit(progress("backfill.completed", state: .completed, done: 3, skipped: 5, failed: 1, total: 4))
         await wait(for: vm) { $0 == .done(done: 3, total: 4, failed: 1) }
-        // Hedged copy reflects the failure; skipped never appears as an error.
-        XCTAssertEqual(
-            SearchAccessibility.backfillAnnouncement(for: vm.backfillState),
-            "Indexed 3 of 4 recordings. 1 could not be indexed."
-        )
     }
 
     func testCancelThenResume() async {
@@ -235,22 +233,4 @@ final class SearchViewModelBackfillTests: XCTestCase {
         XCTAssertEqual(vm.backfillState, .hidden)
     }
 
-    func testTerminalTransitionsAnnounceInProgressTicksDoNot() {
-        // In-progress ticks are silent (no announcement flooding).
-        XCTAssertNil(SearchAccessibility.backfillAnnouncement(for: .hidden))
-        XCTAssertNil(SearchAccessibility.backfillAnnouncement(for: .offering))
-        XCTAssertNil(SearchAccessibility.backfillAnnouncement(for: .starting))
-        XCTAssertNil(SearchAccessibility.backfillAnnouncement(for: .indexing(done: 1, total: 3, failed: 0)))
-
-        // Every terminal state returns a non-nil phrase.
-        XCTAssertNotNil(SearchAccessibility.backfillAnnouncement(for: .done(done: 3, total: 3, failed: 0)))
-        XCTAssertNotNil(SearchAccessibility.backfillAnnouncement(for: .paused(done: 1, total: 3)))
-        XCTAssertNotNil(SearchAccessibility.backfillAnnouncement(for: .cancelled(done: 1, total: 3)))
-        XCTAssertNotNil(SearchAccessibility.backfillAnnouncement(for: .startFailed))
-
-        XCTAssertEqual(
-            SearchAccessibility.backfillAnnouncement(for: .done(done: 3, total: 3, failed: 0)),
-            "Done \u{2014} your recording history is now searchable."
-        )
-    }
 }

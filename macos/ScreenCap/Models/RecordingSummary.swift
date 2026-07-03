@@ -125,7 +125,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     }
 
     /// Newest-first comparator. Recordings without a `startedAt` sort to the
-    /// end (treated as 0). Used by `RecordingsIndex` and `RecordingsListView`.
+    /// end (treated as 0). Used by the Library grid's chip filtering (U5).
     static func newestFirst(_ a: RecordingSummary, _ b: RecordingSummary) -> Bool {
         (a.startedAt ?? 0) > (b.startedAt ?? 0)
     }

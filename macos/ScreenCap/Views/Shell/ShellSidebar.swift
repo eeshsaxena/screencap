@@ -49,7 +49,7 @@ enum ShellSidebarModel {
         ShellNavItem(id: "journal", label: "Journal", route: .journal, availability: .enabled),
     ]
 
-    /// The design's COLLECTIONS list is mock data ("Payroll walkthroughs" etc.,
+    /// The design's COLLECTIONS list is mock data (sample collection names,
     /// which the U14 sweep forbids), so Collections ships as a single honest stub
     /// row until SCR-222 — never the sample names.
     static let collections: [ShellNavItem] = [

@@ -1,11 +1,11 @@
 import Combine
 import Foundation
 
-/// Owner of privacy-related state shared by the Privacy pane
-/// (`PrivacyPaneView`), the first-run banner gate (`MainWindow`), and the
-/// menu bar attention dot (`ScreenCapApp.MenuBarExtra`). Single source of
-/// truth — bound as a singleton `@StateObject` in `ScreenCapApp` and pushed
-/// into the environment.
+/// Owner of privacy-related state shared by the Privacy settings pane
+/// (`PrivacySettingsView`, U12), the first-run banner gate (`MainWindow`),
+/// and the menu bar attention dot (`ScreenCapApp.MenuBarExtra`). Single
+/// source of truth — bound as a singleton `@StateObject` in `ScreenCapApp`
+/// and pushed into the environment.
 ///
 /// All writes flow through the existing `screencap settings privacy` CLI
 /// surface (R16 invariant — mode is never silently mutated by exclude/allow

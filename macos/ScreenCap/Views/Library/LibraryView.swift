@@ -2,8 +2,8 @@ import SwiftUI
 
 // U5 — the Library screen (design 343–377): a card grid over the recordings
 // index with real thumbnails, filter chips, a header search pill + New-recording
-// pill, and the empty / error / zero-match states the prototype omits. Replaces
-// the legacy `RecordingsListView` in the shell's Library route.
+// pill, and the empty / error / zero-match states the prototype omits. Replaced
+// the retired `RecordingsListView` in the shell's Library route.
 //
 // The New-recording pill fires `onNewRecording` (U6's in-window sheet); the
 // search pill fires `onOpenSearch` (U10's Recall palette, KTD-13); a card click

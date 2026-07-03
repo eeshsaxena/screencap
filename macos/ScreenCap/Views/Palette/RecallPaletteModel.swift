@@ -12,8 +12,8 @@ enum RecallPalette {
     // MARK: - Render state
 
     /// What the palette body shows for a given search-stack state. Consent and
-    /// backfill ride alongside results (banner slots), mirroring
-    /// SearchResultsView's mutual-exclusivity rule: the backfill affordance
+    /// backfill ride alongside results (banner slots), keeping the retired
+    /// Search pane's mutual-exclusivity rule: the backfill affordance
     /// displaces the consent banner while active.
     struct State: Equatable {
         enum Body: Equatable {
@@ -155,9 +155,9 @@ enum RecallPalette {
 }
 
 /// U10 — owns the palette's in-flight query task so dismissal provably cancels
-/// it (the existing SearchView cancellation pattern, extracted for testability:
-/// the esc-cancels test drives this with a hook-counter fake instead of a
-/// render).
+/// it (the retired SearchView's cancellation pattern, extracted for
+/// testability: the esc-cancels test drives this with a hook-counter fake
+/// instead of a render).
 @MainActor
 final class RecallPaletteQueryRunner: ObservableObject {
     /// The live search body — injected so tests can observe start/cancel.
@@ -165,7 +165,7 @@ final class RecallPaletteQueryRunner: ObservableObject {
     private let debounceNanos: UInt64
     private(set) var searchTask: Task<Void, Never>?
     /// Dedupes the trailing `.onChange` a programmatic query set produces
-    /// (the SearchView `lastIssuedQuery` pattern).
+    /// (the retired SearchView's `lastIssuedQuery` pattern).
     private var lastIssuedQuery: String?
 
     init(debounceNanos: UInt64 = 300_000_000, run: @escaping (String) async -> Void) {

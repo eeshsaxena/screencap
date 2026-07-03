@@ -45,7 +45,8 @@ final class RecallPaletteStateTests: XCTestCase {
         )
         XCTAssertFalse(declined.showsConsentBanner)
 
-        // The backfill affordance displaces the banner (SearchResultsView rule).
+        // The backfill affordance displaces the banner (the retired Search
+        // pane's mutual-exclusivity rule).
         let backfilling = RecallPalette.state(
             phase: phase, consentDeclined: false, backfillState: .offering, recents: []
         )
@@ -160,8 +161,8 @@ final class RecallPaletteStateTests: XCTestCase {
         XCTAssertNil(runner.searchTask, "the cancelled task handle is released")
     }
 
-    /// A fresh keystroke supersedes the previous in-flight query (the existing
-    /// SearchView single-handle pattern).
+    /// A fresh keystroke supersedes the previous in-flight query (the retired
+    /// SearchView's single-handle pattern).
     func testNewSearchCancelsPreviousTask() async {
         let hook = QueryHook()
         let runner = RecallPaletteQueryRunner(debounceNanos: 0) { _ in
@@ -200,8 +201,8 @@ final class RecallPaletteStateTests: XCTestCase {
         consentDeclined: Bool = false,
         backfillState: SearchViewModel.BackfillUIState = .hidden,
         recents: [String] = []
-    ) -> SearchViewHost.Hosted {
-        SearchViewHost.host(
+    ) -> ViewHost.Hosted {
+        ViewHost.host(
             RecallPaletteContent(
                 phase: phase,
                 consentDeclined: consentDeclined,
@@ -231,7 +232,7 @@ final class RecallPaletteStateTests: XCTestCase {
                  backfillState: .indexing(done: 3, total: 9, failed: 0)),
         ] {
             XCTAssertTrue(
-                SearchViewHost.rendersVisibleContent(in: hosted),
+                ViewHost.rendersVisibleContent(in: hosted),
                 "palette variant must not render blank"
             )
         }

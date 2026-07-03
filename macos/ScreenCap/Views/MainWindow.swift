@@ -416,9 +416,9 @@ struct MainWindow: View {
     }
 
     /// Persistent Start / Stop control in the window toolbar so the user can
-    /// reach it without going to the menu bar once the calendar is populated
-    /// (the empty-state Start button only renders when totalCount == 0).
-    /// State branches mirror MenuBarMenu so the two surfaces stay in lockstep.
+    /// reach it without going to the menu bar or the Library's New-recording
+    /// pill. State branches mirror MenuBarMenu so the two surfaces stay in
+    /// lockstep.
     @ViewBuilder
     private var recordingToolbarControl: some View {
         if recorder.quitProgressSecondsRemaining != nil {

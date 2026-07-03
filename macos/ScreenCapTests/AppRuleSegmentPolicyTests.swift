@@ -105,7 +105,7 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
     }
 
     /// An unknown future `resolved_action` renders as recorded rather than
-    /// blanking the row (mirrors PrivacyBadgeStyle's defensive fallback).
+    /// blanking the row (the retired PrivacyBadgeStyle's defensive fallback).
     func testUnknownResolvedActionFallsBackToRecorded() {
         XCTAssertEqual(
             AppRuleSegmentPolicy.derive(for: app(resolvedAction: "hologram_redact")).selection,
