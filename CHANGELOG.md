@@ -5,24 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.22.0] - 2026-07-03
+
+> No standalone 0.21.0 CLI release was published — 0.21.0 shipped only as the
+> embedded daemon of macOS app v0.1.5. This section covers everything since
+> 0.20.0.
 
 ### Added
 
+- **Cloud sign-in.** `screencap login` / `screencap logout` / `screencap whoami`
+  (Google OAuth + Firebase). Uploads and downloads are per-user and
+  token-authenticated, public viewer URLs are gone, and auth/token hosts are
+  excluded from self-capture (fail closed). Account-mismatch state is surfaced
+  on the daemon API and MCP (SCR-148/171).
+- **Unified disk-first processing pipeline.** Capture writes chunks to disk as
+  the source of truth; an on-disk per-chunk ledger (tri-state upload state),
+  destination-agnostic stages (transcribe → export → manifest), a frozen
+  per-recording destination/retention policy, and a single flock-guarded
+  terminal stage converge every recording. Retention and eviction hold under
+  every policy, and `recording.db` is local-only by rule — never uploaded.
+  Includes masker-safe per-chunk live upload, engine fast finalize, daemon
+  auto-resume + startup sweep, and migration of legacy/in-flight recordings
+  (SCR-123/124/125/129/130).
+- **Reviewed == uploaded.** Recordings are scrubbed before review so what you
+  approve is exactly what uploads; the reviewed scrubbed copy is reused at
+  upload time (completion sentinel + provenance), and the review envelope
+  carries redaction evidence and coverage. Post-hoc video-frame masking for
+  cloud copies exists behind `masked_video_upload` (default OFF).
+- **Agent-memory retrieval (SCR-118).** Local-only content index (OCR of
+  policy-ALLOW frames only; default off, consent-gated per SCR-174) with daemon
+  query verbs `content.search`, `transcript.search`, `timeline.query`, and
+  `frame.nearest` (SCR-186), plus a `screencap mcp` stdio server for local
+  agents. `timeline.query` filters by browser-URL domain and `apps.list`
+  exposes the query-parser vocabulary (SCR-179).
+- **Content-index backfill (SCR-178).** `screencap backfill start|status|cancel`
+  OCR-indexes existing recordings into the content index (closed-set resumable
+  ledger, fail-closed skip-set derivation, budget/pause/cancel), driven by
+  daemon verbs and offered from the Search consent flow.
+- **Daemon permission surface.** Fresh-subprocess TCC probe, live grant state on
+  `daemon.info`, structured `permission_required` start failures naming the
+  exact missing permission, on-demand `permission.request` registration, and
+  proactive install-time TCC registration with identity-scoped decoy cleanup
+  (SCR-200). The PyInstaller spec now emits the `com.screencap.daemon` helper
+  .app (SCR-196).
 - **Stable permissions across updates (macOS app).** ScreenCap now records
   through a background helper that owns the Screen Recording, Accessibility, and
   Input Monitoring permissions. Grant them once and they persist across all
   future ScreenCap updates — no more re-granting on every update. Existing users
   see a one-time explainer on first launch after upgrading, then complete the
-  short helper setup once (SCR-49). *This is a forward-only release: it ships
-  only after the Developer ID signing-validation runbook
-  (`docs/runbooks/developer-id-signing-validation.md`) passes the 5×-rebuild
-  TCC-persistence smoke.*
+  short helper setup once (SCR-49).
+- **Day timeline surface.** New day-segments daemon verb with an honest
+  blocked-intervals surface, plus additive `recording.list` fields and audio
+  echo, backing the rebuilt macOS app UI.
+- **`screencap inspect-data`** — local, no-scrub inspection envelope for a
+  recording, with retry while a recording is still finalizing.
 
 ### Fixed
 
 - `screencap upload` now exits non-zero when a recording fails to upload; a
   retryable "already in progress" busy-lock skip still exits 0 (SCR-79).
+- Mid-recording Screen Recording permission revocation is now detected on the
+  daemon path (SCR-106).
+- Cloud recordings with no ledger derive as ready instead of processing forever.
+- Dynamic text is escaped before Rich-markup rendering across CLI error, info,
+  and success sinks (SCR-117/169).
+- Interactive upload distinguishes a transient `recording.db` lock from
+  corruption and surfaces busy states under a watchdog instead of hanging
+  (SCR-165/166).
+- Scrub concurrency: a per-recording lock closes the concurrent-window
+  scrubbed-dir race, the WAL is hashed into reuse-guard provenance, and
+  `.scrub_failed` sidecars can no longer leak into uploads.
+- Backfill hardening: cross-process safety, units stay PENDING when the index
+  store is unavailable, skip sets re-derive under the frozen capture-time
+  privacy mode, and jobs cancel on daemon shutdown (SCR-190–194).
+- `frame.nearest` fails closed on a partial canonical read (SCR-198).
 
 ### Removed
 
