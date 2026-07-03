@@ -1438,11 +1438,18 @@ async def timeline_day(request: Request) -> JSONResponse:
             return _validation_error_response(
                 schema_version=schema._TIMELINE_DAY_API_VERSION,
             )
+        # Validate the day-surface shape through the typed response model (parity
+        # with every other read verb) so any drift in day_segments' output is
+        # caught here rather than shipping an undocumented shape.
+        recordings = [
+            schema.DaySegmentRecording(**rec).model_dump()
+            for rec in result["recordings"]
+        ]
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._TIMELINE_DAY_API_VERSION,
                 date=result["date"],
-                recordings=result["recordings"],
+                recordings=recordings,
             )
         )
     except errors.DaemonAPIError as exc:

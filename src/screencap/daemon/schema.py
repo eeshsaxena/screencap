@@ -77,6 +77,9 @@ _MODEL_NAMES = {
     "TimelineRow",
     "TimelineQueryResponse",
     "TimelineDayRequest",
+    "DayBlockedInterval",
+    "DaySegmentRecording",
+    "TimelineDayResponse",
     "FrameNearestRequest",
     "FrameNearestResponse",
     "AppsListResponse",
@@ -378,6 +381,36 @@ def _load_models() -> dict[str, Any]:
         date: str = Field(max_length=32)
         tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
 
+    class DayBlockedInterval(_DaemonModel):
+        """A blocked span on the day timeline, in absolute unix ms.
+
+        Named distinctly from ``scrubber.BlockedInterval`` (a different, seconds-
+        based dataclass) — this is the ms wire shape the UI hatches.
+        """
+
+        start_ms: int
+        end_ms: int
+
+    class DaySegmentRecording(_DaemonModel):
+        """One recording's day-clamped span + honest blocked-interval split (U3).
+
+        ``blocked_proven`` is provable MASK/EXCLUDE masking (safe to label
+        "blocked"); ``unverifiable`` is fail-closed coverage-gap / null-column
+        ambiguity the UI must render as a neutral gap, never "blocked" (R7).
+        """
+
+        name: str
+        recording_id: str | None = None
+        state: str
+        start_ms: int
+        end_ms: int
+        blocked_proven: list[DayBlockedInterval]
+        unverifiable: list[DayBlockedInterval]
+
+    class TimelineDayResponse(EnvelopeResponse):
+        date: str
+        recordings: list[DaySegmentRecording]
+
     # SCR-186 frame.nearest input bounds. ``timestamp_ms`` is bounded to a
     # realistic epoch ceiling (year 9999) and ``staleness_cap_ms`` to 24h —
     # comfortably above any chunk duration — so a direct UDS caller cannot drive
@@ -525,6 +558,9 @@ def _load_models() -> dict[str, Any]:
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
         "TimelineDayRequest": TimelineDayRequest,
+        "DayBlockedInterval": DayBlockedInterval,
+        "DaySegmentRecording": DaySegmentRecording,
+        "TimelineDayResponse": TimelineDayResponse,
         "FrameNearestRequest": FrameNearestRequest,
         "FrameNearestResponse": FrameNearestResponse,
         "AppsListResponse": AppsListResponse,

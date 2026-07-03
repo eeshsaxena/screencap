@@ -52,7 +52,12 @@ enum SCFonts {
         Newsreader.regular, SpaceGrotesk.regular, IBMPlexMono.regular, PublicSans.regular,
     ]
 
-    private static var didRegisterBundle = false
+    // Single-threaded by construction: written only by `registerBundledFonts()`,
+    // whose callers (app launch in `ScreenCapApp.init`, test `setUp`) run on one
+    // thread. `nonisolated(unsafe)` states that contract explicitly so the
+    // strict-concurrency checker (SWIFT_STRICT_CONCURRENCY: complete) doesn't flag
+    // it as shared mutable global state.
+    nonisolated(unsafe) private static var didRegisterBundle = false
 
     /// Register the fonts bundled in the app (idempotent). Safe to call from
     /// `ScreenCapApp` init; a no-op after the first successful call.
