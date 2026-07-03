@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>body { margin: 0; background: #10161A; }</style>
+</helmet>
+<div style="min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; font-family: 'Public Sans', sans-serif; position: relative;">
+
+  <!-- ===== RECORDING SCENE (replaces window) ===== -->
+  <sc-if value="{{ isRecording }}" hint-placeholder-val="{{ false }}">
+    <div data-screen-label="Recording" style="width: 1240px; height: 800px; border-radius: 12px; background: #E9E2D2; background-image: repeating-linear-gradient(45deg, transparent, transparent 14px, #E0D8C6 14px, #E0D8C6 15px); box-shadow: 0 24px 64px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.3); position: relative; overflow: hidden;">
+      <div style="position: absolute; top: 0; left: 0; right: 0; height: 34px; background: rgba(255,253,247,0.9); border-bottom: 1px solid #E0D8C6; display: flex; align-items: center; justify-content: flex-end; gap: 18px; padding: 0 16px; font-size: 12.5px; color: #52584F;">
+        <span style="display: flex; align-items: center; gap: 7px; background: rgba(217,164,65,0.15); border-radius: 6px; padding: 4px 10px;">
+          <span style="width: 8px; height: 8px; border-radius: 50%; background: #D9A441;"></span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #A97F2E;">{{ recElapsed }}</span>
+        </span>
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;">Tue 14:32</span>
+      </div>
+      <span style="position: absolute; top: 48px; left: 16px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">[ your desktop — Screencap is recording this task ]</span>
+      <div style="position: absolute; left: 26px; bottom: 116px; width: 104px; height: 104px; border-radius: 50%; background: #1C2420; border: 3px solid #FFFDF7; box-shadow: 0 8px 24px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #9BA69E;">[ camera ]</div>
+      <div style="position: absolute; left: 50%; bottom: 34px; transform: translateX(-50%); background: #10161A; border-radius: 999px; box-shadow: 0 12px 32px rgba(0,0,0,0.4); display: flex; align-items: center; gap: 4px; padding: 10px 12px; color: #EDE6D6;">
+        <span style="display: flex; align-items: center; gap: 8px; padding: 6px 12px; white-space: nowrap;">
+          <span style="width: 9px; height: 9px; border-radius: 50%; background: #E3B054; box-shadow: 0 0 0 4px rgba(227,176,84,0.25);"></span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #E3B054;">{{ recElapsed }}</span>
+        </span>
+        <span style="font-size: 13px; color: #EDE6D6; background: #1D2421; border-radius: 999px; padding: 7px 14px; white-space: nowrap;">Payroll walkthrough</span>
+        <span style="width: 1px; height: 22px; background: #2A322E; margin: 0 4px;"></span>
+        <span style="padding: 8px 10px; font-size: 13px; color: #9BA69E; white-space: nowrap; cursor: pointer;">Draw</span>
+        <span style="padding: 8px 10px; font-size: 13px; color: #9BA69E; white-space: nowrap; cursor: pointer;">Mute</span>
+        <span style="width: 1px; height: 22px; background: #2A322E; margin: 0 4px;"></span>
+        <span onClick="{{ stopRecording }}" style="background: #2FA08D; color: #10161A; font-weight: 700; font-size: 13px; padding: 9px 18px; border-radius: 999px; white-space: nowrap; cursor: pointer;" style-hover="background: #3BB89E;">Stop &amp; save</span>
+      </div>
+      <div style="position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #86795F; white-space: nowrap;">recording to this Mac · encrypted</div>
+    </div>
+  </sc-if>
+
+  <!-- ===== MAIN WINDOW ===== -->
+  <sc-if value="{{ isApp }}" hint-placeholder-val="{{ true }}">
+    <div style="width: 1240px; height: 800px; border-radius: 12px; overflow: hidden; display: flex; background: #FFFDF7; box-shadow: 0 24px 64px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.3); color: #1C2420; position: relative;">
+
+      <!-- ===== ONBOARDING (replaces window content) ===== -->
+      <sc-if value="{{ isOnboarding }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Onboarding" style="flex: 1; background: #F6F2E9; display: flex; flex-direction: column;">
+          <div style="display: flex; gap: 8px; padding: 18px 20px;">
+            <span style="width: 12px; height: 12px; border-radius: 50%; background: #EC6A5E;"></span>
+            <span style="width: 12px; height: 12px; border-radius: 50%; background: #F4BF4F;"></span>
+            <span style="width: 12px; height: 12px; border-radius: 50%; background: #61C554;"></span>
+          </div>
+          <!-- step 0: welcome -->
+          <sc-if value="{{ ob0 }}" hint-placeholder-val="{{ false }}">
+            <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 0 100px;">
+              <svg width="56" height="56" viewBox="0 0 48 48" style="margin-bottom: 26px;"><path d="M 20 6 L 12 6 Q 6 6 6 12 L 6 20" fill="none" stroke="#1C2420" stroke-width="4.5" stroke-linecap="round"></path><path d="M 28 42 L 36 42 Q 42 42 42 36 L 42 28" fill="none" stroke="#1C2420" stroke-width="4.5" stroke-linecap="round"></path><circle cx="24" cy="24" r="8.5" fill="#0E7C6B"></circle></svg>
+              <h1 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 40px; line-height: 1.12; letter-spacing: -0.01em; margin: 0 0 14px; max-width: 560px;">Teach it the way you'd show a friend.</h1>
+              <p style="font-size: 15px; line-height: 1.6; color: #52584F; max-width: 440px; margin: 0 0 36px;">Screencap records your screen so new teammates learn from real work — not documentation that's already out of date.</p>
+              <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; width: 100%; max-width: 640px; margin-bottom: 40px;">
+                <div style="background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 18px 16px; text-align: left;">
+                  <div style="width: 10px; height: 10px; border-radius: 50%; background: #0E7C6B; margin-bottom: 12px;"></div>
+                  <div style="font-weight: 600; font-size: 13.5px; margin-bottom: 4px;">Local by default</div>
+                  <div style="font-size: 12.5px; line-height: 1.5; color: #86795F;">Everything stays on this Mac until you share it.</div>
+                </div>
+                <div style="background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 18px 16px; text-align: left;">
+                  <div style="width: 10px; height: 10px; border-radius: 50%; background: #D9A441; margin-bottom: 12px;"></div>
+                  <div style="font-weight: 600; font-size: 13.5px; margin-bottom: 4px;">Encrypted sharing</div>
+                  <div style="font-size: 12.5px; line-height: 1.5; color: #86795F;">Shared copies are end-to-end encrypted. Always.</div>
+                </div>
+                <div style="background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 18px 16px; text-align: left;">
+                  <div style="width: 10px; height: 10px; border-radius: 50%; border: 2px solid #1C2420; margin-bottom: 12px;"></div>
+                  <div style="font-weight: 600; font-size: 13.5px; margin-bottom: 4px;">Connects to your MCPs</div>
+                  <div style="font-size: 12.5px; line-height: 1.5; color: #86795F;">Recordings carry context from the tools you use.</div>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 18px;">
+                <span onClick="{{ obToPermissions }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 14.5px; padding: 12px 26px; border-radius: 999px; cursor: pointer;" style-hover="background: #0C6E5F;">Set up permissions</span>
+                <span onClick="{{ obFinish }}" style="font-size: 13.5px; color: #86795F; cursor: pointer;">Skip for now</span>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- step 1: permissions -->
+          <sc-if value="{{ ob1 }}" hint-placeholder-val="{{ false }}">
+            <div style="flex: 1; display: flex; gap: 44px; padding: 24px 90px 12px;">
+              <div style="width: 340px; display: flex; flex-direction: column;">
+                <h1 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 31px; line-height: 1.15; letter-spacing: -0.01em; margin: 0 0 10px;">Let Screencap see your screen.</h1>
+                <p style="font-size: 13.5px; line-height: 1.6; color: #52584F; margin: 0 0 26px;">macOS asks once. Recordings still stay on this Mac — permissions only let the app capture, not upload.</p>
+                <div style="display: flex; flex-direction: column; gap: 10px;">
+                  <div style="display: flex; align-items: center; justify-content: space-between; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 13px 16px;">
+                    <div>
+                      <div style="font-weight: 600; font-size: 13.5px;">Screen &amp; system audio</div>
+                      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: {{ permColor }}; margin-top: 3px;">{{ permText }}</div>
+                    </div>
+                    <sc-if value="{{ screenGranted }}" hint-placeholder-val="{{ false }}">
+                      <span style="width: 20px; height: 20px; border-radius: 50%; background: #0E7C6B; display: flex; align-items: center; justify-content: center;"><svg width="10" height="8" viewBox="0 0 10 8"><path d="M1 4 L4 7 L9 1" fill="none" stroke="#F6F2E9" stroke-width="2" stroke-linecap="round"></path></svg></span>
+                    </sc-if>
+                  </div>
+                  <div style="display: flex; align-items: center; justify-content: space-between; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 13px 16px;">
+                    <div>
+                      <div style="font-weight: 600; font-size: 13.5px;">Microphone</div>
+                      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #0E7C6B; margin-top: 3px;">granted</div>
+                    </div>
+                    <span style="width: 20px; height: 20px; border-radius: 50%; background: #0E7C6B; display: flex; align-items: center; justify-content: center;"><svg width="10" height="8" viewBox="0 0 10 8"><path d="M1 4 L4 7 L9 1" fill="none" stroke="#F6F2E9" stroke-width="2" stroke-linecap="round"></path></svg></span>
+                  </div>
+                  <div style="display: flex; align-items: center; justify-content: space-between; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 13px 16px;">
+                    <div>
+                      <div style="font-weight: 600; font-size: 13.5px;">Accessibility</div>
+                      <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #86795F; margin-top: 3px;">optional · enables click highlights</div>
+                    </div>
+                    <span style="width: 20px; height: 20px; border-radius: 50%; border: 2px solid #E0D8C6;"></span>
+                  </div>
+                </div>
+                <div style="margin-top: auto; display: flex; align-items: center; gap: 16px;">
+                  <span onClick="{{ grantScreen }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 14px; padding: 11px 22px; border-radius: 999px; white-space: nowrap; cursor: pointer;" style-hover="background: #0C6E5F;">Open System Settings</span>
+                  <span onClick="{{ obToAppRules }}" style="font-size: 13px; color: #52584F; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;">Continue</span>
+                </div>
+              </div>
+              <div style="flex: 1; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 14px; padding: 26px 28px; display: flex; flex-direction: column;">
+                <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.1em; color: #86795F; margin-bottom: 20px;">DRAG THE ICON INTO SYSTEM SETTINGS</div>
+                <div style="display: flex; align-items: center; gap: 18px; margin-bottom: 22px;">
+                  <div style="width: 84px; height: 84px; border-radius: 20px; background: #F6F2E9; border: 1px solid #E0D8C6; box-shadow: 0 10px 24px rgba(28,36,32,0.18); display: flex; align-items: center; justify-content: center; transform: rotate(-4deg); cursor: grab;">
+                    <svg width="44" height="44" viewBox="0 0 48 48"><path d="M 20 6 L 12 6 Q 6 6 6 12 L 6 20" fill="none" stroke="#1C2420" stroke-width="4.5" stroke-linecap="round"></path><path d="M 28 42 L 36 42 Q 42 42 42 36 L 42 28" fill="none" stroke="#1C2420" stroke-width="4.5" stroke-linecap="round"></path><circle cx="24" cy="24" r="8.5" fill="#0E7C6B"></circle></svg>
+                  </div>
+                  <svg width="52" height="22" viewBox="0 0 52 22"><path d="M2 11 H42" stroke="#86795F" stroke-width="2" stroke-dasharray="4 5" stroke-linecap="round"></path><path d="M40 4 L48 11 L40 18" fill="none" stroke="#86795F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+                  <div style="flex: 1; border: 1px solid #E0D8C6; border-radius: 10px; overflow: hidden;">
+                    <div style="background: #EDE6D6; padding: 7px 12px; display: flex; align-items: center; gap: 6px;">
+                      <span style="width: 8px; height: 8px; border-radius: 50%; background: #D5CCB8;"></span>
+                      <span style="width: 8px; height: 8px; border-radius: 50%; background: #D5CCB8;"></span>
+                      <span style="font-size: 10.5px; color: #52584F; margin-left: 6px; font-weight: 600;">Privacy &amp; Security</span>
+                    </div>
+                    <div style="padding: 10px 12px; display: flex; flex-direction: column; gap: 7px;">
+                      <div style="font-size: 11px; color: #52584F;">Screen &amp; System Audio Recording</div>
+                      <div onClick="{{ grantScreen }}" style="border: 2px dashed #0E7C6B; border-radius: 8px; padding: 9px 10px; display: flex; align-items: center; gap: 8px; background: rgba(14,124,107,0.05); cursor: pointer;" style-hover="background: rgba(14,124,107,0.12);">
+                        <svg width="16" height="16" viewBox="0 0 48 48" style="opacity: 0.45;"><path d="M 20 6 L 12 6 Q 6 6 6 12 L 6 20" fill="none" stroke="#0E7C6B" stroke-width="5" stroke-linecap="round"></path><path d="M 28 42 L 36 42 Q 42 42 42 36 L 42 28" fill="none" stroke="#0E7C6B" stroke-width="5" stroke-linecap="round"></path><circle cx="24" cy="24" r="9" fill="#0E7C6B"></circle></svg>
+                        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #0E7C6B;">drop Screencap here</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <p style="font-size: 12.5px; line-height: 1.6; color: #86795F; margin: 0;">Grab the icon above and drop it straight onto the System Settings list — no digging through menus. We'll detect it the moment macOS flips the switch. (In this prototype, click the drop zone.)</p>
+                <div style="margin-top: auto; display: flex; align-items: center; gap: 8px; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #86795F;">
+                  <span style="width: 7px; height: 7px; border-radius: 50%; background: {{ permColor }};"></span>{{ permListen }}
+                </div>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- step 2: app rules -->
+          <sc-if value="{{ ob2 }}" hint-placeholder-val="{{ false }}">
+            <div style="flex: 1; display: flex; flex-direction: column; align-items: center; padding: 10px 100px 0; text-align: center;">
+              <h1 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 34px; line-height: 1.12; letter-spacing: -0.01em; margin: 0 0 10px;">Some things are nobody's business.</h1>
+              <p style="font-size: 14px; line-height: 1.6; color: #52584F; max-width: 470px; margin: 0 0 24px;">We've pre-blocked the obvious ones. Recording skips blocked apps automatically — the video just cuts around them.</p>
+              <div style="width: 100%; max-width: 560px; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 14px; text-align: left; overflow: hidden;">
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #EDE6D6;">
+                  <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="width: 30px; height: 30px; border-radius: 8px; background: #2B3A67; color: #FFFDF7; display: flex; align-items: center; justify-content: center; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13px;">1P</span>
+                    <span style="font-size: 13.5px; font-weight: 600;">1Password</span>
+                  </div>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #B4552B; border: 1px solid #B4552B44; padding: 3px 10px; border-radius: 999px;">blocked</span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #EDE6D6;">
+                  <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="width: 30px; height: 30px; border-radius: 8px; background: #5C5343; color: #FFFDF7; display: flex; align-items: center; justify-content: center; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13px;">Me</span>
+                    <span style="font-size: 13.5px; font-weight: 600;">Messages</span>
+                  </div>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #B4552B; border: 1px solid #B4552B44; padding: 3px 10px; border-radius: 999px;">blocked</span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #EDE6D6;">
+                  <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="width: 30px; height: 30px; border-radius: 8px; background: #7A4A8A; color: #FFFDF7; display: flex; align-items: center; justify-content: center; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13px;">Sl</span>
+                    <span style="font-size: 13.5px; font-weight: 600;">Slack</span>
+                  </div>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #A97F2E; border: 1px solid #D9A44166; padding: 3px 10px; border-radius: 999px;">masked</span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 18px;">
+                  <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="width: 30px; height: 30px; border-radius: 8px; background: #0E7C6B; color: #FFFDF7; display: flex; align-items: center; justify-content: center; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 13px;">Gu</span>
+                    <span style="font-size: 13.5px; font-weight: 600;">Gusto, Ramp, Attio + everything else</span>
+                  </div>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #0E7C6B; border: 1px solid #0E7C6B55; padding: 3px 10px; border-radius: 999px;">recorded</span>
+                </div>
+              </div>
+              <div style="font-size: 12.5px; color: #86795F; margin-top: 14px;">Private browser windows always pause recording. Fine-tune per app later in Settings → Privacy.</div>
+              <div style="display: flex; align-items: center; gap: 18px; margin-top: 20px;">
+                <span onClick="{{ obToStorage }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 14.5px; padding: 12px 28px; border-radius: 999px; cursor: pointer;" style-hover="background: #0C6E5F;">Looks right</span>
+                <span onClick="{{ obToStorage }}" style="font-size: 13.5px; color: #52584F; text-decoration: underline; text-underline-offset: 3px; cursor: pointer;">Edit the list</span>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- step 3: storage -->
+          <sc-if value="{{ ob3 }}" hint-placeholder-val="{{ false }}">
+            <div style="flex: 1; display: flex; flex-direction: column; align-items: center; padding: 14px 100px 0; text-align: center;">
+              <h1 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 34px; line-height: 1.12; letter-spacing: -0.01em; margin: 0 0 10px;">Where should your recordings live?</h1>
+              <p style="font-size: 14px; line-height: 1.6; color: #52584F; max-width: 460px; margin: 0 0 28px;">Either way, recording happens on this Mac. This only decides what happens after.</p>
+              <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; width: 100%; max-width: 860px; text-align: left;">
+                <div onClick="{{ pickLocal }}" style="background: #FFFDF7; border: {{ localBorder }}; border-radius: 14px; padding: 22px; position: relative; cursor: pointer;">
+                  <span style="position: absolute; top: 16px; right: 16px; width: 20px; height: 20px; border-radius: 50%; background: #0E7C6B; display: flex; align-items: center; justify-content: center; opacity: {{ localCheckOp }};"><svg width="10" height="8" viewBox="0 0 10 8"><path d="M1 4 L4 7 L9 1" fill="none" stroke="#F6F2E9" stroke-width="2" stroke-linecap="round"></path></svg></span>
+                  <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; margin-bottom: 2px;">This Mac only</div>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #0E7C6B; margin-bottom: 14px;">free · forever · no account</div>
+                  <div style="display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; color: #52584F;">
+                    <span style="display: flex; gap: 8px;"><span style="color: #0E7C6B;">—</span>Everything stays on your disk</span>
+                    <span style="display: flex; gap: 8px;"><span style="color: #0E7C6B;">—</span>Share by exporting encrypted files</span>
+                    <span style="display: flex; gap: 8px;"><span style="color: #0E7C6B;">—</span>Nothing ever touches our servers</span>
+                  </div>
+                </div>
+                <div onClick="{{ pickPersonal }}" style="background: #FFFDF7; border: {{ personalBorder }}; border-radius: 14px; padding: 22px; position: relative; cursor: pointer;">
+                  <span style="position: absolute; top: 16px; right: 16px; width: 20px; height: 20px; border-radius: 50%; background: #0E7C6B; display: flex; align-items: center; justify-content: center; opacity: {{ personalCheckOp }};"><svg width="10" height="8" viewBox="0 0 10 8"><path d="M1 4 L4 7 L9 1" fill="none" stroke="#F6F2E9" stroke-width="2" stroke-linecap="round"></path></svg></span>
+                  <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; margin-bottom: 2px;">Personal cloud</div>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F; margin-bottom: 14px;">$5 / month · just you</div>
+                  <div style="display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; color: #52584F;">
+                    <span style="display: flex; gap: 8px;"><span style="color: #86795F;">—</span>Encrypted backup across your Macs</span>
+                    <span style="display: flex; gap: 8px;"><span style="color: #86795F;">—</span>Share single recordings by link</span>
+                    <span style="display: flex; gap: 8px;"><span style="color: #86795F;">—</span>Upgrade to a team anytime</span>
+                  </div>
+                </div>
+                <div onClick="{{ pickTeam }}" style="background: #FFFDF7; border: {{ teamBorder }}; border-radius: 14px; padding: 22px; position: relative; cursor: pointer;">
+                  <span style="position: absolute; top: 16px; right: 16px; width: 20px; height: 20px; border-radius: 50%; background: #0E7C6B; display: flex; align-items: center; justify-content: center; opacity: {{ teamCheckOp }};"><svg width="10" height="8" viewBox="0 0 10 8"><path d="M1 4 L4 7 L9 1" fill="none" stroke="#F6F2E9" stroke-width="2" stroke-linecap="round"></path></svg></span>
+                  <div style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px; margin-bottom: 2px;">Team cloud</div>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F; margin-bottom: 14px;">$8 / person / month</div>
+                  <div style="display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; color: #52584F;">
+                    <span style="display: flex; gap: 8px;"><span style="color: #86795F;">—</span>Shared team library, E2E encrypted</span>
+                    <span style="display: flex; gap: 8px;"><span style="color: #86795F;">—</span>Invite by email or company domain</span>
+                    <span style="display: flex; gap: 8px;"><span style="color: #86795F;">—</span>Keys stay with your team — we can't watch</span>
+                  </div>
+                </div>
+              </div>
+              <div style="font-size: 12.5px; color: #86795F; margin-top: 16px;">You can switch anytime in Settings → Privacy. Local files stay local when you upgrade.</div>
+              <span onClick="{{ storageNext }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 14.5px; padding: 12px 28px; border-radius: 999px; cursor: pointer; margin-top: 22px;" style-hover="background: #0C6E5F;">{{ storageCta }}</span>
+            </div>
+          </sc-if>
+
+          <!-- step 4: account -->
+          <sc-if value="{{ ob4 }}" hint-placeholder-val="{{ false }}">
+            <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0 100px; text-align: center;">
+              <h1 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 34px; line-height: 1.12; letter-spacing: -0.01em; margin: 0 0 10px;">Create your Screencap account.</h1>
+              <p style="font-size: 14px; line-height: 1.6; color: #52584F; max-width: 440px; margin: 0 0 30px;">{{ accountSub }}</p>
+              <div style="display: flex; flex-direction: column; gap: 10px; width: 340px;">
+                <span onClick="{{ accountNext }}" style="display: flex; align-items: center; justify-content: center; gap: 10px; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 999px; padding: 12px 0; font-weight: 600; font-size: 14px; cursor: pointer;" style-hover="border-color: #0E7C6B;">
+                  <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; color: #0E7C6B;">G</span>Continue with Google
+                </span>
+                <span onClick="{{ accountNext }}" style="display: flex; align-items: center; justify-content: center; gap: 10px; background: #1C2420; color: #F6F2E9; border-radius: 999px; padding: 12px 0; font-weight: 600; font-size: 14px; cursor: pointer;" style-hover="background: #2A342E;">
+                  <span style="font-size: 15px;"></span>Continue with Apple
+                </span>
+                <div style="display: flex; align-items: center; gap: 12px; margin: 6px 0;">
+                  <span style="flex: 1; height: 1px; background: #E0D8C6;"></span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #86795F;">or</span>
+                  <span style="flex: 1; height: 1px; background: #E0D8C6;"></span>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                  <span style="flex: 1; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 999px; padding: 11px 18px; font-size: 13.5px; color: #86795F; text-align: left;">work email…</span>
+                  <span onClick="{{ accountNext }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 13.5px; padding: 11px 20px; border-radius: 999px; cursor: pointer;" style-hover="background: #0C6E5F;">Continue</span>
+                </div>
+              </div>
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #86795F; margin-top: 24px;">your recordings are never readable by us — the account can't change that</div>
+            </div>
+          </sc-if>
+
+          <!-- step 5: team setup -->
+          <sc-if value="{{ ob5 }}" hint-placeholder-val="{{ false }}">
+            <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0 100px; text-align: center;">
+              <h1 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 34px; line-height: 1.12; letter-spacing: -0.01em; margin: 0 0 10px;">Set up your team.</h1>
+              <p style="font-size: 14px; line-height: 1.6; color: #52584F; max-width: 440px; margin: 0 0 30px;">Your team gets one shared, encrypted library. You're the admin.</p>
+              <div style="display: flex; flex-direction: column; gap: 12px; width: 400px; text-align: left;">
+                <div>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.08em; color: #86795F; margin-bottom: 6px;">TEAM NAME</div>
+                  <span style="display: block; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px; font-size: 14px;">Acme Ops</span>
+                </div>
+                <div>
+                  <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.08em; color: #86795F; margin-bottom: 6px;">INVITE TEAMMATES</div>
+                  <span style="display: block; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px; font-size: 13.5px; color: #86795F;">ana@acme.com, jonas@acme.com…</span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px;">
+                  <div style="font-size: 13px;">Anyone with an <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #0E7C6B;">@acme.com</span> email can join</div>
+                  <span style="width: 38px; height: 22px; border-radius: 999px; background: #0E7C6B; position: relative; flex-shrink: 0;"><span style="position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%; background: #FFFDF7;"></span></span>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 18px; margin-top: 28px;">
+                <span onClick="{{ obFinish }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 14.5px; padding: 12px 28px; border-radius: 999px; cursor: pointer;" style-hover="background: #0C6E5F;">Create team</span>
+                <span onClick="{{ obFinish }}" style="font-size: 13.5px; color: #52584F; text-decoration: underline; text-underline-offset: 3px; cursor: pointer;">I have an invite link</span>
+              </div>
+            </div>
+          </sc-if>
+          <div style="display: flex; justify-content: center; gap: 7px; padding: 18px 0 24px;">
+            <sc-for list="{{ obDots }}" as="dot" hint-placeholder-count="4">
+              <span style="width: 7px; height: 7px; border-radius: 50%; background: {{ dot.bg }};"></span>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ===== APP (sidebar + views) ===== -->
+      <sc-if value="{{ isMain }}" hint-placeholder-val="{{ true }}">
+        <aside style="width: 248px; background: #F6F2E9; border-right: 1px solid #E0D8C6; display: flex; flex-direction: column; padding: 18px 14px; flex-shrink: 0;">
+          <div style="display: flex; gap: 8px; padding: 0 6px 22px;">
+            <span style="width: 12px; height: 12px; border-radius: 50%; background: #EC6A5E;"></span>
+            <span style="width: 12px; height: 12px; border-radius: 50%; background: #F4BF4F;"></span>
+            <span style="width: 12px; height: 12px; border-radius: 50%; background: #61C554;"></span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 9px; padding: 0 6px 24px;">
+            <svg width="22" height="22" viewBox="0 0 48 48"><path d="M 20 6 L 12 6 Q 6 6 6 12 L 6 20" fill="none" stroke="#1C2420" stroke-width="4.5" stroke-linecap="round"></path><path d="M 28 42 L 36 42 Q 42 42 42 36 L 42 28" fill="none" stroke="#1C2420" stroke-width="4.5" stroke-linecap="round"></path><circle cx="24" cy="24" r="8.5" fill="#0E7C6B"></circle></svg>
+            <span style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 18px;">Screencap</span>
+          </div>
+          <nav style="display: flex; flex-direction: column; gap: 2px;">
+            <sc-for list="{{ navItems }}" as="item" hint-placeholder-count="2">
+              <div onClick="{{ item.onClick }}" style="display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; background: {{ item.bg }}; color: {{ item.color }}; font-weight: {{ item.weight }}; font-size: 13.5px; cursor: pointer;" style-hover="background: rgba(28,36,32,0.05);">
+                <span style="width: 7px; height: 7px; border-radius: 50%; background: {{ item.dotBg }}; border: {{ item.dotBorder }};"></span>{{ item.label }}
+              </div>
+            </sc-for>
+          </nav>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.1em; color: #86795F; padding: 24px 12px 8px;">COLLECTIONS</div>
+          <nav style="display: flex; flex-direction: column; gap: 2px; font-size: 13.5px; color: #52584F;">
+            <div style="padding: 7px 12px;">Onboarding — Ops</div>
+            <div style="padding: 7px 12px;">Payroll walkthroughs</div>
+            <div style="padding: 7px 12px; color: #86795F;">+ New collection</div>
+          </nav>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: 0.1em; color: #86795F; padding: 24px 12px 8px;">SETTINGS</div>
+          <nav style="display: flex; flex-direction: column; gap: 2px;">
+            <sc-for list="{{ settingsItems }}" as="item" hint-placeholder-count="2">
+              <div onClick="{{ item.onClick }}" style="display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; background: {{ item.bg }}; color: {{ item.color }}; font-weight: {{ item.weight }}; font-size: 13.5px; cursor: pointer;" style-hover="background: rgba(28,36,32,0.05);">
+                <span style="width: 7px; height: 7px; border-radius: 50%; background: {{ item.dotBg }}; border: {{ item.dotBorder }};"></span>{{ item.label }}
+              </div>
+            </sc-for>
+          </nav>
+          <div style="margin-top: auto; border-top: 1px solid #E0D8C6; padding: 16px 12px 4px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #52584F;">
+              <span style="width: 7px; height: 7px; border-radius: 50%; background: #0E7C6B;"></span>3 MCPs connected
+            </div>
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">all local · 4.2 GB on this Mac</div>
+            <div onClick="{{ replayOnboarding }}" style="font-size: 12px; color: #86795F; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;" style-hover="color: #0E7C6B;">Replay onboarding</div>
+          </div>
+        </aside>
+
+        <main style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
+
+          <!-- ===== LIBRARY ===== -->
+          <sc-if value="{{ isLibrary }}" hint-placeholder-val="{{ true }}">
+            <div data-screen-label="Library" style="flex: 1; display: flex; flex-direction: column; padding: 28px 36px; overflow: hidden;">
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px;">
+                <h1 style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: -0.01em; margin: 0;">Library</h1>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                  <div onClick="{{ openPalette }}" style="display: flex; align-items: center; gap: 8px; background: #F6F2E9; border: 1px solid #E0D8C6; border-radius: 999px; padding: 9px 16px; width: 250px; color: #86795F; font-size: 13px; cursor: pointer;" style-hover="border-color: #0E7C6B;">
+                    <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="#86795F" stroke-width="1.5"></circle><path d="M8.5 8.5l3 3" stroke="#86795F" stroke-width="1.5" stroke-linecap="round"></path></svg>
+                    Search any moment
+                    <span style="margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #A99C82;">⌘⇧F</span>
+                  </div>
+                  <span onClick="{{ openNewRec }}" style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 13.5px; padding: 10px 20px; border-radius: 999px; display: flex; align-items: center; gap: 8px; cursor: pointer; white-space: nowrap;" style-hover="background: #0C6E5F;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #F6F2E9;"></span>New recording</span>
+                </div>
+              </div>
+              <div style="display: flex; gap: 8px; margin-bottom: 24px;">
+                <sc-for list="{{ chips }}" as="chip" hint-placeholder-count="4">
+                  <span onClick="{{ chip.onClick }}" style="background: {{ chip.bg }}; border: {{ chip.border }}; color: {{ chip.color }}; font-size: 12.5px; font-weight: {{ chip.weight }}; padding: 6px 14px; border-radius: 999px; cursor: pointer;">{{ chip.label }}</span>
+                </sc-for>
+              </div>
+              <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-content: start; overflow: hidden;">
+                <sc-for list="{{ recGrid }}" as="rec" hint-placeholder-count="6">
+                  <div style="display: flex; flex-direction: column; gap: 10px; cursor: pointer;">
+                    <div style="aspect-ratio: 16/9.6; border-radius: 10px; border: 1px solid #E0D8C6; background: #F6F2E9; background-image: repeating-linear-gradient(45deg, transparent, transparent 10px, #EDE6D6 10px, #EDE6D6 11px); position: relative;" style-hover="border-color: #0E7C6B;">
+                      <span style="position: absolute; bottom: 8px; right: 8px; background: rgba(28,36,32,0.85); color: #F6F2E9; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; padding: 3px 8px; border-radius: 4px;">{{ rec.duration }}</span>
+                    </div>
+                    <div>
+                      <div style="font-weight: 600; font-size: 14px; margin-bottom: 3px;">{{ rec.title }}</div>
+                      <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">{{ rec.meta }}</span>
+                        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid {{ rec.badgeBorder }}; color: {{ rec.badgeColor }};">{{ rec.badge }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- ===== JOURNAL ===== -->
+          <sc-if value="{{ isJournal }}" hint-placeholder-val="{{ false }}">
+            <div data-screen-label="Journal" style="flex: 1; display: flex; flex-direction: column; padding: 28px 36px; overflow: hidden;">
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 26px;">
+                <h1 style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 26px; letter-spacing: -0.01em; margin: 0;">Journal</h1>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">ambient recording · split by the agent</span>
+                  <div onClick="{{ openPalette }}" style="display: flex; align-items: center; gap: 8px; background: #F6F2E9; border: 1px solid #E0D8C6; border-radius: 999px; padding: 9px 16px; width: 220px; color: #86795F; font-size: 13px; cursor: pointer;" style-hover="border-color: #0E7C6B;">
+                    <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="#86795F" stroke-width="1.5"></circle><path d="M8.5 8.5l3 3" stroke="#86795F" stroke-width="1.5" stroke-linecap="round"></path></svg>
+                    Search any moment
+                  </div>
+                </div>
+              </div>
+              <div style="overflow: hidden;">
+                <sc-for list="{{ days }}" as="day" hint-placeholder-count="2">
+                  <div style="margin-bottom: 34px;">
+                    <div style="display: flex; align-items: baseline; gap: 14px; margin-bottom: 16px;">
+                      <h2 style="font-family: 'Newsreader', serif; font-weight: 500; font-size: 26px; margin: 0;">{{ day.label }}</h2>
+                      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">{{ day.count }}</span>
+                      <span onClick="{{ jumpToTimeline }}" style="margin-left: auto; font-size: 12.5px; color: #0E7C6B; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;">Open day timeline →</span>
+                    </div>
+                    <div style="display: flex; gap: 16px;">
+                      <sc-for list="{{ day.items }}" as="rec" hint-placeholder-count="3">
+                        <div style="width: 290px; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 12px; padding: 11px; display: flex; flex-direction: column; gap: 10px; cursor: pointer;" style-hover="border-color: #0E7C6B;">
+                          <div style="aspect-ratio: 16/9; border-radius: 8px; background: #F6F2E9; background-image: repeating-linear-gradient(45deg, transparent, transparent 10px, #EDE6D6 10px, #EDE6D6 11px); position: relative; border: 1px solid #EDE6D6;">
+                            <span style="position: absolute; bottom: 7px; right: 7px; background: rgba(28,36,32,0.85); color: #F6F2E9; font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 3px 7px; border-radius: 4px;">{{ rec.duration }}</span>
+                          </div>
+                          <div style="padding: 0 3px 3px;">
+                            <div style="font-weight: 600; font-size: 13.5px; margin-bottom: 3px;">{{ rec.title }}</div>
+                            <div style="font-size: 12px; color: #52584F;">{{ rec.summary }}</div>
+                            <div style="display: flex; gap: 6px; margin-top: 9px;">
+                              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid {{ rec.badgeBorder }}; color: {{ rec.badgeColor }};">{{ rec.badge }}</span>
+                              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid #E0D8C6; color: #86795F;">{{ rec.app }}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </sc-for>
+                    </div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- ===== DAY TIMELINE ===== -->
+          <sc-if value="{{ isTimeline }}" hint-placeholder-val="{{ false }}">
+            <div data-screen-label="Day timeline" style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
+              <div style="display: flex; align-items: center; gap: 16px; padding: 16px 24px; border-bottom: 1px solid #E0D8C6; background: #F6F2E9;">
+                <span onClick="{{ goJournal }}" style="font-size: 13px; color: #52584F; cursor: pointer;" style-hover="color: #0E7C6B;">← Journal</span>
+                <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px;">Wednesday, 1 July</span>
+                <div style="display: flex; align-items: center; gap: 10px; background: #FFFDF7; border: 1px solid #0E7C6B66; border-radius: 999px; padding: 8px 16px; width: 300px; margin-left: auto;">
+                  <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="#0E7C6B" stroke-width="1.6"></circle><path d="M8.5 8.5l3 3" stroke="#0E7C6B" stroke-width="1.6" stroke-linecap="round"></path></svg>
+                  <span style="font-size: 13px;">meeting with John</span>
+                  <span style="margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #0E7C6B;">2 moments</span>
+                </div>
+              </div>
+              <div style="flex: 1; display: flex; align-items: center; justify-content: center; background: #F6F2E9; background-image: repeating-linear-gradient(45deg, transparent, transparent 12px, #EDE6D6 12px, #EDE6D6 13px); position: relative;">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #86795F;">[ playback — 10:04 · Zoom, 1:1 with John Meyer ]</span>
+                <span style="position: absolute; bottom: 14px; left: 24px; background: rgba(28,36,32,0.85); color: #F6F2E9; font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 4px 10px; border-radius: 5px;">10:04:32</span>
+                <span style="position: absolute; bottom: 14px; right: 24px; display: flex; gap: 8px;">
+                  <span style="background: rgba(28,36,32,0.85); color: #F6F2E9; font-size: 12px; padding: 6px 14px; border-radius: 999px; cursor: pointer;">Clip this moment</span>
+                  <span style="background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 12px; padding: 6px 14px; border-radius: 999px; cursor: pointer;">Share from here</span>
+                </span>
+              </div>
+              <div style="padding: 18px 24px 20px; border-top: 1px solid #E0D8C6;">
+                <div style="position: relative; height: 64px; margin-bottom: 10px;">
+                  <div style="position: absolute; left: 0; right: 0; top: 24px; height: 16px; border-radius: 4px; background: #F6F2E9; border: 1px solid #E0D8C6;"></div>
+                  <div style="position: absolute; left: 4%; width: 13%; top: 24px; height: 16px; background: rgba(14,124,107,0.25); border: 1px solid #0E7C6B55; border-radius: 4px;"></div>
+                  <div style="position: absolute; left: 19%; width: 9%; top: 24px; height: 16px; background: rgba(14,124,107,0.25); border: 1px solid #0E7C6B55; border-radius: 4px;"></div>
+                  <div style="position: absolute; left: 31%; width: 17%; top: 24px; height: 16px; background: rgba(14,124,107,0.25); border: 1px solid #0E7C6B55; border-radius: 4px;"></div>
+                  <div style="position: absolute; left: 57%; width: 11%; top: 24px; height: 16px; background: rgba(14,124,107,0.25); border: 1px solid #0E7C6B55; border-radius: 4px;"></div>
+                  <div style="position: absolute; left: 51%; width: 3.5%; top: 24px; height: 16px; background: repeating-linear-gradient(45deg, #B4552B33, #B4552B33 3px, transparent 3px, transparent 6px); border-radius: 4px;"></div>
+                  <span style="position: absolute; left: 4%; top: 2px; font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #0E7C6B;">Weekly 1:1</span>
+                  <span style="position: absolute; left: 31%; top: 2px; font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #0E7C6B;">Payroll run</span>
+                  <span style="position: absolute; left: 57%; top: 2px; font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #0E7C6B;">Hiring sync</span>
+                  <span style="position: absolute; left: 51%; top: 48px; font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #B4552B;">blocked</span>
+                  <span style="position: absolute; left: 8.5%; top: 20px; width: 4px; height: 24px; background: #D9A441; border-radius: 2px; box-shadow: 0 0 0 3px rgba(217,164,65,0.3);"></span>
+                  <span style="position: absolute; left: 73%; top: 20px; width: 4px; height: 24px; background: #D9A441; border-radius: 2px; box-shadow: 0 0 0 3px rgba(217,164,65,0.3);"></span>
+                  <span style="position: absolute; left: 8.5%; top: 14px; width: 2px; height: 36px; background: #1C2420;"></span>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #86795F;">
+                  <span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span><span>18:00</span>
+                </div>
+                <div style="display: flex; gap: 16px; margin-top: 12px; font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #86795F;">
+                  <span style="display: flex; align-items: center; gap: 6px;"><span style="width: 10px; height: 8px; background: rgba(14,124,107,0.25); border: 1px solid #0E7C6B55; border-radius: 2px;"></span>agent-labeled task</span>
+                  <span style="display: flex; align-items: center; gap: 6px;"><span style="width: 10px; height: 8px; background: #F6F2E9; border: 1px solid #E0D8C6; border-radius: 2px;"></span>unsplit — still searchable</span>
+                  <span style="display: flex; align-items: center; gap: 6px;"><span style="width: 3px; height: 10px; background: #D9A441; border-radius: 2px;"></span>search match</span>
+                  <span style="display: flex; align-items: center; gap: 6px;"><span style="width: 10px; height: 8px; background: repeating-linear-gradient(45deg, #B4552B33, #B4552B33 3px, transparent 3px, transparent 6px); border-radius: 2px;"></span>blocked — nothing captured</span>
+                </div>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- ===== SETTINGS: PRIVACY ===== -->
+          <sc-if value="{{ isPrivacy }}" hint-placeholder-val="{{ false }}">
+            <div data-screen-label="Privacy settings" style="flex: 1; padding: 30px 36px; overflow: hidden;">
+              <h1 style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 21px; margin: 0 0 6px;">Privacy</h1>
+              <p style="font-size: 13px; color: #86795F; margin: 0 0 20px;">Where your recordings live and what leaves this Mac.</p>
+              <div style="display: flex; flex-direction: column; max-width: 720px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #EDE6D6;">
+                  <div>
+                    <div style="font-weight: 600; font-size: 14px;">Keep recordings local by default</div>
+                    <div style="font-size: 12.5px; color: #86795F; margin-top: 3px;">New recordings never upload unless you share them.</div>
+                  </div>
+                  <span onClick="{{ tLocalFlip }}" style="width: 38px; height: 22px; border-radius: 999px; background: {{ tLocalBg }}; position: relative; flex-shrink: 0; cursor: pointer; transition: background 0.15s;"><span style="position: absolute; top: 2px; left: {{ tLocalKnob }}; width: 18px; height: 18px; border-radius: 50%; background: #FFFDF7; transition: left 0.15s;"></span></span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #EDE6D6;">
+                  <div>
+                    <div style="font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px;">End-to-end encryption for shared copies <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #0E7C6B; border: 1px solid #0E7C6B55; padding: 2px 7px; border-radius: 999px;">always on</span></div>
+                    <div style="font-size: 12.5px; color: #86795F; margin-top: 3px;">Not a setting — it's how sharing works. Keys stay with your team.</div>
+                  </div>
+                  <span style="width: 38px; height: 22px; border-radius: 999px; background: #6BA89E; position: relative; flex-shrink: 0; opacity: 0.6;"><span style="position: absolute; top: 2px; left: 18px; width: 18px; height: 18px; border-radius: 50%; background: #FFFDF7;"></span></span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #EDE6D6;">
+                  <div>
+                    <div style="font-weight: 600; font-size: 14px;">{{ maskLabel }} sensitive content automatically</div>
+                    <div style="font-size: 12.5px; color: #86795F; margin-top: 3px;">Detects and hides passwords, tokens, and personal data while recording.</div>
+                  </div>
+                  <span onClick="{{ tMaskFlip }}" style="width: 38px; height: 22px; border-radius: 999px; background: {{ tMaskBg }}; position: relative; flex-shrink: 0; cursor: pointer; transition: background 0.15s;"><span style="position: absolute; top: 2px; left: {{ tMaskKnob }}; width: 18px; height: 18px; border-radius: 50%; background: #FFFDF7; transition: left 0.15s;"></span></span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #EDE6D6;">
+                  <div>
+                    <div style="font-weight: 600; font-size: 14px;">Pause when a private window is focused</div>
+                    <div style="font-size: 12.5px; color: #86795F; margin-top: 3px;">Recording auto-pauses over incognito windows and password managers.</div>
+                  </div>
+                  <span onClick="{{ tPauseFlip }}" style="width: 38px; height: 22px; border-radius: 999px; background: {{ tPauseBg }}; position: relative; flex-shrink: 0; cursor: pointer; transition: background 0.15s;"><span style="position: absolute; top: 2px; left: {{ tPauseKnob }}; width: 18px; height: 18px; border-radius: 50%; background: #FFFDF7; transition: left 0.15s;"></span></span>
+                </div>
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 0;">
+                  <div>
+                    <div style="font-weight: 600; font-size: 14px;">Storage location</div>
+                    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #86795F; margin-top: 3px;">~/Screencap/Recordings · 4.2 GB</div>
+                  </div>
+                  <span style="border: 1px solid #E0D8C6; color: #52584F; font-size: 12.5px; padding: 7px 14px; border-radius: 999px; cursor: pointer;">Change…</span>
+                </div>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- ===== SETTINGS: APP RULES ===== -->
+          <sc-if value="{{ isAppRules }}" hint-placeholder-val="{{ false }}">
+            <div data-screen-label="App rules" style="flex: 1; padding: 30px 36px; overflow: hidden; display: flex; flex-direction: column;">
+              <h1 style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 21px; margin: 0 0 6px;">App rules</h1>
+              <p style="font-size: 13px; color: #86795F; margin: 0 0 18px;">What happens when each app is on screen. Blocked apps are cut from the video — in ambient and focused recording alike.</p>
+              <div style="display: flex; align-items: center; justify-content: space-between; background: #F6F2E9; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; max-width: 760px;">
+                <div style="font-size: 13px; color: #52584F;"><span style="font-weight: 600; color: #1C2420;">Default for new apps</span> — anything not listed below</div>
+                <div style="display: flex; border: 1px solid #E0D8C6; border-radius: 999px; overflow: hidden; font-size: 12px;">
+                  <span style="padding: 6px 14px; background: #0E7C6B; color: #F6F2E9; font-weight: 600;">Record</span>
+                  <span style="padding: 6px 14px; color: #52584F;">{{ maskLabel }}</span>
+                  <span style="padding: 6px 14px; color: #52584F;">Block</span>
+                </div>
+              </div>
+              <div style="max-width: 760px;">
+                <sc-for list="{{ appRules }}" as="app" hint-placeholder-count="6">
+                  <div style="display: flex; align-items: center; justify-content: space-between; padding: 11px 4px; border-bottom: 1px solid #EDE6D6;">
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                      <span style="width: 30px; height: 30px; border-radius: 8px; background: {{ app.tile }}; color: #FFFDF7; display: flex; align-items: center; justify-content: center; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 12.5px;">{{ app.initials }}</span>
+                      <div>
+                        <div style="font-size: 13.5px; font-weight: 600;">{{ app.name }}</div>
+                        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #86795F; margin-top: 2px;">{{ app.note }}</div>
+                      </div>
+                    </div>
+                    <div style="display: flex; border: 1px solid #E0D8C6; border-radius: 999px; overflow: hidden; font-size: 12px;">
+                      <span onClick="{{ app.onRecord }}" style="padding: 6px 14px; background: {{ app.recordBg }}; color: {{ app.recordColor }}; font-weight: {{ app.recordWeight }}; cursor: pointer;">Record</span>
+                      <span onClick="{{ app.onMask }}" style="padding: 6px 14px; background: {{ app.maskBg }}; color: {{ app.maskColor }}; font-weight: {{ app.maskWeight }}; cursor: pointer;">{{ maskLabel }}</span>
+                      <span onClick="{{ app.onBlock }}" style="padding: 6px 14px; background: {{ app.blockBg }}; color: {{ app.blockColor }}; font-weight: {{ app.blockWeight }}; cursor: pointer;">Block</span>
+                    </div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-if>
+
+        </main>
+      </sc-if>
+
+      <!-- ===== RECALL PALETTE OVERLAY ===== -->
+      <sc-if value="{{ showPalette }}" hint-placeholder-val="{{ false }}">
+        <div onClick="{{ closePalette }}" style="position: absolute; inset: 0; background: rgba(16,22,26,0.35); z-index: 40;"></div>
+        <div style="position: absolute; left: 50%; top: 60px; transform: translateX(-50%); width: 620px; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 16px; box-shadow: 0 24px 60px rgba(16,22,26,0.35); overflow: hidden; z-index: 41;">
+          <div style="display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid #EDE6D6;">
+            <svg width="15" height="15" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="#0E7C6B" stroke-width="1.8"></circle><path d="M8.5 8.5l3 3" stroke="#0E7C6B" stroke-width="1.8" stroke-linecap="round"></path></svg>
+            <span style="font-size: 16px;">meeting with John<span style="display: inline-block; width: 2px; height: 18px; background: #0E7C6B; margin-left: 2px; vertical-align: middle;"></span></span>
+            <span style="margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">searching this Mac only</span>
+          </div>
+          <div style="padding: 14px 20px 14px;">
+            <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 0.1em; color: #86795F; margin-bottom: 10px;">TODAY</div>
+            <div onClick="{{ jumpToTimeline }}" style="display: flex; gap: 12px; background: rgba(14,124,107,0.07); border: 1px solid #0E7C6B44; border-radius: 10px; padding: 10px; margin-bottom: 8px; cursor: pointer;" style-hover="background: rgba(14,124,107,0.14);">
+              <div style="width: 128px; aspect-ratio: 16/9; border-radius: 6px; background: #F6F2E9; border: 1px solid #E0D8C6; background-image: repeating-linear-gradient(45deg, transparent, transparent 8px, #EDE6D6 8px, #EDE6D6 9px); position: relative; flex-shrink: 0;">
+                <span style="position: absolute; bottom: 5px; right: 5px; background: rgba(28,36,32,0.85); color: #F6F2E9; font-family: 'IBM Plex Mono', monospace; font-size: 9px; padding: 2px 6px; border-radius: 3px;">10:04</span>
+              </div>
+              <div style="min-width: 0;">
+                <div style="font-weight: 600; font-size: 13.5px;">Zoom — 1:1 with John Meyer</div>
+                <div style="font-size: 12px; color: #52584F; margin: 3px 0 6px;">"…so for the payroll handoff, John suggested we…"</div>
+                <div style="display: flex; gap: 6px;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid #0E7C6B55; color: #0E7C6B;">task: Weekly 1:1</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #86795F; padding: 2px 0;">10:04 – 10:31 · 27 min</span>
+                </div>
+              </div>
+            </div>
+            <div onClick="{{ jumpToTimeline }}" style="display: flex; gap: 12px; border: 1px solid #EDE6D6; border-radius: 10px; padding: 10px; cursor: pointer;" style-hover="background: #F6F2E9;">
+              <div style="width: 128px; aspect-ratio: 16/9; border-radius: 6px; background: #F6F2E9; border: 1px solid #E0D8C6; background-image: repeating-linear-gradient(45deg, transparent, transparent 8px, #EDE6D6 8px, #EDE6D6 9px); position: relative; flex-shrink: 0;">
+                <span style="position: absolute; bottom: 5px; right: 5px; background: rgba(28,36,32,0.85); color: #F6F2E9; font-family: 'IBM Plex Mono', monospace; font-size: 9px; padding: 2px 6px; border-radius: 3px;">14:12</span>
+              </div>
+              <div style="min-width: 0;">
+                <div style="font-weight: 600; font-size: 13.5px;">Slack thread — John about Q3 numbers</div>
+                <div style="font-size: 12px; color: #52584F; margin: 3px 0 6px;">John's name on screen in #finance while you drafted the reply.</div>
+                <div style="display: flex; gap: 6px;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid #E0D8C6; color: #86795F;">unsplit footage</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; color: #86795F; padding: 2px 0;">14:12 · moment</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-top: 1px solid #EDE6D6; background: #F6F2E9;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #86795F;">↑↓ browse · ↵ jump to moment · esc close</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; color: #0E7C6B;">indexed on-device</span>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ===== NEW RECORDING SHEET ===== -->
+      <sc-if value="{{ showNewRec }}" hint-placeholder-val="{{ false }}">
+        <div onClick="{{ closeNewRec }}" style="position: absolute; inset: 0; background: rgba(16,22,26,0.35); z-index: 40;"></div>
+        <div style="position: absolute; left: 50%; top: 70px; transform: translateX(-50%); width: 540px; background: #FFFDF7; border: 1px solid #E0D8C6; border-radius: 16px; box-shadow: 0 24px 60px rgba(16,22,26,0.35); overflow: hidden; z-index: 41;">
+          <div style="display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid #E0D8C6; background: #F6F2E9;">
+            <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 14px;">New recording</span>
+            <span style="margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">stays on this Mac</span>
+            <span onClick="{{ closeNewRec }}" style="color: #86795F; cursor: pointer; font-size: 15px; padding: 0 2px;">✕</span>
+          </div>
+          <div style="padding: 22px 24px 26px;">
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px;">
+              <div style="border: 2px solid #0E7C6B; background: rgba(14,124,107,0.06); border-radius: 10px; padding: 13px 12px; text-align: center; cursor: pointer;">
+                <div style="width: 40px; height: 26px; border: 2px solid #0E7C6B; border-radius: 4px; margin: 0 auto 8px;"></div>
+                <div style="font-weight: 600; font-size: 13px; color: #0E7C6B;">Full screen</div>
+              </div>
+              <div style="border: 1px solid #E0D8C6; border-radius: 10px; padding: 13px 12px; text-align: center; cursor: pointer;" style-hover="border-color: #86795F;">
+                <div style="width: 40px; height: 26px; border: 2px solid #86795F; border-radius: 4px; margin: 0 auto 8px; position: relative;"><span style="position: absolute; inset: 4px 4px auto auto; width: 18px; height: 10px; background: #E0D8C6; border-radius: 2px;"></span></div>
+                <div style="font-weight: 500; font-size: 13px; color: #52584F;">Window</div>
+              </div>
+              <div style="border: 1px solid #E0D8C6; border-radius: 10px; padding: 13px 12px; text-align: center; cursor: pointer;" style-hover="border-color: #86795F;">
+                <div style="width: 40px; height: 26px; border: 2px dashed #86795F; border-radius: 4px; margin: 0 auto 8px;"></div>
+                <div style="font-weight: 500; font-size: 13px; color: #52584F;">Area</div>
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;">
+              <div style="display: flex; align-items: center; justify-content: space-between; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px;">
+                <div style="display: flex; align-items: center; gap: 10px; font-size: 13.5px;"><span style="width: 7px; height: 7px; border-radius: 50%; background: #0E7C6B;"></span>Microphone — MacBook Pro</div>
+                <div style="display: flex; gap: 2px; align-items: flex-end;">
+                  <span style="width: 3px; height: 6px; background: #0E7C6B; border-radius: 2px;"></span>
+                  <span style="width: 3px; height: 11px; background: #0E7C6B; border-radius: 2px;"></span>
+                  <span style="width: 3px; height: 8px; background: #0E7C6B; border-radius: 2px;"></span>
+                  <span style="width: 3px; height: 13px; background: #6BA89E; border-radius: 2px;"></span>
+                  <span style="width: 3px; height: 9px; background: #E0D8C6; border-radius: 2px;"></span>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; justify-content: space-between; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px;">
+                <div style="display: flex; align-items: center; gap: 10px; font-size: 13.5px; color: #52584F;"><span style="width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #86795F;"></span>Camera — off</div>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #86795F;">⌘K to toggle</span>
+              </div>
+              <div style="display: flex; align-items: center; justify-content: space-between; border: 1px solid #E0D8C6; border-radius: 10px; padding: 12px 16px;">
+                <div>
+                  <div style="display: flex; align-items: center; gap: 10px; font-size: 13.5px;"><span style="width: 7px; height: 7px; border-radius: 50%; background: #0E7C6B;"></span>Attach MCP context</div>
+                  <div style="font-size: 12px; color: #86795F; margin: 4px 0 0 17px;">Captures app + doc references alongside the video</div>
+                </div>
+                <span style="width: 38px; height: 22px; border-radius: 999px; background: #0E7C6B; position: relative;"><span style="position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%; background: #FFFDF7;"></span></span>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px;">
+              <span onClick="{{ startRecording }}" style="flex: 1; background: #0E7C6B; color: #F6F2E9; font-weight: 600; font-size: 14.5px; padding: 13px 0; border-radius: 999px; text-align: center; display: flex; align-items: center; justify-content: center; gap: 9px; cursor: pointer;" style-hover="background: #0C6E5F;"><span style="width: 9px; height: 9px; border-radius: 50%; background: #F6F2E9;"></span>Start recording</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #86795F;">⌘⇧R</span>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+    </div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;: {&quot;width&quot;: 1360, &quot;height&quot;: 920}, &quot;startView&quot;: {&quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;library&quot;, &quot;onboarding&quot;], &quot;default&quot;: &quot;library&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Prototype&quot;}, &quot;maskLabel&quot;: {&quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;Mask&quot;, &quot;Blur&quot;], &quot;default&quot;: &quot;Mask&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Wording&quot;}}">
+class Component extends DCLogic {
+  state = {
+    view: 'library', obStep: 0, palette: false, newRec: false, recording: false,
+    seconds: 0, filter: 'All', screenGranted: false, storage: 'local', draft: false,
+    togLocal: true, togMask: true, togPause: false,
+    rules: { '1Password': 'block', 'Messages': 'block', 'Slack': 'mask', 'Safari — private windows': 'block', 'Mail': 'mask', 'Gusto': 'record' }
+  };
+
+  componentDidMount() {
+    if ((this.props.startView ?? 'library') === 'onboarding') this.setState({ view: 'onboarding', obStep: 0 });
+    this.timer = setInterval(() => { if (this.state.recording) this.setState(s => ({ seconds: s.seconds + 1 })); }, 1000);
+  }
+  componentWillUnmount() { clearInterval(this.timer); }
+
+  fmt(s) { const m = String(Math.floor(s / 60)).padStart(2, '0'); return m + ':' + String(s % 60).padStart(2, '0'); }
+  go(view) { return () => this.setState({ view, palette: false, newRec: false }); }
+
+  renderVals() {
+    const st = this.state;
+    const maskLabel = this.props.maskLabel ?? 'Mask';
+    const inSettings = st.view === 'privacy' || st.view === 'apprules';
+    const navItem = (label, view, onClick) => {
+      const active = st.view === view;
+      return {
+        label, onClick: onClick || this.go(view),
+        bg: active ? 'rgba(14,124,107,0.1)' : 'transparent',
+        color: active ? '#0E7C6B' : '#52584F',
+        weight: active ? 600 : 400,
+        dotBg: active ? '#0E7C6B' : 'transparent',
+        dotBorder: active ? 'none' : '1.5px solid #86795F'
+      };
+    };
+    const chips = ['All', 'Mine', 'Shared', 'Needs review'].map(label => {
+      const active = st.filter === label;
+      return {
+        label, onClick: () => this.setState({ filter: label }),
+        bg: active ? '#1C2420' : 'transparent',
+        border: active ? '1px solid #1C2420' : '1px solid #E0D8C6',
+        color: active ? '#F6F2E9' : '#52584F',
+        weight: active ? 500 : 400
+      };
+    });
+    const base = [
+      { title: 'Payroll walkthrough — Gusto', meta: '12 May · Ana', duration: '04:32', badge: 'local', badgeColor: '#86795F', badgeBorder: '#E0D8C6', kind: 'Mine' },
+      { title: 'Day-one setup: accounts & tools', meta: '10 May · you', duration: '08:14', badge: 'shared · encrypted', badgeColor: '#0E7C6B', badgeBorder: '#0E7C6B55', kind: 'Shared' },
+      { title: 'Expense reports in Ramp', meta: '9 May · Jonas', duration: '03:51', badge: 'shared · encrypted', badgeColor: '#0E7C6B', badgeBorder: '#0E7C6B55', kind: 'Shared' },
+      { title: 'CRM handoff notes', meta: '6 May · you', duration: '06:02', badge: 'local', badgeColor: '#86795F', badgeBorder: '#E0D8C6', kind: 'Mine' },
+      { title: 'Interview scheduling flow', meta: '2 May · Priya', duration: '05:47', badge: 'draft', badgeColor: '#D9A441', badgeBorder: '#D9A44166', kind: 'Needs review' },
+      { title: 'Quarterly close checklist', meta: '28 Apr · you', duration: '11:20', badge: 'local', badgeColor: '#86795F', badgeBorder: '#E0D8C6', kind: 'Mine' }
+    ];
+    let recGrid = base;
+    if (st.draft) recGrid = [{ title: 'Payroll walkthrough', meta: 'just now · you', duration: this.fmt(st.seconds), badge: 'draft · local', badgeColor: '#D9A441', badgeBorder: '#D9A44166', kind: 'Mine' }, ...base];
+    if (st.filter !== 'All') recGrid = recGrid.filter(r => r.kind === st.filter || (st.filter === 'Needs review' && r.badge.indexOf('draft') === 0));
+
+    const ruleMeta = {
+      '1Password': { initials: '1P', tile: '#2B3A67', note: 'blocked by default · password manager' },
+      'Messages': { initials: 'Me', tile: '#5C5343', note: 'blocked by default · personal chat' },
+      'Slack': { initials: 'Sl', tile: '#7A4A8A', note: 'message content masked, UI visible' },
+      'Safari — private windows': { initials: 'Sa', tile: '#3E6A8A', note: 'always blocked · cannot be changed' },
+      'Mail': { initials: 'Ma', tile: '#8A6A3E', note: 'inbox list masked while recording' },
+      'Gusto': { initials: 'Gu', tile: '#0E7C6B', note: 'recorded — used in 12 walkthroughs' }
+    };
+    const segStyle = (state, target) => {
+      const on = state === target;
+      const colors = { record: ['#0E7C6B', '#F6F2E9'], mask: ['#D9A441', '#1C2420'], block: ['#B4552B', '#FFFDF7'] };
+      return { bg: on ? colors[target][0] : 'transparent', color: on ? colors[target][1] : '#52584F', weight: on ? 600 : 400 };
+    };
+    const appRules = Object.keys(st.rules).map(name => {
+      const cur = st.rules[name];
+      const set = (val) => () => { if (name.indexOf('private') === -1) this.setState(s => ({ rules: { ...s.rules, [name]: val } })); };
+      const r = segStyle(cur, 'record'), m = segStyle(cur, 'mask'), b = segStyle(cur, 'block');
+      return {
+        name, ...ruleMeta[name],
+        recordBg: r.bg, recordColor: r.color, recordWeight: r.weight, onRecord: set('record'),
+        maskBg: m.bg, maskColor: m.color, maskWeight: m.weight, onMask: set('mask'),
+        blockBg: b.bg, blockColor: b.color, blockWeight: b.weight, onBlock: set('block')
+      };
+    });
+    const tog = (key) => ({
+      bg: st[key] ? '#0E7C6B' : '#E0D8C6',
+      knob: st[key] ? '18px' : '2px',
+      flip: () => this.setState(s => ({ [key]: !s[key] }))
+    });
+    const tLocal = tog('togLocal'), tMask = tog('togMask'), tPause = tog('togPause');
+    const days = [
+      { label: 'Today', count: '3 recordings', items: [
+        { title: 'Payroll walkthrough — Gusto', summary: 'Running the mid-month cycle', duration: '04:32', badge: 'local', badgeColor: '#86795F', badgeBorder: '#E0D8C6', app: 'Gusto' },
+        { title: 'Day-one setup: accounts & tools', summary: 'Everything a new hire needs', duration: '08:14', badge: 'shared', badgeColor: '#0E7C6B', badgeBorder: '#0E7C6B55', app: '1Password' },
+        { title: 'Expense reports in Ramp', summary: 'Submitting and approving', duration: '03:51', badge: 'shared', badgeColor: '#0E7C6B', badgeBorder: '#0E7C6B55', app: 'Ramp' }
+      ]},
+      { label: 'Yesterday', count: '2 recordings', items: [
+        { title: 'CRM handoff notes', summary: 'Account ownership transfer', duration: '06:02', badge: 'local', badgeColor: '#86795F', badgeBorder: '#E0D8C6', app: 'Attio' },
+        { title: 'Interview scheduling flow', summary: 'Coordinating panel loops', duration: '05:47', badge: 'draft', badgeColor: '#D9A441', badgeBorder: '#D9A44166', app: 'Ashby' }
+      ]}
+    ];
+    const obDot = (i) => st.obStep === i ? '#1C2420' : '#E0D8C6';
+
+    return {
+      isRecording: st.recording, isApp: !st.recording,
+      isOnboarding: st.view === 'onboarding', isMain: st.view !== 'onboarding',
+      isLibrary: st.view === 'library', isJournal: st.view === 'journal',
+      isPrivacy: st.view === 'privacy', isAppRules: st.view === 'apprules', isTimeline: st.view === 'timeline',
+      ob0: st.obStep === 0, ob1: st.obStep === 1, ob2: st.obStep === 2, ob3: st.obStep === 3,
+      ob4: st.obStep === 4, ob5: st.obStep === 5,
+      obDots: Array.from({ length: st.storage === 'team' ? 6 : (st.storage === 'personal' ? 5 : 4) }, (_, i) => ({ bg: obDot(i) })),
+      showPalette: st.palette, showNewRec: st.newRec,
+      goLibrary: this.go('library'), goJournal: this.go('journal'),
+      goPrivacy: this.go('privacy'), goAppRules: this.go('apprules'),
+      replayOnboarding: () => this.setState({ view: 'onboarding', obStep: 0, palette: false, newRec: false }),
+      obToPermissions: () => this.setState({ obStep: 1 }),
+      obToAppRules: () => this.setState({ obStep: 2 }),
+      obToStorage: () => this.setState({ obStep: 3 }),
+      obFinish: () => this.setState({ view: 'library' }),
+      grantScreen: () => this.setState({ screenGranted: true }),
+      screenGranted: st.screenGranted,
+      permText: st.screenGranted ? 'granted' : 'required · waiting',
+      permColor: st.screenGranted ? '#0E7C6B' : '#A97F2E',
+      permListen: st.screenGranted ? 'permission detected — you are set' : 'listening for permission change…',
+      openPalette: () => this.setState({ palette: true }),
+      closePalette: () => this.setState({ palette: false }),
+      jumpToTimeline: () => this.setState({ palette: false, view: 'timeline' }),
+      openNewRec: () => this.setState({ newRec: true }),
+      closeNewRec: () => this.setState({ newRec: false }),
+      startRecording: () => this.setState({ recording: true, newRec: false, seconds: 0 }),
+      stopRecording: () => this.setState({ recording: false, view: 'library', draft: true, filter: 'All' }),
+      pickLocal: () => this.setState({ storage: 'local' }),
+      pickPersonal: () => this.setState({ storage: 'personal' }),
+      pickTeam: () => this.setState({ storage: 'team' }),
+      localBorder: st.storage === 'local' ? '2px solid #0E7C6B' : '2px solid #E0D8C6',
+      personalBorder: st.storage === 'personal' ? '2px solid #0E7C6B' : '2px solid #E0D8C6',
+      teamBorder: st.storage === 'team' ? '2px solid #0E7C6B' : '2px solid #E0D8C6',
+      localCheckOp: st.storage === 'local' ? 1 : 0,
+      personalCheckOp: st.storage === 'personal' ? 1 : 0,
+      teamCheckOp: st.storage === 'team' ? 1 : 0,
+      storageCta: st.storage === 'local' ? 'Keep it on this Mac' : (st.storage === 'team' ? 'Continue — set up your team' : 'Continue — create your account'),
+      storageNext: () => { if (st.storage === 'local') { this.setState({ view: 'library' }); } else { this.setState({ obStep: 4 }); } },
+      accountNext: () => { if (st.storage === 'team') { this.setState({ obStep: 5 }); } else { this.setState({ view: 'library' }); } },
+      accountSub: st.storage === 'team' ? 'One account for you — your team joins next. It only holds your keys and billing; recordings stay encrypted.' : 'The account only holds your keys and billing — recordings stay encrypted.',
+      isTeamPlan: st.storage === 'team',
+      tLocalBg: tLocal.bg, tLocalKnob: tLocal.knob, tLocalFlip: tLocal.flip,
+      tMaskBg: tMask.bg, tMaskKnob: tMask.knob, tMaskFlip: tMask.flip,
+      tPauseBg: tPause.bg, tPauseKnob: tPause.knob, tPauseFlip: tPause.flip,
+      navItems: [navItem('Library', 'library'), navItem('Journal', 'journal')],
+      settingsItems: [navItem('Privacy', 'privacy'), navItem('App rules', 'apprules')],
+      chips, recGrid, appRules, days, maskLabel,
+      recElapsed: this.fmt(st.seconds)
+    };
+  }
+}
+</script>
+</body>
+</html>
