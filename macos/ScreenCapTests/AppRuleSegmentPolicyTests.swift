@@ -113,6 +113,48 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         )
     }
 
+    // MARK: - Row ordering (stable under rule changes)
+
+    /// Live-QA regression: ranking rows by their user-toggleable rule made a
+    /// just-toggled row jump groups mid-interaction, shifting every row under
+    /// the cursor so the next click hit a different app. Order must be stable:
+    /// only the immutable matrix-excluded rows group first; everything else is
+    /// alphabetical regardless of its current rule.
+    func testOrderingIsStableWhenAUserRuleChanges() {
+        let bitwarden = app(
+            bundleId: "com.bitwarden", contextClass: "password_manager",
+            resolvedAction: "exclude", isMatrixExclude: true
+        )
+        let discord = app(bundleId: "com.discord", contextClass: "chat", resolvedAction: "mask_window")
+        let kindle = app(bundleId: "com.kindle", resolvedAction: "allow")
+        // InstalledApp uses displayName "App" for every fixture; disambiguate
+        // by decoding distinct names through the ordering-relevant field.
+        func named(_ base: InstalledApp, _ name: String, excluded: Bool = false) -> InstalledApp {
+            let json: [String: Any] = [
+                "bundle_id": base.bundleId, "display_name": name, "path": base.path,
+                "icon_path": "", "context_class": base.contextClass,
+                "classification_source": base.classificationSource,
+                "resolved_action": base.resolvedAction,
+                "in_exclude_apps": excluded, "in_allow_apps": base.inAllowApps,
+                "is_matrix_exclude": base.isMatrixExclude,
+                "has_per_frame_overrides": false,
+            ]
+            return try! JSONDecoder().decode(
+                InstalledApp.self, from: try! JSONSerialization.data(withJSONObject: json)
+            )
+        }
+        let before = AppRulesView.stableOrder([
+            named(kindle, "Kindle"), named(bitwarden, "Bitwarden"), named(discord, "Discord"),
+        ])
+        XCTAssertEqual(before.map(\.displayName), ["Bitwarden", "Discord", "Kindle"])
+
+        // Blocking Kindle must NOT move it — same order, new rule.
+        let after = AppRulesView.stableOrder([
+            named(kindle, "Kindle", excluded: true), named(bitwarden, "Bitwarden"), named(discord, "Discord"),
+        ])
+        XCTAssertEqual(after.map(\.displayName), ["Bitwarden", "Discord", "Kindle"])
+    }
+
     // MARK: - Note derivation for known context classes
 
     func testNoteDerivationForKnownClasses() {

@@ -10,6 +10,14 @@ import SwiftUI
 struct AppRulesView: View {
     @EnvironmentObject private var privacy: PrivacyController
 
+    /// Bundle ids with a rule write in flight, mapped to the segment the user
+    /// tapped. Drives the optimistic selection: the tapped segment renders
+    /// selected immediately (the CLI write + `apps --json` refresh takes
+    /// ~1–2s), the row locks against further taps, and disk truth replaces the
+    /// optimistic state when the refresh lands — so a failed write visibly
+    /// snaps back instead of lying.
+    @State private var pendingSegments: [String: AppRuleSegmentPolicy.Segment] = [:]
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("App rules")
@@ -80,41 +88,62 @@ struct AppRulesView: View {
         } else if privacy.apps.isEmpty {
             emptyState
         } else {
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    privateWindowsStubRow
-                    Rectangle().fill(Color.scFillSubtle).frame(height: 1)
-                    ForEach(sortedApps) { app in
-                        AppRuleRow(app: app) { transition in
-                            apply(transition, to: app)
-                        }
-                        Rectangle().fill(Color.scFillSubtle).frame(height: 1)
-                    }
+            VStack(alignment: .leading, spacing: 0) {
+                // A rule write failed while the list is populated — surface it
+                // inline (the toggle's optimistic state has already snapped
+                // back to disk truth) rather than failing silently.
+                if let err = privacy.lastError {
+                    Text("Couldn't save the last change: \(err)")
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scRust)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 8)
                 }
-                .frame(maxWidth: 760, alignment: .leading)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        privateWindowsStubRow
+                        Rectangle().fill(Color.scFillSubtle).frame(height: 1)
+                        ForEach(Self.stableOrder(privacy.apps)) { app in
+                            AppRuleRow(
+                                app: app,
+                                pending: pendingSegments[app.bundleId]
+                            ) { segment, transition in
+                                apply(transition, to: app, tapped: segment)
+                            }
+                            Rectangle().fill(Color.scFillSubtle).frame(height: 1)
+                        }
+                    }
+                    .frame(maxWidth: 760, alignment: .leading)
+                }
             }
         }
     }
 
-    /// The design's ordering: locked always-blocked rows first, then the
-    /// user's own blocks, then masked, then everything else — alphabetical
-    /// within each group.
-    private var sortedApps: [InstalledApp] {
-        func rank(_ app: InstalledApp) -> Int {
-            let policy = AppRuleSegmentPolicy.derive(for: app)
-            if app.isMatrixExclude { return 0 }
-            if policy.selection == .block { return 1 }
-            if policy.selection == .mask { return 2 }
-            return 3
-        }
-        return privacy.apps.sorted {
-            let (ra, rb) = (rank($0), rank($1))
-            if ra != rb { return ra < rb }
+    /// Row order is deliberately STABLE under rule changes: only the
+    /// matrix-immutable always-blocked rows group at the top (their state
+    /// can't change from this pane), and everything else is alphabetical
+    /// regardless of its current rule. Ranking rows by their user-toggleable
+    /// state made a just-toggled row jump groups mid-interaction, shifting
+    /// every row under the cursor — the "clicked one app, changed another"
+    /// failure the live QA caught.
+    static func stableOrder(_ apps: [InstalledApp]) -> [InstalledApp] {
+        apps.sorted {
+            if $0.isMatrixExclude != $1.isMatrixExclude { return $0.isMatrixExclude }
             return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
         }
     }
 
-    private func apply(_ transition: AppRuleSegmentPolicy.Transition, to app: InstalledApp) {
+    /// Fire the CLI transition with per-bundle optimistic pending state. The
+    /// pending entry clears only after the controller's own `refreshApps`
+    /// completes (success or failure), so the row is locked for exactly the
+    /// window where a second tap could race the write.
+    private func apply(
+        _ transition: AppRuleSegmentPolicy.Transition,
+        to app: InstalledApp,
+        tapped segment: AppRuleSegmentPolicy.Segment
+    ) {
+        guard pendingSegments[app.bundleId] == nil else { return }
+        pendingSegments[app.bundleId] = segment
         Task {
             switch transition {
             case .excludeAdd:
@@ -124,6 +153,7 @@ struct AppRulesView: View {
             case .allowAdd:
                 await privacy.toggleAllow(bundleId: app.bundleId, allowed: true)
             }
+            pendingSegments.removeValue(forKey: app.bundleId)
         }
     }
 
@@ -198,7 +228,11 @@ struct AppRulesView: View {
 /// One app row (design 530–547).
 private struct AppRuleRow: View {
     let app: InstalledApp
-    let onTransition: (AppRuleSegmentPolicy.Transition) -> Void
+    /// The optimistic in-flight segment (nil when idle). While set, it renders
+    /// as the selection and the whole control locks — the user's tap responds
+    /// instantly instead of waiting out the CLI round-trip.
+    let pending: AppRuleSegmentPolicy.Segment?
+    let onTap: (AppRuleSegmentPolicy.Segment, AppRuleSegmentPolicy.Transition) -> Void
 
     var body: some View {
         let policy = AppRuleSegmentPolicy.derive(for: app)
@@ -225,28 +259,33 @@ private struct AppRuleRow: View {
     }
 
     private func segmentedControl(_ policy: AppRuleSegmentPolicy) -> some View {
-        HStack(spacing: 0) {
+        // The optimistic pending segment overrides the disk-derived selection
+        // while the write round-trips; the control locks so a second tap
+        // can't race the in-flight write.
+        let selection = pending ?? policy.selection
+        let busy = pending != nil
+        return HStack(spacing: 0) {
             segmentButton(
                 "Record",
-                state: policy.selection == .record ? .selected(.record) : .idle,
-                enabled: policy.recordEnabled && policy.selection != .record,
+                state: selection == .record ? .selected(.record) : .idle,
+                enabled: !busy && policy.recordEnabled && selection != .record,
                 help: nil
             ) {
                 fire(.record)
             }
             segmentButton(
                 "Mask",
-                state: policy.selection == .mask ? .selected(.mask) : .idle,
+                state: selection == .mask ? .selected(.mask) : .idle,
                 // The Mask segment never accepts interaction in v1: it either
                 // shows the matrix's own (real) state or stubs the SCR-225
                 // per-app override.
                 enabled: false,
-                help: policy.selection == .mask ? nil : AppRuleSegmentPolicy.maskStubHelp
+                help: selection == .mask ? nil : AppRuleSegmentPolicy.maskStubHelp
             ) {}
             segmentButton(
                 "Block",
-                state: policy.selection == .block ? .selected(.block) : .idle,
-                enabled: policy.blockEnabled && policy.selection != .block,
+                state: selection == .block ? .selected(.block) : .idle,
+                enabled: !busy && policy.blockEnabled && selection != .block,
                 help: nil
             ) {
                 fire(.block)
@@ -260,7 +299,7 @@ private struct AppRuleRow: View {
         guard let transition = AppRuleSegmentPolicy.transition(for: app, tapping: segment) else {
             return
         }
-        onTransition(transition)
+        onTap(segment, transition)
     }
 
     private func segmentButton(
