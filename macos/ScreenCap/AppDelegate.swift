@@ -11,6 +11,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The design system is light-only (U1: the warm palette is authored as
+        // universal color sets with no dark variant), so pin the Aqua
+        // appearance app-wide — otherwise native chrome (title bars, menus,
+        // sheets, alerts) renders dark against the fixed warm-cream content
+        // on Dark-mode machines (U14 fidelity pass). Unpin if the design ever
+        // gains a dark variant.
+        NSApp.appearance = NSAppearance(named: .aqua)
         NSApp.setActivationPolicy(.regular)
         DaemonInstallController.registerDaemonOnFirstLaunchIfNeeded()
         // After an app update the old daemon process keeps serving the previous

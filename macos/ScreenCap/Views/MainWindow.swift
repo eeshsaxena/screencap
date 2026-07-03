@@ -400,54 +400,13 @@ struct MainWindow: View {
         )
         .navigationSplitViewColumnWidth(248)
         .navigationTitle("ScreenCap")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                recordingToolbarControl
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    Task { await index.refresh() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Refresh recordings")
-            }
-        }
-    }
-
-    /// Persistent Start / Stop control in the window toolbar so the user can
-    /// reach it without going to the menu bar or the Library's New-recording
-    /// pill. State branches mirror MenuBarMenu so the two surfaces stay in
-    /// lockstep.
-    @ViewBuilder
-    private var recordingToolbarControl: some View {
-        if recorder.quitProgressSecondsRemaining != nil {
-            // Non-actionable during a Cmd+Q-driven shutdown — the menu bar
-            // already shows the countdown line.
-            Label("Finalizing…", systemImage: "hourglass")
-                .labelStyle(.titleAndIcon)
-                .foregroundStyle(.secondary)
-        } else if case .recording = recorder.state {
-            Button {
-                recorder.stop()
-            } label: {
-                Label("Stop", systemImage: "stop.circle.fill")
-            }
-            .help("Stop recording")
-        } else if recorder.state.isRecording {
-            // .starting or .stopping — surface progress, don't offer an
-            // action that would re-enter the state machine.
-            Label(recorder.state.isStopping ? "Stopping…" : "Starting…", systemImage: "hourglass")
-                .labelStyle(.titleAndIcon)
-                .foregroundStyle(.secondary)
-        } else {
-            Button {
-                recorder.start()
-            } label: {
-                Label("Start", systemImage: "record.circle")
-            }
-            .help("Start a new recording")
-        }
+        // The prototype has no window toolbar (U14 fidelity pass): the old
+        // toolbar Start/Stop duplicated the Library header pill (which flips
+        // to "Stop recording" while capture runs, U6), the menu bar, and the
+        // HUD; refresh happens on recording events and from the Library error
+        // state. Hiding the toolbar also drops the sidebar-collapse control —
+        // the design's sidebar is fixed.
+        .toolbar(.hidden, for: .windowToolbar)
     }
 
     @ViewBuilder

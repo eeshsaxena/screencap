@@ -135,7 +135,7 @@ struct ShellSidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            trafficLights
+            windowControlsSlot
             brand
             navGroup(ShellSidebarModel.primaryNav)
             sectionHeader("COLLECTIONS")
@@ -151,15 +151,14 @@ struct ShellSidebarView: View {
         .background(Color.scCanvas)
     }
 
-    private var trafficLights: some View {
-        HStack(spacing: SCMetrics.space2) {
-            Circle().fill(Color.scTrafficRed).frame(width: 12, height: 12)
-            Circle().fill(Color.scTrafficYellow).frame(width: 12, height: 12)
-            Circle().fill(Color.scTrafficGreen).frame(width: 12, height: 12)
-        }
-        .padding(.horizontal, 6)
-        .padding(.bottom, 22)
-        .accessibilityHidden(true)
+    /// The design draws mock traffic-light dots here (300–304) — that is the
+    /// prototype's fake window chrome. The window uses `.hiddenTitleBar`, so
+    /// the REAL controls overlay this slot; reserve the dots row's height
+    /// (12pt + 22pt gap) instead of drawing a second set (U14 fidelity pass).
+    private var windowControlsSlot: some View {
+        Color.clear
+            .frame(height: 12)
+            .padding(.bottom, 22)
     }
 
     private var brand: some View {

@@ -130,13 +130,6 @@ extension Color {
     /// Muted label on the dark HUD (`#9BA69E`).
     static var scHUDMuted: Color { role("SCHUDMuted") }
 
-    /// Window traffic-light red (`#EC6A5E`).
-    static var scTrafficRed: Color { role("SCTrafficRed") }
-    /// Window traffic-light yellow (`#F4BF4F`).
-    static var scTrafficYellow: Color { role("SCTrafficYellow") }
-    /// Window traffic-light green (`#61C554`).
-    static var scTrafficGreen: Color { role("SCTrafficGreen") }
-
     /// Stable-hash palette for app initials tiles (App rules / onboarding). Index
     /// an app's identity into this array; see `SCColor.tileColor(for:)`.
     static let scTilePalette: [Color] = [
