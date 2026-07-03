@@ -316,6 +316,8 @@ struct OnboardingWizard: View {
 struct OnboardingPrimaryButton: View {
     let title: String
     var enabled: Bool = true
+    /// Optional key binding (the migration banner's Continue is `.defaultAction`).
+    var shortcut: KeyboardShortcut?
     let action: () -> Void
 
     var body: some View {
@@ -329,6 +331,7 @@ struct OnboardingPrimaryButton: View {
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .keyboardShortcut(shortcut)
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.5)
     }

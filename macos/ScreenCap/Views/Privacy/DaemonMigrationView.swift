@@ -23,7 +23,7 @@ struct DaemonMigrationView: View {
             HStack(alignment: .top, spacing: 14) {
                 Image(systemName: "checkmark.shield.fill")
                     .font(.system(size: 30))
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(Color.scTeal)
                     // Decorative — the adjacent heading + body convey the full
                     // meaning, so keep VoiceOver from announcing the symbol as a
                     // separate, content-free focus stop (mirrors the
@@ -33,7 +33,9 @@ struct DaemonMigrationView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Grant recording permissions once")
-                        .font(.title2.bold())
+                        .font(SCTypography.serif(size: 24))
+                        .foregroundStyle(Color.scInk)
+                        .fixedSize(horizontal: false, vertical: true)
                     // Copy is written to suit both an upgrading user (whose grants
                     // moved to the helper) and a first-time user — it states how
                     // permissions work now without implying a prior re-granting
@@ -44,20 +46,25 @@ struct DaemonMigrationView: View {
                         + "permissions. Grant them once and they'll keep working "
                         + "across every future ScreenCap update."
                     )
-                    .font(.body)
-                    .foregroundStyle(.secondary)
+                    .font(SCTypography.sans(size: 13.5))
+                    .foregroundStyle(Color.scInkSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
             HStack {
                 Spacer()
-                Button("Continue") { onContinue() }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
+                OnboardingPrimaryButton(title: "Continue", shortcut: .defaultAction) {
+                    onContinue()
+                }
             }
         }
         .padding(28)
         .frame(width: 520)
+        .background(Color.scPaper, in: RoundedRectangle(cornerRadius: SCMetrics.radiusPanel))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusPanel)
+                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+        )
     }
 }
