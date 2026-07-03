@@ -78,6 +78,84 @@ extension Color {
     static var scAdvisoryFg: Color { .scTextSecondary }
     static var scAdvisorySurface: Color { .scSurfaceElevated }
 
+    // MARK: - Screencap Prototype warm palette (SCR-197 successor / prototype UI)
+    //
+    // The prototype (`docs/design/screencap-prototype/`) is a single fixed warm-cream
+    // aesthetic, so these roles are authored as *universal* color sets (one value,
+    // no light/dark/high-contrast split) — the teal brand and warm paper read the
+    // same regardless of system appearance. The older SC* roles above stay alive
+    // until U14 retires the legacy views.
+
+    /// Card / window base — the brightest warm surface (`#FFFDF7`).
+    static var scPaper: Color { role("SCPaper") }
+    /// Main content canvas — warm background (`#F6F2E9`).
+    static var scCanvas: Color { role("SCCanvas") }
+    /// Subtle inset fill (chips, hover wells) (`#EDE6D6`).
+    static var scFillSubtle: Color { role("SCFillSubtle") }
+    /// Hairline border on warm surfaces (`#E0D8C6`).
+    static var scBorderWarm: Color { role("SCBorderWarm") }
+
+    /// Primary ink on warm surfaces (`#1C2420`).
+    static var scInk: Color { role("SCInk") }
+    /// Secondary ink (`#52584F`).
+    static var scInkSecondary: Color { role("SCInkSecondary") }
+    /// Muted ink — mono metadata / captions (`#86795F`).
+    static var scInkMuted: Color { role("SCInkMuted") }
+    /// Faintest ink — de-emphasized hints (`#A99C82`).
+    static var scInkFaint: Color { role("SCInkFaint") }
+
+    /// Brand teal — primary actions, active nav, links (`#0E7C6B`).
+    static var scTeal: Color { role("SCTeal") }
+    /// Teal hover / pressed (`#0C6E5F`).
+    static var scTealHover: Color { role("SCTealHover") }
+    /// Soft teal — subtle teal accents / borders (`#6BA89E`).
+    static var scTealSoft: Color { role("SCTealSoft") }
+
+    /// Amber — recording / draft accent (`#D9A441`).
+    static var scAmber: Color { role("SCAmber") }
+    /// Amber text — legible amber on warm surfaces (`#A97F2E`).
+    static var scAmberText: Color { role("SCAmberText") }
+    /// Amber on the dark HUD (`#E3B054`).
+    static var scAmberHUD: Color { role("SCAmberHUD") }
+
+    /// Rust — the "blocked" caption / hard-stop accent (`#B4552B`).
+    static var scRust: Color { role("SCRust") }
+
+    /// Dark canvas — full-bleed dark backdrops (`#10161A`).
+    static var scDarkCanvas: Color { role("SCDarkCanvas") }
+    /// HUD pill surface (`#1D2421`).
+    static var scHUDSurface: Color { role("SCHUDSurface") }
+    /// HUD raised surface — chips within the pill (`#2A322E`).
+    static var scHUDSurfaceRaised: Color { role("SCHUDSurfaceRaised") }
+    /// Muted label on the dark HUD (`#9BA69E`).
+    static var scHUDMuted: Color { role("SCHUDMuted") }
+
+    /// Window traffic-light red (`#EC6A5E`).
+    static var scTrafficRed: Color { role("SCTrafficRed") }
+    /// Window traffic-light yellow (`#F4BF4F`).
+    static var scTrafficYellow: Color { role("SCTrafficYellow") }
+    /// Window traffic-light green (`#61C554`).
+    static var scTrafficGreen: Color { role("SCTrafficGreen") }
+
+    /// Stable-hash palette for app initials tiles (App rules / onboarding). Index
+    /// an app's identity into this array; see `SCColor.tileColor(for:)`.
+    static let scTilePalette: [Color] = [
+        role("SCTile1"), role("SCTile2"), role("SCTile3"), role("SCTile4"), role("SCTile5"),
+    ]
+
+    /// Pick a deterministic tile color for `key` (e.g. a bundle id) from the
+    /// design's five-color tile palette. Stable across launches — same key always
+    /// maps to the same tile — using a small FNV-1a hash so the choice does not
+    /// depend on Swift's per-process `Hasher` seed.
+    static func tileColor(for key: String) -> Color {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in key.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return scTilePalette[Int(hash % UInt64(scTilePalette.count))]
+    }
+
     // MARK: - R9 fast-follow stubs (named here so the contract is fixed; no asset
     // authored until a launch surface consumes them — keeps the catalog lean).
     // TODO(R9): author color set — `scBorder`

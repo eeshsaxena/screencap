@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from screencap.config import get_recordings_dir
-from screencap.recording_db import has_table, open_recording_db
+from screencap.recording_db import has_column, has_table, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,22 @@ class RecordingInfo(NamedTuple):
     # see read_upload_warning for why it is NOT the account-mismatch signal.
     owner_uid: str | None = None
     upload_warning: str | None = None
+    # U2 (prototype UI): additive fields the new SwiftUI surfaces render directly,
+    # so Library / Journal / HUD / sidebar footer need no client-side string
+    # parsing. Mirrored EXACTLY onto daemon.schema.RecordingSummary — recording.list
+    # asserts the two field sets match, so any field added here must be added there.
+    # `size_bytes` is the numeric total behind the formatted `size_mb` (sidebar
+    # footer sums it). `summary` is the namer's `recording.task_description` (null
+    # when absent or the DB is locked). `title` is the humanized directory name (the
+    # namer's slug) shown on cards/HUD — a *title*, distinct from the `summary`
+    # description. `state` is the derived lifecycle (`recording`|`processing`|`ready`,
+    # KTD-7). `recording_id` is the stable id pinned at start (survives the post-stop
+    # auto-name rename) so clients hold identity across it.
+    size_bytes: int = 0
+    summary: str | None = None
+    title: str = ""
+    state: Literal["recording", "processing", "ready"] = "ready"
+    recording_id: str | None = None
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -213,11 +229,222 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{m}m {s}s"
 
 
+def _dir_size_bytes(p: Path) -> int:
+    """Total bytes of every file under ``p`` — the numeric source of ``size_mb``."""
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+
+def _fmt_size(total_bytes: int) -> str:
+    if total_bytes < 1024 * 1024:
+        return f"{total_bytes / 1024:.1f} KB"
+    return f"{total_bytes / (1024 * 1024):.1f} MB"
+
+
 def _dir_size_mb(p: Path) -> str:
-    total = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-    if total < 1024 * 1024:
-        return f"{total / 1024:.1f} KB"
-    return f"{total / (1024 * 1024):.1f} MB"
+    return _fmt_size(_dir_size_bytes(p))
+
+
+def _humanize_name(name: str) -> str:
+    """Humanize the namer's slug/directory name into a display title (U2).
+
+    The auto-named recording directory is a kebab-case slug
+    (``namer.validate_slug``); turn it into Title Case for the card/HUD title
+    (``"stripe-webhook-debugging"`` → ``"Stripe Webhook Debugging"``). Internal
+    capitals are preserved (``.capitalize`` would lowercase them). A legacy
+    timestamp-named recording passes its stamp through with separators spaced —
+    an acceptable fallback for a recording the namer never renamed.
+    """
+    words = name.replace("_", " ").replace("-", " ").split()
+    if not words:
+        return name
+    return " ".join(w[:1].upper() + w[1:] for w in words)
+
+
+def read_recording_id(directory: Path) -> str | None:
+    """Read the stable ``.recording_id`` — the name pinned at recording start.
+
+    Written once by the engine at start (``engine/lock_policy``) into the capture
+    dir, so it moves with the directory and survives the post-stop auto-name
+    rename: a stable identity clients hold across that rename (U2). ``None`` for a
+    legacy recording predating the sidecar (callers fall back to the directory
+    name).
+    """
+    try:
+        rid = (directory / ".recording_id").read_text().strip()
+    except (OSError, ValueError):
+        return None
+    return rid or None
+
+
+def _read_task_description(db_path: Path) -> str | None:
+    """Best-effort read of ``recording.task_description`` — the namer's summary.
+
+    Lock-tolerant like :func:`_read_recording_meta`: returns ``None`` (never
+    raises) when the DB is absent, locked by an active recording, corrupt, or the
+    column/value is missing, so a locked DB yields a null summary rather than an
+    exception (the review-data nullable-timing contract).
+    """
+    import sqlite3
+
+    try:
+        with open_recording_db(db_path, busy_timeout_ms=500) as conn:
+            if has_table(conn, "recording") and has_column(
+                conn, "recording", "task_description"
+            ):
+                row = conn.execute(
+                    "SELECT task_description FROM recording LIMIT 1"
+                ).fetchone()
+                if row and row[0]:
+                    val = str(row[0]).strip()
+                    return val or None
+            return None
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+
+
+def _active_recording_name() -> str | None:
+    """Directory name of the currently-active recording, or ``None`` (U2).
+
+    Disk-only — reads the pidfile lock, no daemon round-trip — so both the CLI
+    (``screencap list``) and the daemon's ``recording.list`` derive the same
+    ``recording`` state. Returns the ``recording_name`` from the lock metadata iff
+    the lock is actively held by a live process.
+    """
+    from screencap import pidfile
+
+    try:
+        if not pidfile.lock_is_active():
+            return None
+        meta = pidfile.read_lock_metadata()
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    name = meta.get("recording_name")
+    return name if isinstance(name, str) and name else None
+
+
+class _LedgerProbe(NamedTuple):
+    """READ-ONLY snapshot of a recording's ``pipeline_chunk_state`` ledger (U2)."""
+
+    # ≥1 chunk confirmed UPLOADED. An EVICTED chunk keeps its UPLOADED upload_state
+    # per the U1 contract, so an uploaded-then-evicted recording still reads True.
+    has_uploaded: bool
+    # ≥1 chunk FAILED — blocks the completeness sentinel forever, so state must
+    # fall to `ready` rather than eternal `processing`.
+    has_failed: bool
+    # Chunks in a terminal "done" lifecycle (local_done/uploaded/evicted/skipped),
+    # mirroring PipelineLedger.all_complete.
+    done_count: int
+    # The FROZEN closed-set count, or None when not yet frozen.
+    chunks_expected: int | None
+
+
+def _ledger_probe(db_path: Path) -> _LedgerProbe | None:
+    """READ-ONLY probe of the U1 pipeline ledger — one open, everything the
+    catalog needs (the ``uploaded`` flag AND KTD-7 state derivation).
+
+    Returns ``None`` when there is no ledger to consult — the table does not exist
+    (legacy / not-yet-seeded recording) or the DB is unreadable — so callers fall
+    back to the file-presence heuristics (R14). Opens ``mode=ro`` (not
+    ``open_recording_db``) and never migrates the schema: catalog listing must
+    never ALTER a recording.db (that would change its content hash and defeat the
+    scrubbed-copy reuse check on the upload path, mirroring
+    ``terminal_stage._open_ledger_readonly``). ``mode=ro`` is also required for the
+    post-upload/evicted state where the ``-wal``/``-shm`` sidecars are gone.
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        if not has_table(conn, "pipeline_chunk_state"):
+            return None  # no ledger — fall back to file-presence heuristics.
+        has_uploaded = (
+            conn.execute(
+                "SELECT 1 FROM pipeline_chunk_state "
+                "WHERE upload_state='uploaded' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        has_failed = (
+            conn.execute(
+                "SELECT 1 FROM pipeline_chunk_state "
+                "WHERE lifecycle='failed' OR upload_state='failed' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        done_count = conn.execute(
+            "SELECT COUNT(*) FROM pipeline_chunk_state "
+            "WHERE lifecycle IN ('local_done','uploaded','evicted','skipped')"
+        ).fetchone()[0]
+        expected: int | None = None
+        try:
+            row = conn.execute(
+                "SELECT chunks_expected FROM recording LIMIT 1"
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                expected = int(row[0])
+        except sqlite3.Error:
+            expected = None
+        return _LedgerProbe(has_uploaded, has_failed, int(done_count), expected)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _derive_state(
+    directory: Path,
+    *,
+    is_active: bool,
+    is_stub: bool,
+    intent: str | None,
+    probe: _LedgerProbe | None,
+) -> Literal["recording", "processing", "ready"]:
+    """Derive the recording's lifecycle state per KTD-7.
+
+    ``recording`` while the pidfile lock names this dir; after stop, route by the
+    FROZEN destination: cloud/both recordings complete on the on-disk completeness
+    sentinel (``recording_complete.json`` — the terminal stage's last write), local
+    recordings on the ledger gate (all frozen ``chunks_expected`` chunks reached a
+    terminal "done" lifecycle — the LOCAL route never writes the sentinel, so it is
+    deliberately NOT consulted for local). A FAILED chunk, a legacy recording (no
+    ledger), or an uploaded-then-evicted stub map to ``ready`` rather than eternal
+    ``processing``. ``probe`` is the recording's :func:`_ledger_probe` result,
+    read once by the caller.
+    """
+    if is_active:
+        return "recording"
+
+    # A FAILED chunk blocks completion forever — never sit in eternal processing.
+    if probe is not None and probe.has_failed:
+        return "ready"
+
+    if intent in ("cloud", "both"):
+        if (directory / "recording_complete.json").exists():
+            return "ready"
+        # Uploaded-then-evicted: unambiguously done even if the local sentinel was
+        # cleaned away with the media.
+        if is_stub:
+            return "ready"
+        # `processing` requires a real path to the completeness sentinel — a seeded
+        # ledger with a FROZEN `chunks_expected` the terminal stage can gate on.
+        # Neither a missing ledger nor an unfrozen `chunks_expected` can ever
+        # produce a sentinel, so both map to `ready` rather than eternal
+        # `processing` (mirrors the local branch's unfrozen-count guard below).
+        if probe is None or probe.chunks_expected is None:
+            return "ready"
+        return "processing"
+
+    # local or legacy(None): the ledger gate over the frozen closed set.
+    if probe is None:
+        return "ready"  # no ledger — legacy / not seeded
+    if probe.chunks_expected is None:
+        return "ready"  # no frozen count — don't sit in eternal processing
+    return "ready" if probe.done_count >= probe.chunks_expected else "processing"
 
 
 def read_drops(directory: Path) -> dict[str, int] | None:
@@ -241,47 +468,6 @@ def find_db(directory: Path) -> Path | None:
     if p.exists():
         return p
     return None
-
-
-def _ledger_has_uploaded_chunk(db_path: Path) -> bool | None:
-    """True iff the U1 pipeline ledger records ≥1 confirmed-uploaded chunk.
-
-    READ-ONLY probe of the ``pipeline_chunk_state`` table: ``upload_state ==
-    'uploaded'`` (an ``EVICTED`` chunk keeps its ``UPLOADED`` upload_state per
-    the U1 contract, so an uploaded-then-evicted recording still reads True).
-
-    Returns ``None`` when there is no ledger to consult — the table does not
-    exist (legacy / not-yet-seeded recording) or the DB is unreadable — so the
-    caller falls back to the file-presence heuristics (R14). Deliberately does
-    NOT migrate the schema: catalog listing is read-only and must never ALTER a
-    recording.db (that would change its content hash and defeat the
-    scrubbed-copy reuse check on the upload path, mirroring
-    ``terminal_stage._open_ledger_readonly``).
-    """
-    import sqlite3
-
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return None
-    try:
-        has_ledger = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='pipeline_chunk_state'"
-        ).fetchone()
-        if has_ledger is None:
-            return None  # no ledger — fall back to file-presence heuristics.
-        return (
-            conn.execute(
-                "SELECT 1 FROM pipeline_chunk_state "
-                "WHERE upload_state='uploaded' LIMIT 1"
-            ).fetchone()
-            is not None
-        )
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
 
 
 def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
@@ -402,6 +588,9 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
     if not recordings_dir.exists():
         return results
 
+    # Disk-only active-recording probe, read once for the whole scan (KTD-7).
+    active_name = _active_recording_name()
+
     for d in sorted(recordings_dir.iterdir()):
         if not d.is_dir():
             continue
@@ -433,15 +622,15 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # these -> is_chunked False and stays listable/readable via video.mp4.
         is_chunked = chunks_total > 0
 
-        # Consult the U1 ledger (read-only) when present: the unified pipeline
-        # uploads from the source dir and records confirmed uploads in
-        # `pipeline_chunk_state`, so a chunked recording can be genuinely
-        # uploaded (and later evicted) WITHOUT the legacy `.chunk_*_status.json`
-        # markers the file heuristics key off. `None` = no ledger (legacy / not
-        # seeded) -> fall back to file-presence only (R14).
-        ledger_uploaded = bool(
-            db is not None and _ledger_has_uploaded_chunk(db)
-        )
+        # Consult the U1 ledger (read-only) once — one open serves both the
+        # `uploaded` flag and the KTD-7 `state` gate. The unified pipeline uploads
+        # from the source dir and records confirmed uploads in
+        # `pipeline_chunk_state`, so a chunked recording can be genuinely uploaded
+        # (and later evicted) WITHOUT the legacy `.chunk_*_status.json` markers the
+        # file heuristics key off. `None` = no ledger (legacy / not seeded) -> fall
+        # back to file-presence only (R14).
+        ledger = _ledger_probe(db)
+        ledger_uploaded = bool(ledger and ledger.has_uploaded)
 
         uploaded = uploaded_legacy or chunks_uploaded > 0 or ledger_uploaded
 
@@ -489,12 +678,30 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         owner_uid = read_owner_uid(d)
         upload_warning = read_upload_warning(d)
 
+        # U2 additive fields. Compute bytes once and format from it (was two
+        # rglob passes); derive the lifecycle state from the active-session
+        # probe + destination-routed completion gate (KTD-7), reusing the single
+        # ledger probe read above.
+        total_bytes = _dir_size_bytes(d)
+        is_active = d.name == active_name
+        state = _derive_state(
+            d,
+            is_active=is_active,
+            is_stub=is_stub,
+            intent=intent,
+            probe=ledger,
+        )
+        # The namer writes `task_description` only AFTER stop, and the active
+        # recording holds a write lock — so reading it here can't yield a summary
+        # and would just block up to the 500ms busy_timeout on every scan. Skip it.
+        summary = None if is_active else _read_task_description(db)
+
         results.append(
             RecordingInfo(
                 name=d.name,
                 date=date_str,
                 duration=_fmt_duration(duration),
-                size_mb=_dir_size_mb(d),
+                size_mb=_fmt_size(total_bytes),
                 has_audio=has_audio,
                 transcribed=transcribed,
                 uploaded=uploaded,
@@ -508,6 +715,11 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 duration_seconds=duration,
                 owner_uid=owner_uid,
                 upload_warning=upload_warning,
+                size_bytes=total_bytes,
+                summary=summary,
+                title=_humanize_name(d.name),
+                state=state,
+                recording_id=read_recording_id(d),
             )
         )
 

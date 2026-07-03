@@ -75,23 +75,21 @@ enum FirstRunSetupPresentationPolicy {
     }
 }
 
-/// Top-level window content. Sidebar (Calendar / Recordings / Privacy) +
-/// detail area. Calendar is the default. Calendar day click filters the
-/// recordings list to that day; "Show all" clears the filter. Privacy is a
-/// stub until Unit 18.
+/// Top-level window content (U4). The prototype sidebar (`ShellSidebarView`)
+/// replaces the legacy four-pane `List` sidebar inside the existing singleton
+/// `Window` scene (KTD-1). The detail routes on `ShellRoute`: Library and Privacy
+/// render their legacy panes until U5/U12 swap them; Journal/App-rules/day-timeline
+/// are disabled in the sidebar until U8/U13/U9 land.
 ///
-/// Unit 13 overlays the recording banner at the top of the detail area.
+/// The recording banner overlays the top of the detail area; the first-run
+/// permission-walkthrough machinery stays until U11's onboarding wizard swaps it.
 struct MainWindow: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var privacy: PrivacyController
 
-    enum SidebarSection: Hashable { case calendar, recordings, search, privacy }
-
-    @State private var section: SidebarSection = .calendar
-    @State private var selectedDate: Date?
-    @State private var visibleMonth: Date = startOfCurrentMonth()
+    @State private var route: ShellRoute = .library
     @State private var showingPermissionsSheet = false
     /// True while the walkthrough sheet is open because the user explicitly tapped
     /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
@@ -115,7 +113,7 @@ struct MainWindow: View {
             if privacy.bannerActive {
                 FirstRunPrivacyBanner(
                     onReview: {
-                        section = .privacy
+                        route = .privacy
                         Task { await privacy.markSetupComplete() }
                     },
                     onDismiss: {
@@ -217,15 +215,6 @@ struct MainWindow: View {
             showingPermissionsSheet = true
             permissions.consumeReopenSetupRequest()
         }
-        .onChange(of: section) { new in
-            // Intentionally one-directional. We only clear the date filter
-            // when leaving the recordings section, not when re-entering it
-            // from the sidebar with a stale `selectedDate`. The "Show all"
-            // breadcrumb in `RecordingsListView` provides the recovery
-            // affordance for that edge case. Revisit if friend-trial
-            // feedback shows users expect sidebar tap to clear filters.
-            if new != .recordings { selectedDate = nil }
-        }
     }
 
     private func updateFirstRunSheetPresentation() {
@@ -278,22 +267,17 @@ struct MainWindow: View {
     }
 
     private var sidebar: some View {
-        List(selection: $section) {
-            NavigationLink(value: SidebarSection.calendar) {
-                Label("Calendar", systemImage: "calendar")
+        ShellSidebarView(
+            route: $route,
+            recordings: index.recordings,
+            onReplayOnboarding: {
+                // Until U11's wizard lands, "Replay onboarding" reopens the existing
+                // first-run setup walkthrough via the recovery latch (the same path
+                // the Privacy pane's "Finish setup" uses).
+                permissions.requestReopenSetup()
             }
-            NavigationLink(value: SidebarSection.recordings) {
-                Label("Recordings", systemImage: "list.bullet.rectangle")
-            }
-            NavigationLink(value: SidebarSection.search) {
-                Label("Search", systemImage: "magnifyingglass")
-            }
-            NavigationLink(value: SidebarSection.privacy) {
-                Label("Privacy", systemImage: "lock.shield")
-            }
-        }
-        .listStyle(.sidebar)
-        .frame(minWidth: 180)
+        )
+        .navigationSplitViewColumnWidth(248)
         .navigationTitle("ScreenCap")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -347,49 +331,54 @@ struct MainWindow: View {
 
     @ViewBuilder
     private var detail: some View {
-        // Search does not depend on the recordings list, so it is reachable
-        // even while the index is loading or errored — intercept before the
-        // index gate.
-        if section == .search {
-            SearchView()
+        switch route {
+        // Index-independent routes are reachable even while the recordings index
+        // is loading or errored — handle them before the index gate.
+        case .privacy:
+            PrivacyPaneView()
+        case .journal:
+            comingSoon(title: "Journal", note: "The day-grouped Journal arrives in a later update.")
+        case .appRules:
+            comingSoon(title: "App rules", note: "Per-app recording rules arrive in a later update.")
+        case .timeline:
+            comingSoon(title: "Day timeline", note: "The day timeline arrives in a later update.")
+        case .library:
+            libraryDetail
         }
-        // Three distinct states the user can be in. Without this gate the
-        // welcome state (CalendarView) would render misleadingly during
-        // first-load and after any CLI failure — both of which look like
-        // "no recordings" but mean something different.
-        else if index.isLoading && index.recordings.isEmpty {
+    }
+
+    /// Library is the one route whose content is the recordings index, so it keeps
+    /// the load / error / content gate. Routes to the legacy list until U5's grid.
+    @ViewBuilder
+    private var libraryDetail: some View {
+        if index.isLoading && index.recordings.isEmpty {
             loadingState
         } else if let error = index.lastError {
             errorState(error)
         } else {
-            sectionContent
+            // Legacy list, unfiltered (Calendar is retired from the shell). U5
+            // swaps this for the card grid.
+            RecordingsListView(filterDay: .constant(nil)) { _ in }
         }
     }
 
-    @ViewBuilder
-    private var sectionContent: some View {
-        switch section {
-        case .calendar:
-            CalendarView(
-                selectedDate: $selectedDate,
-                visibleMonth: $visibleMonth
-            ) { day in
-                selectedDate = day
-                section = .recordings
-            }
-        case .recordings:
-            RecordingsListView(filterDay: $selectedDate) { day in
-                selectedDate = nil
-                visibleMonth = day
-                section = .calendar
-            }
-        case .search:
-            // Normally intercepted in `detail` before the index gate; handled
-            // here too for switch exhaustiveness.
-            SearchView()
-        case .privacy:
-            PrivacyPaneView()
+    /// Uniform placeholder for a sidebar route whose surface lands in a later unit
+    /// (Journal U8 / App rules U13 / Day timeline U9). Not normally reachable — the
+    /// sidebar disables those rows — but kept for switch exhaustiveness and safety.
+    private func comingSoon(title: String, note: String) -> some View {
+        VStack(spacing: SCMetrics.space3) {
+            Image(systemName: "hourglass")
+                .font(.system(size: 30))
+                .foregroundStyle(Color.scInkFaint)
+            Text(title).font(SCTypography.paneHeading).foregroundStyle(Color.scInk)
+            Text(note)
+                .font(SCTypography.bodyText)
+                .foregroundStyle(Color.scInkSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 360)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(SCMetrics.space8)
     }
 
     private var loadingState: some View {
@@ -432,10 +421,5 @@ struct MainWindow: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
-    }
-
-    private static func startOfCurrentMonth() -> Date {
-        let comps = Calendar.current.dateComponents([.year, .month], from: Date())
-        return Calendar.current.date(from: comps) ?? Date()
     }
 }

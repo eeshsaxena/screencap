@@ -21,6 +21,7 @@ _PERMISSION_CLEANUP_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
+_TIMELINE_DAY_API_VERSION = 1
 # SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
 # gains nullable timing fields without an API bump (mirrors the additive
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
@@ -75,6 +76,10 @@ _MODEL_NAMES = {
     "TimelineQueryRequest",
     "TimelineRow",
     "TimelineQueryResponse",
+    "TimelineDayRequest",
+    "DayBlockedInterval",
+    "DaySegmentRecording",
+    "TimelineDayResponse",
     "FrameNearestRequest",
     "FrameNearestResponse",
     "AppsListResponse",
@@ -159,6 +164,17 @@ def _load_models() -> dict[str, Any]:
         # clients ignore unknown keys, so no _LIST_API_VERSION bump is required.
         owner_uid: str | None = None
         upload_warning: str | None = None
+        # U2 (prototype UI): additive fields the new SwiftUI surfaces render. Kept
+        # in EXACT sync with catalog.RecordingInfo (recording.list asserts field
+        # parity). Additive on the wire — no _LIST_API_VERSION bump. Swift decoders
+        # must NOT gate readiness on them (nullable-timing contract): decode
+        # each with `decodeIfPresent` so an older daemon that omits them still
+        # decodes.
+        size_bytes: int = 0
+        summary: str | None = None
+        title: str = ""
+        state: str = "ready"
+        recording_id: str | None = None
 
     class ListResponse(EnvelopeResponse):
         recordings: list[RecordingSummary]
@@ -224,6 +240,11 @@ def _load_models() -> dict[str, Any]:
         # subscribe to /v0/events?since=<cursor> after start to receive the
         # `started` event without an extra `session.snapshot` round-trip.
         cursor: int
+        # U2 (prototype UI): echo the EFFECTIVE audio state so U6/U7 reflect what
+        # the engine actually did. Additive — a STALE daemon omits it, and the app
+        # treats a missing/mismatched echo as audio-on (its default). Optional on
+        # the wire for exactly that back-compat reason.
+        audio: bool | None = None
 
     class RecordingStopRequest(_DaemonModel):
         force: bool = False
@@ -348,6 +369,47 @@ def _load_models() -> dict[str, Any]:
         rows: list[TimelineRow]
         # 'authoritative' — event tables, no OCR/redaction recall loss.
         coverage: str
+
+    class TimelineDayRequest(_DaemonModel):
+        """U3 day-timeline input: a local calendar day + its UTC offset.
+
+        ``date`` is ``YYYY-MM-DD`` (format validated in the handler → typed 400).
+        ``tz_offset_seconds`` is seconds EAST of UTC, bounded to ±14h (the widest
+        real-world offset) as a boundary abuse guard.
+        """
+
+        date: str = Field(max_length=32)
+        tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
+
+    class DayBlockedInterval(_DaemonModel):
+        """A blocked span on the day timeline, in absolute unix ms.
+
+        Named distinctly from ``scrubber.BlockedInterval`` (a different, seconds-
+        based dataclass) — this is the ms wire shape the UI hatches.
+        """
+
+        start_ms: int
+        end_ms: int
+
+    class DaySegmentRecording(_DaemonModel):
+        """One recording's day-clamped span + honest blocked-interval split (U3).
+
+        ``blocked_proven`` is provable MASK/EXCLUDE masking (safe to label
+        "blocked"); ``unverifiable`` is fail-closed coverage-gap / null-column
+        ambiguity the UI must render as a neutral gap, never "blocked" (R7).
+        """
+
+        name: str
+        recording_id: str | None = None
+        state: str
+        start_ms: int
+        end_ms: int
+        blocked_proven: list[DayBlockedInterval]
+        unverifiable: list[DayBlockedInterval]
+
+    class TimelineDayResponse(EnvelopeResponse):
+        date: str
+        recordings: list[DaySegmentRecording]
 
     # SCR-186 frame.nearest input bounds. ``timestamp_ms`` is bounded to a
     # realistic epoch ceiling (year 9999) and ``staleness_cap_ms`` to 24h —
@@ -495,6 +557,10 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryRequest": TimelineQueryRequest,
         "TimelineRow": TimelineRow,
         "TimelineQueryResponse": TimelineQueryResponse,
+        "TimelineDayRequest": TimelineDayRequest,
+        "DayBlockedInterval": DayBlockedInterval,
+        "DaySegmentRecording": DaySegmentRecording,
+        "TimelineDayResponse": TimelineDayResponse,
         "FrameNearestRequest": FrameNearestRequest,
         "FrameNearestResponse": FrameNearestResponse,
         "AppsListResponse": AppsListResponse,

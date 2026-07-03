@@ -45,12 +45,64 @@ final class SCColorTests: XCTestCase {
         "SCDisabledOnAccentFg",
     ]
 
+    /// The prototype warm palette (U1). Authored as universal color sets — a single
+    /// fixed warm aesthetic, no light/dark/high-contrast split — so each resolves
+    /// under *both* appearances (that is the whole contract for these; high-contrast
+    /// divergence is deliberately NOT authored here, per the plan).
+    private let warmPaletteRoles = [
+        "SCPaper", "SCCanvas", "SCFillSubtle", "SCBorderWarm",
+        "SCInk", "SCInkSecondary", "SCInkMuted", "SCInkFaint",
+        "SCTeal", "SCTealHover", "SCTealSoft",
+        "SCAmber", "SCAmberText", "SCAmberHUD", "SCRust",
+        "SCDarkCanvas", "SCHUDSurface", "SCHUDSurfaceRaised", "SCHUDMuted",
+        "SCTrafficRed", "SCTrafficYellow", "SCTrafficGreen",
+        "SCTile1", "SCTile2", "SCTile3", "SCTile4", "SCTile5",
+    ]
+
     // MARK: - Happy path: roles resolve in light + dark
 
     func testEveryAuthoredRoleResolvesInLightAndDark() {
         for role in authoredRoles {
             XCTAssertNotNil(resolve(role, light), "\(role) did not resolve in light")
             XCTAssertNotNil(resolve(role, dark), "\(role) did not resolve in dark")
+        }
+    }
+
+    func testWarmPaletteRolesResolveInLightAndDark() {
+        for role in warmPaletteRoles {
+            XCTAssertNotNil(resolve(role, light), "\(role) did not resolve in light")
+            XCTAssertNotNil(resolve(role, dark), "\(role) did not resolve in dark")
+        }
+    }
+
+    /// The warm roles are the fixed brand aesthetic — they must render the SAME
+    /// under light and dark (universal, no appearance split). Guards against a
+    /// future edit accidentally adding a dark variant that would split the brand.
+    func testWarmPaletteRolesAreAppearanceInvariant() {
+        for role in warmPaletteRoles {
+            let l = resolve(role, light)
+            let d = resolve(role, dark)
+            XCTAssertEqual(l, d, "\(role) must resolve identically in light and dark")
+        }
+    }
+
+    /// The five tile colors must be distinct so the stable-hash tile picker spreads
+    /// apps across the palette rather than collapsing them onto one color.
+    func testTilePaletteColorsAreDistinct() {
+        let tiles = ["SCTile1", "SCTile2", "SCTile3", "SCTile4", "SCTile5"]
+        let resolved = tiles.compactMap { resolve($0, light) }
+        XCTAssertEqual(resolved.count, tiles.count, "every tile color must resolve")
+        XCTAssertEqual(Set(resolved).count, tiles.count, "tile colors must be distinct")
+    }
+
+    /// `SCColor.tileColor(for:)` is deterministic across calls (stable across
+    /// launches — it must not depend on Swift's per-process Hasher seed).
+    func testTileColorPickerIsDeterministic() {
+        for key in ["com.apple.Safari", "1password", "Slack", "unknown-app"] {
+            XCTAssertEqual(
+                Color.tileColor(for: key), Color.tileColor(for: key),
+                "tileColor(for:) must be stable for \(key)"
+            )
         }
     }
 

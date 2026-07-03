@@ -444,6 +444,18 @@ async def recording_start(request: Request) -> JSONResponse:
             )
 
         result = await request.app.state.supervisor.spawn(parsed)
+        # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what
+        # the engine did. An unspecified (None) request resolves the SAME way the
+        # engine does for it — `config.get_audio_default()` (screen_recorder) — so
+        # the echo stays truthful when a user set `audio_default=false` rather than
+        # falsely reporting audio-on. A stale daemon omits the field entirely; the
+        # app treats a missing echo as audio-on.
+        if parsed.audio is not None:
+            result["audio"] = parsed.audio
+        else:
+            from screencap.config import get_audio_default
+
+            result["audio"] = get_audio_default()
         _audit("ok")
         return JSONResponse(
             schema.envelope(
@@ -1390,6 +1402,66 @@ async def frame_nearest(request: Request) -> JSONResponse:
         )
 
 
+async def timeline_day(request: Request) -> JSONResponse:
+    """``POST /v0/timeline.day`` — day-scoped spans + honest blocked intervals (U3).
+
+    Read-only day surface for the Day timeline. Returns each recording's span
+    intersecting the local calendar day plus its blocked intervals split into
+    ``blocked_proven`` (provable ``SCRUB_BLOCK_ACTIONS`` masking) and
+    ``unverifiable`` (deleted-row coverage gaps / null-column ambiguity — the UI
+    must NOT label these "blocked", R7). Recording names are fine here — this is a
+    same-EUID app surface (the name-free constraint is a backfill-progress rule).
+
+    A malformed ``date`` returns a typed 400 (``invalid_request``); a legitimate
+    empty day returns ``ok:true`` with no recordings. Deliberately NOT in
+    ``_ACTIVITY_PATHS`` — a read verb must not reset the idle-shutdown clock.
+    """
+    from pydantic import ValidationError
+
+    from screencap import day_segments
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.TimelineDayRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._TIMELINE_DAY_API_VERSION,
+            )
+        try:
+            result = await asyncio.to_thread(
+                day_segments.day_segments, parsed.date, parsed.tz_offset_seconds,
+            )
+        except day_segments.InvalidDayRequest:
+            return _validation_error_response(
+                schema_version=schema._TIMELINE_DAY_API_VERSION,
+            )
+        # Validate the day-surface shape through the typed response model (parity
+        # with every other read verb) so any drift in day_segments' output is
+        # caught here rather than shipping an undocumented shape.
+        recordings = [
+            schema.DaySegmentRecording(**rec).model_dump()
+            for rec in result["recordings"]
+        ]
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TIMELINE_DAY_API_VERSION,
+                date=result["date"],
+                recordings=recordings,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TIMELINE_DAY_API_VERSION,
+            request=request,
+        )
+
+
 def _backfill_job(app: Starlette) -> Any:
     """Lazily attach the single backfill job holder to ``app.state``.
 
@@ -1527,6 +1599,7 @@ def build_app() -> Starlette:
             Route("/v0/content.search", content_search, methods=["POST"]),
             Route("/v0/transcript.search", transcript_search, methods=["POST"]),
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
+            Route("/v0/timeline.day", timeline_day, methods=["POST"]),
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
