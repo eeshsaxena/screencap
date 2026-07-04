@@ -22,6 +22,11 @@ struct OnboardingPermissionsStep: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var permissions: PermissionController
     @ObservedObject var daemonInstaller: DaemonInstallController
+    /// Read-only wizard replay ("Replay onboarding") — suppresses the
+    /// helper-install auto-start. Deliberately no default: this flag gates a
+    /// side effect (auto-firing `install()`), so every surface must state its
+    /// intent at the call site rather than inherit it silently.
+    let replay: Bool
     let onContinue: () -> Void
 
     @State private var isPreparingRelaunch = false
@@ -41,6 +46,27 @@ struct OnboardingPermissionsStep: View {
         .padding(.horizontal, 90)
         .padding(.top, 24)
         .padding(.bottom, 12)
+        .onAppear { autoStartHelperInstallIfNeeded() }
+        // A step rendered before the launch probe settles is gated off by the
+        // policy's daemonProbeCompleted input; re-evaluate when it lands so
+        // that step still self-heals without re-appearing.
+        .onChange(of: recorder.daemonProbeCompleted) { _ in
+            autoStartHelperInstallIfNeeded()
+        }
+    }
+
+    /// Self-heal a dead helper registration (enabled label, gone bundle →
+    /// launchd `spawn failed`) the moment this surface shows, instead of
+    /// dead-ending on the idle card — see the policy's doc-comment for why
+    /// only install() can repair that state.
+    private func autoStartHelperInstallIfNeeded() {
+        guard OnboardingStepPolicy.shouldAutoStartHelperInstall(
+            installerState: daemonInstaller.state,
+            transport: recorder.transport,
+            daemonProbeCompleted: recorder.daemonProbeCompleted,
+            replay: replay
+        ) else { return }
+        Task { await daemonInstaller.install() }
     }
 
     // MARK: - Left column

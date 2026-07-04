@@ -106,6 +106,7 @@ struct OnboardingWizard: View {
         case .permissions:
             OnboardingPermissionsStep(
                 daemonInstaller: daemonInstaller,
+                replay: replay,
                 onContinue: { step = .appRules }
             )
         case .appRules:

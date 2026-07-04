@@ -143,6 +143,77 @@ final class OnboardingStepPolicyTests: XCTestCase {
         }
     }
 
+    // MARK: - Helper install auto-start
+
+    /// Permissions surface visible, installer untouched, daemon not connected
+    /// → drive `install()` without a click. This is the self-heal trigger for
+    /// a registration that reads `.enabled` while its recorded bundle path is
+    /// gone (deleted dev worktree, app moved after first launch): launchd
+    /// keeps `spawn failed` forever, and only `install()`'s poll-timeout →
+    /// registration-refresh path can repair it — a state the idle card's
+    /// "approve it first" copy would otherwise dead-end, because Login Items
+    /// already shows the helper approved.
+    func testAutoStartsHelperInstallWhenIdleOffDaemonTransport() {
+        XCTAssertTrue(
+            OnboardingStepPolicy.shouldAutoStartHelperInstall(
+                installerState: .idle, transport: .cliFallback,
+                daemonProbeCompleted: true, replay: false
+            )
+        )
+    }
+
+    /// Only the untouched `.idle` state auto-starts: in-flight states must not
+    /// double-fire, and failure states keep their explicit user-driven retry
+    /// (no auto-retry loop against a persistently broken install).
+    func testAutoStartOnlyFiresFromIdle() {
+        let nonIdle: [DaemonInstallController.State] = [
+            .registering, .polling, .pollingFailed(reason: "x"),
+            .installedAndRunning, .requiresApproval, .installFailed(.unknown),
+        ]
+        for state in nonIdle {
+            XCTAssertFalse(
+                OnboardingStepPolicy.shouldAutoStartHelperInstall(
+                    installerState: state, transport: .cliFallback,
+                    daemonProbeCompleted: true, replay: false
+                ),
+                "unexpected auto-start from \(state)"
+            )
+        }
+    }
+
+    /// A connected daemon needs no install — never touch a healthy machine.
+    func testAutoStartSkipsOnDaemonTransport() {
+        XCTAssertFalse(
+            OnboardingStepPolicy.shouldAutoStartHelperInstall(
+                installerState: .idle, transport: .daemon,
+                daemonProbeCompleted: true, replay: false
+            )
+        )
+    }
+
+    /// Before the launch probe settles, transport's `.cliFallback` is a
+    /// default, not a verdict — firing then could destructively re-register a
+    /// healthy daemon that simply hadn't been probed yet. The step re-fires
+    /// the check when `daemonProbeCompleted` flips.
+    func testAutoStartWaitsForLaunchProbe() {
+        XCTAssertFalse(
+            OnboardingStepPolicy.shouldAutoStartHelperInstall(
+                installerState: .idle, transport: .cliFallback,
+                daemonProbeCompleted: false, replay: false
+            )
+        )
+    }
+
+    /// Replay is read-only by contract — it must not mutate helper state.
+    func testAutoStartSkipsInReplay() {
+        XCTAssertFalse(
+            OnboardingStepPolicy.shouldAutoStartHelperInstall(
+                installerState: .idle, transport: .cliFallback,
+                daemonProbeCompleted: true, replay: true
+            )
+        )
+    }
+
     // MARK: - Tier routing + dots
 
     /// Local finishes at storage; Personal and Team continue to the account
