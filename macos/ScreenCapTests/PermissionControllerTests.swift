@@ -65,15 +65,19 @@ final class PermissionControllerTests: XCTestCase {
         let setRoot = try XCTUnwrap(script.range(of: "/bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT \"$4\""))
         let open = try XCTUnwrap(script.range(of: "/usr/bin/open -n \"$2\""))
         let restorePath = try XCTUnwrap(script.range(of: "setenv PATH \"$old_path\""))
-        let unsetRoot = try XCTUnwrap(script.range(of: "/bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT"))
+        let restoreRoot = try XCTUnwrap(script.range(of: "setenv SCREENCAP_DEV_REPO_ROOT \"$old_root\""))
 
         XCTAssertLessThan(setPath.lowerBound, open.lowerBound)
         XCTAssertLessThan(setRoot.lowerBound, open.lowerBound)
         XCTAssertLessThan(open.upperBound, restorePath.lowerBound)
-        XCTAssertLessThan(open.upperBound, unsetRoot.lowerBound)
-        // A pre-existing launchd PATH (e.g. set by the user's own tooling) is
-        // restored, not clobbered; absent one, the temporary value is removed.
+        XCTAssertLessThan(open.upperBound, restoreRoot.lowerBound)
+        // Prior launchd values are restored, not clobbered — build_and_run.sh
+        // publishes this same pair session-wide as the daemon LaunchAgent's
+        // env channel, so the helper must leave the session exactly as found
+        // (an unconditional unsetenv here broke the next daemon respawn).
+        // Absent a prior value, the temporary one is removed.
         XCTAssertTrue(script.contains("/bin/launchctl unsetenv PATH"))
+        XCTAssertTrue(script.contains("/bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT"))
     }
 
     func testRelaunchHelperScriptsAreValidShellSyntax() throws {

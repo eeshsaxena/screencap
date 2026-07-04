@@ -773,10 +773,15 @@ final class PermissionController: ObservableObject {
     /// breaks. `launchctl setenv` is the only channel into an `open`-spawned
     /// process, but it is GLOBAL to the login session and persists until
     /// logout — so the publication is scoped to the `open` call: the prior
-    /// PATH is captured first and restored (or removed) as soon as `open`
-    /// returns, and SCREENCAP_DEV_REPO_ROOT — a variable only we set — is
-    /// removed outright rather than restored, so a stale global value from an
-    /// earlier dev session is cleaned up instead of perpetuated.
+    /// launchd values of PATH and SCREENCAP_DEV_REPO_ROOT are captured first
+    /// and restored (or removed, when previously unset) as soon as `open`
+    /// returns, leaving the session exactly as found. Restore — not removal —
+    /// matters for both variables: script/build_and_run.sh deliberately
+    /// publishes the same pair session-wide as the daemon LaunchAgent's only
+    /// env channel, so removing them here would flip the next daemon respawn
+    /// out of dev-source mode mid-session. Cleaning stale values from a dead
+    /// session is script/clean_dev_macos_state.sh's job, not the relaunch
+    /// path's.
     nonisolated static func relaunchHelperShellScript(
         maxPollCount: Int = relaunchMaxPollCount,
         pollIntervalSeconds: Double = relaunchPollIntervalSeconds,
@@ -789,6 +794,7 @@ final class PermissionController: ObservableObject {
         return """
         \(poll)
         old_path=$(/bin/launchctl getenv PATH)
+        old_root=$(/bin/launchctl getenv SCREENCAP_DEV_REPO_ROOT)
         [ -n "$3" ] && /bin/launchctl setenv PATH "$3"
         [ -n "$4" ] && /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$4"
         /usr/bin/open -n "$2"
@@ -796,7 +802,9 @@ final class PermissionController: ObservableObject {
         if [ -n "$3" ]; then
           if [ -n "$old_path" ]; then /bin/launchctl setenv PATH "$old_path"; else /bin/launchctl unsetenv PATH; fi
         fi
-        [ -n "$4" ] && /bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT
+        if [ -n "$4" ]; then
+          if [ -n "$old_root" ]; then /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$old_root"; else /bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT; fi
+        fi
         exit $status
         """
     }
