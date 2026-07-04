@@ -134,7 +134,7 @@ If your Python still lives somewhere else, either:
 
 ### From the terminal — LaunchServices bundle launch
 
-The dev script sets the required launchd environment, then opens the signed app bundle:
+The dev script publishes the required launchd environment scoped to the single `open` call (set → open → restore, so nothing leaks into other GUI apps), then opens the signed app bundle. The daemon job doesn't rely on that window at all: in dev-source mode the build writes a `screencap-dev-env` file next to the built `.app` (written or removed by `embed-cli.sh` on every build) and the Debug launcher reads it at spawn. That keeps the env scoped to the daemon job, lets a plain `launchctl kickstart -k` propagate mode/env changes, keeps the bundle's code seal independent of the build mode, and keeps the job SMAppService-submitted — which is what lets the daemon read a repo under `~/Documents` (a manually `launchctl bootstrap`ed job has no app TCC identity and gets `Operation not permitted`; per-job plist `EnvironmentVariables` would need an SMAppService re-registration to change).
 
 ```bash
 DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh

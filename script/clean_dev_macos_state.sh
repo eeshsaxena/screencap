@@ -3,9 +3,11 @@
 # masquerading as — or conflicting with — the shipped /Applications install.
 #
 # WHY THIS EXISTS: dev builds (Xcode Cmd+R, script/build_and_run.sh) drop
-# ad-hoc-signed ScreenCap.app copies into DerivedData / macos/.build, register
-# the com.screencap.daemon LaunchAgent against a dev identity, and pollute the
-# launchd session with dev env vars (SCREENCAP_DAEMON_USE_DEV_SOURCE, etc.).
+# ad-hoc-signed ScreenCap.app copies into DerivedData / macos/.build and
+# register the com.screencap.daemon LaunchAgent against a dev identity.
+# (Older build_and_run.sh versions also left dev env vars —
+# SCREENCAP_DAEMON_USE_DEV_SOURCE, etc. — global in the launchd session; the
+# unsetenv step below clears any such leftovers.)
 # Spotlight/Launchpad then index EVERY copy under the same name "ScreenCap", so
 # launching it can hit an ad-hoc dev build instead of the signed install — which
 # fails helper registration ("macOS rejected the helper signature"), shows the
@@ -34,7 +36,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run)   DRY_RUN=1 ;;
     --reset-tcc) RESET_TCC=1 ;;
-    -h|--help)   sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
