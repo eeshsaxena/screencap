@@ -37,14 +37,64 @@ final class PermissionControllerTests: XCTestCase {
         XCTAssertTrue(script.contains("/usr/bin/open -n \"$2\""))
     }
 
-    func testRelaunchHelperPublishesDevEnvironmentBeforeOpeningBundle() {
+    func testRelaunchHelperDefaultScriptNeverTouchesLaunchd() {
+        // Release / non-dev relaunches must not mutate the login session's
+        // launchd environment at all — the pre-fix script published the app's
+        // PATH + repo root globally, leaking dev paths into every subsequently
+        // launched app until logout (and re-publishing them on every relaunch).
         let script = PermissionController.relaunchHelperShellScript(
             maxPollCount: 3,
             pollIntervalSeconds: 0.1
         )
 
-        XCTAssertTrue(script.contains("/bin/launchctl setenv PATH \"$3\""))
-        XCTAssertTrue(script.contains("/bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT \"$4\""))
+        XCTAssertFalse(script.contains("launchctl"))
+        XCTAssertTrue(script.contains("/usr/bin/open -n \"$2\""))
+    }
+
+    func testRelaunchHelperDevScriptScopesLaunchdPublicationToTheOpen() throws {
+        // Dev-source runs publish PATH + repo root through launchd because it
+        // is the only channel into an `open`-spawned process — but scoped:
+        // set before the open, restored/removed right after, never left global.
+        let script = PermissionController.relaunchHelperShellScript(
+            maxPollCount: 3,
+            pollIntervalSeconds: 0.1,
+            publishDevEnvironment: true
+        )
+
+        let setPath = try XCTUnwrap(script.range(of: "/bin/launchctl setenv PATH \"$3\""))
+        let setRoot = try XCTUnwrap(script.range(of: "/bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT \"$4\""))
+        let open = try XCTUnwrap(script.range(of: "/usr/bin/open -n \"$2\""))
+        let restorePath = try XCTUnwrap(script.range(of: "setenv PATH \"$old_path\""))
+        let unsetRoot = try XCTUnwrap(script.range(of: "/bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT"))
+
+        XCTAssertLessThan(setPath.lowerBound, open.lowerBound)
+        XCTAssertLessThan(setRoot.lowerBound, open.lowerBound)
+        XCTAssertLessThan(open.upperBound, restorePath.lowerBound)
+        XCTAssertLessThan(open.upperBound, unsetRoot.lowerBound)
+        // A pre-existing launchd PATH (e.g. set by the user's own tooling) is
+        // restored, not clobbered; absent one, the temporary value is removed.
+        XCTAssertTrue(script.contains("/bin/launchctl unsetenv PATH"))
+    }
+
+    func testRelaunchHelperScriptsAreValidShellSyntax() throws {
+        // The dev variant carries real control flow; `sh -n` parses without
+        // executing, catching quoting/syntax regressions in both variants.
+        for publish in [false, true] {
+            let script = PermissionController.relaunchHelperShellScript(
+                maxPollCount: 3,
+                pollIntervalSeconds: 0.1,
+                publishDevEnvironment: publish
+            )
+            let sh = Process()
+            sh.executableURL = URL(fileURLWithPath: "/bin/sh")
+            sh.arguments = ["-n", "-c", script]
+            try sh.run()
+            sh.waitUntilExit()
+            XCTAssertEqual(
+                sh.terminationStatus, 0,
+                "publishDevEnvironment=\(publish) variant failed to parse"
+            )
+        }
     }
 
     func testDaemonTCCSubjectUsesSamePrivacyPaneDeepLinks() {

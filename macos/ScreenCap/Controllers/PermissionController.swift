@@ -513,9 +513,11 @@ final class PermissionController: ObservableObject {
     /// one up and asking the user to reopen manually.
     ///
     /// The relaunch opens the signed app bundle through LaunchServices so TCC
-    /// sees the same bundle identity that System Settings presents. To keep
-    /// dev runs working, the helper publishes the current PATH and repo root
-    /// into launchd before opening the bundle.
+    /// sees the same bundle identity that System Settings presents. Debug
+    /// dev-source runs additionally pass the terminal PATH and repo root
+    /// through launchd for the duration of the `open` call only — see
+    /// `relaunchHelperShellScript(publishDevEnvironment:)`. Release builds
+    /// never touch the launchd environment.
     func relaunchApplication() {
         guard !isRelaunching else { return }
         isRelaunching = true
@@ -532,18 +534,33 @@ final class PermissionController: ObservableObject {
         }
         let parentPid = ProcessInfo.processInfo.processIdentifier
         let environment = ProcessInfo.processInfo.environment
+        // Dev-source runs are the only case where the relaunched instance needs
+        // the terminal environment (the Debug CLI fallback keys on
+        // SCREENCAP_DEV_REPO_ROOT, which Release ignores entirely). Everything
+        // else relaunches with a script that never touches launchd.
+        #if DEBUG
+        let devRepoRoot = environment["SCREENCAP_DEV_REPO_ROOT"] ?? ""
+        #else
+        let devRepoRoot = ""
+        #endif
+        let publishDevEnvironment = !devRepoRoot.isEmpty
         let detach = Process()
         detach.executableURL = URL(fileURLWithPath: "/bin/sh")
         detach.environment = environment
-        detach.arguments = [
+        var arguments = [
             "-c",
-            Self.relaunchHelperShellScript(),
+            Self.relaunchHelperShellScript(publishDevEnvironment: publishDevEnvironment),
             "screencap-relaunch",     // $0
             String(parentPid),        // $1 — current process's PID
             bundlePath,               // $2 — app bundle path passed through argv
-            environment["PATH"] ?? "",
-            environment["SCREENCAP_DEV_REPO_ROOT"] ?? "",
         ]
+        if publishDevEnvironment {
+            arguments += [
+                environment["PATH"] ?? "",  // $3
+                devRepoRoot,                // $4
+            ]
+        }
+        detach.arguments = arguments
         do {
             try detach.run()
         } catch {
@@ -746,11 +763,42 @@ final class PermissionController: ObservableObject {
         return (info[kSecCodeInfoTeamIdentifier as String] as? String) == nil
     }
 
+    /// Builds the detached relaunch helper script. The default (non-dev)
+    /// variant never touches `launchctl` — a Release relaunch must not mutate
+    /// the login session's launchd environment in any way.
+    ///
+    /// `publishDevEnvironment` is set only for Debug dev-source runs
+    /// (SCREENCAP_DEV_REPO_ROOT present), where the relaunched instance must
+    /// inherit the terminal's PATH and repo root or the Debug CLI fallback
+    /// breaks. `launchctl setenv` is the only channel into an `open`-spawned
+    /// process, but it is GLOBAL to the login session and persists until
+    /// logout — so the publication is scoped to the `open` call: the prior
+    /// PATH is captured first and restored (or removed) as soon as `open`
+    /// returns, and SCREENCAP_DEV_REPO_ROOT — a variable only we set — is
+    /// removed outright rather than restored, so a stale global value from an
+    /// earlier dev session is cleaned up instead of perpetuated.
     nonisolated static func relaunchHelperShellScript(
         maxPollCount: Int = relaunchMaxPollCount,
-        pollIntervalSeconds: Double = relaunchPollIntervalSeconds
+        pollIntervalSeconds: Double = relaunchPollIntervalSeconds,
+        publishDevEnvironment: Bool = false
     ) -> String {
-        "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge \(maxPollCount) ] && exit 0; sleep \(pollIntervalSeconds); done; [ -n \"$3\" ] && /bin/launchctl setenv PATH \"$3\"; [ -n \"$4\" ] && /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT \"$4\"; exec /usr/bin/open -n \"$2\""
+        let poll = "i=0; while kill -0 \"$1\" 2>/dev/null; do i=$((i+1)); [ $i -ge \(maxPollCount) ] && exit 0; sleep \(pollIntervalSeconds); done"
+        guard publishDevEnvironment else {
+            return "\(poll); exec /usr/bin/open -n \"$2\""
+        }
+        return """
+        \(poll)
+        old_path=$(/bin/launchctl getenv PATH)
+        [ -n "$3" ] && /bin/launchctl setenv PATH "$3"
+        [ -n "$4" ] && /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$4"
+        /usr/bin/open -n "$2"
+        status=$?
+        if [ -n "$3" ]; then
+          if [ -n "$old_path" ]; then /bin/launchctl setenv PATH "$old_path"; else /bin/launchctl unsetenv PATH; fi
+        fi
+        [ -n "$4" ] && /bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT
+        exit $status
+        """
     }
 
     private func armRelaunchWatchdog() {
