@@ -12,15 +12,14 @@
 #   2. macos/ScreenCap/Assets.xcassets/AppIcon.appiconset/
 #      The ten light slot PNGs (copied, renamed -2x -> @2x). The appiconset's
 #      Contents.json references these names and is maintained by hand, not by
-#      this script.
-#
-# The dark master (icon_1024x1024_dark.png) is committed but NOT wired: the
-# classic appiconset's `luminosity: dark` appearance entries are an iOS-only
-# grammar — Xcode 26 actool drops them for the mac idiom as "unassigned
-# children" (verified: absent from the compiled Assets.car). Dark mac app
-# icons are a macOS 26 feature delivered via an Icon Composer .icon document,
-# which needs the mark as a separate layer rather than these baked squircle
-# tiles. See the follow-up ticket referenced in the PR that added this file.
+#      this script. This is the app-icon fallback for macOS 13-15.
+#   3. macos/ScreenCap/AppIcon.icon/Assets/
+#      The light + dark 1024 masters, referenced by the hand-authored Icon
+#      Composer document (icon.json) that gives macOS 26+ the light/dark app
+#      icon. The classic appiconset's `luminosity: dark` appearance entries
+#      are an iOS-only grammar (Xcode 26 actool drops them for the mac idiom
+#      as "unassigned children"), so the .icon document is the only dark-mode
+#      wiring for the Mac.
 #
 # Derived outputs are committed and authoritative: no build step invokes this
 # script. Re-run it only when the masters change, then commit the results.
@@ -32,7 +31,9 @@ set -euo pipefail
 BRANDING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MASTERS_DIR="${BRANDING_DIR}/masters"
 APPICONSET_DIR="${BRANDING_DIR}/../ScreenCap/Assets.xcassets/AppIcon.appiconset"
+ICON_DOC_ASSETS_DIR="${BRANDING_DIR}/../ScreenCap/AppIcon.icon/Assets"
 ICNS_PATH="${BRANDING_DIR}/ScreenCap.icns"
+DARK_MASTER="${MASTERS_DIR}/icon_1024x1024_dark.png"
 
 # The ten macOS app-icon slots as "size scale" pairs. The delivered masters
 # name @2x files with a -2x suffix; Apple's tooling (iconutil, asset catalogs)
@@ -70,6 +71,7 @@ for pair in "${SLOTS[@]}"; do
   master="$(master_for "${size}" "${scale}")"
   [ -f "${master}" ] || { echo "error: missing master ${master}" >&2; exit 1; }
 done
+[ -f "${DARK_MASTER}" ] || { echo "error: missing dark master ${DARK_MASTER}" >&2; exit 1; }
 
 # ---- 1. ScreenCap.icns from the light masters --------------------------------
 echo "==> Assembling ScreenCap.icns"
@@ -97,5 +99,11 @@ for pair in "${SLOTS[@]}"; do
      "${APPICONSET_DIR}/$(slot_name "${size}" "${scale}").png"
 done
 echo "    wrote 10 light slot PNGs"
+
+# ---- 3. Icon Composer document assets (macOS 26+ light/dark) -----------------
+echo "==> Populating ${ICON_DOC_ASSETS_DIR}"
+[ -d "${ICON_DOC_ASSETS_DIR}" ] || { echo "error: .icon document assets dir not found at ${ICON_DOC_ASSETS_DIR}" >&2; exit 1; }
+cp "${MASTERS_DIR}/icon_1024x1024.png" "${DARK_MASTER}" "${ICON_DOC_ASSETS_DIR}/"
+echo "    wrote light + dark 1024 masters"
 
 echo "Done. Review and commit the regenerated artifacts."

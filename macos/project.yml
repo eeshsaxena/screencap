@@ -31,6 +31,8 @@ targets:
           - "Resources/Fonts/**"
           - "Info.plist"
           - "ScreenCap.entitlements"
+          - "AppIcon.icon"
+          - "AppIcon.icon/**"
       # Bundled typefaces (KTD-3) as a `type: folder` folder-reference (blue
       # folder), which preserves the `Fonts/` directory in `Contents/Resources/`.
       # The flat sweep above is told to skip these files (excludes) because the
@@ -39,6 +41,14 @@ targets:
       # at a nonexistent directory — making registration a silent no-op.
       - path: ScreenCap/Resources/Fonts
         type: folder
+        buildPhase: resources
+      # Icon Composer document: macOS 26+ renders the app icon (light + dark)
+      # from this; the classic AppIcon.appiconset stays as the fallback for
+      # macOS 13-15. The basename must match ASSETCATALOG_COMPILER_APPICON_NAME
+      # for the build system to pick it up. `type: file` keeps the package a
+      # single file reference (like .xcassets), not a loose-file group.
+      - path: ScreenCap/AppIcon.icon
+        type: file
         buildPhase: resources
     resources:
       - path: ScreenCap/Assets.xcassets
