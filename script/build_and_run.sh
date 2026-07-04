@@ -18,6 +18,7 @@ CLI_BINARY="$CLI_BUNDLE/screencap"
 RUN_LOG_DIR="$ROOT_DIR/.build/run"
 STDOUT_LOG="$RUN_LOG_DIR/$APP_NAME.stdout.log"
 STDERR_LOG="$RUN_LOG_DIR/$APP_NAME.stderr.log"
+DAEMON_LABEL="com.screencap.daemon"
 
 usage() {
   echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
@@ -203,25 +204,61 @@ warn_if_ad_hoc_signing() {
   fi
 }
 
-publish_launch_env() {
-  # NOTE: `launchctl setenv` here publishes vars to the entire GUI session,
-  # so every LaunchAgent-spawned process (not just our daemon) inherits
-  # SCREENCAP_DAEMON_USE_DEV_SOURCE, SCREENCAP_DEV_REPO_ROOT, etc. That's
-  # the trade-off that lets the daemon helper see them without per-process
-  # plumbing. If you ever care about scoping these to just the daemon,
-  # switch to `launchctl bootout` + a custom plist with EnvironmentVariables.
-  /bin/launchctl setenv PATH "$PATH"
-  /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$SCREENCAP_DEV_REPO_ROOT"
-  if [[ -n "${SCREENCAP_DEV_PYTHON:-}" ]]; then
-    /bin/launchctl setenv SCREENCAP_DEV_PYTHON "$SCREENCAP_DEV_PYTHON"
-  else
-    /bin/launchctl unsetenv SCREENCAP_DEV_PYTHON
+daemon_job_is_file_bootstrapped() {
+  # True when the loaded job was bootstrapped from a plist file (print shows
+  # "path = /…"). The real agent is SMAppService-submitted ("path =
+  # (submitted by smd.NNN)"), so a file-bootstrapped squatter is wrong by
+  # construction — and can't read a repo under ~/Documents anyway (a plain
+  # launchctl-bootstrapped job has no app TCC identity, so macOS folder
+  # protection denies it with EPERM).
+  /bin/launchctl print "gui/$(id -u)/$DAEMON_LABEL" 2>/dev/null \
+    | grep -q '^[[:space:]]*path = /'
+}
+
+bootout_daemon_job() {
+  # Removes the loaded daemon job, then waits for the label to actually
+  # clear: bootout only *initiates* termination, and the freshly launched
+  # app polling a still-draining instance would adopt a dying daemon. The
+  # wait matches the job's 30s ExitTimeOut.
+  local uid="$1"
+  local target="gui/$uid/$DAEMON_LABEL"
+  if ! /bin/launchctl print "$target" >/dev/null 2>&1; then
+    return 0
   fi
-  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
-    /bin/launchctl setenv SCREENCAP_DAEMON_USE_DEV_SOURCE "1"
-  else
-    /bin/launchctl unsetenv SCREENCAP_DAEMON_USE_DEV_SOURCE
+  /bin/launchctl bootout "$target" >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    if ! /bin/launchctl print "$target" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+sync_daemon_job() {
+  # Converge the loaded daemon job on this build. The dev-source env rides
+  # the screencap-dev-env file next to the built .app (written or removed by
+  # embed-cli.sh on every build), so for the normal SMAppService-submitted
+  # job a plain kickstart respawn picks up both mode switches and fresh
+  # source — no launchd environment involved anywhere.
+  local uid
+  uid="$(id -u)"
+
+  if /bin/launchctl print "gui/$uid/$DAEMON_LABEL" >/dev/null 2>&1 \
+      && daemon_job_is_file_bootstrapped; then
+    # A file-bootstrapped squatter (e.g. a manual `launchctl bootstrap`)
+    # can't serve a dev repo under ~/Documents and shadows the real agent.
+    # Boot it out; the app's onboarding/permission-repair flow (or the next
+    # login's smd resubmission) re-registers the SMAppService agent.
+    echo "Dislodging file-bootstrapped $DAEMON_LABEL job (not the SMAppService agent)..."
+    if ! bootout_daemon_job "$uid"; then
+      echo "warning: the loaded $DAEMON_LABEL job did not unload within 30s. Manual recovery:" >&2
+      echo "warning:   launchctl bootout gui/$uid/$DAEMON_LABEL && ./script/build_and_run.sh" >&2
+    fi
+    return
   fi
+
+  restart_daemon_if_loaded
 }
 
 generate_project_if_needed() {
@@ -433,10 +470,11 @@ confirm_fresh_daemon() {
 restart_daemon_if_loaded() {
   # launchd's KeepAlive keeps the daemon process alive across app and CLI
   # rebuilds. Without an explicit kickstart, a freshly-built CLI bundle or
-  # an updated launchctl setenv (e.g. SCREENCAP_DAEMON_USE_DEV_SOURCE)
-  # never reaches the running daemon — the developer tests fresh source
-  # against stale execution. Kickstart -k forces the LaunchAgent to
-  # terminate and respawn from the current plist / env / binary.
+  # an updated bundle dev-env file (SCREENCAP_DAEMON_USE_DEV_SOURCE & co,
+  # baked in by embed-cli.sh) never reaches the running daemon — the
+  # developer tests fresh source against stale execution. Kickstart -k
+  # forces the LaunchAgent to terminate and respawn from the current
+  # plist / binary / dev-env file.
   local uid
   uid="$(id -u)"
   if ! /bin/launchctl print "gui/$uid/com.screencap.daemon" >/dev/null 2>&1; then
@@ -475,25 +513,71 @@ build_app() {
   fi
 }
 
+open_app_with_scoped_launch_env() {
+  # `open`-launched apps inherit launchd's session environment, not this
+  # script's, so the dev vars must transit launchd. But `launchctl setenv`
+  # is GLOBAL to the GUI session — left in place it leaks dev PATH entries
+  # and (possibly stale) repo roots into every subsequently launched app,
+  # until logout. Scope the publication to this one launch instead: set,
+  # open, restore — the same contract as
+  # PermissionController.relaunchHelperShellScript (pinned by
+  # testRelaunchHelperDevScriptScopesLaunchdPublicationToTheOpen).
+  # `open` blocks until LaunchServices has launched the app, so the app has
+  # captured its environment by the time we restore. The daemon does NOT
+  # depend on this window — its env is baked into the screencap-dev-env
+  # file next to the built bundle at build time (embed-cli.sh).
+  local old_path status=0
+  # A pre-existing launchd PATH (e.g. set by the user's own tooling) is
+  # restored, not clobbered; absent one, the temporary value is removed.
+  old_path="$(/bin/launchctl getenv PATH || true)"
+  /bin/launchctl setenv PATH "$PATH"
+  /bin/launchctl setenv SCREENCAP_DEV_REPO_ROOT "$SCREENCAP_DEV_REPO_ROOT"
+  if [[ -n "${SCREENCAP_DEV_PYTHON:-}" ]]; then
+    /bin/launchctl setenv SCREENCAP_DEV_PYTHON "$SCREENCAP_DEV_PYTHON"
+  else
+    /bin/launchctl unsetenv SCREENCAP_DEV_PYTHON
+  fi
+  if [[ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" == "1" ]]; then
+    # The APP needs this flag too, not just the daemon job:
+    # DaemonInstallController disables its bundled-version gate when the app
+    # sees it (a dev-source daemon legitimately reports a version the bundle
+    # stamp doesn't match).
+    /bin/launchctl setenv SCREENCAP_DAEMON_USE_DEV_SOURCE "1"
+  else
+    /bin/launchctl unsetenv SCREENCAP_DAEMON_USE_DEV_SOURCE
+  fi
+
+  /usr/bin/open -n "$APP_BUNDLE" || status=$?
+
+  if [[ -n "$old_path" ]]; then
+    /bin/launchctl setenv PATH "$old_path"
+  else
+    /bin/launchctl unsetenv PATH
+  fi
+  # The SCREENCAP_* vars are only ever published by our tooling — remove
+  # rather than restore, so a value leaked by an older version of this
+  # script (possibly a stale worktree path) is cleaned up instead of
+  # faithfully re-leaked.
+  /bin/launchctl unsetenv SCREENCAP_DEV_REPO_ROOT
+  /bin/launchctl unsetenv SCREENCAP_DEV_PYTHON
+  /bin/launchctl unsetenv SCREENCAP_DAEMON_USE_DEV_SOURCE
+  return $status
+}
+
 launch_app() {
   prepare_launch_env
-  publish_launch_env
-  # SCR-121: dislodge a stale/version-mismatched daemon BEFORE kickstart/launch.
-  # Otherwise kickstart just respawns the old bundle and the freshly built app
-  # adopts it (treats "socket reachable" as "installed").
+  # SCR-121: dislodge a stale/version-mismatched daemon BEFORE the job sync
+  # and launch. Otherwise a kickstart just respawns the old bundle and the
+  # freshly built app adopts it (treats "socket reachable" as "installed").
   echo "==> Reconciling daemon version"
   reconcile_daemon_version
-  # Kickstart the daemon AFTER publish_launch_env so the respawned helper
-  # inherits the freshly-set launchctl env (PATH, SCREENCAP_DEV_PYTHON,
-  # SCREENCAP_DAEMON_USE_DEV_SOURCE). Without this, env changes published
-  # by this script never reach the long-lived daemon process.
-  echo "==> Restarting daemon helper (if loaded)"
-  restart_daemon_if_loaded
+  echo "==> Syncing daemon job"
+  sync_daemon_job
 
   : >"$STDOUT_LOG"
   : >"$STDERR_LOG"
 
-  /usr/bin/open -n "$APP_BUNDLE"
+  open_app_with_scoped_launch_env
 
   echo "Launched $APP_NAME through LaunchServices."
   echo "Logs: ./script/build_and_run.sh --logs"

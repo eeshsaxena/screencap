@@ -28,6 +28,16 @@ DEST_APP="${CONTENTS_DIR}/Library/LoginItems/ScreencapDaemon.app"
 # The launched daemon executable inside the embedded helper bundle.
 HELPER_BIN="${DEST_APP}/Contents/MacOS/screencap"
 LAUNCHER="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/screencap-daemon-launcher"
+# Deliberately OUTSIDE the .app: the bundle's code seal must not depend on a
+# file that changes with the developer's build mode. Writing it into
+# Contents/Resources broke `codesign --verify` on incremental builds (Xcode
+# skips re-signing when no tracked inputs changed, so the new file stayed
+# unsealed). The Debug launcher reads it at a fixed path relative to the
+# bundle (../../.. of Contents/Resources = the products dir).
+DEV_ENV_FILE="${BUILT_PRODUCTS_DIR}/screencap-dev-env"
+# Stale copy from the earlier in-bundle placement; remove so old bundles
+# converge back to a valid seal on rebuild.
+rm -f "${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/screencap-dev-env"
 
 write_daemon_launcher() {
     mkdir -p "$(dirname "${LAUNCHER}")"
@@ -59,6 +69,26 @@ umask 077
 mkdir -p "${SCREENCAP_LOG_DIR}" 2>/dev/null || true
 if [ -d "${SCREENCAP_LOG_DIR}" ]; then
     exec 2>>"${SCREENCAP_LOG_DIR}/serve.log"
+fi
+
+# Dev-source config written at build time next to the built .app
+# (embed-cli.sh `write_dev_env_file`, driven by script/build_and_run.sh). A
+# products-dir file — not launchd environment — because (a) `launchctl
+# setenv` is global to the GUI session and leaks dev paths into every app,
+# and (b) per-job plist EnvironmentVariables are snapshotted at bootstrap,
+# so propagating a change would need an SMAppService re-registration only
+# the app's onboarding UI performs. This way `launchctl kickstart -k` alone
+# picks up env changes. It lives OUTSIDE the bundle so the code seal never
+# depends on the developer's build mode. When present, the file is
+# authoritative for the mode this build requested (its absence in a
+# bundled-mode rebuild is what switches dev-source off). Values are
+# extracted literally — the file is never sourced/eval'd.
+DEV_ENV_FILE="${SCRIPT_DIR}/../../../screencap-dev-env"
+if [ -f "${DEV_ENV_FILE}" ]; then
+    SCREENCAP_DAEMON_USE_DEV_SOURCE="$(sed -n 's/^SCREENCAP_DAEMON_USE_DEV_SOURCE=//p' "${DEV_ENV_FILE}")"
+    SCREENCAP_DEV_REPO_ROOT="$(sed -n 's/^SCREENCAP_DEV_REPO_ROOT=//p' "${DEV_ENV_FILE}")"
+    SCREENCAP_DEV_PYTHON="$(sed -n 's/^SCREENCAP_DEV_PYTHON=//p' "${DEV_ENV_FILE}")"
+    export SCREENCAP_DAEMON_USE_DEV_SOURCE SCREENCAP_DEV_REPO_ROOT SCREENCAP_DEV_PYTHON
 fi
 
 if [ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" = "1" ] && [ -n "${SCREENCAP_DEV_REPO_ROOT:-}" ] && [ -d "${SCREENCAP_DEV_REPO_ROOT}/src/screencap" ]; then
@@ -104,7 +134,29 @@ EOF
     chmod 0755 "${LAUNCHER}"
 }
 
+write_dev_env_file() {
+    # Bakes the dev-source config next to the built .app so the daemon job's
+    # env is scoped to this build — never published to the launchd session.
+    # Debug + dev-source builds write it; every other build REMOVES it, so a
+    # bundled-mode rebuild switches a previously-dev build back cleanly.
+    if [ "${CONFIGURATION:-}" = "Debug" ] \
+        && [ "${SCREENCAP_DAEMON_USE_DEV_SOURCE:-0}" = "1" ] \
+        && [ -n "${SCREENCAP_DEV_REPO_ROOT:-}" ]; then
+        {
+            printf 'SCREENCAP_DAEMON_USE_DEV_SOURCE=1\n'
+            printf 'SCREENCAP_DEV_REPO_ROOT=%s\n' "${SCREENCAP_DEV_REPO_ROOT}"
+            if [ -n "${SCREENCAP_DEV_PYTHON:-}" ]; then
+                printf 'SCREENCAP_DEV_PYTHON=%s\n' "${SCREENCAP_DEV_PYTHON}"
+            fi
+        } >"${DEV_ENV_FILE}"
+        echo "Wrote dev-source daemon env -> ${DEV_ENV_FILE}"
+    else
+        rm -f "${DEV_ENV_FILE}"
+    fi
+}
+
 write_daemon_launcher
+write_dev_env_file
 
 if [ ! -d "${SOURCE_APP}" ]; then
     echo "warning: dist/ScreencapDaemon.app not found at ${SOURCE_APP}"
