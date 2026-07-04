@@ -137,13 +137,34 @@ mkdir -p "${STAGING_DIR}"
 /usr/bin/ditto "${APP_PATH}" "${STAGING_DIR}/${APP_NAME}.app"
 ln -s /Applications "${STAGING_DIR}/Applications"
 
-rm -f "${DMG_PATH}"
+# The branded volume icon must be set on the MOUNTED volume of a read-write
+# image: setting the custom-icon bit on the source staging folder does not
+# survive `hdiutil create -srcfolder ... -format UDZO` onto the read-only
+# volume. So build UDRW, attach, place .VolumeIcon.icns + set the icon bit on
+# the volume root, detach, then convert to the final compressed UDZO.
+VOLUME_ICON="${REPO_ROOT}/macos/branding/ScreenCap.icns"
+[ -f "${VOLUME_ICON}" ] || { echo "error: volume icon not found at ${VOLUME_ICON}" >&2; exit 1; }
+
+RW_DMG_PATH="${OUTPUT_DIR}/${APP_NAME}-${VERSION}-rw.dmg"
+rm -f "${RW_DMG_PATH}"
 hdiutil create \
   -volname "${APP_NAME}" \
   -srcfolder "${STAGING_DIR}" \
-  -ov -format UDZO \
-  "${DMG_PATH}"
+  -ov -format UDRW \
+  "${RW_DMG_PATH}"
 rm -rf "${STAGING_DIR}"
+
+echo "==> Setting DMG volume icon"
+MOUNT_POINT="$(hdiutil attach "${RW_DMG_PATH}" -nobrowse -plist \
+  | plutil -extract 'system-entities' json -o - - \
+  | /usr/bin/python3 -c 'import json,sys; print(next(e["mount-point"] for e in json.load(sys.stdin) if "mount-point" in e))')"
+cp "${VOLUME_ICON}" "${MOUNT_POINT}/.VolumeIcon.icns"
+xcrun SetFile -a C "${MOUNT_POINT}"
+hdiutil detach "${MOUNT_POINT}"
+
+rm -f "${DMG_PATH}"
+hdiutil convert "${RW_DMG_PATH}" -format UDZO -o "${DMG_PATH}"
+rm -f "${RW_DMG_PATH}"
 
 # ---- 3. Sign + notarize + staple the DMG ------------------------------------
 echo "==> Signing the DMG"

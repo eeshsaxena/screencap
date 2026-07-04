@@ -280,7 +280,10 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='ScreencapDaemon.app',
-    icon=None,
+    # Brand mark for the System Settings -> Login Items row (and anywhere else
+    # macOS renders the helper bundle). Generated from the branding masters by
+    # macos/branding/generate-icons.sh — same source as the app icon.
+    icon=os.path.join(_root, 'macos', 'branding', 'ScreenCap.icns'),
     bundle_identifier='com.screencap.daemon',
     info_plist={
         'CFBundleExecutable': 'screencap',

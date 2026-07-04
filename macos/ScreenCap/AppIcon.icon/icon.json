@@ -1,0 +1,53 @@
+{
+  "fill" : {
+    "solid" : "srgb:0.88627,0.87843,0.85882,1.00000"
+  },
+  "fill-specializations" : [
+    {
+      "value" : {
+        "solid" : "srgb:0.88627,0.87843,0.85882,1.00000"
+      }
+    },
+    {
+      "appearance" : "dark",
+      "value" : {
+        "solid" : "srgb:0.10588,0.12549,0.14118,1.00000"
+      }
+    }
+  ],
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name-specializations" : [
+            {
+              "value" : "icon_1024x1024.png"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "icon_1024x1024_dark.png"
+            }
+          ],
+          "name" : "tile",
+          "position" : {
+            "scale" : 1.2427184466019416,
+            "translation-in-points" : [ 0, 0 ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "specular" : false,
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.1
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}
