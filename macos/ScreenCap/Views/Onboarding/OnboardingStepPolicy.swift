@@ -107,6 +107,46 @@ enum OnboardingStepPolicy {
         step == .permissions && requiredGrantsGranted
     }
 
+    // MARK: - Helper install auto-start (dead-registration self-heal)
+
+    /// Whether the permissions surface should drive `DaemonInstallController
+    /// .install()` on appear, without waiting for an "Approve helper" click.
+    ///
+    /// SMAppService records the helper's absolute executable path at
+    /// registration time. When that bundle later disappears (a deleted dev
+    /// worktree's Debug build, or an app moved after first launch), the label
+    /// still reads `.enabled` while launchd sits in `spawn failed` — so the
+    /// daemon can never come up, every grant reads indeterminate, and the
+    /// idle card's "approve it first" copy dead-ends the user: Login Items
+    /// already shows the helper approved. `install()` is the only repair
+    /// (its poll-timeout → registration-refresh path re-registers from the
+    /// current bundle), so the surface fires it itself.
+    ///
+    /// Strictly `.idle`: in-flight states must not double-fire, and failure
+    /// states keep their explicit user-driven retry (no auto-retry loop). A
+    /// connected daemon transport means nothing needs installing, and replay
+    /// is read-only by contract.
+    ///
+    /// `daemonProbeCompleted` gates the launch race: `transport` starts as
+    /// `.cliFallback` before the launch probe lands, and unlike the takeover
+    /// (gated in MainWindow on this same flag) the wizard path can render the
+    /// permissions step pre-probe — without this input the auto-fire would
+    /// always poll an as-yet-unprobed socket and could escalate a healthy
+    /// daemon into `install()`'s destructive re-register. The step re-evaluates
+    /// on the flag's change, so a step that appeared pre-probe still
+    /// self-heals the moment the probe settles.
+    static func shouldAutoStartHelperInstall(
+        installerState: DaemonInstallController.State,
+        transport: RecorderTransport,
+        daemonProbeCompleted: Bool,
+        replay: Bool
+    ) -> Bool {
+        installerState == .idle
+            && transport != .daemon
+            && daemonProbeCompleted
+            && !replay
+    }
+
     // MARK: - Progress dots (design 289–294; logic obDots)
 
     /// 4 dots for the local tier, 5 with the account step (personal), 6 with

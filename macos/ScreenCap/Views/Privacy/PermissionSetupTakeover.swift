@@ -43,6 +43,9 @@ struct PermissionSetupTakeover: View {
             } else {
                 OnboardingPermissionsStep(
                     daemonInstaller: daemonInstaller,
+                    // Live repair surface, never a read-only replay — the
+                    // helper-install auto-start (self-heal) is wanted here.
+                    replay: false,
                     onContinue: close
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

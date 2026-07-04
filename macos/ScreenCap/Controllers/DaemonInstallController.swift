@@ -110,6 +110,19 @@ final class DaemonInstallController: ObservableObject {
 
     @Published private(set) var state: State = .idle
 
+    /// Process-wide single-flight latch for `install()`. The auto-start guard
+    /// (`OnboardingStepPolicy.shouldAutoStartHelperInstall`) checks `.idle`
+    /// per-instance, but the wizard and the permission-repair takeover each own
+    /// their own controller while both mutate the SAME process-global
+    /// SMAppService label — two interleaved install() state machines
+    /// (register / destructive refresh / bootout at await points) can corrupt
+    /// each other's outcome. A late-comer returns immediately, leaving its own
+    /// controller `.idle` (the card keeps its Approve button); the winning
+    /// install's completion posts `.screenCapDaemonInstalledAndRunning`, which
+    /// flips transport for every surface. @MainActor-confined, so a plain Bool
+    /// is race-free.
+    private static var installInFlight = false
+
     static let plistName = "com.screencap.daemon.plist"
     static let registrationAttemptedKey = "com.screencap.macos.daemonInstallAttempted"
     /// Records the daemon version for which proactive TCC setup (SCR-200 U3/U4:
@@ -219,6 +232,12 @@ final class DaemonInstallController: ObservableObject {
         // polls 30s for the same reason.
         convergenceTimeoutSeconds: TimeInterval = 30
     ) async {
+        // Single-flight per process (see installInFlight): a concurrent install
+        // from another surface's controller owns the label — do not interleave.
+        guard !Self.installInFlight else { return }
+        Self.installInFlight = true
+        defer { Self.installInFlight = false }
+
         state = .registering
         let status: SMAppService.Status
         do {
@@ -480,11 +499,11 @@ final class DaemonInstallController: ObservableObject {
             }
         case .requiresApproval:
             state = .requiresApproval
-            let approved = await waitForApproval(
+            switch await waitForApproval(
                 timeoutSeconds: approvalTimeoutSeconds,
                 intervalSeconds: approvalPollIntervalSeconds
-            )
-            if approved {
+            ) {
+            case .approved:
                 await handleRegisteredStatus(
                     .enabled,
                     timeoutSeconds: timeoutSeconds,
@@ -495,7 +514,17 @@ final class DaemonInstallController: ObservableObject {
                     allowRegistrationRefresh: allowRegistrationRefresh,
                     priorMismatchVersion: priorMismatchVersion
                 )
-            } else {
+            case .stillPending:
+                // Deadline expired with the label still awaiting approval —
+                // user inaction, not a failure. Stay in .requiresApproval so
+                // the card keeps the honest "approve in Login Items" copy
+                // (Open Login Items + Retry) instead of a misleading "could
+                // not be installed". Matters doubly now that install()
+                // auto-fires on step appearance: the budget starts with no
+                // click, so a user reading the screen or off doing the TCC
+                // drags routinely outlives it.
+                break
+            case .registrationGone:
                 state = .installFailed(.unknown)
             }
         case .notFound:
@@ -541,13 +570,25 @@ final class DaemonInstallController: ObservableObject {
         )
     }
 
-    private func waitForApproval(timeoutSeconds: TimeInterval, intervalSeconds: TimeInterval) async -> Bool {
+    /// How an approval wait ended. `stillPending` (deadline expiry with the
+    /// label still `.requiresApproval`) is deliberately distinct from
+    /// `registrationGone` (the label vanished): the former is user inaction and
+    /// must not render as an install failure.
+    private enum ApprovalWaitOutcome {
+        case approved
+        case stillPending
+        case registrationGone
+    }
+
+    private func waitForApproval(
+        timeoutSeconds: TimeInterval, intervalSeconds: TimeInterval
+    ) async -> ApprovalWaitOutcome {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while true {
             let status = registrationService.currentStatus(plistName: Self.plistName)
-            if status == .enabled { return true }
-            if status == .notFound || status == .notRegistered { return false }
-            if Date() >= deadline { return false }
+            if status == .enabled { return .approved }
+            if status == .notFound || status == .notRegistered { return .registrationGone }
+            if Date() >= deadline { return .stillPending }
             await sleep(Self.nanoseconds(for: intervalSeconds))
         }
     }
@@ -621,6 +662,13 @@ final class DaemonInstallController: ObservableObject {
     private static func nanoseconds(for seconds: TimeInterval) -> UInt64 {
         UInt64(max(0, seconds) * 1_000_000_000)
     }
+
+    #if DEBUG
+    // The single-flight latch is process-global static state; tests that
+    // exercise it must be able to set and restore it deterministically.
+    static func _testSetInstallInFlight(_ inFlight: Bool) { installInFlight = inFlight }
+    static var _testInstallInFlight: Bool { installInFlight }
+    #endif
 
     private static func failureReason(from error: Error) -> InstallFailureReason {
         let nsError = error as NSError

@@ -76,7 +76,12 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .installedAndRunning)
     }
 
-    func testRequiresApprovalTimeoutFailsUnknown() async {
+    /// Approval-budget expiry with the label still `.requiresApproval` is user
+    /// inaction, not a failure: the state stays `.requiresApproval` (honest
+    /// "approve in Login Items" card + Retry) rather than flipping to the
+    /// misleading `.installFailed(.unknown)`. Load-bearing since install()
+    /// auto-fires on step appearance — the budget now starts with no click.
+    func testRequiresApprovalTimeoutStaysRequiresApproval() async {
         let registration = FakeDaemonRegistrationService(
             registerStatuses: [.requiresApproval],
             currentStatuses: [.requiresApproval, .requiresApproval, .requiresApproval]
@@ -94,7 +99,72 @@ final class DaemonInstallControllerTests: XCTestCase {
             approvalPollIntervalSeconds: 0.01
         )
 
+        XCTAssertEqual(controller.state, .requiresApproval)
+    }
+
+    /// The label vanishing mid-wait (unregistered behind our back) is a real
+    /// failure — that is what `.installFailed(.unknown)` is reserved for.
+    func testApprovalRegistrationGoneFailsUnknown() async {
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.requiresApproval],
+            currentStatuses: [.notFound]
+        )
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: FakeDaemonProbe(results: []),
+            sleep: { _ in }
+        )
+
+        await controller.install(
+            timeoutSeconds: 1,
+            probeIntervalSeconds: 0.01,
+            approvalTimeoutSeconds: 1,
+            approvalPollIntervalSeconds: 0.01
+        )
+
         XCTAssertEqual(controller.state, .installFailed(.unknown))
+    }
+
+    /// install() is single-flight per process: with another surface's install
+    /// in flight, a second call returns immediately without registering and
+    /// leaves its controller untouched at `.idle` (the per-instance auto-start
+    /// guard cannot see cross-controller state — the latch is what enforces
+    /// the one-state-machine-per-launchd-label invariant).
+    func testInstallIsSingleFlightAcrossControllers() async {
+        DaemonInstallController._testSetInstallInFlight(true)
+        defer { DaemonInstallController._testSetInstallInFlight(false) }
+
+        let registration = FakeDaemonRegistrationService(registerStatuses: [.enabled])
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: FakeDaemonProbe(results: [true]),
+            sleep: { _ in }
+        )
+
+        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertEqual(registration.registeredPlistNames, [])
+    }
+
+    /// The latch releases when install() returns, so a later install proceeds.
+    func testInstallInFlightLatchClearsAfterCompletion() async {
+        let registration = FakeDaemonRegistrationService(registerStatuses: [.enabled, .enabled])
+        let first = DaemonInstallController(
+            registrationService: registration,
+            probe: FakeDaemonProbe(results: [true, true]),
+            sleep: { _ in }
+        )
+        await first.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+        XCTAssertFalse(DaemonInstallController._testInstallInFlight)
+
+        let second = DaemonInstallController(
+            registrationService: registration,
+            probe: FakeDaemonProbe(results: [true]),
+            sleep: { _ in }
+        )
+        await second.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+        XCTAssertEqual(second.state, .installedAndRunning)
     }
 
     func testProbeTimeoutSurfacesPollingFailed() async {
