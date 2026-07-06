@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 
     from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
+    from screencap.segmentation.provider import SegmentResult
     from screencap.upload import FileInfo
 
 logger = logging.getLogger(__name__)
@@ -892,7 +893,7 @@ def _run_local_segmentation(
     ledger: "PipelineLedger | None",
     result: TerminalResult,
 ) -> None:
-    """Segment a LOCAL recording into named tasks; persist to the local store (U4).
+    """Segment a LOCAL recording into named tasks; persist to the local store (U4/U7).
 
     Runs on the Mac inside the terminal flock (R3/R4). Builds the activity
     summary from the recording's LOCAL on-disk chunk artifacts, passing the
@@ -903,23 +904,61 @@ def _run_local_segmentation(
     ``tasks.json`` and the ``pipeline_task_segments`` ledger table (idempotent —
     re-entry REPLACES, never duplicates).
 
-    **Strictly fail-open.** Any non-tasks outcome — the provider returning
-    ``None`` (ran, no tasks) or ``PROVIDER_UNAVAILABLE`` (could not run, e.g. no
-    on-device model), an empty/invalid summary, or any unexpected error — leaves
-    the recording unnamed but NEVER blocks terminal completion and NEVER uploads.
-    The idle-gap heuristic fallback for an unavailable provider is U7's job,
-    deliberately NOT done here.
+    **Graceful degradation ladder (U7, R5 / KTD6).** The provider's outcome is
+    routed through :func:`screencap.segmentation.degrade.resolve_day_split`:
+
+    * a real tasks dict → persisted unchanged;
+    * ``PROVIDER_UNAVAILABLE`` (could not run — e.g. no on-device model on a
+      CLI-only / pre-macOS-26 install) → fall back to the **local idle-gap
+      heuristic** (``task_manifest._segment_tasks`` over the recording's local
+      events) and persist THOSE mechanically-named tasks. Cloud is **never** a
+      day-split fallback (R7 over R5), so this path never touches the network;
+    * ``None`` (ran, produced nothing) → left unnamed (fail-open); the heuristic
+      is NOT run for a genuine empty result.
+
+    **Strictly fail-open.** An empty/invalid summary or any unexpected error
+    leaves the recording unnamed but NEVER blocks terminal completion and NEVER
+    uploads — the LOCAL branch has no upload seam at all.
     """
+    from screencap.segmentation.consent import ConsentPolicy
+    from screencap.segmentation.degrade import DegradeAction, resolve_day_split
+
     try:
-        tasks = _segment_local_tasks(recording_dir)
+        provider_result = _segment_local_tasks(recording_dir)
     except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
         logger.debug(
             "terminal_stage: local segmentation failed open for %s (%s)",
             recording_dir.name, exc,
         )
         return
+
+    try:
+        decision = resolve_day_split(provider_result, ConsentPolicy.from_config())
+    except Exception as exc:  # noqa: BLE001 — the ladder must never block terminal
+        logger.debug(
+            "terminal_stage: degradation resolve failed open for %s (%s)",
+            recording_dir.name, exc,
+        )
+        return
+
+    if decision.action is DegradeAction.USE_PROVIDER:
+        tasks = decision.tasks
+    elif decision.action is DegradeAction.HEURISTIC:
+        # On-device unavailable → idle-gap heuristic ONLY (never cloud, KTD6).
+        try:
+            tasks = _heuristic_local_tasks(recording_dir)
+        except Exception as exc:  # noqa: BLE001 — heuristic must never block terminal
+            logger.debug(
+                "terminal_stage: idle-gap heuristic failed open for %s (%s)",
+                recording_dir.name, exc,
+            )
+            return
+    else:
+        # NONE (provider ran, no tasks) or CLOUD (never reachable for day-split)
+        # → fail open, nothing to persist.
+        return
+
     if not tasks:
-        # Provider ran and produced nothing, or was unavailable — fail open.
         return
     try:
         n = _persist_local_tasks(recording_dir, ledger, tasks)
@@ -932,12 +971,15 @@ def _run_local_segmentation(
     result.tasks_persisted = n
 
 
-def _segment_local_tasks(recording_dir: Path) -> dict | None:
+def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
     """Build the stripped activity summary and run the configured provider.
 
-    Returns the provider's validated tasks dict, or ``None`` when there is no
-    activity to segment or the provider produced/was-available no tasks. All
-    heavy imports are deferred so the terminal-stage import surface stays light.
+    Returns the provider's raw :class:`~screencap.segmentation.provider.SegmentResult`
+    — a validated tasks dict, ``None`` (ran, no usable tasks / no activity), or
+    ``PROVIDER_UNAVAILABLE`` (could not run). The sentinel is preserved (not
+    collapsed to a falsy ``None``) so the caller's degradation ladder can route
+    on the None-vs-unavailable distinction. All heavy imports are deferred so
+    the terminal-stage import surface stays light.
     """
     from screencap import config
     from screencap.segmentation.activity_summary import build_activity_summary
@@ -970,10 +1012,58 @@ def _segment_local_tasks(recording_dir: Path) -> dict | None:
 
     # Resolve and run the configured provider. segment() returns a validated
     # tasks dict, None (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not
-    # run). Non-tasks results fail open in the caller; U7 owns routing an
-    # unavailable on-device result to the idle-gap heuristic.
+    # run). The caller's ladder routes an unavailable result to the idle-gap
+    # heuristic (day-split → heuristic only, KTD6).
     provider = get_provider(config.get_llm_provider())
     return provider.segment(summary)
+
+
+def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
+    """Idle-gap heuristic fallback for a LOCAL recording (U7, R5 / AE4).
+
+    Reused when the on-device provider is UNAVAILABLE (never for a genuine empty
+    provider result). Reads the recording's LOCAL ``action_event`` rows from
+    ``recording.db``, splits them on inactivity gaps via the shared
+    ``task_manifest._segment_tasks`` (the same idle-gap logic the v1 manifest
+    uses), and returns a ``{"tasks": [...]}`` dict shaped like a provider result
+    so ``_persist_local_tasks`` writes it identically. Tasks are
+    mechanically-named (``task_1`` …) — the heuristic has no model to name them,
+    and cloud is never consulted (R7 over R5).
+
+    Returns ``None`` when there are no events to segment; strictly local (no
+    network, no upload). All imports deferred to keep the import surface light.
+    """
+    from screencap import config
+    from screencap.recording_db import Row, open_recording_db
+    from screencap.task_manifest import _segment_tasks
+
+    db_path = recording_dir / "recording.db"
+    if not db_path.exists():
+        return None
+
+    with open_recording_db(db_path, row_factory=Row) as conn:
+        events = conn.execute(
+            """SELECT timestamp, name FROM action_event
+               WHERE name != 'move'
+               ORDER BY timestamp""",
+        ).fetchall()
+
+    segments = _segment_tasks(events, config.get_rest_threshold())
+    if not segments:
+        return None
+
+    tasks = [
+        {
+            "start_ts": float(start),
+            "end_ts": float(end),
+            "name": f"task_{i + 1}",
+            "derived_name": f"task-{i + 1}",
+            "event_count": count,
+            "source": "idle_gap_heuristic",
+        }
+        for i, (start, end, count) in enumerate(segments)
+    ]
+    return {"tasks": tasks, "summary": {"source": "idle_gap_heuristic"}, "tags": []}
 
 
 def _persist_local_tasks(
