@@ -14,6 +14,8 @@ from screencap.enforcement.recorder_enforcement import (
     RecorderPrivacyFilter,
 )
 
+pytestmark = pytest.mark.privacy
+
 
 def _make_config(**kwargs) -> PrivacyConfig:
     """Build a PrivacyConfig with sensible test defaults."""

@@ -220,6 +220,21 @@ class TestConfirmationFields:
         assert slack["allow_confirmed"] is False
         assert slack["resolved_action"] == "mask_window"
 
+    def test_app_classes_override_drives_confirmation_required(self):
+        """Review fix: the payload resolves the user's app_classes override
+        first, matching the CLI gate — otherwise a user-reclassified
+        sensitive app carries confirmation_required=false and the UI routes
+        it through a plain allow that the gate then refuses (dead-end)."""
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\n'
+            '[privacy.app_classes]\n"com.microsoft.VSCode" = "banking"\n'
+        )
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        vscode = _by_bundle(payload, "com.microsoft.VSCode")
+        assert vscode["context_class"] == "banking"
+        assert vscode["classification_source"] == "user_config"
+        assert vscode["confirmation_required"] is True
+
     def test_mixed_case_membership_matches(self):
         """Config sets are case-normalized (SCR-235): mixed-case entries and
         mixed-case OS bundle IDs still match."""

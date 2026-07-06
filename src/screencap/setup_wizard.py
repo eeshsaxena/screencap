@@ -15,6 +15,7 @@ from pathlib import Path
 import click
 import tomlkit
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from screencap.app_discovery import (
@@ -716,6 +717,7 @@ def run_setup_wizard(
             final_allow.append(bid)
 
     # Process visible groups, applying user overrides
+    pending_sensitive: list[tuple[str, str, ContextClass]] = []
     for group_key in ("blocked", "communication", "safe", "unclassified"):
         for meta, cls, source in groups.get(group_key, []):
             bid = meta.bundle_id
@@ -729,12 +731,26 @@ def run_setup_wizard(
                     if bid in final_allow:
                         final_allow.remove(bid)
                 else:  # "allow"
-                    if bid not in final_allow and bid not in final_exclude:
+                    # Symmetric with the block branch: an explicit allow
+                    # un-blocks. On a wizard re-run the app may sit in
+                    # existing exclude_apps from the first run's defaults —
+                    # the toggle must not silently no-op against it.
+                    for stale in [
+                        e for e in final_exclude if e.lower() == bid.lower()
+                    ]:
+                        final_exclude.remove(stale)
+                    if cls in _BLOCKED_CLASSES:
+                        # Confirmation-required classes need the R7
+                        # consequence disclosure, which the TUI toggle does
+                        # not show — defer to the post-review confirmation
+                        # prompt below instead of confirming silently.
+                        pending_sensitive.append((bid, meta.display_name, cls))
+                        continue
+                    if bid not in final_allow:
                         final_allow.append(bid)
                     # An explicit per-app choice in the visible review flow
-                    # is a confirmed allow (SCR-235) — the one wizard path
-                    # that writes both lists.
-                    if bid in final_allow and bid not in final_confirmed:
+                    # is a confirmed allow (SCR-235).
+                    if bid not in final_confirmed:
                         final_confirmed.append(bid)
                 continue
 
@@ -758,6 +774,29 @@ def run_setup_wizard(
             elif group_key == "unclassified":
                 if bid not in final_allow and bid not in final_exclude:
                     final_allow.append(bid)
+
+    # Confirmation-required apps the user toggled to allow get the same
+    # consequence disclosure the CLI (--confirm-sensitive) and app-picker
+    # dialog show (R7) before gaining confirmed authority. Declining keeps
+    # the app blocked — confirmation is the condition for unblocking a
+    # sensitive app.
+    for bid, display_name, cls in pending_sensitive:
+        console.print(
+            f"\n  [bold]{escape(display_name)}[/bold] is in {cls.value}, a class the "
+            f"privacy matrix excludes in at least one mode. Allowing it makes it "
+            f"fully recordable in every mode: raw capture, keystrokes, the local "
+            f"search index (including past recordings once indexing re-runs), and "
+            f"cloud copies when a recording is cloud-destined."
+        )
+        if click.confirm(f"  Allow and record {display_name}?", default=False):
+            if bid not in final_allow:
+                final_allow.append(bid)
+            if bid not in final_confirmed:
+                final_confirmed.append(bid)
+        else:
+            if bid not in final_exclude:
+                final_exclude.append(bid)
+            console.print(f"  [dim]{escape(display_name)} stays blocked.[/dim]")
 
     final_exclude.sort()
     final_allow.sort()

@@ -188,6 +188,15 @@ BROWSER_BUNDLE_IDS: frozenset[str] = frozenset({
     "org.torproject.torbrowser",
 })
 
+# Case-normalized membership set: bundle-id probes are case-insensitive
+# wherever membership decides policy (SCR-235). Every consumer that asks
+# "is this a browser?" must probe this set with a lowered id — a case-exact
+# probe beside case-insensitive allow membership is the asymmetry that let
+# a confirmed browser dodge the R12 carve-out.
+BROWSER_BUNDLE_IDS_LOWER: frozenset[str] = frozenset(
+    b.lower() for b in BROWSER_BUNDLE_IDS
+)
+
 
 # ---------------------------------------------------------------------------
 # Privacy config
@@ -518,9 +527,11 @@ class DefaultPolicyEvaluator:
         """The classifier's browser definition (classify.py step 3): a stock
         browser or an app_classes-tagged one. The R12 carve-out must use the
         same definition or it goes dead for stock browsers with no
-        app_classes entry."""
+        app_classes entry. Case-insensitive on both arms — the confirmed
+        membership check is case-insensitive, so this must be too, or a
+        non-canonically-cased confirmed browser skips the carve-out."""
         return (
-            bundle_id in BROWSER_BUNDLE_IDS
+            bundle_id.lower() in BROWSER_BUNDLE_IDS_LOWER
             or self._config.app_class_for(bundle_id) == ContextClass.BROWSER_UNVERIFIED
         )
 

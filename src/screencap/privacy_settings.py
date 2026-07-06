@@ -24,9 +24,10 @@ logger = logging.getLogger(__name__)
 
 _MATRIX_ACK_KEY = "matrix_acknowledged_v2026_04"
 
-# `confirmed_allow_apps` is internally managed by the allow_apps add/remove
-# flow (SCR-235): direct writes behave as a plain list field and are meant
-# for tests and hand-edits, not documented use.
+# `confirmed_allow_apps` is normally managed by the allow_apps add/remove
+# flow (SCR-235). Direct `add` goes through the same confirmation gate as
+# allow_apps (an ungated documented verb would bypass it); `remove` behaves
+# as a plain list field.
 _PRIVACY_LIST_FIELDS = (
     "exclude_apps",
     "allow_apps",
@@ -444,34 +445,61 @@ def _settings_privacy_apply(
     # Confirmation gate (SCR-235, replaces the matrix-strictness hard-reject):
     # adds through this flow become *confirmed* entries, so allow-listing a
     # confirmation-required class (EXCLUDE anywhere in its matrix row) needs
-    # the explicit flag.
+    # the explicit flag. `confirmed_allow_apps add` is gated identically —
+    # an ungated direct add would be an in-product bypass of the gate for
+    # any bundle already carrying a legacy allow entry.
     #
     # Also consults the on-disk app_classes overrides (todo 030) so that a
     # bundle absent from BUNDLE_ID_MAP but reclassified by the user as a
     # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
     # cannot be silently allow-listed in a follow-up call.
-    if is_list and field == "allow_apps" and op == "add":
-        from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
-        from screencap.privacy.policy import ContextClass
+    if is_list and field in ("allow_apps", "confirmed_allow_apps") and op == "add":
+        from screencap.privacy.classify import BUNDLE_ID_MAP
+        from screencap.privacy.policy import (
+            BROWSER_BUNDLE_IDS_LOWER,
+            ContextClass,
+        )
+
+        # Idempotency: an entry already confirmed needs no re-confirmation.
+        # Skip the gate so the list logic emits the documented no-op (exit 0)
+        # instead of demanding the flag for a state that already holds.
+        already_confirmed = bool(
+            _matching_entries(privacy_tbl.get("allow_apps") or [], value)
+        ) and bool(
+            _matching_entries(privacy_tbl.get("confirmed_allow_apps") or [], value)
+        )
 
         # Effective class: app_classes override > BUNDLE_ID_MAP > BROWSER_BUNDLE_IDS > None.
         # BROWSER_BUNDLE_IDS resolves to BROWSER_UNVERIFIED at runtime via
         # the classifier's browser detection, so a browser bundle is
         # legitimately allow-listable even though it isn't in BUNDLE_ID_MAP.
+        # All lookups are case-insensitive: the runtime's membership is
+        # case-normalized, so a case-variant input must resolve to the same
+        # class here — a case-exact miss either misfires fail-closed (known
+        # browser rejected as unclassified) or skips a sensitive override.
+        value_lower = value.lower()
         effective_class = None
-        app_classes_overrides = dict(privacy_tbl.get("app_classes", {}))
-        override_str = app_classes_overrides.get(value)
+        app_classes_overrides = {
+            str(k).lower(): v
+            for k, v in dict(privacy_tbl.get("app_classes", {})).items()
+        }
+        override_str = app_classes_overrides.get(value_lower)
         if override_str:
             try:
                 effective_class = ContextClass(str(override_str).lower())
             except ValueError:
                 effective_class = None
         if effective_class is None:
-            effective_class = BUNDLE_ID_MAP.get(value)
-        if effective_class is None and value in BROWSER_BUNDLE_IDS:
+            effective_class = next(
+                (cls for bid, cls in BUNDLE_ID_MAP.items() if bid.lower() == value_lower),
+                None,
+            )
+        if effective_class is None and value_lower in BROWSER_BUNDLE_IDS_LOWER:
             effective_class = ContextClass.BROWSER_UNVERIFIED
 
-        if effective_class is not None:
+        if already_confirmed:
+            pass  # fall through to the list logic's no-op / plain handling
+        elif effective_class is not None:
             if _allow_requires_confirmation(effective_class) and not confirm_sensitive:
                 err_console.print(
                     f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value}, a class "
@@ -518,6 +546,12 @@ def _settings_privacy_apply(
         if arr is None:
             arr = tomlkit.array()
             privacy_tbl[field] = arr
+        # Bundle-id list fields match case-insensitively at the write seam
+        # (SCR-235): runtime membership is case-normalized, so an exact-case
+        # seam would leave hand-edited case-variant entries live at runtime
+        # but unremovable here. mask_domains/mask_title_patterns keep exact
+        # matching (patterns are case-sensitive regexes).
+        is_bundle_field = field in ("exclude_apps", "allow_apps", "confirmed_allow_apps")
         if op == "add":
             if field == "allow_apps":
                 # SCR-235: adds through this flow are confirmed — write both
@@ -540,14 +574,19 @@ def _settings_privacy_apply(
                 if not conf_already:
                     confirmed.append(value)
             else:
-                if value in arr:
+                already = (
+                    bool(_matching_entries(arr, value))
+                    if is_bundle_field
+                    else value in arr
+                )
+                if already:
                     # Idempotent no-op
                     err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
                     _result(True, changed=False)
                     return False
                 arr.append(value)
         else:  # remove
-            if field == "allow_apps":
+            if is_bundle_field:
                 matches = _matching_entries(arr, value)
                 if not matches:
                     err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
@@ -555,12 +594,13 @@ def _settings_privacy_apply(
                     return False
                 for stale in matches:
                     arr.remove(stale)
-                # SCR-235: removing the allow prunes its confirmed entry so
-                # re-allowing a sensitive app re-prompts.
-                confirmed = privacy_tbl.get("confirmed_allow_apps")
-                if confirmed is not None:
-                    for stale in _matching_entries(confirmed, value):
-                        confirmed.remove(stale)
+                if field == "allow_apps":
+                    # SCR-235: removing the allow prunes its confirmed entry
+                    # so re-allowing a sensitive app re-prompts.
+                    confirmed = privacy_tbl.get("confirmed_allow_apps")
+                    if confirmed is not None:
+                        for stale in _matching_entries(confirmed, value):
+                            confirmed.remove(stale)
             else:
                 if value not in arr:
                     err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")

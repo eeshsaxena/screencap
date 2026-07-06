@@ -221,6 +221,25 @@ class TestConfirmationGate:
         assert result.exit_code == 0
         assert "com.tinyspeck.slackmacgap" in _read_cfg()["privacy"]["confirmed_allow_apps"]
 
+    def test_exclude_add_leaves_confirmed_allow_lists_untouched(self):
+        """U2 coexistence scenario (R3/AE6): excluding a confirmed-allowed
+        app leaves both allow lists in place — runtime precedence, not the
+        write seam, resolves the conflict."""
+        _invoke("allow_apps", "add", "com.1password.1password", "--confirm-sensitive")
+        result = _invoke("exclude_apps", "add", "com.1password.1password")
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert "com.1password.1password" in cfg["exclude_apps"]
+        assert "com.1password.1password" in cfg["allow_apps"]
+        assert "com.1password.1password" in cfg["confirmed_allow_apps"]
+
+    def test_confirmed_allow_apps_add_requires_flag_for_sensitive(self):
+        """Review fix: the documented direct verb is gated like allow_apps."""
+        _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")  # benign, fine
+        result = _invoke("confirmed_allow_apps", "add", "com.1password.1password")
+        assert result.exit_code != 0
+        assert "confirm-sensitive" in result.output.lower()
+
     def test_no_backwards_mode_advice_in_error_paths(self):
         """The retired 'Set mode=public to capture broadly' advice (backwards:
         public masks more) must not appear in any guard message."""

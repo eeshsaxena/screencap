@@ -109,14 +109,17 @@ def _report_unclassified_apps(capture_dir) -> None:
     except Exception:
         return
 
-    known_bids = (
-        set(BUNDLE_ID_MAP.keys())
+    # Case-insensitive comparison (SCR-235): the config sets are lowered at
+    # parse while seen_bids carry OS casing — an exact subtraction falsely
+    # reports classified mixed-case apps as unclassified.
+    known_bids_lower = (
+        {b.lower() for b in BUNDLE_ID_MAP}
         | set(privacy_config.exclude_apps)
         | set(privacy_config.allow_apps)
         | set(privacy_config.app_classes.keys())
     )
 
-    unclassified = sorted(seen_bids - known_bids)
+    unclassified = sorted(b for b in seen_bids if b.lower() not in known_bids_lower)
     if not unclassified:
         return
 
@@ -1865,6 +1868,16 @@ def apps(as_json, include_spotlight):
     for meta in installed:
         classification = auto_classify_detailed(meta)
         ctx_class = classification.context_class
+        classification_source = classification.source
+        # User app_classes overrides win (SCR-235): the CLI gate and the
+        # runtime classifier both resolve them first, so the payload must
+        # agree — an override-blind row routes a user-reclassified sensitive
+        # app through the wrong transition (plain allow instead of the
+        # confirmation dialog) and dead-ends on the gate's refusal.
+        override_class = privacy_cfg.app_class_for(meta.bundle_id)
+        if override_class is not None:
+            ctx_class = override_class
+            classification_source = "user_config"
         is_matrix_exclude = all(
             get_matrix_action(ctx_class, m) == PrivacyAction.EXCLUDE
             for m in PrivacyMode
@@ -1886,7 +1899,7 @@ def apps(as_json, include_spotlight):
             "path": meta.path,
             "icon_path": "",  # populated by SwiftUI from .app/Contents/Resources/<icon>
             "context_class": ctx_class.value,
-            "classification_source": classification.source,
+            "classification_source": classification_source,
             "resolved_action": decision.action.value,
             # Accessor methods, not raw set membership — the config sets are
             # case-normalized (SCR-235) and mixed-case bundle IDs must match.
@@ -2951,8 +2964,8 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
     authoritative over the privacy matrix in every mode. Sensitive classes
     (excluded by the matrix in any mode) require ``--confirm-sensitive``;
     unclassified bundles are refused until classified via ``app_classes``.
-    ``allow_apps remove`` also drops the confirmation, so re-allowing a
-    sensitive app re-prompts.
+    ``confirmed_allow_apps add`` is gated identically. ``allow_apps remove``
+    also drops the confirmation, so re-allowing a sensitive app re-prompts.
     """
     import json as _json
 

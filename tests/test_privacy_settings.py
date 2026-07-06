@@ -414,6 +414,134 @@ class TestSettingsPrivacyApply:
 
         assert recorder.calls[0]["error"] == "confirmation_required:banking"
 
+    def test_gate_class_resolution_is_case_insensitive(self):
+        """Review fix: the gate resolves the effective class the way the
+        runtime does — case-insensitively. A case-variant stored override of
+        a sensitive class must still require the flag (not fall back to a
+        benign built-in class), and a lowercase-typed known browser must not
+        be refused as unclassified."""
+        import tomlkit
+
+        # (b) case-variant sensitive override still gates
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        tbl["app_classes"] = {"com.TinySpeck.SlackMacGap": "banking"}
+        recorder = _ResultRecorder()
+        with pytest.raises(SystemExit):
+            self._apply(
+                tbl,
+                field="allow_apps",
+                op="add",
+                value="com.tinyspeck.slackmacgap",
+                is_list=True,
+                is_scalar=False,
+                result=recorder,
+            )
+        assert recorder.calls[0]["error"] == "confirmation_required:banking"
+
+        # (a) lowercase-typed known browser resolves instead of refusing
+        tbl2 = tomlkit.table()
+        tbl2["mode"] = "internal"
+        changed, _ = self._apply(
+            tbl2,
+            field="allow_apps",
+            op="add",
+            value="com.google.chrome",
+            is_list=True,
+            is_scalar=False,
+        )
+        assert changed is True
+        assert "com.google.chrome" in list(tbl2["allow_apps"])
+
+    def test_readd_of_confirmed_entry_is_noop_without_flag(self):
+        """Review fix: idempotency — re-asserting an already-confirmed
+        sensitive entry without the flag is the documented no-op (exit 0),
+        not a confirmation_required error."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("com.1password.1password")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+        )
+        assert changed is False
+        assert recorder.calls[0]["changed"] is False
+        assert recorder.calls[0]["exit_code"] is None
+
+    def test_confirmed_allow_apps_add_is_gated(self):
+        """Review fix: the direct `confirmed_allow_apps add` verb goes
+        through the same confirmation gate — it must not be an in-product
+        bypass that silently promotes a legacy allow entry."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.1password.1password")
+        tbl["allow_apps"] = arr
+        recorder = _ResultRecorder()
+
+        with pytest.raises(SystemExit):
+            self._apply(
+                tbl,
+                field="confirmed_allow_apps",
+                op="add",
+                value="com.1password.1password",
+                is_list=True,
+                is_scalar=False,
+                result=recorder,
+            )
+        assert recorder.calls[0]["error"] == "confirmation_required:password_manager"
+        assert "confirmed_allow_apps" not in tbl or (
+            "com.1password.1password" not in tbl.get("confirmed_allow_apps", [])
+        )
+
+        # With the flag, the direct add succeeds.
+        changed, _ = self._apply(
+            tbl,
+            field="confirmed_allow_apps",
+            op="add",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+            confirm_sensitive=True,
+        )
+        assert changed is True
+        assert "com.1password.1password" in list(tbl["confirmed_allow_apps"])
+
+    def test_exclude_apps_remove_matches_case_variant_entry(self):
+        """Review fix: bundle-id list fields match case-insensitively at the
+        write seam — a hand-edited lowercase exclude entry (live at runtime)
+        must be removable with the OS-cased id."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.microsoft.vscode")
+        tbl["exclude_apps"] = arr
+
+        changed, _ = self._apply(
+            tbl,
+            field="exclude_apps",
+            op="remove",
+            value="com.microsoft.VSCode",
+            is_list=True,
+            is_scalar=False,
+        )
+        assert changed is True
+        assert list(tbl["exclude_apps"]) == []
+
     def test_list_add_already_present_is_idempotent_noop(self):
         """Adding a value already in the list returns ``changed=False`` and
         signals the no-op via ``_result(True, changed=False)`` — exit 0."""

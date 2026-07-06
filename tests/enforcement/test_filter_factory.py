@@ -18,6 +18,8 @@ Covers Unit 1 of the unified-export-callable refactor:
 
 from __future__ import annotations
 
+import pytest
+
 import json
 import re
 from unittest.mock import patch
@@ -28,6 +30,8 @@ from screencap.enforcement.window_filter import (
     build_privacy_filter,
 )
 from screencap.privacy.policy import ContextClass, PrivacyConfig, PrivacyMode
+
+pytestmark = pytest.mark.privacy
 
 
 def _public_config():

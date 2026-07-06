@@ -663,10 +663,14 @@ def _is_known_browser(classifier, bundle: str) -> bool:
     """
     if not bundle:
         return False
-    from screencap.privacy.classify import BROWSER_BUNDLE_IDS
-    from screencap.privacy.policy import ContextClass
+    from screencap.privacy.policy import BROWSER_BUNDLE_IDS_LOWER, ContextClass
 
-    if bundle in BROWSER_BUNDLE_IDS:
+    # Case-insensitive on both arms (SCR-235): the classifier's _app_classes
+    # keys are lowered, and DB bundle ids carry OS casing — a raw-case probe
+    # here silently skips the url-ambiguity guard (fail-open) for any
+    # user-tagged browser with an uppercase-containing bundle id.
+    bundle_lower = bundle.lower()
+    if bundle_lower in BROWSER_BUNDLE_IDS_LOWER:
         return True
     app_classes = getattr(classifier, "_app_classes", {}) or {}
-    return app_classes.get(bundle) == ContextClass.BROWSER_UNVERIFIED
+    return app_classes.get(bundle_lower) == ContextClass.BROWSER_UNVERIFIED

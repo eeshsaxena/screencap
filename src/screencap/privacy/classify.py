@@ -26,6 +26,7 @@ from screencap.privacy.actions import stricter
 from screencap.privacy.domain_loader import _is_tld_like
 from screencap.privacy.policy import (
     BROWSER_BUNDLE_IDS,  # noqa: F401 — re-export for existing importers
+    BROWSER_BUNDLE_IDS_LOWER,
     ContextClass,
     ContextResult,
     FrameMetadata,
@@ -350,7 +351,7 @@ class DefaultContextClassifier:
 
         # 3. Known browser (hardcoded set OR user-config tagged as browser_unverified)
         is_browser = bundle_id and (
-            bundle_id in BROWSER_BUNDLE_IDS
+            bundle_id.lower() in BROWSER_BUNDLE_IDS_LOWER
             or self._app_classes.get(bundle_id.lower()) == ContextClass.BROWSER_UNVERIFIED
         )
         if is_browser:

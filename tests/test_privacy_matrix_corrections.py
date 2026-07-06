@@ -128,16 +128,17 @@ def _eval_for(evaluator, bundle_id, title="Whatever", domain=None):
 
 
 class TestAllowAppsRespectsMatrixFloor:
-    """allow_apps observes the matrix-strictness floor at the configured mode.
+    """Legacy (unconfirmed) allow entries observe the matrix-strictness floor.
 
-    The CLI guard (privacy_settings._matrix_blocks_allow_for_class) rejects new
-    additions of bundles whose matrix action is EXCLUDE / MASK_WINDOW /
-    TEXT_REDACT. The runtime evaluator must apply the same floor so an
-    EXISTING entry (carried over from before the guard or from a prior
-    privacy mode) does not silently bypass the matrix.
+    Since SCR-235, new adds through the CLI/UI are *confirmed* (authoritative
+    over the matrix); the floor pinned here applies to entries that are in
+    allow_apps but NOT confirmed_allow_apps — pre-SCR-235 configs, wizard
+    silent auto-allows, and hand edits. Those must not silently bypass the
+    matrix.
 
-    Documented precedence at policy.py:389+:
-      exclude_apps > matrix-floor(allow_apps) > mask_domains > mask_title_patterns > matrix
+    Documented precedence (policy.py DefaultPolicyEvaluator):
+      exclude_apps > mask_domains/mask_title_patterns > confirmed allow
+      (browser carve-out) > legacy-allow floor > matrix
     """
 
     def test_allow_apps_respects_chat_mask_window_floor_under_internal(self):
@@ -410,6 +411,15 @@ class TestConfirmedBrowserCarveOut:
             evaluator, "com.apple.Safari", ContextClass.BROWSER_UNVERIFIED
         )
         assert decision.action == PrivacyAction.ALLOW
+
+    def test_carve_out_holds_for_case_variant_browser_bundle(self):
+        """Covers the R12 case-asymmetry regression: confirmed membership is
+        case-insensitive, so the browser test must be too — a lowercase-cased
+        Safari event must not skip the carve-out and leak ALLOW on a
+        banking page."""
+        evaluator = _confirmed("com.apple.safari", mode="public")
+        decision = _eval_direct(evaluator, "com.apple.safari", ContextClass.BANKING)
+        assert decision.action == PrivacyAction.EXCLUDE
 
     def test_carve_out_does_not_fire_for_non_browsers(self):
         """A confirmed password manager's own windows classify

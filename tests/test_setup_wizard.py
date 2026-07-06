@@ -387,6 +387,73 @@ class TestRunSetupWizard:
             assert "com.tinyspeck.slackmacgap" in allow
             assert "com.tinyspeck.slackmacgap" in confirmed
 
+    def test_rerun_allow_override_unblocks_sensitive_app_after_confirm(self, tmp_path):
+        """Review fix: on a re-run, an explicit allow toggle on a
+        previously-blocked sensitive app un-blocks it (the old guard
+        silently dropped the choice), gated by the post-review consequence
+        confirmation (R7)."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\nmode = "internal"\n'
+            'exclude_apps = ["com.1password.1password"]\n'
+        )
+        apps = [
+            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch(
+                 "screencap.setup_wizard._run_tui",
+                 return_value={"com.1password.1password": "allow"},
+             ), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2  # Local
+            mock_click.confirm.return_value = True  # accept the disclosure
+
+            assert run_setup_wizard(config_path=config_path) is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            privacy = doc["privacy"]
+            assert "com.1password.1password" not in list(privacy.get("exclude_apps", []))
+            assert "com.1password.1password" in list(privacy["allow_apps"])
+            assert "com.1password.1password" in list(privacy["confirmed_allow_apps"])
+            mock_click.confirm.assert_called()
+
+    def test_rerun_allow_override_declined_disclosure_stays_blocked(self, tmp_path):
+        """Declining the consequence confirmation keeps the sensitive app
+        blocked — confirmation is the condition for unblocking."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\nmode = "internal"\n'
+            'exclude_apps = ["com.1password.1password"]\n'
+        )
+        apps = [
+            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch(
+                 "screencap.setup_wizard._run_tui",
+                 return_value={"com.1password.1password": "allow"},
+             ), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2  # Local
+            mock_click.confirm.return_value = False  # decline the disclosure
+
+            assert run_setup_wizard(config_path=config_path) is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            privacy = doc["privacy"]
+            assert "com.1password.1password" in list(privacy.get("exclude_apps", []))
+            assert "com.1password.1password" not in list(privacy.get("allow_apps", []))
+            assert "com.1password.1password" not in list(
+                privacy.get("confirmed_allow_apps", [])
+            )
+
     def test_rerun_preselects_existing_destination(self, tmp_path):
         """Re-running setup with existing cloud config passes default=1 to prompt."""
         config_path = tmp_path / "config.toml"
