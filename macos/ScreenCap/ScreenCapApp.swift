@@ -13,6 +13,7 @@ struct ScreenCapApp: App {
     @StateObject private var permissions = PermissionController()
     @StateObject private var index = RecordingsIndex()
     @StateObject private var privacy = PrivacyController()
+    @StateObject private var intelligence = IntelligenceController()
     @StateObject private var uploads: UploadCoordinator
     @StateObject private var auth: CloudAuthController
 
@@ -56,6 +57,7 @@ struct ScreenCapApp: App {
                 .environmentObject(permissions)
                 .environmentObject(index)
                 .environmentObject(privacy)
+                .environmentObject(intelligence)
                 .environmentObject(auth)
                 .environmentObject(uploads)
                 .frame(minWidth: 880, minHeight: 560)
