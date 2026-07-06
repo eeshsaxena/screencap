@@ -4,6 +4,10 @@ build/
 dist/
 *.egg-info/
 
+# Cloud Run deploy: vendored copy of src/screencap/segmentation assembled into
+# the process-recording build context at deploy time (see that main.py docstring).
+scripts/process-recording/screencap/
+
 # Python
 __pycache__/
 src/screencap/__pycache__

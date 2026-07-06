@@ -260,129 +260,11 @@ class TestDeriveActivitySummary:
         assert result is None
 
 
-# ---------------------------------------------------------------------------
-# Tests: _validate_llm_tasks
-# ---------------------------------------------------------------------------
-
-class TestValidateLlmTasks:
-    def _make_result(self, tasks, summary=None):
-        return {
-            "tasks": tasks,
-            "summary": summary or {
-                "overview": "Test session.",
-                "primary_focus": "development",
-                "time_breakdown": {"development": 100},
-                "key_accomplishments": ["Did stuff"],
-            },
-        }
-
-    def test_valid_tasks(self):
-        from main import _validate_llm_tasks
-
-        result = self._make_result([
-            {
-                "start_time": "0:00:00", "end_time": "0:10:00",
-                "name": "Coding in VSCode", "description": "Wrote code.",
-                "category": "development", "apps_used": ["VSCode"],
-                "confidence": "high",
-            },
-            {
-                "start_time": "0:10:00", "end_time": "0:20:00",
-                "name": "Checking email", "description": "Read emails.",
-                "category": "communication", "apps_used": ["Chrome"],
-                "confidence": "medium",
-            },
-        ])
-
-        time_map = {"0:00:00": 1000.0, "0:10:00": 1600.0, "0:20:00": 2200.0}
-        validated = _validate_llm_tasks(result, 1000.0, 2200.0, time_map)
-
-        assert validated is not None
-        assert len(validated["tasks"]) == 2
-        assert validated["tasks"][0]["start_ts"] == 1000.0
-        assert validated["tasks"][0]["end_ts"] == 1600.0
-        assert validated["tasks"][0]["name"] == "Coding in VSCode"
-        assert validated["tasks"][0]["category"] == "development"
-        assert validated["tasks"][0]["derived_name"] == "coding-in-vscode"
-
-    def test_gap_allowed(self):
-        """Small gaps between tasks should pass validation."""
-        from main import _validate_llm_tasks
-
-        result = self._make_result([
-            {
-                "start_time": "0:00:00", "end_time": "0:10:00",
-                "name": "Task A", "description": "A",
-                "category": "development", "apps_used": [], "confidence": "high",
-            },
-            {
-                "start_time": "0:10:05", "end_time": "0:20:00",
-                "name": "Task B", "description": "B",
-                "category": "other", "apps_used": [], "confidence": "high",
-            },
-        ])
-
-        time_map = {}
-        validated = _validate_llm_tasks(result, 1000.0, 2200.0, time_map)
-        assert validated is not None
-
-    def test_overlap_rejected(self):
-        from main import _validate_llm_tasks
-
-        result = self._make_result([
-            {
-                "start_time": "0:00:00", "end_time": "0:12:00",
-                "name": "Task A", "description": "A",
-                "category": "development", "apps_used": [], "confidence": "high",
-            },
-            {
-                "start_time": "0:10:00", "end_time": "0:20:00",
-                "name": "Task B", "description": "B",
-                "category": "other", "apps_used": [], "confidence": "high",
-            },
-        ])
-
-        time_map = {}
-        validated = _validate_llm_tasks(result, 1000.0, 2200.0, time_map)
-        assert validated is None
-
-    def test_missing_field_rejected(self):
-        from main import _validate_llm_tasks
-
-        result = self._make_result([
-            {
-                "start_time": "0:00:00", "end_time": "0:10:00",
-                # Missing "name" field
-                "description": "A",
-                "category": "development", "apps_used": [], "confidence": "high",
-            },
-        ])
-
-        validated = _validate_llm_tasks(result, 1000.0, 1600.0, {})
-        assert validated is None
-
-    def test_empty_tasks_rejected(self):
-        from main import _validate_llm_tasks
-
-        result = self._make_result([])
-        validated = _validate_llm_tasks(result, 1000.0, 2000.0, {})
-        assert validated is None
-
-    def test_invalid_category_normalized(self):
-        from main import _validate_llm_tasks
-
-        result = self._make_result([
-            {
-                "start_time": "0:00:00", "end_time": "0:10:00",
-                "name": "Task", "description": "D",
-                "category": "INVALID_CATEGORY",
-                "apps_used": [], "confidence": "high",
-            },
-        ])
-
-        validated = _validate_llm_tasks(result, 1000.0, 1600.0, {})
-        assert validated is not None
-        assert validated["tasks"][0]["category"] == "other"
+# NOTE: _validate_llm_tasks moved to screencap.segmentation.validate (U1) and is
+# now imported by main as validate_llm_tasks. Its unit tests (timestamp
+# conversion, overlap/zero-duration rejection, schema-drift repair) live in
+# tests/segmentation/test_validate.py; the cloud-path characterization guard is
+# tests/segmentation/test_activity_summary.py.
 
 
 # ---------------------------------------------------------------------------
@@ -680,36 +562,8 @@ class TestCategoryPrefix:
         assert folders == ["dev_000_coding", "dev_001_coding-1"]
 
 
-# ---------------------------------------------------------------------------
-# Tests: _validate_tags
-# ---------------------------------------------------------------------------
-
-class TestValidateTags:
-    def test_valid_tags(self):
-        from main import _validate_tags
-        assert _validate_tags(["python", "debugging"]) == ["python", "debugging"]
-
-    def test_invalid_chars_filtered(self):
-        from main import _validate_tags
-        assert _validate_tags(["Python!", "good-tag"]) == ["good-tag"]
-
-    def test_dedup(self):
-        from main import _validate_tags
-        assert _validate_tags(["a", "a", "b"]) == ["a", "b"]
-
-    def test_max_cap(self):
-        from main import _validate_tags
-        tags = [f"tag-{i}" for i in range(12)]
-        result = _validate_tags(tags)
-        assert len(result) == 8
-
-    def test_empty(self):
-        from main import _validate_tags
-        assert _validate_tags([]) == []
-
-    def test_non_string_filtered(self):
-        from main import _validate_tags
-        assert _validate_tags([123, None, "valid"]) == ["valid"]
+# NOTE: _validate_tags moved to screencap.segmentation.validate (U1). Its tests
+# now live in tests/segmentation/test_validate.py.
 
 
 # ---------------------------------------------------------------------------
