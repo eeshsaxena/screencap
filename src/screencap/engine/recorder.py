@@ -432,7 +432,10 @@ def process_events(
         if event.type == "screen":
             # Mask sensitive background window regions (e.g. Slack visible
             # behind the active window) before the frame reaches any writer.
-            # The mask_frame method is a no-op when cloud_intent is False.
+            # mask_frame() runs for both local and cloud recordings; it masks
+            # at the user's configured mode for local and at PUBLIC for
+            # cloud-intent. It only masks windows classified EXCLUDE/MASK_WINDOW
+            # and is a no-op when geometry has no windows.
             if screen_filter is not None and hasattr(screen_filter, "mask_frame"):
                 screen_filter.mask_frame(
                     event.data, event.extra, recording.pixel_ratio,
