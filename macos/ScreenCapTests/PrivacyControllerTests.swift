@@ -184,6 +184,25 @@ final class PrivacyControllerTests: XCTestCase {
         ])
     }
 
+    // MARK: - confirmAllow (SCR-235)
+
+    /// The confirmed-allow write carries the `--confirm-sensitive` flag —
+    /// the argv contract the Python confirmation gate keys on — and only
+    /// fires AFTER the view's consequences dialog (the controller itself
+    /// never prompts).
+    func testConfirmAllowPassesConfirmFlagAndRefreshes() async {
+        let fake = FakeInvoker()
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.confirmAllow(bundleId: "com.1password.1password")
+
+        XCTAssertEqual(fake.calls, [
+            ["settings", "privacy", "allow_apps", "add", "com.1password.1password",
+             "--confirm-sensitive", "--json"],
+            ["apps", "--json"],
+        ])
+    }
+
     func testToggleExcludeRefreshesEvenOnWriteFailure() async {
         var firstWriteFailed = false
         let fake = FakeInvoker()

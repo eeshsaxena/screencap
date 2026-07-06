@@ -3,16 +3,19 @@ import Foundation
 /// U13 — pure mapping from an `apps --json` row to the App-rules segmented
 /// control: which of Record / Mask / Block is selected, which segments accept
 /// interaction, the mono note under the app name, and the CLI transition a tap
-/// issues. Resolution priority (inherited from the retired Privacy pane's
-/// `PrivacyBadgeStyle.derive`, now the single owner):
+/// issues. Resolution priority (SCR-235 — the matrix-immutable hard lock is
+/// retired; a confirmed allow is authoritative and sensitive classes unlock
+/// behind a one-time confirmation):
 ///
-///   1. `is_matrix_exclude` — always blocked; the whole row is locked.
-///   2. `in_exclude_apps`   — Block selected; Record un-blocks.
-///   3. `resolved_action == exclude` (defensive, hand-edited config).
-///   4. `in_allow_apps`     — Record selected by the user's own override.
-///   5. `resolved_action`   — matrix-resolved: mask → Mask selected-but-locked
+///   1. `in_exclude_apps`   — Block selected; Record un-blocks.
+///   2. `allow_confirmed`   — Record selected by the user's confirmed allow.
+///   3. `resolved_action == exclude` — Block selected (matrix default for
+///      sensitive classes at the current mode); Record either confirms
+///      (`confirmation_required`) or attempts the allow override.
+///   4. `resolved_action`   — matrix-resolved: mask → Mask selected-but-locked
 ///      (the per-app Mask *override* is SCR-225; the matrix mask itself is
-///      real), allow → Record.
+///      real), allow → Record. A legacy (unconfirmed) allow entry renders its
+///      real floor state here; Record re-confirms it.
 ///
 /// The Mask segment is never tappable in v1: it is either the matrix's own
 /// (true) state or a stub (KTD-8, SCR-225).
@@ -29,6 +32,10 @@ struct AppRuleSegmentPolicy: Equatable {
         case excludeAdd
         case excludeRemove
         case allowAdd
+        /// SCR-235: allow a confirmation-required app. The view shows the
+        /// consequences dialog first; on confirm the CLI runs with the
+        /// `--confirm-sensitive` flag.
+        case allowConfirm
     }
 
     /// The selected segment; nil renders no selection (the SCR-224 stub row).
@@ -36,6 +43,8 @@ struct AppRuleSegmentPolicy: Equatable {
     let recordEnabled: Bool
     let blockEnabled: Bool
     /// Tooltip explaining a fully-locked row; nil for writable rows.
+    /// SCR-235 retired the matrix-immutable lock, so this is nil for every
+    /// current row shape; kept for future locked states (e.g. SCR-224).
     let lockedReason: String?
     let note: String
 
@@ -46,15 +55,6 @@ struct AppRuleSegmentPolicy: Equatable {
     static func derive(for app: InstalledApp) -> AppRuleSegmentPolicy {
         let classLabel = contextClassLabel(app.contextClass)
 
-        if app.isMatrixExclude {
-            return AppRuleSegmentPolicy(
-                selection: .block,
-                recordEnabled: false,
-                blockEnabled: false,
-                lockedReason: "Blocked under every privacy mode for security. This can't be changed.",
-                note: joined("blocked by default", classLabel)
-            )
-        }
         if app.inExcludeApps {
             return AppRuleSegmentPolicy(
                 selection: .block,
@@ -64,27 +64,27 @@ struct AppRuleSegmentPolicy: Equatable {
                 note: "blocked by you"
             )
         }
-        if app.resolvedAction == "exclude" {
-            // Matrix-resolved EXCLUDE without the user's own exclude entry —
-            // only reachable via a hand-edited config (the CLI guard refuses
-            // the allow write that would produce it). Render honestly as
-            // blocked; Record attempts the allow override and surfaces the
-            // CLI's verdict.
-            return AppRuleSegmentPolicy(
-                selection: .block,
-                recordEnabled: true,
-                blockEnabled: true,
-                lockedReason: nil,
-                note: joined("blocked", classLabel)
-            )
-        }
-        if app.inAllowApps {
+        if app.allowConfirmed {
             return AppRuleSegmentPolicy(
                 selection: .record,
                 recordEnabled: true,
                 blockEnabled: true,
                 lockedReason: nil,
                 note: "recorded · allowed by you"
+            )
+        }
+        if app.resolvedAction == "exclude" {
+            // Matrix-resolved EXCLUDE without the user's own exclude entry —
+            // the sensitive-class default (SCR-235 made this a first-class,
+            // unlockable state; it was the hard-locked matrix-immutable row).
+            // Record confirms the allow (consequences dialog) when the class
+            // requires it, or attempts the plain allow override otherwise.
+            return AppRuleSegmentPolicy(
+                selection: .block,
+                recordEnabled: true,
+                blockEnabled: true,
+                lockedReason: nil,
+                note: joined("blocked by default", classLabel)
             )
         }
         switch app.resolvedAction {
@@ -112,15 +112,14 @@ struct AppRuleSegmentPolicy: Equatable {
                 recordEnabled: true,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: "recorded"
+                note: app.inAllowApps ? "recorded · allowed by you" : "recorded"
             )
         }
     }
 
     /// The CLI transition for tapping `segment` on `app`; nil is a no-op
-    /// (already selected, locked row, or the never-writable Mask segment).
+    /// (already selected or the never-writable Mask segment).
     static func transition(for app: InstalledApp, tapping segment: Segment) -> Transition? {
-        guard !app.isMatrixExclude else { return nil }
         switch segment {
         case .mask:
             return nil
@@ -130,20 +129,30 @@ struct AppRuleSegmentPolicy: Equatable {
         case .record:
             if app.inExcludeApps { return .excludeRemove }
             let current = derive(for: app)
-            switch current.selection {
-            case .record:
-                return nil
-            case .block:
-                // Defensive resolved-exclude state: attempt the allow override;
-                // the CLI's matrix guard is the authority and its refusal
-                // surfaces as the row's error.
-                return .allowAdd
-            case .mask:
-                return .allowAdd
-            case nil:
-                return nil
+            if current.selection == .record { return nil }
+            // Unlocking a confirmation-required class goes through the
+            // consequences dialog (SCR-235); everything else is a plain
+            // allow write (which the CLI records as confirmed, and which
+            // re-confirms a legacy entry).
+            if app.confirmationRequired && !app.allowConfirmed {
+                return .allowConfirm
             }
+            return .allowAdd
         }
+    }
+
+    /// The consequences message for the SCR-235 confirmation dialog. Names
+    /// the full cascade (R7): raw capture, keystrokes, the search index
+    /// (including already-recorded frames once indexing re-runs), and cloud
+    /// copies — phrased conditionally, since the destination is often decided
+    /// per recording.
+    static func confirmationMessage(for app: InstalledApp) -> String {
+        let label = contextClassLabel(app.contextClass).map { " (\($0))" } ?? ""
+        return "“\(app.displayName)”\(label) will be fully recordable in every "
+            + "privacy mode: screen and video captured raw, typed text kept, and "
+            + "its content searchable — including frames from past recordings "
+            + "once the search index re-runs. If a recording is sent to the "
+            + "cloud, this app is included. You can block it again at any time."
     }
 
     /// Human label for a `context_class` value (nil for `unknown`, so the note

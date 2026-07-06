@@ -1,13 +1,15 @@
-"""Tests for Unit 7a: privacy matrix correction.
+"""Tests for the privacy matrix and allow-list precedence.
 
-CHAT/EMAIL/CALENDAR/VIDEO_CALL under PrivacyMode.INTERNAL changed from
-TEXT_REDACT to MASK_WINDOW so the friend-onboarding default actually
-prevents conversation-window contents from being captured (rather than
-relying on post-capture text scrubbing).
+Unit 7a pinned the matrix entries (CHAT/EMAIL/CALENDAR/VIDEO_CALL under
+PrivacyMode.INTERNAL → MASK_WINDOW) and the matrix-strictness floor for
+allow_apps entries.
 
-These tests pin the new matrix entries plus the precedence interactions
-(allow_apps × MASK_WINDOW, EXCLUDE-class invariants) so a future regression
-that quietly reverts the entries fails loudly.
+SCR-235 makes a *confirmed* allow-list entry authoritative over the matrix
+in every mode: the floor now applies only to legacy (unconfirmed) entries,
+user domain/title mask rules outrank any allow, and a confirmed browser's
+windows refined to a confirmation-required context keep the matrix action.
+These tests pin the matrix entries, the legacy floor, and the new
+confirmed-allow precedence so regressions in either direction fail loudly.
 """
 
 from __future__ import annotations
@@ -16,11 +18,16 @@ import pytest
 
 from screencap.privacy.actions import PrivacyAction
 from screencap.privacy.policy import (
+    CONFIRMATION_REQUIRED_CLASSES,
     ContextClass,
+    ContextResult,
+    FrameMetadata,
     PrivacyConfig,
     PrivacyMode,
     get_matrix_action,
 )
+
+pytestmark = pytest.mark.privacy
 
 
 # ---------------------------------------------------------------------------
@@ -83,14 +90,29 @@ def test_unknown_internal_still_allow():
 # ---------------------------------------------------------------------------
 
 
-def _evaluator(*, mode="internal", allow_apps=(), exclude_apps=()):
+def _evaluator(
+    *,
+    mode="internal",
+    allow_apps=(),
+    exclude_apps=(),
+    confirmed_allow_apps=(),
+    mask_domains=(),
+    mask_title_patterns=(),
+    app_classes=None,
+):
     """Build a DefaultPolicyEvaluator with a minimal config."""
+    import re
+
     from screencap.privacy.policy import DefaultPolicyEvaluator
 
     cfg = PrivacyConfig(
         mode=PrivacyMode(mode),
         allow_apps=frozenset(allow_apps),
         exclude_apps=frozenset(exclude_apps),
+        confirmed_allow_apps=frozenset(confirmed_allow_apps),
+        mask_domains=frozenset(mask_domains),
+        mask_title_patterns=tuple(re.compile(p) for p in mask_title_patterns),
+        app_classes=dict(app_classes or {}),
     )
     return DefaultPolicyEvaluator(cfg)
 
@@ -106,16 +128,17 @@ def _eval_for(evaluator, bundle_id, title="Whatever", domain=None):
 
 
 class TestAllowAppsRespectsMatrixFloor:
-    """allow_apps observes the matrix-strictness floor at the configured mode.
+    """Legacy (unconfirmed) allow entries observe the matrix-strictness floor.
 
-    The CLI guard (privacy_settings._matrix_blocks_allow_for_class) rejects new
-    additions of bundles whose matrix action is EXCLUDE / MASK_WINDOW /
-    TEXT_REDACT. The runtime evaluator must apply the same floor so an
-    EXISTING entry (carried over from before the guard or from a prior
-    privacy mode) does not silently bypass the matrix.
+    Since SCR-235, new adds through the CLI/UI are *confirmed* (authoritative
+    over the matrix); the floor pinned here applies to entries that are in
+    allow_apps but NOT confirmed_allow_apps — pre-SCR-235 configs, wizard
+    silent auto-allows, and hand edits. Those must not silently bypass the
+    matrix.
 
-    Documented precedence at policy.py:389+:
-      exclude_apps > matrix-floor(allow_apps) > mask_domains > mask_title_patterns > matrix
+    Documented precedence (policy.py DefaultPolicyEvaluator):
+      exclude_apps > mask_domains/mask_title_patterns > confirmed allow
+      (browser carve-out) > legacy-allow floor > matrix
     """
 
     def test_allow_apps_respects_chat_mask_window_floor_under_internal(self):
@@ -244,3 +267,214 @@ class TestAllowAppsStrictnessFloor:
         )
         decision = _eval_for(evaluator, "com.1password.1password")
         assert decision.action == PrivacyAction.EXCLUDE
+
+
+# ---------------------------------------------------------------------------
+# SCR-235: confirmed allow-list entries are authoritative over the matrix
+# ---------------------------------------------------------------------------
+
+
+def _confirmed(bundle_id, **kwargs):
+    """Evaluator where bundle_id is a confirmed allow entry."""
+    return _evaluator(
+        allow_apps=[bundle_id],
+        confirmed_allow_apps=[bundle_id],
+        **kwargs,
+    )
+
+
+def _eval_direct(evaluator, bundle_id, context_class, title="Whatever", domain=None):
+    """Evaluate with an explicit (pre-refined) context, bypassing the classifier."""
+    metadata = FrameMetadata(bundle_id=bundle_id, window_title=title, domain=domain)
+    context = ContextResult(context_class=context_class, confidence="test", evidence="test")
+    return evaluator.evaluate(context, metadata)
+
+
+class TestConfirmedAllowIsAuthoritative:
+    """A confirmed allow beats every matrix action in every mode (R1)."""
+
+    @pytest.mark.parametrize("mode", ["internal", "public"])
+    def test_confirmed_chat_allows_in_every_mode(self, mode):
+        evaluator = _confirmed("com.tinyspeck.slackmacgap", mode=mode)
+        decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap")
+        assert decision.action == PrivacyAction.ALLOW
+
+    @pytest.mark.parametrize("mode", ["internal", "public"])
+    def test_confirmed_email_allows_in_every_mode(self, mode):
+        """Covers AE1 (policy half): confirmed Mail under public → ALLOW."""
+        evaluator = _confirmed("com.apple.mail", mode=mode)
+        decision = _eval_for(evaluator, "com.apple.mail")
+        assert decision.action == PrivacyAction.ALLOW
+
+    @pytest.mark.parametrize("mode", ["internal", "public"])
+    def test_confirmed_password_manager_allows(self, mode):
+        """Covers AE2 (policy half): a confirmed EXCLUDE-class app is ALLOW."""
+        evaluator = _confirmed("com.1password.1password", mode=mode)
+        decision = _eval_for(evaluator, "com.1password.1password")
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_confirmed_admin_console_allows_under_public(self):
+        """TEXT_REDACT-class contexts are overridable too."""
+        evaluator = _confirmed("com.electron.dockerdesktop", mode="public")
+        decision = _eval_for(evaluator, "com.electron.dockerdesktop")
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_exclude_beats_confirmed_allow(self):
+        """Covers AE6: explicit deny wins over a confirmed allow (R3)."""
+        evaluator = _evaluator(
+            allow_apps=["com.tinyspeck.slackmacgap"],
+            confirmed_allow_apps=["com.tinyspeck.slackmacgap"],
+            exclude_apps=["com.tinyspeck.slackmacgap"],
+        )
+        decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap")
+        assert decision.action == PrivacyAction.EXCLUDE
+
+    def test_orphaned_confirmed_entry_is_inert(self):
+        """A confirmed entry not present in allow_apps behaves as unlisted (KTD1)."""
+        evaluator = _evaluator(
+            mode="internal",
+            confirmed_allow_apps=["com.tinyspeck.slackmacgap"],
+        )
+        decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap")
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+    def test_case_variant_membership_still_authoritative(self):
+        """Covers KTD7: casing differences between the two lists don't drop authority."""
+        evaluator = _evaluator(
+            mode="public",
+            allow_apps=["com.apple.mail"],
+            confirmed_allow_apps=["COM.APPLE.MAIL"],
+        )
+        decision = _eval_for(evaluator, "com.apple.mail")
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_case_variant_probe_still_authoritative(self):
+        """OS-reported casing differences don't drop authority either."""
+        evaluator = _confirmed("com.apple.mail", mode="public")
+        decision = _eval_for(evaluator, "com.Apple.Mail")
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_legacy_entry_still_floor_bound(self):
+        """Covers AE4: an allow entry without confirmation keeps the floor (R5)."""
+        evaluator = _evaluator(
+            mode="internal",
+            allow_apps=["com.tinyspeck.slackmacgap"],
+        )
+        decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap")
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+
+class TestConfirmedBrowserCarveOut:
+    """R12: a confirmed browser's windows refined to a confirmation-required
+    context keep the matrix action; other refinements follow the allow."""
+
+    def test_stock_browser_refined_to_banking_public(self):
+        """Covers AE7: stock browser (BROWSER_BUNDLE_IDS, no app_classes entry)."""
+        evaluator = _confirmed("com.apple.Safari", mode="public")
+        decision = _eval_direct(evaluator, "com.apple.Safari", ContextClass.BANKING)
+        assert decision.action == PrivacyAction.EXCLUDE
+
+    def test_stock_browser_refined_to_banking_internal(self):
+        """Covers AE7: matrix action for the current mode (MASK_WINDOW at internal)."""
+        evaluator = _confirmed("com.apple.Safari", mode="internal")
+        decision = _eval_direct(evaluator, "com.apple.Safari", ContextClass.BANKING)
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+    def test_stock_browser_refined_to_auth_flow_public(self):
+        evaluator = _confirmed("com.apple.Safari", mode="public")
+        decision = _eval_direct(evaluator, "com.apple.Safari", ContextClass.AUTH_FLOW)
+        assert decision.action == PrivacyAction.EXCLUDE
+
+    def test_tagged_browser_refined_to_banking_public(self):
+        """The carve-out also fires for app_classes-tagged browsers."""
+        evaluator = _evaluator(
+            mode="public",
+            allow_apps=["com.example.custombrowser"],
+            confirmed_allow_apps=["com.example.custombrowser"],
+            app_classes={"com.example.custombrowser": ContextClass.BROWSER_UNVERIFIED},
+        )
+        decision = _eval_direct(
+            evaluator, "com.example.custombrowser", ContextClass.BANKING
+        )
+        assert decision.action == PrivacyAction.EXCLUDE
+
+    def test_confirmed_browser_refined_to_email_allows(self):
+        """Mask-class refinements (webmail) follow the confirmed allow."""
+        evaluator = _confirmed("com.apple.Safari", mode="public")
+        decision = _eval_direct(evaluator, "com.apple.Safari", ContextClass.EMAIL)
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_confirmed_browser_benign_page_allows(self):
+        """Unrefined browser context (no rule match) → ALLOW."""
+        evaluator = _confirmed("com.apple.Safari", mode="public")
+        decision = _eval_direct(
+            evaluator, "com.apple.Safari", ContextClass.BROWSER_UNVERIFIED
+        )
+        assert decision.action == PrivacyAction.ALLOW
+
+    def test_carve_out_holds_for_case_variant_browser_bundle(self):
+        """Covers the R12 case-asymmetry regression: confirmed membership is
+        case-insensitive, so the browser test must be too — a lowercase-cased
+        Safari event must not skip the carve-out and leak ALLOW on a
+        banking page."""
+        evaluator = _confirmed("com.apple.safari", mode="public")
+        decision = _eval_direct(evaluator, "com.apple.safari", ContextClass.BANKING)
+        assert decision.action == PrivacyAction.EXCLUDE
+
+    def test_carve_out_does_not_fire_for_non_browsers(self):
+        """A confirmed password manager's own windows classify
+        PASSWORD_MANAGER — the carve-out must not re-exclude them (R1)."""
+        evaluator = _confirmed("com.1password.1password", mode="public")
+        decision = _eval_direct(
+            evaluator, "com.1password.1password", ContextClass.PASSWORD_MANAGER
+        )
+        assert decision.action == PrivacyAction.ALLOW
+
+
+class TestMaskRulesPrecedeAllows:
+    """User domain/title mask rules outrank any allow (R4), including legacy
+    entries (the owned R5 tightening)."""
+
+    def test_mask_domain_masks_inside_confirmed_browser(self):
+        """Covers AE5: a mask_domains rule still masks in a confirmed browser."""
+        evaluator = _confirmed("com.apple.Safari", mode="internal", mask_domains=["mybank.com"])
+        decision = _eval_direct(
+            evaluator,
+            "com.apple.Safari",
+            ContextClass.BROWSER_UNVERIFIED,
+            domain="mybank.com",
+        )
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+    def test_mask_title_masks_inside_confirmed_app(self):
+        """R4 for non-browser apps: title rules apply inside a confirmed app."""
+        evaluator = _confirmed(
+            "com.tinyspeck.slackmacgap", mode="internal", mask_title_patterns=[r"(?i)payroll"]
+        )
+        decision = _eval_for(evaluator, "com.tinyspeck.slackmacgap", title="Payroll review")
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+    def test_mask_title_masks_legacy_allow_in_non_blocking_context(self):
+        """The owned R5 delta: a legacy allow that returns ALLOW today
+        (BROWSER_UNVERIFIED at internal) now yields to a matching mask rule."""
+        evaluator = _evaluator(
+            mode="internal",
+            allow_apps=["com.openai.chat"],
+            mask_title_patterns=[r"(?i)secret"],
+        )
+        decision = _eval_for(evaluator, "com.openai.chat", title="secret roadmap")
+        assert decision.action == PrivacyAction.MASK_WINDOW
+
+
+class TestConfirmationRequiredClasses:
+    """KTD2: the confirmation-required set derives from the matrix."""
+
+    def test_set_is_exactly_the_exclude_anywhere_classes(self):
+        assert CONFIRMATION_REQUIRED_CLASSES == frozenset(
+            {
+                ContextClass.PASSWORD_MANAGER,
+                ContextClass.BANKING,
+                ContextClass.AUTH_FLOW,
+                ContextClass.PAYMENT_FLOW,
+            }
+        )

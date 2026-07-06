@@ -15,6 +15,7 @@ from pathlib import Path
 import click
 import tomlkit
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from screencap.app_discovery import (
@@ -25,12 +26,19 @@ from screencap.app_discovery import (
 )
 from screencap.config import save_config_atomic
 from screencap.privacy.classify import BUNDLE_ID_MAP
-from screencap.privacy.policy import ContextClass, PrivacyMode
+from screencap.privacy.policy import (
+    CONFIRMATION_REQUIRED_CLASSES,
+    ContextClass,
+    PrivacyMode,
+)
 
 console = Console()
 
-# ContextClasses that map to "blocked" (never captured)
-_BLOCKED_CLASSES = frozenset({ContextClass.PASSWORD_MANAGER, ContextClass.BANKING})
+# ContextClasses that map to "blocked" (never silently allowed): the
+# matrix-derived confirmation-required set (SCR-235) — password manager,
+# banking, auth flow, payment flow. One definition shared with the CLI
+# gate and the `apps` payload so the surfaces cannot drift.
+_BLOCKED_CLASSES = CONFIRMATION_REQUIRED_CLASSES
 
 # ContextClasses that are communication-related (masked in public mode)
 _COMM_CLASSES = frozenset({
@@ -142,13 +150,18 @@ def _group_apps(
     auto_allowed: list[tuple[AppMetadata, ContextClass, str]] = []
 
     for _bid, (meta, cls, source) in classified.items():
+        # Confirmation-required classes are never silently auto-allowed
+        # (SCR-235): the class gate runs BEFORE the background/safe-source
+        # short-circuit, so a sensitive app always surfaces for review.
+        if cls in _BLOCKED_CLASSES:
+            groups["blocked"].append((meta, cls, source))
+            continue
+
         if is_background_app(meta) or (not force_review and source in _SAFE_SOURCES):
             auto_allowed.append((meta, cls, source))
             continue
 
-        if cls in _BLOCKED_CLASSES:
-            groups["blocked"].append((meta, cls, source))
-        elif cls in _COMM_CLASSES:
+        if cls in _COMM_CLASSES:
             groups["communication"].append((meta, cls, source))
         elif cls in _CODE_CLASSES:
             groups["safe"].append((meta, cls, source))
@@ -188,6 +201,7 @@ def _build_save_doc(
     allow_apps: list[str],
     app_classes: dict[str, str],
     upload_default: str = "ask",
+    confirmed_allow_apps: list[str] | None = None,
 ) -> tomlkit.TOMLDocument:
     """Update the TOML document with privacy settings."""
     # Ensure [privacy] section exists
@@ -207,6 +221,11 @@ def _build_save_doc(
         privacy["allow_apps"] = allow_apps
     elif "allow_apps" in privacy:
         del privacy["allow_apps"]
+
+    if confirmed_allow_apps:
+        privacy["confirmed_allow_apps"] = confirmed_allow_apps
+    elif confirmed_allow_apps is not None and "confirmed_allow_apps" in privacy:
+        del privacy["confirmed_allow_apps"]
 
     if app_classes:
         ac_table = tomlkit.table()
@@ -561,6 +580,7 @@ def run_setup_wizard(
     existing_mode_str = existing_privacy.get("mode", "internal") if isinstance(existing_privacy, dict) else "internal"
     existing_exclude = frozenset(existing_privacy.get("exclude_apps", [])) if isinstance(existing_privacy, dict) else frozenset()
     existing_allow = frozenset(existing_privacy.get("allow_apps", [])) if isinstance(existing_privacy, dict) else frozenset()
+    existing_confirmed = frozenset(existing_privacy.get("confirmed_allow_apps", [])) if isinstance(existing_privacy, dict) else frozenset()
     existing_ac = {}
     if isinstance(existing_privacy, dict):
         raw_ac = existing_privacy.get("app_classes", {})
@@ -683,17 +703,21 @@ def run_setup_wizard(
     # Build final config from groups + overrides
     final_exclude: list[str] = sorted(existing_exclude)
     final_allow: list[str] = sorted(existing_allow)
+    final_confirmed: list[str] = sorted(existing_confirmed)
     final_app_classes: dict[str, str] = dict(
         (bid, cls.value) for bid, cls in existing_ac.items()
     )
 
-    # Auto-allowed apps (background + safe) -> allow_apps
+    # Auto-allowed apps (background + safe) -> allow_apps ONLY (legacy,
+    # unconfirmed semantics — SCR-235): the user never saw these apps named,
+    # so they must not gain confirmed authority over the matrix.
     for meta, cls, source in auto_allowed:
         bid = meta.bundle_id
         if bid not in final_allow and bid not in final_exclude:
             final_allow.append(bid)
 
     # Process visible groups, applying user overrides
+    pending_sensitive: list[tuple[str, str, ContextClass]] = []
     for group_key in ("blocked", "communication", "safe", "unclassified"):
         for meta, cls, source in groups.get(group_key, []):
             bid = meta.bundle_id
@@ -707,8 +731,27 @@ def run_setup_wizard(
                     if bid in final_allow:
                         final_allow.remove(bid)
                 else:  # "allow"
-                    if bid not in final_allow and bid not in final_exclude:
+                    # Symmetric with the block branch: an explicit allow
+                    # un-blocks. On a wizard re-run the app may sit in
+                    # existing exclude_apps from the first run's defaults —
+                    # the toggle must not silently no-op against it.
+                    for stale in [
+                        e for e in final_exclude if e.lower() == bid.lower()
+                    ]:
+                        final_exclude.remove(stale)
+                    if cls in _BLOCKED_CLASSES:
+                        # Confirmation-required classes need the R7
+                        # consequence disclosure, which the TUI toggle does
+                        # not show — defer to the post-review confirmation
+                        # prompt below instead of confirming silently.
+                        pending_sensitive.append((bid, meta.display_name, cls))
+                        continue
+                    if bid not in final_allow:
                         final_allow.append(bid)
+                    # An explicit per-app choice in the visible review flow
+                    # is a confirmed allow (SCR-235).
+                    if bid not in final_confirmed:
+                        final_confirmed.append(bid)
                 continue
 
             # No override — use group default
@@ -732,11 +775,41 @@ def run_setup_wizard(
                 if bid not in final_allow and bid not in final_exclude:
                     final_allow.append(bid)
 
+    # Confirmation-required apps the user toggled to allow get the same
+    # consequence disclosure the CLI (--confirm-sensitive) and app-picker
+    # dialog show (R7) before gaining confirmed authority. Declining keeps
+    # the app blocked — confirmation is the condition for unblocking a
+    # sensitive app.
+    for bid, display_name, cls in pending_sensitive:
+        console.print(
+            f"\n  [bold]{escape(display_name)}[/bold] is in {cls.value}, a class the "
+            f"privacy matrix excludes in at least one mode. Allowing it makes it "
+            f"fully recordable in every mode: raw capture, keystrokes, the local "
+            f"search index (including past recordings once indexing re-runs), and "
+            f"cloud copies when a recording is cloud-destined."
+        )
+        if click.confirm(f"  Allow and record {display_name}?", default=False):
+            if bid not in final_allow:
+                final_allow.append(bid)
+            if bid not in final_confirmed:
+                final_confirmed.append(bid)
+        else:
+            if bid not in final_exclude:
+                final_exclude.append(bid)
+            console.print(f"  [dim]{escape(display_name)} stays blocked.[/dim]")
+
     final_exclude.sort()
     final_allow.sort()
+    # Confirmed entries are authoritative only alongside a live allow entry
+    # (KTD1): prune anything whose allow was removed above, case-insensitively.
+    allow_lower = {b.lower() for b in final_allow}
+    final_confirmed = sorted(b for b in final_confirmed if b.lower() in allow_lower)
 
     # Save
-    doc = _build_save_doc(doc, mode, final_exclude, final_allow, final_app_classes, upload_default)
+    doc = _build_save_doc(
+        doc, mode, final_exclude, final_allow, final_app_classes, upload_default,
+        confirmed_allow_apps=final_confirmed,
+    )
     _save_config_atomic(config_path, doc)
 
     # Invalidate cache

@@ -18,6 +18,8 @@ Covers Unit 1 of the unified-export-callable refactor:
 
 from __future__ import annotations
 
+import pytest
+
 import json
 import re
 from unittest.mock import patch
@@ -28,6 +30,8 @@ from screencap.enforcement.window_filter import (
     build_privacy_filter,
 )
 from screencap.privacy.policy import ContextClass, PrivacyConfig, PrivacyMode
+
+pytestmark = pytest.mark.privacy
 
 
 def _public_config():
@@ -718,3 +722,87 @@ class TestCloudIntentSkipsAllowApps:
         assert result is not None
         assert result.window_title == slack_event.app_name
         assert result.domain is None
+
+
+# ---------------------------------------------------------------------------
+# SCR-235 KTD5: cloud posture honors confirmed allow entries only
+# ---------------------------------------------------------------------------
+
+
+class TestCloudConfirmedAllowShaping:
+    def _config(self, **kwargs):
+        return patch(
+            "screencap.config.get_privacy_config",
+            return_value=PrivacyConfig(mode=PrivacyMode.INTERNAL, **kwargs),
+        )
+
+    def test_confirmed_app_passes_cloud_filter_unmasked(self, tmp_path):
+        """Covers AE1 (cloud half): a confirmed chat app's window title
+        survives into cloud-bound events — the confirmed allow beats the
+        forced-PUBLIC matrix."""
+        with self._config(
+            allow_apps=frozenset({"com.tinyspeck.slackmacgap"}),
+            confirmed_allow_apps=frozenset({"com.tinyspeck.slackmacgap"}),
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True, privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "#secret-channel — Slack"
+
+    def test_legacy_allow_still_masked_for_cloud(self, tmp_path):
+        """A legacy (unconfirmed) allow entry is dropped from cloud posture
+        exactly as before: the matrix masks the title."""
+        with self._config(
+            allow_apps=frozenset({"com.tinyspeck.slackmacgap"}),
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True, privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.tinyspeck.slackmacgap",
+            app_name="Slack",
+            window_title="#secret-channel — Slack",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "Slack"
+        assert result.domain is None
+
+    def test_confirmed_password_manager_passes_cloud_filter(self, tmp_path):
+        """R1 holds in the forced-PUBLIC cloud path: a confirmed
+        EXCLUDE-class app's events are kept, not dropped."""
+        with self._config(
+            allow_apps=frozenset({"com.1password.1password"}),
+            confirmed_allow_apps=frozenset({"com.1password.1password"}),
+        ):
+            pf = build_cloud_window_filter(
+                cloud_bound=True, privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.1password.1password",
+            app_name="1Password",
+            window_title="Vault — 1Password",
+        )
+        result = pf(event)
+        assert result is not None
+        assert result.window_title == "Vault — 1Password"
+
+    def test_unlisted_sensitive_app_still_excluded_for_cloud(self, tmp_path):
+        """Covers AE3 (cloud half): unlisted 1Password stays excluded."""
+        with self._config():
+            pf = build_cloud_window_filter(
+                cloud_bound=True, privacy_mode="internal", capture_dir=tmp_path,
+            )
+        event = _make_event(
+            bundle_id="com.1password.1password",
+            app_name="1Password",
+            window_title="Vault — 1Password",
+        )
+        assert pf(event) is None

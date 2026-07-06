@@ -132,6 +132,18 @@ final class PrivacyController: ObservableObject {
         await toggleMembership(key: "allow_apps", bundleId: bundleId, add: allowed)
     }
 
+    /// Allow a confirmation-required app (SCR-235). The view has already
+    /// shown the consequences dialog; this issues the allow write with the
+    /// `--confirm-sensitive` flag. On failure the shared refresh snaps the
+    /// row back to its unconfirmed state and the error banner surfaces —
+    /// the user re-taps Record to retry (no silent retry).
+    func confirmAllow(bundleId: String) async {
+        await toggleMembership(
+            key: "allow_apps", bundleId: bundleId, add: true,
+            extraArgs: ["--confirm-sensitive"]
+        )
+    }
+
     /// Shared body for the privacy-list writers. Idempotent at the CLI layer —
     /// `add` of an already-present value is a no-op exit 0, ditto for `remove`
     /// of an absent value. The per-bundle in-flight guard means a rapid
@@ -140,14 +152,18 @@ final class PrivacyController: ObservableObject {
     /// success ensures the membership flags reflect the write; failure reseeds
     /// the caller's optimistic toggle from disk so the user never sees a
     /// position that contradicts the configured state.
-    private func toggleMembership(key: String, bundleId: String, add: Bool) async {
+    private func toggleMembership(
+        key: String, bundleId: String, add: Bool, extraArgs: [String] = []
+    ) async {
         guard !pendingToggles.contains(bundleId) else { return }
         pendingToggles.insert(bundleId)
         defer { pendingToggles.remove(bundleId) }
 
         let op = add ? "add" : "remove"
         do {
-            _ = try await invoke(["settings", "privacy", key, op, bundleId, "--json"])
+            _ = try await invoke(
+                ["settings", "privacy", key, op, bundleId] + extraArgs + ["--json"]
+            )
             lastError = nil
         } catch {
             lastError = error.localizedDescription

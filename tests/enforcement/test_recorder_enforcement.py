@@ -14,6 +14,8 @@ from screencap.enforcement.recorder_enforcement import (
     RecorderPrivacyFilter,
 )
 
+pytestmark = pytest.mark.privacy
+
 
 def _make_config(**kwargs) -> PrivacyConfig:
     """Build a PrivacyConfig with sensible test defaults."""
@@ -987,3 +989,85 @@ class TestMaskFrame:
         pixel = img.getpixel((50, 50))
         assert pixel == (255, 255, 255)
         img.close()
+
+
+class TestConfirmedAllowCascade:
+    """SCR-235: a confirmed allow cascades at capture time (R9) — keystrokes
+    and video kept — while legacy entries keep the floor, and the
+    PUBLIC-forced masking evaluator honors only confirmed entries (KTD5)."""
+
+    def test_confirmed_chat_app_keeps_keystrokes_and_video_in_public(self):
+        """Covers AE1 (capture half): confirmed Slack under public is fully
+        recordable — screen, video, and keystroke content all pass."""
+        config = _make_config(
+            allow_apps=frozenset({"com.tinyspeck.slackmacgap"}),
+            confirmed_allow_apps=frozenset({"com.tinyspeck.slackmacgap"}),
+        )
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
+        f.on_window_event({
+            "app_bundle_id": "com.tinyspeck.slackmacgap",
+            "title": "#general — Slack",
+        })
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True
+        assert disp.video_allowed is True
+        assert disp.keystrokes_allowed is True
+
+    def test_legacy_chat_allow_keeps_floor_in_public(self):
+        """A legacy (unconfirmed) allow entry keeps today's MASK_WINDOW floor:
+        screenshots pass for scrub-time masking, video/keystrokes blocked."""
+        config = _make_config(
+            allow_apps=frozenset({"com.tinyspeck.slackmacgap"}),
+        )
+        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
+        f.on_window_event({
+            "app_bundle_id": "com.tinyspeck.slackmacgap",
+            "title": "#general — Slack",
+        })
+        disp = f.get_capture_disposition()
+        assert disp.screen_allowed is True
+        assert disp.video_allowed is False
+        assert disp.keystrokes_allowed is False
+
+    def test_cloud_masking_evaluator_restricted_to_confirmed(self):
+        """For cloud-intent recordings the lazily-built masking evaluator
+        forces PUBLIC and keeps only confirmed allow entries (KTD5) —
+        agreeing with the cloud window filter instead of reusing the full
+        live allow set."""
+        from screencap.privacy.policy import PrivacyMode as _PM
+
+        config = _make_config(
+            mode=_PM.INTERNAL,
+            allow_apps=frozenset({"com.legacy.app", "com.confirmed.app"}),
+            confirmed_allow_apps=frozenset({"com.confirmed.app"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+        # Trigger the lazy build. image=None makes region computation fail
+        # AFTER the evaluator is constructed; mask_frame swallows the error.
+        f.mask_frame(None, {"windows": [{}], "display_bounds": (0, 0, 0, 0)}, 2.0)
+        ev = f._masking_evaluator
+        assert ev.config.mode is _PM.PUBLIC
+        assert ev.config.allow_apps == frozenset({"com.confirmed.app"})
+        assert ev.config.is_confirmed_allowed_app("com.confirmed.app") is True
+
+    def test_local_masking_evaluator_reuses_live_policy(self):
+        """Local recordings mask via the live evaluator (configured mode,
+        full allow set) — confirmed vs legacy entries resolve exactly as the
+        runtime policy does, with no cloud shaping."""
+        from screencap.privacy.policy import PrivacyMode as _PM
+
+        config = _make_config(
+            mode=_PM.INTERNAL,
+            allow_apps=frozenset({"com.legacy.app", "com.confirmed.app"}),
+            confirmed_allow_apps=frozenset({"com.confirmed.app"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=False, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+        f.mask_frame(None, {"windows": [{}], "display_bounds": (0, 0, 0, 0)}, 2.0)
+        assert f._masking_evaluator is f._evaluator
+        assert f._masking_evaluator.config.mode is _PM.INTERNAL

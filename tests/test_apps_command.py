@@ -17,6 +17,8 @@ from screencap.app_discovery import AppMetadata
 from screencap.cli import cli
 from screencap.privacy.policy import ContextClass
 
+pytestmark = pytest.mark.privacy
+
 
 @pytest.fixture(autouse=True)
 def _isolate_config(tmp_path, monkeypatch):
@@ -170,6 +172,79 @@ class TestUserOverridesReflected:
         assert op["in_allow_apps"] is True
         assert op["resolved_action"] == "exclude"  # matrix wins
         assert op["is_matrix_exclude"] is True
+
+
+class TestConfirmationFields:
+    """SCR-235 schema v3: allow_confirmed + confirmation_required."""
+
+    def _write_privacy(self, body: str) -> None:
+        import screencap.config
+        from screencap.config import _CONFIG_PATH
+        _CONFIG_PATH.write_text(body)
+        screencap.config._config_cache = None
+
+    def test_schema_v3_fields_present(self):
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        assert payload["schema_version"] >= 3
+        for app in payload["apps"]:
+            assert "allow_confirmed" in app
+            assert "confirmation_required" in app
+
+    def test_confirmation_required_per_class(self):
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        assert _by_bundle(payload, "com.1password.1password")["confirmation_required"] is True
+        assert _by_bundle(payload, "com.robinhood.Robinhood")["confirmation_required"] is True
+        assert _by_bundle(payload, "com.tinyspeck.slackmacgap")["confirmation_required"] is False
+        assert _by_bundle(payload, "com.openai.chat")["confirmation_required"] is False
+
+    def test_confirmed_allow_resolves_to_allow(self):
+        """An entry in both lists is authoritative: resolved_action=allow
+        and allow_confirmed=true, even for a mask-class app under internal."""
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\n'
+            'allow_apps = ["com.tinyspeck.slackmacgap"]\n'
+            'confirmed_allow_apps = ["com.tinyspeck.slackmacgap"]\n'
+        )
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        slack = _by_bundle(payload, "com.tinyspeck.slackmacgap")
+        assert slack["allow_confirmed"] is True
+        assert slack["resolved_action"] == "allow"
+
+    def test_legacy_allow_is_not_confirmed(self):
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\nallow_apps = ["com.tinyspeck.slackmacgap"]\n'
+        )
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        slack = _by_bundle(payload, "com.tinyspeck.slackmacgap")
+        assert slack["in_allow_apps"] is True
+        assert slack["allow_confirmed"] is False
+        assert slack["resolved_action"] == "mask_window"
+
+    def test_app_classes_override_drives_confirmation_required(self):
+        """Review fix: the payload resolves the user's app_classes override
+        first, matching the CLI gate — otherwise a user-reclassified
+        sensitive app carries confirmation_required=false and the UI routes
+        it through a plain allow that the gate then refuses (dead-end)."""
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\n'
+            '[privacy.app_classes]\n"com.microsoft.VSCode" = "banking"\n'
+        )
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        vscode = _by_bundle(payload, "com.microsoft.VSCode")
+        assert vscode["context_class"] == "banking"
+        assert vscode["classification_source"] == "user_config"
+        assert vscode["confirmation_required"] is True
+
+    def test_mixed_case_membership_matches(self):
+        """Config sets are case-normalized (SCR-235): mixed-case entries and
+        mixed-case OS bundle IDs still match."""
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\nexclude_apps = ["COM.MICROSOFT.VSCODE"]\n'
+        )
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        vscode = _by_bundle(payload, "com.microsoft.VSCode")
+        assert vscode["in_exclude_apps"] is True
+        assert vscode["resolved_action"] == "exclude"
 
 
 class TestErrorPath:

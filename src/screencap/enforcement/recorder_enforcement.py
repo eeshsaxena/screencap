@@ -604,14 +604,20 @@ class RecorderPrivacyFilter:
             # Pick the masking evaluator's strictness by destination.
             #
             # Cloud-intent recordings mask at PUBLIC so the uploaded copy hides
-            # every sensitive context class. Local recordings mask at the
-            # user's CONFIGURED mode (default INTERNAL): forcing PUBLIC here
-            # blacked out every browser / cloud-storage / AI-desktop window the
-            # user explicitly allowed, masking local-only recordings wholesale.
+            # every sensitive context class, with the allow set restricted to
+            # confirmed entries (SCR-235 KTD5) so this surface agrees with the
+            # cloud window filter: confirmed apps stay unmasked in the cloud
+            # copy, legacy (unconfirmed) entries take the matrix action.
+            #
+            # Local recordings mask at the user's CONFIGURED mode via the live
+            # evaluator (default INTERNAL): forcing PUBLIC here blacked out
+            # every browser / cloud-storage / AI-desktop window the user
+            # explicitly allowed, masking local-only recordings wholesale.
             # INTERNAL still masks genuinely sensitive background contexts
             # (password managers, banking, email, chat, calendar, auth/payment
             # remain EXCLUDE/MASK_WINDOW), so the "Slack behind the active
-            # window" case this masker targets is unaffected.
+            # window" case this masker targets is unaffected — and the live
+            # evaluator already resolves confirmed vs legacy entries (SCR-235).
             if not hasattr(self, "_masking_evaluator"):
                 if self._cloud_intent:
                     from dataclasses import replace as _dc_replace
@@ -621,7 +627,8 @@ class RecorderPrivacyFilter:
                         PrivacyMode,
                     )
                     _cloud_config = _dc_replace(
-                        self._evaluator.config, mode=PrivacyMode.PUBLIC,
+                        self._evaluator.config.restricted_to_confirmed(),
+                        mode=PrivacyMode.PUBLIC,
                     )
                     self._masking_evaluator = DefaultPolicyEvaluator(_cloud_config)
                 else:

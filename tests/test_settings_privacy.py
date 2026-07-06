@@ -2,7 +2,8 @@
 
 Verifies the privacy-list mutation surface — add/remove for list fields,
 set for scalar fields, idempotency, R16 round-trip preservation of mode,
-and the matrix-EXCLUDE bypass guard.
+and the SCR-235 confirmation gate (allow_apps writes confirmed entries;
+sensitive classes require --confirm-sensitive).
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ import pytest
 from click.testing import CliRunner
 
 from screencap.cli import cli
+
+pytestmark = pytest.mark.privacy
 
 
 @pytest.fixture(autouse=True)
@@ -129,44 +132,56 @@ class TestScalarFields:
 # ---------------------------------------------------------------------------
 
 
-class TestMatrixExcludeGuard:
-    def test_allow_apps_cannot_add_password_manager(self):
-        """1Password is in PASSWORD_MANAGER which the matrix unconditionally
-        excludes; allow_apps cannot loosen this."""
+class TestConfirmationGate:
+    """SCR-235: allow_apps adds write confirmed entries; confirmation-required
+    classes (matrix EXCLUDE in any mode) need --confirm-sensitive."""
+
+    def test_allow_apps_password_manager_requires_flag(self):
+        """Covers AE2 (CLI half): 1Password without the flag is rejected with
+        an actionable message; nothing is written."""
         result = _invoke("allow_apps", "add", "com.1password.1password")
         assert result.exit_code != 0
-        assert "PASSWORD_MANAGER" in result.output or "matrix" in result.output
-
-    def test_allow_apps_cannot_add_chat_app_under_internal(self):
-        """CHAT under internal is MASK_WINDOW — allow_apps cannot loosen
-        Unit 7a's strengthening for conversation apps (todo 005)."""
-        # default mode is internal in the test setup
-        result = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
-        assert result.exit_code != 0
         out = result.output.lower()
-        assert "chat" in out and "mask_window" in out
+        assert "confirm-sensitive" in out and "password_manager" in out
+        cfg = _read_cfg()
+        assert "com.1password.1password" not in cfg.get("privacy", {}).get("allow_apps", [])
 
-    def test_allow_apps_can_add_chat_app_under_public(self):
-        """Under mode=public the matrix produces MASK_WINDOW for CHAT, so
-        allow_apps still blocks (todo 005 gates EXCLUDE/MASK_WINDOW/TEXT_REDACT)."""
+    def test_allow_apps_password_manager_with_flag_writes_both_lists(self):
+        """Covers AE2 (CLI half): with the flag, both lists gain the entry."""
+        result = _invoke(
+            "allow_apps", "add", "com.1password.1password", "--confirm-sensitive"
+        )
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert "com.1password.1password" in cfg["allow_apps"]
+        assert "com.1password.1password" in cfg["confirmed_allow_apps"]
+
+    def test_allow_apps_chat_confirms_silently_under_internal(self):
+        """A mask-class add takes effect with no flag and lands in both lists —
+        that is what distinguishes a new deliberate add from a legacy entry."""
+        result = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert "com.tinyspeck.slackmacgap" in cfg["allow_apps"]
+        assert "com.tinyspeck.slackmacgap" in cfg["confirmed_allow_apps"]
+
+    def test_allow_apps_chat_confirms_silently_under_public(self):
         _invoke("mode", "set", "public")
         result = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
-        assert result.exit_code != 0
-        out = result.output.lower()
-        assert "chat" in out
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert "com.tinyspeck.slackmacgap" in cfg["confirmed_allow_apps"]
 
     def test_allow_apps_can_add_browser(self):
-        """BROWSER_UNVERIFIED is ALLOW under internal — explicit allow OK."""
+        """BROWSER_UNVERIFIED is not confirmation-required — explicit allow OK."""
         result = _invoke("allow_apps", "add", "com.brave.Browser")
         assert result.exit_code == 0
-        assert "com.brave.Browser" in _read_cfg()["privacy"]["allow_apps"]
+        cfg = _read_cfg()["privacy"]
+        assert "com.brave.Browser" in cfg["allow_apps"]
+        assert "com.brave.Browser" in cfg["confirmed_allow_apps"]
 
-    def test_allow_apps_cannot_add_banking_app_under_internal(self):
-        """BANKING under internal is MASK_WINDOW — must be blocked."""
-        result = _invoke("allow_apps", "add", "com.robinhood.release.Robinhood")
-        # If Robinhood isn't in the bundle map this test is vacuous; pick a
-        # known-mapped bundle. Use a representative banking bundle ID that's
-        # in BUNDLE_ID_MAP.
+    def test_allow_apps_banking_requires_flag(self):
+        """BANKING is EXCLUDE at public/shared → confirmation-required."""
         from screencap.privacy.classify import BUNDLE_ID_MAP
         from screencap.privacy.policy import ContextClass
         banking_bundle = next(
@@ -177,8 +192,61 @@ class TestMatrixExcludeGuard:
             pytest.skip("No BANKING bundle in BUNDLE_ID_MAP")
         result = _invoke("allow_apps", "add", banking_bundle)
         assert result.exit_code != 0
-        out = result.output.lower()
-        assert "banking" in out or "mask_window" in out
+        assert "banking" in result.output.lower()
+
+    def test_allow_apps_remove_prunes_confirmation(self):
+        """Removing the allow drops the confirmed entry, so re-allowing a
+        sensitive app re-prompts."""
+        _invoke("allow_apps", "add", "com.1password.1password", "--confirm-sensitive")
+        result = _invoke("allow_apps", "remove", "com.1password.1password")
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert "com.1password.1password" not in cfg["allow_apps"]
+        assert "com.1password.1password" not in cfg.get("confirmed_allow_apps", [])
+        result = _invoke("allow_apps", "add", "com.1password.1password")
+        assert result.exit_code != 0
+
+    def test_readd_confirms_legacy_entry(self):
+        """Re-adding an existing unconfirmed entry confirms it (the CLI
+        upgrade path for legacy allow entries)."""
+        _invoke("confirmed_allow_apps", "remove", "com.tinyspeck.slackmacgap")
+        _write = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
+        assert _write.exit_code == 0
+        # Simulate a legacy entry: strip the confirmation.
+        _invoke("confirmed_allow_apps", "remove", "com.tinyspeck.slackmacgap")
+        assert "com.tinyspeck.slackmacgap" not in _read_cfg()["privacy"].get(
+            "confirmed_allow_apps", []
+        )
+        result = _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")
+        assert result.exit_code == 0
+        assert "com.tinyspeck.slackmacgap" in _read_cfg()["privacy"]["confirmed_allow_apps"]
+
+    def test_exclude_add_leaves_confirmed_allow_lists_untouched(self):
+        """U2 coexistence scenario (R3/AE6): excluding a confirmed-allowed
+        app leaves both allow lists in place — runtime precedence, not the
+        write seam, resolves the conflict."""
+        _invoke("allow_apps", "add", "com.1password.1password", "--confirm-sensitive")
+        result = _invoke("exclude_apps", "add", "com.1password.1password")
+        assert result.exit_code == 0
+        cfg = _read_cfg()["privacy"]
+        assert "com.1password.1password" in cfg["exclude_apps"]
+        assert "com.1password.1password" in cfg["allow_apps"]
+        assert "com.1password.1password" in cfg["confirmed_allow_apps"]
+
+    def test_confirmed_allow_apps_add_requires_flag_for_sensitive(self):
+        """Review fix: the documented direct verb is gated like allow_apps."""
+        _invoke("allow_apps", "add", "com.tinyspeck.slackmacgap")  # benign, fine
+        result = _invoke("confirmed_allow_apps", "add", "com.1password.1password")
+        assert result.exit_code != 0
+        assert "confirm-sensitive" in result.output.lower()
+
+    def test_no_backwards_mode_advice_in_error_paths(self):
+        """The retired 'Set mode=public to capture broadly' advice (backwards:
+        public masks more) must not appear in any guard message."""
+        r1 = _invoke("allow_apps", "add", "com.1password.1password")
+        r2 = _invoke("app_classes", "set", "com.1password.1password=chat")
+        for result in (r1, r2):
+            assert "mode=public" not in result.output.lower().replace(" ", "")
 
     def test_exclude_apps_can_add_password_manager(self):
         """exclude_apps can always add anything — strictening is safe."""

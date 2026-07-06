@@ -15,21 +15,26 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from typing import TYPE_CHECKING
-
 import click
 from rich.console import Console
 from rich.markup import escape
-
-if TYPE_CHECKING:
-    from screencap.privacy.policy import PrivacyAction
 
 console = Console()
 logger = logging.getLogger(__name__)
 
 _MATRIX_ACK_KEY = "matrix_acknowledged_v2026_04"
 
-_PRIVACY_LIST_FIELDS = ("exclude_apps", "allow_apps", "mask_domains", "mask_title_patterns")
+# `confirmed_allow_apps` is normally managed by the allow_apps add/remove
+# flow (SCR-235). Direct `add` goes through the same confirmation gate as
+# allow_apps (an ungated documented verb would bypass it); `remove` behaves
+# as a plain list field.
+_PRIVACY_LIST_FIELDS = (
+    "exclude_apps",
+    "allow_apps",
+    "confirmed_allow_apps",
+    "mask_domains",
+    "mask_title_patterns",
+)
 # `matrix_acknowledged_v2026_04` is NOT exposed here (todo 012) — it's an
 # internal migration flag written by `_maybe_prompt_matrix_acknowledgement`
 # and should not be flippable from a `screencap settings` invocation.
@@ -375,36 +380,31 @@ def _privacy_list_field_value(value: str) -> str:
     return value.strip()
 
 
-def _matrix_blocks_allow_for_class(ctx_class, configured_mode: str) -> "PrivacyAction | None":
-    """Return the matrix action if it blocks ``allow_apps`` at this mode, else None.
+def _matching_entries(arr, value: str) -> list:
+    """Entries in a tomlkit array equal to ``value``, case-insensitively.
 
-    Blocks loosening via ``allow_apps`` when the matrix at the user's configured
-    mode produces EXCLUDE / MASK_WINDOW / TEXT_REDACT for this class. Without
-    this guard, ``allow_apps add com.tinyspeck.slackmacgap`` (CHAT, MASK_WINDOW
-    under ``internal``) would silently bypass Unit 7a's strengthening.
-
-    PASSWORD_MANAGER (EXCLUDE in every mode) is always blocked. BANKING
-    (MASK_WINDOW under ``internal``) is also blocked. BROWSER_UNVERIFIED
-    (ALLOW under ``internal``) is *not* blocked — users can still allow
-    a browser explicitly.
+    Bundle-id membership is case-normalized at runtime (SCR-235), so the
+    allow_apps write seam matches the same way — a case-variant add must not
+    append a duplicate the runtime treats as the same bundle, and a
+    case-variant remove must still find the stored entry.
     """
-    from screencap.privacy.policy import (
-        PrivacyAction,
-        PrivacyMode,
-        get_matrix_action,
-    )
+    return [e for e in arr if str(e).lower() == value.lower()]
 
-    blocking = (
-        PrivacyAction.EXCLUDE,
-        PrivacyAction.MASK_WINDOW,
-        PrivacyAction.TEXT_REDACT,
-    )
-    try:
-        mode = PrivacyMode(configured_mode)
-    except ValueError:
-        mode = PrivacyMode.INTERNAL
-    action = get_matrix_action(ctx_class, mode)
-    return action if action in blocking else None
+
+def _allow_requires_confirmation(ctx_class) -> bool:
+    """True when allow-listing this class needs the explicit confirm flag.
+
+    SCR-235 replaced the matrix-strictness hard-reject with a confirmation
+    gate: an allow written through this flow is *confirmed* (authoritative
+    over the matrix in every mode), so classes the matrix excludes in any
+    mode (password manager, banking, auth/payment flows) require the caller
+    to pass ``--confirm-sensitive``. Mask-class apps (chat, email, browsers,
+    terminals) confirm silently on add — a new deliberate add is exactly
+    what distinguishes them from legacy floor-bound entries.
+    """
+    from screencap.privacy.policy import requires_confirmed_allow
+
+    return requires_confirmed_allow(ctx_class)
 
 
 def _settings_privacy_apply(
@@ -419,6 +419,7 @@ def _settings_privacy_apply(
     err_console,
     tomlkit,
     _result,
+    confirm_sensitive: bool = False,
 ) -> bool:
     """Apply a single privacy mutation to the in-memory tomlkit privacy table.
 
@@ -433,55 +434,85 @@ def _settings_privacy_apply(
     leaking a hundred-line block into the context manager body. Mutates
     list fields in-place via tomlkit Array's append/remove (todo 016) so
     inline comments and per-item formatting survive.
+
+    ``allow_apps add`` writes both lists (SCR-235): the entry lands in
+    ``allow_apps`` AND ``confirmed_allow_apps`` in the same transaction, so
+    new deliberate adds are authoritative over the matrix. Classes the
+    matrix excludes in any mode require ``confirm_sensitive=True``.
+    ``allow_apps remove`` prunes the confirmed entry, so re-allowing a
+    sensitive app re-prompts.
     """
-    # Matrix-invariant guard: reject loosening any matrix-blocked class via
-    # allow_apps (todo 005). Evaluated at the *configured mode* — under
-    # `internal` this catches CHAT/EMAIL/CALENDAR/VIDEO_CALL (MASK_WINDOW)
-    # in addition to PASSWORD_MANAGER (EXCLUDE). Defaults to "internal" when
-    # mode is unset.
+    # Confirmation gate (SCR-235, replaces the matrix-strictness hard-reject):
+    # adds through this flow become *confirmed* entries, so allow-listing a
+    # confirmation-required class (EXCLUDE anywhere in its matrix row) needs
+    # the explicit flag. `confirmed_allow_apps add` is gated identically —
+    # an ungated direct add would be an in-product bypass of the gate for
+    # any bundle already carrying a legacy allow entry.
     #
     # Also consults the on-disk app_classes overrides (todo 030) so that a
     # bundle absent from BUNDLE_ID_MAP but reclassified by the user as a
     # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
-    # cannot be allow-listed in a follow-up call.
-    if is_list and field == "allow_apps" and op == "add":
-        from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
-        from screencap.privacy.policy import ContextClass
-        configured_mode = str(privacy_tbl.get("mode") or "internal")
+    # cannot be silently allow-listed in a follow-up call.
+    if is_list and field in ("allow_apps", "confirmed_allow_apps") and op == "add":
+        from screencap.privacy.classify import BUNDLE_ID_MAP
+        from screencap.privacy.policy import (
+            BROWSER_BUNDLE_IDS_LOWER,
+            ContextClass,
+        )
+
+        # Idempotency: an entry already confirmed needs no re-confirmation.
+        # Skip the gate so the list logic emits the documented no-op (exit 0)
+        # instead of demanding the flag for a state that already holds.
+        already_confirmed = bool(
+            _matching_entries(privacy_tbl.get("allow_apps") or [], value)
+        ) and bool(
+            _matching_entries(privacy_tbl.get("confirmed_allow_apps") or [], value)
+        )
 
         # Effective class: app_classes override > BUNDLE_ID_MAP > BROWSER_BUNDLE_IDS > None.
         # BROWSER_BUNDLE_IDS resolves to BROWSER_UNVERIFIED at runtime via
         # the classifier's browser detection, so a browser bundle is
         # legitimately allow-listable even though it isn't in BUNDLE_ID_MAP.
+        # All lookups are case-insensitive: the runtime's membership is
+        # case-normalized, so a case-variant input must resolve to the same
+        # class here — a case-exact miss either misfires fail-closed (known
+        # browser rejected as unclassified) or skips a sensitive override.
+        value_lower = value.lower()
         effective_class = None
-        app_classes_overrides = dict(privacy_tbl.get("app_classes", {}))
-        override_str = app_classes_overrides.get(value)
+        app_classes_overrides = {
+            str(k).lower(): v
+            for k, v in dict(privacy_tbl.get("app_classes", {})).items()
+        }
+        override_str = app_classes_overrides.get(value_lower)
         if override_str:
             try:
                 effective_class = ContextClass(str(override_str).lower())
             except ValueError:
                 effective_class = None
         if effective_class is None:
-            effective_class = BUNDLE_ID_MAP.get(value)
-        if effective_class is None and value in BROWSER_BUNDLE_IDS:
+            effective_class = next(
+                (cls for bid, cls in BUNDLE_ID_MAP.items() if bid.lower() == value_lower),
+                None,
+            )
+        if effective_class is None and value_lower in BROWSER_BUNDLE_IDS_LOWER:
             effective_class = ContextClass.BROWSER_UNVERIFIED
 
-        if effective_class is not None:
-            blocking_action = _matrix_blocks_allow_for_class(
-                effective_class, configured_mode,
-            )
-            if blocking_action is not None:
+        if already_confirmed:
+            pass  # fall through to the list logic's no-op / plain handling
+        elif effective_class is not None:
+            if _allow_requires_confirmation(effective_class) and not confirm_sensitive:
                 err_console.print(
-                    f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value} which the "
-                    f"privacy matrix at mode={configured_mode!r} produces "
-                    f"{blocking_action.value} — allow_apps cannot loosen this. "
-                    f"Set mode=public to capture broadly, or override at the "
-                    f"per-app level via app_classes (subject to the same guard)."
+                    f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value}, a class "
+                    f"the privacy matrix excludes in at least one mode — allowing it "
+                    f"makes it fully recordable in every mode: raw capture, keystrokes, "
+                    f"the local search index, and cloud copies when a cloud destination "
+                    f"is enabled. Re-run with [bold]--confirm-sensitive[/bold] to "
+                    f"confirm, or leave it protected."
                 )
                 _result(
                     False,
                     exit_code=1,
-                    error=f"matrix_blocks_allow:{effective_class.value}@{configured_mode}",
+                    error=f"confirmation_required:{effective_class.value}",
                 )
         else:
             # Unknown bundle (no BUNDLE_ID_MAP entry, no app_classes
@@ -515,19 +546,67 @@ def _settings_privacy_apply(
         if arr is None:
             arr = tomlkit.array()
             privacy_tbl[field] = arr
+        # Bundle-id list fields match case-insensitively at the write seam
+        # (SCR-235): runtime membership is case-normalized, so an exact-case
+        # seam would leave hand-edited case-variant entries live at runtime
+        # but unremovable here. mask_domains/mask_title_patterns keep exact
+        # matching (patterns are case-sensitive regexes).
+        is_bundle_field = field in ("exclude_apps", "allow_apps", "confirmed_allow_apps")
         if op == "add":
-            if value in arr:
-                # Idempotent no-op
-                err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
-                _result(True, changed=False)
-                return False
-            arr.append(value)
+            if field == "allow_apps":
+                # SCR-235: adds through this flow are confirmed — write both
+                # lists in the same transaction. Re-adding an existing legacy
+                # entry is the CLI upgrade path: it confirms the entry.
+                # Membership is case-insensitive to match the runtime's
+                # case-normalized sets.
+                confirmed = privacy_tbl.get("confirmed_allow_apps")
+                if confirmed is None:
+                    confirmed = tomlkit.array()
+                    privacy_tbl["confirmed_allow_apps"] = confirmed
+                already = bool(_matching_entries(arr, value))
+                conf_already = bool(_matching_entries(confirmed, value))
+                if already and conf_already:
+                    err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} (confirmed) — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                if not already:
+                    arr.append(value)
+                if not conf_already:
+                    confirmed.append(value)
+            else:
+                already = (
+                    bool(_matching_entries(arr, value))
+                    if is_bundle_field
+                    else value in arr
+                )
+                if already:
+                    # Idempotent no-op
+                    err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                arr.append(value)
         else:  # remove
-            if value not in arr:
-                err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
-                _result(True, changed=False)
-                return False
-            arr.remove(value)
+            if is_bundle_field:
+                matches = _matching_entries(arr, value)
+                if not matches:
+                    err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                for stale in matches:
+                    arr.remove(stale)
+                if field == "allow_apps":
+                    # SCR-235: removing the allow prunes its confirmed entry
+                    # so re-allowing a sensitive app re-prompts.
+                    confirmed = privacy_tbl.get("confirmed_allow_apps")
+                    if confirmed is not None:
+                        for stale in _matching_entries(confirmed, value):
+                            confirmed.remove(stale)
+            else:
+                if value not in arr:
+                    err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                arr.remove(value)
     elif is_scalar:
         privacy_tbl[field] = parsed_value
     else:
@@ -666,8 +745,9 @@ def _settings_privacy_apply(
                         f"{old_class.value} to {new_class.value} would loosen "
                         f"the matrix at mode={configured_mode!r} from "
                         f"{old_action.value} to {new_action.value} — rejected. "
-                        f"Set mode=public if you want broader capture, or "
-                        f"keep the existing classification."
+                        f"Keep the existing classification, or allow the app "
+                        f"explicitly via allow_apps (sensitive classes require "
+                        f"--confirm-sensitive)."
                     )
                     _result(
                         False,

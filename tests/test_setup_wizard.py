@@ -8,6 +8,8 @@ from unittest import mock
 import pytest
 import tomlkit
 
+pytestmark = pytest.mark.privacy
+
 from screencap.privacy.policy import ContextClass, PrivacyMode
 from screencap.setup_wizard import (
     _build_save_doc,
@@ -83,6 +85,35 @@ class TestGroupApps:
         assert len(groups["communication"]) == 1
         assert len(groups["safe"]) == 1
         assert len(groups["unclassified"]) == 1
+
+    def test_confirmation_required_background_app_not_auto_allowed(self):
+        """SCR-235: the class gate runs BEFORE the background/safe-source
+        short-circuit — a confirmation-required app never silently
+        auto-allows, even via an app_classes override on a background app."""
+        classified = {
+            "com.example.bankhelper": (
+                _make_app("com.example.bankhelper", "BankHelper", is_background=True),
+                ContextClass.BANKING,
+                "user_config",
+            ),
+        }
+        groups, auto_allowed = _group_apps(classified)
+        assert auto_allowed == []
+        assert len(groups["blocked"]) == 1
+
+    def test_auth_flow_lands_in_blocked_group(self):
+        """AUTH_FLOW/PAYMENT_FLOW joined the blocked set via the
+        matrix-derived confirmation-required classes (SCR-235)."""
+        classified = {
+            "com.example.sso": (
+                _make_app("com.example.sso", "SSO"),
+                ContextClass.AUTH_FLOW,
+                "known_app",
+            ),
+        }
+        groups, auto_allowed = _group_apps(classified)
+        assert len(groups["blocked"]) == 1
+        assert auto_allowed == []
 
     def test_apple_prefix_auto_allowed(self):
         """Apple prefix apps are auto-allowed, not shown in groups."""
@@ -244,6 +275,27 @@ class TestBuildSaveDoc:
         assert "allow_apps" not in result["privacy"]
 
 
+class TestBuildSaveDocConfirmed:
+    def test_writes_and_clears_confirmed_allow_apps(self):
+        """SCR-235: the confirmed list round-trips through the wizard save."""
+        doc = _build_save_doc(
+            tomlkit.document(),
+            PrivacyMode.INTERNAL,
+            [],
+            ["com.tinyspeck.slackmacgap"],
+            {},
+            confirmed_allow_apps=["com.tinyspeck.slackmacgap"],
+        )
+        assert list(doc["privacy"]["confirmed_allow_apps"]) == [
+            "com.tinyspeck.slackmacgap"
+        ]
+        # Emptying the list on a later save removes the key.
+        doc = _build_save_doc(
+            doc, PrivacyMode.INTERNAL, [], [], {}, confirmed_allow_apps=[]
+        )
+        assert "confirmed_allow_apps" not in doc["privacy"]
+
+
 class TestAtomicSave:
     def test_atomic_write(self, tmp_path):
         config_path = tmp_path / "config.toml"
@@ -303,6 +355,104 @@ class TestRunSetupWizard:
             doc = tomlkit.parse(config_path.read_text())
             assert doc["privacy"]["mode"] == expected_mode
             assert doc["privacy"]["upload_default"] == expected_upload
+
+    def test_silent_auto_allow_is_legacy_explicit_override_is_confirmed(self, tmp_path):
+        """SCR-235: silent auto-allows land in allow_apps only (legacy);
+        an explicit per-app 'allow' override writes both lists."""
+        config_path = tmp_path / "config.toml"
+        apps = [
+            AppMetadata("/test/Preview.app", "com.apple.Preview", "Preview"),
+            AppMetadata("/test/Slack.app", "com.tinyspeck.slackmacgap", "Slack"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch(
+                 "screencap.setup_wizard._run_tui",
+                 return_value={"com.tinyspeck.slackmacgap": "allow"},
+             ), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2  # Local
+
+            assert run_setup_wizard(config_path=config_path) is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            allow = list(doc["privacy"]["allow_apps"])
+            confirmed = list(doc["privacy"].get("confirmed_allow_apps", []))
+            # Preview auto-allowed silently (apple_prefix) → legacy only.
+            assert "com.apple.Preview" in allow
+            assert "com.apple.Preview" not in confirmed
+            # Slack explicitly allowed per-app in the review flow → both.
+            assert "com.tinyspeck.slackmacgap" in allow
+            assert "com.tinyspeck.slackmacgap" in confirmed
+
+    def test_rerun_allow_override_unblocks_sensitive_app_after_confirm(self, tmp_path):
+        """Review fix: on a re-run, an explicit allow toggle on a
+        previously-blocked sensitive app un-blocks it (the old guard
+        silently dropped the choice), gated by the post-review consequence
+        confirmation (R7)."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\nmode = "internal"\n'
+            'exclude_apps = ["com.1password.1password"]\n'
+        )
+        apps = [
+            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch(
+                 "screencap.setup_wizard._run_tui",
+                 return_value={"com.1password.1password": "allow"},
+             ), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2  # Local
+            mock_click.confirm.return_value = True  # accept the disclosure
+
+            assert run_setup_wizard(config_path=config_path) is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            privacy = doc["privacy"]
+            assert "com.1password.1password" not in list(privacy.get("exclude_apps", []))
+            assert "com.1password.1password" in list(privacy["allow_apps"])
+            assert "com.1password.1password" in list(privacy["confirmed_allow_apps"])
+            mock_click.confirm.assert_called()
+
+    def test_rerun_allow_override_declined_disclosure_stays_blocked(self, tmp_path):
+        """Declining the consequence confirmation keeps the sensitive app
+        blocked — confirmation is the condition for unblocking."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[privacy]\nmode = "internal"\n'
+            'exclude_apps = ["com.1password.1password"]\n'
+        )
+        apps = [
+            AppMetadata("/test/1Password.app", "com.1password.1password", "1Password"),
+        ]
+        with mock.patch("sys.stdin") as mock_stdin, \
+             mock.patch("screencap.setup_wizard.discover_installed_apps", return_value=apps), \
+             mock.patch("screencap.setup_wizard.click") as mock_click, \
+             mock.patch(
+                 "screencap.setup_wizard._run_tui",
+                 return_value={"com.1password.1password": "allow"},
+             ), \
+             mock.patch("screencap.config.invalidate_config_cache"):
+            mock_stdin.isatty.return_value = True
+            mock_click.prompt.return_value = 2  # Local
+            mock_click.confirm.return_value = False  # decline the disclosure
+
+            assert run_setup_wizard(config_path=config_path) is True
+
+            doc = tomlkit.parse(config_path.read_text())
+            privacy = doc["privacy"]
+            assert "com.1password.1password" in list(privacy.get("exclude_apps", []))
+            assert "com.1password.1password" not in list(privacy.get("allow_apps", []))
+            assert "com.1password.1password" not in list(
+                privacy.get("confirmed_allow_apps", [])
+            )
 
     def test_rerun_preselects_existing_destination(self, tmp_path):
         """Re-running setup with existing cloud config passes default=1 to prompt."""

@@ -14,6 +14,8 @@ import os
 
 import pytest
 
+pytestmark = pytest.mark.privacy
+
 
 @pytest.fixture(autouse=True)
 def _isolate_config(tmp_path, monkeypatch):
@@ -76,49 +78,36 @@ class TestPrivacyConfigWriter:
         assert _CONFIG_PATH.read_text(encoding="utf-8") == original
 
 
-class TestMatrixBlocksAllowForClass:
-    """The matrix-invariant guard as a pure function — the extraction's key
-    payoff: directly testable without a CliRunner round trip. Behavioral
-    coverage through `settings privacy` lives in test_settings_privacy.py."""
+class TestAllowRequiresConfirmation:
+    """The SCR-235 confirmation gate as a pure function — mode-independent:
+    a class needs the confirm flag iff the matrix excludes it in any mode.
+    Behavioral coverage through `settings privacy` lives in
+    test_settings_privacy.py."""
 
-    def test_password_manager_blocked_in_every_mode(self):
+    def test_exclude_anywhere_classes_require_confirmation(self):
         from screencap.privacy.policy import ContextClass
-        from screencap.privacy_settings import _matrix_blocks_allow_for_class
+        from screencap.privacy_settings import _allow_requires_confirmation
 
-        for mode in ("internal", "public"):
-            assert (
-                _matrix_blocks_allow_for_class(ContextClass.PASSWORD_MANAGER, mode)
-                is not None
-            )
+        for ctx in (
+            ContextClass.PASSWORD_MANAGER,
+            ContextClass.BANKING,
+            ContextClass.AUTH_FLOW,
+            ContextClass.PAYMENT_FLOW,
+        ):
+            assert _allow_requires_confirmation(ctx) is True
 
-    def test_browser_unverified_is_mode_dependent(self):
-        """BROWSER_UNVERIFIED is ALLOW under internal (allowable) but MASK_WINDOW
-        under public (blocked) — exercises the mode-dependent guard branch."""
+    def test_mask_class_and_allow_class_confirm_silently(self):
         from screencap.privacy.policy import ContextClass
-        from screencap.privacy_settings import _matrix_blocks_allow_for_class
+        from screencap.privacy_settings import _allow_requires_confirmation
 
-        assert (
-            _matrix_blocks_allow_for_class(ContextClass.BROWSER_UNVERIFIED, "internal")
-            is None
-        )
-        assert (
-            _matrix_blocks_allow_for_class(ContextClass.BROWSER_UNVERIFIED, "public")
-            is not None
-        )
-
-    def test_chat_blocked_under_internal(self):
-        from screencap.privacy.policy import ContextClass
-        from screencap.privacy_settings import _matrix_blocks_allow_for_class
-
-        # CHAT is MASK_WINDOW under internal → allow_apps cannot loosen it.
-        assert _matrix_blocks_allow_for_class(ContextClass.CHAT, "internal") is not None
-
-    def test_invalid_mode_falls_back_to_internal(self):
-        from screencap.privacy.policy import ContextClass
-        from screencap.privacy_settings import _matrix_blocks_allow_for_class
-
-        # An unparseable mode is treated as internal, under which CHAT is blocked.
-        assert _matrix_blocks_allow_for_class(ContextClass.CHAT, "garbage") is not None
+        for ctx in (
+            ContextClass.CHAT,
+            ContextClass.EMAIL,
+            ContextClass.BROWSER_UNVERIFIED,
+            ContextClass.CODE_EDITOR_TERMINAL,
+            ContextClass.UNKNOWN,
+        ):
+            assert _allow_requires_confirmation(ctx) is False
 
 
 class _ResultRecorder:
@@ -154,7 +143,7 @@ class TestSettingsPrivacyApply:
     """
 
     def _apply(self, privacy_tbl, *, field, op, value, is_list, is_scalar,
-               parsed_value=None, result=None):
+               parsed_value=None, result=None, confirm_sensitive=False):
         import tomlkit as _tomlkit
         from rich.console import Console
         from screencap.privacy_settings import _settings_privacy_apply
@@ -171,14 +160,36 @@ class TestSettingsPrivacyApply:
             err_console=Console(stderr=True),
             tomlkit=_tomlkit,
             _result=result,
+            confirm_sensitive=confirm_sensitive,
         )
         return changed, result
 
-    def test_allow_apps_add_chat_blocked_by_matrix_under_internal(self):
-        """allow_apps add of a CHAT-classified bundle under mode=internal trips
-        the matrix-invariant guard: ``_result`` is called with a non-zero exit
-        and a ``matrix_blocks_allow:*`` error, and the function never returns a
-        success (it exits before appending)."""
+    def test_allow_apps_add_chat_confirms_silently(self):
+        """SCR-235: a mask-class add succeeds without the flag and writes BOTH
+        allow_apps and confirmed_allow_apps in the same transaction."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.tinyspeck.slackmacgap",  # CHAT — mask-class
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert recorder.calls == []
+        assert "com.tinyspeck.slackmacgap" in list(tbl["allow_apps"])
+        assert "com.tinyspeck.slackmacgap" in list(tbl["confirmed_allow_apps"])
+
+    def test_allow_apps_add_sensitive_without_flag_errors(self):
+        """Covers AE2 (CLI half): a confirmation-required class without the
+        flag exits 1 with an actionable ``confirmation_required:*`` error and
+        writes nothing."""
         import tomlkit
 
         tbl = tomlkit.table()
@@ -190,7 +201,7 @@ class TestSettingsPrivacyApply:
                 tbl,
                 field="allow_apps",
                 op="add",
-                value="com.tinyspeck.slackmacgap",  # CHAT → MASK_WINDOW @ internal
+                value="com.1password.1password",  # PASSWORD_MANAGER
                 is_list=True,
                 is_scalar=False,
                 result=recorder,
@@ -200,11 +211,336 @@ class TestSettingsPrivacyApply:
         call = recorder.calls[0]
         assert call["ok"] is False
         assert call["exit_code"] == 1
-        assert call["error"] == "matrix_blocks_allow:chat@internal"
-        # The guard fired before the bundle was appended.
-        assert "allow_apps" not in tbl or "com.tinyspeck.slackmacgap" not in tbl.get(
+        assert call["error"] == "confirmation_required:password_manager"
+        assert "allow_apps" not in tbl or "com.1password.1password" not in tbl.get(
             "allow_apps", []
         )
+        assert "confirmed_allow_apps" not in tbl or (
+            "com.1password.1password" not in tbl.get("confirmed_allow_apps", [])
+        )
+
+    def test_allow_apps_add_sensitive_with_flag_writes_both_lists(self):
+        """Covers AE2 (CLI half): with the flag, the sensitive add lands in
+        both lists."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+            confirm_sensitive=True,
+        )
+
+        assert changed is True
+        assert recorder.calls == []
+        assert "com.1password.1password" in list(tbl["allow_apps"])
+        assert "com.1password.1password" in list(tbl["confirmed_allow_apps"])
+
+    def test_allow_apps_readd_confirms_legacy_entry(self):
+        """Re-adding an existing legacy (unconfirmed) entry is the CLI
+        upgrade path: it writes the confirmed entry and reports a change."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.tinyspeck.slackmacgap")
+        tbl["allow_apps"] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.tinyspeck.slackmacgap",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["allow_apps"]).count("com.tinyspeck.slackmacgap") == 1
+        assert "com.tinyspeck.slackmacgap" in list(tbl["confirmed_allow_apps"])
+
+    def test_allow_apps_add_fully_confirmed_is_noop(self):
+        """An entry already in both lists is an idempotent no-op."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("com.tinyspeck.slackmacgap")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.tinyspeck.slackmacgap",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is False
+        assert recorder.calls[0]["changed"] is False
+
+    def test_allow_apps_remove_prunes_confirmed_entry(self):
+        """Removing an allow prunes the confirmed entry (case-insensitively)
+        so re-allowing a sensitive app re-prompts."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.1password.1password")
+        tbl["allow_apps"] = arr
+        conf = tomlkit.array()
+        conf.append("COM.1PASSWORD.1PASSWORD")
+        tbl["confirmed_allow_apps"] = conf
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="remove",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert "com.1password.1password" not in list(tbl["allow_apps"])
+        assert list(tbl["confirmed_allow_apps"]) == []
+
+    def test_allow_apps_readd_matches_case_variant_stored_entry(self):
+        """Write-seam membership is case-insensitive (the runtime normalizes
+        casing): re-adding the canonical id over a case-variant stored entry
+        is a no-op, not a duplicate append."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("COM.TINYSPECK.SLACKMACGAP")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.tinyspeck.slackmacgap",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is False
+        assert len(list(tbl["allow_apps"])) == 1
+        assert len(list(tbl["confirmed_allow_apps"])) == 1
+
+    def test_allow_apps_case_variant_remove_finds_entry(self):
+        """A case-variant remove still finds and prunes both entries."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("com.tinyspeck.slackmacgap")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="remove",
+            value="COM.TINYSPECK.SLACKMACGAP",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["allow_apps"]) == []
+        assert list(tbl["confirmed_allow_apps"]) == []
+
+    def test_allow_apps_add_unclassified_bundle_still_refused(self):
+        """The fail-closed refusal for unclassified bundles is unchanged:
+        classification stays a prerequisite to any allow, confirmed or not."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        recorder = _ResultRecorder()
+
+        with pytest.raises(SystemExit):
+            self._apply(
+                tbl,
+                field="allow_apps",
+                op="add",
+                value="com.example.mystery",
+                is_list=True,
+                is_scalar=False,
+                confirm_sensitive=True,  # the flag must not bypass classification
+                result=recorder,
+            )
+
+        call = recorder.calls[0]
+        assert call["exit_code"] == 1
+        assert call["error"] == "unknown_bundle_id:com.example.mystery"
+
+    def test_allow_apps_add_reclassified_sensitive_needs_flag(self):
+        """The gate consults on-disk app_classes overrides (todo 030): a
+        user-reclassified sensitive bundle requires the flag too."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        tbl["app_classes"] = {"com.example.helper": "banking"}
+        recorder = _ResultRecorder()
+
+        with pytest.raises(SystemExit):
+            self._apply(
+                tbl,
+                field="allow_apps",
+                op="add",
+                value="com.example.helper",
+                is_list=True,
+                is_scalar=False,
+                result=recorder,
+            )
+
+        assert recorder.calls[0]["error"] == "confirmation_required:banking"
+
+    def test_gate_class_resolution_is_case_insensitive(self):
+        """Review fix: the gate resolves the effective class the way the
+        runtime does — case-insensitively. A case-variant stored override of
+        a sensitive class must still require the flag (not fall back to a
+        benign built-in class), and a lowercase-typed known browser must not
+        be refused as unclassified."""
+        import tomlkit
+
+        # (b) case-variant sensitive override still gates
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        tbl["app_classes"] = {"com.TinySpeck.SlackMacGap": "banking"}
+        recorder = _ResultRecorder()
+        with pytest.raises(SystemExit):
+            self._apply(
+                tbl,
+                field="allow_apps",
+                op="add",
+                value="com.tinyspeck.slackmacgap",
+                is_list=True,
+                is_scalar=False,
+                result=recorder,
+            )
+        assert recorder.calls[0]["error"] == "confirmation_required:banking"
+
+        # (a) lowercase-typed known browser resolves instead of refusing
+        tbl2 = tomlkit.table()
+        tbl2["mode"] = "internal"
+        changed, _ = self._apply(
+            tbl2,
+            field="allow_apps",
+            op="add",
+            value="com.google.chrome",
+            is_list=True,
+            is_scalar=False,
+        )
+        assert changed is True
+        assert "com.google.chrome" in list(tbl2["allow_apps"])
+
+    def test_readd_of_confirmed_entry_is_noop_without_flag(self):
+        """Review fix: idempotency — re-asserting an already-confirmed
+        sensitive entry without the flag is the documented no-op (exit 0),
+        not a confirmation_required error."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("com.1password.1password")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+        )
+        assert changed is False
+        assert recorder.calls[0]["changed"] is False
+        assert recorder.calls[0]["exit_code"] is None
+
+    def test_confirmed_allow_apps_add_is_gated(self):
+        """Review fix: the direct `confirmed_allow_apps add` verb goes
+        through the same confirmation gate — it must not be an in-product
+        bypass that silently promotes a legacy allow entry."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.1password.1password")
+        tbl["allow_apps"] = arr
+        recorder = _ResultRecorder()
+
+        with pytest.raises(SystemExit):
+            self._apply(
+                tbl,
+                field="confirmed_allow_apps",
+                op="add",
+                value="com.1password.1password",
+                is_list=True,
+                is_scalar=False,
+                result=recorder,
+            )
+        assert recorder.calls[0]["error"] == "confirmation_required:password_manager"
+        assert "confirmed_allow_apps" not in tbl or (
+            "com.1password.1password" not in tbl.get("confirmed_allow_apps", [])
+        )
+
+        # With the flag, the direct add succeeds.
+        changed, _ = self._apply(
+            tbl,
+            field="confirmed_allow_apps",
+            op="add",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+            confirm_sensitive=True,
+        )
+        assert changed is True
+        assert "com.1password.1password" in list(tbl["confirmed_allow_apps"])
+
+    def test_exclude_apps_remove_matches_case_variant_entry(self):
+        """Review fix: bundle-id list fields match case-insensitively at the
+        write seam — a hand-edited lowercase exclude entry (live at runtime)
+        must be removable with the OS-cased id."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.microsoft.vscode")
+        tbl["exclude_apps"] = arr
+
+        changed, _ = self._apply(
+            tbl,
+            field="exclude_apps",
+            op="remove",
+            value="com.microsoft.VSCode",
+            is_list=True,
+            is_scalar=False,
+        )
+        assert changed is True
+        assert list(tbl["exclude_apps"]) == []
 
     def test_list_add_already_present_is_idempotent_noop(self):
         """Adding a value already in the list returns ``changed=False`` and

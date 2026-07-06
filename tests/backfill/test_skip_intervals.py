@@ -845,3 +845,24 @@ def test_missing_db_fail_open_by_default_no_raise(tmp_path):
     )
     # Fail-open: every supplied frame is an uncovered gap (no window events).
     assert find_blocked_interval(150.0, intervals) is not None
+
+
+def test_is_known_browser_matches_classifier_case_normalization():
+    """SCR-235 review fix: _is_known_browser mirrors classify step 3, whose
+    _app_classes keys are now case-normalized. A mixed-case user-tagged
+    browser (or a case-variant stock-browser id from the DB) must still be
+    detected, or the NULL-url ambiguity probe silently goes fail-open."""
+    from screencap.backfill.skip_intervals import _is_known_browser
+    from screencap.privacy.classify import DefaultContextClassifier
+    from screencap.privacy.policy import ContextClass
+
+    classifier = DefaultContextClassifier(
+        app_classes={"com.MyBrowser.App": ContextClass.BROWSER_UNVERIFIED},
+        domain_index={},
+    )
+    # User-tagged browser probed with the DB's OS-cased id.
+    assert _is_known_browser(classifier, "com.MyBrowser.App") is True
+    # Stock browser probed with a case-variant id.
+    assert _is_known_browser(classifier, "COM.APPLE.SAFARI") is True
+    # Non-browser stays non-browser.
+    assert _is_known_browser(classifier, "com.tinyspeck.slackmacgap") is False
