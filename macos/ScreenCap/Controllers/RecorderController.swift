@@ -184,9 +184,10 @@ final class RecorderController: ObservableObject {
     /// Hide control: true while the user has dismissed the recording HUD pill via
     /// its hide control. Distinct from the recording lifecycle — the pill's hide
     /// button and the menu-bar "Show recording controls" item both read this.
-    /// Reset to `false` on every return to `.idle` (the `state.didSet` chokepoint)
-    /// so each recording starts shown and no hidden state survives a recording,
-    /// and defensively when `.showHUD` is applied.
+    /// Only `hideRecordingHUD()` sets it (guarded to `.recording`), and every
+    /// return to `.idle` resets it via the `state.didSet` chokepoint that also
+    /// resets `captureAdvisory` — so no hidden state survives a recording and each
+    /// one starts shown.
     @Published private(set) var hudHidden: Bool = false
     /// U7: true only after `.hideMainWindow` was actually applied (the live
     /// `started` path), so a teardown restores + routes to Library ONLY when the
@@ -727,10 +728,6 @@ final class RecorderController: ObservableObject {
             case .handleCaptureRecovered(let reader):
                 handleCaptureRecovered(reader: reader)
             case .showHUD:
-                // Every recording-start edge (`started`, daemon-session attach)
-                // drains here; clear any hidden state so the pill shows and the
-                // menu-bar restore item is hidden at the start of a recording.
-                hudHidden = false
                 windowLifecycle.showHUD(for: self)
             case .hideHUD:
                 windowLifecycle.hideHUD()
@@ -746,12 +743,14 @@ final class RecorderController: ObservableObject {
     }
 
     /// Hide control (R1, R2): dismiss the floating recording HUD pill while a
-    /// recording is live. No-op outside `.recording` — the pill only exists then,
-    /// and the guard keeps a menu/UI race on the `.recording → .idle` edge from
-    /// acting. Capture is untouched; only the panel is ordered out. The menu-bar
-    /// glyph and Stop item remain the recording indicator and stop path (R3).
+    /// recording is live. No-op outside `.recording` (the pill only exists then,
+    /// and the guard also blocks a menu/UI race on the `.recording → .idle` edge)
+    /// or when it is already hidden — idempotent and symmetric with
+    /// `showRecordingHUD()`. Capture is untouched; only the panel is ordered out.
+    /// The menu-bar glyph and Stop item remain the recording indicator and stop
+    /// path (R3).
     func hideRecordingHUD() {
-        guard case .recording = state else { return }
+        guard case .recording = state, !hudHidden else { return }
         hudHidden = true
         windowLifecycle.hideHUD()
     }

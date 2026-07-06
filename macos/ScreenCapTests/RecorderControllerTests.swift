@@ -549,7 +549,34 @@ final class RecorderControllerTests: XCTestCase {
         recorder._testHandleProcessTerminated(exitCode: 0)  // teardown drains .hideHUD too
 
         XCTAssertFalse(recorder.hudHidden)
-        XCTAssertGreaterThanOrEqual(fake.hideHUDCount, 2, "user-hide + teardown both order the panel out")
+        XCTAssertEqual(fake.hideHUDCount, 2, "user-hide + teardown each order the panel out exactly once")
+    }
+
+    /// Hiding twice in a row is idempotent — the second call no-ops on the
+    /// `!hudHidden` guard rather than ordering the panel out again.
+    func testHideRecordingHUDIsIdempotent() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+
+        recorder.hideRecordingHUD()
+        recorder.hideRecordingHUD()
+
+        XCTAssertTrue(recorder.hudHidden)
+        XCTAssertEqual(fake.hideHUDCount, 1, "second hide is a no-op")
+        XCTAssertTrue(recorder.state.isRecording)
+    }
+
+    /// `showRecordingHUD()` is a no-op while recording but not hidden (the pill
+    /// is already showing) — exercises the `hudHidden` arm of its guard.
+    func testShowRecordingHUDNoOpWhenNotHidden() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        let showsBefore = fake.showHUDCount
+
+        recorder.showRecordingHUD()
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertEqual(fake.showHUDCount, showsBefore, "no-op when already shown")
     }
 
     // MARK: - Audio flag (U6)
