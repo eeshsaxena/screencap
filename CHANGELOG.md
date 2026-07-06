@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.23.0] - 2026-07-06
+
+### Changed
+
+- **Confirmed allow-list is now authoritative over the privacy matrix.** A
+  user-confirmed app allow-list entry takes precedence over the context×mode
+  policy matrix, so explicitly-allowed apps are recorded as configured rather
+  than being overridden by matrix defaults (SCR-235).
+
+### Fixed
+
+- **Local recordings mask at the configured mode, not forced PUBLIC.** Local
+  captures now honor the configured privacy mode instead of being forced to the
+  PUBLIC masking level.
+- Closed case-normalization asymmetries and consent-gate side doors in the
+  allow-list / privacy-matrix path (SCR-235).
+
 ## [0.22.0] - 2026-07-03
 
 > No standalone 0.21.0 CLI release was published — 0.21.0 shipped only as the
