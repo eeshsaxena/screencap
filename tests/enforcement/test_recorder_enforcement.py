@@ -884,6 +884,68 @@ class TestMaskFrame:
         assert clean_pixel == (255, 255, 255), "Non-Slack region should be clean"
         img.close()
 
+    def test_mask_frame_leaves_allowed_browser_unmasked_for_local(self):
+        """Local recordings must NOT mask an allowed browser window.
+
+        Regression: mask_frame() forced PrivacyMode.PUBLIC for every
+        recording, so a full-screen browser (BROWSER_UNVERIFIED → MASK_WINDOW
+        under PUBLIC) was blacked out in local-only recordings even though the
+        user's INTERNAL mode maps it to ALLOW. Local masking must follow the
+        configured mode, not forced PUBLIC.
+        """
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.INTERNAL)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=False, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        geometry = {
+            "windows": [
+                {"bundle_id": "com.brave.Browser", "app_name": "Brave",
+                 "x": 0, "y": 0, "width": 100, "height": 100},
+            ],
+            "display_bounds": (0, 0, 100, 100),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # Browser is ALLOW under INTERNAL → the frame must be untouched.
+        assert img.getpixel((50, 50)) == (255, 255, 255)
+        img.close()
+
+    def test_mask_frame_masks_browser_for_cloud_intent(self):
+        """Cloud-intent recordings still mask a browser window (PUBLIC).
+
+        Pins the destination split: the same browser window that stays clean
+        for a local recording is masked for a cloud-intent one, because cloud
+        masking runs at PrivacyMode.PUBLIC (BROWSER_UNVERIFIED → MASK_WINDOW).
+        """
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.PUBLIC)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        geometry = {
+            "windows": [
+                {"bundle_id": "com.brave.Browser", "app_name": "Brave",
+                 "x": 0, "y": 0, "width": 100, "height": 100},
+            ],
+            "display_bounds": (0, 0, 100, 100),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # Browser is MASK_WINDOW under PUBLIC → the frame must be masked.
+        assert img.getpixel((50, 50)) != (255, 255, 255)
+        img.close()
+
     def test_mask_frame_noop_with_no_geometry(self):
         """mask_frame handles None geometry gracefully."""
         from PIL import Image
@@ -967,10 +1029,11 @@ class TestConfirmedAllowCascade:
         assert disp.video_allowed is False
         assert disp.keystrokes_allowed is False
 
-    def test_masking_evaluator_restricted_to_confirmed(self):
-        """The lazily-built background-masking evaluator forces PUBLIC and
-        keeps only confirmed allow entries (KTD5) — agreeing with the cloud
-        window filter instead of reusing the full live allow set."""
+    def test_cloud_masking_evaluator_restricted_to_confirmed(self):
+        """For cloud-intent recordings the lazily-built masking evaluator
+        forces PUBLIC and keeps only confirmed allow entries (KTD5) —
+        agreeing with the cloud window filter instead of reusing the full
+        live allow set."""
         from screencap.privacy.policy import PrivacyMode as _PM
 
         config = _make_config(
@@ -978,7 +1041,10 @@ class TestConfirmedAllowCascade:
             allow_apps=frozenset({"com.legacy.app", "com.confirmed.app"}),
             confirmed_allow_apps=frozenset({"com.confirmed.app"}),
         )
-        f = RecorderPrivacyFilter(config, transition_hold_seconds=0.0, secure_input_fn=None)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
         # Trigger the lazy build. image=None makes region computation fail
         # AFTER the evaluator is constructed; mask_frame swallows the error.
         f.mask_frame(None, {"windows": [{}], "display_bounds": (0, 0, 0, 0)}, 2.0)
@@ -986,3 +1052,22 @@ class TestConfirmedAllowCascade:
         assert ev.config.mode is _PM.PUBLIC
         assert ev.config.allow_apps == frozenset({"com.confirmed.app"})
         assert ev.config.is_confirmed_allowed_app("com.confirmed.app") is True
+
+    def test_local_masking_evaluator_reuses_live_policy(self):
+        """Local recordings mask via the live evaluator (configured mode,
+        full allow set) — confirmed vs legacy entries resolve exactly as the
+        runtime policy does, with no cloud shaping."""
+        from screencap.privacy.policy import PrivacyMode as _PM
+
+        config = _make_config(
+            mode=_PM.INTERNAL,
+            allow_apps=frozenset({"com.legacy.app", "com.confirmed.app"}),
+            confirmed_allow_apps=frozenset({"com.confirmed.app"}),
+        )
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=False, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+        f.mask_frame(None, {"windows": [{}], "display_bounds": (0, 0, 0, 0)}, 2.0)
+        assert f._masking_evaluator is f._evaluator
+        assert f._masking_evaluator.config.mode is _PM.INTERNAL

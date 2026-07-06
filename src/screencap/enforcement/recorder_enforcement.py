@@ -569,9 +569,14 @@ class RecorderPrivacyFilter:
     def mask_frame(self, image, geometry: dict | None, pixel_ratio: float) -> None:
         """Mask sensitive background window regions in a screenshot, in-place.
 
-        Evaluates every visible window against the privacy policy (forced to
-        public mode) and applies solid masks over windows whose action is
-        EXCLUDE or MASK_WINDOW.
+        Evaluates every visible window against the privacy policy and applies
+        solid masks over windows whose action is EXCLUDE or MASK_WINDOW. The
+        evaluation mode follows the recording's destination: cloud-intent
+        recordings mask at ``PrivacyMode.PUBLIC``; local recordings mask at the
+        user's configured mode (default ``INTERNAL``) so allowed browser /
+        cloud / AI windows are preserved while genuinely sensitive contexts
+        (password managers, banking, email, chat, calendar, auth/payment) still
+        mask.
 
         This catches sensitive apps (Slack, email, terminals) visible in the
         background that the foreground-only capture-time filter cannot block.
@@ -596,23 +601,38 @@ class RecorderPrivacyFilter:
                 _apply_mask_to_image,
                 window_regions_from_geometry,
             )
-            from screencap.privacy.policy import PrivacyMode
-
-            # Force public mode for cloud masking so CHAT/EMAIL/etc. get
-            # MASK_WINDOW instead of TEXT_REDACT (which can't mask pixels).
-            # The allow set is restricted to confirmed entries (SCR-235
-            # KTD5) so this PUBLIC-forcing surface agrees with the cloud
-            # window filter: confirmed apps stay unmasked, legacy entries
-            # take the matrix action exactly as before.
+            # Pick the masking evaluator's strictness by destination.
+            #
+            # Cloud-intent recordings mask at PUBLIC so the uploaded copy hides
+            # every sensitive context class, with the allow set restricted to
+            # confirmed entries (SCR-235 KTD5) so this surface agrees with the
+            # cloud window filter: confirmed apps stay unmasked in the cloud
+            # copy, legacy (unconfirmed) entries take the matrix action.
+            #
+            # Local recordings mask at the user's CONFIGURED mode via the live
+            # evaluator (default INTERNAL): forcing PUBLIC here blacked out
+            # every browser / cloud-storage / AI-desktop window the user
+            # explicitly allowed, masking local-only recordings wholesale.
+            # INTERNAL still masks genuinely sensitive background contexts
+            # (password managers, banking, email, chat, calendar, auth/payment
+            # remain EXCLUDE/MASK_WINDOW), so the "Slack behind the active
+            # window" case this masker targets is unaffected — and the live
+            # evaluator already resolves confirmed vs legacy entries (SCR-235).
             if not hasattr(self, "_masking_evaluator"):
-                from dataclasses import replace as _dc_replace
+                if self._cloud_intent:
+                    from dataclasses import replace as _dc_replace
 
-                from screencap.privacy.policy import DefaultPolicyEvaluator
-                _cloud_config = _dc_replace(
-                    self._evaluator.config.restricted_to_confirmed(),
-                    mode=PrivacyMode.PUBLIC,
-                )
-                self._masking_evaluator = DefaultPolicyEvaluator(_cloud_config)
+                    from screencap.privacy.policy import (
+                        DefaultPolicyEvaluator,
+                        PrivacyMode,
+                    )
+                    _cloud_config = _dc_replace(
+                        self._evaluator.config.restricted_to_confirmed(),
+                        mode=PrivacyMode.PUBLIC,
+                    )
+                    self._masking_evaluator = DefaultPolicyEvaluator(_cloud_config)
+                else:
+                    self._masking_evaluator = self._evaluator
 
             display_bounds = geometry.get("display_bounds", (0, 0, 0, 0))
             display_origin = (display_bounds[0], display_bounds[1])
