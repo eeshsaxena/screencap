@@ -882,6 +882,68 @@ class TestMaskFrame:
         assert clean_pixel == (255, 255, 255), "Non-Slack region should be clean"
         img.close()
 
+    def test_mask_frame_leaves_allowed_browser_unmasked_for_local(self):
+        """Local recordings must NOT mask an allowed browser window.
+
+        Regression: mask_frame() forced PrivacyMode.PUBLIC for every
+        recording, so a full-screen browser (BROWSER_UNVERIFIED → MASK_WINDOW
+        under PUBLIC) was blacked out in local-only recordings even though the
+        user's INTERNAL mode maps it to ALLOW. Local masking must follow the
+        configured mode, not forced PUBLIC.
+        """
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.INTERNAL)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=False, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        geometry = {
+            "windows": [
+                {"bundle_id": "com.brave.Browser", "app_name": "Brave",
+                 "x": 0, "y": 0, "width": 100, "height": 100},
+            ],
+            "display_bounds": (0, 0, 100, 100),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # Browser is ALLOW under INTERNAL → the frame must be untouched.
+        assert img.getpixel((50, 50)) == (255, 255, 255)
+        img.close()
+
+    def test_mask_frame_masks_browser_for_cloud_intent(self):
+        """Cloud-intent recordings still mask a browser window (PUBLIC).
+
+        Pins the destination split: the same browser window that stays clean
+        for a local recording is masked for a cloud-intent one, because cloud
+        masking runs at PrivacyMode.PUBLIC (BROWSER_UNVERIFIED → MASK_WINDOW).
+        """
+        from PIL import Image
+
+        config = _make_config(mode=PrivacyMode.PUBLIC)
+        f = RecorderPrivacyFilter(
+            config, cloud_intent=True, transition_hold_seconds=0.0,
+            secure_input_fn=None,
+        )
+
+        img = Image.new("RGB", (100, 100), (255, 255, 255))
+        geometry = {
+            "windows": [
+                {"bundle_id": "com.brave.Browser", "app_name": "Brave",
+                 "x": 0, "y": 0, "width": 100, "height": 100},
+            ],
+            "display_bounds": (0, 0, 100, 100),
+        }
+
+        f.mask_frame(img, geometry, pixel_ratio=1.0)
+
+        # Browser is MASK_WINDOW under PUBLIC → the frame must be masked.
+        assert img.getpixel((50, 50)) != (255, 255, 255)
+        img.close()
+
     def test_mask_frame_noop_with_no_geometry(self):
         """mask_frame handles None geometry gracefully."""
         from PIL import Image
