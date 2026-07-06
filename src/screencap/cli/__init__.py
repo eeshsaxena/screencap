@@ -137,6 +137,31 @@ def _download_nlp_models() -> None:
     _do_download()
 
 
+def _init_container_store_foreground() -> None:
+    """Create + mount the encrypted store in THIS foreground CLI process.
+
+    Shared by ``serve --install`` and ``screencap store init`` (SCR-236 KTD-5):
+    key + bundle creation must happen in a foreground process so the one-time
+    Keychain ACL prompt lands in the right identity — never a launchd-spawned
+    daemon tick. No-op when the container flow is not active. On failure prints
+    the reason and exits with the typed code.
+    """
+    from screencap import config
+
+    if not config.container_active():
+        return
+    from screencap import container
+
+    try:
+        container.ensure_store_mounted(allow_create=True)
+    except container.ContainerError as exc:
+        console.print(
+            f"[red]Cannot initialize the encrypted recordings store:[/red] "
+            f"{escape(str(exc))}"
+        )
+        raise SystemExit(exc.exit_code)
+
+
 @cli.command("serve")
 @click.option("--self-test", is_flag=True, hidden=True)
 @click.option(
@@ -177,6 +202,11 @@ def serve(
         from screencap.daemon import launchagent
 
         if install:
+            # SCR-236: create + mount the encrypted store in this foreground
+            # process before installing the LaunchAgent, so the one-time
+            # Keychain ACL prompt happens in the right identity (KTD-5). A
+            # launchd-spawned daemon would surface ABSENT instead.
+            _init_container_store_foreground()
             result = launchagent.install()
             if result.state == launchagent.STATE_INSTALLED_AND_RUNNING:
                 # Proactively register the daemon's Screen Recording +

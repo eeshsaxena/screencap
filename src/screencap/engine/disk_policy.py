@@ -78,6 +78,31 @@ class MonitorAndStop:
     def bind(self, capture_dir: Path) -> None:
         self._capture_dir = capture_dir
 
+    def _free_space_check_path(self) -> Path | None:
+        """Path whose *host* volume free space governs the guard (KTD-13).
+
+        With the encrypted container active, ``capture_dir`` sits inside a
+        mounted volume that reports free space against its *declared* size
+        (host capacity), so a naive ``disk_usage(capture_dir)`` would never
+        fire until the host is already full — the 2018 sparse-bundle
+        silent-write failure class. The host volume backing the bundle is the
+        bundle's parent (``~/.screencap``), which sits above the mountpoint
+        and always exists. With the container off, behavior is unchanged: the
+        capture dir's own volume is the host (parent fallback when it does not
+        exist yet).
+        """
+        if self._capture_dir is None:
+            return None
+        from screencap import config
+
+        if config.container_active():
+            from screencap import container
+
+            # Re-resolved every check (not cached) so a re-attach can't strand
+            # a stale host path.
+            return container.default_bundle_path().parent
+        return self._capture_dir if self._capture_dir.exists() else self._capture_dir.parent
+
     def preflight(self) -> None:
         from screencap.config import get_disk_stop_mb, get_disk_warn_mb
         from screencap.engine.screen_recorder import DiskTooLowAtStart
@@ -94,11 +119,7 @@ class MonitorAndStop:
         if self._capture_dir is None:
             return
 
-        check_path = (
-            self._capture_dir.parent
-            if not self._capture_dir.exists()
-            else self._capture_dir
-        )
+        check_path = self._free_space_check_path()
         try:
             free = shutil.disk_usage(check_path).free
             warn_bytes = self._warn_mb * 1_048_576
@@ -125,7 +146,7 @@ class MonitorAndStop:
             return
 
         try:
-            free = shutil.disk_usage(self._capture_dir).free
+            free = shutil.disk_usage(self._free_space_check_path()).free
             free_mb = free / 1_048_576
 
             if self._stop_mb > 0 and free_mb < self._stop_mb:

@@ -184,6 +184,22 @@ def get_data_root() -> Path:
     return _DEFAULT_RECORDINGS
 
 
+def container_active() -> bool:
+    """True iff the encrypted container flow is actually in effect (SCR-236).
+
+    The flag can be *on but bypassed*: ``SCREENCAP_RECORDINGS_DIR`` set or a
+    non-default ``recordings_dir`` routes recordings to a plaintext location
+    and no container is mounted (KTD-8). This folds the flag and the bypass
+    into the single signal every container caller — the daemon mount gate
+    (``serve``), the disk-space guard (KTD-13), and the CLI funnel — must gate
+    on, so they never disagree about whether the store is live.
+
+    It is exactly "flag on AND :func:`get_data_root` resolved to the default
+    mountpoint" (any bypass makes ``get_data_root`` return a different path).
+    """
+    return container_enabled() and get_data_root() == _DEFAULT_RECORDINGS
+
+
 def get_store_dir() -> Path:
     """Return ``<data_root>/.store/``, the reserved dot-directory for sidecar DBs.
 

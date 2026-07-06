@@ -41,6 +41,7 @@ explicit ``timeout=``) but raises typed exceptions instead of returning
 
 from __future__ import annotations
 
+import fcntl
 import math
 import os
 import plistlib
@@ -149,6 +150,33 @@ class ContainerKeyMissingError(FatalContainerError):
 
     Minting a fresh key here would orphan every recording, so this is a
     loud operator stop, never a silent re-create.
+    """
+
+
+class RogueMountpointError(FatalContainerError):
+    """The mountpoint holds non-container content and is not a mounted volume.
+
+    Mirrors ``socket.RogueFileAtSocketPath``: never auto-cleaned — an
+    operator must move/remove the stray content. In v1 this is typically a
+    pre-existing plaintext ``recordings/`` from before the container flag
+    was turned on (there is no migration in v1).
+    """
+
+
+class StoreNotInitializedError(FatalContainerError):
+    """No store exists and this is not a foreground create context (KTD-5).
+
+    A launchd-spawned daemon that finds the ABSENT state stops here rather
+    than minting a key in the wrong ACL identity; the message names
+    ``screencap store init``.
+    """
+
+
+class StoreLockedError(FatalContainerError):
+    """The user explicitly locked the store (``store lock``) — refuse to remount.
+
+    Cleared only by ``store unlock``. A cron-driven auto-spawned daemon must
+    not silently remount a store the user locked (KTD-4).
     """
 
 
@@ -678,6 +706,136 @@ def open_hardened_lock(path: Path) -> int:
         raise RogueLockError(f"lock path {path} is a symlink") from exc
 
 
+# ---------------------------------------------------------------------------
+# Mount orchestration — the one mount owner (KTD-3 / KTD-4 / KTD-10)
+# ---------------------------------------------------------------------------
+
+
+def _run_dir() -> Path:
+    """``~/.screencap/run`` — plaintext, outside the container (KTD-2)."""
+    return Path.home() / ".screencap" / "run"
+
+
+def _mount_lock_path() -> Path:
+    return _run_dir() / "mount.lock"
+
+
+def user_lock_path() -> Path:
+    """The ``store lock`` sentinel (KTD-4). Presence ⇒ refuse to auto-remount."""
+    return _run_dir() / "store.locked"
+
+
+def is_user_locked() -> bool:
+    """True iff the user locked the store. Uses ``lexists`` so a planted
+    symlink still reads as locked (fail-safe: refuse to remount)."""
+    return os.path.lexists(str(user_lock_path()))
+
+
+def set_user_lock() -> None:
+    """Create the user-lock sentinel with the hardened ``0o600`` /
+    ``O_NOFOLLOW`` discipline (``store lock``)."""
+    os.close(open_hardened_lock(user_lock_path()))
+
+
+def clear_user_lock() -> None:
+    """Remove the user-lock sentinel (``store unlock``)."""
+    try:
+        os.unlink(str(user_lock_path()))
+    except FileNotFoundError:
+        pass
+
+
+def ensure_store_mounted(*, allow_create: bool = False) -> str:
+    """The ONE mount owner (KTD-3). Return the live recordings mountpoint.
+
+    Serialized by ``~/.screencap/run/mount.lock`` (``fcntl.flock``), so two
+    racing entrants attach exactly once and the loser reuses the winner's
+    mount. Implements the store state machine (see the plan's HTD flowchart):
+    reuse a healthy mount; attach a LOCKED bundle with the Keychain key;
+    hard-stop on user-LOCKED, ROGUE, KEY_MISSING (AE2), and — unless
+    ``allow_create`` — ABSENT (naming ``store init``).
+
+    ``allow_create=True`` is passed ONLY by a foreground CLI process
+    (``store init`` / ``serve --install``), never a launchd-spawned daemon
+    tick — the one-time Keychain ACL prompt needs the right ``auth.py``
+    identity. Creation is durable-key-first, then bundle, and reuses an
+    existing key when only the bundle is missing (crash-after-key recovery).
+
+    The mount is **not** torn down on daemon exit or idle-shutdown (KTD-4) —
+    the Swift app and MCP agents read files with no daemon in the byte path.
+
+    Call only when :func:`config.container_active`.
+
+    Raises:
+        StoreLockedError / RogueMountpointError / StoreNotInitializedError /
+        ContainerKeyMissingError: operator-fatal (exit 1).
+        ContainerBusyError / ContainerKeyLockedError: retryable (exit 75).
+    """
+    from screencap import config
+
+    mountpoint = Path(config.get_data_root())
+    bundle = default_bundle_path()
+    lock_fd = open_hardened_lock(_mount_lock_path())
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return _ensure_mounted_locked(bundle, mountpoint, allow_create=allow_create)
+    finally:
+        os.close(lock_fd)
+
+
+def _ensure_mounted_locked(bundle: Path, mountpoint: Path, *, allow_create: bool) -> str:
+    """State machine body — runs under the held ``mount.lock``."""
+    # 1. User explicitly locked the store — never silently remount (KTD-4).
+    if is_user_locked():
+        raise StoreLockedError(
+            "the recordings store is locked; run `screencap store unlock` to remount"
+        )
+
+    # 2. Our bundle already attached → reuse (re-harden), never double-attach.
+    existing = container_mountpoint(bundle)
+    if existing:
+        harden_mount(existing)
+        return existing
+    if existing == "":
+        # Attached but not mounted yet — a transient DiskArbitration state.
+        raise ContainerBusyError("container is attached but not mounted yet; retry")
+
+    # 3. ROGUE: non-container content sits at the mountpoint and it is not a
+    #    mounted volume (dot-entries like .store/.fseventsd are ours — ignore).
+    if mountpoint.exists() and not os.path.ismount(str(mountpoint)):
+        if any(not entry.name.startswith(".") for entry in mountpoint.iterdir()):
+            raise RogueMountpointError(
+                f"{mountpoint} holds non-container content and is not a mounted "
+                f"volume; refusing to overwrite it (move it aside, then retry)"
+            )
+
+    # 4. Bundle present (LOCKED) → attach with the Keychain key.
+    if bundle.exists():
+        key = get_container_key()
+        if key is None:
+            raise ContainerKeyMissingError(
+                f"the encrypted store at {bundle} exists but its Keychain key is "
+                f"gone — recordings are unrecoverable ciphertext (see SECURITY.md). "
+                f"Nothing was destroyed."
+            )
+        return attach_container(bundle, key, mountpoint)
+
+    # 5. Bundle absent (ABSENT).
+    if not allow_create:
+        raise StoreNotInitializedError(
+            "no encrypted recordings store exists; run `screencap store init` to "
+            "create one (a foreground process approves the one-time Keychain access)"
+        )
+    # Foreground create: durable key first, then bundle. A key-present but
+    # bundle-absent state (crash after key-write, or a wiped bundle) reuses
+    # the existing key rather than dead-stopping (Resolve During Implementation).
+    key = get_container_key()
+    if key is None:
+        key = create_container_key(bundle)
+    create_container(bundle, key)
+    return attach_container(bundle, key, mountpoint)
+
+
 __all__ = [
     "VOLUME_NAME",
     "SPARSE_BAND_SIZE_SECTORS",
@@ -691,11 +849,19 @@ __all__ = [
     "RogueLockError",
     "ContainerKeyLockedError",
     "ContainerKeyMissingError",
+    "RogueMountpointError",
+    "StoreNotInitializedError",
+    "StoreLockedError",
     "KEY_SERVICE",
     "KEY_ACCOUNT",
     "get_container_key",
     "create_container_key",
     "default_bundle_path",
+    "ensure_store_mounted",
+    "user_lock_path",
+    "is_user_locked",
+    "set_user_lock",
+    "clear_user_lock",
     "container_mountpoint",
     "is_attached",
     "host_backing_free_bytes",

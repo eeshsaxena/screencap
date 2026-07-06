@@ -80,6 +80,15 @@ def serve(
             return 0
 
         resolved_socket_path = Path(socket_path).expanduser() if socket_path else default_socket_path()
+
+        # SCR-236: mount the encrypted store BEFORE binding the socket, so the
+        # daemon never serves any verb against an unmounted store (KTD-3/KTD-10).
+        # The mount outlives the daemon (KTD-4) — no unmount in finally or the
+        # idle-shutdown path.
+        mount_exit_code = _mount_store_if_enabled()
+        if mount_exit_code is not None:
+            return mount_exit_code
+
         listener = bind_unix_socket(resolved_socket_path)
 
         async def run() -> int:
@@ -194,6 +203,30 @@ def serve(
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
+
+
+def _mount_store_if_enabled() -> int | None:
+    """Mount the encrypted store before the daemon binds (SCR-236 KTD-3/KTD-10).
+
+    Returns ``None`` on success or when the container flow is not active;
+    otherwise an exit code (``EX_TEMPFAIL`` for retryable states so launchd
+    retries, ``1`` for operator-fatal states) after printing the reason. The
+    daemon never runs ``store init`` itself: a launchd-spawned daemon that
+    finds ABSENT stops with a message naming ``screencap store init`` —
+    key creation only happens in a foreground CLI process (KTD-5).
+    """
+    from screencap import config
+
+    if not config.container_active():
+        return None
+    from screencap import container
+
+    try:
+        container.ensure_store_mounted()
+        return None
+    except container.ContainerError as exc:
+        _print_stderr(f"screencap: cannot mount encrypted recordings store: {exc}")
+        return exc.exit_code
 
 
 def _print_stderr(message: str) -> None:
