@@ -18,12 +18,20 @@ protocol WindowLifecycle: AnyObject {
     func hideMainWindow()
     /// Bring the main window back after a recording ends.
     func restoreMainWindow()
+    /// Present the one-time first-hide menu-bar hint (U5). `onComplete` fires once
+    /// after the hint has actually been shown (dismissed or timed out), so the
+    /// caller marks the "shown" flag only when the user had a chance to see it.
+    func presentHideHint(onComplete: @escaping () -> Void)
 }
 
 enum WindowLifecycleFactory {
     /// No-op under the XCTest host (mirrors `ScreenCapApp.isRunningUnderTests`) so
     /// controller tests that drive `started` / `stopped` transitions never spawn a
     /// real panel or orderOut the test host's windows; live otherwise.
+    /// `@MainActor` because it constructs main-actor-isolated implementations; it
+    /// is only ever evaluated as a default arg of `RecorderController.init`, which
+    /// is itself `@MainActor`.
+    @MainActor
     static func makeDefault() -> WindowLifecycle {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             return NoopWindowLifecycle()
@@ -36,6 +44,7 @@ enum WindowLifecycleFactory {
 @MainActor
 final class LiveWindowLifecycle: WindowLifecycle {
     private let hud = RecordingHUDPanelController()
+    private let hintPanel = HUDHintPanelController()
 
     func showHUD(for recorder: RecorderController) {
         hud.show(recorder: recorder)
@@ -43,6 +52,10 @@ final class LiveWindowLifecycle: WindowLifecycle {
 
     func hideHUD() {
         hud.hide()
+    }
+
+    func presentHideHint(onComplete: @escaping () -> Void) {
+        hintPanel.present(onComplete: onComplete)
     }
 
     func hideMainWindow() {
@@ -82,4 +95,5 @@ final class NoopWindowLifecycle: WindowLifecycle {
     func hideHUD() {}
     func hideMainWindow() {}
     func restoreMainWindow() {}
+    func presentHideHint(onComplete: @escaping () -> Void) {}
 }
