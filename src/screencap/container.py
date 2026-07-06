@@ -140,6 +140,18 @@ class RogueLockError(FatalContainerError):
     """
 
 
+class ContainerKeyLockedError(RetryableContainerError):
+    """The login Keychain is locked; the key read should be retried (U2)."""
+
+
+class ContainerKeyMissingError(FatalContainerError):
+    """The bundle exists but its Keychain key is gone — unrecoverable (AE2).
+
+    Minting a fresh key here would orphan every recording, so this is a
+    loud operator stop, never a silent re-create.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -152,6 +164,91 @@ def default_bundle_path() -> Path:
     by ``config``; this is only the on-disk bundle artifact.
     """
     return Path.home() / ".screencap" / "store.sparsebundle"
+
+
+# ---------------------------------------------------------------------------
+# Keychain-backed key lifecycle (KTD-5)
+# ---------------------------------------------------------------------------
+
+KEY_SERVICE = "com.screencap.container"
+"""Keychain ``service`` for the container passphrase. Same shape as
+``network/crypto.SERVICE`` (``com.screencap.network``); stable — changing
+it orphans the store."""
+
+KEY_ACCOUNT = "key"
+"""Keychain ``account`` for the container passphrase."""
+
+_KEY_RANDOM_BYTES = 32
+"""Entropy behind the passphrase: 32 random bytes = 256 bits."""
+
+
+def get_container_key() -> bytes | None:
+    """Read-only lookup of the container passphrase. ``None`` if absent.
+
+    Diverges from ``network/crypto.get_or_create_kek`` on purpose (KTD-5):
+    the container read path **never creates**. A missing key with an
+    existing bundle is unrecoverable and must surface loudly (AE2), not be
+    papered over with a fresh key that orphans the store.
+
+    The stored secret is the base64 text of 32 random bytes, and *that
+    ASCII text is the passphrase* piped to ``hdiutil`` — never the raw
+    random bytes, which could contain a ``0x0a`` and trip the KTD-6
+    no-trailing-newline rule (or an embedded NUL on stdin). Returning the
+    ASCII bytes keeps the passphrase newline/NUL-free by construction.
+
+    Raises:
+        ContainerKeyLockedError: the login Keychain is locked (retryable —
+            ``keyring`` raises ``KeyringLocked`` rather than hanging).
+    """
+    # Lazy import: keyring's Darwin backend dispatches to the Security
+    # framework on first access; a module-level import would slow
+    # ``screencap --help``. Mirrors network/crypto.py.
+    import keyring
+    import keyring.errors
+
+    try:
+        stored = keyring.get_password(KEY_SERVICE, KEY_ACCOUNT)
+    except keyring.errors.KeyringLocked as exc:
+        raise ContainerKeyLockedError("login Keychain is locked") from exc
+    if stored is None:
+        return None
+    return stored.encode("ascii")
+
+
+def create_container_key(bundle: Path) -> bytes:
+    """Create and store a fresh container passphrase; return its bytes.
+
+    Refuses when the bundle already exists (KTD-5): a new key would orphan
+    every recording inside the existing store. Creation is only legal when
+    *neither* the bundle *nor* a key exists — the ``store init`` /
+    ``serve --install`` foreground path does the check-lock-check around
+    this call. Runs only in a foreground CLI process (the one-time ACL
+    prompt needs the right ``auth.py`` identity), never a launchd tick.
+
+    Returns the passphrase bytes (base64 ASCII of 32 random bytes) so the
+    caller can attach immediately without a second Keychain read.
+
+    Raises:
+        FatalContainerError: the bundle already exists.
+        ContainerKeyLockedError: the Keychain is locked.
+    """
+    import base64
+    import secrets
+
+    import keyring
+    import keyring.errors
+
+    if Path(bundle).exists():
+        raise FatalContainerError(
+            f"refusing to create a container key: bundle already exists at "
+            f"{bundle} (a new key would orphan it)"
+        )
+    passphrase = base64.b64encode(secrets.token_bytes(_KEY_RANDOM_BYTES)).decode("ascii")
+    try:
+        keyring.set_password(KEY_SERVICE, KEY_ACCOUNT, passphrase)
+    except keyring.errors.KeyringLocked as exc:
+        raise ContainerKeyLockedError("login Keychain is locked") from exc
+    return passphrase.encode("ascii")
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +661,12 @@ __all__ = [
     "ContainerAuthError",
     "ContainerCorruptError",
     "RogueLockError",
+    "ContainerKeyLockedError",
+    "ContainerKeyMissingError",
+    "KEY_SERVICE",
+    "KEY_ACCOUNT",
+    "get_container_key",
+    "create_container_key",
     "default_bundle_path",
     "container_mountpoint",
     "is_attached",
