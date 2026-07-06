@@ -96,6 +96,40 @@ final class RecorderController: ObservableObject {
     static let requiredPermissionsErrorMessage =
         "Grant Screen Recording, Accessibility, and Input Monitoring permissions before recording."
 
+    /// Minimum spacing between two staleness-defeating daemon restarts (see
+    /// `refreshDaemonGrantsDefeatingStaleness`). The grant-watch fires both on
+    /// app re-activation (immediate when the user returns from System Settings)
+    /// and on a ~5s timer; 8s keeps a coincident activation + timer tick from
+    /// double-restarting while still picking up a fresh grant within one cycle.
+    static let staleDaemonRestartCooldown: TimeInterval = 8.0
+
+    /// Decide whether to kickstart a fresh daemon to defeat a stale grant probe.
+    ///
+    /// The daemon's `daemon.info` grant probe reports TCC state as of the
+    /// daemon's *process launch*, not live state: its "fresh subprocess" still
+    /// inherits the daemon's launch-time TCC responsibility context (Screen
+    /// Recording resolves through the responsible-app rollup, cached at launch),
+    /// so a permission granted *after* the daemon started stays invisible until
+    /// the daemon restarts. While a permission surface is visible and a required
+    /// grant still reads denied, a bounded restart re-reads live state instead of
+    /// stranding the user on a permission they have already granted.
+    ///
+    /// Gated so it never fires during a recording (the kickstart would kill
+    /// capture), only when the daemon transport is actually live (never mid
+    /// install / CLI-fallback, where the install flow owns bring-up), and
+    /// rate-limited by `cooldown`.
+    static func shouldRestartStaleDaemon(
+        anyRequiredDenied: Bool,
+        isRecording: Bool,
+        transportIsDaemon: Bool,
+        secondsSinceLastRestart: TimeInterval?,
+        cooldown: TimeInterval
+    ) -> Bool {
+        guard anyRequiredDenied, !isRecording, transportIsDaemon else { return false }
+        guard let secondsSinceLastRestart else { return true }
+        return secondsSinceLastRestart >= cooldown
+    }
+
     @Published private(set) var state: RecordingState = .idle {
         didSet {
             // The capture-health advisory is scoped to an active recording.
@@ -151,6 +185,19 @@ final class RecorderController: ObservableObject {
 
     private weak var index: RecordingsIndex?
     private weak var permissions: PermissionController?
+
+    /// When the last staleness-defeating daemon restart fired, so
+    /// `refreshDaemonGrantsDefeatingStaleness` can rate-limit itself across the
+    /// grant-watch's activation + timer ticks. `nil` until the first restart.
+    private var lastDaemonRestartAt: Date?
+
+    /// True only while a staleness-defeating daemon kickstart is in flight (the
+    /// `daemonService.reload()` + rebind window inside `restartDaemonToRefreshGrants`).
+    /// `start()` refuses during this window so a recording launched from a permission
+    /// surface doesn't dispatch to a daemon that is mid-relaunch (which would fail
+    /// over to CLI and wrongly demand every permission). Cleared via `defer`, and the
+    /// window is ~1s, so a retry succeeds immediately.
+    private var isDefeatingStaleness = false
 
     /// Pure value-type state machine owning `state`, `pendingStartCursor`,
     /// and `recordingStartedAt`. All state transitions route through it; the
@@ -230,6 +277,14 @@ final class RecorderController: ObservableObject {
     /// it on via the daemon body.
     func start(name: String? = nil, audio: Bool? = nil) {
         guard !state.isRecording else { return }
+        // A staleness-defeating daemon kickstart is in flight: the daemon is mid
+        // relaunch, so dispatching a start now would fail over to CLI and wrongly
+        // demand every permission. The window is ~1s — surface a clear transient
+        // reason and let the user retry rather than start against a dying daemon.
+        if isDefeatingStaleness {
+            lastError = "ScreenCap is applying your updated permissions — try again in a moment."
+            return
+        }
         if transport == .cliFallback, let permissions, !permissions.allRequiredGranted {
             lastError = Self.requiredPermissionsErrorMessage
             return
@@ -309,6 +364,52 @@ final class RecorderController: ObservableObject {
     func refreshDaemonGrants() async {
         if case .daemon(let grants) = await daemonService.probe() {
             permissions?.updateDaemonGrants(grants)
+        }
+    }
+
+    /// The grant-watch refresh used by the onboarding wizard and the
+    /// permission-repair takeover. Re-reads the daemon's grant snapshot and, when
+    /// a required grant still reads denied, kickstarts a fresh daemon to defeat
+    /// the stale grant probe (see `shouldRestartStaleDaemon` for why a restart is
+    /// the only way a granted-after-launch permission becomes visible). This is
+    /// what turns the "listening for permission change…" footer into something
+    /// that actually detects a change the running daemon would otherwise report
+    /// as still-missing forever — the bug that stranded users who had already
+    /// granted Screen Recording in System Settings.
+    func refreshDaemonGrantsDefeatingStaleness(now: Date = Date()) async {
+        await refreshDaemonGrants()
+        guard let permissions else { return }
+        let secondsSinceLastRestart = lastDaemonRestartAt.map { now.timeIntervalSince($0) }
+        guard Self.shouldRestartStaleDaemon(
+            anyRequiredDenied: permissions.daemonGrants.anyRequiredDenied,
+            isRecording: state.isRecording,
+            transportIsDaemon: transport == .daemon,
+            secondsSinceLastRestart: secondsSinceLastRestart,
+            cooldown: Self.staleDaemonRestartCooldown
+        ) else { return }
+        lastDaemonRestartAt = now
+        await restartDaemonToRefreshGrants()
+    }
+
+    /// Best-effort daemon kickstart used purely to defeat the stale grant probe.
+    /// Unlike `reloadDaemon()` it never surfaces a user-facing `lastError`: a
+    /// failed staleness restart just leaves the last-known grants in place for
+    /// the next watch tick to retry. After a successful kickstart the relaunched
+    /// daemon needs a moment to rebind `api.sock`, so we wait briefly before the
+    /// live re-read; `refreshDaemonGrants` preserves the last-known grants on a
+    /// transient miss, so the rows never flicker to "couldn't verify" and the
+    /// next timer tick is the backstop if the daemon is slow to return.
+    private func restartDaemonToRefreshGrants() async {
+        isDefeatingStaleness = true
+        defer { isDefeatingStaleness = false }
+        switch await daemonService.reload() {
+        case .success:
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            await refreshDaemonGrants()
+        case .failure(let error):
+            recorderLogger.info(
+                "Stale-grant daemon restart failed: \(String(describing: error), privacy: .public)"
+            )
         }
     }
 
@@ -974,6 +1075,10 @@ extension RecorderController {
 
     func _testSetTransport(_ transport: RecorderTransport) {
         self.transport = transport
+    }
+
+    func _testSetDefeatingStaleness(_ value: Bool) {
+        isDefeatingStaleness = value
     }
 
     func _testCheckPermissionsDuringRecording() {

@@ -535,6 +535,160 @@ final class RecorderControllerTests: XCTestCase {
         await recorder._testCancelDaemonTask()
     }
 
+    // MARK: - Stale daemon grant probe (defeat launch-time TCC pin)
+
+    /// The core regression: a required grant reads denied while a permission
+    /// surface is up, we are not recording, and the daemon transport is live, so
+    /// a fresh daemon must be kicked to escape the launch-time-pinned grant probe.
+    /// The first restart is unconditional (no prior restart to rate-limit).
+    func testShouldRestartStaleDaemonWhenRequiredGrantDenied() {
+        XCTAssertTrue(RecorderController.shouldRestartStaleDaemon(
+            anyRequiredDenied: true,
+            isRecording: false,
+            transportIsDaemon: true,
+            secondsSinceLastRestart: nil,
+            cooldown: RecorderController.staleDaemonRestartCooldown
+        ))
+    }
+
+    /// Never kickstart the daemon during a recording — the restart kills capture.
+    func testShouldNotRestartStaleDaemonWhileRecording() {
+        XCTAssertFalse(RecorderController.shouldRestartStaleDaemon(
+            anyRequiredDenied: true,
+            isRecording: true,
+            transportIsDaemon: true,
+            secondsSinceLastRestart: nil,
+            cooldown: RecorderController.staleDaemonRestartCooldown
+        ))
+    }
+
+    /// Only the daemon transport suffers the stale grant probe; on CLI-fallback
+    /// the install flow owns bring-up, so a stale-grant restart must not fire.
+    func testShouldNotRestartStaleDaemonOnCLIFallback() {
+        XCTAssertFalse(RecorderController.shouldRestartStaleDaemon(
+            anyRequiredDenied: true,
+            isRecording: false,
+            transportIsDaemon: false,
+            secondsSinceLastRestart: nil,
+            cooldown: RecorderController.staleDaemonRestartCooldown
+        ))
+    }
+
+    /// Nothing to defeat once every required grant reads granted.
+    func testShouldNotRestartStaleDaemonWhenAllGranted() {
+        XCTAssertFalse(RecorderController.shouldRestartStaleDaemon(
+            anyRequiredDenied: false,
+            isRecording: false,
+            transportIsDaemon: true,
+            secondsSinceLastRestart: nil,
+            cooldown: RecorderController.staleDaemonRestartCooldown
+        ))
+    }
+
+    /// Rate limit: a coincident activation + timer tick must not double-restart
+    /// within the cooldown, but a later tick past it may restart again.
+    func testStaleDaemonRestartIsRateLimitedByCooldown() {
+        XCTAssertFalse(RecorderController.shouldRestartStaleDaemon(
+            anyRequiredDenied: true,
+            isRecording: false,
+            transportIsDaemon: true,
+            secondsSinceLastRestart: 3,
+            cooldown: 8
+        ))
+        XCTAssertTrue(RecorderController.shouldRestartStaleDaemon(
+            anyRequiredDenied: true,
+            isRecording: false,
+            transportIsDaemon: true,
+            secondsSinceLastRestart: 9,
+            cooldown: 8
+        ))
+    }
+
+    /// End-to-end wiring: a denied daemon grant snapshot drives exactly one
+    /// kickstart, and the post-restart re-read surfaces the now-live grant into
+    /// PermissionController — the fix for the "granted but still waiting" strand.
+    func testDefeatingStalenessRestartsDaemonAndPicksUpLiveGrant() async {
+        let denied = DaemonPermissionGrants(
+            screenRecording: .denied, accessibility: .denied, inputMonitoring: .denied
+        )
+        let granted = DaemonPermissionGrants(
+            screenRecording: .granted, accessibility: .granted, inputMonitoring: .granted
+        )
+        let daemon = StaleGrantDaemonSessionService(grants: denied)
+        daemon.grantsAfterReload = granted
+
+        let suite = "StaleDaemonRestartTests"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        let permissions = PermissionController(defaults: defaults)
+
+        let recorder = RecorderController(daemonService: daemon)
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.daemon)
+        permissions.updateDaemonGrants(denied)
+
+        await recorder.refreshDaemonGrantsDefeatingStaleness()
+
+        XCTAssertEqual(daemon.reloadCount, 1, "a stale denied grant must trigger exactly one kickstart")
+        XCTAssertTrue(
+            permissions.daemonGrants.allRequiredGranted,
+            "the post-restart re-read must surface the live grant"
+        )
+    }
+
+    /// End-to-end rate limit: with grants that stay denied (never granted), the
+    /// wired path restarts once, suppresses a second restart inside the cooldown,
+    /// and restarts again past it — pinning `lastDaemonRestartAt` gating through
+    /// the async method, not just the pure `shouldRestartStaleDaemon`.
+    func testDefeatingStalenessRateLimitsRestartsAcrossCooldown() async {
+        let denied = DaemonPermissionGrants(
+            screenRecording: .denied, accessibility: .denied, inputMonitoring: .denied
+        )
+        // No grantsAfterReload: grants stay denied so only the cooldown — not a
+        // flip to granted — can suppress the second restart.
+        let daemon = StaleGrantDaemonSessionService(grants: denied)
+
+        let suite = "StaleDaemonRestartCooldownTests"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        let permissions = PermissionController(defaults: defaults)
+
+        let recorder = RecorderController(daemonService: daemon)
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.daemon)
+        permissions.updateDaemonGrants(denied)
+
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        await recorder.refreshDaemonGrantsDefeatingStaleness(now: t0)
+        XCTAssertEqual(daemon.reloadCount, 1, "first stale refresh restarts")
+
+        await recorder.refreshDaemonGrantsDefeatingStaleness(now: t0.addingTimeInterval(3))
+        XCTAssertEqual(daemon.reloadCount, 1, "a refresh within the cooldown must not restart again")
+
+        await recorder.refreshDaemonGrantsDefeatingStaleness(
+            now: t0.addingTimeInterval(RecorderController.staleDaemonRestartCooldown + 1)
+        )
+        XCTAssertEqual(daemon.reloadCount, 2, "a refresh past the cooldown restarts again")
+    }
+
+    /// While a staleness-defeating kickstart is in flight, a start() must refuse
+    /// rather than dispatch to a daemon that is mid-relaunch — it surfaces a clear
+    /// transient reason and does NOT enter .starting or reach the daemon.
+    func testStartRefusesWhileDefeatingStalenessKickstartInFlight() {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: nil)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+        recorder._testSetDefeatingStaleness(true)
+
+        recorder.start(name: "x", audio: nil)
+
+        XCTAssertFalse(recorder.state.isRecording, "start must not enter .starting during a kickstart")
+        XCTAssertFalse(daemon.startRecordingCalled, "start must not reach a daemon that is mid-relaunch")
+        XCTAssertNotNil(recorder.lastError, "start must surface a clear transient reason")
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(
@@ -650,6 +804,36 @@ final class CapturingDaemonSessionService: DaemonSessionService {
     func stopRecording(force: Bool) async throws {}
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome { .other(localizedDescription: "") }
     func reload() async -> Result<Void, DaemonSession.ReloadError> { .success(()) }
+    func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome {
+        .shutdown
+    }
+}
+
+/// Fake daemon service whose grant snapshot flips only on `reload()`, modelling
+/// the launch-time-pinned grant probe that a fresh daemon defeats: every `probe`
+/// reports `grants` unchanged until a kickstart swaps in `grantsAfterReload`.
+/// Counts restarts so the staleness-defeating refresh can be pinned end-to-end.
+@MainActor
+private final class StaleGrantDaemonSessionService: DaemonSessionService {
+    var grants: DaemonPermissionGrants
+    /// Grants the daemon reports once restarted (the live state a fresh process reads).
+    var grantsAfterReload: DaemonPermissionGrants?
+    private(set) var reloadCount = 0
+
+    init(grants: DaemonPermissionGrants) { self.grants = grants }
+
+    func probe() async -> DaemonSession.ProbeOutcome { .daemon(grants: grants) }
+    func snapshot() async -> DaemonSession.SnapshotOutcome { .noActiveSession }
+    func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording {
+        DaemonSession.StartedRecording(cursor: 0, sessionID: "stale", audioEcho: nil)
+    }
+    func stopRecording(force: Bool) async throws {}
+    func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome { .other(localizedDescription: "") }
+    func reload() async -> Result<Void, DaemonSession.ReloadError> {
+        reloadCount += 1
+        if let grantsAfterReload { grants = grantsAfterReload }
+        return .success(())
+    }
     func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome {
         .shutdown
     }
