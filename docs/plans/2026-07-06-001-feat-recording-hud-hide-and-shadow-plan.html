@@ -1,0 +1,293 @@
+<meta charset="utf-8">
+<title>Recording HUD hide control and shadow cleanup - Plan</title>
+<style>
+  :root {
+    --paper: #FFFDF7; --warm: #F6F2E9; --fill: #EDE6D6; --border: #E0D8C6;
+    --ink: #1C2420; --secondary: #52584F; --muted: #86795F;
+    --teal: #0E7C6B; --teal-soft: #E1EFEC; --amber-text: #A97F2E; --amber-soft: #F7EED9;
+    --rust: #B4552B; --rust-soft: #F5E6DE;
+    --mono: ui-monospace, "SF Mono", "IBM Plex Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Public Sans", "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--warm); color: var(--ink);
+    font-family: var(--sans); font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased; }
+  .page { max-width: 900px; margin: 0 auto; padding: 2.5rem 1.5rem 4rem;
+    background: var(--paper); }
+  h1 { font-size: 27px; font-weight: 600; line-height: 1.2; margin: 0 0 0.4rem; letter-spacing: -0.01em; }
+  h2 { font-size: 20px; font-weight: 600; margin: 2.4rem 0 0.9rem; padding-bottom: 0.35rem;
+    border-bottom: 1px solid var(--border); scroll-margin-top: 1rem; }
+  h3 { font-size: 15px; font-weight: 600; margin: 1.6rem 0 0.6rem; color: var(--ink); }
+  p { max-width: 72ch; margin: 0 0 0.85rem; }
+  a { color: var(--teal); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.85em; background: var(--fill);
+    padding: 0.1em 0.35em; border-radius: 4px; }
+  .eyebrow { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--amber-text); margin: 0 0 0.5rem; }
+  .meta { display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem; margin: 1rem 0 0; padding: 0; list-style: none; }
+  .meta .pill { font-family: var(--mono); font-size: 12px; background: var(--warm);
+    border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.7rem; color: var(--secondary); }
+  .meta .pill b { color: var(--ink); font-weight: 600; }
+  nav.toc { margin: 1.6rem 0 0; padding: 0.8rem 1rem; background: var(--warm);
+    border: 1px solid var(--border); border-radius: 10px; font-size: 14px; }
+  nav.toc ul { margin: 0.3rem 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; }
+  nav.toc a { color: var(--secondary); }
+  section { margin: 0; }
+  .lede { font-size: 17px; color: var(--secondary); max-width: 74ch; }
+  table.reqs { width: 100%; border-collapse: collapse; margin: 0.6rem 0 0.4rem; font-size: 15px; }
+  table.reqs th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); border-bottom: 1px solid var(--border); padding: 0.4rem 0.6rem 0.4rem 0; font-weight: 600; }
+  table.reqs td { border-bottom: 1px solid var(--border); padding: 0.6rem 0.6rem 0.6rem 0; vertical-align: top; }
+  table.reqs td:first-child { width: 3.2rem; }
+  .idchip { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--teal);
+    background: var(--teal-soft); border-radius: 5px; padding: 0.12rem 0.4rem; white-space: nowrap; }
+  .grp { font-weight: 600; font-size: 14px; color: var(--rust); margin: 1.4rem 0 0.2rem; }
+  .card { background: var(--warm); border: 1px solid var(--border); border-radius: 10px;
+    padding: 0.9rem 1.1rem; margin: 0.7rem 0; }
+  .card .dt { font-weight: 600; }
+  .callout { border-radius: 10px; padding: 0.9rem 1.1rem; margin: 0.7rem 0; }
+  .callout .lbl { font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; margin: 0 0 0.4rem; }
+  .callout.defer { background: var(--fill); }
+  .callout.defer .lbl { color: var(--muted); }
+  .callout.assume { background: var(--amber-soft); }
+  .callout.assume .lbl { color: var(--amber-text); }
+  .callout.q { background: var(--teal-soft); }
+  .callout.q .lbl { color: var(--teal); }
+  ul.tight { margin: 0.3rem 0; padding-left: 1.2rem; }
+  ul.tight li { margin: 0.25rem 0; max-width: 72ch; }
+  .ae { margin: 0.7rem 0; padding-left: 0.9rem; border-left: 3px solid var(--border); }
+  .ae .aeid { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--rust); }
+  .ae .cov { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  figure { margin: 1.2rem 0; }
+  figure svg { width: 100%; height: auto; display: block; border: 1px solid var(--border); border-radius: 10px; background: var(--paper); }
+  figcaption { font-size: 13px; color: var(--muted); font-style: italic; margin-top: 0.5rem; max-width: 74ch; }
+  footer.composition-signal { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border);
+    font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .wf-label { font-family: var(--sans); font-size: 12px; fill: var(--secondary); }
+  .wf-strong { font-family: var(--sans); font-size: 12px; font-weight: 600; fill: var(--ink); }
+  .wf-mut { font-family: var(--sans); font-size: 11px; fill: var(--muted); }
+</style>
+
+<div class="page">
+
+<p class="eyebrow">Requirements-only plan · ce-brainstorm</p>
+<h1>Recording HUD hide control and shadow cleanup</h1>
+<p class="lede">A hide control for the floating recording pill, with the menu bar taking over as indicator and restore — plus a cleaner drop shadow that reads well on any background.</p>
+
+<ul class="meta">
+  <li class="pill"><b>type</b> feat</li>
+  <li class="pill"><b>date</b> <time datetime="2026-07-06">2026-07-06</time></li>
+  <li class="pill"><b>topic</b> recording-hud-hide-and-shadow</li>
+  <li class="pill"><b>execution</b> code</li>
+  <li class="pill"><b>artifact_contract</b> ce-unified-plan/v1</li>
+  <li class="pill"><b>artifact_readiness</b> requirements-only</li>
+  <li class="pill"><b>product_contract_source</b> ce-brainstorm</li>
+</ul>
+
+<nav class="toc" aria-label="Sections">
+  <strong style="font-size:13px;">On this page</strong>
+  <ul>
+    <li><a href="#goal-capsule">Goal Capsule</a></li>
+    <li><a href="#product-contract">Product Contract</a></li>
+    <li><a href="#product-requirements">Requirements</a></li>
+  </ul>
+</nav>
+
+<section id="goal-capsule">
+<h2>Goal Capsule</h2>
+<p><strong>Objective.</strong> Let the person recording get the floating HUD pill out of the way with a single hide action, and stop its drop shadow from reading as a heavy grey halo on light content.</p>
+<p><strong>Product authority.</strong> ScreenCap app owner (this brainstorm's requester).</p>
+<p><strong>Open blockers.</strong> None block planning. Two mechanism choices are deferred to planning (the shadow fix approach and the exact hide-control affordance) — see Outstanding Questions.</p>
+</section>
+
+<section id="product-contract">
+<h2>Product Contract</h2>
+
+<h3 id="summary" style="margin-top:0.4rem;">Summary</h3>
+<p>Add a hide control to the recording HUD pill that <strong>fully dismisses</strong> it during a recording. While hidden, the menu-bar icon stays the persistent recording indicator and Stop, and a new <em>Show recording controls</em> item in the menu-bar dropdown brings the pill back. Separately, clean up the pill's drop shadow so it renders as a subtly lifted capsule on any background instead of a heavy halo on light content.</p>
+
+<h3 id="problem-frame">Problem Frame</h3>
+<p>The recording pill sits bottom-center over whatever you're recording, and today the only thing it offers is <em>Stop &amp; save</em> — there's no way to move it out of sight without ending the recording. During a screen recording that's prime real estate: it overlaps video-player controls, a composer, or the dock exactly where you're working.</p>
+<p>The pill is a dark capsule that needs some lift to separate from the content behind it, but the current shadow is far too heavy — a large, downward-offset 40%-black blur. On a dark page it disappears; on light content it reads as a grey cloud wrapped around the pill, which is what looks "buggy." The heaviness may be compounded by the floating panel being sized to the pill itself, which can clip the shadow's soft edge.</p>
+
+<h3 id="key-decisions">Key Decisions</h3>
+
+<div class="card">
+  <p class="dt">Fully dismiss, not minimize.</p>
+  <p style="margin:0.3rem 0 0;">The pill is removed entirely rather than shrunk to a dot or docked to a screen edge. Zero on-screen footprint is safe because the menu-bar glyph continues to signal that recording is live — so the "am I still recording?" cue isn't lost.</p>
+</div>
+<div class="card">
+  <p class="dt">Menu-bar restore over one-way hide.</p>
+  <p style="margin:0.3rem 0 0;">A <em>Show recording controls</em> menu item keeps the pill reachable rather than gone-until-stop. This future-proofs the pill for when Draw and Mute (<code>SCR-217</code>/<code>SCR-218</code>) become functional, at low added cost over a one-way dismiss.</p>
+</div>
+<div class="card">
+  <p class="dt">Per-recording, not a sticky preference.</p>
+  <p style="margin:0.3rem 0 0;">Hide is an in-the-moment action; every recording starts with the pill shown. A remembered "always start hidden" default is out of scope.</p>
+</div>
+<div class="card">
+  <p class="dt">One universal shadow treatment.</p>
+  <p style="margin:0.3rem 0 0;">A single subtle lift tuned to read on both light and dark content, rather than sampling the background to adapt per-frame. The exact mechanism — softening the shadow, fixing the panel-sizing clip, adding a hairline capsule border so a lighter shadow suffices, or a combination — is a planning decision.</p>
+</div>
+
+<h3 id="product-requirements">Requirements</h3>
+
+<p class="grp">Hide control</p>
+<table class="reqs">
+  <thead><tr><th>ID</th><th>Requirement</th></tr></thead>
+  <tbody>
+    <tr><td id="r1"><span class="idchip">R1</span></td><td>The recording HUD pill carries a hide control that fully dismisses the pill from the screen.</td></tr>
+    <tr><td id="r2"><span class="idchip">R2</span></td><td>Hiding the pill never affects capture — the recording continues uninterrupted.</td></tr>
+  </tbody>
+</table>
+
+<p class="grp">Restore and recording indicator</p>
+<table class="reqs">
+  <thead><tr><th>ID</th><th>Requirement</th></tr></thead>
+  <tbody>
+    <tr><td id="r3"><span class="idchip">R3</span></td><td>While the pill is hidden, the menu-bar icon remains the persistent recording indicator and continues to offer Stop Recording.</td></tr>
+    <tr><td id="r4"><span class="idchip">R4</span></td><td>The menu-bar dropdown provides a <em>Show recording controls</em> action that re-summons the pill. It appears only while a recording is active and the pill is hidden.</td></tr>
+    <tr><td id="r5"><span class="idchip">R5</span></td><td>Restoring the pill returns it to its default bottom-center position.</td></tr>
+    <tr><td id="r6"><span class="idchip">R6</span></td><td>Hide is per-recording and transient: each recording starts with the pill shown, and the hidden state resets when the recording stops or fails.</td></tr>
+  </tbody>
+</table>
+
+<p class="grp">Shadow cleanup</p>
+<table class="reqs">
+  <thead><tr><th>ID</th><th>Requirement</th></tr></thead>
+  <tbody>
+    <tr><td id="r7"><span class="idchip">R7</span></td><td>The pill reads as a subtly, cleanly lifted capsule on any background — no heavy grey halo on light content and no clipped or hard-edged shadow.</td></tr>
+  </tbody>
+</table>
+
+<figure>
+  <svg viewBox="0 0 900 300" role="img" aria-labelledby="wf-title wf-desc">
+    <title id="wf-title">Hide and restore states for the recording pill</title>
+    <desc id="wf-desc">Three panels: the pill visible with a hide control, the pill hidden with the menu-bar glyph active, and the menu-bar dropdown offering Show recording controls.</desc>
+
+    <!-- Panel 1: pill visible -->
+    <g transform="translate(12,20)">
+      <rect x="0" y="0" width="270" height="240" rx="8" fill="#F6F2E9" stroke="#E0D8C6"/>
+      <rect x="0" y="0" width="270" height="20" rx="8" fill="#EDE6D6"/>
+      <rect x="0" y="12" width="270" height="8" fill="#EDE6D6"/>
+      <circle cx="246" cy="10" r="4" fill="#D9A441"/>
+      <text class="wf-mut" x="228" y="13" text-anchor="end">menu bar</text>
+      <text class="wf-mut" x="135" y="120" text-anchor="middle">recorded content</text>
+      <!-- pill -->
+      <g transform="translate(38,196)">
+        <rect x="0" y="0" width="194" height="30" rx="15" fill="#12181c"/>
+        <rect x="8" y="7" width="16" height="16" rx="8" fill="none" stroke="#E3B054" stroke-dasharray="2 2"/>
+        <path d="M13 12 l3 3 l3 -3" fill="none" stroke="#E3B054" stroke-width="1.4"/>
+        <circle cx="34" cy="15" r="3" fill="#E3B054"/>
+        <text class="wf-label" x="44" y="19" fill="#E3B054" style="font-family:var(--mono);font-size:11px">02:34</text>
+        <rect x="150" y="6" width="38" height="18" rx="9" fill="#0E7C6B"/>
+        <text x="169" y="19" text-anchor="middle" style="font-size:9px;fill:#fff">Stop</text>
+      </g>
+      <text class="wf-strong" x="135" y="18" text-anchor="middle" opacity="0">.</text>
+      <text class="wf-strong" x="12" y="-6" opacity="0">.</text>
+    </g>
+    <text class="wf-strong" x="147" y="16" text-anchor="middle">1 · Recording — pill visible</text>
+    <text class="wf-mut" x="147" y="278" text-anchor="middle">dashed square = new hide control</text>
+
+    <!-- Panel 2: hidden -->
+    <g transform="translate(315,20)">
+      <rect x="0" y="0" width="270" height="240" rx="8" fill="#F6F2E9" stroke="#E0D8C6"/>
+      <rect x="0" y="0" width="270" height="20" rx="8" fill="#EDE6D6"/>
+      <rect x="0" y="12" width="270" height="8" fill="#EDE6D6"/>
+      <circle cx="246" cy="10" r="5" fill="#B4552B"/>
+      <circle cx="246" cy="10" r="8" fill="none" stroke="#B4552B" stroke-opacity="0.35" stroke-width="2"/>
+      <text class="wf-mut" x="228" y="13" text-anchor="end">still recording</text>
+      <text class="wf-label" x="135" y="130" text-anchor="middle">pill dismissed</text>
+      <text class="wf-mut" x="135" y="150" text-anchor="middle">recording continues</text>
+    </g>
+    <text class="wf-strong" x="450" y="16" text-anchor="middle">2 · Hidden — footprint gone</text>
+
+    <!-- Panel 3: menu dropdown -->
+    <g transform="translate(618,20)">
+      <rect x="0" y="0" width="270" height="240" rx="8" fill="#F6F2E9" stroke="#E0D8C6"/>
+      <rect x="0" y="0" width="270" height="20" rx="8" fill="#EDE6D6"/>
+      <rect x="0" y="12" width="270" height="8" fill="#EDE6D6"/>
+      <circle cx="30" cy="10" r="5" fill="#B4552B"/>
+      <!-- dropdown -->
+      <g transform="translate(18,22)">
+        <rect x="0" y="0" width="200" height="128" rx="8" fill="#FFFDF7" stroke="#E0D8C6"/>
+        <text class="wf-mut" x="14" y="24">● Recording · 02:41</text>
+        <line x1="10" y1="36" x2="190" y2="36" stroke="#E0D8C6"/>
+        <text class="wf-label" x="14" y="58">Stop Recording</text>
+        <text class="wf-mut" x="186" y="58" text-anchor="end" style="font-family:var(--mono);font-size:10px">⇧⌘S</text>
+        <rect x="6" y="70" width="188" height="24" rx="5" fill="#E1EFEC"/>
+        <text class="wf-strong" x="14" y="86" fill="#0E7C6B">Show recording controls</text>
+        <text class="wf-mut" x="14" y="116">Open ScreenCap</text>
+      </g>
+    </g>
+    <text class="wf-strong" x="753" y="16" text-anchor="middle">3 · Menu bar restores the pill</text>
+  </svg>
+  <figcaption>Directional only — illustrates the intended user-facing shape. Exact colors, spacing, copy, and component choices are placeholders for review, not requirements.</figcaption>
+</figure>
+
+<h3 id="acceptance-examples">Acceptance Examples</h3>
+
+<div class="ae">
+  <p style="margin:0;"><span class="aeid">AE1</span> · <span class="cov">Covers R1, R2</span></p>
+  <p style="margin:0.2rem 0 0;"><strong>When</strong> a recording is in progress and the user activates the hide control, <strong>then</strong> the pill disappears from the screen while the elapsed timer keeps advancing and capture keeps writing to disk.</p>
+</div>
+<div class="ae">
+  <p style="margin:0;"><span class="aeid">AE2</span> · <span class="cov">Covers R3, R4, R5</span></p>
+  <p style="margin:0.2rem 0 0;"><strong>When</strong> the pill is hidden and the user opens the menu-bar dropdown, <strong>then</strong> the menu shows the amber recording glyph, a Stop Recording item, and a Show recording controls item; choosing the latter re-shows the pill at bottom-center.</p>
+</div>
+<div class="ae">
+  <p style="margin:0;"><span class="aeid">AE3</span> · <span class="cov">Covers R3</span></p>
+  <p style="margin:0.2rem 0 0;"><strong>When</strong> the pill is hidden and the user chooses Stop Recording from the menu bar, <strong>then</strong> the recording ends and saves normally, exactly as it would with the pill visible.</p>
+</div>
+<div class="ae">
+  <p style="margin:0;"><span class="aeid">AE4</span> · <span class="cov">Covers R6</span></p>
+  <p style="margin:0.2rem 0 0;"><strong>When</strong> a recording fails (e.g. permission lost) while the pill is hidden, <strong>then</strong> the failure is still surfaced and the next recording begins with the pill visible.</p>
+</div>
+
+<h3 id="scope-boundaries">Scope Boundaries</h3>
+<div class="callout defer">
+  <p class="lbl">Deferred for later</p>
+  <ul class="tight">
+    <li>Making Draw and Mute functional (<code>SCR-217</code> / <code>SCR-218</code>) — the hide and shadow work does not touch them.</li>
+    <li>A global/system-wide hotkey to toggle the pill — ScreenCap's shortcuts are app-scoped, so one wouldn't fire while you're focused in the app being recorded.</li>
+    <li>A remembered "always start recordings hidden" preference.</li>
+    <li>Restoring the pill to its last dragged position (restore is always bottom-center).</li>
+    <li>The minimize-to-a-dot and dock-to-edge hide shapes — considered and rejected in favor of full dismiss.</li>
+    <li>A background-adaptive shadow that samples the content behind the pill.</li>
+  </ul>
+</div>
+
+<h3 id="assumptions">Dependencies and Assumptions</h3>
+<div class="callout assume">
+  <p class="lbl">Assumptions</p>
+  <ul class="tight">
+    <li>The menu-bar label already swaps to a filled amber recording glyph while live, and the dropdown already carries Stop Recording — the hide feature relies on both as the fallback indicator and stop path.</li>
+    <li>The pill is capture-excluded (<code>sharingType = .none</code>), so none of these changes affect what appears inside a recording.</li>
+  </ul>
+</div>
+
+<h3 id="outstanding-questions">Outstanding Questions</h3>
+<div class="callout q">
+  <p class="lbl">Deferred to planning</p>
+  <ul class="tight">
+    <li>The exact hide-control glyph, label, and placement on the pill (must carry an accessible label).</li>
+    <li>The shadow fix mechanism: soften the shadow values, address the panel sizing that may clip the shadow, add a hairline capsule border so a lighter shadow suffices, or a combination.</li>
+    <li>The menu-bar item's exact label, and whether it is a single Hide/Show toggle or a state-gated Show item.</li>
+  </ul>
+</div>
+
+<h3 id="sources">Sources and Research</h3>
+<ul class="tight">
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/Views/Record/RecordingHUDPanel.swift">macos/ScreenCap/Views/Record/RecordingHUDPanel.swift</a> — the HUD pill, its <code>.shadow(...)</code>, and the panel controller (show / hide / reposition, capture exclusion).</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/Views/MenuBarMenu.swift">macos/ScreenCap/Views/MenuBarMenu.swift</a> — the menu-bar dropdown, Stop Recording, ⇧⌘S, and its recording-state gating.</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/ScreenCapApp.swift">macos/ScreenCap/ScreenCapApp.swift</a> — <code>MenuBarLabel</code> swapping the glyph to <code>record.circle.fill</code> (amber) while recording.</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/Controllers/WindowLifecycle.swift">macos/ScreenCap/Controllers/WindowLifecycle.swift</a> — the <code>showHUD</code> / <code>hideHUD</code> seam the recording state machine drives.</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md">docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md</a> — U7, the origin of the HUD (Draw/Mute stubs, capture exclusion, hide-main-window lifecycle).</li>
+</ul>
+
+</section>
+
+<footer class="composition-signal">Composed 2026-07-06 by ce-brainstorm from this session's dialogue.</footer>
+
+</div>
