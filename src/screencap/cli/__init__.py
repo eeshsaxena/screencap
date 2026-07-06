@@ -56,6 +56,11 @@ _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
 # `has_privacy_section` in a single round-trip without touching config.toml.
 # Additive: every v1 field is unchanged.
 _SETTINGS_SCHEMA_VERSION = 2
+# `settings intelligence --json` envelope (ok + schema_version + the current
+# provider / cloud provider / per-task consent rows), read by the Swift
+# Intelligence pane (U9) to reconcile its optimistic toggles. SCR local-first
+# intelligence, U8.
+_SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 1
 _STOP_SCHEMA_VERSION = 1
 # `whoami --json` envelope (ok + schema_version + signed_in/uid/email), read by
 # the SwiftUI shell to gate the Upload affordance on auth state.
@@ -3097,6 +3102,205 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
     if changed:
         err_console.print(f"  [bold]privacy.{escape(str(field))}[/bold] {escape(str(op))} {escape(str(value))}")
         _result(True, changed=True)
+
+
+# ---------------------------------------------------------------------------
+# settings intelligence — the Intelligence provider + per-task consent surface
+# (U8). The write side of config.get_llm_provider / get_llm_cloud_provider /
+# get_summary_cloud_consent / get_recall_cloud_consent; the Swift pane (U9)
+# reads it back via --json.
+# ---------------------------------------------------------------------------
+
+
+def _build_intelligence_settings_block() -> dict:
+    """Return the current ``[intelligence]`` settings, via the config getters.
+
+    Pointer-only, secret-free: the active provider, the configured cloud
+    provider (or ``None``), and each cloud-consent row. The frames/images row
+    is reported as a fixed ``false`` (never-cloud, R9) so the Swift pane can
+    render it as a non-interactive "always off" without a special case.
+    """
+    from screencap import config
+
+    return {
+        "provider": config.get_llm_provider(),
+        "cloud_provider": config.get_llm_cloud_provider(),
+        "summary_cloud_consent": config.get_summary_cloud_consent(),
+        "recall_cloud_consent": config.get_recall_cloud_consent(),
+        # Fixed guards (R7/R9) — surfaced so the pane needn't hard-code them.
+        "day_split_cloud_consent": False,
+        "frames_cloud_consent": False,
+    }
+
+
+@settings.command("intelligence")
+@click.argument("row", required=False)
+@click.argument("op", required=False, type=click.Choice(["set"]))
+@click.argument("value", required=False)
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit the current intelligence settings as JSON (read-back "
+                   "for the Swift pane), or the write result. Auto-detected "
+                   "when stdout is not a TTY.")
+def settings_intelligence(row, op, value, as_json):
+    """Show or change the Intelligence provider + per-task cloud consent.
+
+    \b
+    Read the current settings (Swift reads this back):
+      screencap settings intelligence --json
+
+    \b
+    Select the active provider (on-device | gemini):
+      screencap settings intelligence provider set on-device
+
+    \b
+    Configure the cloud fallback provider (gemini) or clear it:
+      screencap settings intelligence cloud_provider set gemini
+      screencap settings intelligence cloud_provider set none
+
+    \b
+    Enable/disable a cloud-consent row (summary/title or recall-answer only):
+      screencap settings intelligence summary_cloud_consent set true
+      screencap settings intelligence recall_cloud_consent set false
+
+    Writes land in the ``[intelligence]`` section of config.toml through the
+    same advisory-flock + tomlkit path as ``settings privacy``. Defense in
+    depth over the U6 consent policy: the day-split/label row and the
+    frames/images row are **never** settable to cloud/on (R7/R9); only
+    summary/title and recall-answer rows may be consented to cloud (R8/R10).
+    Unknown provider values are rejected. Errors exit non-zero.
+    """
+    import json as _json
+
+    from screencap import config
+
+    err_console = Console(stderr=True)
+
+    # --- Read-back: no positional args → emit the current settings ----------
+    if row is None:
+        payload = _build_intelligence_settings_block()
+        if as_json:
+            sys.stdout.write(_json.dumps({
+                "ok": True,
+                "schema_version": _SETTINGS_INTELLIGENCE_SCHEMA_VERSION,
+                "intelligence": payload,
+            }) + "\n")
+            sys.stdout.flush()
+            return
+        console.print("\n[bold]Intelligence Settings[/bold]\n")
+        console.print(f"  Provider:              {payload['provider']}")
+        console.print(f"  Cloud provider:        {payload['cloud_provider'] or 'none'}")
+        console.print(f"  Summaries & titles:    {'cloud-consented' if payload['summary_cloud_consent'] else 'on-device only'}")
+        console.print(f"  Recall answers:        {'cloud-consented' if payload['recall_cloud_consent'] else 'on-device only'}")
+        console.print("  Day-splitting/labels:  on-device only [dim](fixed)[/dim]")
+        console.print("  Screen frames/images:  never sent to cloud [dim](fixed)[/dim]")
+        console.print()
+        return
+
+    # --- Write path: <row> set <value> --------------------------------------
+    row = row.strip()
+
+    def _emit_error(error: str) -> None:
+        """Print a rich error (stderr / JSON) and exit non-zero."""
+        if as_json:
+            sys.stdout.write(_json.dumps({
+                "ok": False,
+                "schema_version": _SETTINGS_INTELLIGENCE_SCHEMA_VERSION,
+                "row": row,
+                "op": op,
+                "value": value,
+                "error": error,
+            }) + "\n")
+            sys.stdout.flush()
+        raise SystemExit(1)
+
+    if op is None or value is None:
+        err_console.print(
+            "[red]Error:[/red] Setting a row requires ROW set VALUE, "
+            "e.g. [bold]settings intelligence provider set on-device[/bold]."
+        )
+        _emit_error("missing_op_or_value")
+
+    value = value.strip()
+
+    # The forbidden cloud rows: day-split/label and frames. Rejected before
+    # anything is written — defense in depth over U6's policy (R7/R9).
+    _FORBIDDEN_CLOUD_ROWS = ("day_split_cloud_consent", "frames_cloud_consent")
+
+    if row == "provider":
+        if value not in config._VALID_LLM_PROVIDERS:
+            err_console.print(
+                f"[red]Error:[/red] provider must be one of "
+                f"{config._VALID_LLM_PROVIDERS}, got: {escape(str(value))}"
+            )
+            _emit_error(f"invalid_provider:{value}")
+        config.set_intelligence_provider(value)
+        err_console.print(f"  [bold]intelligence.provider[/bold] set {escape(str(value))}")
+
+    elif row == "cloud_provider":
+        # ``none`` / empty clears the configured cloud backend.
+        if value.lower() in ("none", ""):
+            config.set_intelligence_cloud_provider(None)
+            err_console.print("  [bold]intelligence.cloud_provider[/bold] cleared")
+            value = None  # normalize for the JSON echo below
+        elif value not in config._VALID_CLOUD_PROVIDERS:
+            err_console.print(
+                f"[red]Error:[/red] cloud_provider must be one of "
+                f"{config._VALID_CLOUD_PROVIDERS} (or 'none'), got: "
+                f"{escape(str(value))}"
+            )
+            _emit_error(f"invalid_cloud_provider:{value}")
+        else:
+            config.set_intelligence_cloud_provider(value)
+            err_console.print(f"  [bold]intelligence.cloud_provider[/bold] set {escape(str(value))}")
+
+    elif row in _FORBIDDEN_CLOUD_ROWS:
+        # R7 (day-split/label) / R9 (frames) — on-device / never-cloud, fixed.
+        err_console.print(
+            f"[red]Error:[/red] {escape(str(row))} cannot be consented to "
+            "cloud — day-splitting/labeling stays on-device and screen "
+            "frames/images are never sent to any cloud provider."
+        )
+        _emit_error(f"row_never_cloud:{row}")
+
+    elif row in config._CLOUD_CONSENT_ROWS:
+        parsed = _parse_intelligence_consent_bool(value)
+        if parsed is None:
+            err_console.print(
+                f"[red]Error:[/red] {escape(str(row))} must be true or false, "
+                f"got: {escape(str(value))}"
+            )
+            _emit_error(f"invalid_bool:{row}={value}")
+        config.set_intelligence_consent(row, parsed)
+        err_console.print(f"  [bold]intelligence.{escape(str(row))}[/bold] set {parsed}")
+        value = parsed  # echo the normalized bool
+
+    else:
+        _known = ("provider", "cloud_provider", *config._CLOUD_CONSENT_ROWS)
+        err_console.print(f"[red]Error:[/red] Unknown intelligence row: {escape(str(row))}")
+        err_console.print(f"[dim]Settable: {', '.join(_known)}[/dim]")
+        _emit_error(f"unknown_row:{row}")
+
+    if as_json:
+        sys.stdout.write(_json.dumps({
+            "ok": True,
+            "schema_version": _SETTINGS_INTELLIGENCE_SCHEMA_VERSION,
+            "row": row,
+            "op": op,
+            "value": value,
+            "error": None,
+        }) + "\n")
+        sys.stdout.flush()
+
+
+def _parse_intelligence_consent_bool(value: str) -> bool | None:
+    """Parse a truthy/falsey consent value; ``None`` on unrecognized input."""
+    low = value.lower()
+    if low in ("true", "1", "yes", "on"):
+        return True
+    if low in ("false", "0", "no", "off"):
+        return False
+    return None
 
 
 # ---------------------------------------------------------------------------

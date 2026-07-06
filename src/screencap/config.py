@@ -516,6 +516,96 @@ def get_recall_cloud_consent() -> bool:
     )
 
 
+# --- Intelligence settings: write surface (U8) -----------------------------
+#
+# The ``screencap settings intelligence`` CLI verb (U8) is the write side of
+# the getters above. The value vocabularies live here — next to the getters —
+# so the CLI validation and the config schema cannot drift.
+
+#: The active/preferred provider (``[intelligence].llm_provider``). Only the
+#: backends :func:`screencap.segmentation.provider.get_provider` can actually
+#: construct are accepted; the CLI rejects anything else.
+_VALID_LLM_PROVIDERS = ("on-device", "gemini")
+
+#: The cloud backend a consented fallback may use
+#: (``[intelligence].cloud_provider``). Only Gemini ships as a cloud backend in
+#: this plan; the interface accommodates more, but the CLI refuses to persist a
+#: cloud provider the daemon cannot run.
+_VALID_CLOUD_PROVIDERS = ("gemini",)
+
+#: The cloud-consent rows, keyed by their CLI/`[intelligence]` name → the
+#: getter that reads them back. Only summary/title and recall-answer may be
+#: consented to cloud (R8/R10); day-split/label and frames rows are **never**
+#: cloud-settable (R7/R9) and are deliberately absent here — the CLI rejects
+#: them with a clear message rather than persisting a forbidden row.
+_CLOUD_CONSENT_ROWS = ("summary_cloud_consent", "recall_cloud_consent")
+
+
+def set_intelligence_provider(value: str) -> None:
+    """Persist the active provider so :func:`get_llm_provider` reads it back.
+
+    Writes the **top-level** ``llm_provider`` key — the exact key
+    :func:`get_llm_provider` reads (``cfg.get("llm_provider", ...)``), which is
+    top-level, unlike the ``[intelligence]``-scoped cloud provider / consent
+    rows. Persisting the provider anywhere else would silently no-op the
+    read-back, so the write mirrors the getter's key rather than the section.
+
+    Writes through the shared advisory-flock config writer (the same
+    read → flock → mutate → atomic-save → invalidate-cache path used by
+    ``settings privacy``), so a concurrent settings write cannot lose this
+    update. Preserves comments and key order via tomlkit.
+
+    The caller is responsible for validating ``value`` against
+    :data:`_VALID_LLM_PROVIDERS` first; this helper only persists.
+    """
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        doc["llm_provider"] = value
+
+
+def set_intelligence_cloud_provider(value: str | None) -> None:
+    """Persist (or clear) ``[intelligence].cloud_provider``.
+
+    ``None`` removes the key (the zero-config default — no cloud backend
+    configured). Otherwise the string is written verbatim; the caller validates
+    against :data:`_VALID_CLOUD_PROVIDERS` first.
+    """
+    _write_intelligence_key("cloud_provider", value)
+
+
+def set_intelligence_consent(row: str, value: bool) -> None:
+    """Persist a cloud-consent row to ``[intelligence].<row>``.
+
+    ``row`` must be one of :data:`_CLOUD_CONSENT_ROWS`; the caller enforces that
+    (the day-split/label and frames rows can never be cloud-consented, R7/R9).
+    """
+    _write_intelligence_key(row, bool(value))
+
+
+def _write_intelligence_key(key: str, value: object) -> None:
+    """Write a single ``[intelligence]`` key via the shared flock config writer.
+
+    A ``None`` value removes the key (used to clear ``cloud_provider``).
+    Reuses :func:`screencap.privacy_settings._privacy_config_writer` — despite
+    the name it is the generic config read-modify-write helper (it yields the
+    whole tomlkit doc under the advisory flock), so intelligence writes
+    serialize against privacy writes on the same lock instead of racing.
+    """
+    import tomlkit
+
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        if "intelligence" not in doc:
+            doc.add("intelligence", tomlkit.table())
+        if value is None:
+            if key in doc["intelligence"]:
+                del doc["intelligence"][key]
+        else:
+            doc["intelligence"][key] = value
+
+
 def get_show_on_website() -> bool:
     """Return whether recordings should be visible on the website. Default True."""
     return _parse_bool_env("SCREENCAP_SHOW_ON_WEBSITE", "show_on_website", True)
