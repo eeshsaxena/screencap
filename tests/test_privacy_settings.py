@@ -316,6 +316,56 @@ class TestSettingsPrivacyApply:
         assert "com.1password.1password" not in list(tbl["allow_apps"])
         assert list(tbl["confirmed_allow_apps"]) == []
 
+    def test_allow_apps_readd_matches_case_variant_stored_entry(self):
+        """Write-seam membership is case-insensitive (the runtime normalizes
+        casing): re-adding the canonical id over a case-variant stored entry
+        is a no-op, not a duplicate append."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("COM.TINYSPECK.SLACKMACGAP")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.tinyspeck.slackmacgap",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is False
+        assert len(list(tbl["allow_apps"])) == 1
+        assert len(list(tbl["confirmed_allow_apps"])) == 1
+
+    def test_allow_apps_case_variant_remove_finds_entry(self):
+        """A case-variant remove still finds and prunes both entries."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("com.tinyspeck.slackmacgap")
+            tbl[f] = arr
+
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="remove",
+            value="COM.TINYSPECK.SLACKMACGAP",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["allow_apps"]) == []
+        assert list(tbl["confirmed_allow_apps"]) == []
+
     def test_allow_apps_add_unclassified_bundle_still_refused(self):
         """The fail-closed refusal for unclassified bundles is unchanged:
         classification stays a prerequisite to any allow, confirmed or not."""

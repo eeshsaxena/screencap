@@ -67,7 +67,7 @@ extension InstalledApp {
         // Schema v3 fields — lenient with stale-daemon defaults (SCR-235 KTD8).
         allowConfirmed = try c.decodeIfPresent(Bool.self, forKey: .allowConfirmed) ?? false
         confirmationRequired = try c.decodeIfPresent(Bool.self, forKey: .confirmationRequired)
-            ?? (try c.decode(Bool.self, forKey: .isMatrixExclude))
+            ?? isMatrixExclude
     }
 }
 

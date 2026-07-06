@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Protocol
@@ -230,11 +230,7 @@ class PrivacyConfig:
         they agree: confirmed entries survive into cloud posture, legacy
         (unconfirmed) entries do not. Tightening knobs (exclude_apps,
         mask_domains, mask_title_patterns) are untouched."""
-        import dataclasses
-
-        return dataclasses.replace(
-            self, allow_apps=self.allow_apps & self.confirmed_allow_apps
-        )
+        return replace(self, allow_apps=self.allow_apps & self.confirmed_allow_apps)
 
     def is_masked_domain(self, domain: str) -> bool:
         domain = domain.lower()

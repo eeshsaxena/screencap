@@ -17,7 +17,6 @@ Two public constructors:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 from pathlib import Path

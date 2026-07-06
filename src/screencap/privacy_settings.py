@@ -15,14 +15,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from typing import TYPE_CHECKING
-
 import click
 from rich.console import Console
 from rich.markup import escape
-
-if TYPE_CHECKING:
-    from screencap.privacy.policy import PrivacyAction
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -384,6 +379,17 @@ def _privacy_list_field_value(value: str) -> str:
     return value.strip()
 
 
+def _matching_entries(arr, value: str) -> list:
+    """Entries in a tomlkit array equal to ``value``, case-insensitively.
+
+    Bundle-id membership is case-normalized at runtime (SCR-235), so the
+    allow_apps write seam matches the same way — a case-variant add must not
+    append a duplicate the runtime treats as the same bundle, and a
+    case-variant remove must still find the stored entry.
+    """
+    return [e for e in arr if str(e).lower() == value.lower()]
+
+
 def _allow_requires_confirmation(ctx_class) -> bool:
     """True when allow-listing this class needs the explicit confirm flag.
 
@@ -513,18 +519,18 @@ def _settings_privacy_apply(
             arr = tomlkit.array()
             privacy_tbl[field] = arr
         if op == "add":
-            already = value in arr
             if field == "allow_apps":
                 # SCR-235: adds through this flow are confirmed — write both
                 # lists in the same transaction. Re-adding an existing legacy
                 # entry is the CLI upgrade path: it confirms the entry.
+                # Membership is case-insensitive to match the runtime's
+                # case-normalized sets.
                 confirmed = privacy_tbl.get("confirmed_allow_apps")
                 if confirmed is None:
                     confirmed = tomlkit.array()
                     privacy_tbl["confirmed_allow_apps"] = confirmed
-                conf_already = any(
-                    str(e).lower() == value.lower() for e in confirmed
-                )
+                already = bool(_matching_entries(arr, value))
+                conf_already = bool(_matching_entries(confirmed, value))
                 if already and conf_already:
                     err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} (confirmed) — no change.[/dim]")
                     _result(True, changed=False)
@@ -534,27 +540,33 @@ def _settings_privacy_apply(
                 if not conf_already:
                     confirmed.append(value)
             else:
-                if already:
+                if value in arr:
                     # Idempotent no-op
                     err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
                     _result(True, changed=False)
                     return False
                 arr.append(value)
         else:  # remove
-            if value not in arr:
-                err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
-                _result(True, changed=False)
-                return False
-            arr.remove(value)
             if field == "allow_apps":
+                matches = _matching_entries(arr, value)
+                if not matches:
+                    err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                for stale in matches:
+                    arr.remove(stale)
                 # SCR-235: removing the allow prunes its confirmed entry so
                 # re-allowing a sensitive app re-prompts.
                 confirmed = privacy_tbl.get("confirmed_allow_apps")
                 if confirmed is not None:
-                    for stale in [
-                        e for e in confirmed if str(e).lower() == value.lower()
-                    ]:
+                    for stale in _matching_entries(confirmed, value):
                         confirmed.remove(stale)
+            else:
+                if value not in arr:
+                    err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                arr.remove(value)
     elif is_scalar:
         privacy_tbl[field] = parsed_value
     else:

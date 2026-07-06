@@ -25,6 +25,7 @@ from urllib.parse import unquote, urlparse
 from screencap.privacy.actions import stricter
 from screencap.privacy.domain_loader import _is_tld_like
 from screencap.privacy.policy import (
+    BROWSER_BUNDLE_IDS,  # noqa: F401 — re-export for existing importers
     ContextClass,
     ContextResult,
     FrameMetadata,
@@ -170,10 +171,10 @@ PASSWORD_MANAGER_BUNDLES: frozenset[str] = frozenset(
     bid for bid, cls in BUNDLE_ID_MAP.items() if cls == ContextClass.PASSWORD_MANAGER
 )
 
-# Known browser bundle IDs — canonical definition lives in policy.py (shared
-# with the evaluator's R12 browser carve-out); re-exported here for existing
-# importers (app_discovery, privacy_settings, backfill.skip_intervals).
-from screencap.privacy.policy import BROWSER_BUNDLE_IDS  # noqa: E402,F401
+# Known browser bundle IDs: BROWSER_BUNDLE_IDS now lives in policy.py (shared
+# with the evaluator's R12 browser carve-out) and is re-exported from the
+# import block above for existing importers (app_discovery, privacy_settings,
+# backfill.skip_intervals).
 
 # Title patterns for heuristic enrichment.
 # These do NOT replace verified domain evidence — they provide a hint
