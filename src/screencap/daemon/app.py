@@ -30,6 +30,30 @@ logger = logging.getLogger(__name__)
 
 _STARTED_AT = time.time()
 
+# FileVault status is checked once per daemon process and served on
+# ``daemon.info`` (KTD-11 / R11). Warn-only: a FileVault-off machine is
+# surfaced but never blocked. The first ``daemon.info`` fires on the
+# readiness probe immediately after the daemon binds, so first-call caching
+# is effectively "at daemon start"; each new daemon process re-checks.
+_filevault_cache: str | None = None
+
+
+def _filevault_status() -> str:
+    """Cached, log-once FileVault state (``"on"`` / ``"off"`` / ``"unknown"``)."""
+    global _filevault_cache
+    if _filevault_cache is None:
+        from screencap import container
+
+        _filevault_cache = container.filevault_status()
+        if _filevault_cache == "off":
+            logger.warning(
+                "FileVault is OFF — the encrypted recordings container protects "
+                "at-rest artifacts, but full-disk encryption is not active."
+            )
+        else:
+            logger.info("FileVault status: %s", _filevault_cache)
+    return _filevault_cache
+
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -152,6 +176,7 @@ async def daemon_info(request: Request) -> JSONResponse:
             build=_build_string(),
             started_at=_STARTED_AT,
             permissions=grants,
+            filevault=_filevault_status(),
         )
     )
 

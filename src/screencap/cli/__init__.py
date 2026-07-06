@@ -1949,6 +1949,7 @@ def status(as_json, no_nlp_check):
         daemon_reachable: bool
         privacy_configured: bool
         nlp_models_cached: bool | None
+        filevault: str | None
 
     payload: StatusPayload = {
         "ok": True,
@@ -1962,6 +1963,7 @@ def status(as_json, no_nlp_check):
         "daemon_reachable": False,
         "privacy_configured": False,
         "nlp_models_cached": False,
+        "filevault": None,
     }
     if no_nlp_check:
         payload["nlp_models_cached"] = None
@@ -1998,6 +2000,16 @@ def status(as_json, no_nlp_check):
         with DaemonHTTPClient() as client:
             snapshot = client.snapshot()
             payload["daemon_reachable"] = True
+            # Best-effort FileVault surfacing (SCR-236 KTD-11 / R11). A
+            # failed info fetch must never turn ``status`` into an error —
+            # it is warn-only side information.
+            try:
+                info = client.info()
+                fv = info.get("filevault")
+                if isinstance(fv, str):
+                    payload["filevault"] = fv
+            except (DaemonUnreachableError, DaemonAPIError, SchemaMismatchError):
+                pass
     except DaemonUnreachableError:
         snapshot = None
     except SchemaMismatchError as exc:
@@ -2048,6 +2060,13 @@ def status(as_json, no_nlp_check):
         console.print("[dim]Not recording. (Daemon not running.)[/dim]")
     else:
         console.print("[dim]Not recording.[/dim]")
+
+    # FileVault is warn-only (SCR-236 R11): surface but never block.
+    if payload.get("filevault") == "off":
+        console.print(
+            "[yellow]⚠ FileVault is off.[/yellow] Recordings are stored in an "
+            "encrypted container, but full-disk encryption is not active."
+        )
 
 
 @cli.command()

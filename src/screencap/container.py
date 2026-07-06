@@ -614,6 +614,34 @@ def spotlight_indexing_enabled(mountpoint: str) -> bool | None:
 # ---------------------------------------------------------------------------
 
 
+def filevault_status() -> str:
+    """FileVault state — ``"on"``, ``"off"``, or ``"unknown"`` (KTD-11, R11).
+
+    Parses ``fdesetup status`` (runs unprivileged — verified on hardware:
+    "FileVault is On."). **Warn-only:** a broken, missing, or unparseable
+    check must never block daemon startup, so every failure fails open to
+    ``"unknown"`` and this never raises. Live-checked at each daemon
+    start, not cached from install time.
+    """
+    try:
+        cp = subprocess.run(
+            ["fdesetup", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    if cp.returncode != 0:
+        return "unknown"
+    text = cp.stdout.lower()
+    if "filevault is on" in text:
+        return "on"
+    if "filevault is off" in text:
+        return "off"
+    return "unknown"
+
+
 def open_hardened_lock(path: Path) -> int:
     """Open a lock file at ``path`` with the ``_autospawn`` hardening, but
     **raise** on a symlinked path instead of degrading to ``/dev/null``.
@@ -677,5 +705,6 @@ __all__ = [
     "compact_container",
     "harden_mount",
     "spotlight_indexing_enabled",
+    "filevault_status",
     "open_hardened_lock",
 ]
