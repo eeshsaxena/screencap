@@ -422,6 +422,26 @@ def get_segmentation_mode() -> str:
     return val
 
 
+def get_llm_provider() -> str:
+    """Return the active LLM segmentation provider. Default 'on-device'.
+
+    Selects the backend behind ``screencap.segmentation.provider.LLMProvider``
+    (env ``SCREENCAP_LLM_PROVIDER`` > config.toml ``llm_provider`` > default),
+    mirroring :func:`get_segmentation_mode` / :func:`get_rest_threshold`.
+
+    Default ``'on-device'`` keeps the "nothing leaves the Mac" promise for
+    local recordings (the on-device backend lands in U5). The cloud processor
+    does not read this — it pins ``'gemini'`` explicitly. The value is only
+    resolved here; ``provider.get_provider`` maps it to a backend (and raises a
+    clear ``NotImplementedError`` for on-device until U5).
+    """
+    env = os.environ.get("SCREENCAP_LLM_PROVIDER")
+    if env is not None:
+        return env.strip()
+    cfg = _load_toml()
+    return str(cfg.get("llm_provider", "on-device"))
+
+
 def get_show_on_website() -> bool:
     """Return whether recordings should be visible on the website. Default True."""
     return _parse_bool_env("SCREENCAP_SHOW_ON_WEBSITE", "show_on_website", True)
