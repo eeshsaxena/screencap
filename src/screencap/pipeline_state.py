@@ -101,6 +101,7 @@ __all__ = [
     "UploadState",
     "EvictState",
     "ChunkRow",
+    "TaskSegmentRow",
     "PipelineLedger",
     "LedgerError",
     "EvictionRefused",
@@ -205,6 +206,29 @@ class ChunkRow:
     detail: str | None = None
 
 
+@dataclass(frozen=True)
+class TaskSegmentRow:
+    """An immutable snapshot of one ``pipeline_task_segments`` row (U4).
+
+    A named task produced by on-device / provider segmentation for a LOCAL
+    recording. This is part of the LOCAL-ONLY tasks store (alongside the
+    recording dir's ``tasks.json``) — the whole table lives in ``recording.db``
+    which is never uploaded (R8), so named tasks stay on the Mac (R4).
+
+    ``metadata`` is a free-text JSON blob for the extra per-task fields the
+    provider emits (description, apps_used, derived_name, …) that do not need
+    their own column.
+    """
+
+    task_index: int
+    start_ts: float
+    end_ts: float
+    name: str
+    category: str | None = None
+    confidence: str | None = None
+    metadata: str | None = None
+
+
 def from_chunk_status(status: "ChunkStatus") -> UploadState:
     """Map a legacy ``chunk_processor.ChunkStatus`` onto an ``UploadState``.
 
@@ -223,18 +247,56 @@ def from_chunk_status(status: "ChunkStatus") -> UploadState:
     }[status]
 
 
+# U4 local tasks store. One row per named task segment produced by provider
+# segmentation for a LOCAL recording, keyed by (recording_id, task_index). The
+# whole table lives in the local-only ``recording.db`` (R8 — never uploaded), so
+# a recording's named tasks stay on the Mac (R4). Created with raw SQL here
+# (rather than a SQLAlchemy model) so the ledger's schema hook owns it without a
+# model-registry round-trip — the ledger already uses raw ``sqlite3`` throughout.
+_TASK_SEGMENTS_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_task_segments (
+    id INTEGER PRIMARY KEY,
+    recording_id INTEGER NOT NULL,
+    task_index INTEGER NOT NULL,
+    start_ts REAL NOT NULL,
+    end_ts REAL NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT,
+    confidence TEXT,
+    metadata TEXT,
+    updated_at REAL,
+    UNIQUE (recording_id, task_index)
+)
+"""
+
+
 def ensure_pipeline_state_schema(db_path: Path | str) -> None:
-    """Create the ledger table + ``chunks_expected`` column on an EXISTING DB.
+    """Create the ledger tables + ``chunks_expected`` column on an EXISTING DB.
 
     Idempotent. Delegates to ``engine.db._migrate_schema`` (which creates
     the ``pipeline_chunk_state`` table via ``checkfirst=True`` and
-    ALTER-adds ``recording.chunks_expected``) so there is a single
-    schema-evolution code path. Safe to call on a fresh ``create_db`` DB
-    (no-op) or an old pre-U1 ``recording.db`` (creates the missing table).
+    ALTER-adds ``recording.chunks_expected``), then creates the U4
+    ``pipeline_task_segments`` table (raw ``CREATE TABLE IF NOT EXISTS``), so
+    there is a single schema-evolution code path. Safe to call on a fresh
+    ``create_db`` DB (no-op) or an old pre-U1 ``recording.db`` (creates the
+    missing tables). A read-only DB (chmod 444) is tolerated: the task-segments
+    create is best-effort so a read-only open of an old recording never crashes.
     """
     from screencap.engine.db import _migrate_schema
 
     _migrate_schema(str(db_path))
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute(_TASK_SEGMENTS_DDL)
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Read-only DB (an old recording opened for read) — do not crash; the
+        # table is only needed on the write path (terminal-stage segmentation).
+        pass
+    finally:
+        conn.close()
 
 
 def _now() -> float:
@@ -791,6 +853,74 @@ class PipelineLedger:
             and r.upload_state == UploadState.UPLOADED
             for r in rows
         )
+
+    # ------------------------------------------------------------------
+    # U4 local tasks store — named task segments (LOCAL-only, never uploaded).
+    # ------------------------------------------------------------------
+
+    def replace_task_segments(self, segments: list[TaskSegmentRow]) -> None:
+        """Replace ALL task segments for this recording with ``segments``.
+
+        Idempotent by construction: the whole set is deleted and re-inserted
+        in ONE ``BEGIN IMMEDIATE`` transaction, so re-running the terminal
+        segmentation stage never duplicates rows — a second pass over the same
+        recording overwrites cleanly. ``task_index`` is taken from each row's
+        position in the list is NOT assumed; the caller supplies it (kept in
+        the row so the store is self-describing). An empty list clears the
+        store (a provider that returned tasks last time but none now).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM pipeline_task_segments WHERE recording_id=?",
+                    (self._recording_id,),
+                )
+                now = _now()
+                for seg in segments:
+                    conn.execute(
+                        "INSERT INTO pipeline_task_segments "
+                        "(recording_id, task_index, start_ts, end_ts, name, "
+                        " category, confidence, metadata, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            self._recording_id, seg.task_index,
+                            seg.start_ts, seg.end_ts, seg.name,
+                            seg.category, seg.confidence, seg.metadata, now,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def read_task_segments(self) -> list[TaskSegmentRow]:
+        """Return this recording's task segments, ordered by ``task_index``."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_index, start_ts, end_ts, name, category, "
+                "confidence, metadata FROM pipeline_task_segments "
+                "WHERE recording_id=? ORDER BY task_index",
+                (self._recording_id,),
+            ).fetchall()
+            return [
+                TaskSegmentRow(
+                    task_index=int(r["task_index"]),
+                    start_ts=float(r["start_ts"]),
+                    end_ts=float(r["end_ts"]),
+                    name=r["name"],
+                    category=r["category"],
+                    confidence=r["confidence"],
+                    metadata=r["metadata"],
+                )
+                for r in rows
+            ]
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
