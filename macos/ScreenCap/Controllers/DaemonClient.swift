@@ -828,6 +828,18 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/timeline.day", body: body)
     }
 
+    /// A LOCAL recording's named task segments (U10, local-first intelligence).
+    /// Read-only, pointer/data-only over the recording's local-only tasks store
+    /// (`pipeline_task_segments` in `recording.db`, never uploaded — R4/R8). A
+    /// recording with no tasks store returns an empty `tasks` list (not an
+    /// error). On `socketUnavailable`/`connectionFailed` the caller degrades
+    /// silently — the task breakdown is simply omitted (nullable end to end),
+    /// never an error state. No CLI fallback for this verb.
+    static func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.list", body: body)
+    }
+
     /// Query-parser vocabulary (SCR-179). Read-only GET, no parameters. Returns
     /// distinct app names / bundle ids + bare `browser_url` hostnames — never a
     /// full URL. A same-EUID-only browsing-profile artifact (R6): the caller must

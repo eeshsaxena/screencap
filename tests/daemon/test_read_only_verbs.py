@@ -1517,3 +1517,167 @@ async def test_transcript_to_frame_nearest_chunk_granular_resolution(
         "/v0/frame.nearest", {"recording": "demo", "timestamp_ms": anchor_ms}
     )
     assert missed.json()["stem"] is None
+
+
+# ---------------------------------------------------------------------------
+# U10 tasks.list — LOCAL named-task segments (local-first intelligence)
+# ---------------------------------------------------------------------------
+
+
+def _seed_task_segments(recording_dir: Path, segments: list[dict]) -> None:
+    """Write task segments into a recording's pipeline_task_segments ledger.
+
+    Mirrors what U4's ``terminal_stage._persist_local_tasks`` writes to the
+    STRUCTURED ledger sink (the verb reads this table, not ``tasks.json``).
+    """
+    from screencap.pipeline_state import (
+        PipelineLedger,
+        TaskSegmentRow,
+        ensure_pipeline_state_schema,
+    )
+
+    db_path = recording_dir / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    ledger = PipelineLedger(db_path)
+    ledger.replace_task_segments(
+        [
+            TaskSegmentRow(
+                task_index=i,
+                start_ts=float(s["start_ts"]),
+                end_ts=float(s["end_ts"]),
+                name=s["name"],
+                category=s.get("category"),
+                confidence=s.get("confidence"),
+                metadata=s.get("metadata"),
+            )
+            for i, s in enumerate(segments)
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_returns_persisted_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A LOCAL recording with a tasks store returns its named segments, ordered."""
+    recordings_dir = tmp_path / "recordings"
+    rec_dir = _make_recording(recordings_dir, "demo")
+    _seed_task_segments(
+        rec_dir,
+        [
+            {"start_ts": 100.0, "end_ts": 200.0, "name": "Payroll run in Gusto",
+             "category": "finance", "confidence": "high"},
+            {"start_ts": 200.0, "end_ts": 350.0, "name": "Email triage"},
+        ],
+    )
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/tasks.list", {"recording": "demo"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._TASKS_LIST_API_VERSION)
+    assert payload["recording"] == "demo"
+    assert len(payload["tasks"]) == 2
+    first = payload["tasks"][0]
+    assert set(first) == {
+        "task_index", "start_ts", "end_ts", "name", "category", "confidence",
+    }
+    assert first["task_index"] == 0
+    assert first["name"] == "Payroll run in Gusto"
+    assert first["category"] == "finance"
+    assert first["confidence"] == "high"
+    # Heuristic-style task carries no category/confidence — null, not absent.
+    assert payload["tasks"][1]["name"] == "Email triage"
+    assert payload["tasks"][1]["category"] is None
+    assert payload["tasks"][1]["confidence"] is None
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_empty_for_recording_without_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recording with no tasks store (provider miss / legacy) returns []."""
+    recordings_dir = tmp_path / "recordings"
+    _make_recording(recordings_dir, "demo")  # real recording.db, no task rows
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/tasks.list", {"recording": "demo"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["recording"] == "demo"
+    assert payload["tasks"] == []
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_empty_for_missing_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A well-formed name that doesn't exist on disk is a graceful empty, not 500."""
+    recordings_dir = tmp_path / "recordings"
+    recordings_dir.mkdir()
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_post("/v0/tasks.list", {"recording": "ghost"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["tasks"] == []
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_rejects_traversal_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A traversal recording name is rejected before any disk read."""
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+
+    response = await _asgi_post("/v0/tasks.list", {"recording": "../../etc"})
+
+    assert response.status_code >= 400
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_name"
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_missing_recording_field_is_400(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body missing the required ``recording`` field is a typed 400."""
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path / "recordings"))
+
+    response = await _asgi_post("/v0/tasks.list", {})
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_does_not_bump_idle_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tasks.list is read-only — NOT in _ACTIVITY_PATHS, so it must not reset the
+    idle-shutdown clock."""
+    from screencap.daemon import _idle_shutdown
+    from screencap.daemon.app import build_app
+
+    recordings_dir = tmp_path / "recordings"
+    _make_recording(recordings_dir, "demo")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    app = build_app()
+    _idle_shutdown.attach(app, idle_seconds=600.0)
+    sentinel = 12345.0
+    app.state.idle_last_activity = sentinel
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/v0/tasks.list", json={"recording": "demo"})
+    assert resp.status_code == 200
+    assert app.state.idle_last_activity == sentinel

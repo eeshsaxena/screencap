@@ -85,6 +85,40 @@ enum JournalModel {
         return summary
     }
 
+    /// The card's display title, preferring the namer's `title` and falling back
+    /// to a locally-derived named task (U10). When the namer produced no title —
+    /// the raw directory `name` is the placeholder `RecordingSummary` supplies —
+    /// but on-device segmentation named at least one task, the first task's name
+    /// reads far better than the directory slug. Uploaded/cloud-named recordings
+    /// keep the namer title unchanged; only the un-named local case borrows a task
+    /// name. Returns `rec.title` (never empty) in every other case, so the card
+    /// title is always populated.
+    static func displayTitle(_ rec: RecordingSummary, tasks: [RecordingTask]) -> String {
+        if rec.title != rec.name { return rec.title }
+        if let first = tasks.first?.name.trimmingCharacters(in: .whitespacesAndNewlines),
+           !first.isEmpty {
+            return first
+        }
+        return rec.title
+    }
+
+    /// The card's summary line, preferring the namer's `summary` and falling back
+    /// to a compact "N tasks" line derived from the locally-named tasks (U10) when
+    /// the namer produced no summary. Nil (line hidden) only when there is neither
+    /// a namer summary nor any local task — so a recording with no tasks store
+    /// renders exactly as before (no crash, no fabricated line).
+    static func summaryLine(_ rec: RecordingSummary, tasks: [RecordingTask]) -> String? {
+        if let summary = summaryLine(rec) { return summary }
+        let named = tasks
+            .map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !named.isEmpty else { return nil }
+        if named.count == 1 { return named[0] }
+        // A short lead-in that reuses the summary-line slot rather than inventing
+        // a new UI shape: the first task name plus a "+N more" tail.
+        return "\(named[0]) · +\(named.count - 1) more"
+    }
+
     /// The dominant app across a recording's `timeline.query` rows — the app
     /// chip (design 412). Most frequent non-empty `app`, first-seen winning
     /// ties; nil (chip omitted) when no row names an app.
