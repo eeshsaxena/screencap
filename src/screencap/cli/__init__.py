@@ -49,7 +49,7 @@ def _stdin_is_tty() -> bool:
 # silently bump the version SwiftUI reads from `status --json`, and a status
 # payload tweak can be signalled without disturbing the event stream.
 _STATUS_SCHEMA_VERSION = 1
-_APPS_SCHEMA_VERSION = 2
+_APPS_SCHEMA_VERSION = 3
 _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
 # v2 (todo 012 follow-up, SCR-17): adds the `privacy` block to the payload so
 # the SwiftUI first-run banner can read `mode`, `setup_skipped`, and
@@ -1787,7 +1787,15 @@ def apps(as_json, include_spotlight):
     Output (per app, when --json is set):
       bundle_id, display_name, path, icon_path, context_class,
       classification_source, resolved_action, in_exclude_apps,
-      in_allow_apps, is_matrix_exclude, has_per_frame_overrides
+      in_allow_apps, allow_confirmed, confirmation_required,
+      is_matrix_exclude, has_per_frame_overrides
+
+    Schema v3 (SCR-235): ``allow_confirmed`` is true when the entry is an
+    authoritative confirmed allow (present in both allow_apps and
+    confirmed_allow_apps); ``confirmation_required`` is true when the app's
+    class needs --confirm-sensitive to allow (matrix EXCLUDE in any mode).
+    ``is_matrix_exclude`` (EXCLUDE in *every* mode) is kept for backward
+    compatibility but no longer drives row locking.
 
     has_per_frame_overrides is true when ``mask_domains`` or
     ``mask_title_patterns`` is non-empty in config.toml. The per-app
@@ -1809,6 +1817,7 @@ def apps(as_json, include_spotlight):
             FrameMetadata,
             PrivacyMode,
             get_matrix_action,
+            requires_confirmed_allow,
         )
     except ImportError:
         err_console.print(_RECORD_EXTRAS_MSG)
@@ -1879,8 +1888,12 @@ def apps(as_json, include_spotlight):
             "context_class": ctx_class.value,
             "classification_source": classification.source,
             "resolved_action": decision.action.value,
-            "in_exclude_apps": meta.bundle_id in privacy_cfg.exclude_apps,
-            "in_allow_apps": meta.bundle_id in privacy_cfg.allow_apps,
+            # Accessor methods, not raw set membership — the config sets are
+            # case-normalized (SCR-235) and mixed-case bundle IDs must match.
+            "in_exclude_apps": privacy_cfg.is_excluded_app(meta.bundle_id),
+            "in_allow_apps": privacy_cfg.is_allowed_app(meta.bundle_id),
+            "allow_confirmed": privacy_cfg.is_confirmed_allowed_app(meta.bundle_id),
+            "confirmation_required": requires_confirmed_allow(ctx_class),
             "is_matrix_exclude": is_matrix_exclude,
             "has_per_frame_overrides": has_per_frame_overrides,
         })
@@ -2908,13 +2921,18 @@ def settings(ctx, set_pair, as_json):
               default=lambda: _should_default_to_json(),
               help="Emit machine-readable JSON to stdout instead of prose to stderr. "
                    "Auto-detected when stdout is not a TTY (todo 021).")
-def settings_privacy(field, op, value, as_json):
+@click.option("--confirm-sensitive", "confirm_sensitive", is_flag=True,
+              help="Confirm allow-listing a sensitive app (password manager, "
+                   "banking, auth/payment flows). A confirmed allow is "
+                   "authoritative over the privacy matrix in every mode "
+                   "(SCR-235).")
+def settings_privacy(field, op, value, as_json, confirm_sensitive):
     """Mutate a [privacy] field in config.toml (Unit 4b).
 
     \b
     Valid FIELD names (todo 022):
-      list fields (add/remove): exclude_apps, allow_apps, mask_domains,
-                                mask_title_patterns
+      list fields (add/remove): exclude_apps, allow_apps, confirmed_allow_apps,
+                                mask_domains, mask_title_patterns
       scalar fields (set):      mode (public|internal), setup_skipped (bool)
       map fields (BUNDLE=CLASS): app_classes
 
@@ -2929,10 +2947,12 @@ def settings_privacy(field, op, value, as_json):
     (R16 invariant). Idempotent: add of an already-present value is a no-op,
     remove of an absent value is a no-op (both exit 0).
 
-    Validation (todo 022): rejects ``allow_apps add`` for any bundle ID whose
-    matrix action at the configured mode is EXCLUDE, MASK_WINDOW, or
-    TEXT_REDACT — not just EXCLUDE. Use ``screencap apps --json`` to check
-    ``resolved_action`` before attempting allow_apps add.
+    ``allow_apps add`` writes a *confirmed* allow (SCR-235): the entry is
+    authoritative over the privacy matrix in every mode. Sensitive classes
+    (excluded by the matrix in any mode) require ``--confirm-sensitive``;
+    unclassified bundles are refused until classified via ``app_classes``.
+    ``allow_apps remove`` also drops the confirmation, so re-allowing a
+    sensitive app re-prompts.
     """
     import json as _json
 
@@ -3058,6 +3078,7 @@ def settings_privacy(field, op, value, as_json):
             err_console=err_console,
             tomlkit=tomlkit,
             _result=_result,
+            confirm_sensitive=confirm_sensitive,
         )
 
     if changed:

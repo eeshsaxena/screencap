@@ -600,12 +600,17 @@ class RecorderPrivacyFilter:
 
             # Force public mode for cloud masking so CHAT/EMAIL/etc. get
             # MASK_WINDOW instead of TEXT_REDACT (which can't mask pixels).
+            # The allow set is restricted to confirmed entries (SCR-235
+            # KTD5) so this PUBLIC-forcing surface agrees with the cloud
+            # window filter: confirmed apps stay unmasked, legacy entries
+            # take the matrix action exactly as before.
             if not hasattr(self, "_masking_evaluator"):
                 from dataclasses import replace as _dc_replace
 
                 from screencap.privacy.policy import DefaultPolicyEvaluator
                 _cloud_config = _dc_replace(
-                    self._evaluator.config, mode=PrivacyMode.PUBLIC,
+                    self._evaluator.config.restricted_to_confirmed(),
+                    mode=PrivacyMode.PUBLIC,
                 )
                 self._masking_evaluator = DefaultPolicyEvaluator(_cloud_config)
 

@@ -29,7 +29,16 @@ logger = logging.getLogger(__name__)
 
 _MATRIX_ACK_KEY = "matrix_acknowledged_v2026_04"
 
-_PRIVACY_LIST_FIELDS = ("exclude_apps", "allow_apps", "mask_domains", "mask_title_patterns")
+# `confirmed_allow_apps` is internally managed by the allow_apps add/remove
+# flow (SCR-235): direct writes behave as a plain list field and are meant
+# for tests and hand-edits, not documented use.
+_PRIVACY_LIST_FIELDS = (
+    "exclude_apps",
+    "allow_apps",
+    "confirmed_allow_apps",
+    "mask_domains",
+    "mask_title_patterns",
+)
 # `matrix_acknowledged_v2026_04` is NOT exposed here (todo 012) — it's an
 # internal migration flag written by `_maybe_prompt_matrix_acknowledgement`
 # and should not be flippable from a `screencap settings` invocation.
@@ -375,36 +384,20 @@ def _privacy_list_field_value(value: str) -> str:
     return value.strip()
 
 
-def _matrix_blocks_allow_for_class(ctx_class, configured_mode: str) -> "PrivacyAction | None":
-    """Return the matrix action if it blocks ``allow_apps`` at this mode, else None.
+def _allow_requires_confirmation(ctx_class) -> bool:
+    """True when allow-listing this class needs the explicit confirm flag.
 
-    Blocks loosening via ``allow_apps`` when the matrix at the user's configured
-    mode produces EXCLUDE / MASK_WINDOW / TEXT_REDACT for this class. Without
-    this guard, ``allow_apps add com.tinyspeck.slackmacgap`` (CHAT, MASK_WINDOW
-    under ``internal``) would silently bypass Unit 7a's strengthening.
-
-    PASSWORD_MANAGER (EXCLUDE in every mode) is always blocked. BANKING
-    (MASK_WINDOW under ``internal``) is also blocked. BROWSER_UNVERIFIED
-    (ALLOW under ``internal``) is *not* blocked — users can still allow
-    a browser explicitly.
+    SCR-235 replaced the matrix-strictness hard-reject with a confirmation
+    gate: an allow written through this flow is *confirmed* (authoritative
+    over the matrix in every mode), so classes the matrix excludes in any
+    mode (password manager, banking, auth/payment flows) require the caller
+    to pass ``--confirm-sensitive``. Mask-class apps (chat, email, browsers,
+    terminals) confirm silently on add — a new deliberate add is exactly
+    what distinguishes them from legacy floor-bound entries.
     """
-    from screencap.privacy.policy import (
-        PrivacyAction,
-        PrivacyMode,
-        get_matrix_action,
-    )
+    from screencap.privacy.policy import requires_confirmed_allow
 
-    blocking = (
-        PrivacyAction.EXCLUDE,
-        PrivacyAction.MASK_WINDOW,
-        PrivacyAction.TEXT_REDACT,
-    )
-    try:
-        mode = PrivacyMode(configured_mode)
-    except ValueError:
-        mode = PrivacyMode.INTERNAL
-    action = get_matrix_action(ctx_class, mode)
-    return action if action in blocking else None
+    return requires_confirmed_allow(ctx_class)
 
 
 def _settings_privacy_apply(
@@ -419,6 +412,7 @@ def _settings_privacy_apply(
     err_console,
     tomlkit,
     _result,
+    confirm_sensitive: bool = False,
 ) -> bool:
     """Apply a single privacy mutation to the in-memory tomlkit privacy table.
 
@@ -433,21 +427,26 @@ def _settings_privacy_apply(
     leaking a hundred-line block into the context manager body. Mutates
     list fields in-place via tomlkit Array's append/remove (todo 016) so
     inline comments and per-item formatting survive.
+
+    ``allow_apps add`` writes both lists (SCR-235): the entry lands in
+    ``allow_apps`` AND ``confirmed_allow_apps`` in the same transaction, so
+    new deliberate adds are authoritative over the matrix. Classes the
+    matrix excludes in any mode require ``confirm_sensitive=True``.
+    ``allow_apps remove`` prunes the confirmed entry, so re-allowing a
+    sensitive app re-prompts.
     """
-    # Matrix-invariant guard: reject loosening any matrix-blocked class via
-    # allow_apps (todo 005). Evaluated at the *configured mode* — under
-    # `internal` this catches CHAT/EMAIL/CALENDAR/VIDEO_CALL (MASK_WINDOW)
-    # in addition to PASSWORD_MANAGER (EXCLUDE). Defaults to "internal" when
-    # mode is unset.
+    # Confirmation gate (SCR-235, replaces the matrix-strictness hard-reject):
+    # adds through this flow become *confirmed* entries, so allow-listing a
+    # confirmation-required class (EXCLUDE anywhere in its matrix row) needs
+    # the explicit flag.
     #
     # Also consults the on-disk app_classes overrides (todo 030) so that a
     # bundle absent from BUNDLE_ID_MAP but reclassified by the user as a
     # sensitive class (e.g., `app_classes set com.example.foo=password_manager`)
-    # cannot be allow-listed in a follow-up call.
+    # cannot be silently allow-listed in a follow-up call.
     if is_list and field == "allow_apps" and op == "add":
         from screencap.privacy.classify import BROWSER_BUNDLE_IDS, BUNDLE_ID_MAP
         from screencap.privacy.policy import ContextClass
-        configured_mode = str(privacy_tbl.get("mode") or "internal")
 
         # Effective class: app_classes override > BUNDLE_ID_MAP > BROWSER_BUNDLE_IDS > None.
         # BROWSER_BUNDLE_IDS resolves to BROWSER_UNVERIFIED at runtime via
@@ -467,21 +466,19 @@ def _settings_privacy_apply(
             effective_class = ContextClass.BROWSER_UNVERIFIED
 
         if effective_class is not None:
-            blocking_action = _matrix_blocks_allow_for_class(
-                effective_class, configured_mode,
-            )
-            if blocking_action is not None:
+            if _allow_requires_confirmation(effective_class) and not confirm_sensitive:
                 err_console.print(
-                    f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value} which the "
-                    f"privacy matrix at mode={configured_mode!r} produces "
-                    f"{blocking_action.value} — allow_apps cannot loosen this. "
-                    f"Set mode=public to capture broadly, or override at the "
-                    f"per-app level via app_classes (subject to the same guard)."
+                    f"[red]Error:[/red] '{escape(str(value))}' is in {effective_class.value}, a class "
+                    f"the privacy matrix excludes in at least one mode — allowing it "
+                    f"makes it fully recordable in every mode: raw capture, keystrokes, "
+                    f"the local search index, and cloud copies when a cloud destination "
+                    f"is enabled. Re-run with [bold]--confirm-sensitive[/bold] to "
+                    f"confirm, or leave it protected."
                 )
                 _result(
                     False,
                     exit_code=1,
-                    error=f"matrix_blocks_allow:{effective_class.value}@{configured_mode}",
+                    error=f"confirmation_required:{effective_class.value}",
                 )
         else:
             # Unknown bundle (no BUNDLE_ID_MAP entry, no app_classes
@@ -516,18 +513,48 @@ def _settings_privacy_apply(
             arr = tomlkit.array()
             privacy_tbl[field] = arr
         if op == "add":
-            if value in arr:
-                # Idempotent no-op
-                err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
-                _result(True, changed=False)
-                return False
-            arr.append(value)
+            already = value in arr
+            if field == "allow_apps":
+                # SCR-235: adds through this flow are confirmed — write both
+                # lists in the same transaction. Re-adding an existing legacy
+                # entry is the CLI upgrade path: it confirms the entry.
+                confirmed = privacy_tbl.get("confirmed_allow_apps")
+                if confirmed is None:
+                    confirmed = tomlkit.array()
+                    privacy_tbl["confirmed_allow_apps"] = confirmed
+                conf_already = any(
+                    str(e).lower() == value.lower() for e in confirmed
+                )
+                if already and conf_already:
+                    err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} (confirmed) — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                if not already:
+                    arr.append(value)
+                if not conf_already:
+                    confirmed.append(value)
+            else:
+                if already:
+                    # Idempotent no-op
+                    err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
+                    _result(True, changed=False)
+                    return False
+                arr.append(value)
         else:  # remove
             if value not in arr:
                 err_console.print(f"[dim]{escape(str(field))} does not contain {escape(str(value))} — no change.[/dim]")
                 _result(True, changed=False)
                 return False
             arr.remove(value)
+            if field == "allow_apps":
+                # SCR-235: removing the allow prunes its confirmed entry so
+                # re-allowing a sensitive app re-prompts.
+                confirmed = privacy_tbl.get("confirmed_allow_apps")
+                if confirmed is not None:
+                    for stale in [
+                        e for e in confirmed if str(e).lower() == value.lower()
+                    ]:
+                        confirmed.remove(stale)
     elif is_scalar:
         privacy_tbl[field] = parsed_value
     else:
@@ -666,8 +693,9 @@ def _settings_privacy_apply(
                         f"{old_class.value} to {new_class.value} would loosen "
                         f"the matrix at mode={configured_mode!r} from "
                         f"{old_action.value} to {new_action.value} — rejected. "
-                        f"Set mode=public if you want broader capture, or "
-                        f"keep the existing classification."
+                        f"Keep the existing classification, or allow the app "
+                        f"explicitly via allow_apps (sensitive classes require "
+                        f"--confirm-sensitive)."
                     )
                     _result(
                         False,

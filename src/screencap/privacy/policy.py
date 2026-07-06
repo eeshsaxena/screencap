@@ -154,6 +154,41 @@ def _validate_matrix() -> None:
 _validate_matrix()
 
 
+# Classes whose matrix row contains EXCLUDE in any mode. Allow-listing one of
+# these requires an explicit confirmation (SCR-235): the CLI gate, the setup
+# wizard, and the `apps` payload all consume this single matrix-derived set so
+# the definition cannot drift across surfaces.
+CONFIRMATION_REQUIRED_CLASSES: frozenset[ContextClass] = frozenset(
+    ctx
+    for (ctx, _mode), action in _ACTION_MATRIX.items()
+    if action is PrivacyAction.EXCLUDE
+)
+
+
+def requires_confirmed_allow(context_class: ContextClass) -> bool:
+    """True when allow-listing this class needs an explicit confirmation."""
+    return context_class in CONFIRMATION_REQUIRED_CLASSES
+
+
+# Known browser bundle IDs. Lives here (the leaf module) because both the
+# classifier and the evaluator's R12 browser carve-out must share one browser
+# definition; classify.py re-exports it for existing importers.
+BROWSER_BUNDLE_IDS: frozenset[str] = frozenset({
+    "com.apple.Safari",
+    "com.google.Chrome",
+    "org.mozilla.firefox",
+    "com.microsoft.edgemac",
+    "com.brave.Browser",
+    "com.operasoftware.Opera",
+    "com.vivaldi.Vivaldi",
+    "company.thebrowser.Browser",  # Arc
+    "org.chromium.Chromium",
+    "com.nickvision.nicegx.nicegx",  # Orion
+    "org.waterfoxproject.waterfox",
+    "org.torproject.torbrowser",
+})
+
+
 # ---------------------------------------------------------------------------
 # Privacy config
 # ---------------------------------------------------------------------------
@@ -166,15 +201,40 @@ class PrivacyConfig:
     mode: PrivacyMode = PrivacyMode.INTERNAL
     exclude_apps: frozenset[str] = field(default_factory=frozenset)
     allow_apps: frozenset[str] = field(default_factory=frozenset)
+    confirmed_allow_apps: frozenset[str] = field(default_factory=frozenset)
     mask_domains: frozenset[str] = field(default_factory=frozenset)
     mask_title_patterns: tuple[re.Pattern[str], ...] = ()
     app_classes: dict[str, ContextClass] = field(default_factory=dict)
 
     def is_excluded_app(self, bundle_id: str) -> bool:
-        return bundle_id in self.exclude_apps
+        return bundle_id.lower() in self.exclude_apps
 
     def is_allowed_app(self, bundle_id: str) -> bool:
-        return bundle_id in self.allow_apps
+        return bundle_id.lower() in self.allow_apps
+
+    def is_confirmed_allowed_app(self, bundle_id: str) -> bool:
+        """True when the entry is authoritative (SCR-235): present in BOTH
+        allow_apps and confirmed_allow_apps. An orphaned confirmed entry
+        (hand-edited config) is inert."""
+        bid = bundle_id.lower()
+        return bid in self.confirmed_allow_apps and bid in self.allow_apps
+
+    def app_class_for(self, bundle_id: str) -> ContextClass | None:
+        """Case-normalized app_classes lookup."""
+        return self.app_classes.get(bundle_id.lower())
+
+    def restricted_to_confirmed(self) -> "PrivacyConfig":
+        """Cloud-posture shaping (SCR-235 KTD5): keep only confirmed allow
+        entries. Both PUBLIC-forcing cloud surfaces (the cloud window filter
+        and the background-window masking evaluator) use this one helper so
+        they agree: confirmed entries survive into cloud posture, legacy
+        (unconfirmed) entries do not. Tightening knobs (exclude_apps,
+        mask_domains, mask_title_patterns) are untouched."""
+        import dataclasses
+
+        return dataclasses.replace(
+            self, allow_apps=self.allow_apps & self.confirmed_allow_apps
+        )
 
     def is_masked_domain(self, domain: str) -> bool:
         domain = domain.lower()
@@ -188,8 +248,21 @@ class PrivacyConfig:
         return None
 
     def __post_init__(self) -> None:
-        if isinstance(self.app_classes, dict):
-            object.__setattr__(self, "app_classes", MappingProxyType(self.app_classes))
+        # Bundle-id membership is case-normalized (SCR-235): macOS treats
+        # CFBundleIdentifiers case-insensitively, and confirmed-allow
+        # authority rests on two-list membership that must not silently
+        # break on a casing mismatch. Idempotent — safe to re-run on
+        # unpickle and dataclasses.replace().
+        for name in ("exclude_apps", "allow_apps", "confirmed_allow_apps"):
+            object.__setattr__(
+                self, name, frozenset(b.lower() for b in getattr(self, name))
+            )
+        if isinstance(self.app_classes, (dict, MappingProxyType)):
+            object.__setattr__(
+                self,
+                "app_classes",
+                MappingProxyType({k.lower(): v for k, v in self.app_classes.items()}),
+            )
 
     def __getstate__(self) -> dict[str, object]:
         # MappingProxyType is not picklable; convert to plain dict for transport.
@@ -285,6 +358,20 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
             )
     allow_apps = frozenset(raw_allow)
 
+    # confirmed_allow_apps — the subset of allow_apps the user explicitly
+    # confirmed (SCR-235); authoritative only when present in both lists.
+    raw_confirmed = section.get("confirmed_allow_apps", [])
+    if not isinstance(raw_confirmed, list):
+        raise InvalidPrivacyConfigError(
+            f"privacy.confirmed_allow_apps must be a list, got {type(raw_confirmed).__name__}"
+        )
+    for i, app in enumerate(raw_confirmed):
+        if not isinstance(app, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.confirmed_allow_apps[{i}] must be a string, got {type(app).__name__}"
+            )
+    confirmed_allow_apps = frozenset(raw_confirmed)
+
     # mask_domains
     raw_domains = section.get("mask_domains", [])
     if not isinstance(raw_domains, list):
@@ -342,6 +429,7 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
         mode=mode,
         exclude_apps=exclude_apps,
         allow_apps=allow_apps,
+        confirmed_allow_apps=confirmed_allow_apps,
         mask_domains=mask_domains,
         mask_title_patterns=tuple(compiled),
         app_classes=app_classes,
@@ -411,15 +499,16 @@ _CONTEXT_REASON: dict[ContextClass, str] = {
 class DefaultPolicyEvaluator:
     """Evaluates policy using config rules + action matrix.
 
-    Precedence (highest to lowest):
+    Precedence (highest to lowest), per SCR-235:
     1. Explicit user denylist (exclude_apps via bundle_id)
-    2. Explicit user allowlist (allow_apps via bundle_id)
-    3. Domain mask rules (mask_domains)
-    4. Title mask rules (mask_title_patterns)
+    2. User mask rules (mask_domains, mask_title_patterns) — user-authored
+       tightening outranks any allow, confirmed or not
+    3. Confirmed user allowlist (allow_apps ∩ confirmed_allow_apps) —
+       authoritative over the matrix in every mode, except browser windows
+       refined to a confirmation-required context (R12)
+    4. Legacy (unconfirmed) allowlist — keeps the pre-SCR-235
+       matrix-strictness floor
     5. Action matrix lookup (context_class, privacy_mode)
-
-    At each level, the result is compared with the matrix default and
-    the stricter action wins.
     """
 
     def __init__(self, config: PrivacyConfig) -> None:
@@ -429,6 +518,16 @@ class DefaultPolicyEvaluator:
     def config(self) -> PrivacyConfig:
         return self._config
 
+    def _is_browser_bundle(self, bundle_id: str) -> bool:
+        """The classifier's browser definition (classify.py step 3): a stock
+        browser or an app_classes-tagged one. The R12 carve-out must use the
+        same definition or it goes dead for stock browsers with no
+        app_classes entry."""
+        return (
+            bundle_id in BROWSER_BUNDLE_IDS
+            or self._config.app_class_for(bundle_id) == ContextClass.BROWSER_UNVERIFIED
+        )
+
     def evaluate(
         self,
         context: ContextResult,
@@ -437,7 +536,7 @@ class DefaultPolicyEvaluator:
     ) -> ActionDecision:
         mode = mode or self._config.mode
 
-        # 1. Explicit app exclusion
+        # 1. Explicit app exclusion — beats everything.
         if metadata.bundle_id and self._config.is_excluded_app(metadata.bundle_id):
             return ActionDecision(
                 action=PrivacyAction.EXCLUDE,
@@ -445,48 +544,11 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.bundle_id,
             )
 
-        # 2. Explicit app allow (subject to the matrix-strictness floor)
-        # For browsers: allow_apps means "capture by default" but the URL
-        # classifier's per-site decisions still apply. When the classifier
-        # refined the context beyond BROWSER_UNVERIFIED, fall through to
-        # the matrix so sensitive sites are still gated.
-        #
-        # Matrix-strictness floor (mirrors the CLI guard at
-        # privacy_settings._matrix_blocks_allow_for_class): allow_apps cannot loosen the
-        # matrix when it produces EXCLUDE / MASK_WINDOW / TEXT_REDACT. The
-        # CLI prevents NEW additions of those bundles, but EXISTING entries
-        # from before Unit 7a (e.g., a pre-existing Slack allowlist that
-        # used to evaluate to ALLOW under the old TEXT_REDACT default) must
-        # not silently re-enable raw capture under the tightened defaults.
-        if metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
-            matrix_action = get_matrix_action(context.context_class, mode)
-            if matrix_action == PrivacyAction.EXCLUDE:
-                return ActionDecision(
-                    action=PrivacyAction.EXCLUDE,
-                    reason=ReasonCode.POLICY_EXCLUDED_APP,
-                    evidence=f"matrix override: {context.context_class.value}",
-                )
-            if matrix_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.TEXT_REDACT):
-                # allow_apps doesn't override these either — fall through
-                # to step 5 (matrix decision) so the user gets the matrix's
-                # action instead of an unintended ALLOW.
-                pass
-            else:
-                # Browser with refined context → let the matrix decide
-                is_browser = (
-                    self._config.app_classes.get(metadata.bundle_id)
-                    == ContextClass.BROWSER_UNVERIFIED
-                )
-                if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
-                    pass  # fall through to matrix (step 5)
-                else:
-                    return ActionDecision(
-                        action=PrivacyAction.ALLOW,
-                        reason=ReasonCode.POLICY_ALLOWED_APP,
-                        evidence=metadata.bundle_id,
-                    )
-
-        # 3. Domain mask
+        # 2. User mask rules — finer-grained user-authored rules outrank
+        # app-level allows (SCR-235 R4): a domain/title rule the user wrote
+        # holds inside apps they allowed. For legacy allows in non-blocking
+        # contexts this is a deliberate, strictly-tightening change from the
+        # pre-SCR-235 order (allow used to return before these ran).
         if metadata.domain and self._config.is_masked_domain(metadata.domain):
             matrix_action = get_matrix_action(context.context_class, mode)
             forced = stricter(PrivacyAction.MASK_WINDOW, matrix_action)
@@ -495,8 +557,6 @@ class DefaultPolicyEvaluator:
                 reason=ReasonCode.POLICY_MASKED_DOMAIN,
                 evidence=metadata.domain,
             )
-
-        # 4. Title mask
         if metadata.window_title:
             title_match = self._config.matches_title_pattern(metadata.window_title)
             if title_match:
@@ -507,6 +567,60 @@ class DefaultPolicyEvaluator:
                     reason=ReasonCode.POLICY_MASKED_TITLE,
                     evidence=f"pattern={title_match}",
                 )
+
+        # 3. Confirmed allow — the user's explicit, confirmed choice beats
+        # the matrix in every mode (SCR-235 R1). One carve-out (R12): a
+        # browser window the classifier refined to a confirmation-required
+        # context (banking/auth/payment page) keeps the matrix action —
+        # app-level consent does not extend to arbitrary sensitive content
+        # a browser can host.
+        if metadata.bundle_id and self._config.is_confirmed_allowed_app(
+            metadata.bundle_id
+        ):
+            browser_on_sensitive_page = (
+                self._is_browser_bundle(metadata.bundle_id)
+                and context.context_class is not ContextClass.BROWSER_UNVERIFIED
+                and context.context_class in CONFIRMATION_REQUIRED_CLASSES
+            )
+            if not browser_on_sensitive_page:
+                return ActionDecision(
+                    action=PrivacyAction.ALLOW,
+                    reason=ReasonCode.POLICY_ALLOWED_APP,
+                    evidence=metadata.bundle_id,
+                )
+            # fall through to step 5 (matrix decides for the refined context)
+
+        # 4. Legacy (unconfirmed) allow — the pre-SCR-235 matrix-strictness
+        # floor, preserved verbatim: entries from before Unit 7a (or written
+        # outside the confirmation flow) must not silently re-enable raw
+        # capture. Confirming via the UI/CLI is the upgrade path.
+        elif metadata.bundle_id and self._config.is_allowed_app(metadata.bundle_id):
+            matrix_action = get_matrix_action(context.context_class, mode)
+            if matrix_action == PrivacyAction.EXCLUDE:
+                return ActionDecision(
+                    action=PrivacyAction.EXCLUDE,
+                    reason=ReasonCode.POLICY_EXCLUDED_APP,
+                    evidence=f"matrix override: {context.context_class.value}",
+                )
+            if matrix_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.TEXT_REDACT):
+                # The floor: allow_apps doesn't override these — fall through
+                # to step 5 so the user gets the matrix's action.
+                pass
+            else:
+                # Browser with refined context → let the matrix decide
+                # (legacy semantics: app_classes-tagged browsers only).
+                is_browser = (
+                    self._config.app_class_for(metadata.bundle_id)
+                    == ContextClass.BROWSER_UNVERIFIED
+                )
+                if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
+                    pass  # fall through to matrix (step 5)
+                else:
+                    return ActionDecision(
+                        action=PrivacyAction.ALLOW,
+                        reason=ReasonCode.POLICY_ALLOWED_APP,
+                        evidence=metadata.bundle_id,
+                    )
 
         # 5. Matrix default
         action = get_matrix_action(context.context_class, mode)

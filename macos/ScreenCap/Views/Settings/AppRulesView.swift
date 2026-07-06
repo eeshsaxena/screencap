@@ -18,6 +18,11 @@ struct AppRulesView: View {
     /// snaps back instead of lying.
     @State private var pendingSegments: [String: AppRuleSegmentPolicy.Segment] = [:]
 
+    /// The app awaiting the SCR-235 confirmation dialog (Record tapped on a
+    /// confirmation-required row). Cancel writes nothing; Confirm issues the
+    /// CLI write with the confirm flag.
+    @State private var confirmingApp: InstalledApp?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("App rules")
@@ -42,6 +47,31 @@ struct AppRulesView: View {
         .background(Color.scCanvas)
         .task {
             await privacy.refreshApps()
+        }
+        .confirmationDialog(
+            confirmingApp.map { "Allow “\($0.displayName)”?" } ?? "",
+            isPresented: Binding(
+                get: { confirmingApp != nil },
+                set: { if !$0 { confirmingApp = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: confirmingApp
+        ) { app in
+            Button("Allow and record") { runConfirmedAllow(app) }
+            Button("Cancel", role: .cancel) {}
+        } message: { app in
+            Text(AppRuleSegmentPolicy.confirmationMessage(for: app))
+        }
+    }
+
+    /// Fire the confirmed-allow write after the user accepted the dialog.
+    /// Mirrors `apply(_:to:tapped:)`'s optimistic pending discipline.
+    private func runConfirmedAllow(_ app: InstalledApp) {
+        guard pendingSegments[app.bundleId] == nil else { return }
+        pendingSegments[app.bundleId] = .record
+        Task {
+            await privacy.confirmAllow(bundleId: app.bundleId)
+            pendingSegments.removeValue(forKey: app.bundleId)
         }
     }
 
@@ -120,15 +150,15 @@ struct AppRulesView: View {
     }
 
     /// Row order is deliberately STABLE under rule changes: only the
-    /// matrix-immutable always-blocked rows group at the top (their state
-    /// can't change from this pane), and everything else is alphabetical
-    /// regardless of its current rule. Ranking rows by their user-toggleable
-    /// state made a just-toggled row jump groups mid-interaction, shifting
-    /// every row under the cursor — the "clicked one app, changed another"
-    /// failure the live QA caught.
+    /// sensitive confirmation-required rows group at the top (the class is
+    /// immutable, so toggling a rule never moves a row), and everything else
+    /// is alphabetical regardless of its current rule. Ranking rows by their
+    /// user-toggleable state made a just-toggled row jump groups
+    /// mid-interaction, shifting every row under the cursor — the "clicked
+    /// one app, changed another" failure the live QA caught.
     static func stableOrder(_ apps: [InstalledApp]) -> [InstalledApp] {
         apps.sorted {
-            if $0.isMatrixExclude != $1.isMatrixExclude { return $0.isMatrixExclude }
+            if $0.confirmationRequired != $1.confirmationRequired { return $0.confirmationRequired }
             return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
         }
     }
@@ -143,6 +173,12 @@ struct AppRulesView: View {
         tapped segment: AppRuleSegmentPolicy.Segment
     ) {
         guard pendingSegments[app.bundleId] == nil else { return }
+        // The confirmation-required unlock defers the write to the dialog:
+        // no pending state yet, so Cancel leaves the row untouched.
+        if transition == .allowConfirm {
+            confirmingApp = app
+            return
+        }
         pendingSegments[app.bundleId] = segment
         Task {
             switch transition {
@@ -152,6 +188,8 @@ struct AppRulesView: View {
                 await privacy.toggleExclude(bundleId: app.bundleId, excluded: false)
             case .allowAdd:
                 await privacy.toggleAllow(bundleId: app.bundleId, allowed: true)
+            case .allowConfirm:
+                break  // handled above before pending state is set
             }
             pendingSegments.removeValue(forKey: app.bundleId)
         }

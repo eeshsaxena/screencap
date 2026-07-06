@@ -170,21 +170,10 @@ PASSWORD_MANAGER_BUNDLES: frozenset[str] = frozenset(
     bid for bid, cls in BUNDLE_ID_MAP.items() if cls == ContextClass.PASSWORD_MANAGER
 )
 
-# Known browser bundle IDs.
-BROWSER_BUNDLE_IDS: frozenset[str] = frozenset({
-    "com.apple.Safari",
-    "com.google.Chrome",
-    "org.mozilla.firefox",
-    "com.microsoft.edgemac",
-    "com.brave.Browser",
-    "com.operasoftware.Opera",
-    "com.vivaldi.Vivaldi",
-    "company.thebrowser.Browser",  # Arc
-    "org.chromium.Chromium",
-    "com.nickvision.nicegx.nicegx",  # Orion
-    "org.waterfoxproject.waterfox",
-    "org.torproject.torbrowser",
-})
+# Known browser bundle IDs — canonical definition lives in policy.py (shared
+# with the evaluator's R12 browser carve-out); re-exported here for existing
+# importers (app_discovery, privacy_settings, backfill.skip_intervals).
+from screencap.privacy.policy import BROWSER_BUNDLE_IDS  # noqa: E402,F401
 
 # Title patterns for heuristic enrichment.
 # These do NOT replace verified domain evidence — they provide a hint
@@ -261,7 +250,9 @@ class DefaultContextClassifier:
         app_classes: dict[str, ContextClass] | None = None,
         domain_index: dict[str, ContextClass] | None = None,
     ) -> None:
-        self._app_classes = app_classes or {}
+        # Keys case-normalized to match PrivacyConfig's app_classes handling
+        # (SCR-235): a user override must not silently miss on casing.
+        self._app_classes = {k.lower(): v for k, v in (app_classes or {}).items()}
         if domain_index is not None:
             self._domain_index = domain_index
         else:
@@ -338,8 +329,8 @@ class DefaultContextClassifier:
 
         # 1. User config override (non-browser apps only — browsers need
         #    domain/keyword/title refinement in step 3)
-        if bundle_id and bundle_id in self._app_classes:
-            cfg_class = self._app_classes[bundle_id]
+        if bundle_id and bundle_id.lower() in self._app_classes:
+            cfg_class = self._app_classes[bundle_id.lower()]
             if cfg_class != ContextClass.BROWSER_UNVERIFIED:
                 return ContextResult(
                     context_class=cfg_class,
@@ -359,7 +350,7 @@ class DefaultContextClassifier:
         # 3. Known browser (hardcoded set OR user-config tagged as browser_unverified)
         is_browser = bundle_id and (
             bundle_id in BROWSER_BUNDLE_IDS
-            or self._app_classes.get(bundle_id) == ContextClass.BROWSER_UNVERIFIED
+            or self._app_classes.get(bundle_id.lower()) == ContextClass.BROWSER_UNVERIFIED
         )
         if is_browser:
             if domain:

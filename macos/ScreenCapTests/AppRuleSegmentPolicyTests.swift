@@ -2,9 +2,9 @@ import XCTest
 @testable import ScreenCap
 
 /// U13 — the apps-row → segmented-control mapping table (selection, locked
-/// flags, notes) and the tap → CLI-transition rules, across the five row
-/// shapes the plan names: allow-listed, excluded, matrix-mask, matrix-exclude,
-/// and unknown app.
+/// flags, notes) and the tap → CLI-transition rules, across the row shapes:
+/// confirmed-allow, legacy-allow, excluded, matrix-mask, confirmation-required
+/// (SCR-235 — replaces the retired matrix-exclude hard lock), and unknown app.
 final class AppRuleSegmentPolicyTests: XCTestCase {
 
     private func app(
@@ -13,9 +13,11 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         resolvedAction: String = "allow",
         inExcludeApps: Bool = false,
         inAllowApps: Bool = false,
-        isMatrixExclude: Bool = false
+        isMatrixExclude: Bool = false,
+        allowConfirmed: Bool? = nil,
+        confirmationRequired: Bool? = nil
     ) -> InstalledApp {
-        let json: [String: Any] = [
+        var json: [String: Any] = [
             "bundle_id": bundleId,
             "display_name": "App",
             "path": "/Applications/App.app",
@@ -28,30 +30,74 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
             "is_matrix_exclude": isMatrixExclude,
             "has_per_frame_overrides": false,
         ]
+        if let allowConfirmed { json["allow_confirmed"] = allowConfirmed }
+        if let confirmationRequired { json["confirmation_required"] = confirmationRequired }
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(InstalledApp.self, from: data)
     }
 
     // MARK: - Mapping table
 
-    /// Matrix-excluded (password manager): Block selected, whole row locked,
-    /// design note shape "blocked by default · password manager".
-    func testMatrixExcludeRowIsFullyLocked() {
-        let policy = AppRuleSegmentPolicy.derive(for: app(
-            contextClass: "password_manager", resolvedAction: "exclude", isMatrixExclude: true
-        ))
+    /// Confirmation-required (password manager, SCR-235): Block selected by
+    /// the matrix default, but Record is ENABLED and routes through the
+    /// consequences dialog (`.allowConfirm`) — the hard lock is retired.
+    func testConfirmationRequiredRowUnlocksBehindConfirm() {
+        let pm = app(
+            contextClass: "password_manager", resolvedAction: "exclude",
+            isMatrixExclude: true,
+            allowConfirmed: false, confirmationRequired: true
+        )
+        let policy = AppRuleSegmentPolicy.derive(for: pm)
         XCTAssertEqual(policy.selection, .block)
-        XCTAssertFalse(policy.recordEnabled)
-        XCTAssertFalse(policy.blockEnabled)
-        XCTAssertNotNil(policy.lockedReason)
+        XCTAssertTrue(policy.recordEnabled)
+        XCTAssertNil(policy.lockedReason)
         XCTAssertEqual(policy.note, "blocked by default · password manager")
-        // Every tap on a locked row is a no-op.
-        for segment in [AppRuleSegmentPolicy.Segment.record, .mask, .block] {
-            XCTAssertNil(AppRuleSegmentPolicy.transition(
-                for: app(contextClass: "password_manager", resolvedAction: "exclude", isMatrixExclude: true),
-                tapping: segment
-            ))
-        }
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: pm, tapping: .record), .allowConfirm)
+        XCTAssertNil(AppRuleSegmentPolicy.transition(for: pm, tapping: .block), "already blocked")
+        XCTAssertNil(AppRuleSegmentPolicy.transition(for: pm, tapping: .mask))
+    }
+
+    /// Confirmed allow (SCR-235): Record selected regardless of class — the
+    /// user's confirmed choice is authoritative; Block remains writable.
+    func testConfirmedAllowRowIsRecorded() {
+        let confirmed = app(
+            contextClass: "password_manager", resolvedAction: "allow",
+            inAllowApps: true, isMatrixExclude: true,
+            allowConfirmed: true, confirmationRequired: true
+        )
+        let policy = AppRuleSegmentPolicy.derive(for: confirmed)
+        XCTAssertEqual(policy.selection, .record)
+        XCTAssertEqual(policy.note, "recorded · allowed by you")
+        XCTAssertNil(AppRuleSegmentPolicy.transition(for: confirmed, tapping: .record))
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: confirmed, tapping: .block), .excludeAdd)
+    }
+
+    /// Legacy (unconfirmed) allow entry renders its REAL floor state — the
+    /// matrix mask — not a false "recorded"; Record re-confirms via the plain
+    /// allow write (the CLI upgrade path).
+    func testLegacyAllowRendersFloorStateHonestly() {
+        let legacy = app(
+            contextClass: "chat", resolvedAction: "mask_window",
+            inAllowApps: true,
+            allowConfirmed: false, confirmationRequired: false
+        )
+        let policy = AppRuleSegmentPolicy.derive(for: legacy)
+        XCTAssertEqual(policy.selection, .mask)
+        XCTAssertEqual(policy.note, "window masked while recording · chat")
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: legacy, tapping: .record), .allowAdd)
+    }
+
+    /// Stale-daemon decode (KTD8): a schema-v2 payload without the new keys
+    /// decodes with safe defaults — unconfirmed, and confirmation-required
+    /// falls back to the old `is_matrix_exclude` driver.
+    func testSchemaV2PayloadDecodesWithDefaults() {
+        let old = app(
+            contextClass: "password_manager", resolvedAction: "exclude",
+            isMatrixExclude: true
+        )
+        XCTAssertFalse(old.allowConfirmed)
+        XCTAssertTrue(old.confirmationRequired)
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: old, tapping: .record), .allowConfirm)
     }
 
     /// User-excluded: Block selected and writable back — Record issues the
@@ -113,19 +159,19 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         )
     }
 
-    /// The defensive resolved-exclude shape (matrix EXCLUDE without the user's
-    /// own entry and without `is_matrix_exclude` — a hand-edited config):
-    /// rendered blocked but writable, and crucially Record maps to allowAdd —
-    /// an excludeRemove here would be a silent no-op CLI write (the bundle is
-    /// not in exclude_apps).
-    func testResolvedExcludeDefensiveRow() {
+    /// Matrix-resolved EXCLUDE on an old-CLI payload (no confirmation keys,
+    /// `is_matrix_exclude` false — e.g. banking at public on schema v2):
+    /// rendered blocked but writable, and Record maps to allowAdd — the CLI's
+    /// verdict is the authority. On a new CLI this shape carries
+    /// `confirmation_required` and routes through `.allowConfirm` instead.
+    func testResolvedExcludeOldPayloadAttemptsAllow() {
         let handEdited = app(contextClass: "banking", resolvedAction: "exclude")
         let policy = AppRuleSegmentPolicy.derive(for: handEdited)
         XCTAssertEqual(policy.selection, .block)
         XCTAssertTrue(policy.recordEnabled)
         XCTAssertTrue(policy.blockEnabled)
         XCTAssertNil(policy.lockedReason)
-        XCTAssertEqual(policy.note, "blocked · banking")
+        XCTAssertEqual(policy.note, "blocked by default · banking")
         XCTAssertEqual(AppRuleSegmentPolicy.transition(for: handEdited, tapping: .record), .allowAdd)
         XCTAssertNil(AppRuleSegmentPolicy.transition(for: handEdited, tapping: .block), "already blocked")
     }
