@@ -110,13 +110,35 @@ def save_config_atomic(
 
 
 def get_recordings_dir() -> Path:
-    """Return recordings directory, creating it if needed."""
+    """Return recordings directory, creating it if needed.
+
+    SCR-236 (KTD-3): when the encrypted container is active this is the
+    store's mountpoint, so it must be *mounted* — never ``mkdir``'d as a
+    plaintext directory. ``get_recordings_dir`` / ``resolve_recording_dir``
+    are the CLI funnel that mounts the store on demand for daemon-independent
+    commands (``view`` / ``export`` / ``info`` …). A failed mount raises a
+    typed ``container.ContainerError`` (rendered by the CLI group), never a
+    silent plaintext fallback.
+    """
     env = os.environ.get("SCREENCAP_RECORDINGS_DIR")
     if env:
         p = Path(env)
-    else:
-        cfg = _load_toml()
-        p = Path(cfg.get("recordings_dir", str(_DEFAULT_RECORDINGS)))
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    if container_active():
+        root = get_data_root()
+        # Fast path: a plain stat when already mounted (the daemon mounts once
+        # at startup, so its request handlers don't re-shell to hdiutil). Only
+        # an unmounted store pays the ensure_store_mounted() cost.
+        if not os.path.ismount(str(root)):
+            from screencap import container
+
+            container.ensure_store_mounted()
+        return get_data_root()
+
+    cfg = _load_toml()
+    p = Path(cfg.get("recordings_dir", str(_DEFAULT_RECORDINGS)))
     p.mkdir(parents=True, exist_ok=True)
     return p
 

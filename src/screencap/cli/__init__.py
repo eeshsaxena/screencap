@@ -82,7 +82,30 @@ _RECORD_EXTRAS_MSG = (
 )
 
 
-@click.group()
+class _ScreencapGroup(click.Group):
+    """CLI group that renders a typed encrypted-store failure as a clear
+    error (SCR-236). A daemon-independent command (``view`` / ``export`` /
+    ``info`` …) resolves the recordings dir through the container mount, so a
+    locked Keychain, missing key, or rogue mountpoint surfaces here instead of
+    a stack trace. ``container`` is imported only on the exception path so
+    ``screencap --help`` stays fast (imports stay deferred)."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it's ours
+            from screencap import container
+
+            if isinstance(exc, container.ContainerError):
+                console.print(
+                    f"[red]Encrypted recordings store unavailable:[/red] "
+                    f"{escape(str(exc))}"
+                )
+                raise SystemExit(exc.exit_code) from exc
+            raise
+
+
+@click.group(cls=_ScreencapGroup)
 @click.version_option(version=__version__, prog_name="screencap")
 @click.option("--no-update-check", is_flag=True, hidden=True,
               help="Skip auto-update check.")
@@ -160,6 +183,137 @@ def _init_container_store_foreground() -> None:
             f"{escape(str(exc))}"
         )
         raise SystemExit(exc.exit_code)
+
+
+def _detach_container_store_foreground() -> None:
+    """Detach the encrypted store on ``serve --uninstall`` (SCR-236 KTD-4).
+
+    The mount normally outlives the daemon; explicit uninstall is one of the
+    few teardown points where detaching is correct. Best-effort — a detach
+    failure never fails the uninstall.
+    """
+    from screencap import config
+
+    if not config.container_active():
+        return
+    from screencap import container
+
+    mp = container.container_mountpoint(container.default_bundle_path())
+    if mp:
+        try:
+            container.detach_container(mp)
+        except container.ContainerError as exc:
+            console.print(
+                f"[yellow]Could not detach the encrypted store:[/yellow] "
+                f"{escape(str(exc))}"
+            )
+
+
+def _daemon_recording_active() -> bool:
+    """True iff a reachable daemon reports an active recording. No daemon ⇒
+    nothing recording (returns ``False``)."""
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    try:
+        with DaemonHTTPClient() as client:
+            snapshot = client.snapshot()
+        return bool(snapshot.get("is_recording"))
+    except (DaemonUnreachableError, DaemonAPIError, SchemaMismatchError):
+        return False
+
+
+@cli.group("store")
+def store():
+    """Manage the encrypted recordings store (SCR-236)."""
+
+
+@store.command("init")
+def store_init():
+    """Create + mount the encrypted store (foreground; one-time Keychain prompt)."""
+    from screencap import config, container
+
+    if not config.container_active():
+        console.print(
+            "[yellow]The encrypted container is not enabled[/yellow] "
+            "(container_enabled off, or SCREENCAP_RECORDINGS_DIR / a non-default "
+            "recordings_dir is set). Nothing to initialize."
+        )
+        return
+    bundle = container.default_bundle_path()
+    existed = bundle.exists()
+    _init_container_store_foreground()
+    if existed:
+        console.print(f"[green]Store already initialized[/green] at {bundle}; mounted.")
+    else:
+        console.print(f"[green]Encrypted store created[/green] at {bundle} and mounted.")
+
+
+@store.command("lock")
+def store_lock():
+    """Lock the store: refuse auto-remount until `store unlock`, then detach."""
+    from screencap import config, container
+
+    if not config.container_active():
+        console.print("[yellow]The encrypted container is not enabled.[/yellow]")
+        return
+    if _daemon_recording_active():
+        console.print("[red]A recording is active.[/red] Stop it before locking the store.")
+        raise SystemExit(1)
+    # Set the sentinel FIRST so a racing auto-spawned daemon cannot remount
+    # between our detach and the next command (KTD-4).
+    container.set_user_lock()
+    mp = container.container_mountpoint(container.default_bundle_path())
+    if mp:
+        try:
+            container.detach_container(mp)
+            console.print(
+                "[green]Store locked and detached.[/green] Run `store unlock` to use it again."
+            )
+        except container.ContainerError as exc:
+            console.print(
+                f"[yellow]Store marked locked, but it is busy and stayed mounted:[/yellow] "
+                f"{escape(str(exc))} It will not remount once detached."
+            )
+    else:
+        console.print("[green]Store locked.[/green] (It was not mounted.)")
+
+
+@store.command("unlock")
+def store_unlock():
+    """Clear the store lock so it mounts again on next use."""
+    from screencap import container
+
+    container.clear_user_lock()
+    console.print("[green]Store unlocked.[/green] It will mount on next use.")
+
+
+@store.command("compact")
+def store_compact():
+    """Reclaim host disk from deleted recordings (KTD-12). Never force-detaches."""
+    from screencap import config, container
+
+    if not config.container_active():
+        console.print("[yellow]The encrypted container is not enabled.[/yellow]")
+        return
+    if _daemon_recording_active():
+        console.print("[red]A recording is active.[/red] Stop it before compacting.")
+        raise SystemExit(1)
+    try:
+        freed = container.compact_store()
+    except container.ContainerBusyError as exc:
+        console.print(f"[yellow]Store is in use — try again when idle:[/yellow] {escape(str(exc))}")
+        raise SystemExit(exc.exit_code)
+    except container.ContainerError as exc:
+        console.print(f"[red]Compact failed:[/red] {escape(str(exc))}")
+        raise SystemExit(exc.exit_code)
+    console.print(
+        f"[green]Compacted.[/green] Reclaimed {freed / 1e6:.1f} MB to the host disk."
+    )
 
 
 @cli.command("serve")
@@ -241,6 +395,9 @@ def serve(
 
         if uninstall:
             result = launchagent.uninstall()
+            # SCR-236: detach the encrypted store now that the daemon is gone
+            # (KTD-4 — one of the few points where unmount is correct).
+            _detach_container_store_foreground()
             if result.state == launchagent.STATE_UNINSTALLED:
                 console.print(f"[green]{result.state}[/green]: {result.plist_path}")
                 return

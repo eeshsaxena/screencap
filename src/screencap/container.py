@@ -783,6 +783,47 @@ def ensure_store_mounted(*, allow_create: bool = False) -> str:
         os.close(lock_fd)
 
 
+def compact_store() -> int:
+    """Run the manual compaction cycle under ``mount.lock`` (KTD-12). Returns
+    host bytes freed.
+
+    Holds ``mount.lock`` for the whole cycle so no ``ensure_store_mounted``
+    races in during the detached window. Detaches **gracefully only — never
+    ``-force``** (a busy volume means "not now, retry", surfaced as a
+    retryable :class:`ContainerBusyError`), compacts, then re-attaches through
+    the state-machine body so the ROGUE check covers the momentarily-bare
+    mountpoint. The caller (``store compact``) is responsible for refusing
+    while a recording is active.
+    """
+    from screencap import config
+
+    mountpoint = Path(config.get_data_root())
+    bundle = default_bundle_path()
+    key = get_container_key()
+    if key is None:
+        raise ContainerKeyMissingError(
+            f"the encrypted store at {bundle} exists but its Keychain key is gone"
+        )
+    lock_fd = open_hardened_lock(_mount_lock_path())
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        mp = container_mountpoint(bundle)
+        if mp:
+            # Graceful detach ONLY — compact never forces past an active reader.
+            cp = _run_hdiutil(["detach", mp], timeout=_DETACH_TIMEOUT)
+            if cp.returncode != 0:
+                raise ContainerBusyError(
+                    "the store is in use; run `store compact` again when idle "
+                    "(compact never force-detaches)"
+                )
+        freed = compact_container(bundle, key)
+        # Re-attach through the state machine (ROGUE check) WITHOUT re-locking.
+        _ensure_mounted_locked(bundle, mountpoint, allow_create=False)
+        return freed
+    finally:
+        os.close(lock_fd)
+
+
 def _ensure_mounted_locked(bundle: Path, mountpoint: Path, *, allow_create: bool) -> str:
     """State machine body — runs under the held ``mount.lock``."""
     # 1. User explicitly locked the store — never silently remount (KTD-4).
@@ -858,6 +899,7 @@ __all__ = [
     "create_container_key",
     "default_bundle_path",
     "ensure_store_mounted",
+    "compact_store",
     "user_lock_path",
     "is_user_locked",
     "set_user_lock",
