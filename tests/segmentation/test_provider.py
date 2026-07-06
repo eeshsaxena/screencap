@@ -5,8 +5,8 @@ Covers:
 - ``GeminiProvider.segment``: validated tasks on a mocked raw response;
   ``None`` (not raise) on raw-call failure; ``None`` on output that fails
   validation.
-- The ``get_provider`` factory: name→backend mapping, the on-device
-  ``NotImplementedError`` placeholder, and a clear error for an unknown name.
+- The ``get_provider`` factory: name→backend mapping (gemini, on-device)
+  and a clear error for an unknown name.
 - Import-lightness: importing the interface + backend modules pulls no ``google``
   SDK (backends import ``genai`` lazily).
 
@@ -22,7 +22,6 @@ import pytest
 
 from screencap.segmentation.provider import LLMProvider, get_provider
 from screencap.segmentation.providers.gemini import GeminiProvider
-
 
 # ---------------------------------------------------------------------------
 # Fixtures — a minimal activity-data dict as ``build_activity_summary`` returns.
@@ -222,11 +221,12 @@ class TestGetProviderFactory:
         # Structurally satisfies the interface.
         assert isinstance(provider, LLMProvider)
 
-    def test_on_device_raises_not_implemented(self):
-        with pytest.raises(NotImplementedError) as exc:
-            get_provider("on-device")
-        assert "on-device" in str(exc.value)
-        assert "U5" in str(exc.value)
+    def test_on_device_maps_to_ondevice_provider(self):
+        from screencap.segmentation.providers.ondevice import OnDeviceProvider
+
+        provider = get_provider("on-device")
+        assert isinstance(provider, OnDeviceProvider)
+        assert isinstance(provider, LLMProvider)
 
     def test_unknown_name_raises_value_error(self):
         with pytest.raises(ValueError) as exc:
