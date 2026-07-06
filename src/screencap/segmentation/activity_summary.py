@@ -16,11 +16,18 @@ self-contained.
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Protocol
+from pathlib import Path
+from typing import Callable, Iterable, Protocol, Union
 
 log = logging.getLogger(__name__)
 
 MAX_ACTIVITY_ENTRIES = 200  # cap activity timeline entries for LLM context
+
+# A ``blocked_source`` (see ``build_activity_summary``) is either an already-built
+# ``is_blocked(ts) -> bool`` predicate, or a recording directory ``Path`` from
+# which one is derived over the recording's local ``recording.db``.
+BlockedPredicate = Callable[[float], bool]
+BlockedSource = Union[BlockedPredicate, Path, str]
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +371,124 @@ def _app_name_short(bundle_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Privacy strip (R11 / U3) — the single chokepoint before ANY model
+# ---------------------------------------------------------------------------
+#
+# This is the ONE place masked/blocked content is stripped from the activity
+# summary before it reaches a provider (local on-device OR cloud). Because the
+# strip runs at the event-consumption boundary of ``build_activity_summary`` —
+# the single chokepoint where the summary is built (U1) — every derived
+# structure (``entries``, ``timeline``, ``time_map``, the raw-fallback lists,
+# and transcript snippets) inherits it, so no consumer or future code path can
+# bypass it.
+#
+# The activity summary is TEXT ONLY — timeline entries carry app bundle IDs,
+# window titles, action counts, and timestamps; transcript snippets carry text.
+# It never carries frame/image bytes or references, so stripping the blocked
+# TIMESTAMP ranges removes the sensitive content wholesale.
+#
+# ALLOW-only + fail-closed: mirrors ``frame_blocked.build_is_blocked``. Blocked
+# geometry is re-derived from the recording's intact local ``recording.db`` via
+# ``backfill.skip_intervals.derive_skip_intervals(require_canonical=True)`` (the
+# same reader ``frame.nearest`` and the backfill use, so the strip cannot drift
+# from capture-time block semantics — KTD4). On a missing/unreadable/partial DB
+# read — or any failure building the privacy machinery — the predicate flags
+# EVERY timestamp as blocked, so an ambiguous read excludes rather than leaks.
+
+
+def _always_blocked(_ts: float) -> bool:
+    """Fail-closed sentinel predicate: every timestamp is treated as blocked."""
+    return True
+
+
+def _never_blocked(_ts: float) -> bool:
+    """Allow-all predicate: the default when no ``blocked_source`` is given."""
+    return False
+
+
+def _resolve_blocked_predicate(
+    blocked_source: BlockedSource,
+    window: tuple[float, float],
+    strip_tss: list[float],
+) -> BlockedPredicate:
+    """Return an ``is_blocked(ts) -> bool`` predicate from ``blocked_source``.
+
+    * A callable ``blocked_source`` is used directly (test / caller override, or
+      a pre-built predicate).
+    * A ``Path``/``str`` is treated as a recording directory: blocked intervals
+      are re-derived from its local ``recording.db`` over ``window`` (the
+      recording's ``[session_start, session_end)``), then the scrubber's
+      ``find_blocked_interval`` membership test wraps them.
+
+    ``strip_tss`` are the exact timestamps the strip will test — the activity
+    summary's own event/transcript timestamps. They are forwarded to
+    ``derive_skip_intervals`` as ``screenshot_timestamps`` so the fail-closed
+    **uncovered-gap** and **orphan-screenshot** residual protects precisely the
+    timestamps being stripped: a timestamp with no covering ``window_event``
+    (its rows were retroactively deleted) is treated as blocked, exactly as
+    ``frame_blocked.build_is_blocked`` protects the frame timestamps. Without
+    this, an event before the first surviving window would silently under-block.
+
+    Fail-closed on ANY error (missing/unreadable/partial ``recording.db``, a
+    ``require_canonical`` raise, or a failure building the privacy machinery):
+    returns ``_always_blocked`` so an ambiguous read excludes rather than leaks.
+    Heavy imports are deferred to the call so this module stays light.
+    """
+    if callable(blocked_source):
+        return blocked_source
+
+    recording_dir = Path(blocked_source)
+    if not strip_tss:
+        # No timestamped content → the predicate is never consulted; an allow-all
+        # keeps the contract total without forcing an all-blocked strip.
+        return _never_blocked
+
+    try:
+        from screencap.backfill.skip_intervals import (
+            build_classifier_evaluator,
+            derive_skip_intervals,
+        )
+        from screencap.scrubber import find_blocked_interval
+
+        db_path = recording_dir / "recording.db"
+        classifier, evaluator = build_classifier_evaluator(recording_dir)
+        intervals = derive_skip_intervals(
+            db_path,
+            classifier=classifier,
+            evaluator=evaluator,
+            time_range=window,
+            # Forward the exact strip timestamps so the uncovered-gap / orphan
+            # residual protects them (fail-closed) — an event before the first
+            # surviving window would otherwise slip through unblocked.
+            screenshot_timestamps=list(strip_tss),
+            # require_canonical makes derive_skip_intervals RAISE on a partial
+            # canonical read rather than silently returning the under-blocked
+            # set — the except below maps that to the all-blocked sentinel
+            # (fail-closed, SCR-198), matching frame_blocked.build_is_blocked.
+            require_canonical=True,
+        )
+        starts = [iv.start for iv in intervals]
+
+        def is_blocked(ts: float) -> bool:
+            return find_blocked_interval(ts, intervals, starts) is not None
+
+        return is_blocked
+    except Exception:
+        # MUST stay broad enough to catch CanonicalDerivationError (the partial-
+        # read signal from require_canonical=True). Mapping it to _always_blocked
+        # is what fails closed. Not imported by name at module top on purpose:
+        # that would pull the heavy skip_intervals/scrubber stack into this
+        # otherwise-light module.
+        log.warning(
+            "activity-summary privacy strip: blocked-interval derivation failed "
+            "for %s; failing closed (all content treated as blocked)",
+            recording_dir.name,
+            exc_info=True,
+        )
+        return _always_blocked
+
+
+# ---------------------------------------------------------------------------
 # Activity summary derivation
 # ---------------------------------------------------------------------------
 
@@ -371,6 +496,8 @@ def build_activity_summary(
     recording_name: str,
     manifests: list[dict],
     source: ActivitySource,
+    *,
+    blocked_source: BlockedSource | None = None,
 ) -> dict | None:
     """Build a compact activity summary from an injected event/transcript source.
 
@@ -382,9 +509,54 @@ def build_activity_summary(
     Source-agnostic: this is the single chokepoint where the activity summary
     is built, so every consumer (cloud, on-device, future) reads only what the
     injected source yields. GCS-specific reads live in the caller's source.
+
+    ``blocked_source`` (R11 / U3 privacy strip — the ONE place stripping happens,
+    so every consumer inherits it): OPT-IN and defaults to ``None`` (no strip).
+    When ``None``, output is byte-identical to the pre-strip cloud path — the
+    cloud caller passes nothing (its uploaded events are already scrubbed and it
+    has no local ``recording.db``), so cloud behavior is preserved. When
+    provided, any event OR transcript segment whose timestamp falls inside a
+    blocked/masked interval is dropped BEFORE it reaches ``entries`` / the
+    timeline / ``time_map`` / the raw-fallback lists / transcript snippets, so
+    the summary handed to ANY model is ALLOW-only. ``blocked_source`` is either
+    an already-built ``is_blocked(ts) -> bool`` predicate, or a recording-dir
+    ``Path`` from which one is re-derived over ``[session_start, session_end)``
+    (fail-closed: an ambiguous/partial read excludes rather than leaks). The
+    LOCAL segmentation stage (U4) passes the recording's local dir here.
     """
     session_start = min(m["chunk_start"] for m in manifests)
     session_end = max(m["chunk_end"] for m in manifests)
+
+    # Resolve the privacy-strip predicate ONCE (R11 / U3). Defaults to allow-all
+    # when no ``blocked_source`` is given, so the cloud path stays byte-identical
+    # (single pass over the source, no materialization) and cloud behavior is
+    # preserved. When a strip IS requested we materialize the events up front so
+    # the derived predicate can be handed the exact timestamps it will test
+    # (needed for the fail-closed uncovered-gap / orphan residual — see
+    # ``_resolve_blocked_predicate``); the cloud path never pays this cost.
+    sorted_manifests = sorted(manifests, key=lambda m: m["chunk_index"])
+    if blocked_source is None:
+        is_blocked: BlockedPredicate = _never_blocked
+        events_iter: Iterable[dict] = source.iter_events()
+    else:
+        events_list = list(source.iter_events())
+        # The exact timestamps the strip will test: every event timestamp plus
+        # every transcript-segment absolute timestamp. Forwarded so the residual
+        # protects precisely these, ALLOW-only + fail-closed.
+        strip_tss: list[float] = [
+            e.get("timestamp", 0) for e in events_list if e.get("timestamp", 0)
+        ]
+        for manifest in sorted_manifests:
+            transcript = source.read_transcript(manifest["chunk_index"])
+            if transcript is None:
+                continue
+            chunk_start = manifest["chunk_start"]
+            for seg in transcript.get("segments", [])[:20]:
+                strip_tss.append(chunk_start + seg.get("start", 0))
+        is_blocked = _resolve_blocked_predicate(
+            blocked_source, (session_start, session_end), strip_tss,
+        )
+        events_iter = events_list
 
     entries: list[dict] = []
     current_entry: dict | None = None
@@ -392,9 +564,18 @@ def build_activity_summary(
     raw_timestamps: list[float] = []
     raw_window_events: list[dict] = []
 
-    for evt in source.iter_events():
+    for evt in events_iter:
         evt_type = evt.get("type", "")
         ts = evt.get("timestamp", 0)
+
+        # Privacy strip (R11): drop any event inside a blocked/masked interval
+        # BEFORE it contributes to any derived structure. ALLOW-only; fail-closed
+        # via the predicate. This is the single chokepoint — no consumer can
+        # bypass it. A falsy/zero timestamp cannot be range-checked, so it is
+        # left to the existing ``ts > 0`` gates below (an event with no usable
+        # timestamp carries no locatable content to strip).
+        if ts and is_blocked(ts):
+            continue
 
         # Collect raw data for fallback
         if ts > 0 and evt_type != "mouse.move":
@@ -495,8 +676,7 @@ def build_activity_summary(
             entry["clicks"] = e["clicks"]
         timeline.append(entry)
 
-    # Gather transcript snippets
-    sorted_manifests = sorted(manifests, key=lambda m: m["chunk_index"])
+    # Gather transcript snippets (``sorted_manifests`` computed above)
     transcript_snippets: list[dict] = []
     for manifest in sorted_manifests:
         chunk_idx = manifest["chunk_index"]
@@ -506,6 +686,11 @@ def build_activity_summary(
             continue
         for seg in transcript.get("segments", [])[:20]:
             abs_ts = chunk_start + seg.get("start", 0)
+            # Privacy strip (R11): a transcript segment whose absolute timestamp
+            # falls in a blocked/masked interval is dropped too, so spoken
+            # content from a blocked app never reaches the model.
+            if is_blocked(abs_ts):
+                continue
             rel = abs_ts - session_start
             text = seg.get("text", "").strip()
             if text:
