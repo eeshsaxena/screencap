@@ -42,6 +42,7 @@ struct RecordingHUDModel: Equatable {
 
     var titleAccessibilityLabel: String { "Recording \(title)" }
     var stopAccessibilityLabel: String { "Stop and save recording" }
+    var hideAccessibilityLabel: String { "Hide recording controls" }
 }
 
 /// The SwiftUI HUD content, bound to the live recorder for elapsed / title / audio.
@@ -64,6 +65,9 @@ struct RecordingHUDView: View {
                 .foregroundStyle(Color.scInkMuted)
                 .accessibilityHidden(true)
         }
+        // Transparent room for the pill's soft shadow so the fittingSize-based
+        // panel sizing in `show()` doesn't clip the blur (U4).
+        .padding(14)
         .fixedSize()
     }
 
@@ -76,11 +80,18 @@ struct RecordingHUDView: View {
             stub(model.audioEnabled ? "Mute" : "Muted", ticket: "SCR-218")
             divider
             stopButton
+            hideButton
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(Color.scDarkCanvas, in: Capsule())
-        .shadow(color: .black.opacity(0.4), radius: 16, y: 12)
+        // A hairline edge so the dark capsule separates from any background even
+        // with a much lighter shadow than the old radius-16 / opacity-0.4 halo.
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
+        // Softer, tighter lift — the old shadow read as a grey cloud on light
+        // content. `body`'s `.padding(14)` gives this blur transparent room so
+        // the fittingSize-based panel sizing in `show()` doesn't clip it (U4).
+        .shadow(color: .black.opacity(0.28), radius: 10, y: 4)
     }
 
     private var elapsedGroup: some View {
@@ -144,6 +155,24 @@ struct RecordingHUDView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(model.stopAccessibilityLabel)
+    }
+
+    /// Dismisses the pill for the rest of the recording (restored from the
+    /// menu-bar "Show recording controls" item). A small icon button, visually
+    /// subordinate to Stop & save.
+    private var hideButton: some View {
+        Button {
+            recorder.hideRecordingHUD()
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.scHUDMuted)
+                .padding(8)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Hide recording controls")
+        .accessibilityLabel(model.hideAccessibilityLabel)
     }
 }
 

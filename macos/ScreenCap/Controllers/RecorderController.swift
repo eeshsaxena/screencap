@@ -143,6 +143,12 @@ final class RecorderController: ObservableObject {
             if case .idle = state {
                 captureAdvisory = nil
                 unhealthyReaders.removeAll()
+                // Hide control: every teardown path (normal stop via enterIdle,
+                // Cmd+Q, process termination, recording_failed, and the abnormal
+                // transitionToIdle rollbacks) lands on `.idle` here — the same
+                // single chokepoint the advisory uses — so hidden state never
+                // survives a recording and the pill starts shown next time (R6).
+                hudHidden = false
             }
         }
     }
@@ -175,6 +181,13 @@ final class RecorderController: ObservableObject {
     /// session id / CLI name — the directory slug until post-stop auto-naming
     /// renames it; user rename is SCR-223). `nil` → the HUD shows "Recording".
     @Published private(set) var currentRecordingName: String?
+    /// Hide control: true while the user has dismissed the recording HUD pill via
+    /// its hide control. Distinct from the recording lifecycle — the pill's hide
+    /// button and the menu-bar "Show recording controls" item both read this.
+    /// Reset to `false` on every return to `.idle` (the `state.didSet` chokepoint)
+    /// so each recording starts shown and no hidden state survives a recording,
+    /// and defensively when `.showHUD` is applied.
+    @Published private(set) var hudHidden: Bool = false
     /// U7: true only after `.hideMainWindow` was actually applied (the live
     /// `started` path), so a teardown restores + routes to Library ONLY when the
     /// window was really hidden. Without this, a failure in `.starting` (which is
@@ -714,6 +727,10 @@ final class RecorderController: ObservableObject {
             case .handleCaptureRecovered(let reader):
                 handleCaptureRecovered(reader: reader)
             case .showHUD:
+                // Every recording-start edge (`started`, daemon-session attach)
+                // drains here; clear any hidden state so the pill shows and the
+                // menu-bar restore item is hidden at the start of a recording.
+                hudHidden = false
                 windowLifecycle.showHUD(for: self)
             case .hideHUD:
                 windowLifecycle.hideHUD()
@@ -726,6 +743,27 @@ final class RecorderController: ObservableObject {
             }
         }
         state = machine.state
+    }
+
+    /// Hide control (R1, R2): dismiss the floating recording HUD pill while a
+    /// recording is live. No-op outside `.recording` — the pill only exists then,
+    /// and the guard keeps a menu/UI race on the `.recording → .idle` edge from
+    /// acting. Capture is untouched; only the panel is ordered out. The menu-bar
+    /// glyph and Stop item remain the recording indicator and stop path (R3).
+    func hideRecordingHUD() {
+        guard case .recording = state else { return }
+        hudHidden = true
+        windowLifecycle.hideHUD()
+    }
+
+    /// Restore the HUD pill after `hideRecordingHUD()` (R4, R5), driven by the
+    /// menu-bar "Show recording controls" item. No-op unless a recording is live
+    /// and the pill is currently hidden. `showHUD` re-creates the panel and
+    /// repositions it bottom-center (R5).
+    func showRecordingHUD() {
+        guard case .recording = state, hudHidden else { return }
+        hudHidden = false
+        windowLifecycle.showHUD(for: self)
     }
 
     private func attachDaemonEventStream() {

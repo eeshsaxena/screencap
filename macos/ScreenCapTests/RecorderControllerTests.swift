@@ -459,6 +459,99 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(fake.restoreMainWindowCount, 0, "no window was hidden, so none is restored")
     }
 
+    // MARK: - HUD hide control
+
+    /// Drive the controller into `.recording` via the real `.starting` →
+    /// `started` path (matching the existing HUD tests).
+    private func recordingController(_ fake: FakeWindowLifecycle) -> RecorderController {
+        let recorder = RecorderController(windowLifecycle: fake)
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        return recorder
+    }
+
+    /// Hiding the pill orders the panel out, sets `hudHidden`, and leaves the
+    /// recording running (R1, R2).
+    func testHideRecordingHUDDismissesPillWithoutStopping() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        XCTAssertFalse(recorder.hudHidden)
+
+        recorder.hideRecordingHUD()
+
+        XCTAssertTrue(recorder.hudHidden)
+        XCTAssertEqual(fake.hideHUDCount, 1)
+        XCTAssertTrue(recorder.state.isRecording, "hiding must not stop the recording")
+    }
+
+    /// Restoring re-shows the panel and clears `hudHidden` (R4, R5).
+    func testShowRecordingHUDRestoresPill() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        recorder.hideRecordingHUD()
+        let showsBefore = fake.showHUDCount
+
+        recorder.showRecordingHUD()
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertEqual(fake.showHUDCount, showsBefore + 1)
+    }
+
+    /// Both methods are no-ops outside `.recording` (guard behavior).
+    func testHideShowAreNoOpsWhenNotRecording() {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(windowLifecycle: fake)  // stays .idle
+
+        recorder.hideRecordingHUD()
+        recorder.showRecordingHUD()
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertEqual(fake.hideHUDCount, 0)
+        XCTAssertEqual(fake.showHUDCount, 0)
+    }
+
+    /// A teardown to `.idle` after hiding resets `hudHidden` via the `.idle`
+    /// chokepoint, so the next recording starts shown (R6).
+    func testTeardownAfterHideResetsHudHidden() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        recorder.hideRecordingHUD()
+        XCTAssertTrue(recorder.hudHidden)
+
+        // A clean process exit tears the recording down to `.idle`.
+        recorder._testHandleProcessTerminated(exitCode: 0)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertFalse(recorder.hudHidden, "hidden state must not survive a recording (R6)")
+    }
+
+    /// A `recording_failed` while hidden resets `hudHidden` and still surfaces
+    /// the failure — the AE4 async-failure path, not a transitionToIdle shortcut.
+    func testRecordingFailedWhileHiddenResetsHudHidden() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        recorder.hideRecordingHUD()
+
+        recorder._testHandleStderrLine(#"{"type":"recording_failed","schema_version":1,"reason":"engine crashed"}"#)
+
+        XCTAssertFalse(recorder.hudHidden, "AE4: next recording starts shown after a hidden-pill failure")
+        XCTAssertEqual(recorder.lastError, "engine crashed")
+        XCTAssertFalse(recorder.state.isRecording)
+    }
+
+    /// Double-hide is safe: user-hide then a teardown that also closes the HUD
+    /// does not crash, and the flag ends reset.
+    func testDoubleHideIsSafe() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        recorder.hideRecordingHUD()  // hideHUDCount == 1
+
+        recorder._testHandleProcessTerminated(exitCode: 0)  // teardown drains .hideHUD too
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertGreaterThanOrEqual(fake.hideHUDCount, 2, "user-hide + teardown both order the panel out")
+    }
+
     // MARK: - Audio flag (U6)
 
     /// CLI fallback: an explicit audio-off threads `--no-audio` into the argv and

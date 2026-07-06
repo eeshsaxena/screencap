@@ -26,6 +26,13 @@ struct MenuBarMenu: View {
         } else if case .recording = recorder.state {
             Button("Stop Recording") { recorder.stop() }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
+            // Restore the HUD pill after the user hid it from the pill itself.
+            // Gated so it only shows while the pill is actually hidden.
+            if MenuBarMenuPolicy.showRecordingControlsVisible(
+                state: recorder.state, hudHidden: recorder.hudHidden
+            ) {
+                Button("Show recording controls") { recorder.showRecordingHUD() }
+            }
         } else if recorder.state.isRecording {
             // .starting or .stopping — surface progress, don't offer an action
             // that would re-enter the state machine.
