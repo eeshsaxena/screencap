@@ -61,9 +61,12 @@ struct OnboardingWizard: View {
             }
             // Live grant detection while the wizard is up — the same slow
             // daemon-grant refresh lifecycle the walkthrough sheet uses (U5),
-            // driving the permission rows and the "listening…" footer.
+            // driving the permission rows and the "listening…" footer. Uses the
+            // staleness-defeating variant so a grant made after the daemon
+            // launched (which the running daemon reports as still-missing) is
+            // picked up via a restart rather than stranding the user.
             permissions.startDaemonGrantWatching {
-                await recorder.refreshDaemonGrants()
+                await recorder.refreshDaemonGrantsDefeatingStaleness()
             }
             Task {
                 // Independent CLI reads — run concurrently (each spawns its

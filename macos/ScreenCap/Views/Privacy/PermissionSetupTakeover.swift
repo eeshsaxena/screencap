@@ -65,8 +65,11 @@ struct PermissionSetupTakeover: View {
             // Refresh the daemon's grant snapshot while visible so the rows
             // reflect grants the user toggles in System Settings —
             // re-activation + a slow 5s timer (not the 1Hz app-process poll).
+            // The staleness-defeating variant restarts a daemon that is still
+            // reporting an already-granted permission as missing (its grant
+            // probe is pinned to the daemon's launch-time TCC state).
             permissions.startDaemonGrantWatching {
-                await recorder.refreshDaemonGrants()
+                await recorder.refreshDaemonGrantsDefeatingStaleness()
             }
         }
         .onDisappear {
