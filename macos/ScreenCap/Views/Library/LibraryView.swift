@@ -141,19 +141,14 @@ struct LibraryView: View {
         .help("Search your recordings")
     }
 
-    /// New-recording pill — becomes "Stop recording" during an active capture, so
-    /// the header stays actionable while the sheet is unreachable (U6). During
-    /// `.starting` / `.stopping` it shows a non-actionable progress label.
+    /// New-recording CTA — shown only when idle. During any active capture the
+    /// recording banner (pinned above the detail area) is the single control
+    /// surface for both the live status and Stop, so the header does not duplicate
+    /// a Stop button (or the redundant `.starting` / `.stopping` progress labels)
+    /// here.
     @ViewBuilder
     private var newRecordingButton: some View {
-        if case .recording = recorder.state {
-            LibraryPill(title: "Stop recording", filled: true, tint: .scRust) {
-                recorder.stop()
-            }
-        } else if recorder.state.isRecording {
-            LibraryPill(title: recorder.state.isStopping ? "Stopping…" : "Starting…",
-                        filled: true, tint: .scInkFaint, action: nil)
-        } else {
+        if !recorder.state.isRecording {
             LibraryPill(title: "New recording", filled: true, tint: .scTeal) {
                 onNewRecording()
             }

@@ -25,13 +25,14 @@ struct RecordingBanner: View {
 
                 Text(label)
                     .font(SCTypography.monoTimer)
+                    .foregroundStyle(Color.scInk)
 
                 Spacer()
 
                 if let remaining = recorder.quitProgressSecondsRemaining {
                     Text("Finalizing — \(remaining)s remaining")
                         .font(SCTypography.metadata)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Color.scInkSecondary)
                 }
 
                 Button("Stop") { recorder.stop() }
