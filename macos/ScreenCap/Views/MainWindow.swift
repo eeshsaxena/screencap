@@ -208,15 +208,10 @@ struct MainWindow: View {
     /// The normal app shell — everything the window shows when the onboarding
     /// takeover isn't active.
     private var shellContent: some View {
-        // The first-run privacy banner lives here — a sibling ABOVE the
-        // NavigationSplitView, NOT inside its detail column. It must stay out of
-        // the split view's subtree: the banner's multiline `.fixedSize(...)` text
-        // (FirstRunPrivacyBanner) drives a runaway/oscillating height when it
-        // participates in NavigationSplitView's column-height negotiation, which
-        // balloons the sidebar List's height and pushes its rows off-screen — the
-        // sidebar visibly "disappears" ~1–2s after launch, the moment `bannerActive`
-        // flips true. Rendering the banner above the split view (full-window width)
-        // decouples its layout and keeps the sidebar stable.
+        // The first-run privacy banner is a full-width sibling ABOVE the
+        // two-column row, NOT inside the detail column, so it spans the whole
+        // window and its multiline `.fixedSize(...)` height (FirstRunPrivacyBanner)
+        // stays decoupled from the sidebar/detail column layout.
         VStack(spacing: 0) {
             if privacy.bannerActive {
                 FirstRunPrivacyBanner(
@@ -232,15 +227,23 @@ struct MainWindow: View {
                 .padding(.top, 12)
                 .transition(.opacity)
             }
-            NavigationSplitView {
+            // A plain two-column HStack — NOT a NavigationSplitView. Routing is
+            // via `route` (no NavigationLink anywhere), so the split view added no
+            // behavior, only native split chrome. Hiding that chrome's window
+            // toolbar (to drop the sidebar-collapse control) let the split view's
+            // sidebar host view expand over the window's top edge and cover the
+            // hidden-title-bar traffic lights — so the app showed no
+            // close/minimize/zoom buttons. The HStack keeps the real buttons
+            // visible over the sidebar's reserved chrome slot (ShellSidebarView).
+            HStack(spacing: 0) {
                 sidebar
-            } detail: {
                 VStack(spacing: 0) {
                     RecordingBanner()
                         .padding(.horizontal, 16)
                         .padding(.top, recorder.state.isRecording ? 12 : 0)
                     detail
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .top) {
                     if let err = recorder.lastError {
                         RecorderErrorMessage(message: err)
@@ -405,15 +408,14 @@ struct MainWindow: View {
                 onboarding = .replay
             }
         )
-        .navigationSplitViewColumnWidth(248)
-        .navigationTitle("ScreenCap")
-        // The prototype has no window toolbar (U14 fidelity pass): the old
-        // toolbar Start/Stop duplicated the Library header pill (which flips
-        // to "Stop recording" while capture runs, U6), the menu bar, and the
-        // HUD; refresh happens on recording events and from the Library error
-        // state. Hiding the toolbar also drops the sidebar-collapse control —
-        // the design's sidebar is fixed.
-        .toolbar(.hidden, for: .windowToolbar)
+        // Fixed-width custom column (the prototype's sidebar is not a native
+        // NavigationSplitView sidebar). 248pt matches the design; ShellSidebarView
+        // fills the full window height itself. No `.toolbar(.hidden, …)`: there is
+        // no NavigationSplitView, so no native window toolbar or sidebar-collapse
+        // control to hide — which is what previously occluded the traffic lights.
+        // Two frames: `width:` and `maxHeight:` are distinct SwiftUI overloads.
+        .frame(width: 248)
+        .frame(maxHeight: .infinity)
     }
 
     @ViewBuilder
