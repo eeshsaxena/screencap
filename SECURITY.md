@@ -101,6 +101,32 @@ The one-shot **backfill** (`screencap backfill`, also driven from the Search con
 
 A **deferred stronger mitigation** is tracked as a follow-up: persisting the canonical `SCRUB_BLOCK_ACTIONS` interval set to disk at scrub time so the backfill need not re-derive it. This ships the fail-closed conservative approximation; the residual is the documented over-skip, never an under-block.
 
+## Encryption at rest (SCR-236)
+
+ScreenCap's local recording data plane lives inside an app-managed **encrypted sparse bundle** (`~/.screencap/store.sparsebundle`, AES-256, APFS inside), mounted transparently at the recordings directory while in use. The on-disk artifact is ciphertext at all times. The container key lives solely in the login Keychain (service `com.screencap.container`, same "Always Allow" posture as the network-capture KEK) and is read headlessly so the LaunchAgent-managed daemon mounts with no user interaction. Governed by the `container_enabled` flag (default **on**).
+
+**What the container protects.** Any copy of the *raw store* yields no recording content without the key:
+
+- **Backups.** Time Machine backs up the *unmounted* bundle as opaque encrypted bands (a mounted disk image is skipped as removable), so recordings stay backed up **and** the backup is ciphertext.
+- **Disk images and bulk file copies** of `store.sparsebundle`, and any recovery of the raw store from a **FileVault-off** disk (stolen/lost machine, cold storage, discarded drive), contain only ciphertext bands.
+
+The recordings tree, the on-screen content index, and the backfill ledger (the latter two relocated inside the volume under a reserved `.store/` dir) are all covered.
+
+**What it does *not* protect** — documented honestly, in this file's tradition:
+
+- **A live, same-EUID attacker while the store is mounted.** The key is headlessly available by product necessity (all-day LaunchAgent recording), so any process with your effective UID reads decrypted files straight through the mountpoint — identical to the same-user boundary above. This is an at-rest protection, not a live-attacker defense.
+- **The Keychain key itself,** readable by any "Always Allow"-trusted same-user binary (the shared ceiling with the network KEK).
+- **The daemon run-dir** (`~/.screencap/run/` — socket, logs, **audit log**) stays *outside* the container as plaintext by design: it must exist before any mount. The audit log is metadata-sensitive (see the side-channel threat below).
+- **`downloads_dir` exports and `config.toml`** stay plaintext outside the container by design. A user who points `recordings_dir` at an external volume, or sets `SCREENCAP_RECORDINGS_DIR`, bypasses the container entirely (plaintext, documented residual).
+- **QuickLook host-cache thumbnails** of files browsed while mounted persist on the host volume with no per-volume opt-out (a documented residual; `-nobrowse` plus the `0o700` parent keep the volume out of casual Finder browsing).
+- **Filename / duration / timing side channels** (see the side-channel threat below).
+
+**Key loss is unrecoverable (v1).** There is no second decryption path. If the login Keychain entry is lost, the recordings are permanently unrecoverable ciphertext — the app and this document state this plainly. In particular, a machine restore that brings back `~/.screencap` *without* the login Keychain (e.g. a selective `~/.screencap`-only restore rather than a full Migration Assistant / Time Machine restore) leaves an intact-but-unrecoverable store. A recovery code is a deferred fast-follow.
+
+**Downgrade is unsupported.** Once a machine has created a store there is no supported path back to a plaintext store; a pre-container binary sees the recordings as missing (nothing is deleted). Turning `container_enabled` off only stops a machine that has not yet created a store from entering the container flow — there is no reverse migration.
+
+**FileVault** is detected at each daemon start (`fdesetup status`) and surfaced by `screencap status` as a warn-only signal (recording is never blocked). The container protects at-rest artifacts regardless of FileVault; FileVault additionally protects the plaintext run-dir and QuickLook residuals on a stolen disk.
+
 ## Threats in scope
 
 ScreenCap aims to defend against the following:
@@ -115,10 +141,10 @@ ScreenCap aims to defend against the following:
 These threats are *not* defended against by the daemon and require separate mitigations or are explicitly accepted:
 
 - **Malware already running as the same macOS user.** Any process with your effective UID can read `~/.screencap/recordings/`, read the local-only on-screen content index at `~/.screencap/content_index.db` (mode `0600`), connect to the daemon socket, read the audit log, read the short-lived engine ID token from `~/.screencap/run/engine-token-<name>.jwt` (mode `0600`) while a cloud-bound recording is live, read the cloud refresh token from your Keychain (default "Always Allow" ACL), and call any verb — including the read-only content/transcript/timeline query verbs, which expose no more than that process could read from disk directly. Same-user trust is the documented boundary; the daemon is not a sandbox for processes running with your privileges. The macOS TCC subsystem still gates the underlying screen-capture capability — code without Screen Recording permission cannot capture screen content even if it can call `/v0/recording.start` — but the daemon itself does not enforce a per-caller capability check above same-user.
-- **Root, administrator, or another user with read access to your home directory.** A process running as root can read anything; a backup tool with full-disk access can copy recordings; another user with sudo can impersonate you.
+- **Root, administrator, or another user with read access to your home directory.** A process running as root can read anything *while the store is mounted*; another user with sudo can impersonate you. A backup tool with full-disk access can copy the raw `store.sparsebundle`, but (per [Encryption at rest (SCR-236)](#encryption-at-rest-scr-236)) that copy is ciphertext — the container's central protection.
 - **Physical access to an unlocked Mac.** Anyone at the keyboard inherits your session privileges.
 - **Compromised dependencies or supply-chain attacks.** Mitigated by Python and Homebrew's own integrity controls, not by the daemon.
-- **Side-channel inference from recording metadata.** Filenames, durations, and audit-log peer paths can leak that you recorded *something*, even if the content is encrypted at rest. Treat the audit log and recording directory as the same sensitivity class as the recordings themselves.
+- **Side-channel inference from recording metadata.** Even with recording content encrypted at rest (see [Encryption at rest (SCR-236)](#encryption-at-rest-scr-236)), the plaintext run-dir audit-log peer paths — and, while the store is mounted, filenames and durations — can leak that you recorded *something*. Treat the audit log as the same sensitivity class as the recordings themselves.
 - **Cross-account fragmentation in a transient/undeterminable-uid window.** When a cloud recording is pinned to an owner account but the current account cannot be determined at convergence (not signed in, or a transient auth failure), the ownership gate degrades to the normal upload path rather than refusing — the deliberate "never false-refuse over never fragment" tradeoff. Accepted residual; see [Cross-account recording isolation (SCR-116)](#cross-account-recording-isolation-scr-116).
 
 ## Alternatives considered

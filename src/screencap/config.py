@@ -147,17 +147,19 @@ def container_enabled() -> bool:
     """Return whether the SCR-236 encrypted-at-rest container is enabled.
 
     Env var ``SCREENCAP_CONTAINER_ENABLED`` > config ``container_enabled`` >
-    default. The default is **False** for now — the ship-time flip to on happens
-    later (plan U8), once the mount orchestration and lifecycle units land. While
-    it is off, every data-plane path resolves byte-identically to the pre-SCR-236
-    behavior (:func:`get_data_root` returns exactly what :func:`get_recordings_dir`
-    returned before this seam existed).
+    default. The default is **True** — the release that ships this feature
+    encrypts recordings at rest out of the box (KTD-8). When it is off (or
+    bypassed), every data-plane path resolves byte-identically to the
+    pre-SCR-236 behavior (:func:`get_data_root` returns exactly what
+    :func:`get_recordings_dir` returned before this seam existed).
 
     The rollout flag is one-way in the field: turning it off only stops a
-    not-yet-migrated machine from entering the container flow — there is no
-    reverse migration (KTD-8).
+    machine that has not yet created a store from entering the container flow —
+    there is no reverse migration (KTD-8). The test suite forces it off by
+    default (see the ``tests/conftest.py`` autouse fixture) so the full suite
+    runs against the plaintext path without mounting a real store.
     """
-    return _parse_bool_env("SCREENCAP_CONTAINER_ENABLED", "container_enabled", False)
+    return _parse_bool_env("SCREENCAP_CONTAINER_ENABLED", "container_enabled", True)
 
 
 def get_data_root() -> Path:

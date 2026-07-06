@@ -38,10 +38,12 @@ def _reset_cache():
 
 @pytest.fixture
 def _clean_env(monkeypatch):
-    """Strip the container / recordings env vars so each test starts from a
-    known baseline; individual tests re-set exactly what they exercise."""
+    """Start each flag-off test from a known baseline: no recordings override,
+    container explicitly OFF. The shipped default is now ON (KTD-8, U8), so
+    flag-off behavior must be requested explicitly rather than inherited from
+    the default."""
     monkeypatch.delenv("SCREENCAP_RECORDINGS_DIR", raising=False)
-    monkeypatch.delenv("SCREENCAP_CONTAINER_ENABLED", raising=False)
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "0")
 
 
 # --------------------------------------------------------------------------- #
@@ -49,12 +51,15 @@ def _clean_env(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_container_disabled_by_default(_clean_env):
-    """The ship-time flip to on is U8 — U3 keeps the default off so the full
-    existing suite stays green (byte-identical paths)."""
+def test_container_enabled_by_default(monkeypatch):
+    """The shipped default is ON (KTD-8, flipped in U8) — the release that
+    ships this feature encrypts recordings at rest out of the box."""
     from screencap.config import container_enabled
 
-    assert container_enabled() is False
+    monkeypatch.delenv("SCREENCAP_RECORDINGS_DIR", raising=False)
+    monkeypatch.delenv("SCREENCAP_CONTAINER_ENABLED", raising=False)
+    monkeypatch.setattr("screencap.config._load_toml", lambda: {})
+    assert container_enabled() is True
 
 
 def test_container_enabled_via_env(_clean_env, monkeypatch):

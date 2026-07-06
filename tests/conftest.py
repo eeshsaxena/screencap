@@ -101,6 +101,23 @@ def _reset_config_cache():
     screencap.config._config_cache = None
 
 
+@pytest.fixture(autouse=True)
+def _container_disabled_by_default(monkeypatch):
+    """SCR-236: force the encrypted-container flag OFF for the whole suite.
+
+    The shipped default is ON (KTD-8), but the full local suite must pass with
+    the container disabled (Definition of Done) — otherwise any test that
+    resolves the recordings dir would try to mount a real store on the dev's
+    machine (``ensure_store_mounted`` → ``StoreNotInitializedError``). Tests
+    that exercise container-on behavior set the flag themselves in the test
+    body: a later ``monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")``
+    or a direct ``monkeypatch.setattr(config, "container_active"/"container_enabled", ...)``
+    wins over this default. A test asserting the shipped default deletes the
+    env var first.
+    """
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "0")
+
+
 # ---------------------------------------------------------------------------
 # Real engine DB fixture
 # ---------------------------------------------------------------------------

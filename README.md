@@ -9,6 +9,7 @@ ScreenCap is designed for teams who need more than video clips: reproducible rec
 - **One-command capture workflow**: Start recording immediately with `screencap start`, then auto-transcribe and auto-name on stop.
 - **ML-ready outputs**: Export processed interaction events to JSONL with `screencap export` for downstream training pipelines.
 - **Local-first by default**: Run from a standalone binary, keep recordings on disk, and use optional cloud sync only when needed.
+- **Encrypted at rest**: Recordings live inside an app-managed encrypted container (AES-256), mounted transparently while ScreenCap runs. Backups and copies of the raw store are ciphertext. See [SECURITY.md](SECURITY.md#encryption-at-rest-scr-236) — including the key-loss caveat (the key lives only in your login Keychain; there is no recovery path in v1).
 - **Structured recording data**: Recording artifacts and schema are designed for ML training pipelines.
 
 ## Requirements
@@ -413,6 +414,19 @@ Also cleans up orphaned recording processes left behind by a crash or forced qui
 | Flag | Description |
 |------|-------------|
 | `--force` | Skip SIGTERM, go straight to SIGKILL |
+
+### `screencap store`
+
+Manage the encrypted recordings container (see [SECURITY.md](SECURITY.md#encryption-at-rest-scr-236)). Enabled by default (`container_enabled`); disable with `screencap settings --set container_enabled=false`.
+
+| Subcommand | Description |
+|------------|-------------|
+| `store init` | Create and mount the encrypted store (foreground — approves the one-time Keychain access). Also done automatically by `serve --install`. |
+| `store lock` | Detach the store and refuse to remount it until `store unlock` (refuses while a recording is active). |
+| `store unlock` | Clear the lock so the store mounts again on next use. |
+| `store compact` | Reclaim host disk from deleted recordings. Runs only when idle; never force-detaches. |
+
+> **Key loss is unrecoverable.** The container key lives only in your login Keychain. If it is lost (e.g. a `~/.screencap`-only restore that omits the Keychain), the recordings remain intact but permanently unreadable. There is no recovery path in v1.
 
 ### `screencap --version`
 

@@ -172,6 +172,33 @@ def test_content_index_enabled_rejects_non_bool():
     assert "true or false" in result.output
 
 
+def test_container_enabled_set_roundtrips(monkeypatch):
+    """`settings --set container_enabled=...` round-trips through the
+    _BOOL_KEYS allowlist and is reflected in `settings --json` (SCR-236 U8).
+
+    Deletes the env var so the config.toml value is what's read, and forces
+    ``container_active`` off so the ``settings --json`` recordings-dir read
+    doesn't try to mount a real store.
+    """
+    monkeypatch.delenv("SCREENCAP_CONTAINER_ENABLED", raising=False)
+    monkeypatch.setattr("screencap.config.container_active", lambda: False)
+
+    _invoke_set("container_enabled=false")
+    assert _invoke_settings_json()["settings"]["container_enabled"] is False
+
+    _invoke_set("container_enabled=true")
+    assert _invoke_settings_json()["settings"]["container_enabled"] is True
+
+
+def test_container_enabled_rejects_non_bool():
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["settings", "--set", "container_enabled=maybe"], catch_exceptions=False
+    )
+    assert result.exit_code == 1
+    assert "true or false" in result.output
+
+
 def test_content_index_consent_declined_defaults_false_in_json():
     """The one-time-consent decision (SCR-174 U7) is exposed and defaults off.
     Persisted separately from `content_index_enabled` so 'declined' never
