@@ -717,6 +717,43 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(fake.presentHideHintCount, 1, "the hint is one-time — no second present")
     }
 
+    /// The one-time hint is torn down when the recording ends (via the `.hideHUD`
+    /// teardown), so it never outlives the recording with now-false "Still
+    /// recording" copy (review fix).
+    func testHintDismissedWhenRecordingEnds() {
+        let fake = FakeWindowLifecycle()
+        let suite = "hud-hint-teardown-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let recorder = RecorderController(windowLifecycle: fake, hintStore: HUDHintStore(defaults: defaults))
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        recorder.hideRecordingHUD()
+        XCTAssertEqual(fake.presentHideHintCount, 1)
+
+        recorder._testHandleProcessTerminated(exitCode: 0)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertGreaterThanOrEqual(fake.dismissHideHintCount, 1, "hint must be dismissed on recording end")
+    }
+
+    /// An abnormal end (recording_failed → transitionToIdle) also dismisses the hint.
+    func testHintDismissedOnAbnormalEnd() {
+        let fake = FakeWindowLifecycle()
+        let suite = "hud-hint-teardown-abn-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let recorder = RecorderController(windowLifecycle: fake, hintStore: HUDHintStore(defaults: defaults))
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        recorder.hideRecordingHUD()
+
+        recorder._testHandleStderrLine(#"{"type":"recording_failed","schema_version":1,"reason":"engine crashed"}"#)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertGreaterThanOrEqual(fake.dismissHideHintCount, 1, "hint must be dismissed on abnormal end too")
+    }
+
     // MARK: - Audio flag (U6)
 
     /// CLI fallback: an explicit audio-off threads `--no-audio` into the argv and
@@ -1106,6 +1143,7 @@ final class FakeWindowLifecycle: WindowLifecycle {
     private(set) var hideMainWindowCount = 0
     private(set) var restoreMainWindowCount = 0
     private(set) var presentHideHintCount = 0
+    private(set) var dismissHideHintCount = 0
     /// Captured, not auto-invoked, so a test can simulate the hint being shown +
     /// dismissed — the store flag must only be set after the hint actually shows.
     private(set) var lastHintCompletion: (() -> Void)?
@@ -1118,6 +1156,7 @@ final class FakeWindowLifecycle: WindowLifecycle {
         presentHideHintCount += 1
         lastHintCompletion = onComplete
     }
+    func dismissHideHint() { dismissHideHintCount += 1 }
 }
 
 /// U2/U3: records the input-monitor lifecycle so controller tests can assert the

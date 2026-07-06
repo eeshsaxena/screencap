@@ -22,6 +22,10 @@ protocol WindowLifecycle: AnyObject {
     /// after the hint has actually been shown (dismissed or timed out), so the
     /// caller marks the "shown" flag only when the user had a chance to see it.
     func presentHideHint(onComplete: @escaping () -> Void)
+    /// Dismiss the one-time hint if it is still on screen. Called on every
+    /// recording-end path so the hint never outlives the recording (its copy reads
+    /// "Still recording", which would be false once the recording has ended).
+    func dismissHideHint()
 }
 
 enum WindowLifecycleFactory {
@@ -56,6 +60,10 @@ final class LiveWindowLifecycle: WindowLifecycle {
 
     func presentHideHint(onComplete: @escaping () -> Void) {
         hintPanel.present(onComplete: onComplete)
+    }
+
+    func dismissHideHint() {
+        hintPanel.dismiss()
     }
 
     func hideMainWindow() {
@@ -96,4 +104,5 @@ final class NoopWindowLifecycle: WindowLifecycle {
     func hideMainWindow() {}
     func restoreMainWindow() {}
     func presentHideHint(onComplete: @escaping () -> Void) {}
+    func dismissHideHint() {}
 }

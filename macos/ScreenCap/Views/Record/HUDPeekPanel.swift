@@ -77,23 +77,10 @@ final class HUDPeekPanelController {
         let hosting = NSHostingView(
             rootView: HUDPeekView(recorder: recorder, onActivate: onActivate)
         )
-        let panel = NSPanel(
+        let panel = HUDPanel.captureExcluded(
             contentRect: NSRect(x: 0, y: 0, width: 320, height: 60),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
+            contentView: hosting
         )
-        panel.isFloatingPanel = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = false
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        // Never appears inside the recording (KTD-7 / R9).
-        panel.sharingType = .none
-        panel.contentView = hosting
         self.panel = panel
 
         panel.layoutIfNeeded()
@@ -109,6 +96,11 @@ final class HUDPeekPanelController {
 
     func hide() {
         panel?.orderOut(nil)
+        // Load-bearing (mirrors RecordingHUDPanelController.hide): the hosting view
+        // strongly retains the RecorderController passed into HUDPeekView, which
+        // transitively owns this controller through the input monitor — so niling
+        // the panel is what breaks that transient cycle. The monitor's `recorder`
+        // is weak, keeping the monitor itself out of the cycle.
         panel = nil
     }
 

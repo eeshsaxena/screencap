@@ -1,6 +1,12 @@
 import AppKit
 import Carbon.HIToolbox
 
+/// Identity of ScreenCap's single Carbon hotkey ('SCHP', id 1). File-level so both
+/// the registration and the @convention(c) event handler (which cannot capture)
+/// agree on it, and so the handler can filter out any *other* app-target hotkey.
+private let hudHotKeySignature: OSType = 0x53434850  // 'SCHP'
+private let hudHotKeyID: UInt32 = 1
+
 // U2 + U3 — the global-input seam driven by `RecorderController` during a
 // recording (KTD-4). It owns two focus-independent inputs that the shipped
 // app-scoped shortcuts (KTD-13) cannot provide:
@@ -78,7 +84,9 @@ final class LiveHUDInputMonitor: HUDInputMonitor {
     }
 
     func stopMonitoring() {
-        guard isMonitoring else { recorder = nil; return }
+        // Cleanup is idempotent — run it unconditionally so a stray hotkey, poll
+        // timer, or peek panel can never be orphaned even if `isMonitoring` drifts
+        // (e.g. the teardown reaching this twice via different end paths).
         isMonitoring = false
         unregisterHotKey()
         stopPeekDetector()
@@ -98,10 +106,25 @@ final class LiveHUDInputMonitor: HUDInputMonitor {
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
-            { (_, _, userData) -> OSStatus in
-                // @convention(c): no captures. Recover the instance and hop to the
-                // main actor to fire the toggle.
+            { (_, event, userData) -> OSStatus in
+                // @convention(c): no captures. Confirm the fired hotkey is *our*
+                // ⌘⇧H (not some other app-target hotkey a library might register),
+                // then recover the instance and hop to the main actor to toggle.
                 guard let userData else { return noErr }
+                var firedID = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &firedID
+                )
+                guard status == noErr,
+                      firedID.signature == hudHotKeySignature,
+                      firedID.id == hudHotKeyID
+                else { return noErr }
                 let monitor = Unmanaged<LiveHUDInputMonitor>.fromOpaque(userData).takeUnretainedValue()
                 Task { @MainActor in monitor.handleHotKey() }
                 return noErr
@@ -117,7 +140,7 @@ final class LiveHUDInputMonitor: HUDInputMonitor {
             return
         }
         // ⌘⇧H. Command+Shift avoids the macOS-15 modifier-only-hotkey bug.
-        let hotKeyID = EventHotKeyID(signature: OSType(0x53434850) /* 'SCHP' */, id: 1)
+        let hotKeyID = EventHotKeyID(signature: hudHotKeySignature, id: hudHotKeyID)
         let status = RegisterEventHotKey(
             UInt32(kVK_ANSI_H),
             UInt32(cmdKey | shiftKey),
@@ -144,6 +167,13 @@ final class LiveHUDInputMonitor: HUDInputMonitor {
 
     private func handleHotKey() {
         recorder?.toggleRecordingHUD()
+        // If the toggle just restored the pill, hide the peek bar immediately so the
+        // bar and the pill are never on screen together (the peek-click path does
+        // the same); otherwise the bar would linger until the next poll tick.
+        if recorder?.hudHidden == false {
+            peek.hide()
+            bandEnterTime = nil
+        }
     }
 
     // MARK: - Bottom-edge peek detector (KTD-2)

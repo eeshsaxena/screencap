@@ -745,6 +745,9 @@ final class RecorderController: ObservableObject {
             case .hideHUD:
                 windowLifecycle.hideHUD()
                 inputMonitor.stopMonitoring()
+                // Tear down the one-time hint too, so it never outlives the
+                // recording (its "Still recording" copy would otherwise linger).
+                windowLifecycle.dismissHideHint()
             case .hideMainWindow:
                 windowLifecycle.hideMainWindow()
                 mainWindowHidden = true
@@ -878,6 +881,9 @@ final class RecorderController: ObservableObject {
             // input monitor must also be stopped here, or ⌘⇧H stays registered
             // after the recording ends (R3).
             inputMonitor.stopMonitoring()
+            // Same for the one-time hint — dismiss it so it can't linger past the
+            // recording with now-false "Still recording" copy.
+            windowLifecycle.dismissHideHint()
             currentRecordingName = nil
             restoreMainWindowIfHidden()
         }

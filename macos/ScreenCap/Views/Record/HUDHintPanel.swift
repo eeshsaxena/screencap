@@ -69,22 +69,10 @@ final class HUDHintPanelController {
         let hosting = NSHostingView(rootView: HUDHintView(onDismiss: { [weak self] in
             self?.dismiss()
         }))
-        let panel = NSPanel(
+        let panel = HUDPanel.captureExcluded(
             contentRect: NSRect(x: 0, y: 0, width: 340, height: 100),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
+            contentView: hosting
         )
-        panel.isFloatingPanel = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = false
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.sharingType = .none
-        panel.contentView = hosting
         self.panel = panel
 
         panel.layoutIfNeeded()
@@ -116,8 +104,10 @@ final class HUDHintPanelController {
     }
 
     /// Tear the panel down and fire `onComplete` once. Safe to call repeatedly
-    /// (click + auto-timeout can both land).
-    private func dismiss() {
+    /// (click, auto-timeout, and recording-end teardown can all land). Callable by
+    /// `WindowLifecycle.dismissHideHint()` so the hint dies with the recording
+    /// instead of lingering with now-false "Still recording" copy.
+    func dismiss() {
         dismissTask?.cancel()
         dismissTask = nil
         panel?.orderOut(nil)
