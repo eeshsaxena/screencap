@@ -442,6 +442,80 @@ def get_llm_provider() -> str:
     return str(cfg.get("llm_provider", "on-device"))
 
 
+def _parse_intelligence_bool(env_name: str, cfg_key: str, default: bool) -> bool:
+    """Env var (truthy → bool) > ``[intelligence].<cfg_key>`` > default.
+
+    A section-scoped twin of :func:`_parse_bool_env` for the per-task cloud
+    consent rows (U6). Consent defaults **OFF** — cloud never runs a task
+    unless its row is explicitly enabled.
+    """
+    env = os.environ.get(env_name)
+    if env is not None:
+        return env.lower() in _BOOL_TRUE
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get(cfg_key, default)
+        if isinstance(val, bool):
+            return val
+    return default
+
+
+def get_llm_cloud_provider() -> str | None:
+    """Return the configured *cloud* segmentation provider, or ``None``.
+
+    The consent policy (``screencap.segmentation.consent``) may route a
+    consented, on-device-unavailable summary/title task to this backend. It is
+    distinct from :func:`get_llm_provider` (the *active/preferred* provider,
+    default ``on-device``): this getter names which cloud backend a consented
+    fallback is allowed to use, and returns ``None`` when no cloud provider is
+    configured (the zero-config default — nothing leaves the Mac).
+
+    Resolution mirrors the other getters: env ``SCREENCAP_LLM_CLOUD_PROVIDER`` >
+    ``[intelligence].cloud_provider`` > default ``None``.
+    """
+    env = os.environ.get("SCREENCAP_LLM_CLOUD_PROVIDER")
+    if env is not None:
+        env = env.strip()
+        return env or None
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get("cloud_provider")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def get_summary_cloud_consent() -> bool:
+    """Return whether the summary/title cloud-consent row is enabled. Default **False**.
+
+    When on (R8), an on-demand summary/title may fall back to the configured
+    cloud provider — but only when on-device is unavailable (the row grants
+    fallback permission, not always-cloud; the policy in
+    ``screencap.segmentation.consent`` enforces the preference order).
+
+    Env ``SCREENCAP_SUMMARY_CLOUD_CONSENT`` > ``[intelligence].summary_cloud_consent``
+    > default ``False``.
+    """
+    return _parse_intelligence_bool(
+        "SCREENCAP_SUMMARY_CLOUD_CONSENT", "summary_cloud_consent", False,
+    )
+
+
+def get_recall_cloud_consent() -> bool:
+    """Return whether the recall-answer cloud-consent row is enabled. Default **False**.
+
+    Recall-answering runs on-device by default and becomes cloud-eligible only
+    when this opt-in row is added (R10). Even when on, the policy in
+    ``screencap.segmentation.consent`` prefers on-device whenever available.
+
+    Env ``SCREENCAP_RECALL_CLOUD_CONSENT`` > ``[intelligence].recall_cloud_consent``
+    > default ``False``.
+    """
+    return _parse_intelligence_bool(
+        "SCREENCAP_RECALL_CLOUD_CONSENT", "recall_cloud_consent", False,
+    )
+
+
 def get_show_on_website() -> bool:
     """Return whether recordings should be visible on the website. Default True."""
     return _parse_bool_env("SCREENCAP_SHOW_ON_WEBSITE", "show_on_website", True)
