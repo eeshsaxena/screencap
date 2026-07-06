@@ -127,13 +127,15 @@ def get_recordings_dir() -> Path:
         return p
 
     if container_active():
-        root = get_data_root()
-        # Fast path: a plain stat when already mounted (the daemon mounts once
-        # at startup, so its request handlers don't re-shell to hdiutil). Only
-        # an unmounted store pays the ensure_store_mounted() cost.
-        if not os.path.ismount(str(root)):
-            from screencap import container
+        from screencap import container
 
+        root = get_data_root()
+        # Fast path: two stats when OUR store is already mounted (the daemon
+        # mounts once at startup, so its request handlers don't re-shell to
+        # hdiutil). `mount_is_ours` verifies the identity marker so a foreign
+        # or stale volume merely mounted at the path is not trusted — only an
+        # unmounted/unrecognized store pays the ensure_store_mounted() cost.
+        if not container.mount_is_ours(str(root)):
             container.ensure_store_mounted()
         return get_data_root()
 
@@ -194,9 +196,12 @@ def get_data_root() -> Path:
 
     cfg = _load_toml()
     configured = cfg.get("recordings_dir")
-    if configured is not None and Path(configured) != _DEFAULT_RECORDINGS:
+    if configured is not None and Path(configured).expanduser() != _DEFAULT_RECORDINGS:
         # Non-default recordings_dir is treated like the env override: bypass,
-        # plaintext, documented residual (KTD-8).
+        # plaintext, documented residual (KTD-8). ``expanduser`` so a config
+        # that spells the default with a literal ``~`` (as the README shows)
+        # is recognized as the default and still gets the container, rather
+        # than silently running plaintext.
         return Path(configured)
 
     if not container_enabled():
@@ -237,8 +242,22 @@ def get_store_dir() -> Path:
     at ``<recordings_dir>/.store/`` — but the sidecar chokepoints only consult
     this helper when the flag is ON (they keep their old ``get_base_dir()``
     location otherwise), so no plaintext-off path ever lands here.
+
+    SCR-236 security: when the container is *active* but not yet mounted (after
+    ``store lock``, before the daemon mounts, or a failed mount), this mounts
+    first rather than ``mkdir``-ing ``.store`` on the plaintext host disk — a
+    plaintext sidecar DB written there would be silently shadowed by a later
+    mount (an at-rest leak). Mounting-first correctly *raises*
+    ``StoreLockedError`` after ``store lock`` instead of writing plaintext.
     """
-    store = get_data_root() / ".store"
+    root = get_data_root()
+    if container_active():
+        from screencap import container
+
+        if not container.mount_is_ours(str(root)):
+            container.ensure_store_mounted()
+            root = get_data_root()
+    store = root / ".store"
     store.mkdir(parents=True, exist_ok=True)
     return store
 

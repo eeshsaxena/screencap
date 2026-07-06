@@ -74,9 +74,11 @@ class MonitorAndStop:
         self._next_poll_at: float = 0.0
         self._disk_check_interval: float = _DISK_CHECK_INTERVAL
         self._warning: str = ""
+        self._container_active: bool | None = None
 
     def bind(self, capture_dir: Path) -> None:
         self._capture_dir = capture_dir
+        self._container_active = None  # re-resolve for the new capture dir
 
     def _free_space_check_path(self) -> Path | None:
         """Path whose *host* volume free space governs the guard (KTD-13).
@@ -90,16 +92,22 @@ class MonitorAndStop:
         and always exists. With the container off, behavior is unchanged: the
         capture dir's own volume is the host (parent fallback when it does not
         exist yet).
+
+        The ``container_active`` decision is resolved once per recording (the
+        capture dir does not move mid-recording), so ``poll`` does not re-read
+        ``config.toml`` every cadence, and a mid-recording flag flip cannot
+        switch which volume the guard measures out from under an in-flight
+        capture.
         """
         if self._capture_dir is None:
             return None
-        from screencap import config
+        if self._container_active is None:
+            from screencap import config
 
-        if config.container_active():
+            self._container_active = config.container_active()
+        if self._container_active:
             from screencap import container
 
-            # Re-resolved every check (not cached) so a re-attach can't strand
-            # a stale host path.
             return container.default_bundle_path().parent
         return self._capture_dir if self._capture_dir.exists() else self._capture_dir.parent
 

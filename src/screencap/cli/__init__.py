@@ -198,20 +198,35 @@ def _detach_container_store_foreground() -> None:
         return
     from screencap import container
 
-    mp = container.container_mountpoint(container.default_bundle_path())
-    if mp:
-        try:
+    # Best-effort: the mountpoint probe itself can raise (hdiutil info
+    # timeout/corrupt), so it stays INSIDE the guard — a detach hiccup must
+    # never fail an otherwise-completed uninstall.
+    try:
+        mp = container.container_mountpoint(container.default_bundle_path())
+        if mp:
             container.detach_container(mp)
-        except container.ContainerError as exc:
-            console.print(
-                f"[yellow]Could not detach the encrypted store:[/yellow] "
-                f"{escape(str(exc))}"
-            )
+    except container.ContainerError as exc:
+        console.print(
+            f"[yellow]Could not detach the encrypted store:[/yellow] "
+            f"{escape(str(exc))}"
+        )
 
 
-def _daemon_recording_active() -> bool:
-    """True iff a reachable daemon reports an active recording. No daemon ⇒
-    nothing recording (returns ``False``)."""
+def _recording_active() -> bool:
+    """True iff a recording is active — checked via the **disk-only pidfile
+    lock** AND the daemon, so a daemon-independent recording (an engine
+    subprocess still flushing, or a ``screencap start`` CLI recording) still
+    blocks ``store lock`` / ``store compact`` even when the daemon is down.
+    """
+    # Disk-only probe first — authoritative regardless of daemon state.
+    try:
+        from screencap.catalog import _active_recording_name
+
+        if _active_recording_name() is not None:
+            return True
+    except Exception:
+        pass
+
     from screencap.cli._daemon_client import (
         DaemonAPIError,
         DaemonHTTPClient,
@@ -261,26 +276,30 @@ def store_lock():
     if not config.container_active():
         console.print("[yellow]The encrypted container is not enabled.[/yellow]")
         return
-    if _daemon_recording_active():
+    if _recording_active():
         console.print("[red]A recording is active.[/red] Stop it before locking the store.")
         raise SystemExit(1)
     # Set the sentinel FIRST so a racing auto-spawned daemon cannot remount
     # between our detach and the next command (KTD-4).
     container.set_user_lock()
-    mp = container.container_mountpoint(container.default_bundle_path())
-    if mp:
-        try:
-            container.detach_container(mp)
+    # Probe + detach inside the guard (the probe can raise). Detach
+    # GRACEFULLY ONLY — never force past a live direct reader (Swift app / MCP
+    # read frames off the mount with no daemon in the byte path, KTD-4); the
+    # sentinel is already set, so refusing to force still prevents remount.
+    try:
+        mp = container.container_mountpoint(container.default_bundle_path())
+        if mp:
+            container.detach_container(mp, force=False)
             console.print(
                 "[green]Store locked and detached.[/green] Run `store unlock` to use it again."
             )
-        except container.ContainerError as exc:
-            console.print(
-                f"[yellow]Store marked locked, but it is busy and stayed mounted:[/yellow] "
-                f"{escape(str(exc))} It will not remount once detached."
-            )
-    else:
-        console.print("[green]Store locked.[/green] (It was not mounted.)")
+        else:
+            console.print("[green]Store locked.[/green] (It was not mounted.)")
+    except container.ContainerError as exc:
+        console.print(
+            f"[yellow]Store marked locked, but it is busy and stayed mounted:[/yellow] "
+            f"{escape(str(exc))} It will not remount once detached."
+        )
 
 
 @store.command("unlock")
@@ -300,7 +319,7 @@ def store_compact():
     if not config.container_active():
         console.print("[yellow]The encrypted container is not enabled.[/yellow]")
         return
-    if _daemon_recording_active():
+    if _recording_active():
         console.print("[red]A recording is active.[/red] Stop it before compacting.")
         raise SystemExit(1)
     try:
@@ -2980,9 +2999,9 @@ def settings(ctx, set_pair, as_json):
         return
     from screencap.config import (
         _CONFIG_PATH,
+        container_enabled,
         get_audio_default,
         get_auto_delete_after_upload,
-        container_enabled,
         get_auto_name,
         get_chunk_duration,
         get_content_index_backfill_declined,

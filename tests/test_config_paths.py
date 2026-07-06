@@ -131,6 +131,9 @@ def test_store_dir_under_data_root(_clean_env, monkeypatch, tmp_path):
     from screencap import config
 
     monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    # Pretend the store is already mounted so get_store_dir resolves the path
+    # instead of triggering its mount-first guard (SCR-236 security fix).
+    monkeypatch.setattr("screencap.container.mount_is_ours", lambda r: True)
     fake_default = tmp_path / "screencap" / "recordings"
     with mock.patch.object(config, "_DEFAULT_RECORDINGS", fake_default):
         store = config.get_store_dir()
@@ -143,6 +146,7 @@ def test_content_index_path_flag_on_under_store(_clean_env, monkeypatch, tmp_pat
     from screencap.content_index import default_index_path
 
     monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.setattr("screencap.container.mount_is_ours", lambda r: True)
     fake_default = tmp_path / "screencap" / "recordings"
     with mock.patch.object(config, "_DEFAULT_RECORDINGS", fake_default):
         assert default_index_path() == fake_default / ".store" / "content_index.db"
@@ -153,6 +157,7 @@ def test_backfill_ledger_path_flag_on_under_store(_clean_env, monkeypatch, tmp_p
     from screencap.backfill.ledger import default_ledger_path
 
     monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.setattr("screencap.container.mount_is_ours", lambda r: True)
     fake_default = tmp_path / "screencap" / "recordings"
     with mock.patch.object(config, "_DEFAULT_RECORDINGS", fake_default):
         assert default_ledger_path() == fake_default / ".store" / "backfill_state.db"
@@ -166,9 +171,55 @@ def test_sidecars_are_siblings_under_store(_clean_env, monkeypatch, tmp_path):
     from screencap.content_index import default_index_path
 
     monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.setattr("screencap.container.mount_is_ours", lambda r: True)
     fake_default = tmp_path / "screencap" / "recordings"
     with mock.patch.object(config, "_DEFAULT_RECORDINGS", fake_default):
         assert default_index_path().parent == default_ledger_path().parent
+
+
+def test_get_store_dir_mounts_first_when_active_unmounted(_clean_env, monkeypatch, tmp_path):
+    """SCR-236 security: get_store_dir mounts-first (never writes .store on the
+    plaintext host) when the container is active but not mounted."""
+    from screencap import config, container
+
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.setattr(container, "mount_is_ours", lambda r: False)
+    mounted = []
+    monkeypatch.setattr(container, "ensure_store_mounted", lambda **k: mounted.append(1))
+    fake_default = tmp_path / "recordings"
+    with mock.patch.object(config, "_DEFAULT_RECORDINGS", fake_default):
+        config.get_store_dir()
+    assert mounted == [1]  # mounted first, not a bare plaintext-host mkdir
+
+
+def test_get_store_dir_refuses_and_leaks_nothing_when_locked(_clean_env, monkeypatch, tmp_path):
+    """When the store is user-locked, get_store_dir raises rather than writing
+    a plaintext sidecar DB to the host that a later mount would shadow."""
+    from screencap import config, container
+
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.setattr(container, "mount_is_ours", lambda r: False)
+
+    def locked(**k):
+        raise container.StoreLockedError("locked")
+
+    monkeypatch.setattr(container, "ensure_store_mounted", locked)
+    fake_default = tmp_path / "recordings"
+    with mock.patch.object(config, "_DEFAULT_RECORDINGS", fake_default):
+        with pytest.raises(container.StoreLockedError):
+            config.get_store_dir()
+    assert not (fake_default / ".store").exists()  # no plaintext leak on the host
+
+
+def test_container_active_recognizes_literal_tilde_default(_clean_env, monkeypatch):
+    """A config recordings_dir spelled with a literal ~ IS the default → the
+    container stays active, not silently bypassed to plaintext."""
+    from screencap import config
+
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.setattr(config, "_load_toml", lambda: {"recordings_dir": "~/.screencap/recordings"})
+    assert config.container_active() is True
+    assert config.get_data_root() == config._DEFAULT_RECORDINGS
 
 
 def test_run_dir_paths_stay_outside_container(_clean_env, monkeypatch, tmp_path):

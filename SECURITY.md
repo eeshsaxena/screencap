@@ -120,6 +120,7 @@ The recordings tree, the on-screen content index, and the backfill ledger (the l
 - **`downloads_dir` exports and `config.toml`** stay plaintext outside the container by design. A user who points `recordings_dir` at an external volume, or sets `SCREENCAP_RECORDINGS_DIR`, bypasses the container entirely (plaintext, documented residual).
 - **QuickLook host-cache thumbnails** of files browsed while mounted persist on the host volume with no per-volume opt-out (a documented residual; `-nobrowse` plus the `0o700` parent keep the volume out of casual Finder browsing).
 - **Filename / duration / timing side channels** (see the side-channel threat below).
+- **The mountpoint *path* itself.** The `run/mount.lock` path is symlink-hardened (`O_NOFOLLOW`), but the recordings mountpoint is not — a same-EUID actor who replaces `~/.screencap/recordings` with a symlink could redirect it. This is consistent with the same-EUID-out-of-scope boundary (a same-user attacker already reads the mounted plaintext); the asymmetry is intentional, not fuller coverage.
 
 **Key loss is unrecoverable (v1).** There is no second decryption path. If the login Keychain entry is lost, the recordings are permanently unrecoverable ciphertext — the app and this document state this plainly. In particular, a machine restore that brings back `~/.screencap` *without* the login Keychain (e.g. a selective `~/.screencap`-only restore rather than a full Migration Assistant / Time Machine restore) leaves an intact-but-unrecoverable store. A recovery code is a deferred fast-follow.
 

@@ -97,3 +97,16 @@ def test_create_keyring_locked_maps_to_retryable(monkeypatch, tmp_path):
     monkeypatch.setattr(keyring, "set_password", locked)
     with pytest.raises(container.ContainerKeyLockedError):
         container.create_container_key(bundle)
+
+
+def test_get_generic_keyring_error_maps_to_retryable(monkeypatch):
+    """A non-locked KeyringError (e.g. a headless ACL prompt the daemon can't
+    answer — the cross-binary case) maps to a retryable failure so serve()
+    exits EX_TEMPFAIL cleanly instead of crashing on an uncaught exception."""
+    def boom(*a, **k):
+        raise keyring.errors.KeyringError("interaction not allowed")
+
+    monkeypatch.setattr(keyring, "get_password", boom)
+    with pytest.raises(container.ContainerKeyLockedError) as excinfo:
+        container.get_container_key()
+    assert excinfo.value.exit_code == container.EX_TEMPFAIL

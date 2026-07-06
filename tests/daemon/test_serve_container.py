@@ -28,11 +28,14 @@ pytestmark = pytest.mark.privacy
 @pytest.fixture
 def sm(monkeypatch, tmp_path):
     """Wire up the state-machine primitives with recording spies."""
-    calls: dict[str, list] = {"attach": [], "create_bundle": [], "create_key": [], "harden": []}
+    calls: dict[str, list] = {
+        "attach": [], "create_bundle": [], "create_key": [], "harden": [], "marker": [],
+    }
 
     monkeypatch.setattr(container, "is_user_locked", lambda: False)
     monkeypatch.setattr(container, "container_mountpoint", lambda b: None)
     monkeypatch.setattr(container, "harden_mount", lambda mp: calls["harden"].append(mp))
+    monkeypatch.setattr(container, "_write_mount_marker", lambda mp: calls["marker"].append(mp))
     monkeypatch.setattr(container, "get_container_key", lambda: b"KEY")
 
     def _attach(b, key, mp):
@@ -129,7 +132,22 @@ def test_existing_mount_is_reused_not_reattached(sm, monkeypatch, tmp_path):
     monkeypatch.setattr(container, "container_mountpoint", lambda b: "/Volumes/ScreenCapStore")
     assert _run(tmp_path / "store.sparsebundle", tmp_path / "recordings") == "/Volumes/ScreenCapStore"
     assert sm["attach"] == []  # winner's mount reused, never double-attached
-    assert sm["harden"] == ["/Volumes/ScreenCapStore"]
+    # Reuse refreshes the identity marker cheaply; no expensive mdutil re-harden.
+    assert sm["marker"] == ["/Volumes/ScreenCapStore"]
+    assert sm["harden"] == []
+
+
+def test_rogue_populated_host_store_refuses(sm, tmp_path):
+    """A populated host-side .store/ (plaintext sidecar leak) is ROGUE, even
+    though it is a dot-entry — mounting over it would shadow plaintext PII."""
+    mp = tmp_path / "recordings"
+    mp.mkdir()
+    host_store = mp / ".store"
+    host_store.mkdir()
+    (host_store / "content_index.db").write_text("plaintext OCR")  # leaked to host
+    with pytest.raises(container.RogueMountpointError, match="plaintext sidecar"):
+        _run(tmp_path / "store.sparsebundle", mp, allow_create=False)
+    assert sm["attach"] == []
 
 
 def test_attached_but_not_mounted_is_retryable(sm, monkeypatch, tmp_path):

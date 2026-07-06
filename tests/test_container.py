@@ -214,6 +214,7 @@ def test_create_builds_encrypted_apfs_args(monkeypatch, tmp_path):
     def fake_run(args, *, key=None, timeout):
         captured["args"] = args
         captured["key"] = key
+        Path(args[-1]).mkdir(parents=True, exist_ok=True)  # simulate hdiutil materializing it
         return _FakeProc(0)
 
     monkeypatch.setattr(container, "_run_hdiutil", fake_run)
@@ -225,20 +226,29 @@ def test_create_builds_encrypted_apfs_args(monkeypatch, tmp_path):
     assert f"sparse-band-size={container.SPARSE_BAND_SIZE_SECTORS}" in args
     assert "500g" in args
     assert captured["key"] == b"the-key"
+    # Atomic create: built at a temp `.creating` path, then renamed into place.
+    assert args[-1].endswith(".creating.sparsebundle")
+    assert bundle.exists()
 
 
-def test_create_failure_raises_fatal(monkeypatch, tmp_path):
+def test_create_failure_leaves_no_partial_bundle(monkeypatch, tmp_path):
     bundle = tmp_path / "store.sparsebundle"
     monkeypatch.setattr(container, "_run_hdiutil", lambda *a, **k: _FakeProc(1, b"", b"disk full"))
     with pytest.raises(container.FatalContainerError, match="create failed"):
         container.create_container(bundle, b"key", size="1g")
+    # No half-built bundle at the real path (would trap every future mount).
+    assert not bundle.exists()
+    assert not (tmp_path / "store.creating.sparsebundle").exists()
 
 
 def test_attach_reuses_existing_mount(monkeypatch, tmp_path):
-    """Idempotency: an already-attached bundle is reused, never re-attached."""
+    """Idempotency: an already-attached bundle is reused, never re-attached;
+    the identity marker is refreshed but the expensive mdutil re-harden is not."""
     bundle = tmp_path / "store.sparsebundle"
+    marked = []
     hardened = []
     monkeypatch.setattr(container, "container_mountpoint", lambda b: "/Volumes/ScreenCapStore")
+    monkeypatch.setattr(container, "_write_mount_marker", lambda mp: marked.append(mp))
     monkeypatch.setattr(container, "harden_mount", lambda mp: hardened.append(mp))
 
     def fail_if_called(*a, **k):
@@ -246,7 +256,8 @@ def test_attach_reuses_existing_mount(monkeypatch, tmp_path):
 
     monkeypatch.setattr(container, "_run_hdiutil", fail_if_called)
     assert container.attach_container(bundle, b"key", tmp_path / "mp") == "/Volumes/ScreenCapStore"
-    assert hardened == ["/Volumes/ScreenCapStore"]
+    assert marked == ["/Volumes/ScreenCapStore"]
+    assert hardened == []
 
 
 def test_attach_auth_failure_classified(monkeypatch, tmp_path):
@@ -300,6 +311,21 @@ def test_detach_force_failure_is_retryable(monkeypatch):
     monkeypatch.setattr(container.time, "sleep", lambda s: None)
     with pytest.raises(container.ContainerBusyError):
         container.detach_container("/Volumes/ScreenCapStore", wait=0)
+
+
+def test_detach_graceful_only_never_forces(monkeypatch):
+    """force=False (store lock) never escalates to -force past a live reader."""
+    calls = []
+
+    def fake_run(args, *, key=None, timeout):
+        calls.append(args)
+        return _FakeProc(1, b"", b"resource busy")  # graceful fails
+
+    monkeypatch.setattr(container, "_run_hdiutil", fake_run)
+    with pytest.raises(container.ContainerBusyError):
+        container.detach_container("/Volumes/ScreenCapStore", force=False)
+    assert calls == [["detach", "/Volumes/ScreenCapStore"]]  # no -force
+    assert not any("-force" in a for a in calls)
 
 
 def test_compact_pipes_key_with_stdinpass(monkeypatch, tmp_path):
@@ -373,10 +399,11 @@ class _Text:
         ("Indexing enabled.", True),
         ("Indexing disabled.", False),
         ("Error: unknown indexing state.", False),  # macOS 26 non-indexing
+        ("Server search enabled.", False),  # "enabled" but NOT "indexing enabled"
         ("", False),
     ],
 )
-def test_spotlight_indexing_enabled_tolerates_unknown(monkeypatch, text, expected):
+def test_spotlight_indexing_enabled_requires_exact_phrase(monkeypatch, text, expected):
     monkeypatch.setattr(container.subprocess, "run", lambda *a, **k: _Text(text))
     assert container.spotlight_indexing_enabled("/Volumes/X") is expected
 
@@ -387,6 +414,30 @@ def test_spotlight_indexing_enabled_none_on_failure(monkeypatch):
 
     monkeypatch.setattr(container.subprocess, "run", boom)
     assert container.spotlight_indexing_enabled("/Volumes/X") is None
+
+
+# ---------------------------------------------------------------------------
+# Mount identity marker (fast-path can't trust a foreign volume)
+# ---------------------------------------------------------------------------
+
+
+def test_mount_is_ours_requires_marker(monkeypatch, tmp_path):
+    root = tmp_path / "recordings"
+    root.mkdir()
+    monkeypatch.setattr(container.os.path, "ismount", lambda p: True)
+    # A mounted volume WITHOUT our marker is not trusted...
+    assert container.mount_is_ours(str(root)) is False
+    # ...with the marker present, it is.
+    (root / container.MOUNT_MARKER).touch()
+    assert container.mount_is_ours(str(root)) is True
+
+
+def test_mount_is_ours_false_when_not_a_mount(monkeypatch, tmp_path):
+    root = tmp_path / "recordings"
+    root.mkdir()
+    (root / container.MOUNT_MARKER).touch()  # marker present but NOT a mount
+    monkeypatch.setattr(container.os.path, "ismount", lambda p: False)
+    assert container.mount_is_ours(str(root)) is False
 
 
 # ---------------------------------------------------------------------------

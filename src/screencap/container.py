@@ -42,9 +42,9 @@ explicit ``timeout=``) but raises typed exceptions instead of returning
 from __future__ import annotations
 
 import fcntl
-import math
 import os
 import plistlib
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -225,8 +225,16 @@ def get_container_key() -> bytes | None:
     ASCII bytes keeps the passphrase newline/NUL-free by construction.
 
     Raises:
-        ContainerKeyLockedError: the login Keychain is locked (retryable —
-            ``keyring`` raises ``KeyringLocked`` rather than hanging).
+        ContainerKeyLockedError: the Keychain is locked, or the read could
+            not be authorized headlessly (retryable — launchd retries).
+            This maps the cross-binary ACL case too: the key is created by
+            the foreground CLI but first read by the launchd daemon, and if
+            their code-signing identities differ the Security framework
+            raises rather than returning silently (``errSecInteractionNotAllowed``
+            when no one can answer the prompt). Mapping any ``KeyringError``
+            here keeps that from crashing ``serve()`` as an uncaught
+            exception — it becomes a clean ``EX_TEMPFAIL`` with a message
+            that points at Keychain authorization, not "key gone".
     """
     # Lazy import: keyring's Darwin backend dispatches to the Security
     # framework on first access; a module-level import would slow
@@ -238,6 +246,13 @@ def get_container_key() -> bytes | None:
         stored = keyring.get_password(KEY_SERVICE, KEY_ACCOUNT)
     except keyring.errors.KeyringLocked as exc:
         raise ContainerKeyLockedError("login Keychain is locked") from exc
+    except keyring.errors.KeyringError as exc:
+        # Interaction-not-allowed / ACL-denied on a headless read, or any
+        # backend failure. Retryable + actionable, never an uncaught crash.
+        raise ContainerKeyLockedError(
+            "could not read the container key from the Keychain "
+            f"(authorization may be required): {exc}"
+        ) from exc
     if stored is None:
         return None
     return stored.encode("ascii")
@@ -407,8 +422,11 @@ def _host_capacity_size_arg(bundle: Path) -> str:
     """
     sv = os.statvfs(str(bundle.parent))
     capacity_bytes = sv.f_blocks * sv.f_frsize
-    gb = max(1, math.ceil(capacity_bytes / 1_000_000_000))
-    return f"{gb}g"
+    # hdiutil's `g` suffix is binary GiB (1024^3). Floor to whole GiB so the
+    # declared size never *exceeds* host capacity — KTD-13 requires the
+    # declaration not advertise virtual space the host cannot back.
+    gib = max(1, capacity_bytes // (1024 ** 3))
+    return f"{gib}g"
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +449,14 @@ def create_container(
     ``store init`` do the check-lock-check that guards against orphaning
     a key/bundle pair; this primitive just fails loud on a surprise.
 
+    Crash-safety: creates into a temp ``*.creating.sparsebundle`` path and
+    atomically ``os.rename``s it to the real bundle only on success. A crash
+    mid-``hdiutil create`` therefore leaves an orphan temp dir (discarded on
+    the next attempt), never a half-built bundle at the real path — a partial
+    bundle would satisfy ``bundle.exists()`` and trap every future mount and
+    ``store init`` in a corrupt-attach dead end (the key-reuse recovery path
+    only handles a fully *absent* bundle).
+
     Raises:
         FatalContainerError: the bundle already exists, or ``hdiutil
             create`` failed.
@@ -440,6 +466,9 @@ def create_container(
         raise FatalContainerError(f"container already exists at {bundle}")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     size_arg = size or _host_capacity_size_arg(bundle)
+    tmp_bundle = bundle.with_name(f"{bundle.stem}.creating{bundle.suffix}")
+    if tmp_bundle.exists():
+        shutil.rmtree(tmp_bundle, ignore_errors=True)
     cp = _run_hdiutil(
         [
             "create",
@@ -450,23 +479,26 @@ def create_container(
             "-type", "SPARSEBUNDLE",
             "-volname", VOLUME_NAME,
             "-imagekey", f"sparse-band-size={band_size_sectors}",
-            str(bundle),
+            str(tmp_bundle),
         ],
         key=key,
         timeout=_CREATE_TIMEOUT,
     )
     if cp.returncode != 0:
+        shutil.rmtree(tmp_bundle, ignore_errors=True)
         raise FatalContainerError(f"hdiutil create failed: {_stderr(cp)}")
+    os.rename(str(tmp_bundle), str(bundle))
 
 
 def attach_container(bundle: Path, key: bytes, mountpoint: Path) -> str:
     """Attach ``bundle`` at ``mountpoint``, hardened; return the live mountpoint.
 
     Idempotent: if the bundle is already attached (spike: a naive second
-    attach errors), the existing mountpoint is reused and re-hardened
-    rather than re-attaching. Attach always uses ``-nobrowse -owners on
-    -mountpoint`` (KTD-9). Hardening (Spotlight off, ``no_log``) runs on
-    every return path, since macOS re-enables indexing across OS updates.
+    attach errors), the existing mountpoint is reused (marker refreshed, no
+    re-harden) rather than re-attaching. A fresh attach always uses
+    ``-nobrowse -owners on -mountpoint`` (KTD-9) and hardens (Spotlight off,
+    ``no_log``, identity marker) — re-asserted per fresh mount since macOS
+    re-enables indexing across OS updates.
 
     Raises:
         ContainerAuthError / ContainerCorruptError / ContainerBusyError /
@@ -474,7 +506,10 @@ def attach_container(bundle: Path, key: bytes, mountpoint: Path) -> str:
     """
     existing = container_mountpoint(bundle)
     if existing:
-        harden_mount(existing)
+        # Already attached — reuse. Refresh the identity marker cheaply but
+        # skip the mdutil re-harden (it ran on the original fresh attach;
+        # re-shelling mdutil on every reuse is wasted cost on the hot path).
+        _write_mount_marker(existing)
         return existing
 
     mountpoint = Path(mountpoint)
@@ -514,18 +549,27 @@ def _mountpoint_from_attach_plist(stdout: bytes) -> str | None:
     return None
 
 
-def detach_container(mountpoint: str, *, wait: float = _DETACH_FORCE_WAIT_S) -> None:
-    """Detach the volume, graceful-then-force (KTD-10).
+def detach_container(mountpoint: str, *, force: bool = True, wait: float = _DETACH_FORCE_WAIT_S) -> None:
+    """Detach the volume (KTD-10).
 
-    Plain ``detach`` first; on failure wait ~3 s (a reader may be mid-op)
-    then ``detach -force``. A still-busy force is retryable ("not now").
+    Plain ``detach`` first. With ``force=True`` (teardown — ``serve
+    --uninstall``), on failure wait ~3 s (a reader may be mid-op) then
+    ``detach -force``. With ``force=False`` (``store lock``), a busy volume
+    is **never** force-detached — that would yank the mount out from under a
+    live direct reader (Swift app / MCP, KTD-4) — and surfaces as a retryable
+    :class:`ContainerBusyError` instead.
 
     Raises:
-        ContainerBusyError: the volume could not be detached even forcibly.
+        ContainerBusyError: the volume is busy (``force=False``) or could not
+            be detached even forcibly (``force=True``).
     """
     cp = _run_hdiutil(["detach", str(mountpoint)], timeout=_DETACH_TIMEOUT)
     if cp.returncode == 0:
         return
+    if not force:
+        raise ContainerBusyError(
+            f"{mountpoint} is in use (a reader is active); close readers and retry"
+        )
     time.sleep(wait)
     forced = _run_hdiutil(["detach", "-force", str(mountpoint)], timeout=_DETACH_TIMEOUT)
     if forced.returncode != 0:
@@ -578,6 +622,35 @@ def _bundle_disk_usage_bytes(bundle: Path) -> int:
 # Per-attach host-leak hardening (KTD-9)
 # ---------------------------------------------------------------------------
 
+MOUNT_MARKER = ".screencap-store"
+"""Dot-file written at the volume root on every attach. Its presence *inside*
+a mounted volume identifies the mount as ours — the cheap identity check the
+``config`` fast-path uses so it can never trust a foreign/stale volume that
+merely happens to be mounted at the recordings path (dot-prefixed, so
+``catalog.list_recordings`` skips it; lives inside the encrypted volume, so
+it is never a host-side leak)."""
+
+
+def _write_mount_marker(mountpoint: str) -> None:
+    """Best-effort: stamp the identity marker at the mounted volume root."""
+    try:
+        marker = Path(mountpoint) / MOUNT_MARKER
+        if not marker.exists():
+            marker.touch(mode=0o600)
+    except OSError:
+        pass
+
+
+def mount_is_ours(root: str) -> bool:
+    """True iff ``root`` is a mounted volume carrying our identity marker.
+
+    The cheap (two ``stat``s, no ``hdiutil``) fast-path check: a bare
+    ``os.path.ismount`` would trust *any* volume attached at the path, so the
+    marker confirms it is actually our encrypted store before a caller reads
+    or writes recordings there.
+    """
+    return os.path.ismount(str(root)) and (Path(root) / MOUNT_MARKER).exists()
+
 
 def harden_mount(mountpoint: str) -> None:
     """Re-assert host-leak hardening on ``mountpoint`` (KTD-9).
@@ -612,6 +685,8 @@ def harden_mount(mountpoint: str) -> None:
     except OSError:
         pass
 
+    _write_mount_marker(mountpoint)
+
 
 def spotlight_indexing_enabled(mountpoint: str) -> bool | None:
     """Best-effort read of ``mdutil -s``: ``True`` only on a positive
@@ -632,9 +707,10 @@ def spotlight_indexing_enabled(mountpoint: str) -> bool | None:
     except (subprocess.TimeoutExpired, OSError):
         return None
     text = (cp.stdout + cp.stderr).lower()
-    if "indexing enabled" in text or ("enabled" in text and "disabled" not in text and "unknown" not in text):
-        return True
-    return False
+    # Only a positive "Indexing enabled" is a concern. A bare "enabled"
+    # substring match would mis-flag messages like "Indexing enabled but
+    # volume not eligible"; require the exact phrase.
+    return "indexing enabled" in text
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +894,17 @@ def compact_store() -> int:
                 )
         freed = compact_container(bundle, key)
         # Re-attach through the state machine (ROGUE check) WITHOUT re-locking.
-        _ensure_mounted_locked(bundle, mountpoint, allow_create=False)
+        # On failure the store is left DETACHED; surface that explicitly (it
+        # self-heals on the next get_recordings_dir/daemon call) while
+        # preserving the failure's retryable/fatal class via type(exc).
+        try:
+            _ensure_mounted_locked(bundle, mountpoint, allow_create=False)
+        except ContainerError as exc:
+            raise type(exc)(
+                f"compacted, but re-mounting failed and the store is now "
+                f"DETACHED (it will remount on the next command or `store "
+                f"unlock`): {exc}"
+            ) from exc
         return freed
     finally:
         os.close(lock_fd)
@@ -832,22 +918,34 @@ def _ensure_mounted_locked(bundle: Path, mountpoint: Path, *, allow_create: bool
             "the recordings store is locked; run `screencap store unlock` to remount"
         )
 
-    # 2. Our bundle already attached → reuse (re-harden), never double-attach.
+    # 2. Our bundle already attached → reuse, never double-attach. Refresh the
+    #    identity marker cheaply; skip the mdutil re-harden (ran on attach).
     existing = container_mountpoint(bundle)
     if existing:
-        harden_mount(existing)
+        _write_mount_marker(existing)
         return existing
     if existing == "":
         # Attached but not mounted yet — a transient DiskArbitration state.
         raise ContainerBusyError("container is attached but not mounted yet; retry")
 
     # 3. ROGUE: non-container content sits at the mountpoint and it is not a
-    #    mounted volume (dot-entries like .store/.fseventsd are ours — ignore).
+    #    mounted volume (dot-entries like .fseventsd are incidental — ignore).
     if mountpoint.exists() and not os.path.ismount(str(mountpoint)):
         if any(not entry.name.startswith(".") for entry in mountpoint.iterdir()):
             raise RogueMountpointError(
                 f"{mountpoint} holds non-container content and is not a mounted "
                 f"volume; refusing to overwrite it (move it aside, then retry)"
+            )
+        # A populated host-side .store/ is a plaintext sidecar leak: our
+        # .store only ever lives INSIDE the mounted volume, so files here mean
+        # a sidecar DB was written to the host disk. Mounting over it would
+        # silently shadow plaintext PII forever — treat it as ROGUE (defends
+        # legacy state; get_store_dir now mounts-first to prevent creating it).
+        host_store = mountpoint / ".store"
+        if host_store.is_dir() and any(host_store.iterdir()):
+            raise RogueMountpointError(
+                f"{host_store} contains plaintext sidecar data on the host disk; "
+                f"move it aside before mounting (it would otherwise be shadowed)"
             )
 
     # 4. Bundle present (LOCKED) → attach with the Keychain key.
@@ -912,6 +1010,8 @@ __all__ = [
     "detach_container",
     "compact_container",
     "harden_mount",
+    "mount_is_ours",
+    "MOUNT_MARKER",
     "spotlight_indexing_enabled",
     "filevault_status",
     "open_hardened_lock",

@@ -170,13 +170,17 @@ async def daemon_info(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 - readiness probe must never 500
         logger.debug("daemon.info grant probe failed", exc_info=True)
         grants = permission_probe.indeterminate_result()
+    # Run the (cached) FileVault probe off the event loop: the first call
+    # shells out to `fdesetup` (up to 10s), and daemon.info is the readiness
+    # probe fired right after bind — a synchronous call would stall startup.
+    filevault = await asyncio.to_thread(_filevault_status)
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
             build=_build_string(),
             started_at=_STARTED_AT,
             permissions=grants,
-            filevault=_filevault_status(),
+            filevault=filevault,
         )
     )
 

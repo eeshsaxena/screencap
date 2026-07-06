@@ -99,7 +99,9 @@ def _patch_client(monkeypatch, handler) -> None:
 
 def test_idle_daemon_reports_not_recording(monkeypatch):
     def handler(request):
-        assert request.url.path == "/v0/session.snapshot"
+        # ``status`` reads session.snapshot for recording state and, since
+        # SCR-236, daemon.info for the warn-only FileVault field.
+        assert request.url.path in ("/v0/session.snapshot", "/v0/daemon.info")
         return httpx.Response(200, json=_idle_snapshot())
 
     _patch_client(monkeypatch, handler)

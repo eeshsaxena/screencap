@@ -42,15 +42,15 @@ def test_funnel_mounts_when_active_and_unmounted(monkeypatch, tmp_path):
     assert called == [1]  # not a mount → mounts on demand
 
 
-def test_funnel_fast_path_when_already_mounted(monkeypatch, tmp_path):
+def test_funnel_fast_path_when_our_store_mounted(monkeypatch, tmp_path):
     monkeypatch.delenv("SCREENCAP_RECORDINGS_DIR", raising=False)
     monkeypatch.setattr(config, "container_active", lambda: True)
     monkeypatch.setattr(config, "get_data_root", lambda: tmp_path / "recordings")
-    monkeypatch.setattr("os.path.ismount", lambda p: True)
+    monkeypatch.setattr(container, "mount_is_ours", lambda r: True)  # identity verified
     called = []
     monkeypatch.setattr(container, "ensure_store_mounted", lambda **k: called.append(1))
     config.get_recordings_dir()
-    assert called == []  # already mounted → no hdiutil reshell
+    assert called == []  # our store already mounted → no hdiutil reshell
 
 
 def test_funnel_no_container_calls_when_inactive(monkeypatch, tmp_path):
@@ -100,7 +100,7 @@ def test_group_reraises_non_container_errors():
 def test_store_lock_sets_sentinel_then_unlock_clears(monkeypatch, tmp_path):
     monkeypatch.setattr(container, "_run_dir", lambda: tmp_path / "run")
     monkeypatch.setattr(config, "container_active", lambda: True)
-    monkeypatch.setattr(clim, "_daemon_recording_active", lambda: False)
+    monkeypatch.setattr(clim, "_recording_active", lambda: False)
     monkeypatch.setattr(container, "container_mountpoint", lambda b: None)  # not mounted
 
     r1 = CliRunner().invoke(cli, ["store", "lock"])
@@ -121,10 +121,33 @@ def test_store_lock_sets_sentinel_then_unlock_clears(monkeypatch, tmp_path):
 def test_store_lock_refuses_while_recording(monkeypatch, tmp_path):
     monkeypatch.setattr(container, "_run_dir", lambda: tmp_path / "run")
     monkeypatch.setattr(config, "container_active", lambda: True)
-    monkeypatch.setattr(clim, "_daemon_recording_active", lambda: True)
+    monkeypatch.setattr(clim, "_recording_active", lambda: True)
     r = CliRunner().invoke(cli, ["store", "lock"])
     assert r.exit_code == 1
     assert not container.is_user_locked()  # never locked mid-recording
+
+
+def test_recording_active_uses_disk_probe_when_daemon_down(monkeypatch):
+    """A daemon-independent recording (disk pidfile lock held) blocks
+    lock/compact even when the daemon is unreachable."""
+    import screencap.catalog as catmod
+
+    monkeypatch.setattr(catmod, "_active_recording_name", lambda: "rec-123")
+    assert clim._recording_active() is True  # short-circuits before the daemon check
+
+
+def test_store_lock_uses_graceful_only_detach(monkeypatch, tmp_path):
+    """`store lock` never force-detaches past a live direct reader (KTD-4)."""
+    monkeypatch.setattr(container, "_run_dir", lambda: tmp_path / "run")
+    monkeypatch.setattr(config, "container_active", lambda: True)
+    monkeypatch.setattr(clim, "_recording_active", lambda: False)
+    monkeypatch.setattr(container, "container_mountpoint", lambda b: "/Volumes/ScreenCapStore")
+    detach_kwargs = []
+    monkeypatch.setattr(container, "detach_container", lambda mp, **kw: detach_kwargs.append(kw))
+    r = CliRunner().invoke(cli, ["store", "lock"])
+    assert r.exit_code == 0
+    assert container.is_user_locked()
+    assert detach_kwargs == [{"force": False}]  # graceful only
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +188,7 @@ def test_store_init_noop_when_inactive(monkeypatch):
 
 def test_store_compact_refuses_while_recording(monkeypatch):
     monkeypatch.setattr(config, "container_active", lambda: True)
-    monkeypatch.setattr(clim, "_daemon_recording_active", lambda: True)
+    monkeypatch.setattr(clim, "_recording_active", lambda: True)
     ran = []
     monkeypatch.setattr(container, "compact_store", lambda: ran.append(1))
     r = CliRunner().invoke(cli, ["store", "compact"])
@@ -175,7 +198,7 @@ def test_store_compact_refuses_while_recording(monkeypatch):
 
 def test_store_compact_busy_is_not_now(monkeypatch):
     monkeypatch.setattr(config, "container_active", lambda: True)
-    monkeypatch.setattr(clim, "_daemon_recording_active", lambda: False)
+    monkeypatch.setattr(clim, "_recording_active", lambda: False)
 
     def busy():
         raise container.ContainerBusyError("in use")
@@ -187,7 +210,7 @@ def test_store_compact_busy_is_not_now(monkeypatch):
 
 def test_store_compact_success(monkeypatch):
     monkeypatch.setattr(config, "container_active", lambda: True)
-    monkeypatch.setattr(clim, "_daemon_recording_active", lambda: False)
+    monkeypatch.setattr(clim, "_recording_active", lambda: False)
     monkeypatch.setattr(container, "compact_store", lambda: 5_000_000)
     r = CliRunner().invoke(cli, ["store", "compact"])
     assert r.exit_code == 0 and "reclaimed" in r.output.lower()
