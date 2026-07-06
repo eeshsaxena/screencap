@@ -41,6 +41,10 @@ final class RecordingHUDModelTests: XCTestCase {
         XCTAssertEqual(m.stopAccessibilityLabel, "Stop and save recording")
     }
 
+    func testHideAccessibilityLabel() {
+        XCTAssertEqual(model(elapsed: 10).hideAccessibilityLabel, "Hide recording controls")
+    }
+
     // MARK: - Footer honesty (KTD-9)
 
     func testFooterNeverClaimsEncryption() {
