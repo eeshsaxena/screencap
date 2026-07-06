@@ -185,6 +185,19 @@ def get_content_index_enabled() -> bool:
     return _parse_bool_env("SCREENCAP_CONTENT_INDEX", "content_index_enabled", False)
 
 
+def get_cloud_e2ee_enabled() -> bool:
+    """Return whether cloud uploads are end-to-end encrypted on-device (E2EE slice).
+
+    Default OFF — the slice ships dark until the crypto path is proven. When on,
+    a cloud recording's artifacts are encrypted with the device-held cloud key
+    before upload, so the object store holds only ciphertext; when off, uploads
+    are plaintext exactly as before. This flag is the single runtime signal that
+    gates encryption, and the onboarding "we can't watch" copy is bound to it
+    (surfaced via ``settings --json``) so a flag-off build never claims E2EE.
+    """
+    return _parse_bool_env("SCREENCAP_CLOUD_E2EE", "cloud_e2ee_enabled", False)
+
+
 def get_content_index_consent_declined() -> bool:
     """Return whether the user declined the one-time on-screen-text indexing
     consent prompt (SCR-174 U7).

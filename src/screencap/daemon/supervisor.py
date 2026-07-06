@@ -260,6 +260,10 @@ class Supervisor:
         # the short-lived token; the refresh task re-mints it for recordings that
         # outlast the ~1h token. Both are torn down in _reset_state.
         self._engine_token_file: Path | None = None
+        # E2EE slice: the out-of-band cloud-key file staged for the engine (the
+        # engine can't read the Keychain). Static — no refresh loop — and unlinked
+        # in _reset_state so the master key never outlives the recording.
+        self._engine_cloud_key_file: Path | None = None
         # SCR-116: the uid the staged token belonged to. The re-mint loop refuses
         # to restage a token whose uid differs (a mid-recording account switch),
         # so every chunk of this recording stays in the original namespace.
@@ -345,6 +349,9 @@ class Supervisor:
             started_sub = await self._bus.subscribe()
             try:
                 extra_env = await self._stage_engine_token(request, capture_dir)
+                key_env = await self._stage_engine_cloud_key(request, capture_dir)
+                if key_env:
+                    extra_env = {**(extra_env or {}), **key_env}
                 command = self._engine_command_factory(encoded_args)
                 proc = _PopenEngineProcess(command, extra_env=extra_env)
                 self._proc = proc
@@ -840,6 +847,7 @@ class Supervisor:
             self._clear_stale_lock_if_unheld()
         finally:
             self._prune_stale_engine_token_files()
+            self._prune_stale_engine_cloud_key_files()
             self._recovering = False
             # SCR-125 U6 F3 startup sweep — resume cloud recordings left
             # incomplete by a prior daemon/engine crash. Detached (tracked) so it
@@ -874,6 +882,31 @@ class Supervisor:
             except OSError as exc:
                 logger.warning(
                     "daemon: could not remove stale engine token file %s: %s", path, exc
+                )
+
+    @staticmethod
+    def _prune_stale_engine_cloud_key_files() -> None:
+        """Delete any leftover ``engine-cloud-key-*`` files at daemon startup.
+
+        A hard crash / SIGKILL runs no Python teardown, so a 0600 file holding a
+        cloud master key can survive in the run dir. At daemon startup no live
+        recording can legitimately own one (the engine that read it is gone), so
+        unlink every survivor — a master key must not linger. Best-effort.
+        """
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        try:
+            stale = list(run_dir.glob("engine-cloud-key-*"))
+        except OSError as exc:
+            logger.warning("daemon: could not scan for stale cloud-key files: %s", exc)
+            return
+        for path in stale:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "daemon: could not remove stale cloud-key file %s: %s", path, exc
                 )
 
     async def _stderr_pump(self, proc: _PopenEngineProcess) -> None:
@@ -1361,6 +1394,98 @@ class Supervisor:
         except OSError as exc:
             logger.warning("daemon: could not remove engine token file %s: %s", path, exc)
 
+    async def _stage_engine_cloud_key(
+        self, request: "RecordingStartRequest", capture_dir: Path
+    ) -> dict[str, str] | None:
+        """Stage the out-of-band cloud E2EE key for a cloud recording's engine.
+
+        Reads the device-held cloud key in the daemon's OWN ACL context (the
+        engine subprocess cannot read the Keychain), writes it to a hardened 0600
+        file, and returns the env overlay pointing the engine at it. Returns
+        ``None`` — no key, no env var — for local recordings, when the flag is
+        off, or (fail-closed) when no key is available. The engine then encrypts
+        nothing, and under the flag its U2 path fails the upload closed rather
+        than shipping plaintext. Static key: no refresh loop, unlike the token.
+        Never raises.
+        """
+        if not request.cloud_intent:
+            return None
+        from screencap import cloud_crypto
+        from screencap.config import get_cloud_e2ee_enabled
+
+        if not get_cloud_e2ee_enabled():
+            return None
+        try:
+            key = await asyncio.to_thread(cloud_crypto.get_cloud_kek)
+        except Exception as exc:  # noqa: BLE001 — KeyringError etc.: fail closed
+            logger.warning(
+                "daemon: no cloud E2EE key at recording start (%s); live upload "
+                "fails closed under the flag (recording stays local)",
+                type(exc).__name__,
+            )
+            return None
+        if key is None:
+            logger.warning(
+                "daemon: cloud E2EE flag on but no key present; live upload fails "
+                "closed (sign in to create the key)"
+            )
+            return None
+        path = self._engine_cloud_key_path(capture_dir)
+        try:
+            self._write_engine_cloud_key_file(path, key)
+        except OSError as exc:
+            logger.warning("daemon: could not stage engine cloud-key file: %s", exc)
+            return None
+        self._engine_cloud_key_file = path
+        return {cloud_crypto.ENGINE_CLOUD_KEY_FILE_ENV: str(path)}
+
+    @staticmethod
+    def _engine_cloud_key_path(capture_dir: Path) -> Path:
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir / f"engine-cloud-key-{capture_dir.name}.b64"
+
+    @staticmethod
+    def _write_engine_cloud_key_file(path: Path, key: bytes) -> None:
+        """Atomically write the base64 cloud key to *path* at mode 0600.
+
+        Mirrors ``_write_engine_token_file`` hardening (``O_NOFOLLOW`` to reject a
+        pre-planted symlink, atomic replace, re-chmod) — a long-lived master key
+        warrants at least the same care as the short-lived token.
+        """
+        payload = base64.b64encode(key)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        try:
+            os.replace(str(tmp), str(path))
+            os.chmod(path, 0o600)
+        except OSError:
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
+
+    def _cleanup_engine_cloud_key_file(self) -> None:
+        path = self._engine_cloud_key_file
+        self._engine_cloud_key_file = None
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "daemon: could not remove engine cloud-key file %s: %s", path, exc
+            )
+
     async def _token_refresh_loop(self, proc: "_PopenEngineProcess") -> None:
         """Re-mint + rewrite the engine token file while *proc* is alive.
 
@@ -1432,6 +1557,7 @@ class Supervisor:
             self._token_refresh_task.cancel()
         self._token_refresh_task = None
         self._cleanup_engine_token_file()
+        self._cleanup_engine_cloud_key_file()
         self._engine_token_uid = None
         self._finalized_seen = False
         self._stopping = False

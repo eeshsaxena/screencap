@@ -335,11 +335,23 @@ def request_signed_urls(
     (test mocks at ``screencap.upload.requests.post`` keep working).
     """
     from screencap import auth
+    from screencap.config import get_cloud_e2ee_enabled
 
     url = _get_upload_url()
+    # KTD-5: when E2EE is on, objects are ciphertext PUT as octet-stream. The
+    # signed URL binds Content-Type into the V4 signature, so the signed-URL
+    # request must advertise the same octet-stream the encrypted PUT will send —
+    # otherwise the PUT is a 403. Flag on ⇒ every cloud upload is encrypted.
+    e2ee = get_cloud_e2ee_enabled()
     payload = {
         "recording": recording_name,
-        "files": [{"name": f.name, "content_type": f.content_type} for f in files],
+        "files": [
+            {
+                "name": f.name,
+                "content_type": "application/octet-stream" if e2ee else f.content_type,
+            }
+            for f in files
+        ],
     }
     try:
         resp = auth.authed_post(requests.post, url, json=payload, timeout=30)
@@ -709,6 +721,37 @@ def upload_recording(
                 pass
 
 
+class CloudEncryptionUnavailable(RuntimeError):
+    """Cloud E2EE is enabled but no encryption key is available.
+
+    Raised instead of uploading plaintext, so the caller fails the upload
+    closed (the live path marks the chunk FAILED and deletes nothing).
+    """
+
+
+def _cloud_upload_key() -> bytes | None:
+    """Return the cloud encryption key when E2EE is on, else ``None``.
+
+    Resolves the key for the current context (engine → delivered file; batch /
+    CLI → Keychain). When the flag is on but no key is available, raises
+    :class:`CloudEncryptionUnavailable` — callers must fail closed rather than
+    fall back to a plaintext upload.
+    """
+    from screencap.config import get_cloud_e2ee_enabled
+
+    if not get_cloud_e2ee_enabled():
+        return None
+    from screencap import cloud_crypto
+
+    key = cloud_crypto.resolve_cloud_key()
+    if key is None:
+        raise CloudEncryptionUnavailable(
+            "cloud E2EE is enabled but no encryption key is available; refusing "
+            "to upload plaintext (sign in to create the cloud key)"
+        )
+    return key
+
+
 def _upload_with_progress(
     f: FileInfo,
     signed_url: str,
@@ -717,20 +760,39 @@ def _upload_with_progress(
     recording_name: str,
     max_retries: int,
 ) -> None:
-    """Upload a single file with streaming progress and retry on URL expiry."""
+    """Upload a single file with streaming progress and retry on URL expiry.
+
+    When cloud E2EE is enabled the file is encrypted on-device before the PUT
+    (KTD-4): the object store only ever holds ciphertext. The body then streams
+    as ``application/octet-stream`` with the computed ciphertext ``Content-Length``.
+    """
+    key = _cloud_upload_key()
     for attempt in range(1 + max_retries):
         with open(f.path, "rb") as fh:
             progress.reset(task_id)
-            wrapper = _ProgressFile(fh, progress, task_id, f.size)
-            resp = requests.put(
-                signed_url,
-                data=wrapper,
-                headers={
+            if key is not None:
+                from screencap import cloud_crypto
+
+                body = cloud_crypto.EncryptingReader(fh, f.size, key)
+                headers = {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(len(body)),
+                }
+            else:
+                body = _ProgressFile(fh, progress, task_id, f.size)
+                headers = {
                     "Content-Type": f.content_type,
                     "Content-Length": str(f.size),
-                },
+                }
+            resp = requests.put(
+                signed_url,
+                data=body,
+                headers=headers,
                 timeout=(10, 300),
             )
+        if key is not None:
+            # EncryptingReader doesn't drive the bar per-chunk; land it at done.
+            progress.update(task_id, completed=f.size)
 
         if resp.status_code == 403 and attempt < max_retries:
             console.print(f"  [yellow]URL expired for {f.name}, retrying...[/yellow]")
