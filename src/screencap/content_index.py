@@ -130,9 +130,17 @@ class IndexFrame:
 
 
 def default_index_path() -> Path:
-    """Return ``~/.screencap/content_index.db`` (does not create the file)."""
-    from screencap.config import get_base_dir
+    """Return the global content-index DB path (does not create the file).
 
+    Container-aware (SCR-236 KTD-2): when the encrypted-at-rest container flag is
+    on the index lives inside the volume under the reserved ``.store/`` dir
+    (``<data_root>/.store/content_index.db``); when the flag is off it stays at
+    the pre-SCR-236 location ``~/.screencap/content_index.db`` — byte-identical.
+    """
+    from screencap.config import container_enabled, get_base_dir, get_store_dir
+
+    if container_enabled():
+        return get_store_dir() / "content_index.db"
     return get_base_dir() / "content_index.db"
 
 

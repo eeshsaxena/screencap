@@ -52,6 +52,8 @@ LAUNCHAGENT_LABEL = "com.screencap.daemon"
 # in the middle of a multi-command sequence.
 DEFAULT_IDLE_SHUTDOWN_S = 600
 
+# run-dir: stays outside the encrypted container (SCR-236 KTD-2/KTD-3) — the
+# auto-spawn diagnostic log is a plaintext run-dir sidecar.
 _AUTO_LOG_PATH = Path.home() / ".screencap" / "run" / "auto-serve.log"
 
 

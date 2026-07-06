@@ -32,6 +32,8 @@ from screencap.privacy.domain_loader import extract_root_domain
 
 logger = logging.getLogger(__name__)
 
+# config-dir: stays outside the encrypted container (SCR-236 KTD-2/KTD-3) —
+# config.toml (+ its lock) is plaintext and must be readable before any mount.
 _BASE_DIR = Path.home() / ".screencap"
 _CONFIG_PATH = _BASE_DIR / "config.toml"
 _LOCK_PATH = _BASE_DIR / "config.lock"

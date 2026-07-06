@@ -707,6 +707,8 @@ class SessionController:
             # Legacy state file path — still used for STATE_DONE signalling
             # at shutdown. Placed in the screencap dotdir so it doesn't leak
             # into a specific capture.
+            # config-dir: stays outside the encrypted container (SCR-236
+            # KTD-2/KTD-3) — a transient IPC state file, not recording data.
             state_dir = Path.home() / ".screencap"
             state_dir.mkdir(parents=True, exist_ok=True)
             self._menubar_state_file = state_dir / ".menubar_state"

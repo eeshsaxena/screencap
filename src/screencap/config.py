@@ -121,6 +121,88 @@ def get_recordings_dir() -> Path:
     return p
 
 
+def container_enabled() -> bool:
+    """Return whether the SCR-236 encrypted-at-rest container is enabled.
+
+    Env var ``SCREENCAP_CONTAINER_ENABLED`` > config ``container_enabled`` >
+    default. The default is **False** for now — the ship-time flip to on happens
+    later (plan U8), once the mount orchestration and lifecycle units land. While
+    it is off, every data-plane path resolves byte-identically to the pre-SCR-236
+    behavior (:func:`get_data_root` returns exactly what :func:`get_recordings_dir`
+    returned before this seam existed).
+
+    The rollout flag is one-way in the field: turning it off only stops a
+    not-yet-migrated machine from entering the container flow — there is no
+    reverse migration (KTD-8).
+    """
+    return _parse_bool_env("SCREENCAP_CONTAINER_ENABLED", "container_enabled", False)
+
+
+def get_data_root() -> Path:
+    """Return the container-aware data-plane root (KTD-2, KTD-8).
+
+    The single chokepoint every data-plane path resolves through. The recordings
+    tree lives at this root, and the sidecar stores (content index, backfill
+    ledger) live under :func:`get_store_dir` inside it.
+
+    Resolution precedence:
+
+    - ``SCREENCAP_RECORDINGS_DIR`` env set → return that path verbatim. This is
+      the documented dev/test seam the existing fixtures depend on; the container
+      flow is bypassed and the location is plaintext (KTD-8).
+    - Flag off → return the SAME path :func:`get_recordings_dir` returns today
+      (byte-identical: the default ``~/.screencap/recordings`` or a non-default
+      ``recordings_dir`` config.toml value). A non-default ``recordings_dir`` is
+      treated exactly like the env override — bypass, plaintext (KTD-8): a user
+      who pointed recordings at an external volume keeps their location.
+    - Flag on, no override, default location → return the recordings mountpoint,
+      which IS ``~/.screencap/recordings`` (KTD-2: no symlinks; every external
+      path contract survives verbatim).
+
+    U3 is the resolver seam only. This helper deliberately does NOT mount or
+    ``ensure_store_mounted()`` — U4 wires the mount into ``get_recordings_dir`` /
+    ``resolve_recording_dir``. Here we only compute the path.
+    """
+    env = os.environ.get("SCREENCAP_RECORDINGS_DIR")
+    if env:
+        # Documented dev/test bypass — plaintext, container flow skipped (KTD-8).
+        return Path(env)
+
+    cfg = _load_toml()
+    configured = cfg.get("recordings_dir")
+    if configured is not None and Path(configured) != _DEFAULT_RECORDINGS:
+        # Non-default recordings_dir is treated like the env override: bypass,
+        # plaintext, documented residual (KTD-8).
+        return Path(configured)
+
+    if not container_enabled():
+        # Flag off → byte-identical to pre-SCR-236 behavior.
+        return Path(configured) if configured is not None else _DEFAULT_RECORDINGS
+
+    # Flag on, default location → the recordings mountpoint IS the default
+    # recordings dir (KTD-2). No mount is performed here (U4 owns that).
+    return _DEFAULT_RECORDINGS
+
+
+def get_store_dir() -> Path:
+    """Return ``<data_root>/.store/``, the reserved dot-directory for sidecar DBs.
+
+    The content index and backfill ledger relocate here when the container flag
+    is on (KTD-2) — inside the encrypted volume, reached only through their
+    existing ``config`` chokepoints. It is a dot-prefixed directory so recording
+    enumerators (``catalog.list_recordings``, ``upload.list_recording_files``)
+    skip it. Created like the other path helpers.
+
+    Note this is derived from :func:`get_data_root`, so with the flag OFF it sits
+    at ``<recordings_dir>/.store/`` — but the sidecar chokepoints only consult
+    this helper when the flag is ON (they keep their old ``get_base_dir()``
+    location otherwise), so no plaintext-off path ever lands here.
+    """
+    store = get_data_root() / ".store"
+    store.mkdir(parents=True, exist_ok=True)
+    return store
+
+
 def get_audio_default() -> bool:
     """Return default audio setting (True = on)."""
     return _parse_bool_env("SCREENCAP_AUDIO_DEFAULT", "audio_default", True)

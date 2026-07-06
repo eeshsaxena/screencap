@@ -15,6 +15,8 @@ from pathlib import Path
 
 import psutil
 
+# run-dir/config-dir: stays outside the encrypted container (SCR-236 KTD-2/KTD-3)
+# — the PID + lock files must exist before any mount and are plaintext by design.
 _DEFAULT_BASE = Path.home() / ".screencap"
 PID_FILE = _DEFAULT_BASE / "recording.pid"
 

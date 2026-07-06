@@ -34,6 +34,8 @@ from screencap.privacy.classify import PASSWORD_MANAGER_BUNDLES
 # Debug log — written by the menubar subprocess so we can post-mortem
 # what the prompt path saw. Disabled by default; set
 # SCREENCAP_MENUBAR_DEBUG=1 to enable.
+# config-dir: stays outside the encrypted container (SCR-236 KTD-2/KTD-3) — the
+# menubar debug log is a plaintext dotdir sidecar, not recording data.
 _DEBUG_LOG_PATH = Path.home() / ".screencap" / "menubar_debug.log"
 
 

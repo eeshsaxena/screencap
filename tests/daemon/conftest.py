@@ -32,7 +32,13 @@ def _isolate_recordings_and_run_dir(tmp_path, monkeypatch):
     per-exit terminal-stage resume (takes the ``~/.screencap/run`` flock). Without
     isolation those would touch the developer's REAL recordings / run dir during
     the test suite. Pointing both at a per-test tmp dir keeps the daemon tests
-    hermetic (the sweep finds an empty dir → no-op; the flock lives in tmp)."""
+    hermetic (the sweep finds an empty dir → no-op; the flock lives in tmp).
+
+    SCR-236 U3 adds ``config.get_data_root()`` as the container-aware data-plane
+    root. Setting ``SCREENCAP_RECORDINGS_DIR`` isolates it too: ``get_data_root``
+    returns the override verbatim (the documented dev/test bypass, KTD-8), and
+    ``get_store_dir`` (the in-container sidecar location) derives from it, so it
+    also lands under this tmp dir rather than the real ``~/.screencap``."""
     import screencap.terminal_stage as ts
 
     isolated = tmp_path / "recordings-isolated"

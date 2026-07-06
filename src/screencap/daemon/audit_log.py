@@ -53,6 +53,8 @@ def _audit_log_path() -> Path:
     ``HOME`` after this module is imported. Mirrors the lazy shape used by
     ``default_socket_path`` in ``screencap.daemon.socket``.
     """
+    # run-dir: stays outside the encrypted container (SCR-236 KTD-2/KTD-3) — the
+    # audit log is metadata-sensitive plaintext and this residual is documented.
     return Path.home() / ".screencap" / "run" / "audit.log"
 
 

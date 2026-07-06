@@ -96,14 +96,22 @@ class RunState(str, Enum):
 
 
 def default_ledger_path() -> Path:
-    """Return the default sibling ledger path ``~/.screencap/backfill_state.db``.
+    """Return the default sibling ledger path for ``backfill_state.db``.
 
-    Resolved via :func:`screencap.config.get_base_dir` (deferred import to keep
-    this module light). Deliberately a SIBLING of ``content_index.db``, not a
-    table inside it — see the module docstring.
+    Deliberately a SIBLING of ``content_index.db``, not a table inside it — see
+    the module docstring. Container-aware (SCR-236 KTD-2): when the
+    encrypted-at-rest container flag is on the ledger lives inside the volume
+    under the reserved ``.store/`` dir (``<data_root>/.store/backfill_state.db``,
+    still a sibling of the index); when the flag is off it stays at the
+    pre-SCR-236 location ``~/.screencap/backfill_state.db`` — byte-identical.
+
+    Resolved via :mod:`screencap.config` (deferred import to keep this module
+    light).
     """
     from screencap import config
 
+    if config.container_enabled():
+        return config.get_store_dir() / "backfill_state.db"
     return config.get_base_dir() / "backfill_state.db"
 
 

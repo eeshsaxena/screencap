@@ -594,6 +594,12 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
     for d in sorted(recordings_dir.iterdir()):
         if not d.is_dir():
             continue
+        # Skip dot-prefixed entries so reserved dot-dirs are never enumerated as
+        # recordings — chiefly the SCR-236 in-container sidecar store
+        # ``.store/`` (KTD-2), which holds the content index + backfill ledger.
+        # (``upload.list_recording_files`` already skips dot-prefixed names.)
+        if d.name.startswith("."):
+            continue
         db = find_db(d)
         if db is None:
             continue

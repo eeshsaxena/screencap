@@ -48,6 +48,8 @@ class SocketPermsDrift(DaemonSocketError):
 
 
 def default_socket_path() -> Path:
+    # run-dir: stays outside the encrypted container (SCR-236 KTD-2/KTD-3) — the
+    # socket must exist before any mount and is plaintext by design.
     return Path.home() / ".screencap" / "run" / "api.sock"
 
 
