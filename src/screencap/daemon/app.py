@@ -63,6 +63,9 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         backfill_job = getattr(app.state, "backfill_job", None)
         if backfill_job is not None:
             await backfill_job.shutdown()
+        model_download_job = getattr(app.state, "model_download_job", None)
+        if model_download_job is not None:
+            await model_download_job.shutdown()
         if hasattr(app.state, "supervisor"):
             await app.state.supervisor.shutdown()
         await app.state.event_bus.shutdown()
@@ -1690,6 +1693,104 @@ async def backfill_cancel(request: Request) -> JSONResponse:
         )
 
 
+def _model_download_job(app: Starlette) -> Any:
+    """Lazily attach the single model-download job holder to ``app.state`` (SCR-239)."""
+    state = app.state
+    if not hasattr(state, "model_download_job"):
+        from screencap.daemon.model_download_job import ModelDownloadJob
+
+        state.model_download_job = ModelDownloadJob(state.event_bus)
+    return state.model_download_job
+
+
+def _model_status_payload() -> dict[str, Any]:
+    """Build the install-state snapshot for ``/v0/model.status`` (SCR-239)."""
+    from screencap.models import DEFAULT_MODEL_ID
+    from screencap.models.download import get_disclosed_size, is_model_installed
+    from screencap.segmentation.local_model.runtime import select_runtime
+
+    runtime = select_runtime()  # resolve the host runtime once
+    return {
+        "models": [
+            {
+                "model_id": DEFAULT_MODEL_ID,
+                "size_bytes": get_disclosed_size(DEFAULT_MODEL_ID, runtime) or 0,
+                "installed": is_model_installed(DEFAULT_MODEL_ID, runtime),
+            }
+        ]
+    }
+
+
+async def model_download_start(request: Request) -> JSONResponse:
+    """``POST /v0/model.download.start`` — start (or return) the model download.
+
+    Idempotent: a start while a download is in flight returns the in-flight
+    snapshot. Progress is published on ``/v0/events`` as ``model.download.progress``
+    (throttled, no recording context). Deliberately NOT in ``_ACTIVITY_PATHS`` — a
+    running download keeps the daemon alive via ``_daemon_is_busy``.
+    """
+    try:
+        body = await _backfill_body(request)
+        parsed = schema.ModelDownloadStartRequest.model_validate(body)
+        job = _model_download_job(request.app)
+        snapshot = job.start(parsed.model_id)
+        return JSONResponse(
+            schema.envelope(schema_version=schema._MODELS_API_VERSION, **snapshot.as_payload())
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._MODELS_API_VERSION, request=request
+        )
+
+
+async def model_download_status(request: Request) -> JSONResponse:
+    """``GET /v0/model.download.status`` — current download snapshot (read-only)."""
+    try:
+        job = _model_download_job(request.app)
+        snapshot = job.status()
+        return JSONResponse(
+            schema.envelope(schema_version=schema._MODELS_API_VERSION, **snapshot.as_payload())
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._MODELS_API_VERSION, request=request
+        )
+
+
+async def model_download_cancel(request: Request) -> JSONResponse:
+    """``POST /v0/model.download.cancel`` — signal the in-flight download to stop."""
+    try:
+        body = await _backfill_body(request)
+        schema.ModelDownloadCancelRequest.model_validate(body)
+        job = _model_download_job(request.app)
+        snapshot = job.cancel()
+        return JSONResponse(
+            schema.envelope(schema_version=schema._MODELS_API_VERSION, **snapshot.as_payload())
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._MODELS_API_VERSION, request=request
+        )
+
+
+async def model_status(request: Request) -> JSONResponse:
+    """``GET /v0/model.status`` — installed-model snapshot for the settings UI."""
+    try:
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._MODELS_API_VERSION, **_model_status_payload()
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._MODELS_API_VERSION, request=request
+        )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -1712,6 +1813,10 @@ def build_app() -> Starlette:
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
             Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),
+            Route("/v0/model.download.start", model_download_start, methods=["POST"]),
+            Route("/v0/model.download.status", model_download_status, methods=["GET"]),
+            Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),
+            Route("/v0/model.status", model_status, methods=["GET"]),
         ],
         lifespan=lifespan,
     )

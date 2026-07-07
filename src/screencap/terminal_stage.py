@@ -981,13 +981,12 @@ def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
     on the None-vs-unavailable distinction. All heavy imports are deferred so
     the terminal-stage import surface stays light.
     """
-    from screencap import config
     from screencap.segmentation.activity_summary import build_activity_summary
     from screencap.segmentation.local_source import (
         LocalActivitySource,
         load_local_manifests,
     )
-    from screencap.segmentation.provider import get_provider
+    from screencap.segmentation.routing import build_day_split_provider
 
     manifests = load_local_manifests(recording_dir)
     if not manifests:
@@ -1010,11 +1009,14 @@ def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
     # on-device provider's fail-closed gate relies on that builder-set marker, so
     # the caller does not (and must not) forge it here.
 
-    # Resolve and run the configured provider. segment() returns a validated
-    # tasks dict, None (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not
-    # run). The caller's ladder routes an unavailable result to the idle-gap
-    # heuristic (day-split → heuristic only, KTD6).
-    provider = get_provider(config.get_llm_provider())
+    # Build the day-split provider for the configured active provider (U8): an
+    # on-device chain (AFM → downloaded), the downloaded backend, or a LOCAL BYO
+    # endpoint. A REMOTE BYO endpoint or a cloud provider routes to an
+    # always-unavailable provider so day-split degrades to the heuristic and never
+    # touches the network (R5). segment() returns a validated tasks dict, None
+    # (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not run — routed to
+    # the idle-gap heuristic by the caller's ladder, KTD6).
+    provider = build_day_split_provider()
     return provider.segment(summary)
 
 

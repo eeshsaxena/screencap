@@ -80,6 +80,18 @@ enum ShellSidebarModel {
         return StorageFooter(byteText: formatStorage(bytes), allLocal: !anyUploaded)
     }
 
+    /// SCR-239 (U11) — whether the standing "enable local intelligence" sidebar
+    /// hint should show: only when the active provider is on-device, no
+    /// downloadable model is installed yet, and the user hasn't dismissed it.
+    /// A cloud provider (which already names tasks) or an installed model hides it.
+    static func shouldShowLocalModelHint(
+        provider: String?,
+        downloadedInstalled: Bool,
+        dismissed: Bool
+    ) -> Bool {
+        provider == "on-device" && !downloadedInstalled && !dismissed
+    }
+
     /// Format a byte total the design's way ("4.2 GB"), stepping down to MB/KB for
     /// small libraries.
     static func formatStorage(_ bytes: Int) -> String {
@@ -137,6 +149,14 @@ struct ShellSidebarView: View {
     let recordings: [RecordingSummary]
     var onReplayOnboarding: () -> Void
 
+    /// Injected app-wide (ScreenCapApp) — drives the SCR-239 local-intelligence
+    /// hint from the Intelligence read-back (provider + install state).
+    @EnvironmentObject private var intelligence: IntelligenceController
+
+    /// The persisted once-dismissed flag for the local-model hint (R7 — never
+    /// re-prompt once dismissed).
+    @State private var hintDismissed = HUDHintStore().hasDismissedLocalModelHint
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             windowControlsSlot
@@ -153,6 +173,47 @@ struct ShellSidebarView: View {
         .padding(.vertical, 18)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(Color.scCanvas)
+        .task { await intelligence.refresh() }
+    }
+
+    /// The standing, dismissible "enable local intelligence" hint (SCR-239 U11).
+    /// Shown only when on-device is active and no model is installed; tapping it
+    /// opens the Intelligence pane, the [x] dismisses it for good (R7).
+    @ViewBuilder
+    private var localModelHint: some View {
+        let show = ShellSidebarModel.shouldShowLocalModelHint(
+            provider: intelligence.settings?.provider,
+            downloadedInstalled: intelligence.settings?.downloadedModelInstalled ?? false,
+            dismissed: hintDismissed
+        )
+        if show {
+            HStack(alignment: .top, spacing: 8) {
+                Button { route = .intelligence } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Name your tasks on this Mac")
+                            .font(SCTypography.sans(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.scInk)
+                        Text("Download a local model — on-device, nothing leaves.")
+                            .font(SCTypography.sans(size: 11))
+                            .foregroundStyle(Color.scInkMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 0)
+                Button {
+                    hintDismissed = true
+                    HUDHintStore().markLocalModelHintDismissed()
+                } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.scInkMuted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(10)
+            .background(Color.scTeal.opacity(0.08), in: RoundedRectangle(cornerRadius: SCMetrics.radiusInner))
+        }
     }
 
     /// The design draws mock traffic-light dots here (300–304) — that is the
@@ -244,6 +305,7 @@ struct ShellSidebarView: View {
         VStack(alignment: .leading, spacing: 10) {
             Divider().overlay(Color.scBorderWarm)
                 .padding(.bottom, 6)
+            localModelHint
             // MCP row — a stub until SCR-226 (no daemon verb reports connected MCP
             // clients yet), so it never shows a fabricated count.
             HStack(spacing: SCMetrics.space2) {

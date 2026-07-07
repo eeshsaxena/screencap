@@ -197,6 +197,19 @@ def get_content_index_enabled() -> bool:
     return _parse_bool_env("SCREENCAP_CONTENT_INDEX", "content_index_enabled", False)
 
 
+def get_cloud_e2ee_enabled() -> bool:
+    """Return whether cloud uploads are end-to-end encrypted on-device (E2EE slice).
+
+    Default OFF — the slice ships dark until the crypto path is proven. When on,
+    a cloud recording's artifacts are encrypted with the device-held cloud key
+    before upload, so the object store holds only ciphertext; when off, uploads
+    are plaintext exactly as before. This flag is the single runtime signal that
+    gates encryption, and the onboarding "we can't watch" copy is bound to it
+    (surfaced via ``settings --json``) so a flag-off build never claims E2EE.
+    """
+    return _parse_bool_env("SCREENCAP_CLOUD_E2EE", "cloud_e2ee_enabled", False)
+
+
 def get_content_index_consent_declined() -> bool:
     """Return whether the user declined the one-time on-screen-text indexing
     consent prompt (SCR-174 U7).
@@ -250,6 +263,23 @@ def get_base_dir() -> Path:
     """Return ~/.screencap/, creating it if needed."""
     _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)
     return _DEFAULT_BASE
+
+
+def get_models_dir() -> Path:
+    """Return ~/.screencap/models/ (the downloaded-model store), creating it 0o700.
+
+    Same-EUID-hardened like the content-index store (SECURITY.md): the dir is
+    ``0o700`` so another local user cannot read or swap the weights. Env override
+    ``SCREENCAP_MODELS_DIR`` (SCR-239).
+    """
+    env = os.environ.get("SCREENCAP_MODELS_DIR")
+    p = Path(env) if env else (_DEFAULT_BASE / "models")
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.chmod(0o700)
+    except OSError:
+        pass
+    return p
 
 
 def get_disk_warn_mb() -> int:
@@ -528,6 +558,53 @@ def get_recall_cloud_consent() -> bool:
     )
 
 
+_VALID_CONFIDENCE_THRESHOLDS = ("low", "medium", "high")
+
+
+def get_confidence_gate_threshold() -> str:
+    """Return the confidence-gate threshold for local-model names (SCR-239 U3).
+
+    A local-model task whose self-reported ``confidence`` is at/below this
+    threshold — or missing — is left *unnamed* rather than shown with a name the
+    model wasn't confident in (R9/KTD9). Default ``'low'`` (blank only the
+    lowest-confidence names + omissions); the U12 eval calibrates it.
+
+    Env ``SCREENCAP_CONFIDENCE_GATE_THRESHOLD`` > ``[intelligence].confidence_gate_threshold``
+    > default ``'low'``. An out-of-range value falls back to the default.
+    """
+    env = os.environ.get("SCREENCAP_CONFIDENCE_GATE_THRESHOLD")
+    if env is not None:
+        env = env.strip().lower()
+        return env if env in _VALID_CONFIDENCE_THRESHOLDS else "low"
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get("confidence_gate_threshold")
+        if isinstance(val, str) and val.strip().lower() in _VALID_CONFIDENCE_THRESHOLDS:
+            return val.strip().lower()
+    return "low"
+
+
+def get_local_server_endpoint() -> str | None:
+    """Return the configured bring-your-own model-server URL, or ``None`` (SCR-239).
+
+    The endpoint's LOCAL/REMOTE classification
+    (``screencap.segmentation.endpoint.classify_endpoint``) decides whether it is
+    treated as on-device (day-split allowed) or as a cloud provider. Env
+    ``SCREENCAP_LOCAL_SERVER_ENDPOINT`` > ``[intelligence].local_server_endpoint``
+    > default ``None``.
+    """
+    env = os.environ.get("SCREENCAP_LOCAL_SERVER_ENDPOINT")
+    if env is not None:
+        env = env.strip()
+        return env or None
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get("local_server_endpoint")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
 # --- Intelligence settings: write surface (U8) -----------------------------
 #
 # The ``screencap settings intelligence`` CLI verb (U8) is the write side of
@@ -537,7 +614,7 @@ def get_recall_cloud_consent() -> bool:
 #: The active/preferred provider (``[intelligence].llm_provider``). Only the
 #: backends :func:`screencap.segmentation.provider.get_provider` can actually
 #: construct are accepted; the CLI rejects anything else.
-_VALID_LLM_PROVIDERS = ("on-device", "gemini")
+_VALID_LLM_PROVIDERS = ("on-device", "gemini", "downloaded", "local-server")
 
 #: The cloud backend a consented fallback may use
 #: (``[intelligence].cloud_provider``). Only Gemini ships as a cloud backend in
@@ -584,6 +661,17 @@ def set_intelligence_cloud_provider(value: str | None) -> None:
     against :data:`_VALID_CLOUD_PROVIDERS` first.
     """
     _write_intelligence_key("cloud_provider", value)
+
+
+def set_intelligence_endpoint(value: str | None) -> None:
+    """Persist (or clear) ``[intelligence].local_server_endpoint`` (SCR-239).
+
+    ``None``/empty removes the key. The caller validates the scheme and the
+    LOCAL/REMOTE classification (``segmentation.endpoint.classify_endpoint``)
+    before persisting.
+    """
+    cleaned = value.strip() if isinstance(value, str) and value.strip() else None
+    _write_intelligence_key("local_server_endpoint", cleaned)
 
 
 def set_intelligence_consent(row: str, value: bool) -> None:

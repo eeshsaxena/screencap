@@ -1429,17 +1429,26 @@ def upload_chunk_files(
 
 
 def _upload_single(fi, signed_url: str) -> None:
-    """Upload a single file without progress tracking."""
+    """Upload a single file without progress tracking.
+
+    This is the live/during-recording PUT site, reached from the engine
+    subprocess. When cloud E2EE is enabled it encrypts on-device before the PUT
+    (KTD-4) using the daemon-delivered key, so a live cloud recording never
+    ships plaintext chunks. A missing key raises (fail closed) — the caller
+    marks the chunk FAILED and deletes nothing.
+    """
     import requests
 
+    from screencap.upload import _cloud_upload_key, _put_body_and_headers
+
+    key = _cloud_upload_key()
     with open(fi.path, "rb") as fh:
+        # Plaintext body is the raw handle (no progress bar on the live path).
+        body, headers = _put_body_and_headers(fh, fi.size, fi.content_type, key, fh)
         resp = requests.put(
             signed_url,
-            data=fh,
-            headers={
-                "Content-Type": fi.content_type,
-                "Content-Length": str(fi.size),
-            },
+            data=body,
+            headers=headers,
             timeout=(10, 600),
         )
     resp.raise_for_status()

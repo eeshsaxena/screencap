@@ -1593,6 +1593,25 @@ def login_cmd(as_json):
         else:
             console.print(f"[red]Sign-in failed:[/red] {escape(str(e))}")
         sys.exit(1)
+    # E2EE slice: create the device-held cloud key in this foreground process.
+    # The one-time Keychain ACL prompt needs a foreground identity — the daemon
+    # and engine can only read a delivered key, never create it. Flag-gated; a
+    # Keychain hiccup here must never fail the sign-in (the key is (re)created on
+    # the next login attempt).
+    from screencap.config import get_cloud_e2ee_enabled
+
+    if get_cloud_e2ee_enabled():
+        try:
+            from screencap import cloud_crypto
+
+            cloud_crypto.get_or_create_cloud_kek()
+        except Exception:  # noqa: BLE001 — never fail sign-in over key setup
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "could not create cloud E2EE key at login (will retry next login)",
+                exc_info=True,
+            )
     if as_json:
         click.echo(json.dumps({
             "ok": True, "schema_version": _AUTH_SCHEMA_VERSION,
@@ -2856,6 +2875,7 @@ def settings(ctx, set_pair, as_json):
         get_auto_delete_after_upload,
         get_auto_name,
         get_chunk_duration,
+        get_cloud_e2ee_enabled,
         get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
@@ -2880,7 +2900,7 @@ def settings(ctx, set_pair, as_json):
         _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
                        "content_index_enabled", "content_index_consent_declined",
-                       "content_index_backfill_declined"}
+                       "content_index_backfill_declined", "cloud_e2ee_enabled"}
         _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
                          "segmentation_mode": ("llm", "idle")}
 
@@ -2942,6 +2962,7 @@ def settings(ctx, set_pair, as_json):
         "content_index_enabled": bool(get_content_index_enabled()),
         "content_index_consent_declined": bool(get_content_index_consent_declined()),
         "content_index_backfill_declined": bool(get_content_index_backfill_declined()),
+        "cloud_e2ee_enabled": bool(get_cloud_e2ee_enabled()),
         "privacy": _build_privacy_settings_block(),
     }
 
@@ -3168,6 +3189,15 @@ def _build_intelligence_settings_block() -> dict:
     render it as a non-interactive "always off" without a special case.
     """
     from screencap import config
+    from screencap.segmentation.endpoint import classify_endpoint
+
+    endpoint = config.get_local_server_endpoint()
+    try:
+        from screencap.models import is_model_installed
+
+        downloaded_installed = is_model_installed()
+    except Exception:
+        downloaded_installed = False
 
     return {
         "provider": config.get_llm_provider(),
@@ -3177,7 +3207,28 @@ def _build_intelligence_settings_block() -> dict:
         # Fixed guards (R7/R9) — surfaced so the pane needn't hard-code them.
         "day_split_cloud_consent": False,
         "frames_cloud_consent": False,
+        # SCR-239 BYO endpoint (redacted — never echo userinfo/query) + its
+        # LOCAL/REMOTE classification, and the downloaded-model install state.
+        "local_server_endpoint": _redact_url(endpoint),
+        "endpoint_classification": classify_endpoint(endpoint) if endpoint else None,
+        "downloaded_model_installed": downloaded_installed,
     }
+
+
+def _redact_url(url):
+    """Strip userinfo/query/fragment from a URL so a token can't leak (SCR-239)."""
+    if not url:
+        return url
+    from urllib.parse import urlparse, urlunparse
+
+    try:
+        p = urlparse(url)
+        netloc = p.hostname or ""
+        if p.port:
+            netloc = f"{netloc}:{p.port}"
+        return urlunparse(p._replace(netloc=netloc, params="", query="", fragment=""))
+    except Exception:
+        return "<redacted>"
 
 
 @settings.command("intelligence")
@@ -3281,8 +3332,58 @@ def settings_intelligence(row, op, value, as_json):
                 f"{config._VALID_LLM_PROVIDERS}, got: {escape(str(value))}"
             )
             _emit_error(f"invalid_provider:{value}")
+        # SCR-239: a local-server active provider must point at a LOCAL endpoint —
+        # a REMOTE endpoint is treated as cloud and can never be the day-split
+        # provider (R5). Defense in depth over the U8 routing.
+        if value == "local-server":
+            from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+
+            endpoint = config.get_local_server_endpoint()
+            if not endpoint:
+                err_console.print(
+                    "[red]Error:[/red] provider 'local-server' requires an endpoint; "
+                    "set it first: [bold]settings intelligence local_server_endpoint "
+                    "set http://127.0.0.1:11434[/bold]"
+                )
+                _emit_error("local_server_requires_endpoint")
+            if classify_endpoint(endpoint) != LOCAL:
+                err_console.print(
+                    "[red]Error:[/red] the configured endpoint is remote — a remote "
+                    "server is treated as cloud and cannot be the active day-split "
+                    "provider (R5). Point at a loopback server (127.0.0.1 / localhost)."
+                )
+                _emit_error("remote_endpoint_not_day_split_provider")
         config.set_intelligence_provider(value)
         err_console.print(f"  [bold]intelligence.provider[/bold] set {escape(str(value))}")
+
+    elif row == "local_server_endpoint":
+        from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+
+        if value.lower() in ("none", ""):
+            config.set_intelligence_endpoint(None)
+            err_console.print("  [bold]intelligence.local_server_endpoint[/bold] cleared")
+            value = None
+        else:
+            from urllib.parse import urlparse
+
+            if urlparse(value).scheme not in ("http", "https"):
+                err_console.print(
+                    f"[red]Error:[/red] endpoint must be an http(s) URL, got: "
+                    f"{escape(_redact_url(value) or str(value))}"
+                )
+                _emit_error("invalid_endpoint_scheme")
+            config.set_intelligence_endpoint(value)
+            cls = classify_endpoint(value)
+            redacted = _redact_url(value)
+            note = (
+                "local — day-split on-device" if cls == LOCAL
+                else "remote — treated as cloud (day-split off)"
+            )
+            err_console.print(
+                f"  [bold]intelligence.local_server_endpoint[/bold] set "
+                f"{escape(str(redacted))} [dim]({note})[/dim]"
+            )
+            value = redacted  # echo the REDACTED url (never the token)
 
     elif row == "cloud_provider":
         # ``none`` / empty clears the configured cloud backend.
@@ -3323,7 +3424,10 @@ def settings_intelligence(row, op, value, as_json):
         value = parsed  # echo the normalized bool
 
     else:
-        _known = ("provider", "cloud_provider", *config._CLOUD_CONSENT_ROWS)
+        _known = (
+            "provider", "cloud_provider", "local_server_endpoint",
+            *config._CLOUD_CONSENT_ROWS,
+        )
         err_console.print(f"[red]Error:[/red] Unknown intelligence row: {escape(str(row))}")
         err_console.print(f"[dim]Settable: {', '.join(_known)}[/dim]")
         _emit_error(f"unknown_row:{row}")
@@ -4027,6 +4131,82 @@ def backfill_cancel_cmd() -> None:
     else:
         console.print(f"[#22d3ee]Backfill {escape(state)}.[/#22d3ee]")
     console.print(f"  {_backfill_snapshot_line(snapshot)}")
+
+
+@cli.group("model")
+def model_group() -> None:
+    """Download and manage the optional local Intelligence model (SCR-239).
+
+    Thin one-shot HTTP clients of the daemon's ``model.download.*`` /
+    ``model.status`` verbs over the UNIX socket. The download is opt-in, size-
+    disclosed, and integrity-verified. The macOS app's Intelligence settings pane
+    is the supported live-progress surface; this CLI ships ``download`` /
+    ``status`` / ``cancel`` for headless use (poll ``status --json`` for progress).
+    """
+
+
+def _model_download_line(snapshot: dict) -> str:
+    state = str(snapshot.get("state", "unknown"))
+    done = snapshot.get("bytes_done", 0) or 0
+    total = snapshot.get("bytes_total", 0) or 0
+    pct = f" — {100 * done // total}%" if total else ""
+    reason = snapshot.get("reason")
+    tail = f" ({escape(str(reason))})" if reason and state == "failed" else ""
+    return f"Model download {escape(state)}{pct}{tail}"
+
+
+@model_group.command("download")
+@click.argument("model_id", required=False)
+def model_download_cmd(model_id: str | None) -> None:
+    """Download the local model (opt-in). Idempotent on the daemon side."""
+    client = _backfill_client_or_exit()
+    with client:
+        snapshot = _model_call_or_exit(lambda: client.model_download_start(model_id))
+    state = str(snapshot.get("state", "unknown"))
+    if state == "installed":
+        console.print("[green]Model already installed.[/green]")
+    elif state == "downloading":
+        console.print("[#22d3ee]Model download started.[/#22d3ee]")
+    elif state == "failed":
+        console.print(f"[red]Model download failed:[/red] {escape(str(snapshot.get('reason')))}")
+        raise SystemExit(1)
+    else:
+        console.print(f"[#22d3ee]Model download {escape(state)}.[/#22d3ee]")
+    console.print(f"  {_model_download_line(snapshot)}")
+
+
+@model_group.command("status")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit the raw status payload as JSON.")
+def model_status_cmd(as_json: bool) -> None:
+    """Report the download state + which models are installed."""
+    client = _backfill_client_or_exit(auto_spawn=False)
+    with client:
+        dl = _model_call_or_exit(client.model_download_status)
+        installed = _model_call_or_exit(client.model_status)
+    if as_json:
+        console.print_json(data={"download": dl, "installed": installed})
+        return
+    console.print(f"  {_model_download_line(dl)}")
+    for m in installed.get("models", []):
+        mark = "installed" if m.get("installed") else "not installed"
+        gb = (m.get("size_bytes", 0) or 0) / (1024**3)
+        console.print(f"  {escape(str(m.get('model_id')))}: {mark} (~{gb:.1f} GB)")
+
+
+@model_group.command("cancel")
+def model_cancel_cmd() -> None:
+    """Cancel the in-flight model download."""
+    client = _backfill_client_or_exit(auto_spawn=False)
+    with client:
+        snapshot = _model_call_or_exit(client.model_download_cancel)
+    console.print(f"  {_model_download_line(snapshot)}")
+
+
+def _model_call_or_exit(call):
+    """Reuse the backfill daemon-call error translation for model verbs."""
+    return _backfill_call_or_exit(call)
 
 
 @cli.command("_smoke-test", hidden=True)

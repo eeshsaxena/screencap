@@ -16,6 +16,10 @@ enum OnboardingStep: Int, Equatable, CaseIterable {
     case storage = 3
     case account = 4
     case teamSetup = 5
+    /// SCR-239 — the opt-in downloadable-model offer. Local tier only, shown
+    /// after `storage` (the local tier has no account/team steps, so it is the
+    /// local tier's 5th dot). Raw value 6 keeps the design's 0–5 indices stable.
+    case downloadModel = 6
 }
 
 /// The storage tier picked on step 3. Cloud tiers extend the wizard with the
@@ -149,26 +153,29 @@ enum OnboardingStepPolicy {
 
     // MARK: - Progress dots (design 289–294; logic obDots)
 
-    /// 4 dots for the local tier, 5 with the account step (personal), 6 with
+    /// 5 dots for the local tier (welcome, permissions, appRules, storage,
+    /// download-model — SCR-239), 5 with the account step (personal), 6 with
     /// team setup.
     static func dotCount(tier: OnboardingStorageTier) -> Int {
         switch tier {
-        case .local: return 4
+        case .local: return 5
         case .personalCloud: return 5
         case .teamCloud: return 6
         }
     }
 
     static func activeDotIndex(for step: OnboardingStep) -> Int {
-        step.rawValue
+        // The download-model step is the local tier's 5th dot (index 4); the
+        // local tier never shows account(4)/teamSetup(5), so there's no collision.
+        step == .downloadModel ? 4 : step.rawValue
     }
 
     // MARK: - Storage routing (logic storageNext / accountNext)
 
-    /// The step after the storage CTA: local finishes, cloud tiers continue to
-    /// the account step.
+    /// The step after the storage CTA: local continues to the SCR-239
+    /// download-model offer, cloud tiers continue to the account step.
     static func stepAfterStorage(tier: OnboardingStorageTier) -> OnboardingStep? {
-        tier == .local ? nil : .account
+        tier == .local ? .downloadModel : .account
     }
 
     /// The step after a successful sign-in: team continues to team setup,
@@ -287,6 +294,16 @@ enum OnboardingCopy {
     /// waitlist form (no team backend yet, KTD-7). Swap for a self-hosted
     /// endpoint later. Placeholder URL — replace with the real form before launch.
     static let teamWaitlistURL = "https://screencap.app/team-waitlist"
+
+    // SCR-239 download-model step (local tier only). Opt-in, non-blocking — Skip
+    // leaves the user on the idle-gap heuristic (R7); nothing here claims cloud
+    // quality or blocks recording.
+    static let downloadModelHeadline = "Want named tasks on this Mac?"
+    static let downloadModelSub =
+        "Download a small model (about 2 GB) and Screencap names your day's tasks "
+        + "on-device — nothing leaves the Mac. You can skip this and add it later "
+        + "in Settings → Intelligence."
+    static let downloadModelSkip = "Not now"
 
     /// Every string the storage + account steps render, for the KTD-9
     /// string-level gate (no pricing, encryption, or team-sharing claims).

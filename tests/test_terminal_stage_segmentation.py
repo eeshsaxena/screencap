@@ -175,16 +175,16 @@ def _isolate_run_dir(tmp_path, monkeypatch):
 
 
 def _install_provider(monkeypatch, provider) -> None:
-    """Wire a fake provider + a stable provider name into the segmentation seam.
+    """Wire a fake provider into the day-split routing seam.
 
-    ``_segment_local_tasks`` does ``config.get_llm_provider()`` then
-    ``provider.get_provider(name)``; patch both symbols where they are looked up.
+    Since U8, ``_segment_local_tasks`` builds the day-split provider via
+    ``screencap.segmentation.routing.build_day_split_provider()`` (an on-device
+    chain, the downloaded backend, or a LOCAL BYO endpoint); patch that seam to
+    return the fake provider directly.
     """
-    import screencap.config as config
-    import screencap.segmentation.provider as prov
+    import screencap.segmentation.routing as routing
 
-    monkeypatch.setattr(config, "get_llm_provider", lambda: "fake")
-    monkeypatch.setattr(prov, "get_provider", lambda name: provider)
+    monkeypatch.setattr(routing, "build_day_split_provider", lambda: provider)
 
 
 def _run_terminal(rec_dir: Path):
@@ -351,17 +351,15 @@ def test_provider_returns_none_is_fail_open(tmp_path, monkeypatch):
 
 
 def test_unavailable_provider_is_fail_open(tmp_path, monkeypatch):
-    """A provider that RAISES on resolution (e.g. on-device pre-U5) fails open."""
-    import screencap.config as config
-    import screencap.segmentation.provider as prov
+    """A provider builder that RAISES fails open — terminal never blocks (U8 seam)."""
+    import screencap.segmentation.routing as routing
 
     rec_dir = _make_local_recording(tmp_path)
-    monkeypatch.setattr(config, "get_llm_provider", lambda: "on-device")
 
-    def _raise(name):  # noqa: ANN001
-        raise NotImplementedError("on-device backend lands in U5")
+    def _raise():
+        raise RuntimeError("provider build failed unexpectedly")
 
-    monkeypatch.setattr(prov, "get_provider", _raise)
+    monkeypatch.setattr(routing, "build_day_split_provider", _raise)
 
     result = _run_terminal(rec_dir)
 

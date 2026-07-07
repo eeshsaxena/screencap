@@ -94,4 +94,24 @@ final class ShellSidebarModelTests: XCTestCase {
         """
         return try! JSONDecoder().decode(RecordingSummary.self, from: Data(json.utf8))
     }
+
+    // MARK: - SCR-239 (U11) local-model hint visibility
+
+    func testLocalModelHintVisibilityRules() {
+        // Shown: on-device active, no model, not dismissed.
+        XCTAssertTrue(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", downloadedInstalled: false, dismissed: false))
+        // Hidden once installed.
+        XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", downloadedInstalled: true, dismissed: false))
+        // Hidden once dismissed (R7 — no re-prompt).
+        XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", downloadedInstalled: false, dismissed: true))
+        // Hidden for a cloud provider (which already names tasks).
+        XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "gemini", downloadedInstalled: false, dismissed: false))
+        // Hidden when settings unknown (nil provider).
+        XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: nil, downloadedInstalled: false, dismissed: false))
+    }
 }
