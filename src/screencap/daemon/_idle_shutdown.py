@@ -149,6 +149,12 @@ def _daemon_is_busy(app: Starlette) -> bool:
     job = getattr(app.state, "backfill_job", None)
     if job is not None and _backfill_running(job):
         return True
+    # SCR-239: a model download is in flight. Like ``backfill.*``, the
+    # ``model.download.*`` verbs are NOT in ``_ACTIVITY_PATHS``, so this busy
+    # predicate is what keeps the auto-spawned daemon alive across a ~2 GB fetch.
+    dl_job = getattr(app.state, "model_download_job", None)
+    if dl_job is not None and _backfill_running(dl_job):  # same is_running() shape
+        return True
     return False
 
 
