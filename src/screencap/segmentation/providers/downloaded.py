@@ -38,6 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from screencap.segmentation.confidence_gate import apply_confidence_gate
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.sanitize import sanitize_tasks
 from screencap.segmentation.validate import validate_llm_tasks
@@ -182,7 +183,13 @@ class DownloadedProvider:
         except Exception:
             log.warning("Downloaded-model output failed validation", exc_info=True)
             return None
-        return sanitize_tasks(validated)
+        # Sanitize untrusted names/descriptions (KTD12), THEN gate on confidence
+        # (KTD9) — order matters: the sanitizer defaults an empty name to a
+        # placeholder, so the gate's blanking must be the final step.
+        from screencap import config
+
+        sanitized = sanitize_tasks(validated)
+        return apply_confidence_gate(sanitized, config.get_confidence_gate_threshold())
 
     def _run_worker(self, payload: str) -> dict | None | ProviderUnavailable:
         """Spawn the worker and return its raw ``result`` dict, ``None``, or the sentinel."""

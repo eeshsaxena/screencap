@@ -529,6 +529,32 @@ def get_recall_cloud_consent() -> bool:
     )
 
 
+_VALID_CONFIDENCE_THRESHOLDS = ("low", "medium", "high")
+
+
+def get_confidence_gate_threshold() -> str:
+    """Return the confidence-gate threshold for local-model names (SCR-239 U3).
+
+    A local-model task whose self-reported ``confidence`` is at/below this
+    threshold — or missing — is left *unnamed* rather than shown with a name the
+    model wasn't confident in (R9/KTD9). Default ``'low'`` (blank only the
+    lowest-confidence names + omissions); the U12 eval calibrates it.
+
+    Env ``SCREENCAP_CONFIDENCE_GATE_THRESHOLD`` > ``[intelligence].confidence_gate_threshold``
+    > default ``'low'``. An out-of-range value falls back to the default.
+    """
+    env = os.environ.get("SCREENCAP_CONFIDENCE_GATE_THRESHOLD")
+    if env is not None:
+        env = env.strip().lower()
+        return env if env in _VALID_CONFIDENCE_THRESHOLDS else "low"
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get("confidence_gate_threshold")
+        if isinstance(val, str) and val.strip().lower() in _VALID_CONFIDENCE_THRESHOLDS:
+            return val.strip().lower()
+    return "low"
+
+
 # --- Intelligence settings: write surface (U8) -----------------------------
 #
 # The ``screencap settings intelligence`` CLI verb (U8) is the write side of
