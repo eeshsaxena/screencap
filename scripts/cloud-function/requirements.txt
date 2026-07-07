@@ -11,3 +11,7 @@ google-cloud-storage>=3.1.1
 # Offline Firebase ID-token verification (bearer -> uid). Uses ADC on Cloud Run;
 # check_revoked=False keeps verification on the hot path (no Admin-API call).
 firebase-admin>=7.4.0
+# Billing: hosted Checkout session creation + webhook signature verification for
+# the $5/mo Personal-cloud paywall (billing.py). Only the billing entry points
+# import it; the signing function does not.
+stripe>=9,<12

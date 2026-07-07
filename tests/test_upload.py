@@ -450,6 +450,53 @@ def test_request_signed_urls_server_error():
             request_signed_urls("rec1", files)
 
 
+def test_request_signed_urls_subscription_required_402():
+    # Covers U6. A 402 from the signer -> SubscriptionRequired, not a generic error.
+    from screencap.upload import SubscriptionRequired, request_signed_urls
+    import pytest
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 402
+    mock_resp.json.return_value = {
+        "error": "Subscription required",
+        "code": "subscription_required",
+    }
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp):
+        with pytest.raises(SubscriptionRequired):
+            request_signed_urls("rec1", files)
+
+
+def test_subscription_required_is_runtimeerror_subclass():
+    # So the live-upload path's existing RuntimeError handling (fail the chunk,
+    # never delete local media) applies unchanged, while a caller can catch it
+    # specifically to prompt an upgrade.
+    from screencap.upload import SubscriptionRequired
+
+    assert issubclass(SubscriptionRequired, RuntimeError)
+
+
+def test_request_signed_urls_503_is_not_subscription_required():
+    # A transient 503 stays a generic RuntimeError (retryable), NOT the paywall
+    # refusal — the two must be distinguishable by the caller.
+    from screencap.upload import SubscriptionRequired, request_signed_urls
+    import pytest
+
+    files = [FileInfo("video.mp4", mock.MagicMock(), "video/mp4", 1000)]
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 503
+    mock_resp.json.return_value = {"error": "Signing temporarily unavailable"}
+    mock_resp.text = "Signing temporarily unavailable"
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp):
+        with pytest.raises(RuntimeError) as exc:
+            request_signed_urls("rec1", files)
+        assert not isinstance(exc.value, SubscriptionRequired)
+
+
 def test_request_signed_urls_timeout():
     from screencap.upload import request_signed_urls
     import pytest

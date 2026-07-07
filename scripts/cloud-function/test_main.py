@@ -7,6 +7,7 @@ in-memory fake whose ``list_blobs`` filters by prefix — so a handler that list
 the wrong prefix is provably caught (a prefix-only mock would miss it).
 """
 
+import contextlib
 from datetime import timedelta
 from unittest import mock
 
@@ -85,10 +86,22 @@ def _req(body, method="POST"):
     )
 
 
-def _auth(uid=None, exc=None):
+@contextlib.contextmanager
+def _auth(uid=None, exc=None, claims=None):
+    """Patch BOTH the uid-only ``verify_bearer`` (list/sign-download/demo) and
+    the additive ``verify_bearer_full`` (upload gate) so a test's auth stub
+    applies on every handler path. ``claims`` seeds the decoded token's custom
+    claims that the upload gate reads (default: none / unsubscribed)."""
     if exc is not None:
-        return mock.patch.object(main, "verify_bearer", side_effect=exc)
-    return mock.patch.object(main, "verify_bearer", return_value=uid)
+        with mock.patch.object(main, "verify_bearer", side_effect=exc), \
+             mock.patch.object(main, "verify_bearer_full", side_effect=exc):
+            yield
+    else:
+        with mock.patch.object(main, "verify_bearer", return_value=uid), \
+             mock.patch.object(
+                 main, "verify_bearer_full", return_value=(uid, claims or {})
+             ):
+            yield
 
 
 def _invoke(req):
@@ -181,6 +194,78 @@ def test_upload_skips_preexisting_object(gcs):
         status, payload = _invoke(_req(body))
     assert status == 200
     assert payload["urls"]["video.mp4"] is None  # already present -> not re-signed
+
+
+# --------------------------------------------------------------------------
+# U2 — entitlement hard gate (upload-only, fail-closed, enforce-gated)
+# --------------------------------------------------------------------------
+
+
+def test_upload_refused_when_enforced_and_not_subscribed(gcs, monkeypatch):
+    # Covers AE3. Enforce on + no subscribed claim -> 402, zero PUT URLs signed.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA"}):
+        status, payload = _invoke(_req(body))
+    assert status == 402
+    assert payload.get("code") == "subscription_required"
+    assert gcs.blob_calls == [], "refused upload must not touch bucket.blob"
+
+
+def test_upload_signs_when_enforced_and_subscribed(gcs, monkeypatch):
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA", "subscribed": True}):
+        status, payload = _invoke(_req(body))
+    assert status == 200
+    assert payload["urls"]["video.mp4"] and "m=PUT" in payload["urls"]["video.mp4"]
+
+
+def test_upload_signs_when_enforce_off_regardless_of_claim(gcs, monkeypatch):
+    # Dark-deploy: enforce off -> byte-identical to today even with no claim.
+    monkeypatch.delenv("STRIPE_PAYWALL_ENFORCE", raising=False)
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA"}):
+        status, _ = _invoke(_req(body))
+    assert status == 200
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"uid": "userA"},                        # missing subscribed
+        {"uid": "userA", "subscribed": False},   # explicit false
+        {"uid": "userA", "subscribed": "true"},  # wrong type -> not positively True
+    ],
+)
+def test_upload_fail_closed_on_non_true_claim(gcs, monkeypatch, claims):
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims=claims):
+        status, _ = _invoke(_req(body))
+    assert status == 402, claims
+    assert gcs.blob_calls == []
+
+
+def test_subscription_refusal_fails_closed_on_unreadable_claims(monkeypatch):
+    # Unreadable (None) claims under enforce -> refuse; enforce off -> always allow.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    assert main._subscription_refusal(None) is not None
+    assert main._subscription_refusal({}) is not None
+    assert main._subscription_refusal({"subscribed": True}) is None
+    monkeypatch.delenv("STRIPE_PAYWALL_ENFORCE", raising=False)
+    assert main._subscription_refusal(None) is None
+
+
+def test_download_and_list_never_gated_when_enforced(gcs, monkeypatch):
+    # Covers AE5. A lapsed (no claim) account still lists and sign-downloads.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    gcs.add("users/userA/recordings/rec1/video.mp4")
+    with _auth(uid="userA", claims={"uid": "userA"}):
+        list_status, _ = _invoke(_req({"action": "list"}))
+        dl_status, _ = _invoke(_req({"action": "sign-download", "recording": "rec1"}))
+    assert list_status == 200
+    assert dl_status == 200
 
 
 # --------------------------------------------------------------------------

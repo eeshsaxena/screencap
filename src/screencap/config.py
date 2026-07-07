@@ -151,6 +151,18 @@ def get_wifi_metrics() -> bool:
     return _parse_bool_env("SCREENCAP_WIFI_METRICS", "wifi_metrics", True)
 
 
+def get_stripe_paywall_enabled() -> bool:
+    """Return whether the Stripe cloud paywall is active on the client (True = on).
+
+    Default OFF: when off, cloud upload behaves exactly as before this feature —
+    no pricing copy, no soft gate, no checkout routing. Flipping it on activates
+    the app/CLI paywall surfaces. The signer's *enforcement* is governed
+    separately by the ``STRIPE_PAYWALL_ENFORCE`` Cloud Function env (KTD-6), so
+    the two release tracks can be sequenced independently at cutover.
+    """
+    return _parse_bool_env("SCREENCAP_STRIPE_PAYWALL", "stripe_paywall", False)
+
+
 def get_app_versions() -> bool:
     """Return whether running-application version capture is enabled (True = on)."""
     return _parse_bool_env("SCREENCAP_APP_VERSIONS", "app_versions", True)

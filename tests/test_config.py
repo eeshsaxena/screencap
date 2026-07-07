@@ -299,6 +299,51 @@ class TestSentinelShowOnWebsite:
         assert data["show_on_website"] is False
 
 
+# --- stripe paywall config tests ---
+
+
+class TestStripePaywall:
+    """Tests for get_stripe_paywall_enabled() (default OFF)."""
+
+    def test_default_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_stripe_paywall_enabled
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_STRIPE_PAYWALL"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {}  # empty config — no stripe_paywall key
+            assert get_stripe_paywall_enabled() is False
+
+    def test_env_var_true(self):
+        from screencap.config import get_stripe_paywall_enabled
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_STRIPE_PAYWALL": "1"}):
+            assert get_stripe_paywall_enabled() is True
+
+    def test_env_var_false(self):
+        from screencap.config import get_stripe_paywall_enabled
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_STRIPE_PAYWALL": "false"}):
+            assert get_stripe_paywall_enabled() is False
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_stripe_paywall_enabled
+
+        env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_STRIPE_PAYWALL"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"stripe_paywall": True}
+            assert get_stripe_paywall_enabled() is True
+
+    def test_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_stripe_paywall_enabled
+
+        cfg._config_cache = {"stripe_paywall": True}
+        with mock.patch.dict(os.environ, {"SCREENCAP_STRIPE_PAYWALL": "no"}):
+            assert get_stripe_paywall_enabled() is False
+
+
 # --- upload default config tests ---
 
 

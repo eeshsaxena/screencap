@@ -71,7 +71,7 @@ import functions_framework
 import google.auth
 import google.auth.exceptions
 import google.auth.transport.requests
-from auth import AuthInvalid, AuthUnavailable, verify_bearer
+from auth import AuthInvalid, AuthUnavailable, verify_bearer, verify_bearer_full
 from flask import jsonify
 from google.cloud import storage
 from paths import PrefixResolutionError, is_valid_name, resolve_prefix
@@ -211,6 +211,62 @@ def _authenticate(request) -> "tuple[str, None] | tuple[None, tuple]":
         )
     except AuthInvalid:
         return None, _cors((jsonify({"error": "Authentication required"}), 401))
+
+
+def _paywall_enforced() -> bool:
+    """Whether the signer denies uploads for accounts without an active sub.
+
+    Read per-request from ``STRIPE_PAYWALL_ENFORCE`` (default off) so the
+    entitlement-checking code can be deployed dark and the enforce flip is a
+    config change, not a redeploy. Separate from the client-side
+    ``SCREENCAP_STRIPE_PAYWALL`` flag so the two release tracks stay
+    independent (billing plan KTD-6).
+    """
+    return os.environ.get("STRIPE_PAYWALL_ENFORCE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _authenticate_with_claims(request):
+    """Verify the bearer token and ALSO return the decoded custom claims.
+
+    Additive sibling of ``_authenticate`` used ONLY by the upload gate: returns
+    ``(uid, claims, None)`` on success or ``(None, None, response)`` on failure,
+    mapping AuthUnavailable -> 503 and AuthInvalid -> 401 identically.
+    ``_handle_list`` / ``_handle_sign_download`` / demo paths keep the uid-only
+    ``_authenticate`` (over ``verify_bearer``), so their contract and the
+    tokenless-boundary contract test are untouched.
+    """
+    try:
+        uid, claims = verify_bearer_full(request, PROJECT_ID)
+    except AuthUnavailable:
+        return None, None, _cors(
+            (jsonify({"error": "Auth verification temporarily unavailable"}), 503)
+        )
+    except AuthInvalid:
+        return None, None, _cors((jsonify({"error": "Authentication required"}), 401))
+    return uid, claims, None
+
+
+def _subscription_refusal(claims):
+    """Return a 402 refusal if the paywall is enforced and the caller is not
+    positively subscribed; ``None`` to allow.
+
+    Fail-closed: signs only when ``subscribed`` reads exactly ``True``. A falsy,
+    missing, or unreadable claim refuses and never falls through to signing
+    (billing plan U2 / KTD-2). Downloads and list are never gated (R10).
+    """
+    if not _paywall_enforced():
+        return None
+    subscribed = claims.get("subscribed") if isinstance(claims, dict) else None
+    if subscribed is True:
+        return None
+    return _cors(
+        (jsonify({"error": "Subscription required", "code": "subscription_required"}), 402)
+    )
 
 
 def _collect_recordings(prefix, *, honor_unlisted, skip_invalid_names=False):
@@ -371,9 +427,15 @@ def _handle_sign_download(request, data):
 
 def _handle_upload(request, data):
     """Generate signed PUT URLs under the caller's own namespace."""
-    uid, err = _authenticate(request)
+    uid, claims, err = _authenticate_with_claims(request)
     if err:
         return err
+
+    # Entitlement gate (upload-only). Fail-closed when enforced; a no-op when
+    # STRIPE_PAYWALL_ENFORCE is off. Runs before any signing work is done.
+    refusal = _subscription_refusal(claims)
+    if refusal:
+        return refusal
 
     recording = data.get("recording")
     files = data.get("files")

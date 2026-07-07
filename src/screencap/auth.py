@@ -213,6 +213,7 @@ class WhoAmI(TypedDict, total=False):
     uid: str | None
     email: str | None
     stale: bool
+    subscribed: bool
 
 
 # In-memory cache of the current session. The ID token is NEVER persisted; only
@@ -726,9 +727,24 @@ def whoami() -> WhoAmI:
         return {"signed_in": False}
     try:
         state = _ensure_fresh()
-        return {"signed_in": True, "uid": state.uid, "email": state.email}
+        # ``subscribed`` is read (unverified) from the ID token's custom claims —
+        # a display/UX signal for the soft gate only; the signer's hard gate is
+        # the real entitlement enforcement. Absent claim -> False.
+        claims = _decode_id_token_claims(state.id_token)
+        return {
+            "signed_in": True,
+            "uid": state.uid,
+            "email": state.email,
+            "subscribed": bool(claims.get("subscribed")),
+        }
     except NotSignedIn:
         return {"signed_in": False}
     except AuthError:
         # We have a refresh token but couldn't refresh right now (e.g. offline).
-        return {"signed_in": True, "uid": None, "email": None, "stale": True}
+        return {
+            "signed_in": True,
+            "uid": None,
+            "email": None,
+            "stale": True,
+            "subscribed": False,
+        }

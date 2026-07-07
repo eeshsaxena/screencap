@@ -326,6 +326,17 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     return files
 
 
+class SubscriptionRequired(RuntimeError):
+    """The signer refused an upload for lack of an active cloud subscription (402).
+
+    Subclasses ``RuntimeError`` so the existing upload-failure handling (fail the
+    chunk, NEVER delete local media — see the chunk-upload-sentinel-gating
+    solution doc) applies unchanged and the recording simply stays local. A
+    caller that wants to show an upgrade prompt catches this specifically; it is
+    distinct from a transient 503 (retryable) and a 401 (force-refresh + retry).
+    """
+
+
 def request_signed_urls(
     recording_name: str, files: list[FileInfo],
 ) -> tuple[dict[str, str | None], str]:
@@ -366,6 +377,14 @@ def request_signed_urls(
         raise RuntimeError("Upload service unavailable. Check your internet connection.")
     except requests.Timeout:
         raise RuntimeError("Upload service timed out. Try again later.")
+
+    if resp.status_code == 402:
+        # The signer refused: no active cloud subscription (billing plan U2/U6).
+        # Distinct type so the caller keeps the recording local and can prompt an
+        # upgrade — never a retry-storm, never a delete.
+        raise SubscriptionRequired(
+            "Cloud upload requires an active subscription — upgrade in the app to enable cloud."
+        )
 
     if resp.status_code != 200:
         detail = ""

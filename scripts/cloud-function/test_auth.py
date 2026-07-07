@@ -10,7 +10,7 @@ outage rather than treating it as a hard deny.
 from unittest import mock
 
 import pytest
-from auth import AuthInvalid, AuthUnavailable, verify_bearer
+from auth import AuthInvalid, AuthUnavailable, verify_bearer, verify_bearer_full
 from firebase_admin import auth as fb_auth
 
 PROJECT = "proteus-photos"
@@ -142,3 +142,41 @@ def test_user_disabled_token_is_invalid():
     ):
         with pytest.raises(AuthInvalid):
             verify_bearer(_req("Bearer disabled"), PROJECT)
+
+
+# --------------------------------------------------------------------------
+# verify_bearer_full — additive: returns (uid, decoded) incl. custom claims
+# --------------------------------------------------------------------------
+
+
+def test_verify_bearer_full_returns_uid_and_claims():
+    claims = dict(_good_claims("userA"), subscribed=True)
+    with mock.patch.object(fb_auth, "verify_id_token", return_value=claims):
+        uid, decoded = verify_bearer_full(_req("Bearer good"), PROJECT)
+    assert uid == "userA"
+    assert decoded["subscribed"] is True
+
+
+def test_verify_bearer_full_absent_subscribed_claim():
+    with mock.patch.object(fb_auth, "verify_id_token", return_value=_good_claims("userA")):
+        uid, decoded = verify_bearer_full(_req("Bearer good"), PROJECT)
+    assert uid == "userA"
+    assert "subscribed" not in decoded
+
+
+def test_verify_bearer_full_foreign_project_rejected():
+    with mock.patch.object(
+        fb_auth, "verify_id_token", return_value=_good_claims(project="someone-else")
+    ):
+        with pytest.raises(AuthInvalid):
+            verify_bearer_full(_req("Bearer foreign"), PROJECT)
+
+
+def test_verify_bearer_full_cert_fetch_is_unavailable():
+    with mock.patch.object(
+        fb_auth,
+        "verify_id_token",
+        side_effect=fb_auth.CertificateFetchError("cert fetch failed", None),
+    ):
+        with pytest.raises(AuthUnavailable):
+            verify_bearer_full(_req("Bearer good"), PROJECT)

@@ -72,8 +72,16 @@ def _extract_bearer(request: _HasHeaders) -> str:
     return parts[1].strip()
 
 
-def verify_bearer(request: _HasHeaders, project_id: str | None = None) -> str:
-    """Verify the request's bearer token and return the Firebase uid.
+def verify_bearer_full(
+    request: _HasHeaders, project_id: str | None = None
+) -> "tuple[str, dict]":
+    """Verify the request's bearer token; return ``(uid, decoded_token)``.
+
+    The decoded token carries any Firebase **custom claims** (e.g.
+    ``subscribed``) as top-level keys, so an entitlement gate can read them
+    without a second Admin-API round-trip. This is the full verification core;
+    :func:`verify_bearer` is a thin uid-only wrapper over it, so existing
+    callers and the tokenless-boundary contract test stay unchanged.
 
     Args:
         request: a Flask request (anything with ``.headers.get``).
@@ -83,7 +91,8 @@ def verify_bearer(request: _HasHeaders, project_id: str | None = None) -> str:
             misattribute against a foreign project.
 
     Returns:
-        The verified, immutable, path-safe Firebase ``uid``.
+        ``(uid, decoded_token)`` — the verified, immutable, path-safe Firebase
+        ``uid`` and the full decoded token (including custom claims).
 
     Raises:
         AuthInvalid: missing/malformed/expired/bad-signature/foreign-project
@@ -120,4 +129,16 @@ def verify_bearer(request: _HasHeaders, project_id: str | None = None) -> str:
         if aud != project_id or iss != f"https://securetoken.google.com/{project_id}":
             raise AuthInvalid("Token minted for a different Firebase project")
 
+    return uid, decoded
+
+
+def verify_bearer(request: _HasHeaders, project_id: str | None = None) -> str:
+    """Verify the request's bearer token and return the Firebase uid.
+
+    Thin wrapper over :func:`verify_bearer_full` that discards the decoded
+    token — the historical contract (``-> str``) the demo/list/sign-download
+    handlers and the tokenless-boundary test depend on. Raises the same
+    ``AuthInvalid`` / ``AuthUnavailable`` errors.
+    """
+    uid, _ = verify_bearer_full(request, project_id)
     return uid
