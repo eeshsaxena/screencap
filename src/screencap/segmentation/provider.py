@@ -113,6 +113,15 @@ def get_provider(name: str) -> LLMProvider:
         from screencap.segmentation.providers.ondevice import OnDeviceProvider
 
         return OnDeviceProvider()
+    if name == "downloaded":
+        from screencap.segmentation.providers.downloaded import DownloadedProvider
+
+        return DownloadedProvider()
+    if name == "local-server":
+        from screencap.segmentation.providers.local_server import LocalServerProvider
+
+        return LocalServerProvider()
     raise ValueError(
-        f"Unknown LLM provider: {name!r}. Known providers: 'gemini', 'on-device'."
+        f"Unknown LLM provider: {name!r}. "
+        "Known providers: 'gemini', 'on-device', 'downloaded', 'local-server'."
     )

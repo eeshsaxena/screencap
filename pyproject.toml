@@ -73,6 +73,16 @@ record = [
     "pyobjc-framework-Vision>=9.0; sys_platform == 'darwin'",
 ]
 privacy = []  # Moved to base dependencies as of v0.11.0
+local-model = [
+    # SCR-239 opt-in downloadable local model (never bundled by default).
+    # These runtimes ship in the per-arch embedded daemon build; the model
+    # WEIGHTS (~2 GB) are the opt-in download, not these libs. Kept OUT of
+    # `dev`/CI on purpose: the runtime tests stub the backends + `importorskip`,
+    # so CI needs no native ML build. `mlx-lm` is Apple-Silicon-only.
+    "huggingface_hub>=0.20.0",
+    "llama-cpp-python>=0.3.0",
+    "mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 build = [
     # PyInstaller pinning per `pyinstaller-hooks-contrib` issue #736 --
     # 6.0+ ships the keyring.backends.macOS hook needed for V1.5's

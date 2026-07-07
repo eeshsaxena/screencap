@@ -212,24 +212,98 @@ final class IntelligenceSettingsTests: XCTestCase {
 
     // MARK: - Provider picker model (R2/R7/R9 pane rules)
 
-    /// With no cloud provider configured the picker offers on-device (default)
-    /// and the non-selectable "add another provider…" affordance only.
+    /// With no cloud provider configured the picker offers on-device (default),
+    /// the SCR-239 downloaded + local-server rows, and the non-selectable "add"
+    /// affordance.
     func testProviderOptionsWithoutCloudProvider() {
         let opts = IntelligenceProviderOption.options(cloudProvider: nil)
-        XCTAssertEqual(opts.map(\.id), ["on-device", IntelligenceProviderOption.addProviderID])
-        // On-device is the default and writes `on-device`.
+        XCTAssertEqual(
+            opts.map(\.id),
+            ["on-device", "downloaded", "local-server", IntelligenceProviderOption.addProviderID]
+        )
         XCTAssertEqual(opts.first?.providerValue, "on-device")
         // The "add" row is non-selectable — it writes nothing.
         XCTAssertNil(opts.last?.providerValue)
     }
 
-    /// A configured cloud provider becomes a selectable middle row that writes
-    /// its own provider id.
+    /// A configured cloud provider becomes a selectable row after the local rows.
     func testProviderOptionsWithCloudProvider() {
         let opts = IntelligenceProviderOption.options(cloudProvider: "gemini")
-        XCTAssertEqual(opts.map(\.id), ["on-device", "gemini", IntelligenceProviderOption.addProviderID])
-        XCTAssertEqual(opts[1].providerValue, "gemini")
-        XCTAssertNotNil(opts[1].subtitle)
+        XCTAssertEqual(
+            opts.map(\.id),
+            ["on-device", "downloaded", "local-server", "gemini", IntelligenceProviderOption.addProviderID]
+        )
+        XCTAssertEqual(opts.first { $0.id == "gemini" }?.providerValue, "gemini")
+    }
+
+    // MARK: - SCR-239 (U10) — downloaded + local-server rows
+
+    func testDownloadedAndLocalServerRowsWriteExpectedProviderValues() {
+        let opts = IntelligenceProviderOption.options(cloudProvider: nil)
+        XCTAssertEqual(opts.first { $0.id == "downloaded" }?.providerValue, "downloaded")
+        XCTAssertEqual(opts.first { $0.id == "local-server" }?.providerValue, "local-server")
+    }
+
+    func testDownloadedSubtitleReflectsInstallState() {
+        let notInstalled = IntelligenceProviderOption.options(cloudProvider: nil, downloadedInstalled: false)
+        XCTAssertTrue(notInstalled.first { $0.id == "downloaded" }!.subtitle!.contains("Download"))
+        let installed = IntelligenceProviderOption.options(cloudProvider: nil, downloadedInstalled: true)
+        XCTAssertTrue(installed.first { $0.id == "downloaded" }!.subtitle!.contains("runs on this Mac"))
+    }
+
+    func testLocalServerSubtitleReflectsClassification() {
+        XCTAssertTrue(
+            IntelligenceProviderOption.localServerSubtitle("http://127.0.0.1:11434", "LOCAL")!
+                .contains("on-device")
+        )
+        XCTAssertTrue(
+            IntelligenceProviderOption.localServerSubtitle("http://1.2.3.4:1234", "REMOTE")!
+                .contains("treated as cloud")
+        )
+        XCTAssertTrue(
+            IntelligenceProviderOption.localServerSubtitle(nil, nil)!.contains("set an endpoint")
+        )
+    }
+
+    func testDecodeNewFieldsWithDefaults() {
+        // An old envelope without the SCR-239 fields still decodes (defaults).
+        let old = try! JSONDecoder().decode(
+            IntelligenceEnvelope.self, from: envelope(provider: "on-device")
+        )
+        XCTAssertNil(old.intelligence.localServerEndpoint)
+        XCTAssertFalse(old.intelligence.downloadedModelInstalled)
+
+        // A full envelope decodes the new fields.
+        let full = Data(#"{"ok":true,"schema_version":1,"intelligence":{"provider":"local-server","cloud_provider":null,"summary_cloud_consent":false,"recall_cloud_consent":false,"day_split_cloud_consent":false,"frames_cloud_consent":false,"local_server_endpoint":"http://127.0.0.1:11434","endpoint_classification":"LOCAL","downloaded_model_installed":true}}"#.utf8)
+        let decoded = try! JSONDecoder().decode(IntelligenceEnvelope.self, from: full)
+        XCTAssertEqual(decoded.intelligence.localServerEndpoint, "http://127.0.0.1:11434")
+        XCTAssertEqual(decoded.intelligence.endpointClassification, "LOCAL")
+        XCTAssertTrue(decoded.intelligence.downloadedModelInstalled)
+    }
+
+    func testSetEndpointIssuesExpectedArgv() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        _ = await controller.setEndpoint("http://127.0.0.1:11434")
+
+        XCTAssertTrue(fake.calls.contains([
+            "settings", "intelligence", "local_server_endpoint", "set",
+            "http://127.0.0.1:11434", "--json",
+        ]))
+    }
+
+    func testSetEndpointEmptyClearsWithNone() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        _ = await controller.setEndpoint("   ")
+
+        XCTAssertTrue(fake.calls.contains([
+            "settings", "intelligence", "local_server_endpoint", "set", "none", "--json",
+        ]))
     }
 
     // MARK: - Fixed-row rules (R7 day-split not a cloud toggle; R9 frames off)

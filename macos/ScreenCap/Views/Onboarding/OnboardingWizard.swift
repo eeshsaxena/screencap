@@ -131,6 +131,10 @@ struct OnboardingWizard: View {
             )
         case .teamSetup:
             OnboardingTeamStep(onSkip: complete)
+        case .downloadModel:
+            // SCR-239 — opt-in downloadable model. Both the download and Skip
+            // complete onboarding (never blocks; R7).
+            OnboardingDownloadModelStep(onContinue: complete, onSkip: complete)
         }
     }
 

@@ -38,6 +38,9 @@ _BACKFILL_API_VERSION = 1
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
 # additive precedent).
 _TASKS_LIST_API_VERSION = 1
+# SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
+# global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
+_MODELS_API_VERSION = 1
 
 
 @cache
@@ -96,6 +99,11 @@ _MODEL_NAMES = {
     "TasksListRequest",
     "TaskSegment",
     "TasksListResponse",
+    "ModelDownloadStartRequest",
+    "ModelDownloadCancelRequest",
+    "ModelDownloadStatusResponse",
+    "InstalledModel",
+    "ModelStatusResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -584,6 +592,45 @@ def _load_models() -> dict[str, Any]:
         recording: str
         tasks: list[TaskSegment]
 
+    class ModelDownloadStartRequest(_DaemonModel):
+        """SCR-239 ``model.download.start`` input.
+
+        ``model_id`` selects the downloadable model; ``None`` uses the default.
+        No user data — a public model identifier only.
+        """
+
+        model_id: str | None = None
+
+    class ModelDownloadCancelRequest(_DaemonModel):
+        """SCR-239 ``model.download.cancel`` input (no parameters)."""
+
+    class ModelDownloadStatusResponse(EnvelopeResponse):
+        """The download status snapshot — no recording context (R9-equivalent).
+
+        Carries a public model id + byte counters + a class-name ``reason``.
+        ``state`` is typed ``str`` (not ``Literal``) so a future value decodes
+        tolerantly: ``idle`` / ``downloading`` / ``installed`` / ``failed`` /
+        ``cancelled``.
+        """
+
+        state: str
+        model_id: str | None = None
+        bytes_done: int = 0
+        bytes_total: int = 0
+        reason: str | None = None
+
+    class InstalledModel(_DaemonModel):
+        """One installed model's public id + disclosed size, for the settings UI."""
+
+        model_id: str
+        size_bytes: int
+        installed: bool
+
+    class ModelStatusResponse(EnvelopeResponse):
+        """Read-only install-state snapshot: which models are installed + sizes."""
+
+        models: list[InstalledModel]
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -621,6 +668,11 @@ def _load_models() -> dict[str, Any]:
         "TasksListRequest": TasksListRequest,
         "TaskSegment": TaskSegment,
         "TasksListResponse": TasksListResponse,
+        "ModelDownloadStartRequest": ModelDownloadStartRequest,
+        "ModelDownloadCancelRequest": ModelDownloadCancelRequest,
+        "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
+        "InstalledModel": InstalledModel,
+        "ModelStatusResponse": ModelStatusResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -657,6 +709,7 @@ __all__ = [
     "_AUTH_WHOAMI_API_VERSION",
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
+    "_MODELS_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)

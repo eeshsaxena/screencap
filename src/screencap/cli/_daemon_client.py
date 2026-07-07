@@ -336,6 +336,29 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/backfill.cancel", json_body={})
         )
 
+    def model_download_start(self, model_id: str | None = None) -> dict[str, Any]:
+        """``POST /v0/model.download.start`` — start (or return) the model download."""
+        body = {"model_id": model_id} if model_id else {}
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/model.download.start", json_body=body)
+        )
+
+    def model_download_status(self) -> dict[str, Any]:
+        """``GET /v0/model.download.status`` — current download snapshot."""
+        return self._parse_ok_envelope(
+            self._request("GET", "/v0/model.download.status")
+        )
+
+    def model_download_cancel(self) -> dict[str, Any]:
+        """``POST /v0/model.download.cancel`` — signal the download to stop."""
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/model.download.cancel", json_body={})
+        )
+
+    def model_status(self) -> dict[str, Any]:
+        """``GET /v0/model.status`` — installed-model snapshot."""
+        return self._parse_ok_envelope(self._request("GET", "/v0/model.status"))
+
     @contextmanager
     def events(
         self,

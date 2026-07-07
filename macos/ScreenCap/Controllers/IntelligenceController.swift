@@ -24,6 +24,13 @@ struct IntelligenceSettings: Decodable, Equatable {
     let daySplitCloudConsent: Bool
     /// R9 — screen frames/images are never sent to any cloud; always false.
     let framesCloudConsent: Bool
+    /// SCR-239 — the configured bring-your-own endpoint (redacted; no token), or
+    /// nil. `decodeIfPresent` so an older CLI that omits it still decodes.
+    let localServerEndpoint: String?
+    /// SCR-239 — the endpoint's LOCAL/REMOTE classification, or nil when unset.
+    let endpointClassification: String?
+    /// SCR-239 — whether the downloadable model is installed on this Mac.
+    let downloadedModelInstalled: Bool
 
     enum CodingKeys: String, CodingKey {
         case provider
@@ -32,6 +39,40 @@ struct IntelligenceSettings: Decodable, Equatable {
         case recallCloudConsent = "recall_cloud_consent"
         case daySplitCloudConsent = "day_split_cloud_consent"
         case framesCloudConsent = "frames_cloud_consent"
+        case localServerEndpoint = "local_server_endpoint"
+        case endpointClassification = "endpoint_classification"
+        case downloadedModelInstalled = "downloaded_model_installed"
+    }
+
+    init(
+        provider: String, cloudProvider: String?, summaryCloudConsent: Bool,
+        recallCloudConsent: Bool, daySplitCloudConsent: Bool, framesCloudConsent: Bool,
+        localServerEndpoint: String? = nil, endpointClassification: String? = nil,
+        downloadedModelInstalled: Bool = false
+    ) {
+        self.provider = provider
+        self.cloudProvider = cloudProvider
+        self.summaryCloudConsent = summaryCloudConsent
+        self.recallCloudConsent = recallCloudConsent
+        self.daySplitCloudConsent = daySplitCloudConsent
+        self.framesCloudConsent = framesCloudConsent
+        self.localServerEndpoint = localServerEndpoint
+        self.endpointClassification = endpointClassification
+        self.downloadedModelInstalled = downloadedModelInstalled
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try c.decode(String.self, forKey: .provider)
+        cloudProvider = try c.decodeIfPresent(String.self, forKey: .cloudProvider)
+        summaryCloudConsent = try c.decode(Bool.self, forKey: .summaryCloudConsent)
+        recallCloudConsent = try c.decode(Bool.self, forKey: .recallCloudConsent)
+        daySplitCloudConsent = try c.decode(Bool.self, forKey: .daySplitCloudConsent)
+        framesCloudConsent = try c.decode(Bool.self, forKey: .framesCloudConsent)
+        localServerEndpoint = try c.decodeIfPresent(String.self, forKey: .localServerEndpoint)
+        endpointClassification = try c.decodeIfPresent(String.self, forKey: .endpointClassification)
+        downloadedModelInstalled =
+            try c.decodeIfPresent(Bool.self, forKey: .downloadedModelInstalled) ?? false
     }
 }
 
@@ -136,6 +177,28 @@ final class IntelligenceController: ObservableObject {
         }
     }
 
+    /// Set (or clear with an empty string) the bring-your-own endpoint URL
+    /// (SCR-239). Writes `local_server_endpoint set <url>` then reconciles against
+    /// disk so the pane reflects the resolved LOCAL/REMOTE classification. Returns
+    /// success so the field can show an inline error.
+    @discardableResult
+    func setEndpoint(_ value: String) async -> Bool {
+        let arg = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            _ = try await invoke([
+                "settings", "intelligence", "local_server_endpoint", "set",
+                arg.isEmpty ? "none" : arg, "--json",
+            ])
+            lastError = nil
+            await refresh()
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            await refresh()
+            return false
+        }
+    }
+
     /// Toggle a cloud-consent row (`summary_cloud_consent` / `recall_cloud_consent`).
     /// Optimistic flip + revert-on-failure, serialized per row. The forbidden rows
     /// (day-split, frames) are never written from here — the pane renders them as
@@ -174,7 +237,10 @@ extension IntelligenceSettings {
             summaryCloudConsent: summaryCloudConsent,
             recallCloudConsent: recallCloudConsent,
             daySplitCloudConsent: daySplitCloudConsent,
-            framesCloudConsent: framesCloudConsent
+            framesCloudConsent: framesCloudConsent,
+            localServerEndpoint: localServerEndpoint,
+            endpointClassification: endpointClassification,
+            downloadedModelInstalled: downloadedModelInstalled
         )
     }
 
@@ -187,7 +253,10 @@ extension IntelligenceSettings {
             summaryCloudConsent: row == "summary_cloud_consent" ? enabled : summaryCloudConsent,
             recallCloudConsent: row == "recall_cloud_consent" ? enabled : recallCloudConsent,
             daySplitCloudConsent: daySplitCloudConsent,
-            framesCloudConsent: framesCloudConsent
+            framesCloudConsent: framesCloudConsent,
+            localServerEndpoint: localServerEndpoint,
+            endpointClassification: endpointClassification,
+            downloadedModelInstalled: downloadedModelInstalled
         )
     }
 }

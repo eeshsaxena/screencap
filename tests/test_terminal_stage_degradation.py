@@ -179,12 +179,10 @@ def _isolate_run_dir(tmp_path, monkeypatch):
 
 
 def _install_provider(monkeypatch, provider) -> None:
-    """Wire a fake provider + a stable provider name into the segmentation seam."""
-    import screencap.config as config
-    import screencap.segmentation.provider as prov
+    """Wire a fake provider into the U8 day-split routing seam."""
+    import screencap.segmentation.routing as routing
 
-    monkeypatch.setattr(config, "get_llm_provider", lambda: "fake")
-    monkeypatch.setattr(prov, "get_provider", lambda name: provider)
+    monkeypatch.setattr(routing, "build_day_split_provider", lambda: provider)
 
 
 def _install_consent(monkeypatch, policy: ConsentPolicy) -> None:
