@@ -24,6 +24,13 @@ import SwiftUI
 struct IntelligenceSettingsView: View {
     @EnvironmentObject private var intelligence: IntelligenceController
 
+    /// Drives the opt-in downloadable model (SCR-239 U10) — the download state
+    /// machine + install state, polled from `screencap model status`.
+    @StateObject private var download = ModelDownloadController()
+
+    /// The endpoint field draft for the Local-server row (committed on Save).
+    @State private var endpointDraft: String = ""
+
     /// Locks the provider picker while a write round-trips (the AppRulesView
     /// pending pattern). Without it a rapid re-pick races the controller's
     /// in-flight guard, whose `false` return would render as a spurious error
@@ -60,6 +67,7 @@ struct IntelligenceSettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.scCanvas)
         .task { await intelligence.refresh() }
+        .task { await download.refreshStatus() }
     }
 
     @ViewBuilder
@@ -88,8 +96,21 @@ struct IntelligenceSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             sectionHeader("MODEL")
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(IntelligenceProviderOption.options(cloudProvider: settings.cloudProvider)) { option in
+                let opts = IntelligenceProviderOption.options(
+                    cloudProvider: settings.cloudProvider,
+                    downloadedInstalled: settings.downloadedModelInstalled
+                        || download.isDefaultModelInstalled,
+                    localEndpoint: settings.localServerEndpoint,
+                    endpointClassification: settings.endpointClassification
+                )
+                ForEach(opts) { option in
                     providerRow(option, settings: settings)
+                    if option.id == "downloaded" {
+                        downloadAccessory(settings)
+                    }
+                    if option.id == "local-server" {
+                        endpointField(settings)
+                    }
                     if option.id != IntelligenceProviderOption.addProviderID {
                         rowDivider
                     }
@@ -127,10 +148,16 @@ struct IntelligenceSettingsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // The "add provider" affordance is a stub — the add-key flow is daemon
-        // owned and not yet exposed in-app, so the row is non-interactive.
-        .disabled(providerWriteInFlight || isAddRow)
+        // The "add provider" affordance is a stub; the downloaded model can't be
+        // selected until it's installed (the Download button below is the CTA).
+        .disabled(providerWriteInFlight || isAddRow || downloadedNotInstalled(option, settings))
         .help(isAddRow ? "Coming soon — add a cloud provider with your own API key" : "")
+    }
+
+    /// The downloaded-model radio is inert until the model is on disk.
+    private func downloadedNotInstalled(_ option: IntelligenceProviderOption, _ settings: IntelligenceSettings) -> Bool {
+        option.id == "downloaded"
+            && !(settings.downloadedModelInstalled || download.isDefaultModelInstalled)
     }
 
     private func selectProvider(_ option: IntelligenceProviderOption) {
@@ -143,6 +170,73 @@ struct IntelligenceSettingsView: View {
             providerWriteInFlight = false
             if !ok { writeError = intelligence.lastError ?? "the provider change." }
         }
+    }
+
+    // MARK: - SCR-239 Downloaded-model + Local-server accessories
+
+    /// The Download button / progress / failed-Retry affordance for the
+    /// Downloaded-model row (KTD11 progress; failed surfaces the backend cause).
+    @ViewBuilder
+    private func downloadAccessory(_ settings: IntelligenceSettings) -> some View {
+        let sizeGB = (download.disclosedSizeBytes ?? 0) > 0
+            ? String(format: "%.1f GB", Double(download.disclosedSizeBytes!) / 1_073_741_824)
+            : "~2 GB"
+        HStack(spacing: 10) {
+            switch download.state {
+            case .installed:
+                EmptyView()
+            case let .downloading(done, total):
+                ProgressView(value: total > 0 ? Double(done) / Double(total) : nil)
+                    .frame(maxWidth: 220)
+                Button("Cancel") { Task { await download.cancel() } }
+                    .buttonStyle(.plain).font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scTeal)
+            case let .failed(reason):
+                Text("Download failed: \(reason)")
+                    .font(SCTypography.sans(size: 12)).foregroundStyle(Color.scRust)
+                Button("Retry") { Task { await download.startDownload() } }
+                    .font(SCTypography.sans(size: 12)).foregroundStyle(Color.scTeal)
+            case .idle, .cancelled:
+                if !(settings.downloadedModelInstalled || download.isDefaultModelInstalled) {
+                    Button("Download (\(sizeGB))") { Task { await download.startDownload() } }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 44)
+        .padding(.bottom, download.state == .installed ? 0 : 12)
+    }
+
+    /// The endpoint text field for the Local-server row (U9 write via the CLI),
+    /// showing the resolved LOCAL/REMOTE classification and its treatment.
+    private func endpointField(_ settings: IntelligenceSettings) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField("http://127.0.0.1:11434", text: $endpointDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(SCTypography.mono(size: 12))
+                    .frame(maxWidth: 320)
+                Button("Save") {
+                    Task {
+                        _ = await intelligence.setEndpoint(endpointDraft)
+                        endpointDraft = intelligence.settings?.localServerEndpoint ?? endpointDraft
+                    }
+                }
+                .controlSize(.small)
+                .disabled(endpointDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if let cls = settings.endpointClassification {
+                Text(cls == "LOCAL"
+                    ? "Local — day-splitting runs against this server; nothing leaves the Mac."
+                    : "Remote — treated as a cloud provider (consent-gated; day-splitting stays off).")
+                    .font(SCTypography.sans(size: 11.5))
+                    .foregroundStyle(cls == "LOCAL" ? Color.scTeal : Color.scInkMuted)
+            }
+        }
+        .padding(.horizontal, 44)
+        .padding(.bottom, 12)
+        .onAppear { endpointDraft = settings.localServerEndpoint ?? "" }
     }
 
     // MARK: - WHAT CLOUD MODELS MAY DO section (consent matrix)
@@ -330,18 +424,38 @@ struct IntelligenceProviderOption: Identifiable, Equatable {
     /// non-selectable "add" row.
     let providerValue: String?
 
-    /// Build the picker rows for the given configured cloud provider. Always
-    /// leads with the on-device default (R3); shows the configured cloud
-    /// provider as a selectable row when one is set; and always ends with the
-    /// "add another provider…" affordance.
-    static func options(cloudProvider: String?) -> [IntelligenceProviderOption] {
+    /// Build the picker rows. Always leads with the on-device default (R3), then
+    /// the SCR-239 opt-in **Downloaded model** and **Local server** rows, then a
+    /// configured cloud provider when set, then the "add another provider…"
+    /// affordance. Subtitles reflect the downloaded-model install state and the
+    /// BYO endpoint's LOCAL/REMOTE classification.
+    static func options(
+        cloudProvider: String?,
+        downloadedInstalled: Bool = false,
+        localEndpoint: String? = nil,
+        endpointClassification: String? = nil
+    ) -> [IntelligenceProviderOption] {
         var opts: [IntelligenceProviderOption] = [
             IntelligenceProviderOption(
                 id: "on-device",
                 title: "On-device model",
                 subtitle: "Built into macOS · runs on this Mac · nothing leaves",
                 providerValue: "on-device"
-            )
+            ),
+            IntelligenceProviderOption(
+                id: "downloaded",
+                title: "Downloaded model",
+                subtitle: downloadedInstalled
+                    ? "Downloaded · runs on this Mac · nothing leaves"
+                    : "Download to get named tasks on any Mac (~2 GB, opt-in)",
+                providerValue: "downloaded"
+            ),
+            IntelligenceProviderOption(
+                id: "local-server",
+                title: "Local server (bring your own)",
+                subtitle: localServerSubtitle(localEndpoint, endpointClassification),
+                providerValue: "local-server"
+            ),
         ]
         if let cloud = cloudProvider {
             opts.append(IntelligenceProviderOption(
@@ -358,6 +472,17 @@ struct IntelligenceProviderOption: Identifiable, Equatable {
             providerValue: nil
         ))
         return opts
+    }
+
+    /// Subtitle for the Local-server row: the redacted endpoint + its treatment,
+    /// or a prompt to configure one.
+    static func localServerSubtitle(_ endpoint: String?, _ classification: String?) -> String? {
+        guard let endpoint, !endpoint.isEmpty else {
+            return "Ollama / LM Studio on this Mac — set an endpoint below"
+        }
+        return classification == "LOCAL"
+            ? "\(endpoint) · on-device · day-splitting on"
+            : "\(endpoint) · remote · treated as cloud (day-split off)"
     }
 
     /// A human label for a cloud provider id.
