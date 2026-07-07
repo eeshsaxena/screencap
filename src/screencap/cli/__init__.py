@@ -4003,6 +4003,82 @@ def backfill_cancel_cmd() -> None:
     console.print(f"  {_backfill_snapshot_line(snapshot)}")
 
 
+@cli.group("model")
+def model_group() -> None:
+    """Download and manage the optional local Intelligence model (SCR-239).
+
+    Thin one-shot HTTP clients of the daemon's ``model.download.*`` /
+    ``model.status`` verbs over the UNIX socket. The download is opt-in, size-
+    disclosed, and integrity-verified. The macOS app's Intelligence settings pane
+    is the supported live-progress surface; this CLI ships ``download`` /
+    ``status`` / ``cancel`` for headless use (poll ``status --json`` for progress).
+    """
+
+
+def _model_download_line(snapshot: dict) -> str:
+    state = str(snapshot.get("state", "unknown"))
+    done = snapshot.get("bytes_done", 0) or 0
+    total = snapshot.get("bytes_total", 0) or 0
+    pct = f" — {100 * done // total}%" if total else ""
+    reason = snapshot.get("reason")
+    tail = f" ({escape(str(reason))})" if reason and state == "failed" else ""
+    return f"Model download {escape(state)}{pct}{tail}"
+
+
+@model_group.command("download")
+@click.argument("model_id", required=False)
+def model_download_cmd(model_id: str | None) -> None:
+    """Download the local model (opt-in). Idempotent on the daemon side."""
+    client = _backfill_client_or_exit()
+    with client:
+        snapshot = _model_call_or_exit(lambda: client.model_download_start(model_id))
+    state = str(snapshot.get("state", "unknown"))
+    if state == "installed":
+        console.print("[green]Model already installed.[/green]")
+    elif state == "downloading":
+        console.print("[#22d3ee]Model download started.[/#22d3ee]")
+    elif state == "failed":
+        console.print(f"[red]Model download failed:[/red] {escape(str(snapshot.get('reason')))}")
+        raise SystemExit(1)
+    else:
+        console.print(f"[#22d3ee]Model download {escape(state)}.[/#22d3ee]")
+    console.print(f"  {_model_download_line(snapshot)}")
+
+
+@model_group.command("status")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit the raw status payload as JSON.")
+def model_status_cmd(as_json: bool) -> None:
+    """Report the download state + which models are installed."""
+    client = _backfill_client_or_exit(auto_spawn=False)
+    with client:
+        dl = _model_call_or_exit(client.model_download_status)
+        installed = _model_call_or_exit(client.model_status)
+    if as_json:
+        console.print_json(data={"download": dl, "installed": installed})
+        return
+    console.print(f"  {_model_download_line(dl)}")
+    for m in installed.get("models", []):
+        mark = "installed" if m.get("installed") else "not installed"
+        gb = (m.get("size_bytes", 0) or 0) / (1024**3)
+        console.print(f"  {escape(str(m.get('model_id')))}: {mark} (~{gb:.1f} GB)")
+
+
+@model_group.command("cancel")
+def model_cancel_cmd() -> None:
+    """Cancel the in-flight model download."""
+    client = _backfill_client_or_exit(auto_spawn=False)
+    with client:
+        snapshot = _model_call_or_exit(client.model_download_cancel)
+    console.print(f"  {_model_download_line(snapshot)}")
+
+
+def _model_call_or_exit(call):
+    """Reuse the backfill daemon-call error translation for model verbs."""
+    return _backfill_call_or_exit(call)
+
+
 @cli.command("_smoke-test", hidden=True)
 @click.option("--verbose", "-v", is_flag=True, help="Show full tracebacks.")
 def smoke_test(verbose):
