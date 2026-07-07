@@ -118,6 +118,38 @@ the previous release first; completion marker absent.
       grant state); the "running without the background helper" advisory shows
       in Library.
 
+### 4a. Hide controls v2 — ⌘⇧H, edge peek, one-time hint (design 8a)
+
+Run these with a *second app focused* (e.g. a browser) so the global paths are
+genuinely exercised — a window-scoped shortcut would pass this only by accident.
+
+- [ ] Pill shows a plain **"Hide"** button beside Draw and Mute (not a chevron
+      icon); clicking it dismisses the pill and the recording continues.
+- [ ] With focus in the recorded app, **⌘⇧H** hides the pill; **⌘⇧H** again
+      restores it bottom-center. The elapsed timer keeps advancing throughout.
+- [ ] With **no** recording active, ⌘⇧H does nothing in ScreenCap and reaches
+      the frontmost app normally (the hotkey is registered only while recording).
+- [ ] While hidden, rest the cursor at the **bottom screen edge** → after a brief
+      dwell a slim "Show controls ⌘⇧H" bar appears; move away and it hides without
+      pinning; move up onto the bar and click → the toolbar restores bottom-center
+      (the bar must not dismiss before the click lands). Confirm the band clears a
+      bottom **Dock** (default Dock position).
+- [ ] **First-ever hide only:** a one-time hint appears near the menu bar naming
+      it as where status/Stop live and ⌘⇧H to return; it never appears on
+      subsequent hides (this or later recordings). Reset with
+      `defaults delete com.screencap.app com.screencap.macos.hasShownHideHint`
+      (or the test host's domain) to re-arm.
+- [ ] **Capture exclusion (blocker if it fails):** across hide, ⌘⇧H, the peek
+      bar, and the hint, none of these ScreenCap surfaces appears in the captured
+      video, and capture keeps writing (`sharingType = .none`).
+- [ ] **No new permission prompt:** exercising ⌘⇧H and the edge peek triggers no
+      Accessibility / Input Monitoring dialog beyond what recording already needs.
+- [ ] **VoiceOver:** the peek bar reads as "Show recording controls"; the hint is
+      announced; ⌘⇧H restores the toolbar for a keyboard-only user.
+- [ ] **⌘⇧H collision:** register ⌘⇧H in another app first, start a recording →
+      ScreenCap logs the registration failure and the menu-bar "Show recording
+      controls" item still restores the pill (graceful degradation, no dead hotkey).
+
 ## 5. TCC quit-relaunch loop (permission loss + recovery)
 
 - [ ] With everything granted, `tccutil reset ScreenCapture` while the app

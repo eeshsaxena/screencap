@@ -227,6 +227,11 @@ final class RecorderController: ObservableObject {
     /// XCTest (see `WindowLifecycleFactory`) so controller tests never spawn a
     /// real panel; the app gets the live implementation.
     private let windowLifecycle: WindowLifecycle
+    /// Global-input seam for the ⌘⇧H toggle and the bottom-edge peek, active only
+    /// during a recording (U2/U3). No-op under XCTest via `HUDInputMonitorFactory`.
+    private let inputMonitor: HUDInputMonitor
+    /// Persistence for the one-time first-hide menu-bar hint (U5).
+    private let hintStore: HUDHintStore
 
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
@@ -246,7 +251,9 @@ final class RecorderController: ObservableObject {
         cliService: CLIRecorderService = LiveCLIRecorderService(),
         daemonService: DaemonSessionService = LiveDaemonSessionService(),
         stopPolicy: StopPolicyCoordinator = LiveStopPolicyCoordinator(),
-        windowLifecycle: WindowLifecycle = WindowLifecycleFactory.makeDefault()
+        windowLifecycle: WindowLifecycle = WindowLifecycleFactory.makeDefault(),
+        inputMonitor: HUDInputMonitor = HUDInputMonitorFactory.makeDefault(),
+        hintStore: HUDHintStore = HUDHintStore()
     ) {
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
@@ -254,6 +261,8 @@ final class RecorderController: ObservableObject {
         self.daemonService = daemonService
         self.stopPolicy = stopPolicy
         self.windowLifecycle = windowLifecycle
+        self.inputMonitor = inputMonitor
+        self.hintStore = hintStore
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -729,8 +738,16 @@ final class RecorderController: ObservableObject {
                 handleCaptureRecovered(reader: reader)
             case .showHUD:
                 windowLifecycle.showHUD(for: self)
+                // Start the ⌘⇧H hotkey + peek detector for this recording (U2/U3).
+                // `.showHUD` also fires on the daemon-attach path — a recording is
+                // live there too, and startMonitoring is idempotent.
+                inputMonitor.startMonitoring(for: self)
             case .hideHUD:
                 windowLifecycle.hideHUD()
+                inputMonitor.stopMonitoring()
+                // Tear down the one-time hint too, so it never outlives the
+                // recording (its "Still recording" copy would otherwise linger).
+                windowLifecycle.dismissHideHint()
             case .hideMainWindow:
                 windowLifecycle.hideMainWindow()
                 mainWindowHidden = true
@@ -753,6 +770,29 @@ final class RecorderController: ObservableObject {
         guard case .recording = state, !hudHidden else { return }
         hudHidden = true
         windowLifecycle.hideHUD()
+        // First-ever hide: point the user at the menu bar, where the recording
+        // status and Stop now live (U5, R7). The store flag is set only after the
+        // hint has actually been shown (the panel calls back on dismissal), so a
+        // distracted first-timer isn't silently robbed of the one guidance moment.
+        if HUDHintPolicy.shouldShow(hasShownBefore: hintStore.hasShownHideHint) {
+            windowLifecycle.presentHideHint { [weak self] in
+                self?.hintStore.markShown()
+            }
+        }
+    }
+
+    /// Toggle the recording HUD pill's visibility — the ⌘⇧H entry point (R1).
+    /// Hides the pill when shown, restores it when hidden. No-op outside
+    /// `.recording`. Routes through `hideRecordingHUD()` / `showRecordingHUD()` so
+    /// the pill button, ⌘⇧H, the peek, and the menu item all read the single
+    /// `hudHidden` source of truth.
+    func toggleRecordingHUD() {
+        guard case .recording = state else { return }
+        if hudHidden {
+            showRecordingHUD()
+        } else {
+            hideRecordingHUD()
+        }
     }
 
     /// Restore the HUD pill after `hideRecordingHUD()` (R4, R5), driven by the
@@ -836,6 +876,14 @@ final class RecorderController: ObservableObject {
         state = machine.state
         if wasRecording {
             windowLifecycle.hideHUD()
+            // Abnormal-end paths (foreign claimant, daemon failure, stream loss)
+            // reach here imperatively, bypassing the `.hideHUD` effect arm — so the
+            // input monitor must also be stopped here, or ⌘⇧H stays registered
+            // after the recording ends (R3).
+            inputMonitor.stopMonitoring()
+            // Same for the one-time hint — dismiss it so it can't linger past the
+            // recording with now-false "Still recording" copy.
+            windowLifecycle.dismissHideHint()
             currentRecordingName = nil
             restoreMainWindowIfHidden()
         }

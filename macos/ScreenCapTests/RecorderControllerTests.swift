@@ -579,6 +579,181 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(fake.showHUDCount, showsBefore, "no-op when already shown")
     }
 
+    // MARK: - HUD hide control v2 (toggle, ⌘⇧H monitor, one-time hint)
+
+    /// Drive into `.recording` with a fake input monitor injected (U2/U3).
+    private func recordingControllerWithMonitor(
+        _ fake: FakeWindowLifecycle, _ monitor: FakeHUDInputMonitor
+    ) -> RecorderController {
+        let recorder = RecorderController(windowLifecycle: fake, inputMonitor: monitor)
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        return recorder
+    }
+
+    /// `toggleRecordingHUD()` hides the pill when it is shown (R1). The ⌘⇧H entry.
+    func testToggleHidesWhenShown() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+
+        recorder.toggleRecordingHUD()
+
+        XCTAssertTrue(recorder.hudHidden)
+        XCTAssertEqual(fake.hideHUDCount, 1)
+        XCTAssertTrue(recorder.state.isRecording, "toggling visibility must not stop the recording")
+    }
+
+    /// `toggleRecordingHUD()` restores the pill when it is hidden (R1).
+    func testToggleShowsWhenHidden() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+        recorder.hideRecordingHUD()
+        let showsBefore = fake.showHUDCount
+
+        recorder.toggleRecordingHUD()
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertEqual(fake.showHUDCount, showsBefore + 1)
+    }
+
+    /// A hide→show round-trip via two toggles ends shown, ordering the panel out
+    /// exactly once for the hide.
+    func testToggleRoundTrip() {
+        let fake = FakeWindowLifecycle()
+        let recorder = recordingController(fake)
+
+        recorder.toggleRecordingHUD()  // hide
+        recorder.toggleRecordingHUD()  // show
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertEqual(fake.hideHUDCount, 1)
+    }
+
+    /// `toggleRecordingHUD()` is a no-op outside `.recording` (guard behavior).
+    func testToggleNoOpWhenNotRecording() {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(windowLifecycle: fake)  // stays .idle
+
+        recorder.toggleRecordingHUD()
+
+        XCTAssertFalse(recorder.hudHidden)
+        XCTAssertEqual(fake.hideHUDCount, 0)
+        XCTAssertEqual(fake.showHUDCount, 0)
+    }
+
+    /// The input monitor starts on the recording-start edge, bound to this
+    /// recorder (U2/U3, R2).
+    func testInputMonitorStartsOnRecordingStart() {
+        let fake = FakeWindowLifecycle()
+        let monitor = FakeHUDInputMonitor()
+        let recorder = recordingControllerWithMonitor(fake, monitor)
+
+        XCTAssertEqual(monitor.startCount, 1)
+        XCTAssertTrue(monitor.isMonitoring)
+        XCTAssertTrue(monitor.boundRecorder === recorder)
+    }
+
+    /// A normal stop tears the monitor down — ⌘⇧H must not stay registered once the
+    /// recording ends (R3).
+    func testInputMonitorStopsOnNormalStop() {
+        let fake = FakeWindowLifecycle()
+        let monitor = FakeHUDInputMonitor()
+        let recorder = recordingControllerWithMonitor(fake, monitor)
+
+        recorder._testHandleProcessTerminated(exitCode: 0)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertFalse(monitor.isMonitoring, "⌘⇧H must not stay registered after a recording (R3)")
+        XCTAssertGreaterThanOrEqual(monitor.stopCount, 1)
+    }
+
+    /// An async `recording_failed` also tears the monitor down (R3, abnormal end).
+    func testInputMonitorStopsOnRecordingFailed() {
+        let fake = FakeWindowLifecycle()
+        let monitor = FakeHUDInputMonitor()
+        let recorder = recordingControllerWithMonitor(fake, monitor)
+
+        recorder._testHandleStderrLine(#"{"type":"recording_failed","schema_version":1,"reason":"engine crashed"}"#)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertFalse(monitor.isMonitoring, "abnormal end must unregister ⌘⇧H (R3)")
+    }
+
+    /// The recorder handed to the monitor is the live one, so the ⌘⇧H handler's
+    /// `toggleRecordingHUD()` call round-trips visibility.
+    func testInputMonitorHotkeyCallbackDrivesToggle() {
+        let fake = FakeWindowLifecycle()
+        let monitor = FakeHUDInputMonitor()
+        let recorder = recordingControllerWithMonitor(fake, monitor)
+
+        monitor.boundRecorder?.toggleRecordingHUD()
+        XCTAssertTrue(recorder.hudHidden)
+        monitor.boundRecorder?.toggleRecordingHUD()
+        XCTAssertFalse(recorder.hudHidden)
+    }
+
+    /// The first-ever hide presents the one-time hint; the store flag is set only
+    /// after the hint is actually shown (completion fired), and never re-presents
+    /// (U5, R7).
+    func testFirstHideShowsHintOncePersistedAfterDisplay() {
+        let fake = FakeWindowLifecycle()
+        let suite = "hud-hint-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = HUDHintStore(defaults: defaults)
+        let recorder = RecorderController(windowLifecycle: fake, hintStore: store)
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+
+        recorder.hideRecordingHUD()
+        XCTAssertEqual(fake.presentHideHintCount, 1, "first-ever hide presents the hint")
+        XCTAssertFalse(store.hasShownHideHint, "flag is not set until the hint is actually shown")
+
+        fake.lastHintCompletion?()  // simulate the hint being shown + dismissed
+        XCTAssertTrue(store.hasShownHideHint)
+
+        recorder.showRecordingHUD()
+        recorder.hideRecordingHUD()
+        XCTAssertEqual(fake.presentHideHintCount, 1, "the hint is one-time — no second present")
+    }
+
+    /// The one-time hint is torn down when the recording ends (via the `.hideHUD`
+    /// teardown), so it never outlives the recording with now-false "Still
+    /// recording" copy (review fix).
+    func testHintDismissedWhenRecordingEnds() {
+        let fake = FakeWindowLifecycle()
+        let suite = "hud-hint-teardown-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let recorder = RecorderController(windowLifecycle: fake, hintStore: HUDHintStore(defaults: defaults))
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        recorder.hideRecordingHUD()
+        XCTAssertEqual(fake.presentHideHintCount, 1)
+
+        recorder._testHandleProcessTerminated(exitCode: 0)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertGreaterThanOrEqual(fake.dismissHideHintCount, 1, "hint must be dismissed on recording end")
+    }
+
+    /// An abnormal end (recording_failed → transitionToIdle) also dismisses the hint.
+    func testHintDismissedOnAbnormalEnd() {
+        let fake = FakeWindowLifecycle()
+        let suite = "hud-hint-teardown-abn-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let recorder = RecorderController(windowLifecycle: fake, hintStore: HUDHintStore(defaults: defaults))
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        recorder.hideRecordingHUD()
+
+        recorder._testHandleStderrLine(#"{"type":"recording_failed","schema_version":1,"reason":"engine crashed"}"#)
+
+        XCTAssertFalse(recorder.state.isRecording)
+        XCTAssertGreaterThanOrEqual(fake.dismissHideHintCount, 1, "hint must be dismissed on abnormal end too")
+    }
+
     // MARK: - Audio flag (U6)
 
     /// CLI fallback: an explicit audio-off threads `--no-audio` into the argv and
@@ -967,11 +1142,43 @@ final class FakeWindowLifecycle: WindowLifecycle {
     private(set) var hideHUDCount = 0
     private(set) var hideMainWindowCount = 0
     private(set) var restoreMainWindowCount = 0
+    private(set) var presentHideHintCount = 0
+    private(set) var dismissHideHintCount = 0
+    /// Captured, not auto-invoked, so a test can simulate the hint being shown +
+    /// dismissed — the store flag must only be set after the hint actually shows.
+    private(set) var lastHintCompletion: (() -> Void)?
 
     func showHUD(for recorder: RecorderController) { showHUDCount += 1 }
     func hideHUD() { hideHUDCount += 1 }
     func hideMainWindow() { hideMainWindowCount += 1 }
     func restoreMainWindow() { restoreMainWindowCount += 1 }
+    func presentHideHint(onComplete: @escaping () -> Void) {
+        presentHideHintCount += 1
+        lastHintCompletion = onComplete
+    }
+    func dismissHideHint() { dismissHideHintCount += 1 }
+}
+
+/// U2/U3: records the input-monitor lifecycle so controller tests can assert the
+/// ⌘⇧H hotkey + peek detector start on the recording-start edge and stop on every
+/// teardown, without registering a real Carbon hotkey or spawning a poll timer.
+@MainActor
+final class FakeHUDInputMonitor: HUDInputMonitor {
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var isMonitoring = false
+    private(set) weak var boundRecorder: RecorderController?
+
+    func startMonitoring(for recorder: RecorderController) {
+        startCount += 1
+        isMonitoring = true
+        boundRecorder = recorder
+    }
+
+    func stopMonitoring() {
+        stopCount += 1
+        isMonitoring = false
+    }
 }
 
 /// Fake `StopPolicyCoordinator` that returns a fixed `StopPolicyOutcome`

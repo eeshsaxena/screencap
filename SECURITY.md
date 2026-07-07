@@ -112,6 +112,14 @@ The one-shot **backfill** (`screencap backfill`, also driven from the Search con
 
 A **deferred stronger mitigation** is tracked as a follow-up: persisting the canonical `SCRUB_BLOCK_ACTIONS` interval set to disk at scrub time so the backfill need not re-derive it. This ships the fail-closed conservative approximation; the residual is the documented over-skip, never an under-block.
 
+## Recording toolbar hide controls: global input + capture exclusion
+
+The recording HUD can be dismissed and restored during a recording via a global **⌘⇧H** hotkey and a bottom-edge cursor "peek," alongside the pill's Hide button and the menu-bar item. These touch two surfaces the rest of the app deliberately avoids; both are held to a narrow footprint:
+
+- **Capture exclusion is an invariant, not a styling detail.** Every ScreenCap floating surface shown over recorded content — the HUD pill, the bottom-edge peek bar, and the one-time first-hide hint — is a non-activating `NSPanel` with `sharingType = .none`, so none is ever captured into the user's recording. A ScreenCap surface leaking into a recording is a **blocker**, not a cosmetic bug; the manual-QA capture spot-check (`docs/runbooks/new-ui-manual-qa.md` §4a) guards it, and any new floating surface must carry the same exclusion.
+
+- **The global-input footprint is minimal and recording-scoped.** ⌘⇧H is a single fixed **Carbon `RegisterEventHotKey`** binding — a scoped system hotkey registration, **not** a keystroke-stream tap or event monitor — registered only while a recording is live and unregistered on every teardown (including the imperative abnormal-end path), so ScreenCap observes no input when idle and never reads the user's keystroke stream. The bottom-edge peek reads only the **public `NSEvent.mouseLocation`** on a short recording-scoped poll timer; it is not a mouse-event tap. Consequently the feature needs **no new TCC grant** (neither Accessibility nor Input Monitoring) beyond what recording already requires. This is the deliberate, narrowly-scoped exception to the app's otherwise window-scoped-shortcut posture (the ⌘⇧F "no global tap" decision): ⌘⇧H's purpose is to reach the user while the *recorded* app is focused, which a window-scoped shortcut cannot do.
+
 ## Threats in scope
 
 ScreenCap aims to defend against the following:

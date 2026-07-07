@@ -78,9 +78,9 @@ struct RecordingHUDView: View {
             divider
             stub("Draw", ticket: "SCR-217")
             stub(model.audioEnabled ? "Mute" : "Muted", ticket: "SCR-218")
+            hideButton
             divider
             stopButton
-            hideButton
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -157,21 +157,22 @@ struct RecordingHUDView: View {
         .accessibilityLabel(model.stopAccessibilityLabel)
     }
 
-    /// Dismisses the pill for the rest of the recording (restored from the
-    /// menu-bar "Show recording controls" item). A small icon button, visually
-    /// subordinate to Stop & save.
+    /// Dismisses the pill for the rest of the recording (design 8a). A plain
+    /// "Hide" label beside Draw and Mute; restored via ⌘⇧H, the bottom-edge peek,
+    /// or the menu-bar "Show recording controls" item.
     private var hideButton: some View {
         Button {
             recorder.hideRecordingHUD()
         } label: {
-            Image(systemName: "chevron.down")
-                .font(.system(size: 11, weight: .semibold))
+            Text("Hide")
+                .font(SCTypography.sans(size: 13))
                 .foregroundStyle(Color.scHUDMuted)
-                .padding(8)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Hide recording controls")
+        .help("Hide recording controls (⌘⇧H)")
         .accessibilityLabel(model.hideAccessibilityLabel)
     }
 }
