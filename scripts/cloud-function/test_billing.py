@@ -99,3 +99,67 @@ def test_ensure_firebase_app_noop_when_present():
     ), mock.patch.object(billing.firebase_admin, "initialize_app") as init:
         billing._ensure_firebase_app()
     init.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# U14 — reconcile_entitlement (dropped-webhook self-heal, grant-only)
+# --------------------------------------------------------------------------
+
+
+def _invoke_reconcile(req):
+    resp, status, _headers = billing.reconcile_entitlement(req)
+    payload = resp.get_json() if hasattr(resp, "get_json") else resp
+    return status, payload
+
+
+def test_reconcile_grants_when_active_subscription_exists():
+    # Covers AE7. Claim absent but Stripe has an active sub -> repair the grant.
+    with mock.patch.object(billing, "verify_bearer", return_value="userA"), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [{"status": "active"}]}
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, payload = _invoke_reconcile(_req())
+    assert status == 200
+    assert payload["subscribed"] is True
+    setc.assert_called_once_with("userA", {"subscribed": True})
+
+
+def test_reconcile_no_grant_when_no_active_subscription():
+    # Claim absent + no live subscription -> never hand out free access.
+    with mock.patch.object(billing, "verify_bearer", return_value="userA"), mock.patch(
+        "stripe.Subscription.search", return_value={"data": []}
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, payload = _invoke_reconcile(_req())
+    assert status == 200
+    assert payload["subscribed"] is False
+    setc.assert_not_called()
+
+
+def test_reconcile_no_grant_when_only_inactive_subscription():
+    with mock.patch.object(billing, "verify_bearer", return_value="userA"), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [{"status": "canceled"}]}
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, payload = _invoke_reconcile(_req())
+    assert status == 200
+    assert payload["subscribed"] is False
+    setc.assert_not_called()
+
+
+def test_reconcile_requires_auth():
+    from auth import AuthInvalid
+
+    with mock.patch.object(
+        billing, "verify_bearer", side_effect=AuthInvalid("no token")
+    ), mock.patch("stripe.Subscription.search") as search:
+        status, _ = _invoke_reconcile(_req(auth=None))
+    assert status == 401
+    search.assert_not_called()
+
+
+def test_reconcile_search_failure_does_not_grant():
+    with mock.patch.object(billing, "verify_bearer", return_value="userA"), mock.patch(
+        "stripe.Subscription.search", side_effect=Exception("stripe down")
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, payload = _invoke_reconcile(_req())
+    assert status == 200
+    assert payload["subscribed"] is False
+    setc.assert_not_called()

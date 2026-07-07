@@ -827,6 +827,46 @@ async def test_cloud_engine_receives_token_out_of_band_not_in_argv(
 
 
 @pytest.mark.asyncio
+async def test_cloud_engine_stage_forces_token_remint(
+    tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # U13: a cloud recording started right after checkout must re-mint the
+    # daemon's cached token (force_refresh=True) so the just-granted `subscribed`
+    # claim is on the token the engine uploads with — not a stale pre-claim one.
+    from screencap.daemon.supervisor import Supervisor
+
+    calls: dict[str, bool] = {}
+
+    def spy_get_id_token(force_refresh=False):
+        calls["force_refresh"] = force_refresh
+        return "fresh-id-token"
+
+    monkeypatch.setattr("screencap.auth.get_id_token", spy_get_id_token)
+
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(_cloud_engine_script(tmp_path)),
+        reconcile_on_init=False, poll_interval=0.05, startup_timeout=2.0, stop_timeout=2.0,
+    )
+    sub = await bus.subscribe()
+    await supervisor.spawn(
+        schema.RecordingStartRequest(
+            name="remint", output_dir=str(tmp_path / "remint"), cloud_intent=True,
+        )
+    )
+
+    started = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+    assert started["type"] == _stderr_events.EVENT_STARTED
+    assert calls.get("force_refresh") is True  # staged with a forced re-mint
+    assert started["token_seen"] == "fresh-id-token"
+
+    await supervisor.stop(force=False)
+    await _wait_until(lambda: not isolated_lock.lock_is_active())
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cloud_engine_not_signed_in_fails_closed_no_token(
     tmp_path: Path, isolated_lock, allow_tmp_output_dir, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

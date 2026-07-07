@@ -13,6 +13,10 @@ KTD-3):
   the ``subscribed`` custom claim to the subscription's CURRENT status, so
   out-of-order / duplicate delivery cannot revoke a currently-active
   subscription (KTD-9).
+- ``reconcile_entitlement`` — Firebase-token-gated, GRANT-ONLY self-heal: if the
+  caller has a live Stripe subscription but no claim (dropped webhook), grant it
+  so a paying customer is never permanently stuck (U14 / AE7). It deploys like
+  ``create-checkout-session`` (Firebase-gated, needs ``STRIPE_SECRET_KEY``).
 
 Firebase Admin is initialized HERE (KTD-8): a separately-deployed entry point
 never imports main.py, so it cannot rely on main.py's module-scope init side
@@ -260,3 +264,57 @@ def stripe_webhook(request):
 
     _apply_entitlement(uid, active)
     return (jsonify({"received": True}), 200)
+
+
+# --------------------------------------------------------------------------
+# U14 — reconcile-entitlement (Firebase-token-gated dropped-webhook self-heal)
+# --------------------------------------------------------------------------
+
+
+def _has_active_subscription(uid) -> bool:
+    """True if the account has a currently-active Stripe subscription.
+
+    Searches by the uid stamped into subscription metadata (KTD-9). Any lookup
+    failure returns False — never hand out access on an error.
+    """
+    try:
+        result = stripe.Subscription.search(query=f"metadata['uid']:'{uid}'")
+    except Exception as exc:  # transient / search error — do not grant on failure.
+        logger.warning("subscription search failed for uid %s: %s", uid, exc)
+        return False
+    for sub in result.get("data", []):
+        if sub.get("status") in _ACTIVE_STATUSES:
+            return True
+    return False
+
+
+@functions_framework.http
+def reconcile_entitlement(request):
+    """Self-heal a dropped webhook: grant ``subscribed`` if the caller has a live
+    Stripe subscription but no claim yet (U14 / AE7).
+
+    Firebase-token-gated (uid server-derived). GRANT-ONLY: it repairs a missing
+    grant when Stripe confirms an active subscription; it never revokes here
+    (revocation is the webhook's job), so it can never lock out a paying user. A
+    client calls this when a post-checkout ``whoami`` still shows
+    ``subscribed: false``, so a paying customer is never permanently stuck.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204, CORS_HEADERS)
+
+    _ensure_firebase_app()
+
+    try:
+        uid = verify_bearer(request, PROJECT_ID)
+    except AuthUnavailable:
+        return _cors(
+            (jsonify({"error": "Auth verification temporarily unavailable"}), 503)
+        )
+    except AuthInvalid:
+        return _cors((jsonify({"error": "Authentication required"}), 401))
+
+    stripe.api_key = _stripe_key()
+    active = _has_active_subscription(uid)
+    if active:
+        _apply_entitlement(uid, True)
+    return _cors(jsonify({"subscribed": bool(active)}))
