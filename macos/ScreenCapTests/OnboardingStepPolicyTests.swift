@@ -216,21 +216,35 @@ final class OnboardingStepPolicyTests: XCTestCase {
 
     // MARK: - Tier routing + dots
 
-    /// Local finishes at storage; Personal and Team continue to the account
-    /// step; Team continues again to team setup after sign-in.
+    /// Local continues to the SCR-239 download-model step; Personal and Team
+    /// continue to the account step; Team continues again to team setup.
     func testTierRouting() {
-        XCTAssertNil(OnboardingStepPolicy.stepAfterStorage(tier: .local))
+        XCTAssertEqual(OnboardingStepPolicy.stepAfterStorage(tier: .local), .downloadModel)
         XCTAssertEqual(OnboardingStepPolicy.stepAfterStorage(tier: .personalCloud), .account)
         XCTAssertEqual(OnboardingStepPolicy.stepAfterStorage(tier: .teamCloud), .account)
         XCTAssertNil(OnboardingStepPolicy.stepAfterAccount(tier: .personalCloud))
         XCTAssertEqual(OnboardingStepPolicy.stepAfterAccount(tier: .teamCloud), .teamSetup)
     }
 
-    /// Progress-dot count is 4/5/6 by picked tier.
+    /// Progress-dot count is 5/5/6 by picked tier (local gained the SCR-239
+    /// download-model step).
     func testDotCountByTier() {
-        XCTAssertEqual(OnboardingStepPolicy.dotCount(tier: .local), 4)
+        XCTAssertEqual(OnboardingStepPolicy.dotCount(tier: .local), 5)
         XCTAssertEqual(OnboardingStepPolicy.dotCount(tier: .personalCloud), 5)
         XCTAssertEqual(OnboardingStepPolicy.dotCount(tier: .teamCloud), 6)
+    }
+
+    /// SCR-239 (U11) — the download-model step is the local tier's 5th dot
+    /// (index 4), not present for cloud tiers, and never colliding with
+    /// account(4)/teamSetup(5).
+    func testDownloadModelStepDotAndRouting() {
+        XCTAssertEqual(OnboardingStepPolicy.activeDotIndex(for: .downloadModel), 4)
+        XCTAssertEqual(OnboardingStepPolicy.activeDotIndex(for: .storage), 3)
+        // The download-model step is the local tier's 5th of 5 dots.
+        XCTAssertEqual(
+            OnboardingStepPolicy.activeDotIndex(for: .downloadModel) + 1,
+            OnboardingStepPolicy.dotCount(tier: .local)
+        )
     }
 
     // MARK: - Honesty gate (KTD-9 / R7)

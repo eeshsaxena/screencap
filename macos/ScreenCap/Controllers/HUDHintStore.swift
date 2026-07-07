@@ -10,6 +10,9 @@ import Foundation
 /// not silently robbed of the one guidance moment.
 struct HUDHintStore {
     static let hasShownHideHintKey = "com.screencap.macos.hasShownHideHint"
+    /// SCR-239 — the standing "enable local intelligence" sidebar hint, dismissed
+    /// once (persisted so it never reappears — R7 no intrusive re-prompt).
+    static let localModelHintDismissedKey = "com.screencap.macos.localModelHintDismissed"
 
     private let defaults: UserDefaults
 
@@ -23,5 +26,13 @@ struct HUDHintStore {
 
     func markShown() {
         defaults.set(true, forKey: Self.hasShownHideHintKey)
+    }
+
+    var hasDismissedLocalModelHint: Bool {
+        defaults.bool(forKey: Self.localModelHintDismissedKey)
+    }
+
+    func markLocalModelHintDismissed() {
+        defaults.set(true, forKey: Self.localModelHintDismissedKey)
     }
 }

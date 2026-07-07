@@ -19,4 +19,22 @@ final class HUDHintStoreTests: XCTestCase {
         let reopened = HUDHintStore(defaults: defaults)
         XCTAssertTrue(reopened.hasShownHideHint)
     }
+
+    /// SCR-239 (U11) — the local-model hint dismissal flag round-trips and
+    /// persists (once dismissed, never re-prompt — R7).
+    func testLocalModelHintDismissalPersists() {
+        let suite = "hud-hint-store-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = HUDHintStore(defaults: defaults)
+        XCTAssertFalse(store.hasDismissedLocalModelHint, "defaults to not-dismissed")
+
+        store.markLocalModelHintDismissed()
+        XCTAssertTrue(store.hasDismissedLocalModelHint)
+        XCTAssertTrue(HUDHintStore(defaults: defaults).hasDismissedLocalModelHint,
+                      "survives relaunch")
+        // Independent of the hide-hint flag.
+        XCTAssertFalse(store.hasShownHideHint)
+    }
 }
