@@ -1439,24 +1439,12 @@ def _upload_single(fi, signed_url: str) -> None:
     """
     import requests
 
-    from screencap.upload import _cloud_upload_key
+    from screencap.upload import _cloud_upload_key, _put_body_and_headers
 
     key = _cloud_upload_key()
     with open(fi.path, "rb") as fh:
-        if key is not None:
-            from screencap import cloud_crypto
-
-            body = cloud_crypto.EncryptingReader(fh, fi.size, key)
-            headers = {
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(len(body)),
-            }
-        else:
-            body = fh
-            headers = {
-                "Content-Type": fi.content_type,
-                "Content-Length": str(fi.size),
-            }
+        # Plaintext body is the raw handle (no progress bar on the live path).
+        body, headers = _put_body_and_headers(fh, fi.size, fi.content_type, key, fh)
         resp = requests.put(
             signed_url,
             data=body,

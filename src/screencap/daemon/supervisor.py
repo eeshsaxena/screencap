@@ -1358,31 +1358,37 @@ class Supervisor:
         return run_dir / f"engine-token-{capture_dir.name}.jwt"
 
     @staticmethod
-    def _write_engine_token_file(path: Path, token: str) -> None:
-        """Atomically write *token* to *path* with mode 0600 (same-EUID only)."""
+    def _atomic_write_secret_file(path: Path, payload: bytes) -> None:
+        """Atomically write *payload* to *path* at mode 0600 (same-EUID only).
+
+        ``O_NOFOLLOW`` rejects a pre-planted symlink at the tmp path so a
+        same-EUID actor can't redirect the write (matches the run-dir 0600
+        hardening in audit_log.py / socket.py); a failed replace unlinks the tmp
+        so no readable secret residue is left in the run dir. Single audited
+        implementation shared by the engine token and cloud-key writers.
+        """
         tmp = path.with_suffix(path.suffix + ".tmp")
-        # O_NOFOLLOW: reject a pre-planted symlink at the tmp path so a same-EUID
-        # actor can't redirect the live token write — matches the run-dir 0600
-        # hardening convention in audit_log.py / socket.py.
         fd = os.open(
             str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
         )
         try:
-            os.write(fd, token.encode("ascii"))
+            os.write(fd, payload)
         finally:
             os.close(fd)
         try:
             os.replace(str(tmp), str(path))
             os.chmod(path, 0o600)  # re-assert in case the file pre-existed wider
         except OSError:
-            # The .tmp holds a live ID token; _cleanup_engine_token_file only
-            # removes the canonical .jwt, so unlink the residue before re-raising
-            # rather than leaking a same-EUID-readable token in the run dir.
             try:
                 os.unlink(str(tmp))
             except OSError:
                 pass
             raise
+
+    @staticmethod
+    def _write_engine_token_file(path: Path, token: str) -> None:
+        """Atomically write *token* to *path* with mode 0600 (same-EUID only)."""
+        Supervisor._atomic_write_secret_file(path, token.encode("ascii"))
 
     def _cleanup_engine_token_file(self) -> None:
         path = self._engine_token_file
@@ -1451,28 +1457,10 @@ class Supervisor:
     def _write_engine_cloud_key_file(path: Path, key: bytes) -> None:
         """Atomically write the base64 cloud key to *path* at mode 0600.
 
-        Mirrors ``_write_engine_token_file`` hardening (``O_NOFOLLOW`` to reject a
-        pre-planted symlink, atomic replace, re-chmod) — a long-lived master key
-        warrants at least the same care as the short-lived token.
+        A long-lived master key warrants at least the same hardening as the
+        short-lived token, so both go through ``_atomic_write_secret_file``.
         """
-        payload = base64.b64encode(key)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        fd = os.open(
-            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
-        )
-        try:
-            os.write(fd, payload)
-        finally:
-            os.close(fd)
-        try:
-            os.replace(str(tmp), str(path))
-            os.chmod(path, 0o600)
-        except OSError:
-            try:
-                os.unlink(str(tmp))
-            except OSError:
-                pass
-            raise
+        Supervisor._atomic_write_secret_file(path, base64.b64encode(key))
 
     def _cleanup_engine_cloud_key_file(self) -> None:
         path = self._engine_cloud_key_file

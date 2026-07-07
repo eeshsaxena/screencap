@@ -244,3 +244,46 @@ def test_assert_uploadable_still_rejects_recording_db(tmp_path):
     )
     with pytest.raises(Exception):
         assert_uploadable(fi)
+
+
+# --------------------------------------------------------------------------
+# 403-retry re-encrypts from a fresh handle with a fresh nonce (no reuse)
+# --------------------------------------------------------------------------
+
+
+def test_batch_403_retry_reencrypts_with_fresh_nonce(tmp_path, monkeypatch, e2ee_on):
+    fi, content = _make_file(tmp_path)
+    bodies: list[bytes] = []
+    calls = {"n": 0}
+
+    class _403(_PutResp):
+        status_code = 403
+
+    def fake_put(url, data=None, headers=None, timeout=None):
+        bodies.append(_readall(data))
+        calls["n"] += 1
+        return _403() if calls["n"] == 1 else _PutResp()
+
+    monkeypatch.setattr(requests, "put", fake_put)
+    # The 403 branch re-requests a signed URL before retrying.
+    monkeypatch.setattr(
+        upload, "request_signed_urls", lambda rec, files: ({fi.name: "https://put2"}, "p")
+    )
+    _upload_with_progress(fi, "https://put1", _progress(), 1, "rec", 1)  # max_retries=1
+
+    assert len(bodies) == 2  # first attempt 403'd, second succeeded
+    assert all(cc.is_encrypted_prefix(b) for b in bodies)
+    assert bodies[0] != bodies[1]  # fresh per-file nonce prefix per attempt (no reuse)
+    for i, b in enumerate(bodies):
+        monkeypatch.setattr(requests, "get", lambda url, stream=None, timeout=None, _b=b: _GetResp(_b))
+        dest = tmp_path / f"out{i}" / "chunk_0.mp4"
+        download._download_file_with_progress("https://get", dest, _progress(), 1)
+        assert dest.read_bytes() == content
+
+
+def test_download_plaintext_shorter_than_magic(tmp_path, monkeypatch):
+    body = b"{}"  # 2 bytes, shorter than the 6-byte MAGIC — must pass through
+    monkeypatch.setattr(requests, "get", lambda url, stream=None, timeout=None: _GetResp(body))
+    dest = tmp_path / "tiny.json"
+    download._download_file_with_progress("https://get", dest, _progress(), 1)
+    assert dest.read_bytes() == body

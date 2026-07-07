@@ -583,14 +583,17 @@ def upload_recording(
             for f, _ in to_upload:
                 task_ids[f.name] = progress.add_task(f.name, total=f.size)
 
-            # 2. Submit all uploads
+            # 2. Submit all uploads. Resolve the cloud key once for the whole
+            #    batch — a per-file Keychain read would be N round-trips — and a
+            #    flag-on-but-no-key state fails the whole upload closed right here.
+            cloud_key = _cloud_upload_key()
             with ThreadPoolExecutor(max_workers=jobs) as executor:
                 futures = {}
                 for f, signed_url in to_upload:
                     future = executor.submit(
                         _upload_with_progress,
                         f, signed_url, progress, task_ids[f.name],
-                        recording_name, max_retries,
+                        recording_name, max_retries, cloud_key,
                     )
                     futures[future] = f.name
 
@@ -752,6 +755,34 @@ def _cloud_upload_key() -> bytes | None:
     return key
 
 
+_RESOLVE_KEY = object()
+"""Sentinel default for ``_upload_with_progress(cloud_key=...)`` — a standalone
+call resolves the key itself; a batch caller resolves it once and passes it."""
+
+
+def _put_body_and_headers(fh, size, content_type, cloud_key, plaintext_body):
+    """Return the ``(body, headers)`` for a signed-URL PUT.
+
+    With a cloud key set, the body is encrypted on-device (``EncryptingReader``,
+    KTD-4) and sent as ``application/octet-stream`` with the computed ciphertext
+    length; otherwise the caller's ``plaintext_body`` is sent with the original
+    content type. Shared by the batch and live upload seams so the
+    encrypt-vs-plaintext decision cannot drift between them.
+    """
+    if cloud_key is None:
+        return plaintext_body, {
+            "Content-Type": content_type,
+            "Content-Length": str(size),
+        }
+    from screencap import cloud_crypto
+
+    body = cloud_crypto.EncryptingReader(fh, size, cloud_key)
+    return body, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(body)),
+    }
+
+
 def _upload_with_progress(
     f: FileInfo,
     signed_url: str,
@@ -759,38 +790,32 @@ def _upload_with_progress(
     task_id,
     recording_name: str,
     max_retries: int,
+    cloud_key=_RESOLVE_KEY,
 ) -> None:
     """Upload a single file with streaming progress and retry on URL expiry.
 
     When cloud E2EE is enabled the file is encrypted on-device before the PUT
     (KTD-4): the object store only ever holds ciphertext. The body then streams
     as ``application/octet-stream`` with the computed ciphertext ``Content-Length``.
+    ``cloud_key`` is resolved once by the batch caller; a standalone call
+    resolves it itself.
     """
-    key = _cloud_upload_key()
+    if cloud_key is _RESOLVE_KEY:
+        cloud_key = _cloud_upload_key()
     for attempt in range(1 + max_retries):
         with open(f.path, "rb") as fh:
             progress.reset(task_id)
-            if key is not None:
-                from screencap import cloud_crypto
-
-                body = cloud_crypto.EncryptingReader(fh, f.size, key)
-                headers = {
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(len(body)),
-                }
-            else:
-                body = _ProgressFile(fh, progress, task_id, f.size)
-                headers = {
-                    "Content-Type": f.content_type,
-                    "Content-Length": str(f.size),
-                }
+            body, headers = _put_body_and_headers(
+                fh, f.size, f.content_type, cloud_key,
+                _ProgressFile(fh, progress, task_id, f.size),
+            )
             resp = requests.put(
                 signed_url,
                 data=body,
                 headers=headers,
                 timeout=(10, 300),
             )
-        if key is not None:
+        if cloud_key is not None:
             # EncryptingReader doesn't drive the bar per-chunk; land it at done.
             progress.update(task_id, completed=f.size)
 
