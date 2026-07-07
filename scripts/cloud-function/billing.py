@@ -24,12 +24,25 @@ effect — that gap would otherwise crash ``set_custom_user_claims`` /
 ``verify_id_token`` at runtime while unit tests (which mock init) stay green.
 
 Deploy (project: proteus-photos, region: southamerica-east1):
+    # CRITICAL: these entry points live in billing.py, but the GCF Python buildpack
+    # DEFAULTS the source file to main.py — so every billing deploy MUST pass
+    # --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py, or the container fails
+    # at startup with MissingTargetException (it looks for the fn inside main.py).
+    # These functions also run as a dedicated SA with roles/firebaseauth.admin so
+    # set_custom_user_claims works:
+    #   gcloud iam service-accounts create screencap-billing --project proteus-photos
+    #   gcloud projects add-iam-policy-binding proteus-photos \
+    #     --member serviceAccount:screencap-billing@proteus-photos.iam.gserviceaccount.com \
+    #     --role roles/firebaseauth.admin
+
     # create-checkout-session — Firebase-token-gated, needs the Stripe secret key
     gcloud functions deploy create-checkout-session \
         --project proteus-photos --gen2 --runtime python312 \
         --trigger-http --allow-unauthenticated \
         --region southamerica-east1 --source scripts/cloud-function/ \
         --entry-point create_checkout_session \
+        --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py \
+        --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
         --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_PRICE_ID=price_...
 
     # stripe-webhook — Stripe-signature-verified (tokenless by design)
@@ -38,7 +51,19 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --trigger-http --allow-unauthenticated \
         --region southamerica-east1 --source scripts/cloud-function/ \
         --entry-point stripe_webhook \
+        --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py \
+        --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
         --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_WEBHOOK_SECRET=whsec_...
+
+    # reconcile-entitlement — Firebase-token-gated, grant-only dropped-webhook self-heal
+    gcloud functions deploy reconcile-entitlement \
+        --project proteus-photos --gen2 --runtime python312 \
+        --trigger-http --allow-unauthenticated \
+        --region southamerica-east1 --source scripts/cloud-function/ \
+        --entry-point reconcile_entitlement \
+        --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py \
+        --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
+        --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...
 
     # NEVER commit sk_live_... / whsec_...; keep test-mode and live-mode keys per
     # environment and rotate via the console + redeploy (billing plan U11).
