@@ -126,6 +126,16 @@ def _resolve_model_path() -> str | None:
     return str(path) if path else None
 
 
+def _installed_model_size() -> int | None:
+    """The disclosed on-disk size of the installed model, for the RAM floor (KTD11)."""
+    try:
+        from screencap.models import get_disclosed_size
+
+        return get_disclosed_size()
+    except ImportError:
+        return None
+
+
 def _worker_command() -> list[str]:
     override = os.environ.get(_WORKER_OVERRIDE_ENV)
     if override:
@@ -192,7 +202,26 @@ class DownloadedProvider:
         return apply_confidence_gate(sanitized, config.get_confidence_gate_threshold())
 
     def _run_worker(self, payload: str) -> dict | None | ProviderUnavailable:
-        """Spawn the worker and return its raw ``result`` dict, ``None``, or the sentinel."""
+        """Spawn the worker and return its raw ``result`` dict, ``None``, or the sentinel.
+
+        Guarded by the process-wide single-flight + RAM-headroom precheck (KTD11):
+        a second overlapping worker, or a machine short on memory, skips fail-open
+        to ``PROVIDER_UNAVAILABLE`` (→ heuristic) rather than thrashing capture.
+        """
+        from screencap.segmentation.inference_guard import (
+            has_ram_headroom,
+            inference_slot,
+        )
+
+        with inference_slot() as acquired:
+            if not acquired:
+                log.info("Another inference worker is in flight; skipping (unavailable)")
+                return PROVIDER_UNAVAILABLE
+            if not has_ram_headroom(_installed_model_size()):
+                return PROVIDER_UNAVAILABLE
+            return self._spawn_worker(payload)
+
+    def _spawn_worker(self, payload: str) -> dict | None | ProviderUnavailable:
         cmd = _worker_command()
 
         def _preexec() -> None:  # pragma: no cover - child-side, POSIX only

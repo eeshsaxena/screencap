@@ -602,7 +602,7 @@ def get_local_server_endpoint() -> str | None:
 #: The active/preferred provider (``[intelligence].llm_provider``). Only the
 #: backends :func:`screencap.segmentation.provider.get_provider` can actually
 #: construct are accepted; the CLI rejects anything else.
-_VALID_LLM_PROVIDERS = ("on-device", "gemini")
+_VALID_LLM_PROVIDERS = ("on-device", "gemini", "downloaded", "local-server")
 
 #: The cloud backend a consented fallback may use
 #: (``[intelligence].cloud_provider``). Only Gemini ships as a cloud backend in
