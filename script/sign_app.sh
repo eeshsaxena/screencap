@@ -125,6 +125,22 @@ if [ -d "${APP_PATH}/Contents/Frameworks" ]; then
   done
 fi
 
+# Sign the on-device intelligence helper (Contents/MacOS/IntelligenceHelper), a
+# nested command-line tool copied in by the "Embed IntelligenceHelper" build
+# phase. Xcode signs it with an Apple Development cert + get-task-allow, and
+# codesign does NOT re-sign a nested Contents/MacOS/ executable when it seals the
+# outer bundle — so without an explicit pass it ships the dev signature and
+# notarization rejects it ("not signed with a valid Developer ID certificate",
+# "signature does not include a secure timestamp", "requests the
+# com.apple.security.get-task-allow entitlement"). Re-sign with hardened runtime
+# + secure timestamp and no entitlements so get-task-allow is dropped. It needs
+# no entitlements of its own (FoundationModels is weak-linked, no special grant).
+INTELLIGENCE_HELPER="${APP_PATH}/Contents/MacOS/IntelligenceHelper"
+if [ -x "${INTELLIGENCE_HELPER}" ]; then
+  echo "==> Signing on-device intelligence helper (Contents/MacOS/IntelligenceHelper)"
+  sign "${INTELLIGENCE_HELPER}"
+fi
+
 echo "==> Signing outer app bundle (last)"
 sign --entitlements "${APP_ENTITLEMENTS}" "${APP_PATH}"
 
