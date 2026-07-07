@@ -651,6 +651,17 @@ def set_intelligence_cloud_provider(value: str | None) -> None:
     _write_intelligence_key("cloud_provider", value)
 
 
+def set_intelligence_endpoint(value: str | None) -> None:
+    """Persist (or clear) ``[intelligence].local_server_endpoint`` (SCR-239).
+
+    ``None``/empty removes the key. The caller validates the scheme and the
+    LOCAL/REMOTE classification (``segmentation.endpoint.classify_endpoint``)
+    before persisting.
+    """
+    cleaned = value.strip() if isinstance(value, str) and value.strip() else None
+    _write_intelligence_key("local_server_endpoint", cleaned)
+
+
 def set_intelligence_consent(row: str, value: bool) -> None:
     """Persist a cloud-consent row to ``[intelligence].<row>``.
 

@@ -37,6 +37,7 @@ def _isolate_config(tmp_path, monkeypatch):
         "SCREENCAP_LLM_CLOUD_PROVIDER",
         "SCREENCAP_SUMMARY_CLOUD_CONSENT",
         "SCREENCAP_RECALL_CLOUD_CONSENT",
+        "SCREENCAP_LOCAL_SERVER_ENDPOINT",
     ):
         monkeypatch.delenv(var, raising=False)
     yield
@@ -247,3 +248,83 @@ class TestJsonWriteEnvelope:
         payload = _last_json_line(r.output)
         assert payload["ok"] is False
         assert payload["error"].startswith("row_never_cloud")
+
+
+# ---------------------------------------------------------------------------
+# U9 (SCR-239) — downloaded / local-server provider + BYO endpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_downloaded_round_trips():
+    result = _invoke("provider", "set", "downloaded", as_json=True)
+    assert result.exit_code == 0, result.output
+    assert _read_cfg()["llm_provider"] == "downloaded"
+
+
+def test_local_server_provider_requires_endpoint():
+    """Selecting local-server with no endpoint is rejected (defense in depth)."""
+    result = _invoke("provider", "set", "local-server", as_json=True)
+    assert result.exit_code == 1
+    assert _last_json_line(result.output)["error"] == "local_server_requires_endpoint"
+
+
+def test_local_server_provider_rejects_remote_endpoint():
+    """A remote endpoint can't be the active day-split provider (R5)."""
+    _invoke("local_server_endpoint", "set", "http://192.168.1.9:1234")
+    result = _invoke("provider", "set", "local-server", as_json=True)
+    assert result.exit_code == 1
+    assert (
+        _last_json_line(result.output)["error"]
+        == "remote_endpoint_not_day_split_provider"
+    )
+
+
+def test_local_server_provider_accepts_loopback_endpoint():
+    _invoke("local_server_endpoint", "set", "http://127.0.0.1:11434")
+    result = _invoke("provider", "set", "local-server", as_json=True)
+    assert result.exit_code == 0, result.output
+    assert _read_cfg()["llm_provider"] == "local-server"
+
+
+def test_endpoint_persists_and_classifies():
+    result = _invoke("local_server_endpoint", "set", "http://127.0.0.1:11434", as_json=True)
+    assert result.exit_code == 0, result.output
+    assert _read_cfg()["intelligence"]["local_server_endpoint"] == "http://127.0.0.1:11434"
+
+    block = _last_json_line(_invoke(as_json=True).output)["intelligence"]
+    assert block["local_server_endpoint"] == "http://127.0.0.1:11434"
+    assert block["endpoint_classification"] == "LOCAL"
+
+
+def test_remote_endpoint_classified_remote():
+    _invoke("local_server_endpoint", "set", "http://10.0.0.5:1234")
+    block = _last_json_line(_invoke(as_json=True).output)["intelligence"]
+    assert block["endpoint_classification"] == "REMOTE"
+
+
+def test_non_http_scheme_rejected():
+    result = _invoke("local_server_endpoint", "set", "file:///etc/passwd", as_json=True)
+    assert result.exit_code == 1
+    assert _last_json_line(result.output)["error"] == "invalid_endpoint_scheme"
+
+
+def test_endpoint_userinfo_redacted_in_readback():
+    """A URL carrying credentials is stored but never echoed with the token."""
+    _invoke("local_server_endpoint", "set", "http://user:secret@127.0.0.1:1234/v1?k=tok")
+    block = _last_json_line(_invoke(as_json=True).output)["intelligence"]
+    redacted = block["local_server_endpoint"]
+    assert "secret" not in redacted and "tok" not in redacted
+    assert redacted == "http://127.0.0.1:1234/v1"
+
+
+def test_endpoint_clear():
+    _invoke("local_server_endpoint", "set", "http://127.0.0.1:11434")
+    result = _invoke("local_server_endpoint", "set", "none", as_json=True)
+    assert result.exit_code == 0, result.output
+    assert "local_server_endpoint" not in _read_cfg().get("intelligence", {})
+
+
+def test_readback_includes_downloaded_install_state():
+    block = _last_json_line(_invoke(as_json=True).output)["intelligence"]
+    # No model installed in a fresh isolated config → False (never raises).
+    assert block["downloaded_model_installed"] is False

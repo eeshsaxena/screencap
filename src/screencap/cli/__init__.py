@@ -3142,6 +3142,15 @@ def _build_intelligence_settings_block() -> dict:
     render it as a non-interactive "always off" without a special case.
     """
     from screencap import config
+    from screencap.segmentation.endpoint import classify_endpoint
+
+    endpoint = config.get_local_server_endpoint()
+    try:
+        from screencap.models import is_model_installed
+
+        downloaded_installed = is_model_installed()
+    except Exception:
+        downloaded_installed = False
 
     return {
         "provider": config.get_llm_provider(),
@@ -3151,7 +3160,28 @@ def _build_intelligence_settings_block() -> dict:
         # Fixed guards (R7/R9) — surfaced so the pane needn't hard-code them.
         "day_split_cloud_consent": False,
         "frames_cloud_consent": False,
+        # SCR-239 BYO endpoint (redacted — never echo userinfo/query) + its
+        # LOCAL/REMOTE classification, and the downloaded-model install state.
+        "local_server_endpoint": _redact_url(endpoint),
+        "endpoint_classification": classify_endpoint(endpoint) if endpoint else None,
+        "downloaded_model_installed": downloaded_installed,
     }
+
+
+def _redact_url(url):
+    """Strip userinfo/query/fragment from a URL so a token can't leak (SCR-239)."""
+    if not url:
+        return url
+    from urllib.parse import urlparse, urlunparse
+
+    try:
+        p = urlparse(url)
+        netloc = p.hostname or ""
+        if p.port:
+            netloc = f"{netloc}:{p.port}"
+        return urlunparse(p._replace(netloc=netloc, params="", query="", fragment=""))
+    except Exception:
+        return "<redacted>"
 
 
 @settings.command("intelligence")
@@ -3255,8 +3285,58 @@ def settings_intelligence(row, op, value, as_json):
                 f"{config._VALID_LLM_PROVIDERS}, got: {escape(str(value))}"
             )
             _emit_error(f"invalid_provider:{value}")
+        # SCR-239: a local-server active provider must point at a LOCAL endpoint —
+        # a REMOTE endpoint is treated as cloud and can never be the day-split
+        # provider (R5). Defense in depth over the U8 routing.
+        if value == "local-server":
+            from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+
+            endpoint = config.get_local_server_endpoint()
+            if not endpoint:
+                err_console.print(
+                    "[red]Error:[/red] provider 'local-server' requires an endpoint; "
+                    "set it first: [bold]settings intelligence local_server_endpoint "
+                    "set http://127.0.0.1:11434[/bold]"
+                )
+                _emit_error("local_server_requires_endpoint")
+            if classify_endpoint(endpoint) != LOCAL:
+                err_console.print(
+                    "[red]Error:[/red] the configured endpoint is remote — a remote "
+                    "server is treated as cloud and cannot be the active day-split "
+                    "provider (R5). Point at a loopback server (127.0.0.1 / localhost)."
+                )
+                _emit_error("remote_endpoint_not_day_split_provider")
         config.set_intelligence_provider(value)
         err_console.print(f"  [bold]intelligence.provider[/bold] set {escape(str(value))}")
+
+    elif row == "local_server_endpoint":
+        from screencap.segmentation.endpoint import classify_endpoint
+
+        if value.lower() in ("none", ""):
+            config.set_intelligence_endpoint(None)
+            err_console.print("  [bold]intelligence.local_server_endpoint[/bold] cleared")
+            value = None
+        else:
+            from urllib.parse import urlparse
+
+            if urlparse(value).scheme not in ("http", "https"):
+                err_console.print(
+                    f"[red]Error:[/red] endpoint must be an http(s) URL, got: "
+                    f"{escape(_redact_url(value) or str(value))}"
+                )
+                _emit_error("invalid_endpoint_scheme")
+            config.set_intelligence_endpoint(value)
+            cls = classify_endpoint(value)
+            redacted = _redact_url(value)
+            note = (
+                "local — day-split on-device" if cls == "LOCAL"
+                else "remote — treated as cloud (day-split off)"
+            )
+            err_console.print(
+                f"  [bold]intelligence.local_server_endpoint[/bold] set "
+                f"{escape(str(redacted))} [dim]({note})[/dim]"
+            )
+            value = redacted  # echo the REDACTED url (never the token)
 
     elif row == "cloud_provider":
         # ``none`` / empty clears the configured cloud backend.
@@ -3297,7 +3377,10 @@ def settings_intelligence(row, op, value, as_json):
         value = parsed  # echo the normalized bool
 
     else:
-        _known = ("provider", "cloud_provider", *config._CLOUD_CONSENT_ROWS)
+        _known = (
+            "provider", "cloud_provider", "local_server_endpoint",
+            *config._CLOUD_CONSENT_ROWS,
+        )
         err_console.print(f"[red]Error:[/red] Unknown intelligence row: {escape(str(row))}")
         err_console.print(f"[dim]Settable: {', '.join(_known)}[/dim]")
         _emit_error(f"unknown_row:{row}")
