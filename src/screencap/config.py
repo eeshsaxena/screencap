@@ -572,6 +572,27 @@ def get_confidence_gate_threshold() -> str:
     return "low"
 
 
+def get_local_server_endpoint() -> str | None:
+    """Return the configured bring-your-own model-server URL, or ``None`` (SCR-239).
+
+    The endpoint's LOCAL/REMOTE classification
+    (``screencap.segmentation.endpoint.classify_endpoint``) decides whether it is
+    treated as on-device (day-split allowed) or as a cloud provider. Env
+    ``SCREENCAP_LOCAL_SERVER_ENDPOINT`` > ``[intelligence].local_server_endpoint``
+    > default ``None``.
+    """
+    env = os.environ.get("SCREENCAP_LOCAL_SERVER_ENDPOINT")
+    if env is not None:
+        env = env.strip()
+        return env or None
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get("local_server_endpoint")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
 # --- Intelligence settings: write surface (U8) -----------------------------
 #
 # The ``screencap settings intelligence`` CLI verb (U8) is the write side of
