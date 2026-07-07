@@ -1707,14 +1707,15 @@ def _model_status_payload() -> dict[str, Any]:
     """Build the install-state snapshot for ``/v0/model.status`` (SCR-239)."""
     from screencap.models import DEFAULT_MODEL_ID
     from screencap.models.download import get_disclosed_size, is_model_installed
+    from screencap.segmentation.local_model.runtime import select_runtime
 
-    size = get_disclosed_size(DEFAULT_MODEL_ID) or 0
+    runtime = select_runtime()  # resolve the host runtime once
     return {
         "models": [
             {
                 "model_id": DEFAULT_MODEL_ID,
-                "size_bytes": size,
-                "installed": is_model_installed(DEFAULT_MODEL_ID),
+                "size_bytes": get_disclosed_size(DEFAULT_MODEL_ID, runtime) or 0,
+                "installed": is_model_installed(DEFAULT_MODEL_ID, runtime),
             }
         ]
     }

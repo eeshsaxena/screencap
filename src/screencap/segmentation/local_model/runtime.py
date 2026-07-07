@@ -156,21 +156,30 @@ def build_json_grammar(schema: dict):
 class MlxRuntime:
     """Apple Silicon backend via ``mlx-lm`` (prompt-plus-parse-plus-retry).
 
-    ``raw_generate(model_path, prompt) -> str | None`` is injectable (mirrors the
-    ``GeminiProvider.raw_call`` seam) so the parse/retry logic is CI-testable
-    without the native library or a model. It defaults to a live ``mlx-lm`` call.
+    Split into an injectable ``load(model_path) -> handle | None`` and
+    ``gen(handle, prompt) -> str | None`` (mirrors the ``GeminiProvider.raw_call``
+    seam) so the parse/retry logic is CI-testable without the native library or a
+    model. The split matters at runtime too: the model is loaded **once** and only
+    *generation* retries on a JSON-parse miss — otherwise a retry would re-read the
+    whole ~2 GB model from disk. Both seams default to live ``mlx-lm`` calls.
     """
 
     def __init__(
-        self, raw_generate: Callable[[str, str], str | None] | None = None
+        self,
+        load: Callable[[str], object | None] | None = None,
+        gen: Callable[[object, str], str | None] | None = None,
     ) -> None:
-        self._raw = raw_generate if raw_generate is not None else self._raw_default
+        self._load = load if load is not None else self._load_default
+        self._gen = gen if gen is not None else self._gen_default
 
     def generate(self, model_path: str, prompt: str) -> dict | None:
+        handle = self._load(model_path)
+        if handle is None:
+            return None  # unavailable / load failed
         for attempt in range(_MLX_MAX_ATTEMPTS):
-            text = self._raw(model_path, prompt)
+            text = self._gen(handle, prompt)
             if text is None:
-                return None  # backend error/unavailable — do not retry
+                return None  # generation error — do not retry
             parsed = _extract_json(text)
             if parsed is not None:
                 return parsed
@@ -178,16 +187,26 @@ class MlxRuntime:
         return None
 
     @staticmethod
-    def _raw_default(model_path: str, prompt: str) -> str | None:
-        """Live ``mlx-lm`` call. Not exercised in CI (needs the lib + a model)."""
+    def _load_default(model_path: str) -> object | None:
+        """Load the model once. Not exercised in CI (needs the lib + a model)."""
         try:
-            from mlx_lm import generate as mlx_generate
             from mlx_lm import load
         except ImportError:
             log.info("mlx-lm not installed; runtime unavailable")
             return None
         try:
-            model, tokenizer = load(model_path)
+            return load(model_path)
+        except Exception:
+            log.warning("mlx-lm failed to load model at %s", model_path, exc_info=True)
+            return None
+
+    @staticmethod
+    def _gen_default(handle: object, prompt: str) -> str | None:
+        """Generate from an already-loaded model. Not exercised in CI."""
+        try:
+            from mlx_lm import generate as mlx_generate
+
+            model, tokenizer = handle
             return mlx_generate(
                 model, tokenizer, prompt=prompt, max_tokens=_MAX_OUTPUT_TOKENS
             )

@@ -67,7 +67,7 @@ struct OnboardingDownloadModelStep: View {
 
     private var downloadTitle: String {
         if let bytes = download.disclosedSizeBytes, bytes > 0 {
-            return String(format: "Download (%.1f GB)", Double(bytes) / 1_073_741_824)
+            return "Download (\(ShellSidebarModel.formatStorage(bytes)))"
         }
         return "Download the model (~2 GB)"
     }

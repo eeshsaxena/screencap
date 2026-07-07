@@ -84,31 +84,50 @@ class TestAdapterGenerate:
     """Adapter parse/retry logic via an injected fake backend (no native lib)."""
 
     def test_mlx_returns_dict_on_valid_backend_output(self):
-        rt = MlxRuntime(raw_generate=lambda p, prompt: '{"tasks": [{"name": "Fix login"}]}')
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: '{"tasks": [{"name": "Fix login"}]}')
         assert rt.generate("model", "prompt") == {"tasks": [{"name": "Fix login"}]}
 
     def test_mlx_returns_none_on_backend_error(self):
-        # raw_generate returning None signals a backend error/unavailable.
-        rt = MlxRuntime(raw_generate=lambda p, prompt: None)
+        # gen returning None signals a generation error.
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: None)
         assert rt.generate("model", "prompt") is None
 
-    def test_mlx_retries_then_succeeds(self):
+    def test_mlx_load_failure_returns_none_without_generating(self):
+        gen_calls = {"n": 0}
+
+        def gen(_h, _p):
+            gen_calls["n"] += 1
+            return "{}"
+
+        rt = MlxRuntime(load=lambda mp: None, gen=gen)  # load unavailable → None
+        assert rt.generate("model", "prompt") is None
+        assert gen_calls["n"] == 0  # never generate when the model didn't load
+
+    def test_mlx_loads_once_and_retries_generation_only(self):
+        # A parse miss retries GENERATION without reloading the model.
+        load_calls = {"n": 0}
         outputs = iter(["not json", "```json\n{\"tasks\": []}\n```"])
-        rt = MlxRuntime(raw_generate=lambda p, prompt: next(outputs))
+
+        def load(_mp):
+            load_calls["n"] += 1
+            return "handle"
+
+        rt = MlxRuntime(load=load, gen=lambda h, p: next(outputs))
         assert rt.generate("model", "prompt") == {"tasks": []}
+        assert load_calls["n"] == 1  # loaded once, not per retry
 
     def test_mlx_gives_up_after_max_attempts_of_bad_json(self):
-        rt = MlxRuntime(raw_generate=lambda p, prompt: "still not json")
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: "still not json")
         assert rt.generate("model", "prompt") is None
 
-    def test_mlx_does_not_retry_on_backend_error(self):
+    def test_mlx_does_not_retry_on_generation_error(self):
         calls = {"n": 0}
 
-        def raw(_p, _prompt):
+        def gen(_h, _p):
             calls["n"] += 1
             return None
 
-        assert MlxRuntime(raw_generate=raw).generate("model", "prompt") is None
+        assert MlxRuntime(load=lambda mp: "h", gen=gen).generate("model", "prompt") is None
         assert calls["n"] == 1  # None is a hard error, not a retryable parse miss
 
     def test_llamacpp_returns_dict_on_valid_backend_output(self):

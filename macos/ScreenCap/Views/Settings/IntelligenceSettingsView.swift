@@ -179,7 +179,7 @@ struct IntelligenceSettingsView: View {
     @ViewBuilder
     private func downloadAccessory(_ settings: IntelligenceSettings) -> some View {
         let sizeGB = (download.disclosedSizeBytes ?? 0) > 0
-            ? String(format: "%.1f GB", Double(download.disclosedSizeBytes!) / 1_073_741_824)
+            ? ShellSidebarModel.formatStorage(download.disclosedSizeBytes!)
             : "~2 GB"
         HStack(spacing: 10) {
             switch download.state {

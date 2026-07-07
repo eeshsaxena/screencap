@@ -27,10 +27,8 @@ import logging
 from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
-from screencap.segmentation.confidence_gate import apply_confidence_gate
+from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
-from screencap.segmentation.sanitize import sanitize_tasks
-from screencap.segmentation.validate import validate_llm_tasks
 
 log = logging.getLogger(__name__)
 
@@ -81,11 +79,7 @@ class LocalServerProvider:
             return PROVIDER_UNAVAILABLE
 
         try:
-            from screencap.segmentation.providers.gemini import _LLM_PROMPT
-
-            prompt = _LLM_PROMPT.format(
-                activity_json=json.dumps(activity_summary["summary"], indent=2)
-            )
+            prompt = build_local_prompt(activity_summary["summary"])
         except Exception:  # pragma: no cover - defensive
             return PROVIDER_UNAVAILABLE
 
@@ -95,20 +89,9 @@ class LocalServerProvider:
             # LOCAL endpoint lets the day-split chain degrade to the heuristic.
             return PROVIDER_UNAVAILABLE
 
-        try:
-            validated = validate_llm_tasks(
-                raw,
-                activity_summary["session_start"],
-                activity_summary["session_end"],
-                activity_summary["time_map"],
-            )
-        except Exception:
-            log.warning("Local-server output failed validation", exc_info=True)
-            return None
-        from screencap import config
-
-        sanitized = sanitize_tasks(validated)
-        return apply_confidence_gate(sanitized, config.get_confidence_gate_threshold())
+        # Validate → sanitize (KTD12) → confidence-gate (KTD9), shared with the
+        # downloaded backend (both surface model-generated names to the same sink).
+        return finalize_local_result(raw, activity_summary)
 
     @staticmethod
     def _default_raw_call(endpoint: str, prompt: str) -> dict | None:

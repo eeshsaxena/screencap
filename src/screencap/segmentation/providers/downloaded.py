@@ -38,10 +38,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from screencap.segmentation.confidence_gate import apply_confidence_gate
+from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
-from screencap.segmentation.sanitize import sanitize_tasks
-from screencap.segmentation.validate import validate_llm_tasks
 
 log = logging.getLogger(__name__)
 
@@ -143,13 +141,6 @@ def _worker_command() -> list[str]:
     return [sys.executable, "-m", "screencap.segmentation.local_model.worker"]
 
 
-def _build_prompt(summary: dict) -> str:
-    # Reuse the canonical segmentation prompt so local and cloud drive one prompt.
-    from screencap.segmentation.providers.gemini import _LLM_PROMPT
-
-    return _LLM_PROMPT.format(activity_json=json.dumps(summary, indent=2))
-
-
 class DownloadedProvider:
     """Downloaded local model via a hardened subprocess worker. See module docs."""
 
@@ -168,7 +159,7 @@ class DownloadedProvider:
             return PROVIDER_UNAVAILABLE
 
         try:
-            prompt = _build_prompt(activity_summary["summary"])
+            prompt = build_local_prompt(activity_summary["summary"])
         except Exception:  # pragma: no cover - defensive
             log.warning("Failed to build the segmentation prompt", exc_info=True)
             return PROVIDER_UNAVAILABLE
@@ -182,24 +173,9 @@ class DownloadedProvider:
         if raw_result is PROVIDER_UNAVAILABLE or raw_result is None:
             return raw_result  # unavailable (could not run)
 
-        # ``raw_result`` is the worker's raw tasks dict — validate + sanitize.
-        try:
-            validated = validate_llm_tasks(
-                raw_result,
-                activity_summary["session_start"],
-                activity_summary["session_end"],
-                activity_summary["time_map"],
-            )
-        except Exception:
-            log.warning("Downloaded-model output failed validation", exc_info=True)
-            return None
-        # Sanitize untrusted names/descriptions (KTD12), THEN gate on confidence
-        # (KTD9) — order matters: the sanitizer defaults an empty name to a
-        # placeholder, so the gate's blanking must be the final step.
-        from screencap import config
-
-        sanitized = sanitize_tasks(validated)
-        return apply_confidence_gate(sanitized, config.get_confidence_gate_threshold())
+        # ``raw_result`` is the worker's raw tasks dict — validate → sanitize
+        # (KTD12) → confidence-gate (KTD9), shared with the BYO backend.
+        return finalize_local_result(raw_result, activity_summary)
 
     def _run_worker(self, payload: str) -> dict | None | ProviderUnavailable:
         """Spawn the worker and return its raw ``result`` dict, ``None``, or the sentinel.
