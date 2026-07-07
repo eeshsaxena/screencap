@@ -235,16 +235,35 @@ final class OnboardingStepPolicyTests: XCTestCase {
 
     // MARK: - Honesty gate (KTD-9 / R7)
 
-    /// The storage and account steps carry no pricing, encryption, or
-    /// present-tense team-sharing copy while SCR-220/221/229 are open.
+    /// The storage and account steps carry no end-to-end-encryption or
+    /// present-tense team-sharing claims. The Personal card now DOES carry its
+    /// real price ($5/mo, billing U7 / R2) — honest and billable on a
+    /// server-readable tier — so pricing is no longer forbidden here; the E2EE
+    /// "we can't watch" claims still are (R2), and the Team card stays
+    /// price-free while coming-soon (checked below).
     func testStorageAndAccountCopyCarriesNoForbiddenClaims() {
         let all = OnboardingCopy.storageAndAccountStrings.joined(separator: " ").lowercased()
-        for forbidden in ["$", "month", "billing", "encrypt", "e2e", "keys stay", "we can't watch"] {
+        for forbidden in ["encrypt", "e2e", "keys stay", "we can't watch"] {
             XCTAssertFalse(all.contains(forbidden), "storage/account copy contains \"\(forbidden)\"")
         }
-        // The design's team card claims a shared library exists; the interim
-        // copy may only reference team libraries as future ("on the way").
         XCTAssertFalse(all.contains("shared team library"))
+    }
+
+    /// The Personal card shows its price now; the Team card (coming soon) must
+    /// not carry any price until the team tier actually ships (R11).
+    func testPersonalCardPricedButTeamCardIsNot() {
+        XCTAssertTrue(
+            OnboardingCopy.personalCardMeta.contains("$5"),
+            "Personal card should surface its $5/mo price"
+        )
+        let teamStrings = ([OnboardingCopy.teamCardTitle, OnboardingCopy.teamCardMeta]
+            + OnboardingCopy.teamCardBullets).joined(separator: " ").lowercased()
+        for forbidden in ["$", "month", "/mo"] {
+            XCTAssertFalse(
+                teamStrings.contains(forbidden),
+                "Team card must stay price-free while coming soon; found \"\(forbidden)\""
+            )
+        }
     }
 
     /// The welcome cards (the design's "Encrypted sharing … Always." card),

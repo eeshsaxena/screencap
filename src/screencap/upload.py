@@ -71,6 +71,51 @@ def _get_upload_url() -> str:
     return os.environ.get("SCREENCAP_UPLOAD_URL", DEFAULT_UPLOAD_URL)
 
 
+DEFAULT_CHECKOUT_URL = (
+    "https://southamerica-east1-proteus-photos.cloudfunctions.net/create-checkout-session"
+)
+
+
+def _get_checkout_url() -> str:
+    return os.environ.get("SCREENCAP_CHECKOUT_URL", DEFAULT_CHECKOUT_URL)
+
+
+def request_checkout_url() -> str:
+    """POST to create-checkout-session with the caller's bearer token; return the
+    hosted Stripe Checkout URL for the $5/mo Personal cloud plan (billing U9).
+
+    Mirrors :func:`request_signed_urls`'s auth/error handling: ``NotSignedIn`` ->
+    a clear "sign in" message, a transient ``AuthError`` -> retryable message.
+    The uid is derived server-side from the token, never sent by the client.
+    """
+    from screencap import auth
+
+    url = _get_checkout_url()
+    try:
+        resp = auth.authed_post(requests.post, url, json={}, timeout=30)
+    except auth.NotSignedIn:
+        raise RuntimeError("Sign in to upgrade: run `screencap login`.")
+    except auth.AuthError as e:
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+    except requests.ConnectionError:
+        raise RuntimeError("Checkout service unavailable. Check your internet connection.")
+    except requests.Timeout:
+        raise RuntimeError("Checkout service timed out. Try again later.")
+
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("error", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Checkout service error: {detail}")
+
+    checkout_url = resp.json().get("url")
+    if not checkout_url:
+        raise RuntimeError("Checkout service returned no URL.")
+    return checkout_url
+
+
 def _content_type(path: Path) -> str:
     ct = CONTENT_TYPES.get(path.suffix.lower())
     if ct:

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // U11 steps 3–5 — storage choice, account, and team setup (design 196–288).
@@ -130,17 +131,27 @@ struct OnboardingStorageStep: View {
 /// gate. A functional skip keeps the wizard completable without an account.
 struct OnboardingAccountStep: View {
     @EnvironmentObject private var auth: CloudAuthController
+    let tier: OnboardingStorageTier
     let onSignedIn: () -> Void
     let onSkip: () -> Void
 
+    /// Short reason surfaced when minting the checkout URL fails (U9).
+    @State private var upgradeError: String?
+
+    /// After sign-in, Personal cloud stays on this step until the $5/mo
+    /// subscription is active — the upgrade panel drives checkout (U8/U9).
+    private var showUpgrade: Bool {
+        auth.isSignedIn && tier == .personalCloud && !auth.isSubscribed
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            Text(OnboardingCopy.accountHeadline)
+            Text(showUpgrade ? "One more step to unlock cloud." : OnboardingCopy.accountHeadline)
                 .font(SCTypography.serifHeading)
                 .foregroundStyle(Color.scInk)
                 .multilineTextAlignment(.center)
                 .padding(.bottom, 10)
-            Text(OnboardingCopy.accountSub)
+            Text(showUpgrade ? OnboardingCopy.upgradeSub : OnboardingCopy.accountSub)
                 .font(SCTypography.sans(size: 14))
                 .foregroundStyle(Color.scInkSecondary)
                 .multilineTextAlignment(.center)
@@ -149,6 +160,8 @@ struct OnboardingAccountStep: View {
 
             if auth.signInFlow == .inProgress {
                 signInWaiting
+            } else if showUpgrade {
+                upgradePanel
             } else {
                 signInActions
             }
@@ -158,6 +171,54 @@ struct OnboardingAccountStep: View {
         }
         .padding(.horizontal, 100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Subscription just became active (webhook granted it) → finish the step.
+        .onChange(of: auth.isSubscribed) { subscribed in
+            if subscribed, tier == .personalCloud { onSignedIn() }
+        }
+        // Returning from the browser checkout → re-check entitlement.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            if showUpgrade { Task { await auth.refreshEntitlement() } }
+        }
+    }
+
+    private var upgradePanel: some View {
+        VStack(spacing: 12) {
+            Text(OnboardingCopy.upgradePriceLine)
+                .font(SCTypography.metaMono)
+                .foregroundStyle(Color.scTeal)
+            ForEach(OnboardingCopy.upgradeBullets, id: \.self) { bullet in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("—").foregroundStyle(Color.scInkMuted)
+                    Text(bullet).foregroundStyle(Color.scInkSecondary)
+                }
+                .font(SCTypography.sans(size: 12.5))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let upgradeError {
+                Text(upgradeError)
+                    .font(SCTypography.sans(size: 12.5))
+                    .foregroundStyle(Color.scRust)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
+            }
+            OnboardingPrimaryButton(title: "Continue to payment — $5/month") {
+                upgradeError = nil
+                auth.startCheckout { reason in upgradeError = reason }
+            }
+            .padding(.top, 4)
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Unlocks automatically once payment completes.")
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkMuted)
+            }
+            OnboardingLinkButton(title: "I've paid — check now") {
+                Task { await auth.refreshEntitlement() }
+            }
+        }
+        .frame(width: 360)
     }
 
     private var signInWaiting: some View {
@@ -206,8 +267,16 @@ struct OnboardingAccountStep: View {
     /// bring native per-provider flows.
     private func startSignIn() {
         auth.startSignIn { success in
-            if success { onSignedIn() }
+            if success { proceedAfterSignIn() }
         }
+    }
+
+    /// Personal cloud requires an active subscription before finishing — the
+    /// upgrade panel (shown reactively when `showUpgrade`) drives it. Team and
+    /// already-subscribed accounts proceed immediately (U9).
+    private func proceedAfterSignIn() {
+        if tier == .personalCloud, !auth.isSubscribed { return }
+        onSignedIn()
     }
 
     private func providerButton(label: String, monogram: String) -> some View {
@@ -310,8 +379,14 @@ struct OnboardingTeamStep: View {
             .padding(.bottom, 28)
 
             HStack(spacing: 18) {
-                OnboardingPrimaryButton(title: "Create team", enabled: false, action: {})
-                    .help(Self.stubHelp)
+                // U10: Team cloud is coming soon — the primary action captures
+                // interest via the hosted waitlist form rather than a dead
+                // "Create team" (the team backend is deferred).
+                OnboardingPrimaryButton(title: "Join the Team cloud waitlist") {
+                    if let url = URL(string: OnboardingCopy.teamWaitlistURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
                 OnboardingLinkButton(title: "I have an invite link", enabled: false, action: {})
                     .help(Self.stubHelp)
             }

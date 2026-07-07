@@ -126,6 +126,7 @@ struct OnboardingWizard: View {
             OnboardingStorageStep(tier: $tier, onContinue: storageContinue)
         case .account:
             OnboardingAccountStep(
+                tier: tier,
                 onSignedIn: accountSignedIn,
                 onSkip: complete
             )

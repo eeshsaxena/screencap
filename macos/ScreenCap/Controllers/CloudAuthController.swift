@@ -1,8 +1,22 @@
+import AppKit
 import Combine
 import Foundation
 import OSLog
 
 private let authLogger = Logger(subsystem: "com.screencap.macos", category: "cloud-auth")
+
+/// Decoded `screencap checkout-url --json` envelope (billing U9): `{ok, url}` on
+/// success or `{ok:false, error}`. Tolerant parse like `AuthWhoAmIEnvelope`.
+private struct CheckoutURLEnvelope: Decodable {
+    let ok: Bool?
+    let url: String?
+    let error: String?
+
+    static func parse(_ data: Data) -> CheckoutURLEnvelope? {
+        guard !data.isEmpty else { return nil }
+        return try? JSONDecoder().decode(CheckoutURLEnvelope.self, from: data)
+    }
+}
 
 /// Sign-in flow state, distinct from `AuthStatus` (which is the persistent
 /// signed-in/out fact). Drives the "Waiting for sign-in in your browser…"
@@ -41,6 +55,15 @@ protocol CloudAuthService {
     /// Runs `screencap logout` (best-effort; the CLI swallows the common
     /// "nothing stored" case and exits zero).
     func signOut() async throws
+
+    /// Raw stdout of `screencap whoami --force-refresh --json` — re-mints the ID
+    /// token first so a just-granted `subscribed` claim is visible immediately
+    /// (billing U5/U9, post-checkout).
+    func fetchWhoAmIForceRefresh() async throws -> Data
+
+    /// Raw stdout of `screencap checkout-url --json` — a hosted Stripe Checkout
+    /// URL for the $5/mo plan (billing U9). Token handling stays in Python.
+    func fetchCheckoutURL() async throws -> Data
 }
 
 @MainActor
@@ -74,6 +97,14 @@ final class LiveCloudAuthService: CloudAuthService {
         // (not decoding) is the right primitive.
         try await CLIClient.runAwaitingExit(["logout"], timeout: 15)
     }
+
+    func fetchWhoAmIForceRefresh() async throws -> Data {
+        try await CLIClient.runJSONRaw(["whoami", "--force-refresh", "--json"], timeout: 30)
+    }
+
+    func fetchCheckoutURL() async throws -> Data {
+        try await CLIClient.runJSONRaw(["checkout-url", "--json"], timeout: 30)
+    }
 }
 
 /// Owns cloud sign-in state for the app shell (plan U6). Surfaces:
@@ -92,6 +123,10 @@ final class LiveCloudAuthService: CloudAuthService {
 final class CloudAuthController: ObservableObject {
     @Published private(set) var status: AuthStatus = .unknown
     @Published private(set) var signInFlow: SignInFlowState = .idle
+    /// Cloud-paywall entitlement (billing U8). Display/UX only — the signer's
+    /// hard gate is the real enforcement. Read from the `whoami` envelope's
+    /// `subscribed` field; false when signed out or absent.
+    @Published private(set) var isSubscribed: Bool = false
 
     private let service: CloudAuthService
     /// Read-only window onto the upload count that gates Sign Out. Owned by the
@@ -151,9 +186,51 @@ final class CloudAuthController: ObservableObject {
             let envelope = AuthWhoAmIEnvelope.parse(data)
             warnOnSchemaDrift(envelope)
             status = AuthStatus.from(envelope: envelope)
+            isSubscribed = envelope?.subscribed ?? false
         } catch {
             authLogger.debug("whoami refresh failed: \(error.localizedDescription, privacy: .public); treating as signed out")
             status = .signedOut
+            isSubscribed = false
+        }
+    }
+
+    // MARK: - Entitlement + checkout (billing U8/U9)
+
+    /// Force-refresh the ID token, then re-read `whoami`, so a just-completed
+    /// checkout's `subscribed` claim is reflected without a re-login (U9). Leaves
+    /// status untouched on failure (offline) rather than flipping signed-out.
+    func refreshEntitlement() async {
+        do {
+            let data = try await service.fetchWhoAmIForceRefresh()
+            let envelope = AuthWhoAmIEnvelope.parse(data)
+            warnOnSchemaDrift(envelope)
+            if envelope?.signedIn == true {
+                status = AuthStatus.from(envelope: envelope)
+            }
+            isSubscribed = envelope?.subscribed ?? isSubscribed
+        } catch {
+            authLogger.debug("entitlement refresh failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Opens hosted Stripe Checkout for the $5/mo plan in the browser (U9). The
+    /// URL is minted by `checkout-url` (token stays in Python); `onFailure`
+    /// carries a short reason for the UI when the mint fails.
+    func startCheckout(onFailure: @escaping @MainActor (String) -> Void = { _ in }) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let data = try await self.service.fetchCheckoutURL()
+                let env = CheckoutURLEnvelope.parse(data)
+                guard env?.ok != false, let urlString = env?.url,
+                      let url = URL(string: urlString) else {
+                    onFailure(env?.error ?? "Couldn't start checkout.")
+                    return
+                }
+                NSWorkspace.shared.open(url)
+            } catch {
+                onFailure(error.localizedDescription)
+            }
         }
     }
 
@@ -270,6 +347,7 @@ final class CloudAuthController: ObservableObject {
         let resolved = AuthStatus.from(envelope: envelope)
         if exitCode == 0, resolved.isSignedIn {
             status = resolved
+            isSubscribed = envelope?.subscribed ?? false
             signInFlow = .idle
             finishResult(true)
             return

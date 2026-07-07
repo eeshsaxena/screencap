@@ -1657,6 +1657,37 @@ def whoami_cmd(as_json, force_refresh):
         console.print("Not signed in. Run [bold]screencap login[/bold] to upload to the cloud.")
 
 
+@cli.command("checkout-url")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def checkout_url_cmd(as_json):
+    """Print a hosted Stripe Checkout URL for the $5/mo Personal cloud plan.
+
+    Requires sign-in (the uid is derived server-side from the bearer token). The
+    macOS app opens the printed URL in the browser; on return it force-refreshes
+    the entitlement (`whoami --force-refresh`) to pick up the granted plan.
+    """
+    from screencap import upload
+
+    try:
+        url = upload.request_checkout_url()
+    except Exception as e:
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
+            ))
+            sys.exit(1)
+        console.print(f"[red]Couldn't start checkout:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps(
+            {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, "url": url}
+        ))
+        return
+    console.print(url)
+
+
 @cli.command()
 @click.argument("name", required=False, default=None)
 @click.option("--all", "all_recordings", is_flag=True, help="Export all recordings.")

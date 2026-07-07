@@ -240,7 +240,7 @@ enum OnboardingCopy {
     ]
 
     static let personalCardTitle = "Personal cloud"
-    static let personalCardMeta = "just you"
+    static let personalCardMeta = "$5/month"
     static let personalCardBullets = [
         "Upload the recordings you approve",
         "Share single recordings by link",
@@ -264,11 +264,29 @@ enum OnboardingCopy {
         "Sign-in opens in your browser. Uploads still happen only when you "
         + "approve them, recording by recording."
 
+    // Billing U9 — the post-sign-in upgrade panel for Personal cloud. Unlike the
+    // pre-billing gate, these DO carry the price ($5/mo is true and billable
+    // now), but carry NO end-to-end-encryption / "we can't watch" claim (R2 —
+    // the paid tier is server-readable). Team stays price-free (coming soon).
+    static let upgradeSub =
+        "Personal cloud keeps the recordings you approve backed up and shareable. "
+        + "Local recording stays free either way."
+    static let upgradePriceLine = "$5 / month · cancel anytime"
+    static let upgradeBullets = [
+        "Upload the recordings you approve",
+        "Share single recordings by link",
+    ]
+
     // Step 5 — team setup (design 264–288). The design's "one shared,
     // encrypted library" is SCR-221/SCR-220; the fields render per the design
     // but disabled (KTD-8) under future-tense copy.
     static let teamHeadline = "Set up your team."
     static let teamSub = "Team libraries are on the way — you'll be the admin when they land."
+
+    /// Billing U10 — Team cloud is coming-soon; capture interest via a hosted
+    /// waitlist form (no team backend yet, KTD-7). Swap for a self-hosted
+    /// endpoint later. Placeholder URL — replace with the real form before launch.
+    static let teamWaitlistURL = "https://screencap.app/team-waitlist"
 
     /// Every string the storage + account steps render, for the KTD-9
     /// string-level gate (no pricing, encryption, or team-sharing claims).
