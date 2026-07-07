@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.24.0] - 2026-07-07
+
+### Added
+
+- **segmentation:** Pluggable LLM provider interface + Gemini backend (U2)
+- **segmentation:** Strip masked/blocked content before any provider (U3, R11)
+- **cloud:** Client-side E2EE for cloud uploads (default off)
+- **segmentation:** Per-task consent policy (U6, R6-R10)
+- **segmentation:** On-device provider via Foundation Models Swift helper (U5, R2, R3)
+- **segmentation:** Run segmentation locally in terminal_stage (U4, R3, R4)
+- **segmentation:** Graceful degradation ladder for local day-split (U7, R5)
+- **cli:** screencap settings intelligence verb (U8, R2, R6)
+- **app:** Surface locally-generated named tasks in Journal and Library (U10, R4)
+- **app:** Intelligence settings pane — model picker + per-task consent (U9, R2, R6-R9)
+- **macos:** Recording toolbar hide controls v2 — ⌘⇧H, edge peek, one-time hint
+- **segmentation:** U1 local-model runtime abstraction + optional deps (SCR-239)
+- **segmentation:** U2 downloaded-model provider + hardened subprocess worker (SCR-239)
+- **segmentation:** U3 confidence gate, fail-closed on missing enum (SCR-239)
+- **models:** U4 model download + integrity engine (SCR-239)
+- **segmentation:** U7 BYO local-server provider + endpoint classifier (SCR-239)
+- **segmentation:** U8 chained on-device resolution + day-split routing (SCR-239)
+- **daemon:** U5 model-download job + verbs (SCR-239)
+- **billing:** Personal-cloud $5/mo paywall backend (SCR-237 U1-U6, U12)
+- **cli:** U6 screencap model download/status/cancel group (SCR-239)
+- **cli:** U9 settings intelligence extension for downloaded/BYO (SCR-239)
+- **benchmarks:** U12 segmentation eval scoring harness (SCR-239)
+- **billing:** Daemon token re-mint + dropped-webhook reconciliation (SCR-237 U13, U14)
+- **macos:** U10 Intelligence pane downloaded-model + local-server rows (SCR-239)
+- **macos:** U11 onboarding download offer + sidebar hint (SCR-239)
+- **app:** Personal-cloud paywall onboarding + checkout (SCR-237 U7-U10)
+
+### Fixed
+
+- **macos:** Drop duplicate Stop button, align recording banner to design tokens
+- **review:** Tear down hint on recording end + harden HUD input monitor
+- **review:** Harden the on-device privacy + subprocess boundary
+- **review:** Address SCR-239 code-review findings
+- **billing:** Correct billing deploy commands + guard local Stripe env
+
+### Changed
+
+- **segmentation:** Extract cloud segmentation core into importable package (U1)
+- **cloud:** Dedup E2EE upload seams and secret-file write
+- **segmentation:** Dedup local-model finish + MLX load-once (SCR-239)
+
 ## [0.23.0] - 2026-07-06
 
 ### Changed
