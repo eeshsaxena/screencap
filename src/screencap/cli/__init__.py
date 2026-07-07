@@ -3310,7 +3310,7 @@ def settings_intelligence(row, op, value, as_json):
         err_console.print(f"  [bold]intelligence.provider[/bold] set {escape(str(value))}")
 
     elif row == "local_server_endpoint":
-        from screencap.segmentation.endpoint import classify_endpoint
+        from screencap.segmentation.endpoint import LOCAL, classify_endpoint
 
         if value.lower() in ("none", ""):
             config.set_intelligence_endpoint(None)
@@ -3329,7 +3329,7 @@ def settings_intelligence(row, op, value, as_json):
             cls = classify_endpoint(value)
             redacted = _redact_url(value)
             note = (
-                "local — day-split on-device" if cls == "LOCAL"
+                "local — day-split on-device" if cls == LOCAL
                 else "remote — treated as cloud (day-split off)"
             )
             err_console.print(

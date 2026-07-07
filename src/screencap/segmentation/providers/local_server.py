@@ -78,6 +78,15 @@ class LocalServerProvider:
             log.info("No local-server endpoint configured; provider unavailable")
             return PROVIDER_UNAVAILABLE
 
+        # Re-assert LOCAL on the exact string about to be POSTed (KTD8). Routing
+        # classifies at build time, but the endpoint is re-read from config here,
+        # so classify the value we will actually egress — never send off-box.
+        from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+
+        if classify_endpoint(endpoint) != LOCAL:
+            log.warning("Local-server endpoint is not LOCAL at send time; unavailable")
+            return PROVIDER_UNAVAILABLE
+
         try:
             prompt = build_local_prompt(activity_summary["summary"])
         except Exception:  # pragma: no cover - defensive
@@ -100,7 +109,13 @@ class LocalServerProvider:
             import requests
         except ImportError:  # pragma: no cover
             return None
-        url = endpoint.rstrip("/") + "/v1/chat/completions"
+        # Accept the endpoint with or without a trailing ``/v1`` — LM Studio and
+        # Ollama present their OpenAI-compatible base URL as ``.../v1``, so naive
+        # concatenation would double it to ``/v1/v1/chat/completions`` (404).
+        base = endpoint.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")].rstrip("/")
+        url = base + "/v1/chat/completions"
         body = {
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
@@ -108,18 +123,27 @@ class LocalServerProvider:
             "stream": False,
         }
         try:
-            resp = requests.post(
+            # ``stream=True`` so the size cap bounds what we read into memory — a
+            # non-streaming read fully buffers the body before any cap can fire,
+            # letting a hostile local server drive daemon memory pressure (KTD8).
+            with requests.post(
                 url,
                 json=body,
                 timeout=_REQUEST_TIMEOUT_S,
                 allow_redirects=False,  # a 302 must not bounce us off-box (KTD8)
-            )
-            if resp.status_code != 200:
-                return None
-            if len(resp.content) > _MAX_RESPONSE_BYTES:
-                log.warning("Local-server response exceeds the size cap; unavailable")
-                return None
-            content = resp.json()["choices"][0]["message"]["content"]
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    return None
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    total += len(chunk)
+                    if total > _MAX_RESPONSE_BYTES:
+                        log.warning("Local-server response exceeds the size cap; unavailable")
+                        return None
+                    chunks.append(chunk)
+            content = json.loads(b"".join(chunks))["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             return parsed if isinstance(parsed, dict) else None
         except Exception:

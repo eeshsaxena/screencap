@@ -80,6 +80,26 @@ class TestLifecycle:
         assert EVENT_MODEL_DOWNLOAD_FAILED in [e["type"] for e in bus.events]
         assert job.is_running() is False  # daemon stays up
 
+    async def test_unpinned_model_reports_not_release_pinned(self, monkeypatch):
+        # The shipped default model is PLACEHOLDER-pinned, so download_model raises
+        # ModelNotPinnedError — the job must surface a distinct, greppable reason
+        # rather than the opaque "job-crashed" of the broad-Exception handler.
+        from screencap.models.download import ModelNotPinnedError
+
+        def unpinned(model_id, *, progress_cb, stop_event, **kw):
+            raise ModelNotPinnedError("qwen2.5-3b-instruct is not release-pinned")
+
+        _patch_download(monkeypatch, unpinned)
+        bus = FakeBus()
+        job = ModelDownloadJob(bus)
+        job.start("qwen2.5-3b-instruct")
+        await _drain(job)
+
+        assert job.status().state == "failed"
+        assert job.status().reason == "not-release-pinned"
+        assert EVENT_MODEL_DOWNLOAD_FAILED in [e["type"] for e in bus.events]
+        assert job.is_running() is False
+
     async def test_failed_result_maps_to_failed_event(self, monkeypatch):
         def fake(model_id, *, progress_cb, stop_event, **kw):
             return DownloadResult("failed", model_id or "m", "llamacpp",

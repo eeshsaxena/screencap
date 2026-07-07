@@ -24,11 +24,11 @@ from dataclasses import dataclass, field
 #: Sentinel for a not-yet-release-pinned revision / file hash.
 PLACEHOLDER = "PLACEHOLDER-record-at-release-QA"
 
-#: Non-executable weight formats we will install. Everything else (pickle-based
-#: `.bin`/`.pt`/`.ckpt`, or a `.py`) is rejected at download (KTD5, H1).
-ALLOWED_FORMATS = frozenset({"safetensors", "gguf"})
-
-#: File extensions that can execute code on load — never installed.
+#: File extensions that can execute code on load — never installed. Format safety
+#: is enforced as this **denylist** (plus the manifest's exact-filename allow list
+#: and per-file sha256 pin in :func:`~screencap.models.download.download_model`);
+#: the weight files themselves are the non-executable safetensors / GGUF a variant
+#: declares via :attr:`Variant.allowed_format` (KTD5, H1).
 DISALLOWED_EXTS = frozenset({".bin", ".pt", ".pth", ".pickle", ".ckpt", ".py"})
 
 # Runtime identifiers (mirror screencap.segmentation.local_model.runtime).

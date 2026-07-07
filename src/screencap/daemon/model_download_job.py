@@ -158,7 +158,7 @@ class ModelDownloadJob:
     # -- Internal run driver ----------------------------------------------
 
     async def _run(self, model_id: str | None, engine_kwargs: dict[str, Any]) -> None:
-        from screencap.models.download import download_model
+        from screencap.models.download import ModelNotPinnedError, download_model
 
         try:
             result = await asyncio.to_thread(
@@ -169,6 +169,13 @@ class ModelDownloadJob:
                 **engine_kwargs,
             )
             await self._on_terminal(result)
+        except ModelNotPinnedError:
+            # The shipped default model is PLACEHOLDER-pinned until release QA, so
+            # this is the expected outcome of a v1 download attempt — surface a
+            # distinct, greppable, non-retryable reason instead of the opaque
+            # "job-crashed" the broad handler would report.
+            logger.info("model download refused: model not release-pinned")
+            await self._publish_terminal("failed", "not-release-pinned")
         except Exception:
             logger.exception("model download job crashed; reporting failed")
             await self._publish_terminal("failed", "job-crashed")

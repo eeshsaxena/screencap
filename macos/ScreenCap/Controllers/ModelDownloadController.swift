@@ -91,12 +91,28 @@ final class ModelDownloadController: ObservableObject {
     typealias JSONInvoker = @Sendable ([String]) async throws -> Data
     private let invoke: JSONInvoker
 
+    /// The status-poll loop that runs only while a download is in flight; nil when
+    /// idle/terminal. See ``startPollingIfNeeded()``.
+    private var pollTask: Task<Void, Never>?
+
     init(invoke: @escaping JSONInvoker = ModelDownloadController.defaultInvoke) {
         self.invoke = invoke
     }
 
+    deinit {
+        pollTask?.cancel()
+    }
+
     static let defaultInvoke: JSONInvoker = { args in
-        try await CLIClient.runJSONRaw(args)
+        // `model status --json` returns a JSON envelope; the write verbs
+        // (`model download` / `model cancel`) emit no JSON, so route them through
+        // the non-asserting runner — `runJSONRaw` asserts `--json` is present and
+        // would abort the app in Debug when a write verb (no `--json`) is passed.
+        if args.contains("--json") {
+            return try await CLIClient.runJSONRaw(args)
+        }
+        try await CLIClient.runAwaitingExit(args)
+        return Data()
     }
 
     /// Whether the default (only) model is installed — drives the pane's row.
@@ -141,10 +157,12 @@ final class ModelDownloadController: ObservableObject {
             lastError = error.localizedDescription
         }
         await refreshStatus()
+        startPollingIfNeeded()
     }
 
     /// Cancel an in-flight download; state converges to `.cancelled` / `.idle`.
     func cancel() async {
+        stopPolling()
         do {
             _ = try await invoke(["model", "cancel"])
             lastError = nil
@@ -152,5 +170,29 @@ final class ModelDownloadController: ObservableObject {
             lastError = error.localizedDescription
         }
         await refreshStatus()
+    }
+
+    /// Poll `model status` on a ~1s cadence while a download is in flight so the
+    /// pane's ProgressView advances. The `model download` verb returns immediately
+    /// (the daemon job runs in the background), so without this the bar would
+    /// freeze at its first reading. Self-cancels once state leaves `.downloading`.
+    private func startPollingIfNeeded() {
+        guard state.isDownloading, pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                await self.refreshStatus()
+                if !self.state.isDownloading {
+                    self.stopPolling()
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopPolling() {
+        pollTask?.cancel()
+        pollTask = nil
     }
 }

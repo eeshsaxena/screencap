@@ -7,6 +7,9 @@ confidence-gate parity with the downloaded path, and the localhost→127.0.0.1 p
 
 from __future__ import annotations
 
+import json
+import sys
+
 import pytest
 
 from screencap.segmentation.provider import (
@@ -99,6 +102,19 @@ class TestPrivacy:
         result = provider.segment(_stripped())
         assert result["tasks"][0]["name"] == ""
 
+    def test_remote_endpoint_refused_at_send_time_without_egress(self):
+        # The provider re-classifies the exact endpoint it is about to POST (KTD8):
+        # a REMOTE value resolved from config must never reach raw_call.
+        called = {"n": 0}
+
+        def raw(ep, p):
+            called["n"] += 1
+            return _raw_result()
+
+        provider = LocalServerProvider(endpoint="http://evil.example.com:1234", raw_call=raw)
+        assert provider.segment(_stripped()) is PROVIDER_UNAVAILABLE
+        assert called["n"] == 0  # nothing egressed off-box
+
     def test_endpoint_passed_to_raw_call_has_localhost_pinned(self):
         seen = {}
 
@@ -122,3 +138,65 @@ class TestPinAndFactory:
         provider = get_provider("local-server")
         assert isinstance(provider, LocalServerProvider)
         assert isinstance(provider, LLMProvider)
+
+
+class TestDefaultRawCall:
+    """The live ``_default_raw_call`` path (URL de-dup + streaming size cap) via a
+    stubbed ``requests`` module — not otherwise exercised (tests inject ``raw_call``)."""
+
+    @staticmethod
+    def _fake_requests(*, status: int, chunks: list[bytes]):
+        import types
+
+        captured: dict = {}
+
+        class _Resp:
+            status_code = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def iter_content(self, chunk_size: int = 0):
+                yield from chunks
+
+        def post(url, **kw):
+            captured["url"] = url
+            captured["kwargs"] = kw
+            return _Resp()
+
+        return types.SimpleNamespace(post=post), captured
+
+    @staticmethod
+    def _ok_body() -> bytes:
+        inner = json.dumps({"tasks": [], "summary": {}, "tags": []})
+        return json.dumps({"choices": [{"message": {"content": inner}}]}).encode()
+
+    def test_v1_base_url_is_not_doubled(self, monkeypatch):
+        fake, captured = self._fake_requests(status=200, chunks=[self._ok_body()])
+        monkeypatch.setitem(sys.modules, "requests", fake)
+
+        out = LocalServerProvider._default_raw_call("http://127.0.0.1:1234/v1", "p")
+        assert out == {"tasks": [], "summary": {}, "tags": []}
+        assert captured["url"] == "http://127.0.0.1:1234/v1/chat/completions"
+        # KTD8 connect-time guarantees still hold on the streaming path.
+        assert captured["kwargs"]["allow_redirects"] is False
+        assert captured["kwargs"]["stream"] is True
+
+    def test_bare_base_url_gets_v1(self, monkeypatch):
+        fake, captured = self._fake_requests(status=200, chunks=[self._ok_body()])
+        monkeypatch.setitem(sys.modules, "requests", fake)
+
+        LocalServerProvider._default_raw_call("http://127.0.0.1:1234/", "p")
+        assert captured["url"] == "http://127.0.0.1:1234/v1/chat/completions"
+
+    def test_oversized_body_is_rejected(self, monkeypatch):
+        from screencap.segmentation.providers import local_server
+
+        big = b"x" * (local_server._MAX_RESPONSE_BYTES + 1)
+        fake, _ = self._fake_requests(status=200, chunks=[big])
+        monkeypatch.setitem(sys.modules, "requests", fake)
+
+        assert LocalServerProvider._default_raw_call("http://127.0.0.1:1234", "p") is None

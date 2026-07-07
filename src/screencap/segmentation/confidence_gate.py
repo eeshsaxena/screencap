@@ -39,11 +39,15 @@ def apply_confidence_gate(
     """Blank the name of every task at/below ``threshold`` confidence (or missing).
 
     ``None`` passes through unchanged. A task is *blanked* (``name``/``derived_name``
-    set to ``""`` — an unnamed boundary the UI renders as such) when its confidence
-    rank is ``<=`` the threshold rank; a missing/unparseable confidence ranks below
-    all thresholds and is always blanked. The task itself is kept (boundary
-    preserved), never dropped. An unknown ``threshold`` falls back to
-    :data:`DEFAULT_THRESHOLD`.
+    **and** the model-written ``description`` set to ``""`` — an unnamed boundary the
+    UI renders as such) when its confidence rank is ``<=`` the threshold rank; a
+    missing/unparseable confidence ranks below all thresholds and is always blanked.
+    The task itself is kept (boundary preserved), never dropped. An unknown
+    ``threshold`` falls back to :data:`DEFAULT_THRESHOLD`.
+
+    The ``description`` is blanked with the name because it is the same
+    low-confidence model guess reaching the same sink — leaving it populated would
+    surface free text the model wasn't confident in, defeating "never mislead".
     """
     if tasks_dict is None:
         return None
@@ -56,4 +60,5 @@ def apply_confidence_gate(
             if _rank(task.get("confidence")) <= thr:
                 task["name"] = ""
                 task["derived_name"] = ""
+                task["description"] = ""
     return tasks_dict

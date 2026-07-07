@@ -46,6 +46,20 @@ class TestGate:
         result = apply_confidence_gate(_tasks("medium"), "low")
         assert result["tasks"][0]["name"] == "Task 0"
 
+    def test_low_confidence_blanks_description_too(self):
+        """A gated task carries no model-written free text either (never mislead)."""
+        tasks = _tasks("low")
+        tasks["tasks"][0]["description"] = "Refactored the auth module"
+        result = apply_confidence_gate(tasks, "low")
+        assert result["tasks"][0]["name"] == ""
+        assert result["tasks"][0]["description"] == ""
+
+    def test_high_confidence_keeps_description(self):
+        tasks = _tasks("high")
+        tasks["tasks"][0]["description"] = "kept — model was confident"
+        result = apply_confidence_gate(tasks, "low")
+        assert result["tasks"][0]["description"] == "kept — model was confident"
+
     def test_missing_confidence_is_blanked_failclosed(self):
         """Covers AE3: an absent confidence is treated as below every threshold."""
         tasks = _tasks("high")
