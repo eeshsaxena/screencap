@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 
     from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
+    from screencap.segmentation.provider import SegmentResult
     from screencap.upload import FileInfo
 
 logger = logging.getLogger(__name__)
@@ -186,6 +187,12 @@ class TerminalResult:
     evicted: list[int] = field(default_factory=list)
     masked_copies_evicted: list[int] = field(default_factory=list)
     bytes_freed: int = 0
+    # U4 — count of named task segments persisted to the LOCAL tasks store this
+    # run (0 when the recording is not local, the provider returned no tasks, or
+    # segmentation failed open). Informational; the ledger + tasks.json are the
+    # source of truth. ``tasks_persisted`` stays 0 on any fail-open path so a
+    # caller can tell "segmented, no tasks" apart from "segmented N tasks".
+    tasks_persisted: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +752,15 @@ def _run_locked(
         # we never produce a scrubbed copy for a local recording.
         _route_local(ledger, result)
         result.routed = True
+        # U4 (R3, R4): run session→named-task segmentation on the Mac for this
+        # LOCAL recording and persist the named tasks to the LOCAL-only tasks
+        # store (tasks.json + the pipeline_task_segments ledger table). Runs
+        # inside the terminal flock, AFTER the routing decision and BEFORE
+        # retention. Strictly fail-open: no provider result (None / any error)
+        # leaves the recording unnamed but NEVER blocks terminal completion,
+        # and never triggers an upload (AE1 — the LOCAL branch has no upload
+        # seam and the tasks store is excluded from upload by rule).
+        _run_local_segmentation(recording_dir, ledger, result)
         # Retention is UNIVERSAL (R11): a local recording with a size/time cap
         # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
         # no-op. No remote precondition for local eviction.
@@ -867,6 +883,243 @@ def _route_local(ledger: "PipelineLedger | None", result: TerminalResult) -> Non
         with contextlib.suppress(Exception):
             ledger.mark_local_done(row.chunk_index)
             result.n_local_done += 1
+
+
+_LOCAL_TASKS_FILE = "tasks.json"
+
+
+def _run_local_segmentation(
+    recording_dir: Path,
+    ledger: "PipelineLedger | None",
+    result: TerminalResult,
+) -> None:
+    """Segment a LOCAL recording into named tasks; persist to the local store (U4/U7).
+
+    Runs on the Mac inside the terminal flock (R3/R4). Builds the activity
+    summary from the recording's LOCAL on-disk chunk artifacts, passing the
+    recording dir as ``blocked_source`` so the U3 privacy strip drops
+    masked/blocked content BEFORE it reaches any provider (R11 / AE1). Resolves
+    the configured provider (``config.get_llm_provider`` → ``get_provider``) and
+    calls ``segment``. A returned tasks dict is written to BOTH the recording's
+    ``tasks.json`` and the ``pipeline_task_segments`` ledger table (idempotent —
+    re-entry REPLACES, never duplicates).
+
+    **Graceful degradation ladder (U7, R5 / KTD6).** The provider's outcome is
+    routed through :func:`screencap.segmentation.degrade.resolve_day_split`:
+
+    * a real tasks dict → persisted unchanged;
+    * ``PROVIDER_UNAVAILABLE`` (could not run — e.g. no on-device model on a
+      CLI-only / pre-macOS-26 install) → fall back to the **local idle-gap
+      heuristic** (``task_manifest._segment_tasks`` over the recording's local
+      events) and persist THOSE mechanically-named tasks. Cloud is **never** a
+      day-split fallback (R7 over R5), so this path never touches the network;
+    * ``None`` (ran, produced nothing) → left unnamed (fail-open); the heuristic
+      is NOT run for a genuine empty result.
+
+    **Strictly fail-open.** An empty/invalid summary or any unexpected error
+    leaves the recording unnamed but NEVER blocks terminal completion and NEVER
+    uploads — the LOCAL branch has no upload seam at all.
+    """
+    from screencap.segmentation.consent import ConsentPolicy
+    from screencap.segmentation.degrade import DegradeAction, resolve_day_split
+
+    try:
+        provider_result = _segment_local_tasks(recording_dir)
+    except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
+        logger.debug(
+            "terminal_stage: local segmentation failed open for %s (%s)",
+            recording_dir.name, exc,
+        )
+        return
+
+    try:
+        decision = resolve_day_split(provider_result, ConsentPolicy.from_config())
+    except Exception as exc:  # noqa: BLE001 — the ladder must never block terminal
+        logger.debug(
+            "terminal_stage: degradation resolve failed open for %s (%s)",
+            recording_dir.name, exc,
+        )
+        return
+
+    if decision.action is DegradeAction.USE_PROVIDER:
+        tasks = decision.tasks
+    elif decision.action is DegradeAction.HEURISTIC:
+        # On-device unavailable → idle-gap heuristic ONLY (never cloud, KTD6).
+        try:
+            tasks = _heuristic_local_tasks(recording_dir)
+        except Exception as exc:  # noqa: BLE001 — heuristic must never block terminal
+            logger.debug(
+                "terminal_stage: idle-gap heuristic failed open for %s (%s)",
+                recording_dir.name, exc,
+            )
+            return
+    else:
+        # NONE (provider ran, no tasks) or CLOUD (never reachable for day-split)
+        # → fail open, nothing to persist.
+        return
+
+    if not tasks:
+        return
+    try:
+        n = _persist_local_tasks(recording_dir, ledger, tasks)
+    except Exception as exc:  # noqa: BLE001 — a persistence failure must not block
+        logger.warning(
+            "terminal_stage: persisting local tasks failed for %s (%s)",
+            recording_dir.name, exc,
+        )
+        return
+    result.tasks_persisted = n
+
+
+def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
+    """Build the stripped activity summary and run the configured provider.
+
+    Returns the provider's raw :class:`~screencap.segmentation.provider.SegmentResult`
+    — a validated tasks dict, ``None`` (ran, no usable tasks / no activity), or
+    ``PROVIDER_UNAVAILABLE`` (could not run). The sentinel is preserved (not
+    collapsed to a falsy ``None``) so the caller's degradation ladder can route
+    on the None-vs-unavailable distinction. All heavy imports are deferred so
+    the terminal-stage import surface stays light.
+    """
+    from screencap import config
+    from screencap.segmentation.activity_summary import build_activity_summary
+    from screencap.segmentation.local_source import (
+        LocalActivitySource,
+        load_local_manifests,
+    )
+    from screencap.segmentation.provider import get_provider
+
+    manifests = load_local_manifests(recording_dir)
+    if not manifests:
+        return None
+
+    summary = build_activity_summary(
+        recording_dir.name,
+        manifests,
+        LocalActivitySource(recording_dir, manifests),
+        # U3 privacy strip: pass the recording dir so blocked/masked intervals
+        # are re-derived over its local recording.db and stripped ALLOW-only,
+        # fail-closed — BEFORE the summary reaches any provider (R11 / AE1).
+        blocked_source=recording_dir,
+    )
+    if summary is None:
+        return None
+
+    # The summary was built with blocked_source, so build_activity_summary has
+    # run the R11 strip and marked the summary stripped AUTHORITATIVELY — the
+    # on-device provider's fail-closed gate relies on that builder-set marker, so
+    # the caller does not (and must not) forge it here.
+
+    # Resolve and run the configured provider. segment() returns a validated
+    # tasks dict, None (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not
+    # run). The caller's ladder routes an unavailable result to the idle-gap
+    # heuristic (day-split → heuristic only, KTD6).
+    provider = get_provider(config.get_llm_provider())
+    return provider.segment(summary)
+
+
+def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
+    """Idle-gap heuristic fallback for a LOCAL recording (U7, R5 / AE4).
+
+    Reused when the on-device provider is UNAVAILABLE (never for a genuine empty
+    provider result). Reads the recording's LOCAL ``action_event`` rows from
+    ``recording.db``, splits them on inactivity gaps via the shared
+    ``task_manifest._segment_tasks`` (the same idle-gap logic the v1 manifest
+    uses), and returns a ``{"tasks": [...]}`` dict shaped like a provider result
+    so ``_persist_local_tasks`` writes it identically. Tasks are
+    mechanically-named (``task_1`` …) — the heuristic has no model to name them,
+    and cloud is never consulted (R7 over R5).
+
+    Returns ``None`` when there are no events to segment; strictly local (no
+    network, no upload). All imports deferred to keep the import surface light.
+    """
+    from screencap import config
+    from screencap.recording_db import Row, open_recording_db
+    from screencap.task_manifest import _segment_tasks
+
+    db_path = recording_dir / "recording.db"
+    if not db_path.exists():
+        return None
+
+    with open_recording_db(db_path, row_factory=Row) as conn:
+        events = conn.execute(
+            """SELECT timestamp, name FROM action_event
+               WHERE name != 'move'
+               ORDER BY timestamp""",
+        ).fetchall()
+
+    segments = _segment_tasks(events, config.get_rest_threshold())
+    if not segments:
+        return None
+
+    tasks = [
+        {
+            "start_ts": float(start),
+            "end_ts": float(end),
+            "name": f"task_{i + 1}",
+            "derived_name": f"task-{i + 1}",
+            "event_count": count,
+            "source": "idle_gap_heuristic",
+        }
+        for i, (start, end, count) in enumerate(segments)
+    ]
+    return {"tasks": tasks, "summary": {"source": "idle_gap_heuristic"}, "tags": []}
+
+
+def _persist_local_tasks(
+    recording_dir: Path,
+    ledger: "PipelineLedger | None",
+    tasks: dict,
+) -> int:
+    """Write the validated tasks to the LOCAL-only store; return the task count.
+
+    Two co-located sinks, both LOCAL-only (never uploaded — R4):
+
+    * ``tasks.json`` in the recording dir — the human/app-readable artifact
+      (excluded from ``upload.list_recording_files`` + rejected by
+      ``assert_uploadable`` exactly like ``recording.db``). Written atomically
+      (tmp + ``os.replace``) so a crash never leaves a torn file.
+    * the ``pipeline_task_segments`` ledger table inside ``recording.db`` —
+      queryable per-task rows (task_index, start/end, name, category,
+      confidence, metadata). ``replace_task_segments`` deletes-then-inserts in
+      one transaction, so re-running terminal REPLACES rather than duplicates.
+    """
+    import json
+
+    from screencap.pipeline_state import TaskSegmentRow
+
+    task_list = tasks.get("tasks", []) if isinstance(tasks, dict) else []
+
+    # 1. tasks.json — atomic write (tmp + replace), local-only by upload rule.
+    payload = json.dumps(tasks, indent=2)
+    final_path = recording_dir / _LOCAL_TASKS_FILE
+    tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+    tmp_path.write_text(payload)
+    os.replace(tmp_path, final_path)
+
+    # 2. pipeline_task_segments ledger table (idempotent replace). Skipped for a
+    # legacy / no-ledger recording (no recording.db row to key on) — tasks.json
+    # still carries the tasks in that case.
+    if ledger is not None:
+        segments = [
+            TaskSegmentRow(
+                task_index=i,
+                start_ts=float(t.get("start_ts", 0.0)),
+                end_ts=float(t.get("end_ts", 0.0)),
+                name=str(t.get("name", "")),
+                category=t.get("category"),
+                confidence=t.get("confidence"),
+                metadata=json.dumps({
+                    k: t[k]
+                    for k in ("description", "apps_used", "derived_name")
+                    if k in t
+                }) or None,
+            )
+            for i, t in enumerate(task_list)
+        ]
+        ledger.replace_task_segments(segments)
+
+    return len(task_list)
 
 
 def _route_cloud(

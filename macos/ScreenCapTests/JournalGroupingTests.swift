@@ -199,4 +199,8 @@ private final class FakeJournalSearchService: SearchService, @unchecked Sendable
     func appsList() async throws -> AppsListResponse {
         AppsListResponse(appNames: [], hostnames: [])
     }
+
+    func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
+        TasksListResponse(recording: req.recording, tasks: [])
+    }
 }

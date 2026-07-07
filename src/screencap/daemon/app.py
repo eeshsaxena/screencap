@@ -1402,6 +1402,112 @@ async def frame_nearest(request: Request) -> JSONResponse:
         )
 
 
+def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
+    """Read a LOCAL recording's named-task segments, off the event loop.
+
+    Reads the ``pipeline_task_segments`` ledger rows from the recording's
+    local-only ``recording.db`` (never uploaded — R4/R8) via
+    ``PipelineLedger.read_task_segments`` — the STRUCTURED sink U4 writes
+    alongside ``tasks.json``. The ledger is chosen over ``tasks.json`` because it
+    is already typed per-task rows (``task_index`` / ``start_ts`` / ``end_ts`` /
+    ``name`` / ``category`` / ``confidence``), so the wire shape needs no re-parse
+    of the provider's free-text blob, and it keeps the read on the same query
+    seam every other consumer uses.
+
+    Returns ``[]`` on any legitimate absence — a missing recording dir, a missing
+    ``recording.db`` (legacy / pre-U1 recording), a DB with no ``recording`` row,
+    or a recording whose segmentation produced no tasks. Never raises for those,
+    so the verb answers an empty list rather than a 500. The ``PrivacyMode`` and
+    upload rules are unchanged: this only reads rows the local pipeline already
+    persisted; nothing leaves the Mac.
+    """
+    import sqlite3
+
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import (
+        LedgerError,
+        PipelineLedger,
+        ensure_pipeline_state_schema,
+    )
+
+    rec_dir = resolve_recording_dir(recording)
+    db_path = rec_dir / "recording.db"
+    if not db_path.exists():
+        return []
+    try:
+        # Idempotent, read-tolerant: creates the table on an old DB (no-op on a
+        # current one), so reading a recording captured before U4 landed never
+        # raises "no such table".
+        ensure_pipeline_state_schema(db_path)
+        ledger = PipelineLedger(db_path)
+        segments = ledger.read_task_segments()
+    except (LedgerError, sqlite3.Error):
+        # No recording row / unreadable DB → treat as "no tasks" rather than 500.
+        return []
+    return [
+        {
+            "task_index": seg.task_index,
+            "start_ts": seg.start_ts,
+            "end_ts": seg.end_ts,
+            "name": seg.name,
+            "category": seg.category,
+            "confidence": seg.confidence,
+        }
+        for seg in segments
+    ]
+
+
+async def tasks_list(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.list`` — a LOCAL recording's named task segments (U10).
+
+    Read-only surface over the U4 local tasks store: the named tasks the
+    terminal-stage on-device segmentation persisted for a local recording (or the
+    idle-gap heuristic fallback's mechanically-named ones). The app reads these to
+    populate the SAME surfaces as cloud-derived tasks — the Journal day view's
+    task breakdown and the Library card title/summary — with no cloud round-trip.
+
+    The tasks live in the local-only ``recording.db`` (never uploaded — R4/R8), so
+    this verb only ever exposes local-Mac data to the same-EUID caller. A missing
+    store / legacy recording / provider miss returns ``ok:true`` with an empty
+    ``tasks`` list (never an error), so a recording with no tasks renders
+    gracefully. A traversal recording name returns 400 ``invalid_name``; a
+    malformed body returns 400 ``invalid_request``. Deliberately NOT in
+    ``_ACTIVITY_PATHS`` — a read verb must not reset the idle-shutdown clock.
+    """
+    from pydantic import ValidationError
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.TasksListRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._TASKS_LIST_API_VERSION,
+            )
+        validate_recording_name(parsed.recording)
+        rows = await asyncio.to_thread(_run_tasks_list, parsed.recording)
+        tasks = [schema.TaskSegment(**row).model_dump() for row in rows]
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TASKS_LIST_API_VERSION,
+                recording=parsed.recording,
+                tasks=tasks,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TASKS_LIST_API_VERSION,
+            request=request,
+        )
+
+
 async def timeline_day(request: Request) -> JSONResponse:
     """``POST /v0/timeline.day`` — day-scoped spans + honest blocked intervals (U3).
 
@@ -1601,6 +1707,7 @@ def build_app() -> Starlette:
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
             Route("/v0/timeline.day", timeline_day, methods=["POST"]),
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
+            Route("/v0/tasks.list", tasks_list, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),

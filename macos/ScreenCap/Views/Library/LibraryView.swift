@@ -28,6 +28,10 @@ struct LibraryView: View {
     // card), mirroring SearchView's SCR-177 wiring.
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
+    // U10 — one `tasks.list` per recording, shared across every card. Feeds the
+    // card title/summary fallback for locally-named recordings (no cloud
+    // round-trip); a recording with no tasks store keeps its existing title.
+    @StateObject private var journalTasks = JournalTasks()
     @State private var rowError: String?
     @State private var restarting = false
 
@@ -88,10 +92,12 @@ struct LibraryView: View {
                             recording: rec,
                             frameIndex: frameIndex,
                             thumbnailLoader: thumbnailLoader,
+                            tasks: journalTasks.tasks(for: rec),
                             onOpen: { open(rec) },
                             onInspect: { openInspect(rec) },
                             onReview: { openWindow(id: ReviewWindowID, value: rec.name) }
                         )
+                        .task(id: rec.stableID) { await journalTasks.resolve(rec) }
                     }
                 }
                 .padding(.bottom, 8)

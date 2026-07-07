@@ -99,6 +99,9 @@ final class SearchViewModelBackfillTests: XCTestCase {
         func appsList() async throws -> AppsListResponse {
             AppsListResponse(appNames: [], hostnames: [])
         }
+        func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
+            TasksListResponse(recording: req.recording, tasks: [])
+        }
     }
 
     /// Poll until `predicate` holds (or time out) — the run task and stream

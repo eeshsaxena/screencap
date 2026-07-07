@@ -1,0 +1,245 @@
+{
+  "activity_summary": {
+    "entries": [
+      {
+        "app": "VS Code",
+        "bundle_id": "com.microsoft.VSCode",
+        "cat": "CODE",
+        "clicks": 1,
+        "domain": "",
+        "end_ts": 2000.0,
+        "scrolls": 1,
+        "shortcuts": [
+          "Cmd+S"
+        ],
+        "start_ts": 1100.0,
+        "title": "main.py \u2014 screencap",
+        "typed": [
+          "def foo():"
+        ]
+      },
+      {
+        "app": "Chrome",
+        "bundle_id": "com.google.Chrome",
+        "cat": "BROWSER",
+        "clicks": 0,
+        "domain": "mail.google.com",
+        "end_ts": 3000.0,
+        "scrolls": 0,
+        "shortcuts": [],
+        "start_ts": 2000.0,
+        "title": "Gmail",
+        "typed": [
+          "Hey team"
+        ]
+      },
+      {
+        "app": "VS Code",
+        "bundle_id": "com.microsoft.VSCode",
+        "cat": "CODE",
+        "clicks": 1,
+        "domain": "",
+        "end_ts": 6000.0,
+        "scrolls": 0,
+        "shortcuts": [],
+        "start_ts": 3000.0,
+        "title": "auth.py \u2014 screencap",
+        "typed": [
+          "class Auth:",
+          "def token():"
+        ]
+      },
+      {
+        "app": "Slack",
+        "bundle_id": "com.tinyspeck.slackmacgap",
+        "cat": "CHAT",
+        "clicks": 0,
+        "domain": "",
+        "end_ts": 8200.0,
+        "scrolls": 0,
+        "shortcuts": [],
+        "start_ts": 6000.0,
+        "title": "#dev \u2014 Slack",
+        "typed": [
+          "PR is ready"
+        ]
+      }
+    ],
+    "raw_timestamps": [
+      1100.0,
+      1110.0,
+      1120.0,
+      1130.0,
+      1140.0,
+      2000.0,
+      2010.0,
+      3000.0,
+      3010.0,
+      4700.0,
+      4710.0,
+      4720.0,
+      6000.0,
+      6010.0
+    ],
+    "raw_window_events": [
+      {
+        "bundle_id": "com.microsoft.VSCode",
+        "timestamp": 1100.0,
+        "title": "main.py \u2014 screencap"
+      },
+      {
+        "bundle_id": "com.google.Chrome",
+        "timestamp": 2000.0,
+        "title": "Gmail"
+      },
+      {
+        "bundle_id": "com.microsoft.VSCode",
+        "timestamp": 3000.0,
+        "title": "auth.py \u2014 screencap"
+      },
+      {
+        "bundle_id": "com.microsoft.VSCode",
+        "timestamp": 4700.0,
+        "title": "auth.py \u2014 screencap"
+      },
+      {
+        "bundle_id": "com.tinyspeck.slackmacgap",
+        "timestamp": 6000.0,
+        "title": "#dev \u2014 Slack"
+      }
+    ],
+    "session_end": 8200.0,
+    "session_start": 1000.0,
+    "summary": {
+      "duration": "2h 0s",
+      "recording": "test-rec",
+      "timeline": [
+        {
+          "app": "VS Code",
+          "cat": "CODE",
+          "clicks": 1,
+          "dur": "15m 0s",
+          "shortcuts": [
+            "Cmd+S"
+          ],
+          "t": "0:01:40",
+          "title": "main.py \u2014 screencap",
+          "typed": [
+            "def foo():"
+          ]
+        },
+        {
+          "app": "Chrome",
+          "cat": "BROWSER",
+          "domain": "mail.google.com",
+          "dur": "16m 40s",
+          "t": "0:16:40",
+          "title": "Gmail",
+          "typed": [
+            "Hey team"
+          ]
+        },
+        {
+          "app": "VS Code",
+          "cat": "CODE",
+          "clicks": 1,
+          "dur": "50m 0s",
+          "t": "0:33:20",
+          "title": "auth.py \u2014 screencap",
+          "typed": [
+            "class Auth:",
+            "def token():"
+          ]
+        },
+        {
+          "app": "Slack",
+          "cat": "CHAT",
+          "dur": "36m 40s",
+          "t": "1:23:20",
+          "title": "#dev \u2014 Slack",
+          "typed": [
+            "PR is ready"
+          ]
+        }
+      ],
+      "transcript": [
+        {
+          "t": "0:00:50",
+          "text": "Let me fix this bug first"
+        },
+        {
+          "t": "0:15:50",
+          "text": "Now let me check email"
+        }
+      ]
+    },
+    "time_map": {
+      "0:00:50": 1050.0,
+      "0:01:40": 1100.0,
+      "0:15:50": 1950.0,
+      "0:16:40": 2000.0,
+      "0:33:20": 3000.0,
+      "1:23:20": 6000.0,
+      "2:00:00": 8200.0
+    }
+  },
+  "validated": {
+    "summary": {
+      "key_accomplishments": [
+        "Shipped auth module",
+        "Opened PR"
+      ],
+      "overview": "Built the auth module then coordinated review.",
+      "primary_focus": "development",
+      "time_breakdown": {
+        "communication": 40,
+        "development": 60
+      }
+    },
+    "tags": [
+      "python",
+      "auth",
+      "code-review"
+    ],
+    "tasks": [
+      {
+        "all_apps": {},
+        "apps_used": [
+          "VS Code"
+        ],
+        "category": "development",
+        "confidence": "high",
+        "derived_name": "implement-auth-module",
+        "description": "Wrote auth.py and tests.",
+        "dominant_app": "",
+        "dominant_app_name": "",
+        "dominant_pct": 0.0,
+        "dominant_title": "",
+        "end_ts": 1900.0,
+        "event_count": 0,
+        "name": "Implement auth module",
+        "rest_after_s": 100.0,
+        "start_ts": 1000.0
+      },
+      {
+        "all_apps": {},
+        "apps_used": [
+          "Slack"
+        ],
+        "category": "communication",
+        "confidence": "medium",
+        "derived_name": "coordinate-pr-review",
+        "description": "Pinged team on Slack about the PR.",
+        "dominant_app": "",
+        "dominant_app_name": "",
+        "dominant_pct": 0.0,
+        "dominant_title": "",
+        "end_ts": 5800.0,
+        "event_count": 0,
+        "name": "Coordinate PR review",
+        "rest_after_s": 0.0,
+        "start_ts": 2000.0
+      }
+    ]
+  }
+}

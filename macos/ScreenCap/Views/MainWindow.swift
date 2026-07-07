@@ -437,6 +437,10 @@ struct MainWindow: View {
         case .appRules:
             // U13: the prototype App rules pane.
             AppRulesView()
+        case .intelligence:
+            // U9: the Intelligence pane — model picker + per-task cloud-consent
+            // matrix, persisting through `screencap settings intelligence`.
+            IntelligenceSettingsView()
         case .timeline(let day, let seekMs):
             // U9: the day view. `.id(day)` gives each date a fresh engine +
             // search scope rather than mutating one view's state across days.

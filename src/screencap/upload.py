@@ -172,10 +172,20 @@ def _wal_checkpoint(recording_dir: Path) -> None:
 #   - `*.scrub_failed`             — fail-closed scrub artifacts retaining raw,
 #                                    unredacted content (review already hides
 #                                    them, so upload must too)
+#   - `tasks.json`                 — U4 LOCAL-only named-task store, derived from
+#                                    the raw (unscrubbed) local events by on-Mac
+#                                    segmentation. Like `recording.db` it is
+#                                    LOCAL-ONLY BY RULE (R4): cloud task/summary
+#                                    data derives only from scrubbed exports, so a
+#                                    cloud/both recording must never carry it. Its
+#                                    sibling ledger table (`pipeline_task_segments`)
+#                                    lives inside `recording.db`, already excluded.
 #
 # Review-only artifacts (`.video_review.mp4`) are dot-prefixed, so the dotfile
 # filter in `list_recording_files` already skips them — no entry needed here.
-_RAW_DB_NAMES = frozenset({"recording.db", "recording.db-wal", "recording.db-shm"})
+_RAW_DB_NAMES = frozenset(
+    {"recording.db", "recording.db-wal", "recording.db-shm", "tasks.json"}
+)
 _RAW_SUFFIXES = (".scrub_failed",)
 
 
@@ -205,7 +215,9 @@ def assert_uploadable(file_info: FileInfo) -> FileInfo:
         raise ValueError(
             f"refusing to upload raw local-only artifact {file_info.name!r}: "
             "recording.db (and its WAL/SHM sidecars and *.scrub_failed files) "
-            "contain unscrubbed content and must never leave the machine (R8)."
+            "contain unscrubbed content, and tasks.json is the U4 local-only "
+            "named-task store derived from raw local events — all must never "
+            "leave the machine (R8/R4)."
         )
     return file_info
 

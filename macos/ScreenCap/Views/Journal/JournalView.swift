@@ -21,6 +21,10 @@ struct JournalView: View {
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
     @StateObject private var appChips = JournalAppChips()
+    // U10 — one `tasks.list` per recording, shared across every card (like the
+    // frame index + app chips). Populates the day-grouped task breakdown from the
+    // LOCAL tasks store with no cloud round-trip.
+    @StateObject private var journalTasks = JournalTasks()
 
     var body: some View {
         content
@@ -135,13 +139,17 @@ struct JournalView: View {
                             frameIndex: frameIndex,
                             thumbnailLoader: thumbnailLoader,
                             app: appChips.app(for: rec),
+                            tasks: journalTasks.tasks(for: rec),
                             onOpen: {
                                 if let date = day.day {
                                     onOpenTimeline(date, rec.startedAt.map { Int($0 * 1000) })
                                 }
                             }
                         )
-                        .task(id: rec.stableID) { await appChips.resolve(rec) }
+                        .task(id: rec.stableID) {
+                            await appChips.resolve(rec)
+                            await journalTasks.resolve(rec)
+                        }
                     }
                 }
             }
@@ -208,11 +216,25 @@ struct JournalCard: View {
     /// Dominant app for the recording's span (JournalAppChips) — chip omitted
     /// while unresolved or when the lookup failed (nullable contract).
     let app: String?
+    /// The recording's locally-named task segments (U10, JournalTasks) — empty
+    /// while unresolved, on a daemon miss, or when the recording has no tasks
+    /// store. Feeds the day-grouped task breakdown + title/summary fallback.
+    var tasks: [RecordingTask] = []
     var onOpen: () -> Void
 
     @State private var hovering = false
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
+
+    /// Title prefers the namer's, falling back to the first local task name when
+    /// the recording is otherwise un-named (U10).
+    private var title: String { JournalModel.displayTitle(recording, tasks: tasks) }
+
+    /// The card's task breakdown — the named tasks under the summary (U10). The
+    /// prototype had no per-recording task list; this reuses the card body rather
+    /// than adding a new surface. Empty (section omitted) when the recording has
+    /// no tasks store. Capped so a long session doesn't blow out the card.
+    private var breakdown: [RecordingTask] { Array(tasks.prefix(4)) }
 
     var body: some View {
         Button(action: onOpen) {
@@ -243,16 +265,17 @@ struct JournalCard: View {
 
     private var info: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(recording.title)
+            Text(title)
                 .font(SCTypography.sans(size: 13.5, weight: .semibold))
                 .foregroundStyle(Color.scInk)
                 .lineLimit(1)
-            if let summary = JournalModel.summaryLine(recording) {
+            if let summary = JournalModel.summaryLine(recording, tasks: tasks) {
                 Text(summary)
                     .font(SCTypography.sans(size: 12))
                     .foregroundStyle(Color.scInkSecondary)
                     .lineLimit(2)
             }
+            taskBreakdown
             HStack(spacing: 6) {
                 LibraryBadgeChip(badge: badge)
                 if let app {
@@ -273,10 +296,41 @@ struct JournalCard: View {
         .padding(.bottom, 3)
     }
 
+    /// The day-grouped task breakdown (U10): the recording's locally-named tasks
+    /// as a compact bulleted list. Omitted entirely when there are no tasks, so a
+    /// recording with no tasks store renders exactly as before.
+    @ViewBuilder
+    private var taskBreakdown: some View {
+        if !breakdown.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(breakdown) { task in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("•")
+                            .font(SCTypography.sans(size: 11))
+                            .foregroundStyle(Color.scInkMuted)
+                        Text(task.name)
+                            .font(SCTypography.sans(size: 11.5))
+                            .foregroundStyle(Color.scInkSecondary)
+                            .lineLimit(1)
+                    }
+                }
+                if tasks.count > breakdown.count {
+                    Text("+\(tasks.count - breakdown.count) more")
+                        .font(SCTypography.mono(size: 10))
+                        .foregroundStyle(Color.scInkMuted)
+                }
+            }
+            .padding(.top, 5)
+        }
+    }
+
     private var accessibilityText: String {
-        var parts = [recording.title, recording.duration, badge.text]
-        if let summary = JournalModel.summaryLine(recording) { parts.insert(summary, at: 1) }
+        var parts = [title, recording.duration, badge.text]
+        if let summary = JournalModel.summaryLine(recording, tasks: tasks) { parts.insert(summary, at: 1) }
         if let app { parts.append(app) }
+        if !breakdown.isEmpty {
+            parts.append("tasks: " + breakdown.map(\.name).joined(separator: ", "))
+        }
         return parts.joined(separator: ", ")
     }
 }

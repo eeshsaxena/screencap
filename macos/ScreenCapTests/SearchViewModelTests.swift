@@ -58,6 +58,10 @@ final class SearchViewModelTests: XCTestCase {
             if let appsListError { throw appsListError }
             return appsListResponse ?? AppsListResponse(appNames: [], hostnames: [])
         }
+
+        func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
+            TasksListResponse(recording: req.recording, tasks: [])
+        }
     }
 
     /// Holds the search `Task` so a fake-service hook can cancel it mid-flight.

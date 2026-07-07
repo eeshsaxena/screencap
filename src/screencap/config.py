@@ -422,6 +422,190 @@ def get_segmentation_mode() -> str:
     return val
 
 
+def get_llm_provider() -> str:
+    """Return the active LLM segmentation provider. Default 'on-device'.
+
+    Selects the backend behind ``screencap.segmentation.provider.LLMProvider``
+    (env ``SCREENCAP_LLM_PROVIDER`` > config.toml ``llm_provider`` > default),
+    mirroring :func:`get_segmentation_mode` / :func:`get_rest_threshold`.
+
+    Default ``'on-device'`` keeps the "nothing leaves the Mac" promise for
+    local recordings (the on-device backend lands in U5). The cloud processor
+    does not read this — it pins ``'gemini'`` explicitly. The value is only
+    resolved here; ``provider.get_provider`` maps it to a backend (and raises a
+    clear ``NotImplementedError`` for on-device until U5).
+    """
+    env = os.environ.get("SCREENCAP_LLM_PROVIDER")
+    if env is not None:
+        return env.strip()
+    cfg = _load_toml()
+    return str(cfg.get("llm_provider", "on-device"))
+
+
+def _parse_intelligence_bool(env_name: str, cfg_key: str, default: bool) -> bool:
+    """Env var (truthy → bool) > ``[intelligence].<cfg_key>`` > default.
+
+    A section-scoped twin of :func:`_parse_bool_env` for the per-task cloud
+    consent rows (U6). Consent defaults **OFF** — cloud never runs a task
+    unless its row is explicitly enabled.
+    """
+    env = os.environ.get(env_name)
+    if env is not None:
+        return env.lower() in _BOOL_TRUE
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get(cfg_key, default)
+        if isinstance(val, bool):
+            return val
+    return default
+
+
+def get_llm_cloud_provider() -> str | None:
+    """Return the configured *cloud* segmentation provider, or ``None``.
+
+    The consent policy (``screencap.segmentation.consent``) may route a
+    consented, on-device-unavailable summary/title task to this backend. It is
+    distinct from :func:`get_llm_provider` (the *active/preferred* provider,
+    default ``on-device``): this getter names which cloud backend a consented
+    fallback is allowed to use, and returns ``None`` when no cloud provider is
+    configured (the zero-config default — nothing leaves the Mac).
+
+    Resolution mirrors the other getters: env ``SCREENCAP_LLM_CLOUD_PROVIDER`` >
+    ``[intelligence].cloud_provider`` > default ``None``.
+    """
+    env = os.environ.get("SCREENCAP_LLM_CLOUD_PROVIDER")
+    if env is not None:
+        env = env.strip()
+        return env or None
+    section = _load_toml().get("intelligence", {})
+    if isinstance(section, dict):
+        val = section.get("cloud_provider")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def get_summary_cloud_consent() -> bool:
+    """Return whether the summary/title cloud-consent row is enabled. Default **False**.
+
+    When on (R8), an on-demand summary/title may fall back to the configured
+    cloud provider — but only when on-device is unavailable (the row grants
+    fallback permission, not always-cloud; the policy in
+    ``screencap.segmentation.consent`` enforces the preference order).
+
+    Env ``SCREENCAP_SUMMARY_CLOUD_CONSENT`` > ``[intelligence].summary_cloud_consent``
+    > default ``False``.
+    """
+    return _parse_intelligence_bool(
+        "SCREENCAP_SUMMARY_CLOUD_CONSENT", "summary_cloud_consent", False,
+    )
+
+
+def get_recall_cloud_consent() -> bool:
+    """Return whether the recall-answer cloud-consent row is enabled. Default **False**.
+
+    Recall-answering runs on-device by default and becomes cloud-eligible only
+    when this opt-in row is added (R10). Even when on, the policy in
+    ``screencap.segmentation.consent`` prefers on-device whenever available.
+
+    Env ``SCREENCAP_RECALL_CLOUD_CONSENT`` > ``[intelligence].recall_cloud_consent``
+    > default ``False``.
+    """
+    return _parse_intelligence_bool(
+        "SCREENCAP_RECALL_CLOUD_CONSENT", "recall_cloud_consent", False,
+    )
+
+
+# --- Intelligence settings: write surface (U8) -----------------------------
+#
+# The ``screencap settings intelligence`` CLI verb (U8) is the write side of
+# the getters above. The value vocabularies live here — next to the getters —
+# so the CLI validation and the config schema cannot drift.
+
+#: The active/preferred provider (``[intelligence].llm_provider``). Only the
+#: backends :func:`screencap.segmentation.provider.get_provider` can actually
+#: construct are accepted; the CLI rejects anything else.
+_VALID_LLM_PROVIDERS = ("on-device", "gemini")
+
+#: The cloud backend a consented fallback may use
+#: (``[intelligence].cloud_provider``). Only Gemini ships as a cloud backend in
+#: this plan; the interface accommodates more, but the CLI refuses to persist a
+#: cloud provider the daemon cannot run.
+_VALID_CLOUD_PROVIDERS = ("gemini",)
+
+#: The cloud-consent rows, keyed by their CLI/`[intelligence]` name → the
+#: getter that reads them back. Only summary/title and recall-answer may be
+#: consented to cloud (R8/R10); day-split/label and frames rows are **never**
+#: cloud-settable (R7/R9) and are deliberately absent here — the CLI rejects
+#: them with a clear message rather than persisting a forbidden row.
+_CLOUD_CONSENT_ROWS = ("summary_cloud_consent", "recall_cloud_consent")
+
+
+def set_intelligence_provider(value: str) -> None:
+    """Persist the active provider so :func:`get_llm_provider` reads it back.
+
+    Writes the **top-level** ``llm_provider`` key — the exact key
+    :func:`get_llm_provider` reads (``cfg.get("llm_provider", ...)``), which is
+    top-level, unlike the ``[intelligence]``-scoped cloud provider / consent
+    rows. Persisting the provider anywhere else would silently no-op the
+    read-back, so the write mirrors the getter's key rather than the section.
+
+    Writes through the shared advisory-flock config writer (the same
+    read → flock → mutate → atomic-save → invalidate-cache path used by
+    ``settings privacy``), so a concurrent settings write cannot lose this
+    update. Preserves comments and key order via tomlkit.
+
+    The caller is responsible for validating ``value`` against
+    :data:`_VALID_LLM_PROVIDERS` first; this helper only persists.
+    """
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        doc["llm_provider"] = value
+
+
+def set_intelligence_cloud_provider(value: str | None) -> None:
+    """Persist (or clear) ``[intelligence].cloud_provider``.
+
+    ``None`` removes the key (the zero-config default — no cloud backend
+    configured). Otherwise the string is written verbatim; the caller validates
+    against :data:`_VALID_CLOUD_PROVIDERS` first.
+    """
+    _write_intelligence_key("cloud_provider", value)
+
+
+def set_intelligence_consent(row: str, value: bool) -> None:
+    """Persist a cloud-consent row to ``[intelligence].<row>``.
+
+    ``row`` must be one of :data:`_CLOUD_CONSENT_ROWS`; the caller enforces that
+    (the day-split/label and frames rows can never be cloud-consented, R7/R9).
+    """
+    _write_intelligence_key(row, bool(value))
+
+
+def _write_intelligence_key(key: str, value: object) -> None:
+    """Write a single ``[intelligence]`` key via the shared flock config writer.
+
+    A ``None`` value removes the key (used to clear ``cloud_provider``).
+    Reuses :func:`screencap.privacy_settings._privacy_config_writer` — despite
+    the name it is the generic config read-modify-write helper (it yields the
+    whole tomlkit doc under the advisory flock), so intelligence writes
+    serialize against privacy writes on the same lock instead of racing.
+    """
+    import tomlkit
+
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        if "intelligence" not in doc:
+            doc.add("intelligence", tomlkit.table())
+        if value is None:
+            if key in doc["intelligence"]:
+                del doc["intelligence"][key]
+        else:
+            doc["intelligence"][key] = value
+
+
 def get_show_on_website() -> bool:
     """Return whether recordings should be visible on the website. Default True."""
     return _parse_bool_env("SCREENCAP_SHOW_ON_WEBSITE", "show_on_website", True)

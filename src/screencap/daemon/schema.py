@@ -33,6 +33,11 @@ _APPS_LIST_API_VERSION = 1
 _AUTH_WHOAMI_API_VERSION = 1
 # SCR-178 content-index backfill lifecycle verbs.
 _BACKFILL_API_VERSION = 1
+# U10 (local-first intelligence) read verb: the named-task segments a LOCAL
+# recording's terminal-stage segmentation persisted (U4). Additive (new verb) —
+# no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
+# additive precedent).
+_TASKS_LIST_API_VERSION = 1
 
 
 @cache
@@ -88,6 +93,9 @@ _MODEL_NAMES = {
     "BackfillCancelRequest",
     "BackfillStatusResponse",
     "BackfillProgressEvent",
+    "TasksListRequest",
+    "TaskSegment",
+    "TasksListResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -535,6 +543,47 @@ def _load_models() -> dict[str, Any]:
         total: int
         current_unit_index: int
 
+    class TasksListRequest(_DaemonModel):
+        """U10 ``tasks.list`` input: the recording whose named tasks to read.
+
+        ``recording`` is validated by the canonical name validator in the handler
+        (traversal-safe), not via a ``Literal`` — same posture as
+        ``frame.nearest`` / ``content.search``.
+        """
+
+        recording: str
+
+    class TaskSegment(_DaemonModel):
+        """One named task segment from a LOCAL recording's tasks store (U4).
+
+        Read from the ``pipeline_task_segments`` ledger table inside the
+        local-only ``recording.db`` (never uploaded — R4/R8), so these named
+        tasks stay on the Mac. ``start_ts`` / ``end_ts`` are Unix seconds (the
+        ledger's native units). ``category`` / ``confidence`` are optional
+        provider metadata; the idle-gap heuristic fallback (U7) emits neither.
+        """
+
+        task_index: int
+        start_ts: float
+        end_ts: float
+        name: str
+        category: str | None = None
+        confidence: str | None = None
+
+    class TasksListResponse(EnvelopeResponse):
+        """A recording's named-task segments, ordered by ``task_index``.
+
+        ``recording`` echoes the requested name. ``tasks`` is empty (never
+        absent) for a recording with no tasks store — a provider miss, the
+        heuristic producing none, a legacy recording, or a cloud/both recording
+        (whose tasks store is local-only and thus never present remotely). The
+        app renders the empty case gracefully rather than treating it as an
+        error.
+        """
+
+        recording: str
+        tasks: list[TaskSegment]
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -569,6 +618,9 @@ def _load_models() -> dict[str, Any]:
         "BackfillCancelRequest": BackfillCancelRequest,
         "BackfillStatusResponse": BackfillStatusResponse,
         "BackfillProgressEvent": BackfillProgressEvent,
+        "TasksListRequest": TasksListRequest,
+        "TaskSegment": TaskSegment,
+        "TasksListResponse": TasksListResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -604,6 +656,7 @@ __all__ = [
     "_APPS_LIST_API_VERSION",
     "_AUTH_WHOAMI_API_VERSION",
     "_BACKFILL_API_VERSION",
+    "_TASKS_LIST_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)

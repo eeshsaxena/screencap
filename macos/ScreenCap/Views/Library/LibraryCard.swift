@@ -35,6 +35,10 @@ struct LibraryCard: View {
     let recording: RecordingSummary
     let frameIndex: RecordingFrameIndex
     let thumbnailLoader: ThumbnailLoader
+    /// The recording's locally-named task segments (U10) — empty while unresolved,
+    /// on a daemon miss, or when the recording has no tasks store. Used only for
+    /// the title fallback when the namer produced no title.
+    var tasks: [RecordingTask] = []
     /// Primary tap — opens the recording on the Day timeline (U9).
     var onOpen: () -> Void
     /// Open the read-only Inspect window (context menu, KTD-4).
@@ -45,6 +49,11 @@ struct LibraryCard: View {
     @State private var hovering = false
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
+
+    /// Title prefers the namer's, falling back to the first local task name when
+    /// the recording is otherwise un-named (U10). Shared rule with the Journal
+    /// card so both surfaces read identically for a locally-named recording.
+    private var title: String { JournalModel.displayTitle(recording, tasks: tasks) }
 
     var body: some View {
         Button(action: onOpen) {
@@ -57,7 +66,7 @@ struct LibraryCard: View {
         .buttonStyle(.plain)
         .contextMenu { contextMenu }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(recording.title), \(recording.duration), \(badge.text)")
+        .accessibilityLabel("\(title), \(recording.duration), \(badge.text)")
     }
 
     // MARK: - Thumbnail
@@ -77,7 +86,7 @@ struct LibraryCard: View {
 
     private var info: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(recording.title)
+            Text(title)
                 .font(SCTypography.sans(size: 14, weight: .semibold))
                 .foregroundStyle(Color.scInk)
                 .lineLimit(1)

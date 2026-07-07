@@ -12,6 +12,10 @@ protocol SearchService: Sendable {
     /// Query-parser vocabulary (SCR-179). A throw (incl. an older daemon's 404)
     /// must degrade gracefully to the static parser vocabulary at the call site.
     func appsList() async throws -> AppsListResponse
+    /// A LOCAL recording's named task segments (U10). A throw (incl. an older
+    /// daemon's 404) must degrade gracefully — the task breakdown is omitted, not
+    /// surfaced as an error.
+    func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse
 }
 
 /// Live implementation: forwards to the daemon over the UNIX socket.
@@ -30,5 +34,9 @@ struct LiveSearchService: SearchService {
 
     func appsList() async throws -> AppsListResponse {
         try await DaemonClient.appsList()
+    }
+
+    func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
+        try await DaemonClient.tasksList(req)
     }
 }

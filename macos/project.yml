@@ -52,6 +52,13 @@ targets:
         buildPhase: resources
     resources:
       - path: ScreenCap/Assets.xcassets
+    dependencies:
+      # Build the on-device segmentation helper alongside the app; the
+      # post-build script below copies its product into Contents/MacOS.
+      # `embed: false` — a `type: tool` is not a bundle, so it is not eligible
+      # for the standard "Embed" copy phase; we place it by hand instead.
+      - target: IntelligenceHelper
+        embed: false
     info:
       path: ScreenCap/Info.plist
       properties:
@@ -99,6 +106,50 @@ targets:
           cp "${SRCROOT}/ScreenCap/Resources/com.screencap.daemon.plist" "${DEST_DIR}/com.screencap.daemon.plist"
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false
+      # Place the on-device segmentation helper at Contents/MacOS/IntelligenceHelper
+      # so `OnDeviceProvider._find_bundled_helper()` discovers it. The tool built
+      # in this same build lands in BUILT_PRODUCTS_DIR; copy it into the app's
+      # executable dir.
+      - name: Embed IntelligenceHelper
+        script: |
+          set -euo pipefail
+          SRC="${BUILT_PRODUCTS_DIR}/IntelligenceHelper"
+          DEST_DIR="${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}"
+          if [ -f "${SRC}" ]; then
+            mkdir -p "${DEST_DIR}"
+            cp "${SRC}" "${DEST_DIR}/IntelligenceHelper"
+          else
+            echo "warning: IntelligenceHelper product not found at ${SRC}"
+          fi
+        basedOnDependencyAnalysis: false
+        showEnvVarsInLog: false
+
+  # On-device (Apple Foundation Models) segmentation helper (U5 / KTD2). A tiny
+  # command-line tool the Python `OnDeviceProvider` spawns as a subprocess: it
+  # reads the privacy-stripped activity summary on stdin and writes a tasks JSON
+  # envelope on stdout. The whole FoundationModels path is `#available(macOS 26)`
+  # -guarded so it still COMPILES for the app's macOS 13.0 floor and reports
+  # "unavailable" at runtime below macOS 26 (Python then degrades — U7).
+  #
+  # It builds as its own product and is copied into the app bundle's
+  # `Contents/MacOS/IntelligenceHelper` by the app's post-build script below, so
+  # `OnDeviceProvider._find_bundled_helper()` discovers it. CLI-only/headless
+  # installs (no app bundle) have no helper and always degrade.
+  IntelligenceHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: IntelligenceHelper
+    settings:
+      base:
+        PRODUCT_NAME: IntelligenceHelper
+        # The helper is copied into the app's hardened runtime; sign it the same
+        # way so the bundle stays consistently signed.
+        ENABLE_HARDENED_RUNTIME: YES
+        # FoundationModels is weak-linked so the tool loads on the macOS 13.0
+        # floor (the framework is absent there); the `#available` guard prevents
+        # any macOS-26 symbol from being touched below the floor.
+        OTHER_LDFLAGS: "-weak_framework FoundationModels"
 
   ScreenCapTests:
     type: bundle.unit-test

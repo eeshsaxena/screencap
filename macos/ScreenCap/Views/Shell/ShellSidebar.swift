@@ -1,15 +1,18 @@
 import SwiftUI
 
 /// The detail routes the shell can display (U4). `privacy` renders the
-/// prototype Privacy settings pane (U12) and `appRules` the App rules pane
-/// (U13). `timeline` has no sidebar row — it is reached from Journal day links
-/// and recording cards (U9), optionally carrying a wall-clock seek anchor.
+/// prototype Privacy settings pane (U12), `appRules` the App rules pane
+/// (U13), and `intelligence` the Intelligence pane (U9 — model picker + the
+/// per-task cloud-consent matrix). `timeline` has no sidebar row — it is
+/// reached from Journal day links and recording cards (U9), optionally
+/// carrying a wall-clock seek anchor.
 enum ShellRoute: Hashable {
     case library
     case journal
     case timeline(day: Date, seekMs: Int?)
     case privacy
     case appRules
+    case intelligence
 }
 
 /// A sidebar nav row's presentation contract — pure, so the routing / enablement /
@@ -60,6 +63,7 @@ enum ShellSidebarModel {
     static let settingsNav: [ShellNavItem] = [
         ShellNavItem(id: "privacy", label: "Privacy", route: .privacy, availability: .enabled),
         ShellNavItem(id: "appRules", label: "App rules", route: .appRules, availability: .enabled),
+        ShellNavItem(id: "intelligence", label: "Intelligence", route: .intelligence, availability: .enabled),
     ]
 
     /// The status-footer storage summary. `allLocal` gates the "all local ·"

@@ -14,14 +14,25 @@ Deploy (project: proteus-photos, region: southamerica-east1):
     gcloud secrets add-iam-policy-binding screencap-genai-key --project $PROJ \
         --member "serviceAccount:$PROC" --role roles/secretmanager.secretAccessor
 
-    # 2. Deploy from source (Dockerfile builds ffmpeg); SCREENCAP_BUCKET = staging pre-cutover:
+    # 2. Vendor the shared, cloud-free segmentation core into the build context
+    #    (``main.py`` now imports ``screencap.segmentation`` — one source of truth
+    #    with the local pipeline). Only the ``segmentation`` subpackage + a MINIMAL
+    #    ``screencap/__init__.py`` are vendored (NOT the whole screencap package —
+    #    its real __init__ needs a pip-installed dist and drags in heavy deps).
+    #    The vendored dir is gitignored; regenerate it fresh before every deploy:
+    rm -rf scripts/process-recording/screencap
+    mkdir -p scripts/process-recording/screencap
+    printf '' > scripts/process-recording/screencap/__init__.py
+    cp -R src/screencap/segmentation scripts/process-recording/screencap/segmentation
+
+    # 3. Deploy from source (Dockerfile builds ffmpeg); SCREENCAP_BUCKET = staging pre-cutover:
     gcloud run deploy process-recording --project $PROJ --region $R \
         --source scripts/process-recording/ \
         --service-account "$PROC" --no-allow-unauthenticated --cpu 1 --memory 1Gi \
         --set-env-vars SCREENCAP_BUCKET=screencap-recordings-staging,GOOGLE_CLOUD_PROJECT=$PROJ \
         --set-secrets GOOGLE_GENAI_API_KEY=screencap-genai-key:latest
 
-    # 3. Eventarc object-finalize trigger. The trigger LOCATION must match the bucket
+    # 4. Eventarc object-finalize trigger. The trigger LOCATION must match the bucket
     #    location: the recordings bucket is US multi-region, so the trigger lives in `us`
     #    (NOT southamerica-east1). The GCS service agent needs roles/pubsub.publisher and
     #    the Eventarc SA needs roles/run.invoker on the service + roles/eventarc.eventReceiver.
@@ -54,6 +65,13 @@ from pathlib import Path
 
 import functions_framework
 from google.cloud import storage
+
+# Shared, source-agnostic segmentation core (extracted from this script — one
+# source of truth for both the cloud processor and the local pipeline). Vendored
+# into the container by the Dockerfile so ``screencap`` resolves at runtime.
+from screencap.segmentation.activity_summary import build_activity_summary
+from screencap.segmentation.providers.gemini import GeminiProvider
+from screencap.segmentation.schema import _RESPONSE_SCHEMA
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -1110,285 +1128,59 @@ def _parse_relative_time(rel: str) -> float:
         return 0.0
 
 
+class _GcsActivitySource:
+    """GCS-backed ``ActivitySource`` for the shared activity-summary builder.
+
+    Wraps this script's existing GCS readers — ``_iterate_events`` (events
+    JSONL) and ``_blob_bytes`` (transcript JSON) — so ``build_activity_summary``
+    stays cloud-free while the cloud processor keeps reading from GCS.
+    """
+
+    def __init__(self, recording_name: str, manifests: list[dict]) -> None:
+        self._recording_name = recording_name
+        self._manifests = manifests
+
+    def iter_events(self):
+        return _iterate_events(self._recording_name, self._manifests)
+
+    def read_transcript(self, chunk_index: int) -> dict | None:
+        blob_name = (
+            f"recordings/{self._recording_name}/transcript_{chunk_index:04d}.json"
+        )
+        data = _blob_bytes(blob_name)
+        if data is None:
+            return None
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+
 def _derive_activity_summary(
     recording_name: str,
     manifests: list[dict],
 ) -> dict | None:
-    """Build compact activity summary from events JSONL + transcripts.
+    """Build compact activity summary from GCS events JSONL + transcripts.
 
-    Stream-parses events files line by line for memory efficiency.
-    Returns dict with keys: summary, entries, time_map, session_start, session_end.
-    Returns None if no events data exists.
+    Thin GCS adapter over the shared ``build_activity_summary`` core (one source
+    of truth with the local pipeline). Returns dict with keys: summary, entries,
+    time_map, session_start, session_end. Returns None if no events data exists.
     """
-    session_start = min(m["chunk_start"] for m in manifests)
-    session_end = max(m["chunk_end"] for m in manifests)
-
-    entries: list[dict] = []
-    current_entry: dict | None = None
-    # Also collect raw data for fallback segmentation (avoids re-reading GCS)
-    raw_timestamps: list[float] = []
-    raw_window_events: list[dict] = []
-
-    for evt in _iterate_events(recording_name, manifests):
-        evt_type = evt.get("type", "")
-        ts = evt.get("timestamp", 0)
-
-        # Collect raw data for fallback
-        if ts > 0 and evt_type != "mouse.move":
-            raw_timestamps.append(ts)
-        if evt_type == "window.switch":
-            raw_window_events.append({
-                "timestamp": ts,
-                "bundle_id": evt.get("app_bundle_id", ""),
-                "title": evt.get("window_title", ""),
-            })
-
-        if evt_type == "window.switch":
-            if current_entry is not None:
-                current_entry["end_ts"] = ts
-                entries.append(current_entry)
-
-            bundle_id = evt.get("app_bundle_id", "")
-            title = evt.get("window_title", "")
-            domain = evt.get("domain", "") or ""
-
-            current_entry = {
-                "start_ts": ts, "end_ts": ts,
-                "app": _app_name_short(bundle_id),
-                "bundle_id": bundle_id,
-                "title": title[:80], "domain": domain,
-                "cat": _classify_app(bundle_id, title, domain),
-                "typed": [], "shortcuts": [],
-                "clicks": 0, "scrolls": 0,
-            }
-
-        elif evt_type == "key.type" and current_entry is not None:
-            text = evt.get("text", "")
-            if text and len(current_entry["typed"]) < 5:
-                current_entry["typed"].append(text[:50])
-
-        elif evt_type == "key.shortcut" and current_entry is not None:
-            combo = evt.get("text", "") or evt.get("combo", "")
-            if combo and len(current_entry["shortcuts"]) < 10:
-                current_entry["shortcuts"].append(combo)
-
-        elif evt_type in ("mouse.singleclick", "mouse.doubleclick") and current_entry is not None:
-            current_entry["clicks"] += 1
-
-        elif evt_type == "mouse.scroll" and current_entry is not None:
-            current_entry["scrolls"] += 1
-
-    # Close final entry
-    if current_entry is not None:
-        current_entry["end_ts"] = session_end
-        entries.append(current_entry)
-
-    if not entries:
-        return None
-
-    # Merge consecutive entries with same app+title
-    merged: list[dict] = [entries[0]]
-    for e in entries[1:]:
-        prev = merged[-1]
-        if prev["bundle_id"] == e["bundle_id"] and prev["title"] == e["title"]:
-            prev["end_ts"] = e["end_ts"]
-            prev["typed"].extend(e["typed"])
-            prev["shortcuts"].extend(e["shortcuts"])
-            prev["clicks"] += e["clicks"]
-            prev["scrolls"] += e["scrolls"]
-            prev["typed"] = prev["typed"][:5]
-            prev["shortcuts"] = prev["shortcuts"][:10]
-        else:
-            merged.append(e)
-
-    # Build time_map: relative timestamp string → unix timestamp
-    time_map: dict[str, float] = {}
-
-    # Build compact timeline for LLM consumption (capped for context limits)
-    capped = merged[:MAX_ACTIVITY_ENTRIES]
-    if len(merged) > MAX_ACTIVITY_ENTRIES:
-        log.info("Activity entries capped: %d → %d", len(merged), MAX_ACTIVITY_ENTRIES)
-    timeline: list[dict] = []
-    for e in capped:
-        rel_start = e["start_ts"] - session_start
-        rel_end = e["end_ts"] - session_start
-        dur = rel_end - rel_start
-
-        rel_str = _format_relative_time(rel_start)
-        time_map[rel_str] = e["start_ts"]
-
-        entry: dict = {
-            "t": rel_str, "dur": _duration_human(dur),
-            "app": e["app"], "title": e["title"],
-        }
-        if e["domain"]:
-            entry["domain"] = e["domain"]
-        entry["cat"] = e["cat"]
-        if e["typed"]:
-            entry["typed"] = e["typed"]
-        if e["shortcuts"]:
-            entry["shortcuts"] = e["shortcuts"]
-        if e["clicks"]:
-            entry["clicks"] = e["clicks"]
-        timeline.append(entry)
-
-    # Gather transcript snippets
-    sorted_manifests = sorted(manifests, key=lambda m: m["chunk_index"])
-    transcript_snippets: list[dict] = []
-    for manifest in sorted_manifests:
-        chunk_idx = manifest["chunk_index"]
-        chunk_start = manifest["chunk_start"]
-        blob_name = f"recordings/{recording_name}/transcript_{chunk_idx:04d}.json"
-        data = _blob_bytes(blob_name)
-        if data is None:
-            continue
-        try:
-            transcript = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        for seg in transcript.get("segments", [])[:20]:
-            abs_ts = chunk_start + seg.get("start", 0)
-            rel = abs_ts - session_start
-            text = seg.get("text", "").strip()
-            if text:
-                snippet_rel = _format_relative_time(rel)
-                time_map[snippet_rel] = abs_ts
-                transcript_snippets.append({"t": snippet_rel, "text": text[:100]})
-
-    # Register session end
-    end_rel = _format_relative_time(session_end - session_start)
-    time_map[end_rel] = session_end
-
-    summary = {
-        "recording": recording_name,
-        "duration": _duration_human(session_end - session_start),
-        "timeline": timeline,
-    }
-    if transcript_snippets:
-        summary["transcript"] = transcript_snippets
-
-    return {
-        "summary": summary,
-        "entries": merged,
-        "time_map": time_map,
-        "session_start": session_start,
-        "session_end": session_end,
-        # Raw data for fallback segmentation (avoids re-reading GCS)
-        "raw_timestamps": raw_timestamps,
-        "raw_window_events": raw_window_events,
-    }
+    return build_activity_summary(
+        recording_name, manifests, _GcsActivitySource(recording_name, manifests),
+    )
 
 
 # ---------------------------------------------------------------------------
 # LLM segmentation (Steps 4–5)
+#
+# The prompt template, structured-output schema, and validation now live behind
+# the pluggable provider interface (``screencap.segmentation.provider`` +
+# ``providers.gemini.GeminiProvider``). ``_process_v2_manifests`` drives the
+# Gemini backend; ``_call_llm`` below stays as this script's raw-model seam —
+# the provider's ``raw_call`` and this file's test mock point (``_RESPONSE_SCHEMA``
+# is imported from ``screencap.segmentation.schema``, one source of truth).
 # ---------------------------------------------------------------------------
-
-_LLM_PROMPT = """\
-You are a productivity analyst examining a computer activity timeline from a screen recording.
-
-ACTIVITY LOG:
-{activity_json}
-
-INSTRUCTIONS:
-1. Identify the distinct TASKS the user performed. A task is a coherent unit of work —
-   not just "used an app" but "what were they trying to accomplish?"
-2. Brief app switches (< 30s) mid-task are NOT separate tasks — absorb them.
-3. Related activities across different apps are ONE task
-   (e.g., "code in VSCode → test in Terminal → check docs in Chrome" = one dev task).
-4. Use transcript speech to understand INTENT — "let me check my email" signals a task switch.
-
-For each task return:
-- start_time: relative timestamp (matching timeline format, e.g. "0:02:00")
-- end_time: relative timestamp
-- name: 2-3 words capturing the core task (NOT the app name)
-  Good: "Fix login", "Draft roadmap", "Deploy hotfix", "Review PR", "Write tests"
-  Bad: "Used VSCode", "Chrome session", "Terminal work", "Coding task"
-- description: 3-5 sentences covering what was being worked on, specific actions taken,
-  outcomes or blockers encountered, and tools/files involved.
-  Be concrete — mention file names, URLs, error messages, or people when visible.
-- category: one of [development, communication, research, admin, creative, other]
-- apps_used: list of apps involved
-- confidence: high | medium | low
-
-Also provide a SESSION SUMMARY:
-- overview: 4-6 sentence description of what the user accomplished, including specific
-  outcomes, tools used, and any notable blockers or achievements
-- primary_focus: the main category of work
-- time_breakdown: approximate percentage per category
-- key_accomplishments: 2-4 bullet points of specific things completed
-
-Also provide TAGS for the entire recording session:
-- tags: 3-8 lowercase hyphenated labels describing the session
-  (e.g., "python", "debugging", "email-triage", "code-review", "api-design")
-- Capture: languages, frameworks, tools, activity types, and domains
-- Use only lowercase letters, numbers, and hyphens
-
-RULES:
-- Every second of the recording must be covered by exactly one task (no gaps, no overlaps)
-- Name tasks by INTENT not by app name
-- A task should be at least 1 minute long
-- start_time of first task must be "0:00:00"
-
-Return ONLY valid JSON: {{"tasks": [...], "summary": {{...}}, "tags": [...]}}"""
-
-_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "tasks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "start_time": {"type": "string"},
-                    "end_time": {"type": "string"},
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "category": {
-                        "type": "string",
-                        "enum": ["development", "communication", "research",
-                                 "admin", "creative", "other"],
-                    },
-                    "apps_used": {"type": "array", "items": {"type": "string"}},
-                    "confidence": {
-                        "type": "string",
-                        "enum": ["high", "medium", "low"],
-                    },
-                },
-                "required": ["start_time", "end_time", "name", "description",
-                             "category", "apps_used", "confidence"],
-            },
-        },
-        "summary": {
-            "type": "object",
-            "properties": {
-                "overview": {"type": "string"},
-                "primary_focus": {"type": "string"},
-                "time_breakdown": {"type": "object"},
-                "key_accomplishments": {
-                    "type": "array", "items": {"type": "string"},
-                },
-            },
-            "required": ["overview", "primary_focus", "time_breakdown",
-                         "key_accomplishments"],
-        },
-        "tags": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-    },
-    "required": ["tasks", "summary", "tags"],
-}
-
-
-def _llm_segment_session(activity_summary: dict) -> dict | None:
-    """Call LLM to segment the session into tasks.
-
-    Returns dict with "tasks" and "summary", or None on failure.
-    """
-    prompt = _LLM_PROMPT.format(
-        activity_json=json.dumps(activity_summary, indent=2),
-    )
-    return _call_llm(prompt)
 
 
 def _call_llm(prompt: str) -> dict | None:
@@ -1437,125 +1229,13 @@ def _call_gemini(prompt: str) -> dict | None:
 
 # ---------------------------------------------------------------------------
 # LLM output validation (Step 6)
+#
+# Relative→Unix conversion, overlap/zero-duration rejection, and schema-drift
+# repair (``screencap.segmentation.validate.validate_llm_tasks``, one source of
+# truth with the local pipeline) now run *inside* ``GeminiProvider.segment`` —
+# the provider returns already-validated tasks, so ``_process_v2_manifests`` no
+# longer validates separately.
 # ---------------------------------------------------------------------------
-
-_VALID_CATEGORIES = frozenset(
-    {"development", "communication", "research", "admin", "creative", "other"}
-)
-
-_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
-_MAX_TAGS = 8
-
-
-def _validate_tags(raw: list) -> list[str]:
-    """Validate and normalize LLM-generated tags."""
-    seen: set[str] = set()
-    result: list[str] = []
-    for t in raw:
-        if not isinstance(t, str):
-            continue
-        t = t.lower().strip()
-        if _TAG_RE.match(t) and t not in seen:
-            seen.add(t)
-            result.append(t)
-        if len(result) >= _MAX_TAGS:
-            break
-    return result
-
-
-def _validate_llm_tasks(
-    llm_result: dict,
-    session_start: float,
-    session_end: float,
-    time_map: dict[str, float],
-) -> dict | None:
-    """Validate LLM output and convert relative timestamps to Unix.
-
-    Returns dict with "tasks" and "summary", or None if invalid.
-    """
-    tasks = llm_result.get("tasks", [])
-    summary = llm_result.get("summary", {})
-
-    if not tasks:
-        log.warning("LLM returned empty tasks list")
-        return None
-
-    converted: list[dict] = []
-
-    for i, task in enumerate(tasks):
-        for field in ("start_time", "end_time", "name", "description", "category"):
-            if field not in task:
-                log.warning("Task %d missing field: %s", i, field)
-                return None
-
-        start_rel = task["start_time"]
-        end_rel = task["end_time"]
-
-        start_unix = time_map.get(start_rel, session_start + _parse_relative_time(start_rel))
-        end_unix = time_map.get(end_rel, session_start + _parse_relative_time(end_rel))
-
-        # Clamp to session bounds
-        start_unix = max(session_start, min(start_unix, session_end))
-        end_unix = max(session_start, min(end_unix, session_end))
-
-        if end_unix <= start_unix:
-            log.warning("Task %d has zero or negative duration", i)
-            return None
-
-        cat = task.get("category", "other")
-        if cat not in _VALID_CATEGORIES:
-            cat = "other"
-
-        name = (task.get("name") or f"Task {i + 1}").strip()[:80]
-
-        converted.append({
-            "start_ts": start_unix,
-            "end_ts": end_unix,
-            "name": name,
-            "derived_name": _slugify(name),
-            "description": (task.get("description") or "")[:600],
-            "category": cat,
-            "apps_used": task.get("apps_used", []),
-            "confidence": task.get("confidence", "medium"),
-            # Compatibility defaults for _process_task
-            "dominant_app": "",
-            "dominant_app_name": "",
-            "dominant_title": "",
-            "dominant_pct": 0.0,
-            "all_apps": {},
-            "rest_after_s": 0.0,
-            "event_count": 0,
-        })
-
-    converted.sort(key=lambda t: t["start_ts"])
-
-    # Check for overlaps (1s tolerance)
-    for i in range(len(converted) - 1):
-        if converted[i]["end_ts"] > converted[i + 1]["start_ts"] + 1.0:
-            log.warning("Tasks %d and %d overlap", i, i + 1)
-            return None
-
-    # Compute rest_after_s
-    for i in range(len(converted) - 1):
-        gap = converted[i + 1]["start_ts"] - converted[i]["end_ts"]
-        converted[i]["rest_after_s"] = round(max(0, gap), 1)
-    if converted:
-        converted[-1]["rest_after_s"] = 0.0
-
-    # Ensure summary has all required fields
-    if not summary.get("overview"):
-        summary["overview"] = f"Recording with {len(converted)} tasks."
-    if not summary.get("primary_focus"):
-        cats = [t["category"] for t in converted]
-        summary["primary_focus"] = max(set(cats), key=cats.count) if cats else "other"
-    if not summary.get("time_breakdown"):
-        summary["time_breakdown"] = {}
-    if not summary.get("key_accomplishments"):
-        summary["key_accomplishments"] = []
-
-    tags = _validate_tags(llm_result.get("tags", []))
-
-    return {"tasks": converted, "summary": summary, "tags": tags}
 
 
 # ---------------------------------------------------------------------------
@@ -1793,29 +1473,21 @@ def _process_v2_manifests(
             len(activity_data["entries"]),
             len(activity_data["summary"]["timeline"]),
         )
-        llm_result = _llm_segment_session(activity_data["summary"])
+        # Route the LLM call through the pluggable provider interface (U2).
+        # The cloud path pins the Gemini backend; ``raw_call=_call_llm`` keeps
+        # the raw-model call as this script's seam (its fallback log + test
+        # mock point). The provider owns prompt-formatting + validation and
+        # returns the already-validated tasks dict (or None).
+        validated = GeminiProvider(raw_call=_call_llm).segment(activity_data)
 
-        if llm_result:
-            try:
-                validated = _validate_llm_tasks(
-                    llm_result,
-                    activity_data["session_start"],
-                    activity_data["session_end"],
-                    activity_data["time_map"],
-                )
-            except Exception:
-                log.warning("%s: LLM validation crashed", recording_name, exc_info=True)
-                validated = None
-            if validated:
-                tasks = _map_tasks_to_chunks(validated["tasks"], manifests)
-                summary = validated["summary"]
-                tags = validated.get("tags", [])
-                segmentation_method = "llm"
-                log.info("%s: LLM segmentation → %d tasks", recording_name, len(tasks))
-            else:
-                log.warning("%s: LLM output failed validation", recording_name)
+        if validated:
+            tasks = _map_tasks_to_chunks(validated["tasks"], manifests)
+            summary = validated["summary"]
+            tags = validated.get("tags", [])
+            segmentation_method = "llm"
+            log.info("%s: LLM segmentation → %d tasks", recording_name, len(tasks))
         else:
-            log.warning("%s: LLM call returned None", recording_name)
+            log.warning("%s: LLM segmentation produced no valid tasks", recording_name)
     else:
         log.warning("%s: no activity data for LLM", recording_name)
 
