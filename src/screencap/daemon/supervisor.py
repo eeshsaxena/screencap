@@ -1307,7 +1307,12 @@ class Supervisor:
         from screencap import auth
 
         try:
-            token = await asyncio.to_thread(auth.get_id_token)
+            # U13: force a re-mint at recording start so a recording begun right
+            # after checkout carries the just-granted ``subscribed`` claim, rather
+            # than the daemon's cached pre-claim token (which an enforced signer
+            # would refuse for up to ~1h). The daemon holds the refresh token, so
+            # force_refresh works here (the engine, which does not, cannot).
+            token = await asyncio.to_thread(auth.get_id_token, force_refresh=True)
         except Exception as exc:  # noqa: BLE001 — NotSignedIn/AuthError/KeyringError: fail closed
             logger.warning(
                 "daemon: no cloud auth token at recording start (%s); live upload "

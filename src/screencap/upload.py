@@ -71,6 +71,51 @@ def _get_upload_url() -> str:
     return os.environ.get("SCREENCAP_UPLOAD_URL", DEFAULT_UPLOAD_URL)
 
 
+DEFAULT_CHECKOUT_URL = (
+    "https://southamerica-east1-proteus-photos.cloudfunctions.net/create-checkout-session"
+)
+
+
+def _get_checkout_url() -> str:
+    return os.environ.get("SCREENCAP_CHECKOUT_URL", DEFAULT_CHECKOUT_URL)
+
+
+def request_checkout_url() -> str:
+    """POST to create-checkout-session with the caller's bearer token; return the
+    hosted Stripe Checkout URL for the $5/mo Personal cloud plan (billing U9).
+
+    Mirrors :func:`request_signed_urls`'s auth/error handling: ``NotSignedIn`` ->
+    a clear "sign in" message, a transient ``AuthError`` -> retryable message.
+    The uid is derived server-side from the token, never sent by the client.
+    """
+    from screencap import auth
+
+    url = _get_checkout_url()
+    try:
+        resp = auth.authed_post(requests.post, url, json={}, timeout=30)
+    except auth.NotSignedIn:
+        raise RuntimeError("Sign in to upgrade: run `screencap login`.")
+    except auth.AuthError as e:
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+    except requests.ConnectionError:
+        raise RuntimeError("Checkout service unavailable. Check your internet connection.")
+    except requests.Timeout:
+        raise RuntimeError("Checkout service timed out. Try again later.")
+
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("error", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Checkout service error: {detail}")
+
+    checkout_url = resp.json().get("url")
+    if not checkout_url:
+        raise RuntimeError("Checkout service returned no URL.")
+    return checkout_url
+
+
 def _content_type(path: Path) -> str:
     ct = CONTENT_TYPES.get(path.suffix.lower())
     if ct:
@@ -326,6 +371,17 @@ def list_recording_files(recording_dir: Path) -> list[FileInfo]:
     return files
 
 
+class SubscriptionRequired(RuntimeError):
+    """The signer refused an upload for lack of an active cloud subscription (402).
+
+    Subclasses ``RuntimeError`` so the existing upload-failure handling (fail the
+    chunk, NEVER delete local media — see the chunk-upload-sentinel-gating
+    solution doc) applies unchanged and the recording simply stays local. A
+    caller that wants to show an upgrade prompt catches this specifically; it is
+    distinct from a transient 503 (retryable) and a 401 (force-refresh + retry).
+    """
+
+
 def request_signed_urls(
     recording_name: str, files: list[FileInfo],
 ) -> tuple[dict[str, str | None], str]:
@@ -378,6 +434,14 @@ def request_signed_urls(
         raise RuntimeError("Upload service unavailable. Check your internet connection.")
     except requests.Timeout:
         raise RuntimeError("Upload service timed out. Try again later.")
+
+    if resp.status_code == 402:
+        # The signer refused: no active cloud subscription (billing plan U2/U6).
+        # Distinct type so the caller keeps the recording local and can prompt an
+        # upgrade — never a retry-storm, never a delete.
+        raise SubscriptionRequired(
+            "Cloud upload requires an active subscription — upgrade in the app to enable cloud."
+        )
 
     if resp.status_code != 200:
         detail = ""

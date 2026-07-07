@@ -62,8 +62,12 @@ _SETTINGS_SCHEMA_VERSION = 2
 # intelligence, U8.
 _SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 1
 _STOP_SCHEMA_VERSION = 1
-# `whoami --json` envelope (ok + schema_version + signed_in/uid/email), read by
-# the SwiftUI shell to gate the Upload affordance on auth state.
+# `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed),
+# read by the SwiftUI shell to gate the Upload affordance on auth + entitlement.
+# Deliberately NOT bumped when `subscribed` was added: it is an additive,
+# defaulted, backward-compatible field, and the Swift drift check is warn-only —
+# bumping would emit spurious warnings on older app builds during the two-track
+# paywall rollout for no compatibility gain.
 _AUTH_SCHEMA_VERSION = 1
 # `backfill status --json` envelope (ok + schema_version + the privacy-safe
 # status snapshot the daemon publishes). SCR-178 U6.
@@ -1632,9 +1636,21 @@ def logout_cmd():
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
-def whoami_cmd(as_json):
+@click.option("--force-refresh", "force_refresh", is_flag=True,
+              help="Force an ID-token re-mint before reading state, so a "
+                   "just-granted subscription claim is picked up immediately.")
+def whoami_cmd(as_json, force_refresh):
     """Show the signed-in cloud account (or 'not signed in')."""
     from screencap import auth
+
+    if force_refresh:
+        # Post-checkout path: re-mint the ID token so a webhook-set ``subscribed``
+        # claim is visible on this and subsequent reads. A refresh failure is not
+        # fatal — whoami() below reports stale rather than crashing.
+        try:
+            auth.get_id_token(force_refresh=True)
+        except Exception:
+            pass
 
     try:
         info = auth.whoami()
@@ -1658,6 +1674,37 @@ def whoami_cmd(as_json):
         console.print(f"Signed in as [bold]{escape(str(who))}[/bold]{suffix}")
     else:
         console.print("Not signed in. Run [bold]screencap login[/bold] to upload to the cloud.")
+
+
+@cli.command("checkout-url")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def checkout_url_cmd(as_json):
+    """Print a hosted Stripe Checkout URL for the $5/mo Personal cloud plan.
+
+    Requires sign-in (the uid is derived server-side from the bearer token). The
+    macOS app opens the printed URL in the browser; on return it force-refreshes
+    the entitlement (`whoami --force-refresh`) to pick up the granted plan.
+    """
+    from screencap import upload
+
+    try:
+        url = upload.request_checkout_url()
+    except Exception as e:
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
+            ))
+            sys.exit(1)
+        console.print(f"[red]Couldn't start checkout:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps(
+            {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, "url": url}
+        ))
+        return
+    console.print(url)
 
 
 @cli.command()

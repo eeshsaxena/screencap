@@ -18,6 +18,10 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
     let uid: String?
     let email: String?
     let stale: Bool?
+    /// Cloud-paywall entitlement (billing U5/U8). Display/UX only — the signer's
+    /// hard gate is the real enforcement. Additive/optional, so an older CLI that
+    /// omits it decodes fine and resolves to "not subscribed".
+    let subscribed: Bool?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -27,6 +31,7 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
         case uid
         case email
         case stale
+        case subscribed
         case error
     }
 

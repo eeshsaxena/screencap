@@ -219,13 +219,29 @@ def test_logout_when_not_signed_in_returns_false(fake_keyring):
     assert a.logout() is False
 
 
-def test_whoami_signed_in(fake_keyring, monkeypatch):
+def test_whoami_signed_in_reads_subscribed_claim(fake_keyring, monkeypatch):
     fake_keyring[_KEY] = "rt"
+    tok = _jwt({"user_id": "uid1", "email": "e@x.com", "subscribed": True})
     monkeypatch.setattr(
         a, "_ensure_fresh",
-        lambda: a.AuthState("id", "rt", time.time() + 3600, "uid1", "e@x.com"),
+        lambda: a.AuthState(tok, "rt", time.time() + 3600, "uid1", "e@x.com"),
     )
-    assert a.whoami() == {"signed_in": True, "uid": "uid1", "email": "e@x.com"}
+    assert a.whoami() == {
+        "signed_in": True,
+        "uid": "uid1",
+        "email": "e@x.com",
+        "subscribed": True,
+    }
+
+
+def test_whoami_signed_in_absent_claim_is_unsubscribed(fake_keyring, monkeypatch):
+    fake_keyring[_KEY] = "rt"
+    tok = _jwt({"user_id": "uid1", "email": "e@x.com"})
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda: a.AuthState(tok, "rt", time.time() + 3600, "uid1", "e@x.com"),
+    )
+    assert a.whoami()["subscribed"] is False
 
 
 def test_whoami_offline_reports_stale_not_crash(fake_keyring, monkeypatch):
@@ -267,11 +283,35 @@ def test_cli_whoami_json_envelope_both_states(monkeypatch):
     assert payload["schema_version"] == _AUTH_SCHEMA_VERSION
     assert payload["signed_in"] is False
 
-    monkeypatch.setattr(a, "whoami", lambda: {"signed_in": True, "uid": "u", "email": "e@x.com"})
+    monkeypatch.setattr(
+        a, "whoami",
+        lambda: {"signed_in": True, "uid": "u", "email": "e@x.com", "subscribed": True},
+    )
     res = runner.invoke(whoami_cmd, ["--json"])
     payload = json.loads(res.output)
     assert payload["signed_in"] is True
     assert payload["email"] == "e@x.com"
+    assert payload["subscribed"] is True
+
+
+def test_cli_whoami_force_refresh_remints_token(monkeypatch):
+    from click.testing import CliRunner
+
+    from screencap.cli import whoami_cmd
+
+    calls = {}
+
+    def fake_get_id_token(force_refresh=False):
+        calls["force"] = force_refresh
+        return "tok"
+
+    monkeypatch.setattr(a, "get_id_token", fake_get_id_token)
+    monkeypatch.setattr(
+        a, "whoami", lambda: {"signed_in": True, "uid": "u", "subscribed": True}
+    )
+    res = CliRunner().invoke(whoami_cmd, ["--json", "--force-refresh"])
+    assert res.exit_code == 0
+    assert calls.get("force") is True  # re-mint was forced before reading state
 
 
 # --------------------------------------------------------------------------

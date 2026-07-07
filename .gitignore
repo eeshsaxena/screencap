@@ -19,6 +19,9 @@ src/screencap/__pycache__
 .venv-*/
 venv/
 .env
+# Local Stripe/billing test-mode keys for local deploys — NEVER commit real values
+.env.*
+!.env.example
 
 # Build-time-injected cloud-auth credentials (written by
 # scripts/generate_provisioned.py; non-secret but kept out of git by policy)

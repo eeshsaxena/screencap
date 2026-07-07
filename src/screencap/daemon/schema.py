@@ -494,6 +494,9 @@ def _load_models() -> dict[str, Any]:
         uid: str | None = None
         email: str | None = None
         stale: bool = False
+        # Cloud-paywall entitlement (display/UX only; the signer's hard gate is
+        # the real enforcement). Additive, defaulted, backward-compatible.
+        subscribed: bool = False
 
     class BackfillStartRequest(_DaemonModel):
         """SCR-178 ``backfill.start`` input.
