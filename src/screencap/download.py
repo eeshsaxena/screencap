@@ -212,7 +212,22 @@ def request_signed_urls(recording_name: str) -> tuple[dict[str, str], str]:
 def _download_file_with_progress(
     url: str, dest_path: Path, progress: Progress, task_id
 ) -> int:
-    """Stream-download a file with progress updates. Returns bytes written."""
+    """Stream-download a file with progress updates. Returns bytes written.
+
+    Objects uploaded with cloud E2EE on are ciphertext; this seam detects them
+    by the header magic and decrypts them on-device (KTD-4/KTD-6). Decryption
+    lands in a ``0600`` temp file in the destination directory and is
+    ``os.replace``-d onto ``dest_path`` only after every frame's tag verifies —
+    so a truncated or tampered object raises and leaves no partial plaintext at
+    the destination. Legacy plaintext objects (no magic) stream through
+    unchanged, so a recording with mixed objects downloads correctly.
+    """
+    import os
+    import tempfile
+    from itertools import chain
+
+    from screencap import cloud_crypto
+
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     resp = requests.get(url, stream=True, timeout=(10, None))
@@ -222,13 +237,47 @@ def _download_file_with_progress(
     if total:
         progress.update(task_id, total=total)
 
-    written = 0
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-            written += len(chunk)
-            progress.update(task_id, completed=written)
+    # iter() so a single-pass consume holds even if iter_content returns a
+    # re-iterable (a real generator already is single-pass; this guards mocks
+    # and any list-returning implementation from double-counting on the peek).
+    stream = iter(resp.iter_content(chunk_size=8192))
+    # Peek just enough to detect the encrypted-object magic without buffering.
+    head = b""
+    for chunk in stream:
+        head += chunk
+        if len(head) >= len(cloud_crypto.MAGIC):
+            break
+    body = chain([head], stream)
 
+    if not cloud_crypto.is_encrypted_prefix(head):
+        written = 0
+        with open(dest_path, "wb") as f:
+            for chunk in body:
+                f.write(chunk)
+                written += len(chunk)
+                progress.update(task_id, completed=written)
+        return written
+
+    key = cloud_crypto.resolve_cloud_key()
+    if key is None:
+        raise RuntimeError(
+            "recording is end-to-end encrypted but no cloud key is available "
+            "(sign in on the device that recorded it)"
+        )
+    fd, tmp = tempfile.mkstemp(dir=str(dest_path.parent), prefix=f".{dest_path.name}.")
+    os.chmod(tmp, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            cloud_crypto.decrypt_stream_from_chunks(body, out, key)
+        written = os.path.getsize(tmp)
+        os.replace(tmp, str(dest_path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    progress.update(task_id, total=written, completed=written)
     return written
 
 

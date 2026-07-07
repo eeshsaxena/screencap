@@ -1589,6 +1589,25 @@ def login_cmd(as_json):
         else:
             console.print(f"[red]Sign-in failed:[/red] {escape(str(e))}")
         sys.exit(1)
+    # E2EE slice: create the device-held cloud key in this foreground process.
+    # The one-time Keychain ACL prompt needs a foreground identity — the daemon
+    # and engine can only read a delivered key, never create it. Flag-gated; a
+    # Keychain hiccup here must never fail the sign-in (the key is (re)created on
+    # the next login attempt).
+    from screencap.config import get_cloud_e2ee_enabled
+
+    if get_cloud_e2ee_enabled():
+        try:
+            from screencap import cloud_crypto
+
+            cloud_crypto.get_or_create_cloud_kek()
+        except Exception:  # noqa: BLE001 — never fail sign-in over key setup
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "could not create cloud E2EE key at login (will retry next login)",
+                exc_info=True,
+            )
     if as_json:
         click.echo(json.dumps({
             "ok": True, "schema_version": _AUTH_SCHEMA_VERSION,
@@ -2809,6 +2828,7 @@ def settings(ctx, set_pair, as_json):
         get_auto_delete_after_upload,
         get_auto_name,
         get_chunk_duration,
+        get_cloud_e2ee_enabled,
         get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
@@ -2833,7 +2853,7 @@ def settings(ctx, set_pair, as_json):
         _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
                        "content_index_enabled", "content_index_consent_declined",
-                       "content_index_backfill_declined"}
+                       "content_index_backfill_declined", "cloud_e2ee_enabled"}
         _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
                          "segmentation_mode": ("llm", "idle")}
 
@@ -2895,6 +2915,7 @@ def settings(ctx, set_pair, as_json):
         "content_index_enabled": bool(get_content_index_enabled()),
         "content_index_consent_declined": bool(get_content_index_consent_declined()),
         "content_index_backfill_declined": bool(get_content_index_backfill_declined()),
+        "cloud_e2ee_enabled": bool(get_cloud_e2ee_enabled()),
         "privacy": _build_privacy_settings_block(),
     }
 
