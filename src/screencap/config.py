@@ -253,6 +253,23 @@ def get_base_dir() -> Path:
     return _DEFAULT_BASE
 
 
+def get_models_dir() -> Path:
+    """Return ~/.screencap/models/ (the downloaded-model store), creating it 0o700.
+
+    Same-EUID-hardened like the content-index store (SECURITY.md): the dir is
+    ``0o700`` so another local user cannot read or swap the weights. Env override
+    ``SCREENCAP_MODELS_DIR`` (SCR-239).
+    """
+    env = os.environ.get("SCREENCAP_MODELS_DIR")
+    p = Path(env) if env else (_DEFAULT_BASE / "models")
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.chmod(0o700)
+    except OSError:
+        pass
+    return p
+
+
 def get_disk_warn_mb() -> int:
     """Minimum free MB to start recording / show warning. Default 2000."""
     return _parse_nonneg_int_env("SCREENCAP_DISK_WARN_MB", "disk_warn_mb", 2000)
