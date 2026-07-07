@@ -273,11 +273,19 @@ def test_real_db_blocks_sensitive_app_span(tmp_path):
 
 
 def test_all_allow_predicate_passthrough():
-    """An all-ALLOW recording (predicate never blocks) is unchanged by the strip."""
+    """An all-ALLOW recording (predicate never blocks) leaves content unchanged.
+
+    The strip ran (a ``blocked_source`` was applied) but blocked nothing, so the
+    content matches the no-strip build while the summary is authoritatively
+    marked ``stripped=True`` (the on-device provider's fail-closed gate relies on
+    this). The no-strip build carries no marker.
+    """
     stripped = build_activity_summary(
         "rec", _MANIFESTS, _source(), blocked_source=lambda _ts: False,
     )
     plain = build_activity_summary("rec", _MANIFESTS, _source())
+    assert stripped.pop("stripped") is True
+    assert "stripped" not in plain
     assert stripped == plain
 
 

@@ -1005,10 +1005,10 @@ def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
     if summary is None:
         return None
 
-    # The summary was built with blocked_source, so the R11 privacy strip has
-    # run; mark it stripped so the on-device provider's fail-closed gate accepts
-    # it (an unmarked summary is refused and reported unavailable, U5).
-    summary["stripped"] = True
+    # The summary was built with blocked_source, so build_activity_summary has
+    # run the R11 strip and marked the summary stripped AUTHORITATIVELY — the
+    # on-device provider's fail-closed gate relies on that builder-set marker, so
+    # the caller does not (and must not) forge it here.
 
     # Resolve and run the configured provider. segment() returns a validated
     # tasks dict, None (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not

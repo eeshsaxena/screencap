@@ -474,12 +474,15 @@ def _resolve_blocked_predicate(
 
         return is_blocked
     except Exception:
-        # MUST stay broad enough to catch CanonicalDerivationError (the partial-
-        # read signal from require_canonical=True). Mapping it to _always_blocked
-        # is what fails closed. Not imported by name at module top on purpose:
-        # that would pull the heavy skip_intervals/scrubber stack into this
-        # otherwise-light module.
-        log.warning(
+        # Deliberately broad: privacy fail-closed MUST win over surfacing the
+        # error, so ANY failure (the CanonicalDerivationError partial-read signal
+        # from require_canonical=True, but also an unexpected programming error)
+        # maps to _always_blocked. The heavy skip_intervals/scrubber import stays
+        # inside the try on purpose — importing it at module top would defeat this
+        # module's light import surface. Logged at ERROR (not warning) so a
+        # systematic failure or a programming bug still surfaces loudly rather
+        # than hiding behind a silently-all-blocked recording.
+        log.error(
             "activity-summary privacy strip: blocked-interval derivation failed "
             "for %s; failing closed (all content treated as blocked)",
             recording_dir.name,
@@ -710,7 +713,7 @@ def build_activity_summary(
     if transcript_snippets:
         summary["transcript"] = transcript_snippets
 
-    return {
+    result = {
         "summary": summary,
         "entries": merged,
         "time_map": time_map,
@@ -720,3 +723,11 @@ def build_activity_summary(
         "raw_timestamps": raw_timestamps,
         "raw_window_events": raw_window_events,
     }
+    if blocked_source is not None:
+        # Mark the summary stripped AUTHORITATIVELY — the on-device provider's
+        # fail-closed gate trusts this flag, so it is set here (and ONLY when a
+        # ``blocked_source`` was applied) rather than by the caller, tying the
+        # claim to the strip actually having run. Omitted entirely on the cloud
+        # path (``blocked_source is None``) so the golden stays byte-identical.
+        result["stripped"] = True
+    return result

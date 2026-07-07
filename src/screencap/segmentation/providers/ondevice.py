@@ -73,9 +73,32 @@ def _helper_timeout_s() -> float:
     if not raw:
         return _DEFAULT_TIMEOUT_S
     try:
-        return float(raw)
+        val = float(raw)
     except ValueError:
         return _DEFAULT_TIMEOUT_S
+    # A non-positive override would fail to bound the helper; fall back to the
+    # default rather than trusting a bad value.
+    return val if val > 0 else _DEFAULT_TIMEOUT_S
+
+
+# Env var names whose value is credential-bearing and must never reach the
+# helper subprocess (defense in depth — the on-device model needs no secrets).
+_SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """The process environment with credential-bearing variables removed.
+
+    The Swift helper is trusted, bundled code, but has no need for any cloud API
+    key. Stripping ``GOOGLE_GENAI_API_KEY`` and any ``*_KEY`` / ``*_TOKEN`` /
+    ``*_SECRET`` / ``*_PASSWORD`` / ``*_CREDENTIAL`` keeps a compromised or
+    future-extended helper from ever seeing them.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not any(m in k.upper() for m in _SECRET_ENV_MARKERS)
+    }
 
 
 def _find_bundled_helper() -> Path | None:
@@ -143,6 +166,7 @@ class OnDeviceProvider:
                 capture_output=True,
                 text=True,
                 timeout=_helper_timeout_s(),
+                env=_scrubbed_env(),
             )
         except subprocess.TimeoutExpired:
             log.warning("On-device helper timed out; unavailable")
