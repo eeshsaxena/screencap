@@ -16,9 +16,11 @@ struct ThumbnailImage: @unchecked Sendable {
     let cgImage: CGImage
 }
 
-/// A minimal async counting semaphore so the loader can bound how many decodes
-/// run at once (the fork-bomb guard from learning #1).
-private actor DecodeGate {
+/// A minimal async counting semaphore so a loader can bound how many decodes
+/// run at once (the fork-bomb guard from learning #1). Shared with
+/// `RecordingFrameIndex`, which gates its video poster-frame extraction the same
+/// way (video decode is heavier than a JPEG downsample, so it needs the cap too).
+actor DecodeGate {
     private var permits: Int
     private var waiters: [CheckedContinuation<Void, Never>] = []
 

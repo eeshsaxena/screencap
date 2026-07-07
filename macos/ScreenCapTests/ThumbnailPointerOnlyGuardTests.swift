@@ -76,4 +76,17 @@ final class ThumbnailPointerOnlyGuardTests: XCTestCase {
         // Never reads outside the recordings tree.
         XCTAssertNil(RecordingFrameIndex.screenshotsDir(root: root, recording: "../../Library/Keychains"))
     }
+
+    /// The poster-frame fallback reads a video chunk from the recording dir, so
+    /// that dir resolver carries the same R6 containment invariant as
+    /// `screenshotsDir` — it must never resolve outside the recordings tree.
+    func testPosterVideoSourceIsRootedUnderRecordingDir() {
+        let root = URL(fileURLWithPath: "/Users/x/.screencap/recordings")
+        let dir = RecordingFrameIndex.recordingDir(root: root, recording: "rec-1")
+        XCTAssertEqual(dir?.path, "/Users/x/.screencap/recordings/rec-1")
+        // Escapes and non-single-component names are rejected before any disk read.
+        XCTAssertNil(RecordingFrameIndex.recordingDir(root: root, recording: "../../Library/Keychains"))
+        XCTAssertNil(RecordingFrameIndex.recordingDir(root: root, recording: "a/b"))
+        XCTAssertNil(RecordingFrameIndex.recordingDir(root: root, recording: ".."))
+    }
 }

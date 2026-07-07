@@ -234,6 +234,44 @@ def _dir_size_bytes(p: Path) -> int:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
 
+def _audio_duration_seconds(recording_dir: Path) -> float | None:
+    """Total duration (seconds) of a recording's local FLAC audio, or ``None``.
+
+    The DB-derived duration (``_read_recording_meta``) only measures *screen
+    activity* — ``MAX(action_event.timestamp) - started``. A recording with audio
+    but no ``action_event`` rows (an audio-only or otherwise activity-free
+    capture) leaves that ``None``, so the row shows "—" despite minutes of audio
+    on disk. This reads the true length straight from the FLAC header (cheap — no
+    decode) as a fallback for exactly that case, summing chunked audio files.
+
+    Fail-open: an unreadable or zero-length file contributes nothing, so a
+    genuinely empty recording (0-byte audio, an evicted stub with no local FLAC)
+    still resolves to ``None`` → "—". Runs only when the DB duration is absent, so
+    the common listing path pays nothing and never imports ``soundfile``.
+    """
+    flacs = sorted(recording_dir.glob("audio_*.flac"))
+    legacy = recording_dir / "audio.flac"
+    if legacy.exists():
+        flacs.append(legacy)
+    if not flacs:
+        return None
+    try:
+        # Deferred: libsndfile is a heavy import; keep it off the hot path and
+        # out of `screencap --help` (CLAUDE.md).
+        import soundfile
+    except Exception:
+        return None
+    total = 0.0
+    for f in flacs:
+        try:
+            info = soundfile.info(str(f))
+            if info.samplerate > 0 and info.frames > 0:
+                total += info.frames / info.samplerate
+        except Exception:
+            continue
+    return total if total > 0 else None
+
+
 def _fmt_size(total_bytes: int) -> str:
     if total_bytes < 1024 * 1024:
         return f"{total_bytes / 1024:.1f} KB"
@@ -599,6 +637,11 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
             continue
 
         started, duration, _ = _read_recording_meta(db)
+        # The DB duration only counts screen activity; fall back to the on-disk
+        # audio length so an audio-only (no action_event) recording shows a real
+        # duration instead of "—". Only when the DB gave us nothing (rare path).
+        if duration is None:
+            duration = _audio_duration_seconds(d)
         date_str = "—"
         if started:
             date_str = datetime.fromtimestamp(started).strftime("%Y-%m-%d")

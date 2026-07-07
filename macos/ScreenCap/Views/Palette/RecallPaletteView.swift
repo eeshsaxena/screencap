@@ -75,7 +75,8 @@ struct RecallPaletteView: View {
                 onCancelBackfill: model.cancelBackfill,
                 onResumeBackfill: model.resumeBackfill,
                 onRunChip: runChipQuery,
-                onOpen: jump
+                onOpen: jump,
+                onRetry: { runner?.search(query, debounced: false) }
             )
             footer
         }
@@ -267,6 +268,8 @@ struct RecallPaletteContent: View {
     var onResumeBackfill: () -> Void = {}
     var onRunChip: (String) -> Void = { _ in }
     var onOpen: (SearchResultItem) -> Void = { _ in }
+    /// Re-run the current query — the daemon-down state's retry affordance.
+    var onRetry: () -> Void = {}
 
     private var state: RecallPalette.State {
         RecallPalette.state(
@@ -302,7 +305,8 @@ struct RecallPaletteContent: View {
             message(
                 icon: "bolt.horizontal.circle",
                 title: "ScreenCap isn't running",
-                note: "Start ScreenCap's background helper to search your history."
+                note: "Start ScreenCap's background helper to search your history.",
+                retry: onRetry
             )
         case .empty:
             message(
@@ -455,7 +459,12 @@ struct RecallPaletteContent: View {
 
     // MARK: - Message state
 
-    private func message(icon: String, title: String, note: String) -> some View {
+    private func message(
+        icon: String,
+        title: String,
+        note: String,
+        retry: (() -> Void)? = nil
+    ) -> some View {
         VStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 22))
@@ -467,6 +476,12 @@ struct RecallPaletteContent: View {
                 .font(SCTypography.sans(size: 12))
                 .foregroundStyle(Color.scInkSecondary)
                 .multilineTextAlignment(.center)
+            // Give the daemon-down state a way to act on its own instruction:
+            // re-run the query once the helper is back, instead of a dead end.
+            if let retry {
+                Button("Retry") { retry() }
+                    .padding(.top, 4)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
