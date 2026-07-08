@@ -62,30 +62,33 @@ final class FakeCloudAuthService: CloudAuthService {
         if let logoutThrows { throw logoutThrows }
     }
 
-    // entitlement + checkout (billing U9/U14). `forceRefreshData` defaults to
-    // `whoamiData` so a test that only sets the latter still drives the
-    // force-refresh path.
-    var forceRefreshData: Data?
+    // billing (U9/U14) — force-refresh whoami, hosted-checkout URL, and the
+    // grant-only reconcile self-heal. (The U9 methods gained protocol
+    // requirements in the paywall work without the fake being updated; reconcile
+    // is added here alongside.)
+    var forceRefreshData = Data()
     var forceRefreshError: Error?
     private(set) var forceRefreshCallCount = 0
-
-    var checkoutURLData = Data()
-    var checkoutURLError: Error?
-
-    var reconcileData = Data()
-    var reconcileError: Error?
-    private(set) var reconcileCallCount = 0
 
     func fetchWhoAmIForceRefresh() async throws -> Data {
         forceRefreshCallCount += 1
         if let forceRefreshError { throw forceRefreshError }
-        return forceRefreshData ?? whoamiData
+        return forceRefreshData
     }
 
+    var checkoutURLData = Data()
+    var checkoutURLError: Error?
+    private(set) var checkoutURLCallCount = 0
+
     func fetchCheckoutURL() async throws -> Data {
+        checkoutURLCallCount += 1
         if let checkoutURLError { throw checkoutURLError }
         return checkoutURLData
     }
+
+    var reconcileData = Data()
+    var reconcileError: Error?
+    private(set) var reconcileCallCount = 0
 
     func fetchReconcileEntitlement() async throws -> Data {
         reconcileCallCount += 1
@@ -208,6 +211,86 @@ final class CloudAuthControllerTests: XCTestCase {
 
         XCTAssertTrue(controller.isSignedIn)
         XCTAssertEqual(controller.status.accountLabel, "abc123")
+    }
+
+    // MARK: - lazy refresh (SCR-241: no eager Keychain decrypt at launch)
+
+    /// A freshly-constructed controller does NO auth work: status stays
+    /// `.unknown` and no `whoami` shell-out (hence no Keychain decrypt) fires
+    /// until something calls `refreshIfNeeded`/`refresh`. This is the invariant
+    /// the launch-prompt fix rests on — the app must be able to build the
+    /// controller at launch without touching the Keychain.
+    func testInitialStateDoesNoAuthWork() {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+
+        let controller = CloudAuthController(service: service)
+
+        XCTAssertEqual(controller.status, .unknown)
+        XCTAssertEqual(service.whoamiCallCount, 0, "constructing the controller must not decrypt the Keychain")
+    }
+
+    /// From the initial `.unknown` state, `refreshIfNeeded` resolves status by
+    /// shelling out to `whoami` exactly once — the lazy replacement for the
+    /// launch-time probe that decrypts the Keychain only when a cloud surface
+    /// actually appears.
+    func testRefreshIfNeededResolvesFromUnknown() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        let controller = CloudAuthController(service: service)
+        XCTAssertEqual(controller.status, .unknown)
+
+        await controller.refreshIfNeeded()
+
+        XCTAssertEqual(service.whoamiCallCount, 1)
+        XCTAssertTrue(controller.isSignedIn)
+    }
+
+    /// Once status has resolved, `refreshIfNeeded` is a no-op — it must NOT
+    /// re-decrypt the Keychain on every subsequent cloud-surface appearance
+    /// (menu reopened, another review window), which is exactly the repeated
+    /// prompting this fix exists to avoid.
+    func testRefreshIfNeededNoOpsOnceResolved() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refreshIfNeeded()
+        await controller.refreshIfNeeded()
+        await controller.refreshIfNeeded()
+
+        XCTAssertEqual(service.whoamiCallCount, 1, "resolved status must not re-shell whoami")
+    }
+
+    /// Two cloud surfaces appearing at once (e.g. the menu-bar account section
+    /// while cloud onboarding is on screen) must share a single in-flight
+    /// refresh — two concurrent decrypts would risk two authorization prompts.
+    func testRefreshIfNeededCoalescesConcurrentCallers() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        let controller = CloudAuthController(service: service)
+
+        async let first: Void = controller.refreshIfNeeded()
+        async let second: Void = controller.refreshIfNeeded()
+        _ = await (first, second)
+
+        XCTAssertEqual(service.whoamiCallCount, 1, "concurrent callers must not each decrypt the Keychain")
+        XCTAssertTrue(controller.isSignedIn)
+    }
+
+    /// A failed lazy refresh (offline) still resolves status away from
+    /// `.unknown` (to signed-out, matching `refresh`), so `refreshIfNeeded`
+    /// doesn't retry-shell on every appearance while offline.
+    func testRefreshIfNeededTreatsFailureAsResolved() async {
+        let service = FakeCloudAuthService()
+        service.whoamiError = FakeCloudAuthError.offline
+        let controller = CloudAuthController(service: service)
+
+        await controller.refreshIfNeeded()
+        await controller.refreshIfNeeded()
+
+        XCTAssertEqual(service.whoamiCallCount, 1)
+        XCTAssertEqual(controller.status, .signedOut)
     }
 
     // MARK: - sign in

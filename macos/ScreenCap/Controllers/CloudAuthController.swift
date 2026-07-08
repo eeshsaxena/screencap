@@ -166,6 +166,13 @@ final class CloudAuthController: ObservableObject {
     /// signed in"). Fired exactly once per attempt — on success, failure, or
     /// cancel — then cleared.
     private var pendingResult: ((Bool) -> Void)?
+    /// Coalesces concurrent `refreshIfNeeded()` callers onto a single `whoami`
+    /// shell-out. Two cloud surfaces appearing at once (e.g. the menu-bar
+    /// account section while the cloud-onboarding step is on screen) must not
+    /// each decrypt the Keychain — a second decrypt would risk a second
+    /// authorization prompt (SCR-241). Held only for the duration of one
+    /// lazy refresh; nil the rest of the time.
+    private var pendingLazyRefresh: Task<Void, Never>?
 
     /// Watchdog deadline: just past the CLI's own 180s `login` self-timeout so
     /// the Swift side only fires when the subprocess has genuinely hung before
@@ -209,6 +216,35 @@ final class CloudAuthController: ObservableObject {
             isSubscribed = false
             paywallEnabled = false
         }
+    }
+
+    /// Lazily resolves sign-in state the first time a cloud surface actually
+    /// needs it, instead of eagerly at app launch.
+    ///
+    /// `whoami` decrypts the Keychain refresh token, and on macOS a decrypt that
+    /// the reading binary's ACL doesn't silently authorize raises the "ScreenCap
+    /// wants to use confidential information stored in screencap-auth" prompt.
+    /// Probing at launch (a scene `.task`) made that prompt fire *the moment the
+    /// app opened*, before the user touched anything cloud-related. Cloud
+    /// surfaces (the menu-bar account section, the Upload gate, cloud onboarding)
+    /// call this on appear so the decrypt — and any prompt — only happens on a
+    /// genuine cloud interaction. The durable storage-layer fix that stops the
+    /// prompt entirely is tracked in SCR-241.
+    ///
+    /// Coalesced two ways: it no-ops once `status` has resolved away from
+    /// `.unknown` (so a signed-in session decrypts at most once), and concurrent
+    /// callers share one in-flight refresh via `pendingLazyRefresh` (so two
+    /// surfaces appearing together can't trigger two decrypts / two prompts).
+    func refreshIfNeeded() async {
+        guard status == .unknown else { return }
+        if let pendingLazyRefresh {
+            await pendingLazyRefresh.value
+            return
+        }
+        let task = Task { await self.refresh() }
+        pendingLazyRefresh = task
+        await task.value
+        pendingLazyRefresh = nil
     }
 
     // MARK: - Entitlement + checkout (billing U8/U9)

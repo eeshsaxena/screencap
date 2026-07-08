@@ -68,15 +68,16 @@ struct ScreenCapApp: App {
                     recorder.bindPermissions(permissions)
                     permissions.refresh()
                 }
-                .task {
-                    // Cloud sign-in state. Runs concurrently with the daemon
-                    // probe below (separate `.task`) so a slow `whoami` refresh
-                    // never delays recording-engine startup. Local recording is
-                    // never gated on auth (R3).
-                    if !isRunningUnderTests {
-                        await auth.refresh()
-                    }
-                }
+                // Cloud sign-in state is deliberately NOT probed here at launch.
+                // `whoami` decrypts the Keychain refresh token, and a decrypt the
+                // reading binary's ACL doesn't silently authorize raises a macOS
+                // "ScreenCap wants to use screencap-auth" prompt — probing on
+                // appear made that fire the instant the app opened, before any
+                // cloud interaction. Cloud surfaces (menu-bar account section,
+                // Upload gate, cloud onboarding) call `auth.refreshIfNeeded()` on
+                // appear instead, so the decrypt/prompt only happens on genuine
+                // cloud engagement. Storage-layer fix: SCR-241. Local recording
+                // is never gated on auth (R3), so nothing at launch needs it.
                 .task {
                     if !isRunningUnderTests {
                         await recorder.probeDaemon()
