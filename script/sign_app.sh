@@ -162,6 +162,16 @@ if ! codesign -d -r- "${CLI_DIR}" 2>&1 | grep -q "com.screencap.daemon"; then
   exit 1
 fi
 
+# SCR-241: the keychain-access-groups entitlement must survive the release re-sign,
+# or the shipped daemon/CLI silently falls back to the legacy keyring path (no
+# prompt, no sharing — the fix looks done while doing nothing). Primary catch.
+echo "==> Asserting helper carries the keychain-access-groups entitlement"
+if ! codesign -d --entitlements :- "${CLI_BINARY}" 2>/dev/null | grep -q "2A8S6MV8DZ.com.screencap.shared"; then
+  echo "error: signed helper is missing keychain-access-groups (2A8S6MV8DZ.com.screencap.shared)." >&2
+  echo "error: cloud auth would fall back to the legacy keyring path; check screencap-cli.entitlements." >&2
+  exit 1
+fi
+
 echo "==> Smoke-testing the signed embedded daemon helper under hardened runtime"
 # Necessary but not sufficient: this is a direct exec, not the launchd/
 # SMAppService daemon path. A hardened-runtime/library-validation break that
