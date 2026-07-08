@@ -1,0 +1,23 @@
+# Keep secrets and dev-only files OUT of the Cloud Function source bundle.
+# gcloud looks for this file in the --source dir; without it, a
+# `gcloud functions deploy --source scripts/cloud-function/` would upload
+# EVERYTHING here — including any local .env.stripe with real Stripe keys —
+# into the deployed/retrievable source. The function gets its config via
+# --set-env-vars (or Secret Manager), never from a file in the bundle.
+
+# Local credentials (never deploy these)
+.env
+.env.*
+!.env.example
+
+# Python build junk
+__pycache__/
+*.pyc
+*.pyo
+
+# Tests + fixtures are not needed at runtime
+test_*.py
+conftest.py
+
+# This file itself
+.gcloudignore
