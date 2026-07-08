@@ -64,6 +64,13 @@ protocol CloudAuthService {
     /// Raw stdout of `screencap checkout-url --json` — a hosted Stripe Checkout
     /// URL for the $5/mo plan (billing U9). Token handling stays in Python.
     func fetchCheckoutURL() async throws -> Data
+
+    /// Raw stdout of `screencap reconcile-entitlement --json` — a GRANT-ONLY
+    /// dropped-webhook self-heal (billing U14). If Stripe confirms an active
+    /// subscription but the claim is missing, the server grants it, so a paying
+    /// customer is never permanently stuck. The caller re-mints the token
+    /// (force-refresh whoami) afterward to observe the grant locally.
+    func fetchReconcileEntitlement() async throws -> Data
 }
 
 @MainActor
@@ -105,6 +112,10 @@ final class LiveCloudAuthService: CloudAuthService {
     func fetchCheckoutURL() async throws -> Data {
         try await CLIClient.runJSONRaw(["checkout-url", "--json"], timeout: 30)
     }
+
+    func fetchReconcileEntitlement() async throws -> Data {
+        try await CLIClient.runJSONRaw(["reconcile-entitlement", "--json"], timeout: 30)
+    }
 }
 
 /// Owns cloud sign-in state for the app shell (plan U6). Surfaces:
@@ -127,6 +138,10 @@ final class CloudAuthController: ObservableObject {
     /// hard gate is the real enforcement. Read from the `whoami` envelope's
     /// `subscribed` field; false when signed out or absent.
     @Published private(set) var isSubscribed: Bool = false
+    /// Client paywall flag (billing KTD-6). When OFF, the app shows no pricing /
+    /// soft gate / checkout — cloud onboarding behaves exactly as before billing.
+    /// Read from the `whoami` envelope's `paywall_enabled`; false when absent.
+    @Published private(set) var paywallEnabled: Bool = false
 
     private let service: CloudAuthService
     /// Read-only window onto the upload count that gates Sign Out. Owned by the
@@ -187,10 +202,12 @@ final class CloudAuthController: ObservableObject {
             warnOnSchemaDrift(envelope)
             status = AuthStatus.from(envelope: envelope)
             isSubscribed = envelope?.subscribed ?? false
+            paywallEnabled = envelope?.paywallEnabled ?? false
         } catch {
             authLogger.debug("whoami refresh failed: \(error.localizedDescription, privacy: .public); treating as signed out")
             status = .signedOut
             isSubscribed = false
+            paywallEnabled = false
         }
     }
 
@@ -208,9 +225,26 @@ final class CloudAuthController: ObservableObject {
                 status = AuthStatus.from(envelope: envelope)
             }
             isSubscribed = envelope?.subscribed ?? isSubscribed
+            paywallEnabled = envelope?.paywallEnabled ?? paywallEnabled
         } catch {
             authLogger.debug("entitlement refresh failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// GRANT-ONLY dropped-webhook self-heal, then re-read entitlement (billing
+    /// U14). The "I've paid — check now" action: `reconcile-entitlement` asks the
+    /// server to grant `subscribed` if Stripe confirms an active subscription
+    /// (repairing a dropped checkout webhook), then `refreshEntitlement` re-mints
+    /// the ID token so the just-granted claim is observed locally. Reconcile
+    /// failure is non-fatal — we still force-refresh in case the webhook already
+    /// landed.
+    func reconcileEntitlement() async {
+        do {
+            _ = try await service.fetchReconcileEntitlement()
+        } catch {
+            authLogger.debug("reconcile failed: \(error.localizedDescription, privacy: .public); refreshing anyway")
+        }
+        await refreshEntitlement()
     }
 
     /// Opens hosted Stripe Checkout for the $5/mo plan in the browser (U9). The
@@ -348,6 +382,7 @@ final class CloudAuthController: ObservableObject {
         if exitCode == 0, resolved.isSignedIn {
             status = resolved
             isSubscribed = envelope?.subscribed ?? false
+            paywallEnabled = envelope?.paywallEnabled ?? paywallEnabled
             signInFlow = .idle
             finishResult(true)
             return

@@ -497,6 +497,60 @@ def test_request_signed_urls_503_is_not_subscription_required():
         assert not isinstance(exc.value, SubscriptionRequired)
 
 
+# --------------------------------------------------------------------------
+# reconcile-entitlement client seam (billing U14 — dropped-webhook self-heal)
+# --------------------------------------------------------------------------
+
+
+def test_request_reconcile_entitlement_returns_subscribed_state():
+    from screencap.upload import request_reconcile_entitlement
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"subscribed": True}
+    with mock.patch("screencap.auth.authed_post", return_value=mock_resp):
+        assert request_reconcile_entitlement() is True
+
+    mock_resp.json.return_value = {"subscribed": False}
+    with mock.patch("screencap.auth.authed_post", return_value=mock_resp):
+        assert request_reconcile_entitlement() is False
+
+
+def test_request_reconcile_entitlement_not_signed_in_is_clear():
+    from screencap import auth
+    from screencap.upload import request_reconcile_entitlement
+
+    with mock.patch("screencap.auth.authed_post", side_effect=auth.NotSignedIn):
+        with pytest.raises(RuntimeError, match="Sign in"):
+            request_reconcile_entitlement()
+
+
+def test_request_reconcile_entitlement_server_error():
+    from screencap.upload import request_reconcile_entitlement
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 503
+    mock_resp.json.return_value = {"error": "temporarily unavailable"}
+    mock_resp.text = "temporarily unavailable"
+    with mock.patch("screencap.auth.authed_post", return_value=mock_resp):
+        with pytest.raises(RuntimeError, match="Entitlement service error"):
+            request_reconcile_entitlement()
+
+
+def test_cli_reconcile_entitlement_json_envelope():
+    from screencap import upload
+    from screencap.cli import _AUTH_SCHEMA_VERSION, reconcile_entitlement_cmd
+
+    runner = CliRunner()
+    with mock.patch.object(upload, "request_reconcile_entitlement", return_value=True):
+        res = runner.invoke(reconcile_entitlement_cmd, ["--json"])
+    assert res.exit_code == 0
+    payload = json.loads(res.output)
+    assert payload["ok"] is True
+    assert payload["subscribed"] is True
+    assert payload["schema_version"] == _AUTH_SCHEMA_VERSION
+
+
 def test_request_signed_urls_timeout():
     from screencap.upload import request_signed_urls
     import pytest

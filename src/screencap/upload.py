@@ -80,6 +80,15 @@ def _get_checkout_url() -> str:
     return os.environ.get("SCREENCAP_CHECKOUT_URL", DEFAULT_CHECKOUT_URL)
 
 
+DEFAULT_RECONCILE_URL = (
+    "https://southamerica-east1-proteus-photos.cloudfunctions.net/reconcile-entitlement"
+)
+
+
+def _get_reconcile_url() -> str:
+    return os.environ.get("SCREENCAP_RECONCILE_URL", DEFAULT_RECONCILE_URL)
+
+
 def request_checkout_url() -> str:
     """POST to create-checkout-session with the caller's bearer token; return the
     hosted Stripe Checkout URL for the $5/mo Personal cloud plan (billing U9).
@@ -114,6 +123,47 @@ def request_checkout_url() -> str:
     if not checkout_url:
         raise RuntimeError("Checkout service returned no URL.")
     return checkout_url
+
+
+def request_reconcile_entitlement() -> bool:
+    """POST to reconcile-entitlement with the caller's bearer token; return the
+    resolved ``subscribed`` state (billing U14 / AE7).
+
+    GRANT-ONLY dropped-webhook self-heal: if the caller has a live Stripe
+    subscription but no ``subscribed`` claim yet, the server grants it. Called
+    from the app's "I've paid — check now" path so a paying customer whose
+    checkout webhook was dropped is never permanently stuck. Mirrors
+    :func:`request_checkout_url`'s auth/error handling; the uid is derived
+    server-side from the token, never sent by the client.
+
+    The grant lands on the server's user record, so the caller must re-mint its
+    ID token (``whoami --force-refresh``) afterward to observe the new claim
+    locally — the returned bool reflects Stripe's current state, not the local
+    token.
+    """
+    from screencap import auth
+
+    url = _get_reconcile_url()
+    try:
+        resp = auth.authed_post(requests.post, url, json={}, timeout=30)
+    except auth.NotSignedIn:
+        raise RuntimeError("Sign in to check your subscription: run `screencap login`.")
+    except auth.AuthError as e:
+        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+    except requests.ConnectionError:
+        raise RuntimeError("Entitlement service unavailable. Check your internet connection.")
+    except requests.Timeout:
+        raise RuntimeError("Entitlement service timed out. Try again later.")
+
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("error", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Entitlement service error: {detail}")
+
+    return bool(resp.json().get("subscribed", False))
 
 
 def _content_type(path: Path) -> str:

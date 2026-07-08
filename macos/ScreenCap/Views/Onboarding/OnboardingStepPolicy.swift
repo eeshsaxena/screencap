@@ -248,6 +248,9 @@ enum OnboardingCopy {
 
     static let personalCardTitle = "Personal cloud"
     static let personalCardMeta = "$5/month"
+    /// Paywall-off label (KTD-6): shown when `SCREENCAP_STRIPE_PAYWALL` is off, so
+    /// the storage card makes no pricing claim the app isn't enforcing.
+    static let personalCardMetaFree = "just you"
     static let personalCardBullets = [
         "Upload the recordings you approve",
         "Share single recordings by link",
@@ -311,7 +314,7 @@ enum OnboardingCopy {
         [
             storageHeadline, storageSub, storageFootnote,
             localCardTitle, localCardMeta,
-            personalCardTitle, personalCardMeta,
+            personalCardTitle, personalCardMeta, personalCardMetaFree,
             teamCardTitle, teamCardMeta,
             accountHeadline, accountSub,
             OnboardingStepPolicy.storageCTATitle(tier: .local),

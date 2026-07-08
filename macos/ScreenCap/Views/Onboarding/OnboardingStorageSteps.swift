@@ -10,6 +10,7 @@ import SwiftUI
 
 /// Step 3 — storage (design 196–236).
 struct OnboardingStorageStep: View {
+    @EnvironmentObject private var auth: CloudAuthController
     @Binding var tier: OnboardingStorageTier
     let onContinue: () -> Void
 
@@ -38,7 +39,12 @@ struct OnboardingStorageStep: View {
                 storageCard(
                     tier: .personalCloud,
                     title: OnboardingCopy.personalCardTitle,
-                    meta: OnboardingCopy.personalCardMeta,
+                    // Show the $5/mo price only when the client paywall is on
+                    // (KTD-6); otherwise fall back to the pre-billing label so
+                    // the app makes no pricing claim it isn't enforcing.
+                    meta: auth.paywallEnabled
+                        ? OnboardingCopy.personalCardMeta
+                        : OnboardingCopy.personalCardMetaFree,
                     metaColor: .scInkMuted,
                     bullets: OnboardingCopy.personalCardBullets
                 )
@@ -139,9 +145,10 @@ struct OnboardingAccountStep: View {
     @State private var upgradeError: String?
 
     /// After sign-in, Personal cloud stays on this step until the $5/mo
-    /// subscription is active — the upgrade panel drives checkout (U8/U9).
+    /// subscription is active — the upgrade panel drives checkout (U8/U9). Only
+    /// when the client paywall is on (KTD-6); off → no soft gate (pre-billing).
     private var showUpgrade: Bool {
-        auth.isSignedIn && tier == .personalCloud && !auth.isSubscribed
+        auth.paywallEnabled && auth.isSignedIn && tier == .personalCloud && !auth.isSubscribed
     }
 
     var body: some View {
@@ -215,7 +222,10 @@ struct OnboardingAccountStep: View {
                     .foregroundStyle(Color.scInkMuted)
             }
             OnboardingLinkButton(title: "I've paid — check now") {
-                Task { await auth.refreshEntitlement() }
+                // Reconcile first (grant-only self-heal for a dropped checkout
+                // webhook), then force-refresh — so a paid customer is never
+                // stuck if the webhook never landed (U14).
+                Task { await auth.reconcileEntitlement() }
             }
         }
         .frame(width: 360)
@@ -271,11 +281,12 @@ struct OnboardingAccountStep: View {
         }
     }
 
-    /// Personal cloud requires an active subscription before finishing — the
-    /// upgrade panel (shown reactively when `showUpgrade`) drives it. Team and
-    /// already-subscribed accounts proceed immediately (U9).
+    /// With the paywall on, Personal cloud requires an active subscription before
+    /// finishing — the upgrade panel (shown reactively when `showUpgrade`) drives
+    /// it. Paywall-off, Team, and already-subscribed accounts proceed immediately
+    /// (U9 / KTD-6).
     private func proceedAfterSignIn() {
-        if tier == .personalCloud, !auth.isSubscribed { return }
+        if auth.paywallEnabled, tier == .personalCloud, !auth.isSubscribed { return }
         onSignedIn()
     }
 
