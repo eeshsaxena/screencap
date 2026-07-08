@@ -166,10 +166,10 @@ def create_checkout_session(request):
 
     price_id = os.environ.get("STRIPE_PRICE_ID", "")
     success_url = os.environ.get(
-        "STRIPE_CHECKOUT_SUCCESS_URL", "https://screencap.app/checkout/success"
+        "STRIPE_CHECKOUT_SUCCESS_URL", "https://screencap.sh/checkout/success"
     )
     cancel_url = os.environ.get(
-        "STRIPE_CHECKOUT_CANCEL_URL", "https://screencap.app/checkout/cancel"
+        "STRIPE_CHECKOUT_CANCEL_URL", "https://screencap.sh/checkout/cancel"
     )
 
     stripe.api_key = _stripe_key()

@@ -62,9 +62,10 @@ final class FakeCloudAuthService: CloudAuthService {
         if let logoutThrows { throw logoutThrows }
     }
 
-    // billing (U9) — force-refresh whoami + hosted-checkout URL. Stubbed so the
-    // fake conforms to `CloudAuthService`; these gained protocol methods in the
-    // paywall work (71a33bce) without the fake being updated.
+    // billing (U9/U14) — force-refresh whoami, hosted-checkout URL, and the
+    // grant-only reconcile self-heal. (The U9 methods gained protocol
+    // requirements in the paywall work without the fake being updated; reconcile
+    // is added here alongside.)
     var forceRefreshData = Data()
     var forceRefreshError: Error?
     private(set) var forceRefreshCallCount = 0
@@ -83,6 +84,16 @@ final class FakeCloudAuthService: CloudAuthService {
         checkoutURLCallCount += 1
         if let checkoutURLError { throw checkoutURLError }
         return checkoutURLData
+    }
+
+    var reconcileData = Data()
+    var reconcileError: Error?
+    private(set) var reconcileCallCount = 0
+
+    func fetchReconcileEntitlement() async throws -> Data {
+        reconcileCallCount += 1
+        if let reconcileError { throw reconcileError }
+        return reconcileData
     }
 }
 
@@ -576,5 +587,55 @@ final class CloudAuthControllerTests: XCTestCase {
         await controller.signOut()
 
         XCTAssertEqual(controller.status, .signedOut)
+    }
+
+    // MARK: - entitlement: paywall flag + reconcile (billing KTD-6 / U14)
+
+    /// The client paywall flag (KTD-6) rides the whoami envelope and drives the
+    /// app's soft gate. Present → on; absent → off (pre-billing behavior).
+    func testRefreshReadsPaywallEnabledFlag() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":false,"paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertTrue(controller.paywallEnabled)
+
+        // An envelope without the key resolves to off (older CLI / flag off).
+        service.whoamiData = Data(signedOutEnvelope.utf8)
+        await controller.refresh()
+        XCTAssertFalse(controller.paywallEnabled, "absent paywall_enabled must resolve to off")
+    }
+
+    /// "I've paid — check now" reconciles FIRST (grant-only self-heal for a
+    /// dropped checkout webhook) and THEN force-refreshes, so a just-granted
+    /// claim is observed locally without a re-login (U14).
+    func testReconcileEntitlementReconcilesThenRefreshes() async {
+        let service = FakeCloudAuthService()
+        service.reconcileData = Data(#"{"ok":true,"schema_version":1,"subscribed":true}"#.utf8)
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.reconcileEntitlement()
+
+        XCTAssertEqual(service.reconcileCallCount, 1)
+        XCTAssertEqual(service.forceRefreshCallCount, 1, "must force-refresh after reconcile to observe the grant")
+        XCTAssertTrue(controller.isSubscribed)
+        XCTAssertTrue(controller.paywallEnabled)
+    }
+
+    /// Reconcile failure is non-fatal: the controller still force-refreshes (the
+    /// webhook may have already landed), so a transient reconcile error never
+    /// blocks a paying customer from being recognized.
+    func testReconcileEntitlementStillRefreshesWhenReconcileFails() async {
+        let service = FakeCloudAuthService()
+        service.reconcileError = FakeCloudAuthError.offline
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.reconcileEntitlement()
+
+        XCTAssertEqual(service.forceRefreshCallCount, 1)
+        XCTAssertTrue(controller.isSubscribed)
     }
 }

@@ -1707,6 +1707,38 @@ def checkout_url_cmd(as_json):
     console.print(url)
 
 
+@cli.command("reconcile-entitlement")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def reconcile_entitlement_cmd(as_json):
+    """Self-heal a dropped webhook: grant the subscription if Stripe confirms it.
+
+    GRANT-ONLY, sign-in required (the uid is derived server-side from the bearer
+    token). The macOS app calls this from "I've paid — check now" BEFORE
+    force-refreshing `whoami`, so a paying customer whose checkout webhook was
+    dropped is never permanently stuck. Prints the resolved `subscribed` state.
+    """
+    from screencap import upload
+
+    try:
+        subscribed = upload.request_reconcile_entitlement()
+    except Exception as e:
+        if as_json:
+            click.echo(json.dumps(
+                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
+            ))
+            sys.exit(1)
+        console.print(f"[red]Couldn't check subscription:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps(
+            {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, "subscribed": subscribed}
+        ))
+        return
+    console.print("Subscription active." if subscribed else "No active subscription found.")
+
+
 @cli.command()
 @click.argument("name", required=False, default=None)
 @click.option("--all", "all_recordings", is_flag=True, help="Export all recordings.")

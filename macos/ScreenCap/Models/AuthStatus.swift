@@ -22,6 +22,11 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
     /// hard gate is the real enforcement. Additive/optional, so an older CLI that
     /// omits it decodes fine and resolves to "not subscribed".
     let subscribed: Bool?
+    /// Client paywall flag (billing KTD-6). Config-driven and independent of
+    /// sign-in, so it rides every whoami envelope (incl. signed-out). Gates
+    /// whether the app shows pricing / the soft gate at all; absent → OFF, i.e.
+    /// pre-billing behavior. Distinct from `subscribed` (the per-user grant).
+    let paywallEnabled: Bool?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -32,6 +37,7 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
         case email
         case stale
         case subscribed
+        case paywallEnabled = "paywall_enabled"
         case error
     }
 

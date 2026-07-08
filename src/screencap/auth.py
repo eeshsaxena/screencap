@@ -214,6 +214,11 @@ class WhoAmI(TypedDict, total=False):
     email: str | None
     stale: bool
     subscribed: bool
+    # Client paywall flag (KTD-6): config-driven, independent of sign-in, so it
+    # rides EVERY envelope (incl. signed-out). The app reads it to decide whether
+    # to show pricing / the soft gate at all; the signer's hard gate is governed
+    # separately by STRIPE_PAYWALL_ENFORCE.
+    paywall_enabled: bool
 
 
 # In-memory cache of the current session. The ID token is NEVER persisted; only
@@ -719,12 +724,18 @@ def whoami() -> WhoAmI:
     returns uid/email; if a refresh is needed but fails (e.g. offline), reports
     signed_in=True with stale=True rather than raising.
     """
+    from screencap import config
+
+    # Config-driven, independent of sign-in, so it rides every return path below
+    # (incl. signed-out) — the app reads it even before sign-in to decide whether
+    # to show pricing / the soft gate at all (KTD-6).
+    paywall_enabled = config.get_stripe_paywall_enabled()
     try:
         refresh_token = _load_refresh_token()
     except Exception:
         refresh_token = None
     if not refresh_token:
-        return {"signed_in": False}
+        return {"signed_in": False, "paywall_enabled": paywall_enabled}
     try:
         state = _ensure_fresh()
         # ``subscribed`` is read (unverified) from the ID token's custom claims —
@@ -736,9 +747,10 @@ def whoami() -> WhoAmI:
             "uid": state.uid,
             "email": state.email,
             "subscribed": bool(claims.get("subscribed")),
+            "paywall_enabled": paywall_enabled,
         }
     except NotSignedIn:
-        return {"signed_in": False}
+        return {"signed_in": False, "paywall_enabled": paywall_enabled}
     except AuthError:
         # We have a refresh token but couldn't refresh right now (e.g. offline).
         return {
@@ -747,4 +759,5 @@ def whoami() -> WhoAmI:
             "email": None,
             "stale": True,
             "subscribed": False,
+            "paywall_enabled": paywall_enabled,
         }

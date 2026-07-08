@@ -208,11 +208,12 @@ def test_describe_error_handles_identitytoolkit_dict_shape():
 # --------------------------------------------------------------------------
 
 
-def test_logout_deletes_and_whoami_reports_signed_out(fake_keyring):
+def test_logout_deletes_and_whoami_reports_signed_out(fake_keyring, monkeypatch):
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: False)
     fake_keyring[_KEY] = "rt"
     assert a.logout() is True
     assert _KEY not in fake_keyring
-    assert a.whoami() == {"signed_in": False}
+    assert a.whoami() == {"signed_in": False, "paywall_enabled": False}
 
 
 def test_logout_when_not_signed_in_returns_false(fake_keyring):
@@ -220,6 +221,7 @@ def test_logout_when_not_signed_in_returns_false(fake_keyring):
 
 
 def test_whoami_signed_in_reads_subscribed_claim(fake_keyring, monkeypatch):
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: False)
     fake_keyring[_KEY] = "rt"
     tok = _jwt({"user_id": "uid1", "email": "e@x.com", "subscribed": True})
     monkeypatch.setattr(
@@ -231,7 +233,24 @@ def test_whoami_signed_in_reads_subscribed_claim(fake_keyring, monkeypatch):
         "uid": "uid1",
         "email": "e@x.com",
         "subscribed": True,
+        "paywall_enabled": False,
     }
+
+
+def test_whoami_surfaces_paywall_flag_in_every_state(fake_keyring, monkeypatch):
+    """The client paywall flag (KTD-6) rides EVERY whoami envelope — signed-out
+    included — so the app can gate pricing/soft-gate before sign-in."""
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: True)
+    # Signed out (no refresh token stored).
+    assert a.whoami() == {"signed_in": False, "paywall_enabled": True}
+    # Signed in.
+    fake_keyring[_KEY] = "rt"
+    tok = _jwt({"user_id": "uid1", "email": "e@x.com"})
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda: a.AuthState(tok, "rt", time.time() + 3600, "uid1", "e@x.com"),
+    )
+    assert a.whoami()["paywall_enabled"] is True
 
 
 def test_whoami_signed_in_absent_claim_is_unsubscribed(fake_keyring, monkeypatch):
