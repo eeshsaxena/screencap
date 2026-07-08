@@ -79,6 +79,23 @@ def test_store_existing_updates_not_errors(fake_group: _FakeGroupKeychain) -> No
     assert len(fake_group.items) == 1
 
 
+def test_store_duplicate_then_update_fails_surfaces_update_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    # add → errSecDuplicateItem → update fails: the UPDATE's status must surface,
+    # not the swallowed duplicate.
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a: kg.errSecDuplicateItem)
+    monkeypatch.setattr(kg, "_sec_item_update", lambda *a: -25291)  # errSecNotAvailable
+    with pytest.raises(kg.KeychainError) as exc:
+        kg.store(SERVICE, ACCOUNT, "x", GROUP)
+    assert exc.value.status == -25291
+
+
+def test_store_duplicate_then_update_missing_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a: kg.errSecDuplicateItem)
+    monkeypatch.setattr(kg, "_sec_item_update", lambda *a: kg.errSecMissingEntitlement)
+    with pytest.raises(kg.MissingEntitlement):
+        kg.store(SERVICE, ACCOUNT, "x", GROUP)
+
+
 def test_non_ascii_secret_roundtrips(fake_group: _FakeGroupKeychain) -> None:
     secret = "réfrèsh-tökèn-🔑-Ω"
     kg.store(SERVICE, ACCOUNT, secret, GROUP)

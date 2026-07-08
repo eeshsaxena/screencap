@@ -335,7 +335,7 @@ def load(service: str, account: str, access_group: str) -> str | None:
     """
     status, data = _sec_item_copy_matching(service, account, access_group)
     if status == errSecSuccess:
-        return data.decode("utf-8") if data is not None else None
+        return data.decode("utf-8") if data else None  # normalize empty bytes → None
     if status == errSecItemNotFound:
         return None
     _raise_for_status(status, "SecItemCopyMatching")
@@ -369,7 +369,7 @@ def load_legacy_noninteractive(service: str, account: str) -> str | None:
         logger.debug("legacy non-interactive read raised; treating as absent", exc_info=True)
         return None
     if status == errSecSuccess:
-        return data.decode("utf-8") if data is not None else None
+        return data.decode("utf-8") if data else None  # normalize empty bytes → None
     if status not in _LEGACY_NOT_READABLE:
         # An unexpected status still fails open (no prompt was shown), but log it
         # so a novel macOS behavior is visible rather than silently a re-login.

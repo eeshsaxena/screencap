@@ -281,6 +281,15 @@ def _store_refresh_token(token: str) -> None:
             return
         except keychain_group.MissingEntitlement:
             _log_keyring_fallback("store")
+        except keychain_group.KeychainError as exc:
+            # A non-entitlement Keychain failure (locked, backend error) means the
+            # credential was NOT persisted. Surface it as an AuthError — the CLI's
+            # auth vocabulary — so callers like `login_cmd` (which catches
+            # AuthError) degrade cleanly instead of crashing on an unexpected
+            # RuntimeError. NOT masked as un-entitled → no keyring fallback (KTD-4).
+            raise AuthError(
+                f"Couldn't save your credentials to the Keychain (status {exc.status})."
+            ) from exc
     import keyring
 
     keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token)
@@ -294,6 +303,14 @@ def _load_refresh_token() -> str | None:
             token = keychain_group.load(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, KEYCHAIN_ACCESS_GROUP)
         except keychain_group.MissingEntitlement:
             _log_keyring_fallback("load")
+        except keychain_group.KeychainError as exc:
+            # Keychain unreadable (locked / backend error) — an auth failure, not a
+            # reason to fall back to keyring or attempt migration. Surface as
+            # AuthError so callers degrade cleanly instead of crashing on an
+            # unexpected RuntimeError (KTD-4: never masked as un-entitled).
+            raise AuthError(
+                f"Couldn't read your credentials from the Keychain (status {exc.status})."
+            ) from exc
         else:
             if token is not None:
                 logger.debug("auth keychain: loaded refresh token via access group")
@@ -314,6 +331,14 @@ def _delete_refresh_token() -> None:
             keychain_group.delete(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, KEYCHAIN_ACCESS_GROUP)
         except keychain_group.MissingEntitlement:
             _log_keyring_fallback("delete")
+        except keychain_group.KeychainError as exc:
+            # Don't let a group-delete failure skip the legacy cleanup below — the
+            # belt-and-braces guarantee (no pre-migration token left to resurrect)
+            # must still hold. Log and fall through rather than propagate.
+            logger.warning(
+                "auth keychain: access-group delete failed (status %s); clearing legacy item anyway",
+                exc.status,
+            )
     # Always also clear any legacy keyring item, so a pre-migration token cannot
     # resurrect via a later migration read (belt-and-braces; SCR-241 U2 decision).
     import keyring

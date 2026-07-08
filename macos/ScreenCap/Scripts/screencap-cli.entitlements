@@ -14,13 +14,14 @@
   the helper binary has different needs (it does not, e.g., declare audio-input;
   TCC permissions are not entitlements).
 
-  keychain-access-groups (SCR-241): lets this binary (the daemon + bundled CLI —
+  keychain-access-groups (SCR-241): lets this binary (the daemon + bundled CLI,
   one PyInstaller identity) read the cloud refresh token from a shared Keychain
   access group without a per-binary-ACL prompt. The group MUST be written as the
-  LITERAL team-prefixed string — `codesign --entitlements` (used by embed-cli.sh
-  and sign_app.sh) does NOT expand Xcode's $(TeamIdentifierPrefix) — and MUST
-  match KEYCHAIN_ACCESS_GROUP in src/screencap/auth.py exactly. A binary signed
-  under a different team simply can't claim this group and falls back to keyring.
+  LITERAL team-prefixed string: the raw codesign entitlements step (in
+  embed-cli.sh and sign_app.sh) does NOT expand Xcode's $(TeamIdentifierPrefix),
+  and it MUST match KEYCHAIN_ACCESS_GROUP in src/screencap/auth.py exactly. A
+  binary signed under a different team can't claim this group and falls back to
+  the legacy keyring path.
 -->
 <plist version="1.0">
 <dict>

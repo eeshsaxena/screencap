@@ -988,15 +988,32 @@ def test_entitled_delete_clears_group_and_also_legacy_keyring(fake_group):
     assert ("del", *_KEY) in fake_group.keyring_calls
 
 
-def test_entitled_unexpected_keychainerror_propagates_not_masked(fake_group, monkeypatch):
+def test_entitled_store_keychainerror_becomes_autherror_not_raw_runtimeerror(fake_group, monkeypatch):
+    # A non-MissingEntitlement group error must surface as AuthError (the CLI's
+    # vocabulary), NOT a raw KeychainError — else `screencap login` crashes on it.
     from screencap import keychain_group
 
     def _boom(*_a, **_k):
         raise keychain_group.KeychainError(-25291, "SecItemAdd")  # errSecNotAvailable
 
     monkeypatch.setattr(keychain_group, "store", _boom)
-    with pytest.raises(keychain_group.KeychainError):
+    with pytest.raises(a.AuthError):
         a._store_refresh_token("x")
+    # and it does NOT fall back to keyring (a real error is not "un-entitled")
+    assert fake_group.keyring_calls == []
+
+
+def test_entitled_load_keychainerror_becomes_autherror_not_raw_runtimeerror(fake_group, monkeypatch):
+    # Same for the load path — else `screencap upload`'s get_id_token pre-flight
+    # crashes instead of degrading.
+    from screencap import keychain_group
+
+    def _boom(*_a, **_k):
+        raise keychain_group.KeychainError(-25291, "SecItemCopyMatching")
+
+    monkeypatch.setattr(keychain_group, "load", _boom)
+    with pytest.raises(a.AuthError):
+        a._load_refresh_token()
 
 
 def test_migration_silent_hit_moves_legacy_into_group(fake_group):
@@ -1028,3 +1045,78 @@ def test_backend_log_never_contains_the_secret(fake_group, caplog):
         a._store_refresh_token("super-secret-token-xyz")
         a._load_refresh_token()
     assert "super-secret-token-xyz" not in caplog.text
+
+
+def test_get_id_token_surfaces_autherror_on_group_keychainerror(fake_group, monkeypatch):
+    # Full path: get_id_token -> _ensure_fresh -> _load_refresh_token. A keychain
+    # error must reach callers as AuthError (which upload's pre-flight handles),
+    # never a raw KeychainError traceback.
+    from screencap import keychain_group
+
+    monkeypatch.setattr(
+        keychain_group, "load", lambda *_a: (_ for _ in ()).throw(keychain_group.KeychainError(-25291, "load"))
+    )
+    with pytest.raises(a.AuthError):
+        a.get_id_token()
+
+
+def test_entitled_delete_keychainerror_still_clears_legacy(fake_group, monkeypatch):
+    # A group-delete failure must NOT skip the belt-and-braces legacy cleanup.
+    from screencap import keychain_group
+
+    monkeypatch.setattr(
+        keychain_group, "delete", lambda *_a: (_ for _ in ()).throw(keychain_group.KeychainError(-25291, "delete"))
+    )
+    a._delete_refresh_token()  # must not raise (logout must complete)
+    assert ("del", *_KEY) in fake_group.keyring_calls  # legacy cleanup ran anyway
+
+
+def test_frozen_build_fallback_warns_unfrozen_stays_debug(fake_keyring, monkeypatch, caplog):
+    # The silent-degradation alarm: an entitled/frozen build that falls back to
+    # keyring WARNs; an un-frozen (CLI/dev) context stays at debug. fake_keyring
+    # forces the MissingEntitlement fallback; pin platform so the group branch runs.
+    monkeypatch.setattr(a.sys, "platform", "darwin")
+    monkeypatch.setattr(a.sys, "frozen", True, raising=False)
+    with caplog.at_level("DEBUG", logger="screencap.auth"):
+        a._store_refresh_token("tok")
+    assert any(r.levelname == "WARNING" and "fell back" in r.message for r in caplog.records)
+
+    caplog.clear()
+    monkeypatch.setattr(a.sys, "frozen", False, raising=False)
+    with caplog.at_level("DEBUG", logger="screencap.auth"):
+        a._store_refresh_token("tok")
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_migration_group_write_failure_keeps_legacy_and_token(fake_group, monkeypatch):
+    # Migration read succeeds but the group WRITE fails: keep the user signed in
+    # on the legacy token, do NOT delete the legacy copy (distinct from a failed
+    # *delete*).
+    from screencap import keychain_group
+
+    fake_group.legacy[_KEY] = "legacy-tok"
+    monkeypatch.setattr(
+        keychain_group, "store", lambda *_a: (_ for _ in ()).throw(keychain_group.KeychainError(-25291, "store"))
+    )
+    deleted = []
+    monkeypatch.setattr(keychain_group, "delete_legacy_noninteractive", lambda s, ac: deleted.append((s, ac)) or True)
+    assert a._load_refresh_token() == "legacy-tok"  # still signed in on the legacy token
+    assert fake_group.group == {}  # nothing written to the group
+    assert deleted == []  # legacy copy NOT deleted after a failed write
+
+
+def test_entitlement_group_matches_auth_constant():
+    # The .entitlements literal and KEYCHAIN_ACCESS_GROUP MUST stay identical, or
+    # an entitled build silently falls back to keyring (KTD-3 drift guard).
+    import os
+    import plistlib
+    from pathlib import Path
+
+    if os.environ.get("SCREENCAP_KEYCHAIN_ACCESS_GROUP"):
+        pytest.skip("access group overridden via env; drift guard checks the shipped default")
+    root = Path(__file__).resolve().parents[1]
+    ent = plistlib.loads((root / "macos/ScreenCap/Scripts/screencap-cli.entitlements").read_bytes())
+    groups = ent.get("keychain-access-groups", [])
+    assert a.KEYCHAIN_ACCESS_GROUP in groups, (
+        f"auth.KEYCHAIN_ACCESS_GROUP={a.KEYCHAIN_ACCESS_GROUP!r} not in entitlement {groups!r}"
+    )
