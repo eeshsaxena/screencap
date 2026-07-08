@@ -189,11 +189,22 @@ struct ReviewWindow: View {
     /// Upload tapped (the `.ready` and `.failed`-with-retry action). Signed in
     /// → start the upload; signed out → present the sign-in prompt rather than
     /// letting `screencap upload` refuse opaquely (plan U6).
+    ///
+    /// `refreshIfNeeded` first, because sign-in state is now resolved lazily
+    /// rather than at app launch (SCR-241): if the user opens a review window
+    /// and hits Upload before any cloud surface has resolved `status`, it would
+    /// still be `.unknown` (→ `isSignedIn == false`) and a genuinely signed-in
+    /// user would be wrongly shown the sign-in sheet. Resolving here — on an
+    /// explicit cloud action — is exactly where decrypting the Keychain (and any
+    /// prompt) belongs. No-ops once resolved, so it adds no cost on later taps.
     private func attemptUpload() {
-        if auth.isSignedIn {
-            model.startUpload()
-        } else {
-            showSignInSheet = true
+        Task {
+            await auth.refreshIfNeeded()
+            if auth.isSignedIn {
+                model.startUpload()
+            } else {
+                showSignInSheet = true
+            }
         }
     }
 

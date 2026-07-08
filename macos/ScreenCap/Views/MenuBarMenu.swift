@@ -60,7 +60,15 @@ struct MenuBarMenu: View {
 
         // Cloud account (plan U6). The one consistent place to see sign-in
         // state and sign in / out. Local recording is never gated on this.
+        //
+        // Sign-in state is resolved lazily on first menu open (not at app
+        // launch): `refreshIfNeeded` decrypts the Keychain only when this
+        // account surface actually appears, so the macOS "screencap-auth"
+        // authorization prompt can't fire the instant the app opens. It
+        // coalesces + no-ops once resolved, so opening the menu repeatedly
+        // re-decrypts nothing. See CloudAuthController.refreshIfNeeded / SCR-241.
         accountSection
+            .onAppear { Task { await auth.refreshIfNeeded() } }
 
         Divider()
 
