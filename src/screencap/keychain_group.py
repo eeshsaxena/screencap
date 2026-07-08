@@ -282,6 +282,23 @@ def _sec_item_copy_legacy_noninteractive(service: str, account: str) -> tuple[in
         sec.SecKeychainSetUserInteractionAllowed(1)
 
 
+def _sec_item_delete_legacy_noninteractive(service: str, account: str) -> int:
+    """Delete a *legacy* (file-keychain) item with interaction suppressed.
+
+    The migration only reaches here after a silent legacy *read* succeeded (so the
+    binary is already ACL-trusted), but suppression keeps the "never prompt"
+    guarantee even if delete authorization ever diverged from read.
+    """
+    sec, cf = _frameworks()
+    query = _cfdict(cf, _base_pairs(cf, sec, service, account))
+    sec.SecKeychainSetUserInteractionAllowed(0)
+    try:
+        return int(sec.SecItemDelete(query))
+    finally:
+        cf.CFRelease(query)
+        sec.SecKeychainSetUserInteractionAllowed(1)
+
+
 # --------------------------------------------------------------------------
 # Public policy API.
 # --------------------------------------------------------------------------
@@ -358,3 +375,21 @@ def load_legacy_noninteractive(service: str, account: str) -> str | None:
         # so a novel macOS behavior is visible rather than silently a re-login.
         logger.debug("legacy non-interactive read: unexpected OSStatus %s → treating as absent", status)
     return None
+
+
+def delete_legacy_noninteractive(service: str, account: str) -> bool:
+    """Delete a legacy (login-keychain) item **without ever prompting**.
+
+    Returns ``True`` when the item is gone (deleted, or already absent), ``False``
+    when it could not be removed (still present). Never prompts, never raises —
+    the migration uses the boolean to decide whether to WARN about a duplicate.
+    """
+    try:
+        status = _sec_item_delete_legacy_noninteractive(service, account)
+    except Exception:  # noqa: BLE001 — migration cleanup must never raise
+        logger.debug("legacy non-interactive delete raised; treating as not-removed", exc_info=True)
+        return False
+    if status in (errSecSuccess, errSecItemNotFound):
+        return True
+    logger.debug("legacy non-interactive delete: OSStatus %s (item may persist)", status)
+    return False

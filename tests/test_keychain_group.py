@@ -162,6 +162,27 @@ def test_legacy_read_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     assert kg.load_legacy_noninteractive(SERVICE, ACCOUNT) is None
 
 
+@pytest.mark.parametrize(
+    ("status", "gone"),
+    [
+        (kg.errSecSuccess, True),
+        (kg.errSecItemNotFound, True),  # already absent counts as gone
+        (kg.errSecAuthFailed, False),  # couldn't remove → still present
+    ],
+)
+def test_delete_legacy_maps_status_to_gone(monkeypatch: pytest.MonkeyPatch, status: int, gone: bool) -> None:
+    monkeypatch.setattr(kg, "_sec_item_delete_legacy_noninteractive", lambda *a: status)
+    assert kg.delete_legacy_noninteractive(SERVICE, ACCOUNT) is gone
+
+
+def test_delete_legacy_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*_a: object) -> int:
+        raise OSError("keychain exploded")
+
+    monkeypatch.setattr(kg, "_sec_item_delete_legacy_noninteractive", _boom)
+    assert kg.delete_legacy_noninteractive(SERVICE, ACCOUNT) is False
+
+
 # --- macOS-gated real-keychain integration --------------------------------
 
 
