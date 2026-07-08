@@ -9,10 +9,15 @@ a few minutes before expiry.
 
 Security posture (see SECURITY.md + docs/runbooks/cloud-auth-setup.md):
 
-* The Keychain entry uses the **default "Always Allow" trusted-binary ACL** (the
-  same posture as ``network/crypto.py``) — NOT a code-signing-pinned ACL. Any
-  same-user trusted binary can read it. Documented honestly; we do not claim
-  pinning that does not exist.
+* The refresh token is stored on the **data-protection keychain** in a **shared
+  access group** (``kSecAttrAccessGroup`` = :data:`KEYCHAIN_ACCESS_GROUP`), so every
+  same-Team-signed binary carrying the ``keychain-access-groups`` entitlement reads
+  it without a per-binary-ACL prompt (SCR-241, see :mod:`screencap.keychain_group`).
+  Un-entitled binaries (pip/pyenv CLI, Debug fallback) get ``errSecMissingEntitlement``
+  and fall back to the legacy ``keyring`` path — a separate credential. This is
+  honestly a *team-shared* read, NOT a code-signing-pinned secret, and does not
+  cross the same-user boundary (see SECURITY.md). The E2EE/network KEKs still use the
+  default per-binary ACL (deferred).
 * The OAuth client is a **public native client**: no ``client_secret`` is
   embedded in source or binaries. PKCE is the protection (RFC 9700). An env
   override (``SCREENCAP_OAUTH_CLIENT_SECRET``) exists only as an escape hatch for
