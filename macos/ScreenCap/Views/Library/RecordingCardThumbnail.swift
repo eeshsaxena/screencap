@@ -64,13 +64,20 @@ struct RecordingCardThumbnail: View {
 
     private func loadThumbnail() async {
         let key = recording.stableID
-        guard let url = await frameIndex.firstFrameURL(recording: recording.name) else {
+        if let url = await frameIndex.firstFrameURL(recording: recording.name) {
+            let image = await thumbnailLoader.thumbnail(for: url)
             if Task.isCancelled { return }
-            loaded = Loaded(key: key, image: nil)
+            loaded = Loaded(key: key, image: image)
             return
         }
-        let image = await thumbnailLoader.thumbnail(for: url)
+        // No flat screenshot frame — the default capture records video, not flat
+        // frames, so most finished recordings land here. Fall back to a poster
+        // frame from the local video chunk so the card previews the recording
+        // instead of a permanent blank hatch; nil (no local video) keeps the
+        // placeholder (R5).
         if Task.isCancelled { return }
-        loaded = Loaded(key: key, image: image)
+        let poster = await frameIndex.posterFrame(recording: recording.name)
+        if Task.isCancelled { return }
+        loaded = Loaded(key: key, image: poster)
     }
 }

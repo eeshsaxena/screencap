@@ -1,3 +1,5 @@
+import AVFoundation
+import CoreGraphics
 import Foundation
 
 // SCR-177 U1 — resolve a `(recording, anchorMs)` search pointer to a concrete
@@ -48,6 +50,17 @@ actor RecordingFrameIndex {
     /// recording await the same task rather than serializing behind a blocking
     /// `contentsOfDirectory` on the actor executor.
     private var cache: [String: Task<[FrameRef], Never>] = [:]
+    /// Per-recording extracted video poster, cached as its in-flight `Task` so a
+    /// recording's poster is decoded once and shared across coalesced callers
+    /// (same discipline as `cache`). Separate from `cache` because a poster comes
+    /// from the video chunk, not the flat-frame listing.
+    private var posterCache: [String: Task<ThumbnailImage?, Never>] = [:]
+    /// Bounds concurrent video poster extractions. The poster path is the COMMON
+    /// case (default capture records video, not flat frames), so a fast scroll
+    /// over distinct recordings would otherwise fire one full AVFoundation decode
+    /// per visible card at once — the same thrash the JPEG loader's `DecodeGate`
+    /// guards against, but heavier. A small permit count keeps it capped.
+    private let posterGate = DecodeGate(permits: 3)
 
     /// `stalenessCapMs` (~30s default): content hits map essentially exactly,
     /// while timeline / transcript anchors snap to a captured moment that can
@@ -95,6 +108,40 @@ actor RecordingFrameIndex {
             return nil
         }
         return frames.first?.url
+    }
+
+    /// A downsampled poster frame extracted from the recording's first local
+    /// video chunk — the card thumbnail's fallback when no flat `screenshots/*.jpg`
+    /// frame exists. This is the common case, not an edge: the default capture
+    /// config records video (`RECORD_VIDEO`), not flat frames (`RECORD_IMAGES` is
+    /// off), so a finished recording usually has an empty `screenshots/` dir but a
+    /// real `chunk_0000.mp4`. Returns `nil` when there is no local video (a
+    /// legacy single-file recording, or an uploaded-and-evicted stub) → the
+    /// hatched placeholder (R5).
+    ///
+    /// Same trust boundary as `firstFrameURL`: the poster is read from the LOCAL,
+    /// unmasked video the app already plays in the Day/Review panes, so it adds no
+    /// exposure beyond same-EUID (masking is upload-scoped; see SECURITY.md). The
+    /// extraction runs in a detached task so the AVFoundation decode never blocks
+    /// the actor; a miss is not retained so a still-processing recording that
+    /// gains its first chunk after an early miss isn't stuck on the placeholder.
+    func posterFrame(recording: String, maxPixelSize: Int = 320) async -> ThumbnailImage? {
+        if let existing = posterCache[recording] { return await existing.value }
+        let root = recordingsRoot
+        let gate = posterGate
+        let task = Task<ThumbnailImage?, Never>.detached(priority: .userInitiated) {
+            // Find the chunk before taking a permit — the directory glob is cheap
+            // and shouldn't hold a decode slot; only the AVFoundation decode is gated.
+            guard let url = Self.firstVideoChunkURL(root: root, recording: recording) else { return nil }
+            await gate.wait()
+            let image = await Self.extractPoster(url: url, maxPixelSize: maxPixelSize)
+            await gate.signal()
+            return image
+        }
+        posterCache[recording] = task
+        let image = await task.value
+        if image == nil, posterCache[recording] == task { posterCache[recording] = nil }
+        return image
     }
 
     /// The cached (or freshly started) enumeration task for a recording. The disk
@@ -149,5 +196,56 @@ actor RecordingFrameIndex {
         let rootResolved = root.resolvingSymlinksInPath()
         guard dir.path == rootResolved.path || dir.path.hasPrefix(rootResolved.path + "/") else { return nil }
         return dir
+    }
+
+    /// The recording's own dir, path-contained under the recordings root with the
+    /// same symlink-resolved guard as `screenshotsDir`. Used to locate the local
+    /// video chunk for the poster fallback.
+    static func recordingDir(root: URL, recording: String) -> URL? {
+        guard !recording.isEmpty,
+              !recording.contains("/"),
+              !recording.contains("\\"),
+              recording != ".",
+              recording != ".." else { return nil }
+        let dir = root.appendingPathComponent(recording, isDirectory: true)
+            .resolvingSymlinksInPath()
+        let rootResolved = root.resolvingSymlinksInPath()
+        guard dir.path == rootResolved.path || dir.path.hasPrefix(rootResolved.path + "/") else { return nil }
+        return dir
+    }
+
+    /// The recording's first local video chunk (`chunk_0000.mp4`, else the
+    /// lexically-first `chunk_*.mp4`), or `nil` when the dir is unsafe or holds no
+    /// local chunk. Static + explicit root so it is testable without disk fixtures
+    /// under a real recordings tree.
+    static func firstVideoChunkURL(root: URL, recording: String) -> URL? {
+        guard let dir = recordingDir(root: root, recording: recording) else { return nil }
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return nil }
+        return entries
+            .filter { $0.pathExtension.lowercased() == "mp4" && $0.lastPathComponent.hasPrefix("chunk_") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .first
+    }
+
+    /// Extract a downsampled `CGImage` roughly one second into the video — past a
+    /// possible black lead-in — with generous seek tolerance (the card wants a
+    /// recognizable poster, not an exact frame). Falls back to the first frame for
+    /// a sub-second chunk, and returns `nil` on any AVFoundation failure (an
+    /// unreadable or still-being-written chunk) → the placeholder.
+    static func extractPoster(url: URL, maxPixelSize: Int) async -> ThumbnailImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxPixelSize, height: maxPixelSize)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
+        if let image = try? await generator.image(at: CMTime(seconds: 1, preferredTimescale: 600)).image {
+            return ThumbnailImage(cgImage: image)
+        }
+        if let image = try? await generator.image(at: .zero).image {
+            return ThumbnailImage(cgImage: image)
+        }
+        return nil
     }
 }

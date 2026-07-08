@@ -25,6 +25,7 @@ struct DayTimelineView: View {
     @StateObject private var engine = DayPlaybackEngine()
     @StateObject private var searchModel = SearchViewModel()
     @State private var loadPhase: LoadPhase = .loading
+    @State private var reloading = false
     @State private var spans: [DaySegmentRecording] = []
     @State private var query = ""
     @State private var contentIndexEnabled = false
@@ -111,9 +112,22 @@ struct DayTimelineView: View {
                 AVPlayerNSView(player: engine.player)
             case .placeholder(let reason):
                 LibraryHatchPlaceholder()
-                Text(placeholderCaption(reason))
-                    .font(SCTypography.mono(size: 12))
-                    .foregroundStyle(Color.scInkMuted)
+                VStack(spacing: 12) {
+                    Text(placeholderCaption(reason))
+                        .font(SCTypography.mono(size: 12))
+                        .foregroundStyle(Color.scInkMuted)
+                        .multilineTextAlignment(.center)
+                    // The daemon-down caption tells the user to retry, so give
+                    // them the control to do it — a stale-daemon restart (a
+                    // no-op if the daemon isn't stale) followed by a reload,
+                    // mirroring the Library's staleDaemonError affordance.
+                    // Without this the message is an instruction with no button.
+                    if loadPhase == .daemonUnavailable {
+                        Button(reloading ? "Retrying…" : "Retry") { retryDay() }
+                            .disabled(reloading)
+                    }
+                }
+                .padding(.horizontal, 24)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -242,6 +256,19 @@ struct DayTimelineView: View {
         return results.items.compactMap { item in
             guard let ms = item.anchorMs, ms >= dayStartMs, ms < dayEndMs else { return nil }
             return ms
+        }
+    }
+
+    /// Manual retry for the daemon-unavailable placeholder: attempt a
+    /// stale-daemon restart (fail-safe no-op when the daemon isn't stale), then
+    /// reload the day. Guarded against a double-tap racing two loads.
+    private func retryDay() {
+        guard !reloading else { return }
+        reloading = true
+        Task {
+            await DaemonInstallController.restartStaleDaemonIfNeeded()
+            await loadDay()
+            reloading = false
         }
     }
 

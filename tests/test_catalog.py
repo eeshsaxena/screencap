@@ -52,6 +52,46 @@ def _make_recording(base: Path, name: str, *, audio: bool = False, duration: flo
     return d
 
 
+def _make_audio_only_recording(base: Path, name: str, *, audio_seconds: float, samplerate: int = 16000):
+    """A recording whose DB has a start row but NO action_event — so the
+    DB-derived duration is ``None`` — plus a real FLAC of known length. Models
+    the audio-only capture that used to render "—" for its duration.
+    """
+    import numpy as np
+    import soundfile
+
+    from screencap.engine.db import create_db, crud
+
+    d = base / name
+    d.mkdir(parents=True)
+
+    db_path = d / "recording.db"
+    started = time.time() - audio_seconds
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    crud.insert_recording(session, {
+        "timestamp": started,
+        "platform": "darwin",
+        "monitor_width": 1920,
+        "monitor_height": 1080,
+        "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5,
+        "double_click_distance_pixels": 5.0,
+    })
+    # Deliberately NO action_event: the DB has no activity to derive duration from.
+    session.close()
+    engine.dispose()
+
+    frames = int(audio_seconds * samplerate)
+    soundfile.write(
+        str(d / "audio_0000.flac"),
+        np.zeros(frames, dtype="float32"),
+        samplerate,
+        format="FLAC",
+    )
+    return d
+
+
 def _make_recording_with_window_events(base: Path, name: str, bundle_ids: list[str]):
     """Create a recording dir with real engine DB and window events."""
     from screencap.engine.db import create_db, crud
@@ -113,6 +153,19 @@ def test_list_multiple(recordings_dir):
     names = [r.name for r in result]
     assert "alpha" in names
     assert "beta" in names
+
+
+def test_audio_only_recording_uses_audio_duration(recordings_dir):
+    """A recording with audio but no action events derives its duration from the
+    FLAC length instead of showing "—" (QA: blank duration on audio-only recs).
+    """
+    _make_audio_only_recording(recordings_dir, "audio-only", audio_seconds=3.0)
+    result = list_recordings(recordings_dir)
+    assert len(result) == 1
+    rec = result[0]
+    assert rec.has_audio is True
+    assert rec.duration_seconds == pytest.approx(3.0, abs=0.2)
+    assert rec.duration == "0m 3s"
 
 
 def test_skips_non_recording_dirs(recordings_dir):
