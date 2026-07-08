@@ -350,6 +350,83 @@ class TestFailClosed:
 # Factory wiring
 # ---------------------------------------------------------------------------
 
+class TestBundledHelperDiscovery:
+    """`_find_bundled_helper()` bundle-walk across the real app layouts (SCR-239).
+
+    The daemon can run from more than one place inside the app, but the helper
+    only ever ships in the OUTER ``ScreenCap.app/Contents/MacOS`` (the app's
+    "Embed IntelligenceHelper" build phase copies it there). After SCR-196 the
+    daemon runs from a NESTED ``ScreencapDaemon.app`` under
+    ``Contents/Library/LoginItems`` — so the helper it needs is in an ANCESTOR
+    bundle, past the first (helper-less) ``Contents``. These pin the walk so the
+    nested layout still discovers the outer helper, while a bundle-less install
+    stays ``None``.
+    """
+
+    @staticmethod
+    def _make_helper(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+    @staticmethod
+    def _make_module(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+        return path
+
+    def _discover(self, monkeypatch, ondevice_file: Path):
+        from screencap.segmentation.providers import ondevice
+
+        monkeypatch.setattr(ondevice, "__file__", str(ondevice_file))
+        return ondevice._find_bundled_helper()
+
+    def test_outer_app_resources_layout_is_discovered(self, tmp_path, monkeypatch):
+        """CLI at ``ScreenCap.app/Contents/Resources`` → helper in that same
+        ``Contents/MacOS`` (the historical single-bundle layout)."""
+        app = tmp_path / "ScreenCap.app"
+        helper = app / "Contents" / "MacOS" / "IntelligenceHelper"
+        self._make_helper(helper)
+        mod = self._make_module(
+            app / "Contents" / "Resources" / "screencap"
+            / "segmentation" / "providers" / "ondevice.py"
+        )
+        assert self._discover(monkeypatch, mod) == helper
+
+    def test_nested_daemon_bundle_finds_outer_helper(self, tmp_path, monkeypatch):
+        """SCR-196: the daemon runs from a NESTED ``ScreencapDaemon.app`` whose
+        own ``Contents/MacOS`` has no helper; discovery must keep walking up to
+        the OUTER app's ``Contents/MacOS`` rather than stop at the first
+        ``Contents``. This is the regression guard for the idle-gap fallback."""
+        app = tmp_path / "ScreenCap.app"
+        helper = app / "Contents" / "MacOS" / "IntelligenceHelper"
+        self._make_helper(helper)
+        mod = self._make_module(
+            app / "Contents" / "Library" / "LoginItems" / "ScreencapDaemon.app"
+            / "Contents" / "Frameworks" / "screencap"
+            / "segmentation" / "providers" / "ondevice.py"
+        )
+        assert self._discover(monkeypatch, mod) == helper
+
+    def test_no_app_bundle_is_none(self, tmp_path, monkeypatch):
+        """A source/CLI-only tree with no ``.app`` ancestor → ``None`` (headless
+        installs ship no bundled helper — U7 then degrades)."""
+        mod = self._make_module(
+            tmp_path / "src" / "screencap" / "segmentation"
+            / "providers" / "ondevice.py"
+        )
+        assert self._discover(monkeypatch, mod) is None
+
+    def test_contents_without_any_helper_is_none(self, tmp_path, monkeypatch):
+        """A ``Contents`` ancestor whose ``MacOS`` lacks the helper and no outer
+        bundle carries one → ``None``, not a crash or a false positive."""
+        mod = self._make_module(
+            tmp_path / "Weird.app" / "Contents" / "Resources" / "screencap"
+            / "segmentation" / "providers" / "ondevice.py"
+        )
+        assert self._discover(monkeypatch, mod) is None
+
+
 class TestFactory:
     def test_on_device_maps_to_ondevice_provider(self):
         provider = get_provider("on-device")

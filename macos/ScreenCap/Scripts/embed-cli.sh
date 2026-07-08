@@ -58,6 +58,20 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
+# On-device segmentation helper (SCR-239). The daemon runs either from a nested
+# ScreencapDaemon.app (whose Contents/MacOS carries no helper, so the Python
+# OnDeviceProvider._find_bundled_helper() walk-up cannot see the OUTER app's
+# copy) or, in dev-source mode, from the repo with no app-bundle ancestry at
+# all. This launcher lives in the OUTER app's Contents/Resources, so it knows
+# the helper's exact path (../MacOS/IntelligenceHelper) — export it so it rides
+# through every exec below and the daemon actually names tasks on-device instead
+# of degrading to the idle-gap heuristic. Respect a caller's override; only set
+# when the helper is present + runnable.
+if [ -z "${SCREENCAP_ONDEVICE_HELPER:-}" ] && [ -x "${SCRIPT_DIR}/../MacOS/IntelligenceHelper" ]; then
+    SCREENCAP_ONDEVICE_HELPER="${SCRIPT_DIR}/../MacOS/IntelligenceHelper"
+    export SCREENCAP_ONDEVICE_HELPER
+fi
+
 # Debug-only stderr capture: the LaunchAgent plist has no StandardErrorPath,
 # so without this redirect daemon stderr (engine events forwarded by
 # _stderr_pump, supervisor logger output, fatal tracebacks) goes to
@@ -127,6 +141,16 @@ EOF
 set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+# On-device segmentation helper (SCR-239). The daemon runs from the nested
+# ScreencapDaemon.app, whose Contents/MacOS has no helper; this launcher lives
+# in the OUTER app's Contents/Resources and knows the helper's exact path, so
+# export it explicitly rather than rely on the Python bundle walk-up. Respect a
+# caller's override; only set when present + runnable.
+if [ -z "${SCREENCAP_ONDEVICE_HELPER:-}" ] && [ -x "${SCRIPT_DIR}/../MacOS/IntelligenceHelper" ]; then
+    SCREENCAP_ONDEVICE_HELPER="${SCRIPT_DIR}/../MacOS/IntelligenceHelper"
+    export SCREENCAP_ONDEVICE_HELPER
+fi
 
 exec "${SCRIPT_DIR}/../Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap" "$@"
 EOF

@@ -35,14 +35,19 @@ input set the flag explicitly; there is no implicit trust.)
 
 Helper discovery
 ----------------
-1. ``SCREENCAP_ONDEVICE_HELPER`` env var (an explicit path) — used first;
-   primarily a test seam (point it at a fake helper) but also a valid override.
-2. The bundled helper inside the macOS app
-   (``…/ScreenCap.app/Contents/MacOS/IntelligenceHelper``), discovered relative
-   to this file when running from a source/dev checkout is NOT attempted — the
-   helper ships only in the built app. **CLI-only / headless installs have no
-   app bundle and therefore no helper**, so discovery fails and the provider
-   reports unavailable — exactly the case U7 degrades (heuristic for
+1. ``SCREENCAP_ONDEVICE_HELPER`` env var (an explicit path) — used first. It is
+   both a test seam (point it at a fake helper) and the PRIMARY production
+   channel: the daemon launcher inside the app bundle exports it at
+   ``…/ScreenCap.app/Contents/MacOS/IntelligenceHelper`` (the launcher knows the
+   layout), covering both the nested-daemon bundle and dev-source runs.
+2. The bundled helper, discovered by walking up to the enclosing
+   ``ScreenCap.app/Contents/MacOS/IntelligenceHelper`` (see
+   :func:`_find_bundled_helper`). This is the fallback when the env var is
+   unset; it walks PAST the nested ``ScreencapDaemon.app`` Contents to the outer
+   app. A source/dev checkout has no app-bundle ancestry, so this fallback finds
+   nothing there — the launcher env in (1) is what makes dev/CI work.
+   **CLI-only / headless installs have neither**, so discovery fails and the
+   provider reports unavailable — exactly the case U7 degrades (heuristic for
    day-splitting; consented cloud for summaries).
 """
 
@@ -104,18 +109,32 @@ def _scrubbed_env() -> dict[str, str]:
 def _find_bundled_helper() -> Path | None:
     """Return the helper inside the enclosing ``ScreenCap.app`` bundle, if any.
 
-    The embedded CLI lives at ``ScreenCap.app/Contents/Resources/…`` and the
-    helper is built into ``ScreenCap.app/Contents/MacOS/IntelligenceHelper``.
-    We walk up from this module looking for a ``…/Contents`` dir with a
-    sibling ``MacOS/IntelligenceHelper``. Returns ``None`` for a CLI-only /
-    headless install (no app bundle) — the provider then reports unavailable.
+    The helper is built into the OUTER app at
+    ``ScreenCap.app/Contents/MacOS/IntelligenceHelper`` (the app's "Embed
+    IntelligenceHelper" build phase copies it there). The daemon that imports
+    this module, though, runs from a NESTED helper bundle after SCR-196
+    (``ScreenCap.app/Contents/Library/LoginItems/ScreencapDaemon.app``), whose
+    own ``Contents/MacOS`` carries no helper. So we walk up through EVERY
+    ``…/Contents`` ancestor and take the first that has a runnable
+    ``MacOS/IntelligenceHelper`` — skipping the nested bundle's helper-less
+    ``Contents`` and finding the outer app's. (The historical single-bundle
+    layout — CLI at ``Contents/Resources`` — matches on its first ``Contents``,
+    so this is a strict superset of the old behavior.)
+
+    Returns ``None`` for a CLI-only / headless install (no app bundle in the
+    ancestry) — the provider then reports unavailable and U7 degrades. NOTE the
+    daemon launcher also exports ``SCREENCAP_ONDEVICE_HELPER`` for both the
+    nested-bundle and dev-source cases, so this walk is the fallback, not the
+    only path (a dev-source run has no bundle ancestry and relies on the env).
     """
     for parent in Path(__file__).resolve().parents:
         if parent.name == "Contents":
             candidate = parent / "MacOS" / _HELPER_BASENAME
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return candidate
-            return None
+            # Not in THIS bundle's MacOS — keep walking up. The daemon runs from
+            # a nested ScreencapDaemon.app whose Contents has no helper; the one
+            # it needs sits in an ANCESTOR bundle (the outer ScreenCap.app).
     return None
 
 
