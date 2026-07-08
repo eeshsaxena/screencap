@@ -459,6 +459,70 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(fake.restoreMainWindowCount, 0, "no window was hidden, so none is restored")
     }
 
+    /// The freeze fix: clicking in-app Stop must dismiss the HUD pill
+    /// IMMEDIATELY — not leave it frozen on screen until the (up to 60s)
+    /// background finalization wait completes — and must conclude staying
+    /// backgrounded: the main window is never restored/activated, so focus stays
+    /// in whatever app the user moved on to. The recording still routes to
+    /// Library so it's there when the user reopens ScreenCap themselves.
+    func testInAppStopDismissesHUDImmediatelyAndStaysBackgrounded() async {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(
+            stopPolicy: StubbedStopPolicyCoordinator(outcome: .completed),
+            windowLifecycle: fake
+        )
+        recorder._testSetTransport(.cliFallback)
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        XCTAssertEqual(fake.hideMainWindowCount, 1)  // window really hidden
+        XCTAssertEqual(fake.hideHUDCount, 0)
+
+        // The still-hidden window routes to Library for when the user returns.
+        let routed = expectation(forNotification: .screenCapRecordingDidEnd, object: nil)
+
+        recorder.stop()
+
+        // Synchronous: `enterStopping` drops the pill the instant Stop is
+        // clicked, BEFORE `runStop` awaits finalization. This is the freeze fix —
+        // pre-fix, `hideHUDCount` stayed 0 here and only flipped after the wait.
+        XCTAssertEqual(fake.hideHUDCount, 1, "the pill must be dismissed immediately, not after finalization")
+        XCTAssertEqual(fake.restoreMainWindowCount, 0)
+
+        // Background finalization then settles the controller to `.idle`.
+        await waitUntil { recorder.state == .idle }
+        await fulfillment(of: [routed], timeout: 1)
+
+        // Stay put: even after the terminal transition, the window is never
+        // restored/activated — a clean in-app Stop must not steal focus.
+        XCTAssertEqual(fake.restoreMainWindowCount, 0, "a clean in-app Stop must not pull ScreenCap to the foreground")
+    }
+
+    /// If the in-app Stop signal never dispatches, the recording is still live,
+    /// so the rollback must undo the synchronous pill hide: roll back to
+    /// `.recording` AND re-float the pill (`.showHUD`). Guards the
+    /// `apply(machine.restoreRecordingAfterStopFailure())` callsite added
+    /// alongside the immediate-hide fix.
+    func testInAppStopSignalFailureRollsBackAndReshowsHUD() async {
+        let fake = FakeWindowLifecycle()
+        let recorder = RecorderController(
+            stopPolicy: StubbedStopPolicyCoordinator(outcome: .sendSignalFailed(NSError(domain: "test", code: 1))),
+            windowLifecycle: fake
+        )
+        recorder._testSetTransport(.cliFallback)
+        recorder._testSetPresentation(state: .starting)
+        recorder._testHandleStderrLine(#"{"type":"started","schema_version":1,"cursor":1,"ts":1.0}"#)
+        let showsAfterStart = fake.showHUDCount  // 1, from the `started` event
+
+        recorder.stop()
+        XCTAssertEqual(fake.hideHUDCount, 1, "the pill is dropped synchronously on click")
+
+        // The failed send rolls the state machine back to `.recording` and the
+        // controller re-applies `.showHUD` so the pill returns for the live recording.
+        await waitUntil { if case .recording = recorder.state { return true }; return false }
+        XCTAssertEqual(fake.showHUDCount, showsAfterStart + 1, "a failed stop signal must re-float the pill")
+        XCTAssertFalse(recorder.state.isStopping)
+    }
+
     // MARK: - HUD hide control
 
     /// Drive the controller into `.recording` via the real `.starting` →

@@ -552,11 +552,15 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    /// In-app Stop button path. SIGTERM via `screencap stop`, await
-    /// `recording_finalized` with a 60s wall-clock fallback (headroom over the
-    /// daemon's own 30s `SCREENCAP_DAEMON_STOP_TIMEOUT` + SIGKILL fallback;
-    /// see `StopPolicyCoordinator.runStop`), then transition UI to `.idle`.
-    /// Background finalization continues invisibly.
+    /// In-app Stop button path. Tears the recording HUD down immediately (via
+    /// `enterStopping`) so the pill never freezes on screen, then finalizes in
+    /// the background: SIGTERM via `screencap stop`, await `recording_finalized`
+    /// with a 60s wall-clock fallback (headroom over the daemon's own 30s
+    /// `SCREENCAP_DAEMON_STOP_TIMEOUT` + SIGKILL fallback; see
+    /// `StopPolicyCoordinator.runStop`). The terminal transition concludes
+    /// staying backgrounded (`enterIdleStayingBackgrounded`) so a clean Stop
+    /// never pulls ScreenCap to the foreground — the user keeps working
+    /// uninterrupted while finalization continues invisibly.
     ///
     /// Guard is intentionally narrower than `state.isRecording`: a second
     /// click while we're already `.stopping` would dispatch a duplicate
@@ -613,8 +617,9 @@ final class RecorderController: ObservableObject {
 
     // MARK: - Stop policy
 
-    /// `quitting=false`: in-app Stop, 60s wait, transition UI to .idle and
-    /// continue background finalization invisibly.
+    /// `quitting=false`: in-app Stop, 60s wait. The HUD was already dropped on
+    /// `enterStopping`, so this just finalizes in the background and concludes
+    /// staying backgrounded — the UI is never blocked on the wait.
     /// `quitting=true`:  Cmd+Q, 300s wait, then NSApp.reply(...). On timeout
     /// we SIGKILL the CLI recorder (daemon transport surfaces the
     /// "may still be running" message instead) and let
@@ -659,9 +664,11 @@ final class RecorderController: ObservableObject {
             }
             // No-op for the daemon path when `handleDaemonOperationFailure`
             // already forced state to `.idle`; only the CLI path lands in
-            // `.stopping` and gets rolled back to `.recording(elapsed:)`.
-            machine.restoreRecordingAfterStopFailure()
-            state = machine.state
+            // `.stopping` and gets rolled back to `.recording(elapsed:)`. The
+            // rollback re-emits `.showHUD` because the in-app Stop already hid
+            // the pill on `enterStopping` — the recording is still live, so the
+            // HUD must come back (apply() also mirrors the machine state).
+            apply(machine.restoreRecordingAfterStopFailure())
         case .completed:
             finalizeStop(quitting: quitting)
         case .timedOut:
@@ -683,14 +690,22 @@ final class RecorderController: ObservableObject {
         }
     }
 
-    /// Shared stop-completion sequence: clear the Cmd+Q countdown, transition
-    /// the machine to `.idle`, and (for Cmd+Q) tell AppKit it may terminate.
+    /// Shared stop-completion sequence, transitioning the machine to `.idle`.
+    /// The two stop paths conclude differently:
+    /// - Cmd+Q restores + activates the window (`enterIdle`) so any final message
+    ///   is visible, then tells AppKit it may finish terminating.
+    /// - In-app Stop concludes staying backgrounded (`enterIdleStayingBackgrounded`)
+    ///   so a clean Stop never steals focus from the app the user moved on to —
+    ///   the HUD was already dropped on `enterStopping`, so this just routes the
+    ///   still-hidden window to Library. apply() mirrors `.idle` into `state`.
     private func finalizeStop(quitting: Bool) {
-        if quitting { quitProgressSecondsRemaining = nil }
-        // enterIdle() emits the HUD close + main-window restore (U7); apply drains
-        // them and mirrors the machine's `.idle` into `state`.
-        apply(machine.enterIdle())
-        if quitting { NSApp.reply(toApplicationShouldTerminate: true) }
+        if quitting {
+            quitProgressSecondsRemaining = nil
+            apply(machine.enterIdle())
+            NSApp.reply(toApplicationShouldTerminate: true)
+        } else {
+            apply(machine.enterIdleStayingBackgrounded())
+        }
     }
 
     // MARK: - Event / process callbacks
@@ -754,6 +769,23 @@ final class RecorderController: ObservableObject {
             case .restoreMainWindow:
                 currentRecordingName = nil
                 restoreMainWindowIfHidden()
+            case .endRecordingInBackground:
+                // Stay-put teardown for the in-app Stop: the recording is over,
+                // but we must NOT pull ScreenCap to the foreground. Clear the
+                // recording title, then — only if the main window was hidden for
+                // the recording — drop that bookkeeping (so the terminal
+                // enterIdle's restore and this effect stay no-ops) and route the
+                // still-hidden window to Library, so the new recording is there
+                // when the user reopens ScreenCap on their own terms. Deliberately
+                // skips `windowLifecycle.restoreMainWindow()` (its orderFront +
+                // NSApp.activate is the focus steal we're avoiding). The
+                // `mainWindowHidden` guard mirrors `restoreMainWindowIfHidden`, so
+                // a `.starting` failure or HUD-only attach session doesn't reroute.
+                currentRecordingName = nil
+                if mainWindowHidden {
+                    mainWindowHidden = false
+                    NotificationCenter.default.post(name: .screenCapRecordingDidEnd, object: nil)
+                }
             }
         }
         state = machine.state

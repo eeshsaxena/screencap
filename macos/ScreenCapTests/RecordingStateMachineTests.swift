@@ -26,14 +26,42 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertEqual(effects, [])
     }
 
-    func testEnterStoppingFromRecordingTransitionsState() {
+    /// In-app Stop drops the HUD immediately so the pill never freezes on screen
+    /// during the background finalization wait (the teardown used to be gated on
+    /// the 60s `recording_finalized` wait).
+    func testEnterStoppingFromRecordingDropsHUDImmediately() {
         var machine = RecordingStateMachine()
         machine.forceState(.recording(elapsed: 3))
 
         let effects = machine.enterStopping(quitting: false)
 
         XCTAssertEqual(machine.state, .stopping(quitting: false))
+        XCTAssertEqual(effects, [.hideHUD])
+    }
+
+    /// Cmd+Q keeps its HUD (+ quit-progress countdown) until the 300s stop
+    /// completes, so the quitting path must NOT tear the HUD down on entry.
+    func testEnterStoppingWhileQuittingKeepsHUD() {
+        var machine = RecordingStateMachine()
+        machine.forceState(.recording(elapsed: 3))
+
+        let effects = machine.enterStopping(quitting: true)
+
+        XCTAssertEqual(machine.state, .stopping(quitting: true))
         XCTAssertEqual(effects, [])
+    }
+
+    /// The in-app Stop terminal transition drops to `.idle` and concludes in the
+    /// background — HUD close + Library route, but NO `.restoreMainWindow` (which
+    /// would orderFront + activate and steal focus from the user's current app).
+    func testEnterIdleStayingBackgroundedConcludesWithoutWindowRestore() {
+        var machine = RecordingStateMachine()
+        machine.forceState(.stopping(quitting: false))
+
+        let effects = machine.enterIdleStayingBackgrounded()
+
+        XCTAssertEqual(machine.state, .idle)
+        XCTAssertEqual(effects, [.hideHUD, .endRecordingInBackground])
     }
 
     func testEnterStoppingFromIdleIsNoOp() {
@@ -78,9 +106,12 @@ final class RecordingStateMachineTests: XCTestCase {
         _ = machine.observeActiveDaemonSession(startedAt: startedAt, now: Date(timeIntervalSince1970: 60))
         _ = machine.enterStopping(quitting: false)
 
-        machine.restoreRecordingAfterStopFailure(now: Date(timeIntervalSince1970: 70))
+        // The in-app Stop dropped the HUD on `enterStopping`; a failed stop
+        // signal rolls back to `.recording`, so the pill must be re-shown.
+        let effects = machine.restoreRecordingAfterStopFailure(now: Date(timeIntervalSince1970: 70))
 
         XCTAssertEqual(machine.state, .recording(elapsed: 20))
+        XCTAssertEqual(effects, [.showHUD])
     }
 
     func testTickElapsedUpdatesRecordingElapsed() {
