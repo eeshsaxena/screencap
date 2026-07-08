@@ -9,10 +9,15 @@ a few minutes before expiry.
 
 Security posture (see SECURITY.md + docs/runbooks/cloud-auth-setup.md):
 
-* The Keychain entry uses the **default "Always Allow" trusted-binary ACL** (the
-  same posture as ``network/crypto.py``) — NOT a code-signing-pinned ACL. Any
-  same-user trusted binary can read it. Documented honestly; we do not claim
-  pinning that does not exist.
+* The refresh token is stored on the **data-protection keychain** in a **shared
+  access group** (``kSecAttrAccessGroup`` = :data:`KEYCHAIN_ACCESS_GROUP`), so every
+  same-Team-signed binary carrying the ``keychain-access-groups`` entitlement reads
+  it without a per-binary-ACL prompt (SCR-241, see :mod:`screencap.keychain_group`).
+  Un-entitled binaries (pip/pyenv CLI, Debug fallback) get ``errSecMissingEntitlement``
+  and fall back to the legacy ``keyring`` path — a separate credential. This is
+  honestly a *team-shared* read, NOT a code-signing-pinned secret, and does not
+  cross the same-user boundary (see SECURITY.md). The E2EE/network KEKs still use the
+  default per-binary ACL (deferred).
 * The OAuth client is a **public native client**: no ``client_secret`` is
   embedded in source or binaries. PKCE is the protection (RFC 9700). An env
   override (``SCREENCAP_OAUTH_CLIENT_SECRET``) exists only as an escape hatch for
@@ -30,6 +35,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -71,6 +77,19 @@ SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 # network KEK).
 KEYCHAIN_SERVICE = "screencap-auth"
 KEYCHAIN_ACCOUNT = "default"
+
+# Shared Keychain access group (SCR-241). Every same-Team-signed ScreenCap binary
+# carrying the ``keychain-access-groups`` entitlement (the app's embedded daemon +
+# bundled CLI) reads the refresh token from this group without a prompt; binaries
+# that are not entitled for it (the pip/pyenv terminal CLI, the Debug fallback)
+# get ``errSecMissingEntitlement`` and fall back to the legacy ``keyring`` path
+# below. The literal team prefix is required because ``codesign --entitlements``
+# does not expand Xcode's ``$(TeamIdentifierPrefix)`` (KTD-3); the env override
+# exists for dev/testing. It MUST match the value in
+# ``macos/ScreenCap/Scripts/screencap-cli.entitlements`` exactly.
+KEYCHAIN_ACCESS_GROUP = os.environ.get(
+    "SCREENCAP_KEYCHAIN_ACCESS_GROUP", "2A8S6MV8DZ.com.screencap.shared"
+)
 
 # Out-of-band engine token channel. The live-upload ``ChunkProcessor`` runs inside
 # the daemon-spawned engine subprocess, whose Keychain ACL identity differs from the
@@ -232,25 +251,140 @@ _thread_lock = threading.Lock()
 # --------------------------------------------------------------------------
 
 
+def _log_keyring_fallback(operation: str) -> None:
+    """Note that a token op used the legacy ``keyring`` instead of the access group.
+
+    A *frozen* (bundled) binary that falls back is a silent-degradation signal — it
+    is supposed to carry the ``keychain-access-groups`` entitlement, so a fallback
+    means a wrong-team / missing-entitlement build that "looks done but does
+    nothing" (SCR-241 KTD-3) — hence WARN so it is visible in daemon logs. An
+    un-frozen context (pip/pyenv CLI, Debug ``python3 -m screencap.cli`` fallback)
+    is the expected Fork-1A path and logs at debug. Never logs the token itself.
+    """
+    if getattr(sys, "frozen", False):
+        logger.warning(
+            "auth keychain: entitled build fell back to legacy keyring for %s — access "
+            "group unavailable (check keychain-access-groups entitlement + team signing)",
+            operation,
+        )
+    else:
+        logger.debug("auth keychain: %s via legacy keyring (un-entitled context)", operation)
+
+
 def _store_refresh_token(token: str) -> None:
+    if sys.platform == "darwin":
+        from screencap import keychain_group
+
+        try:
+            keychain_group.store(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token, KEYCHAIN_ACCESS_GROUP)
+            logger.debug("auth keychain: stored refresh token via access group")
+            return
+        except keychain_group.MissingEntitlement:
+            _log_keyring_fallback("store")
+        except keychain_group.KeychainError as exc:
+            # A non-entitlement Keychain failure (locked, backend error) means the
+            # credential was NOT persisted. Surface it as an AuthError — the CLI's
+            # auth vocabulary — so callers like `login_cmd` (which catches
+            # AuthError) degrade cleanly instead of crashing on an unexpected
+            # RuntimeError. NOT masked as un-entitled → no keyring fallback (KTD-4).
+            raise AuthError(
+                f"Couldn't save your credentials to the Keychain (status {exc.status})."
+            ) from exc
     import keyring
 
     keyring.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token)
 
 
 def _load_refresh_token() -> str | None:
+    if sys.platform == "darwin":
+        from screencap import keychain_group
+
+        try:
+            token = keychain_group.load(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, KEYCHAIN_ACCESS_GROUP)
+        except keychain_group.MissingEntitlement:
+            _log_keyring_fallback("load")
+        except keychain_group.KeychainError as exc:
+            # Keychain unreadable (locked / backend error) — an auth failure, not a
+            # reason to fall back to keyring or attempt migration. Surface as
+            # AuthError so callers degrade cleanly instead of crashing on an
+            # unexpected RuntimeError (KTD-4: never masked as un-entitled).
+            raise AuthError(
+                f"Couldn't read your credentials from the Keychain (status {exc.status})."
+            ) from exc
+        else:
+            if token is not None:
+                logger.debug("auth keychain: loaded refresh token via access group")
+                return token
+            # Entitled, but the group has no item yet → attempt the one-time
+            # migration of a pre-existing legacy item (SCR-241 Fork 2A).
+            return _migrate_legacy_token_if_needed()
     import keyring
 
     return keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
 
 
 def _delete_refresh_token() -> None:
+    if sys.platform == "darwin":
+        from screencap import keychain_group
+
+        try:
+            keychain_group.delete(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, KEYCHAIN_ACCESS_GROUP)
+        except keychain_group.MissingEntitlement:
+            _log_keyring_fallback("delete")
+        except keychain_group.KeychainError as exc:
+            # Don't let a group-delete failure skip the legacy cleanup below — the
+            # belt-and-braces guarantee (no pre-migration token left to resurrect)
+            # must still hold. Log and fall through rather than propagate.
+            logger.warning(
+                "auth keychain: access-group delete failed (status %s); clearing legacy item anyway",
+                exc.status,
+            )
+    # Always also clear any legacy keyring item, so a pre-migration token cannot
+    # resurrect via a later migration read (belt-and-braces; SCR-241 U2 decision).
     import keyring
 
     try:
         keyring.delete_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
     except keyring.errors.PasswordDeleteError:
         pass  # nothing stored — already signed out
+
+
+def _migrate_legacy_token_if_needed() -> str | None:
+    """SCR-241 Fork 2A: one-time silent migration of a legacy login-keychain token
+    into the access group. Runs only on the entitled path when the group is empty.
+
+    Strictly non-interactive (read *and* delete) so it can NEVER reintroduce the
+    prompt this ticket exists to kill. The silent read succeeds only when the
+    calling binary is already in the legacy item's ACL (the single-identity
+    upgrade case); otherwise it returns ``None`` and the user re-signs in. Any
+    failure is fail-open (returns the legacy token or ``None``, never raises).
+    """
+    from screencap import keychain_group
+
+    try:
+        secret = keychain_group.load_legacy_noninteractive(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    except Exception:  # noqa: BLE001 — migration must never raise
+        return None
+    if secret is None:
+        return None  # not silently readable / absent → re-login (R3-compliant)
+    try:
+        keychain_group.store(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, secret, KEYCHAIN_ACCESS_GROUP)
+    except Exception:  # noqa: BLE001 — fail-open: keep the user signed in on the legacy token
+        logger.debug(
+            "auth keychain: legacy→group migration write failed; using legacy token",
+            exc_info=True,
+        )
+        return secret
+    # Group now holds it — remove the legacy copy. A failed/incomplete delete is
+    # WARNed (not hidden) so the duplicate-token window is observable.
+    if keychain_group.delete_legacy_noninteractive(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT):
+        logger.info("auth keychain: migrated legacy refresh token into the access group")
+    else:
+        logger.warning(
+            "auth keychain: migrated token to access group but the legacy item persists; "
+            "token duplicated until next logout"
+        )
+    return secret
 
 
 def _read_engine_token() -> str | None:

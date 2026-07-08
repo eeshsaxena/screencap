@@ -274,7 +274,16 @@ sign_embedded_helper() {
         codesign -d -r- "${DEST_APP}" >&2 || true
         exit 1
     fi
-    echo "Signed embedded daemon helper with team identity (DR names com.screencap.daemon; grants persist)."
+    # SCR-241: the keychain-access-groups entitlement must survive signing, or the
+    # daemon/CLI silently falls back to the legacy keyring path — the "looks done
+    # but does nothing" failure. This build-time check is the primary, non-human-
+    # gated catch (the runtime WARN in auth.py is only a backstop).
+    if ! codesign -d --entitlements :- "${HELPER_BIN}" 2>/dev/null | grep -q "2A8S6MV8DZ.com.screencap.shared"; then
+        echo "error: signed helper is missing the keychain-access-groups entitlement (2A8S6MV8DZ.com.screencap.shared)." >&2
+        echo "error: check screencap-cli.entitlements — cloud auth would fall back to the legacy keyring path." >&2
+        exit 1
+    fi
+    echo "Signed embedded daemon helper with team identity (DR names com.screencap.daemon; keychain access group present; grants persist)."
 }
 
 sign_embedded_helper
