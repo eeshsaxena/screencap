@@ -171,6 +171,13 @@ struct OnboardingAccountStep: View {
         }
         .padding(.horizontal, 100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Resolve sign-in state lazily when this account step appears (sign-in
+        // is no longer probed at app launch — SCR-241). Without this, a user who
+        // replays onboarding while already signed in would see `status ==
+        // .unknown` (→ `isSignedIn == false`) and be offered a redundant sign-in
+        // instead of the upgrade panel. The account step is an explicit cloud
+        // surface, so decrypting the Keychain (and any prompt) here is expected.
+        .task { await auth.refreshIfNeeded() }
         // Subscription just became active (webhook granted it) → finish the step.
         .onChange(of: auth.isSubscribed) { subscribed in
             if subscribed, tier == .personalCloud { onSignedIn() }
