@@ -14,6 +14,16 @@ The app **embeds a daemon built from the current Python source at build time** (
 
 ## Step 0: Preflight — confirm the app actually needs a release
 
+**First, sync local `main` with remote.** The preflight below (and the Step 1 version math) diff `HEAD` and the local tag list against the last release. A stale local `main` — or a missing newly-pushed `macos-app-v*` tag — silently produces a wrong verdict ("no release warranted" when there is, or vice-versa) and wrong version numbers. Always fast-forward before deciding:
+
+```bash
+git checkout main
+git fetch origin --tags --prune
+git pull --ff-only origin main
+```
+
+`--ff-only` refuses to merge if local `main` has diverged (e.g. unpushed local commits). If it fails, stop and reconcile — do **not** proceed on a diverged branch. Then run the preflight:
+
 ```bash
 bash scripts/what-needs-releasing.sh
 ```
