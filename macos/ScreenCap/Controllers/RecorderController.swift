@@ -672,6 +672,15 @@ final class RecorderController: ObservableObject {
         case .completed:
             finalizeStop(quitting: quitting)
         case .timedOut:
+            // Cmd+Q surfaces a terminal message (the window is restored on quit
+            // so it's seen, and the app is exiting so it can't go stale). The
+            // in-app path surfaces NOTHING: background finalization outlasting
+            // the 60s wait is normal for a long recording, not a failure, and it
+            // self-resolves. Writing it to `lastError` (the terminal-failure
+            // channel, never auto-cleared — see the `state.didSet` idle
+            // chokepoint) left a stale red banner over the Library long after the
+            // recording finished uploading. The per-recording Library status
+            // chips already carry the finalization signal.
             if quitting {
                 if isDaemon {
                     lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
@@ -683,8 +692,6 @@ final class RecorderController: ObservableObject {
                     // unrelated process cannot be signalled.
                     lastError = "Stop timed out after 5 minutes; recorder force-killed."
                 }
-            } else {
-                lastError = "Stop is still finalizing in the background."
             }
             finalizeStop(quitting: quitting)
         }

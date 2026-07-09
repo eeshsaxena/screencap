@@ -153,8 +153,8 @@ final class StopPolicyCoordinatorTests: XCTestCase {
     /// In-app Stop's default wait MUST exceed the daemon's 30s stop budget
     /// (SCREENCAP_DAEMON_STOP_TIMEOUT) plus its ~3s SIGKILL fallback. Lowering
     /// `inAppStopTimeout` back below ~35s re-introduces the SCR-69 race where
-    /// a clean stop surfaces "Stop is still finalizing in the background."
-    /// even though the worker exits seconds later.
+    /// a clean stop concludes as `.timedOut` and stops waiting for
+    /// `recording_finalized` even though the worker exits seconds later.
     func testInAppStopDefaultExceedsDaemonStopBudget() {
         XCTAssertGreaterThanOrEqual(LiveStopPolicyCoordinator.inAppStopTimeout, 60)
     }
