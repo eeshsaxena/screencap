@@ -68,3 +68,64 @@ def test_empty_chain_is_unavailable():
 
 def test_unavailable_generation_provider_always_unavailable():
     assert UnavailableGenerationProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# U7 — build_answer_provider (config routing; LOCAL-only BYO; REMOTE excluded)
+# ---------------------------------------------------------------------------
+
+from screencap.segmentation.providers.downloaded import DownloadedProvider  # noqa: E402
+from screencap.segmentation.providers.local_server import LocalServerProvider  # noqa: E402
+from screencap.segmentation.providers.ondevice import OnDeviceProvider  # noqa: E402
+from screencap.segmentation.routing import build_answer_provider  # noqa: E402
+
+
+@pytest.fixture()
+def cfg(monkeypatch):
+    """Set the active provider, BYO endpoint, and downloaded-installed flag."""
+    from screencap import config
+    from screencap.segmentation import routing
+
+    def _set(provider: str, *, endpoint: str | None = None, installed: bool = False):
+        monkeypatch.setattr(config, "get_llm_provider", lambda: provider)
+        monkeypatch.setattr(config, "get_local_server_endpoint", lambda: endpoint)
+        monkeypatch.setattr(routing, "_downloaded_model_installed", lambda: installed)
+
+    return _set
+
+
+def test_on_device_builds_afm_chain(cfg):
+    cfg("on-device")
+    prov = build_answer_provider()
+    assert isinstance(prov, ChainedGenerationProvider)
+    assert isinstance(prov._backends[0], OnDeviceProvider)
+    assert len(prov._backends) == 1  # downloaded not installed
+
+
+def test_on_device_chain_includes_downloaded_when_installed(cfg):
+    cfg("on-device", installed=True)
+    prov = build_answer_provider()
+    assert isinstance(prov, ChainedGenerationProvider)
+    assert any(isinstance(b, DownloadedProvider) for b in prov._backends)
+
+
+def test_downloaded_active_provider(cfg):
+    cfg("downloaded")
+    assert isinstance(build_answer_provider(), DownloadedProvider)
+
+
+def test_local_server_local_endpoint_participates(cfg):
+    cfg("local-server", endpoint="http://127.0.0.1:1234")
+    assert isinstance(build_answer_provider(), LocalServerProvider)
+
+
+@pytest.mark.privacy
+def test_local_server_remote_endpoint_excluded(cfg):
+    # KTD5: a REMOTE BYO endpoint must NOT join the answer chain.
+    cfg("local-server", endpoint="http://evil.example.com:1234")
+    assert isinstance(build_answer_provider(), UnavailableGenerationProvider)
+
+
+def test_cloud_active_provider_has_no_on_device_backend(cfg):
+    cfg("gemini")
+    assert isinstance(build_answer_provider(), UnavailableGenerationProvider)

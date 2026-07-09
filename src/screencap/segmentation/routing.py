@@ -17,6 +17,7 @@ on-device-class backends are ever placed in the day-split provider set.
 
 from __future__ import annotations
 
+from screencap.segmentation.generation import GenerationProvider
 from screencap.segmentation.provider import LLMProvider
 
 
@@ -57,6 +58,55 @@ def build_day_split_provider() -> LLMProvider:
 
     # Any other active provider (e.g. a cloud one) never day-splits.
     return UnavailableProvider()
+
+
+def build_answer_provider() -> GenerationProvider:
+    """Return the on-device-class generation provider for the configured active
+    provider (SCR-243, U7).
+
+    Mirrors :func:`build_day_split_provider`, but for the recall-answer path and
+    returning **on-device-class only** — the consented-cloud fallback lives in
+    the dispatcher (``answer_recall``), not here (KTD6). REMOTE BYO endpoints are
+    excluded (KTD5): a REMOTE endpoint resolves to
+    :class:`UnavailableGenerationProvider` so evidence never egresses off-box via
+    the answer chain.
+    """
+    from screencap import config
+    from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+    from screencap.segmentation.providers.chained import (
+        ChainedGenerationProvider,
+        UnavailableGenerationProvider,
+    )
+
+    name = config.get_llm_provider()
+
+    if name == "on-device":
+        from screencap.segmentation.providers.ondevice import OnDeviceProvider
+
+        backends: list[GenerationProvider] = [OnDeviceProvider()]
+        if _downloaded_model_installed():
+            from screencap.segmentation.providers.downloaded import DownloadedProvider
+
+            backends.append(DownloadedProvider())
+        return ChainedGenerationProvider(backends)
+
+    if name == "downloaded":
+        from screencap.segmentation.providers.downloaded import DownloadedProvider
+
+        return DownloadedProvider()
+
+    if name == "local-server":
+        endpoint = config.get_local_server_endpoint()
+        if endpoint and classify_endpoint(endpoint) == LOCAL:
+            from screencap.segmentation.providers.local_server import LocalServerProvider
+
+            return LocalServerProvider()
+        # REMOTE endpoint (or none) — no on-device-class answer backend (KTD5).
+        return UnavailableGenerationProvider()
+
+    # Any other active provider (e.g. a cloud one) has no on-device-class answer
+    # backend; the dispatcher handles the consented-cloud step.
+    return UnavailableGenerationProvider()
 
 
 def _downloaded_model_installed() -> bool:
