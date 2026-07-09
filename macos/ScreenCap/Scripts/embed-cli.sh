@@ -298,16 +298,18 @@ sign_embedded_helper() {
         codesign -d -r- "${DEST_APP}" >&2 || true
         exit 1
     fi
-    # SCR-241: the keychain-access-groups entitlement must survive signing, or the
-    # daemon/CLI silently falls back to the legacy keyring path — the "looks done
-    # but does nothing" failure. This build-time check is the primary, non-human-
-    # gated catch (the runtime WARN in auth.py is only a backstop).
-    if ! codesign -d --entitlements :- "${HELPER_BIN}" 2>/dev/null | grep -q "2A8S6MV8DZ.com.screencap.shared"; then
-        echo "error: signed helper is missing the keychain-access-groups entitlement (2A8S6MV8DZ.com.screencap.shared)." >&2
-        echo "error: check screencap-cli.entitlements — cloud auth would fall back to the legacy keyring path." >&2
-        exit 1
-    fi
-    echo "Signed embedded daemon helper with team identity (DR names com.screencap.daemon; keychain access group present; grants persist)."
+    # SCR-241/SCR-242: keychain-access-groups is a RESTRICTED entitlement that only
+    # survives — and is only authorizable — on the Developer ID re-sign WITH an
+    # embedded provisioning profile. This Xcode build phase runs under Apple
+    # Development (which strips restricted entitlements) and does not embed the
+    # profile; script/sign_app.sh owns embedding it and hard-asserting the
+    # entitlement + profile at release time, and re-signs every nested Mach-O from
+    # scratch — so this phase's entitlement state is not what ships. Asserting the
+    # group here fails EVERY build under Apple Development (SCR-242 secondary bug #1),
+    # so defer rather than assert.
+    echo "note: keychain-access-groups authorization (entitlement + embedded provisioning"
+    echo "note: profile) is applied and asserted by the Developer ID re-sign (script/sign_app.sh)."
+    echo "Signed embedded daemon helper with team identity (DR names com.screencap.daemon; grants persist)."
 }
 
 sign_embedded_helper

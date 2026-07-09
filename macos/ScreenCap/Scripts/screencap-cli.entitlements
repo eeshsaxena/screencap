@@ -22,6 +22,18 @@
   and it MUST match KEYCHAIN_ACCESS_GROUP in src/screencap/auth.py exactly. A
   binary signed under a different team can't claim this group and falls back to
   the legacy keyring path.
+
+  keychain-access-groups is a RESTRICTED entitlement (SCR-242): AMFI SIGKILLs the
+  binary at launch (exit 137 / "Killed: 9") unless an embedded Developer ID
+  provisioning profile AUTHORIZES it. That authorization also requires the binary
+  to declare com.apple.application-identifier (matching the profile's explicit
+  App ID, 2A8S6MV8DZ.com.screencap.daemon) and com.apple.developer.team-identifier,
+  and the helper .app must ship Contents/embedded.provisionprofile (embedded by the
+  Developer ID re-sign, script/sign_app.sh, from SCREENCAP_DAEMON_PROVISION_PROFILE).
+  Under an Apple Development identity these restricted entitlements are stripped at
+  sign time, so the Xcode build phase (embed-cli.sh) defers the whole keychain
+  authorization to that release re-sign. See
+  docs/runbooks/scr-242-keychain-access-group-provisioning.md.
 -->
 <plist version="1.0">
 <dict>
@@ -31,6 +43,10 @@
   <true/>
   <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
+  <key>com.apple.application-identifier</key>
+  <string>2A8S6MV8DZ.com.screencap.daemon</string>
+  <key>com.apple.developer.team-identifier</key>
+  <string>2A8S6MV8DZ</string>
   <key>keychain-access-groups</key>
   <array>
     <string>2A8S6MV8DZ.com.screencap.shared</string>

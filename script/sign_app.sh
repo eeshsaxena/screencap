@@ -110,10 +110,34 @@ find "${CLI_DIR}" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
 echo "==> Signing embedded daemon helper binary (with entitlements)"
 sign --entitlements "${CLI_ENTITLEMENTS}" "${CLI_BINARY}"
 
+# SCR-242: keychain-access-groups is a RESTRICTED entitlement — AMFI SIGKILLs the
+# daemon at launch (exit 137) unless an embedded Developer ID provisioning profile
+# authorizes it. Embed it into the helper bundle's Contents/ BEFORE sealing the
+# wrapper (the seal below includes it in CodeResources). Required whenever the CLI
+# entitlements declare the group. See
+# docs/runbooks/scr-242-keychain-access-group-provisioning.md.
+if grep -q "keychain-access-groups" "${CLI_ENTITLEMENTS}"; then
+  PROFILE="${SCREENCAP_DAEMON_PROVISION_PROFILE:-}"
+  if [ -z "${PROFILE}" ] || [ ! -f "${PROFILE}" ]; then
+    echo "error: the CLI entitlements declare keychain-access-groups (a restricted" >&2
+    echo "error: entitlement), but no Developer ID provisioning profile was provided." >&2
+    echo "error: Set SCREENCAP_DAEMON_PROVISION_PROFILE to the .provisionprofile path." >&2
+    echo "error: Without it AMFI SIGKILLs the daemon at launch (exit 137). See" >&2
+    echo "error: docs/runbooks/scr-242-keychain-access-group-provisioning.md." >&2
+    exit 1
+  fi
+  echo "==> Embedding Developer ID provisioning profile into the helper bundle"
+  cp "${PROFILE}" "${CLI_DIR}/Contents/embedded.provisionprofile"
+  echo "    embedded.provisionprofile <- ${PROFILE}"
+fi
+
 echo "==> Signing embedded daemon helper .app wrapper"
 # The helper .app must be sealed AFTER its nested code so its Info.plist
 # (CFBundleIdentifier=com.screencap.daemon) is what TCC attributes grants to.
-sign "${CLI_DIR}"
+# SCR-242: carry --entitlements on the wrapper seal — sealing re-signs the nested
+# main executable (CLI_BINARY); without it that re-sign STRIPS the keychain-access-
+# groups entitlement (+ hardened-runtime exceptions) applied to CLI_BINARY above.
+sign --entitlements "${CLI_ENTITLEMENTS}" "${CLI_DIR}"
 
 # Sign any embedded frameworks/helpers if the bundle grows them later. No-op today.
 if [ -d "${APP_PATH}/Contents/Frameworks" ]; then
@@ -172,13 +196,33 @@ if ! codesign -d --entitlements :- "${CLI_BINARY}" 2>/dev/null | grep -q "2A8S6M
   exit 1
 fi
 
+# SCR-242: the entitlement above is present but UNauthorized without the embedded
+# provisioning profile — AMFI would then SIGKILL the daemon at launch. Confirm the
+# profile actually shipped in the sealed bundle (the smoke test below is the runtime
+# proof; this is the fast structural check).
+if grep -q "keychain-access-groups" "${CLI_ENTITLEMENTS}"; then
+  echo "==> Asserting the helper bundle carries embedded.provisionprofile"
+  if [ ! -f "${CLI_DIR}/Contents/embedded.provisionprofile" ]; then
+    echo "error: helper bundle is missing Contents/embedded.provisionprofile — the" >&2
+    echo "error: restricted keychain-access-groups entitlement is unauthorized and AMFI" >&2
+    echo "error: would SIGKILL the daemon at launch. See the SCR-242 runbook." >&2
+    exit 1
+  fi
+fi
+
 echo "==> Smoke-testing the signed embedded daemon helper under hardened runtime"
 # Necessary but not sufficient: this is a direct exec, not the launchd/
 # SMAppService daemon path. A hardened-runtime/library-validation break that
 # only shows up via launchd surfaces on the real daemon launch (CI gate / tester).
+# SCR-242: this direct exec DOES exercise AMFI's restricted-entitlement check — an
+# unauthorized keychain-access-groups entitlement SIGKILLs here (exit 137 /
+# "Killed: 9"), so a missing/wrong provisioning profile fails the build right here.
 if ! "${CLI_BINARY}" --version >/dev/null 2>&1; then
   echo "error: embedded daemon helper fails to launch after signing." >&2
-  echo "error: check ${CLI_ENTITLEMENTS} against hardened-runtime needs." >&2
+  echo "error: if this is exit 137 / Killed: 9, the keychain-access-groups entitlement is" >&2
+  echo "error: unauthorized — check the embedded Developer ID provisioning profile" >&2
+  echo "error: (docs/runbooks/scr-242-keychain-access-group-provisioning.md)." >&2
+  echo "error: otherwise check ${CLI_ENTITLEMENTS} against hardened-runtime needs." >&2
   exit 1
 fi
 
