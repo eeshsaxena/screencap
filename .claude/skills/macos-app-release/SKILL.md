@@ -38,10 +38,11 @@ This diffs HEAD against the last tag of each track. Proceed here only if the **m
 4. The gitignored `.env` present (provisioned OAuth/Firebase values — see `docs/runbooks/cloud-auth-setup.md`).
 5. Signing + notarization creds exported in `~/.zshrc` (the Bash shell does **not** auto-source it). Extract them per step:
    ```bash
-   eval "$(grep -E '^\s*export\s+(MACOS_SIGN_IDENTITY|APPLE_NOTARY_KEY_P8|APPLE_NOTARY_KEY_ID|APPLE_NOTARY_ISSUER_ID)=' ~/.zshrc)"
+   eval "$(grep -E '^\s*export\s+(MACOS_SIGN_IDENTITY|APPLE_NOTARY_KEY_P8|APPLE_NOTARY_KEY_ID|APPLE_NOTARY_ISSUER_ID|SCREENCAP_DAEMON_PROVISION_PROFILE)=' ~/.zshrc)"
    ```
    Confirm `test -f "$APPLE_NOTARY_KEY_P8"` and `security find-identity -v -p codesigning | grep "Developer ID Application"`. Team ID / `DEVELOPMENT_TEAM` = `2A8S6MV8DZ`.
-6. On `main`, working tree clean.
+6. **SCR-242 — the daemon's Developer ID provisioning profile.** `script/sign_app.sh` now *requires* `SCREENCAP_DAEMON_PROVISION_PROFILE` (path to the Developer ID `.provisionprofile` that authorizes the daemon's restricted `keychain-access-groups` entitlement) — without it AMFI SIGKILLs the shipped daemon at launch, so the script hard-fails. Confirm `test -f "$SCREENCAP_DAEMON_PROVISION_PROFILE"`. If it is unset or missing, create/download the profile first per `docs/runbooks/scr-242-keychain-access-group-provisioning.md`, then add its path to `~/.zshrc`.
+7. On `main`, working tree clean.
 
 ## Step 1: Decide the versions
 
@@ -116,12 +117,17 @@ The `screencap-cli-version` stamp must equal the intended daemon version (this i
 ## Step 6: Sign, notarize, package the DMG
 
 ```bash
-eval "$(grep -E '^\s*export\s+(MACOS_SIGN_IDENTITY|APPLE_NOTARY_KEY_P8|APPLE_NOTARY_KEY_ID|APPLE_NOTARY_ISSUER_ID)=' ~/.zshrc)"
+eval "$(grep -E '^\s*export\s+(MACOS_SIGN_IDENTITY|APPLE_NOTARY_KEY_P8|APPLE_NOTARY_KEY_ID|APPLE_NOTARY_ISSUER_ID|SCREENCAP_DAEMON_PROVISION_PROFILE)=' ~/.zshrc)"
 APP="macos/.build/ReleaseDD/Build/Products/Release/ScreenCap.app"
 
 # Inside-out Developer ID signing (hardened runtime). Gatekeeper 'rejected' at the
-# end is EXPECTED pre-notarization.
-MACOS_SIGN_IDENTITY="$MACOS_SIGN_IDENTITY" script/sign_app.sh "$APP"
+# end is EXPECTED pre-notarization. SCR-242: sign_app.sh embeds the daemon's
+# Developer ID provisioning profile from SCREENCAP_DAEMON_PROVISION_PROFILE (it
+# hard-fails if unset) so the restricted keychain-access-groups entitlement is
+# AMFI-authorized — see docs/runbooks/scr-242-keychain-access-group-provisioning.md.
+MACOS_SIGN_IDENTITY="$MACOS_SIGN_IDENTITY" \
+  SCREENCAP_DAEMON_PROVISION_PROFILE="$SCREENCAP_DAEMON_PROVISION_PROFILE" \
+  script/sign_app.sh "$APP"
 
 # Notarize (uploads to Apple, minutes) + staple + build/sign/notarize/staple the DMG.
 APPLE_NOTARY_KEY_P8="$APPLE_NOTARY_KEY_P8" APPLE_NOTARY_KEY_ID="$APPLE_NOTARY_KEY_ID" \
