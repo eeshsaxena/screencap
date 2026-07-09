@@ -67,10 +67,13 @@ Certificates, Identifiers & Profiles → **Identifiers** → **+**:
 - Description: `ScreenCap Daemon`.
 - Bundle ID: **Explicit** → `com.screencap.daemon` (must be explicit, **not** a
   wildcard — a wildcard App ID cannot authorize a restricted entitlement).
-- Capabilities: enable **Keychain Sharing**, and add the keychain group
-  `com.screencap.shared`. (The portal stores it team-prefixed; the resulting profile
-  authorizes `2A8S6MV8DZ.com.screencap.shared`, matching the entitlement string.)
-- Save.
+- **Leave Capabilities / App Services alone — there is NO "Keychain Sharing"
+  capability to enable on a portal App ID** (that toggle exists only in *Xcode's*
+  Signing & Capabilities UI). Keychain access groups are *implicit* to any explicit
+  App ID: the Developer ID profile you create from it in Step 2 automatically
+  authorizes `keychain-access-groups = 2A8S6MV8DZ.*` (the whole team namespace) +
+  `com.apple.token`, and `2A8S6MV8DZ.*` covers our `2A8S6MV8DZ.com.screencap.shared`.
+- Register.
 
 ## Step 2 — Create the Developer ID provisioning profile (portal)
 
@@ -92,7 +95,10 @@ security cms -D -i ~/path/to/ScreenCap_Daemon_Developer_ID.provisionprofile \
 # expect entries for:
 #   application-identifier            = 2A8S6MV8DZ.com.screencap.daemon
 #   com.apple.developer.team-identifier = 2A8S6MV8DZ
-#   keychain-access-groups            = ( 2A8S6MV8DZ.com.screencap.shared )
+#   keychain-access-groups            = ( 2A8S6MV8DZ.*, com.apple.token )
+#     ^ the wildcard 2A8S6MV8DZ.* authorizes our 2A8S6MV8DZ.com.screencap.shared
+#       (implicit to the explicit App ID — no capability to enable). A specific
+#       group string here instead of the wildcard is equally fine.
 ```
 
 ## Step 3 — Point the build at it and sign
