@@ -75,6 +75,12 @@ struct RecordingStateMachine {
         case hideMainWindow
         /// Restore the main window after a recording ends and route to Library.
         case restoreMainWindow
+        /// Conclude an in-app Stop *without* pulling ScreenCap to the foreground:
+        /// route the (still-hidden) main window to Library and drop the
+        /// hidden-window bookkeeping, but do NOT orderFront/activate it. Lets a
+        /// clean Stop finish in the background so it never steals focus from the
+        /// app the user has moved on to.
+        case endRecordingInBackground
     }
 
     private(set) var state: RecordingState = .idle
@@ -163,7 +169,18 @@ struct RecordingStateMachine {
         switch state {
         case .recording:
             state = .stopping(quitting: quitting)
-            return []
+            // In-app Stop tears the HUD down immediately so the pill never
+            // freezes on screen during the background finalization wait — that
+            // teardown used to be gated on the 60s `recording_finalized` wait
+            // (LiveStopPolicyCoordinator.inAppStopTimeout), leaving the pill
+            // stuck with a frozen clock until finalization completed. Cmd+Q
+            // (`quitting`) keeps the recording UI up while its quit-progress
+            // countdown runs (in the banner / menu bar) until the 300s stop
+            // completes, so only the in-app path tears down here. The window
+            // side is deferred to the terminal transition
+            // (enterIdleStayingBackgrounded) so a clean Stop never yanks focus
+            // back to ScreenCap.
+            return quitting ? [] : [.hideHUD]
         case .starting where quitting,
              .stopping(quitting: false) where quitting:
             state = .stopping(quitting: quitting)
@@ -175,10 +192,14 @@ struct RecordingStateMachine {
 
     /// Stop was requested but the stop signal failed to dispatch. Restore the
     /// previous `.recording(elapsed:)` so the UI doesn't hang in `.stopping`.
-    mutating func restoreRecordingAfterStopFailure(now: Date = Date()) {
-        guard state.isStopping else { return }
+    /// Re-shows the HUD because the in-app path already dropped it on
+    /// `enterStopping`; the recording is still live, so the pill must come back
+    /// (a no-op re-create for the Cmd+Q path, whose HUD was never hidden).
+    mutating func restoreRecordingAfterStopFailure(now: Date = Date()) -> [Effect] {
+        guard state.isStopping else { return [] }
         let elapsed = recordingStartedAt.map { now.timeIntervalSince($0) } ?? 0
         state = .recording(elapsed: elapsed)
+        return [.showHUD]
     }
 
     /// Final transition to `.idle` after a stop completes. Idempotent. Emits the
@@ -187,6 +208,19 @@ struct RecordingStateMachine {
         startedSessionID = nil
         state = .idle
         return [.hideHUD, .restoreMainWindow]
+    }
+
+    /// Terminal transition for the in-app Stop path. Drops to `.idle` like
+    /// `enterIdle()`, but *concludes in the background*: it closes the HUD (a
+    /// no-op when `enterStopping` already did) and routes the still-hidden main
+    /// window to Library via `.endRecordingInBackground` — which, unlike
+    /// `.restoreMainWindow`, never orderFronts/activates the window. So a clean
+    /// Stop finishes without stealing focus from the app the user moved on to.
+    /// Idempotent.
+    mutating func enterIdleStayingBackgrounded() -> [Effect] {
+        startedSessionID = nil
+        state = .idle
+        return [.hideHUD, .endRecordingInBackground]
     }
 
     /// Update the displayed elapsed seconds. No-op outside `.recording`.
