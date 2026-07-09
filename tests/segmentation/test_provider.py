@@ -288,7 +288,9 @@ def _ev(text: str = "You edited main.py.", stripped: bool = True) -> Evidence:
 class TestGeminiAnswer:
     def test_returns_sanitized_text_from_raw_call(self):
         p = GeminiProvider(answer_raw_call=lambda prompt: "You edited <i>main.py</i>.")
-        assert p.answer("what did I do?", _ev()) == "You edited main.py."
+        out = p.answer("what did I do?", _ev())
+        assert "<" not in out and ">" not in out  # markup neutralized (KTD10)
+        assert "main.py" in out
 
     @pytest.mark.privacy
     def test_unmarked_evidence_refused_without_call(self):
@@ -310,3 +312,12 @@ class TestGeminiAnswer:
         # proving answer() degrades to unavailable rather than raising.
         monkeypatch.delenv("GOOGLE_GENAI_API_KEY", raising=False)
         assert GeminiProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_oversized_evidence_self_capped_no_egress(self):
+        # The cloud backend is the only off-box egress; it self-caps rather than
+        # trusting the dispatcher, so a direct oversized call never reaches the model.
+        calls: list = []
+        p = GeminiProvider(answer_raw_call=lambda prompt: (calls.append(prompt), "x")[1])
+        huge = _ev(text="x" * (600 * 1024))
+        assert p.answer("q", huge) is PROVIDER_UNAVAILABLE
+        assert calls == []  # never egressed

@@ -73,8 +73,33 @@ def test_generation_provider_is_runtime_checkable():
 _SEG_ROOT = Path(__file__).resolve().parents[2] / "src" / "screencap" / "segmentation"
 
 
+def _is_truthy(value: ast.AST) -> bool:
+    """False only for a *falsy constant* (False / 0 / None / "").
+
+    A truthy constant OR any non-constant expression (a variable that could be
+    truthy) is flagged conservatively — the guard fails closed.
+    """
+    return not (isinstance(value, ast.Constant) and not value.value)
+
+
+def _evidence_names(tree: ast.AST) -> set[str]:
+    """Local names bound to the ``Evidence`` class, incl. ``import ... as`` aliases."""
+    names = {"Evidence"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "Evidence":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
 def _constructs_stripped_evidence(tree: ast.AST) -> bool:
-    """True if this AST calls ``Evidence(..., stripped=<non-falsy-constant>)``."""
+    """True if this AST constructs a trusted ``Evidence(stripped=truthy)`` via ANY
+    form: keyword arg, second positional arg, an ``import ... as`` alias, or a
+    module-qualified ``pkg.Evidence(...)`` call. Catching only the keyword form
+    (the earlier version) let ``Evidence("t", True)`` and aliased imports slip
+    past the tripwire."""
+    names = _evidence_names(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -86,15 +111,14 @@ def _constructs_stripped_evidence(tree: ast.AST) -> bool:
             if isinstance(func, ast.Attribute)
             else None
         )
-        if name != "Evidence":
+        if name not in names:
             continue
-        for kw in node.keywords:
-            # Flag stripped=<anything except a falsy constant>. A non-constant
-            # value (a variable that could be truthy) is flagged conservatively.
-            if kw.arg == "stripped" and not (
-                isinstance(kw.value, ast.Constant) and not kw.value.value
-            ):
-                return True
+        # keyword: Evidence(..., stripped=<truthy>)
+        if any(kw.arg == "stripped" and _is_truthy(kw.value) for kw in node.keywords):
+            return True
+        # positional: Evidence(text, <truthy>)
+        if len(node.args) >= 2 and _is_truthy(node.args[1]):
+            return True
     return False
 
 
@@ -112,6 +136,31 @@ def test_no_segmentation_module_mints_stripped_evidence():
         "Evidence(stripped=True) must be minted only by the consumer, never "
         f"inside segmentation/; these modules construct it: {offenders}"
     )
+
+
+@pytest.mark.privacy
+def test_stripped_evidence_guard_catches_all_construction_forms():
+    """The guard must catch every trusted-evidence construction form — a bypass
+    via any of these would ship unstripped, recording-derived text undetected."""
+    caught = [
+        "Evidence(stripped=True)",
+        "Evidence('t', True)",  # second positional arg is `stripped`
+        "Evidence('t', flag)",  # non-constant positional — flagged conservatively
+        "pkg.Evidence(stripped=True)",  # module-qualified
+        "from x.generation import Evidence as E\nE(stripped=True)",  # aliased import
+        "from x.generation import Evidence as E\nE('t', True)",  # aliased + positional
+    ]
+    for src in caught:
+        assert _constructs_stripped_evidence(ast.parse(src)), f"missed: {src!r}"
+
+    ignored = [
+        "Evidence('t')",  # no stripped
+        "Evidence('t', stripped=False)",
+        "Evidence('t', False)",  # falsy positional
+        "other(stripped=True)",  # a non-Evidence call with a stripped= kwarg
+    ]
+    for src in ignored:
+        assert not _constructs_stripped_evidence(ast.parse(src)), f"false-positive: {src!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +190,21 @@ def test_build_answer_prompt_handles_empty_evidence():
 def test_sanitize_answer_strips_markup_and_control_chars():
     dirty = "Answer <script>alert(1)</script> with a \x07 bell and <b>tag</b>."
     clean = sanitize_answer(dirty)
-    assert "<" not in clean and ">" not in clean
+    assert "<" not in clean and ">" not in clean  # angle brackets escaped, not raw
     assert "\x07" not in clean
-    assert "alert(1)" in clean  # inner text survives; only the tag span is stripped
+    assert "alert(1)" in clean  # inner text preserved; markup neutralized via escaping
+    assert "tag" in clean
+
+
+def test_sanitize_answer_neutralizes_malformed_and_bare_brackets():
+    # A lone '<' (prose or a truncated tag) and unbalanced brackets must be
+    # neutralized, not left dangling — and legitimate prose text is preserved
+    # (escaping is lossless, unlike deleting <...> spans).
+    out = sanitize_answer("compare x < y and 3 > 2, plus <notclosed here")
+    assert "<" not in out and ">" not in out
+    assert "x" in out and "y" in out and "3" in out and "2" in out  # prose kept
+    assert "notclosed here" in out  # truncated-tag text preserved, not deleted
+    assert "&lt;" in out and "&gt;" in out  # escaped, not stripped
 
 
 def test_sanitize_answer_passes_benign_text_unchanged():

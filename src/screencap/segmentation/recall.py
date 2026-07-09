@@ -20,41 +20,38 @@ from __future__ import annotations
 import logging
 
 from screencap.segmentation.generation import Evidence, GenerationProvider
+from screencap.segmentation.generation_finish import evidence_gate_ok
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
 log = logging.getLogger(__name__)
-
-# Bound the request once, before either the on-device or cloud path runs — the
-# single home for the DoS/OOM/egress-size cap (mirrors the per-backend caps).
-_MAX_EVIDENCE_BYTES = 512 * 1024
-_MAX_PROMPT_BYTES = 16 * 1024
 
 
 def answer_recall(prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
     """Answer ``prompt`` grounded in stripped ``evidence``: on-device first, then
     consented cloud. See the module docstring for the contract.
     """
-    # Fail-closed privacy gate (R11): refuse unmarked evidence, build nothing.
-    if getattr(evidence, "stripped", False) is not True:
-        log.warning("answer_recall refused evidence not marked stripped=True; unavailable")
+    # Single fail-closed gate (shared with every backend): stripped marker (R11),
+    # str text/prompt (R12), within the size caps (KTD10). Build nothing on refusal.
+    if not evidence_gate_ok(prompt, evidence):
+        log.warning("answer_recall refused the request (gate); unavailable")
         return PROVIDER_UNAVAILABLE
 
-    # Bound the request before any spawn / cloud egress.
-    if (
-        len(evidence.text.encode("utf-8")) > _MAX_EVIDENCE_BYTES
-        or len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES
-    ):
-        log.warning("answer_recall request exceeds the size cap; unavailable")
+    # answer_recall is the Chat entry point and is contracted to NEVER raise.
+    # Config / routing reads (build_answer_provider → config getters → _load_toml,
+    # which raises on a corrupt config.toml) and a backend answer() can raise;
+    # the sibling segment path is guarded one level up in terminal_stage, but this
+    # seam IS the entry, so it guards itself here.
+    try:
+        from screencap.segmentation.routing import build_answer_provider
+
+        on_device = build_answer_provider().answer(prompt, evidence)
+        if isinstance(on_device, str):
+            return on_device  # a grounded str answer stops here
+        # The whole on-device chain is unavailable — consult the consent matrix.
+        return _cloud_fallback(prompt, evidence)
+    except Exception:
+        log.warning("answer_recall failed unexpectedly; unavailable", exc_info=True)
         return PROVIDER_UNAVAILABLE
-
-    from screencap.segmentation.routing import build_answer_provider
-
-    on_device = build_answer_provider().answer(prompt, evidence)
-    if on_device is not PROVIDER_UNAVAILABLE:
-        return on_device  # a grounded str answer stops here
-
-    # The whole on-device chain is unavailable — consult the consent matrix.
-    return _cloud_fallback(prompt, evidence)
 
 
 def _cloud_fallback(prompt: str, evidence: Evidence) -> str | ProviderUnavailable:

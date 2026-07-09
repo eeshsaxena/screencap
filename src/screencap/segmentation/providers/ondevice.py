@@ -60,7 +60,7 @@ import subprocess
 from pathlib import Path
 
 from screencap.segmentation.generation import Evidence
-from screencap.segmentation.generation_finish import sanitize_answer
+from screencap.segmentation.generation_finish import evidence_gate_ok, sanitize_answer
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.validate import validate_llm_tasks
 
@@ -74,12 +74,9 @@ _HELPER_BASENAME = "IntelligenceHelper"
 # on segmentation. Overridable via env for the (fast) fake-helper tests.
 _DEFAULT_TIMEOUT_S = 120.0
 
-# Size caps for the free-form answer path (KTD10 / security review). Segmentation
-# relies on the bounded structured schema; a free-form request/response is
-# unbounded, so bound the request before spawn and the response before parse —
-# mirroring the downloaded worker's stdin/stdout guards.
-_MAX_EVIDENCE_BYTES = 512 * 1024
-_MAX_PROMPT_BYTES = 16 * 1024
+# Response size cap for the free-form answer path (KTD10 / security review).
+# The request-side caps + fail-closed gate are shared via
+# ``generation_finish.evidence_gate_ok``; this bounds the helper's stdout result.
 _MAX_ANSWER_STDOUT_BYTES = 1 * 1024 * 1024
 
 
@@ -291,20 +288,10 @@ class OnDeviceProvider:
         ordinary error. The grounding instructions live in the helper (KTD3);
         this side passes the raw prompt + stripped evidence text.
         """
-        # Fail-closed privacy gate (R11): refuse unmarked evidence, no spawn.
-        if getattr(evidence, "stripped", False) is not True:
-            log.warning(
-                "OnDeviceProvider.answer refused evidence not marked "
-                "stripped=True (fail-closed); returning unavailable."
-            )
-            return PROVIDER_UNAVAILABLE
-
-        # Bound the request before spawning (DoS / OOM guard, KTD10).
-        if (
-            len(evidence.text.encode("utf-8")) > _MAX_EVIDENCE_BYTES
-            or len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES
-        ):
-            log.warning("On-device answer request exceeds the size cap; unavailable")
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10). No helper spawn on refusal.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("OnDeviceProvider.answer refused the request (gate); unavailable")
             return PROVIDER_UNAVAILABLE
 
         helper = _resolve_helper()

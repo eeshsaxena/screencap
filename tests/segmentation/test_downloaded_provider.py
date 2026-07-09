@@ -349,7 +349,9 @@ class TestAnswer:
             "print('{\"status\":\"ok\",\"result\":\"You edited <b>main.py</b>.\"}')\n"
         )
         worker_env(_write_worker(tmp_path, body))
-        assert DownloadedProvider().answer("q", _ev()) == "You edited main.py."
+        out = DownloadedProvider().answer("q", _ev())
+        assert "<" not in out and ">" not in out  # markup neutralized (KTD10)
+        assert "main.py" in out
 
     def test_worker_receives_generate_text_mode(self, tmp_path, worker_env):
         capture = tmp_path / "stdin.json"

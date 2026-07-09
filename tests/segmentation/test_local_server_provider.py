@@ -219,7 +219,9 @@ class TestAnswer:
             endpoint="http://127.0.0.1:1234",
             answer_raw_call=lambda ep, prompt: "You edited <b>main.py</b>.",
         )
-        assert p.answer("what did I do?", _ev()) == "You edited main.py."
+        out = p.answer("what did I do?", _ev())
+        assert "<" not in out and ">" not in out  # markup neutralized (KTD10)
+        assert "main.py" in out
 
     @pytest.mark.privacy
     def test_unmarked_evidence_refused_without_call(self):

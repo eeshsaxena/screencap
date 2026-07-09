@@ -66,13 +66,16 @@ class ChainedGenerationProvider:
 
     def answer(self, prompt: str, evidence: Evidence) -> GenerationResult:
         # Empty chain → nothing on-device-class is available.
-        result: GenerationResult = PROVIDER_UNAVAILABLE
         for backend in self._backends:
             result = backend.answer(prompt, evidence)
-            if result is PROVIDER_UNAVAILABLE:
-                continue  # this backend could not run — try the next
-            return result  # a str answer stops the chain
-        return result
+            # Only a non-empty str is a real answer that stops the chain. A
+            # backend that returns PROVIDER_UNAVAILABLE — or (defensively) None,
+            # "", whitespace, or any non-str from a future/buggy backend — is
+            # treated as "could not run": cascade to the next rather than leak a
+            # blank/invalid answer or suppress a healthy downstream backend (KTD9).
+            if isinstance(result, str) and result.strip():
+                return result
+        return PROVIDER_UNAVAILABLE
 
 
 class UnavailableGenerationProvider:

@@ -70,6 +70,27 @@ def test_unavailable_generation_provider_always_unavailable():
     assert UnavailableGenerationProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
 
 
+def test_chain_treats_empty_or_non_str_as_unavailable():
+    # Defensive (KTD9): a misbehaving backend returning "", whitespace, or a
+    # non-str must be cascaded past — never leaked as a blank answer and never
+    # allowed to suppress a healthy downstream backend.
+    calls: list = []
+
+    class _Bad:
+        def __init__(self, r) -> None:
+            self._r = r
+
+        def answer(self, prompt, evidence):
+            calls.append(self)
+            return self._r
+
+    good = _Fixed("real answer", calls)
+    assert ChainedGenerationProvider([_Bad(""), _Bad(None), good]).answer("q", _ev()) == "real answer"
+    assert ChainedGenerationProvider([_Bad("")]).answer("q", _ev()) is PROVIDER_UNAVAILABLE
+    assert ChainedGenerationProvider([_Bad(None)]).answer("q", _ev()) is PROVIDER_UNAVAILABLE
+    assert ChainedGenerationProvider([_Bad("   ")]).answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+
 # ---------------------------------------------------------------------------
 # U7 — build_answer_provider (config routing; LOCAL-only BYO; REMOTE excluded)
 # ---------------------------------------------------------------------------

@@ -484,8 +484,9 @@ class TestAnswer:
     def test_ok_envelope_returns_sanitized_text(self, tmp_path, helper_env):
         env = json.dumps({"status": "ok", "result": "You worked on <b>auth</b>."})
         helper_env(_write_helper(tmp_path, _answer_helper(env)))
-        # markup is stripped by sanitize_answer (KTD10).
-        assert OnDeviceProvider().answer("what did I do?", _stripped_evidence()) == "You worked on auth."
+        out = OnDeviceProvider().answer("what did I do?", _stripped_evidence())
+        assert "<" not in out and ">" not in out  # markup neutralized by sanitize_answer (KTD10)
+        assert "auth" in out
 
     @pytest.mark.privacy
     def test_unmarked_evidence_refused_without_spawn(self, tmp_path, helper_env):
@@ -504,6 +505,12 @@ class TestAnswer:
         helper_env(_write_helper(tmp_path, _answer_helper('{"status":"ok","result":"hi"}')))
         huge = Evidence(text="x" * (600 * 1024), stripped=True)
         assert OnDeviceProvider().answer("q", huge) is PROVIDER_UNAVAILABLE
+
+    def test_oversized_prompt_unavailable(self, tmp_path, helper_env):
+        # The prompt cap is an order of magnitude smaller than evidence (16KiB);
+        # exercise its half of the size gate independently.
+        helper_env(_write_helper(tmp_path, _answer_helper('{"status":"ok","result":"hi"}')))
+        assert OnDeviceProvider().answer("p" * (20 * 1024), _stripped_evidence()) is PROVIDER_UNAVAILABLE
 
     def test_missing_helper_unavailable(self, monkeypatch):
         monkeypatch.setenv("SCREENCAP_ONDEVICE_HELPER", "/nonexistent/helper")

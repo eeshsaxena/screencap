@@ -28,7 +28,11 @@ from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
 from screencap.segmentation.generation import Evidence
-from screencap.segmentation.generation_finish import build_answer_prompt, sanitize_answer
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
 from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
@@ -190,9 +194,10 @@ class LocalServerProvider:
         chat completion (no JSON response format). Returns the sanitized answer
         string or :data:`PROVIDER_UNAVAILABLE`. Never raises.
         """
-        # Fail-closed privacy gate (R11): refuse unmarked evidence.
-        if getattr(evidence, "stripped", False) is not True:
-            log.warning("LocalServerProvider.answer refused unmarked evidence; unavailable")
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10).
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("LocalServerProvider.answer refused the request (gate); unavailable")
             return PROVIDER_UNAVAILABLE
 
         endpoint = self._resolve_local_endpoint()

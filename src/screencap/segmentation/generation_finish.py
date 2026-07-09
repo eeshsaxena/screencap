@@ -24,19 +24,51 @@ consumer must treat the answer as untrusted.
 
 from __future__ import annotations
 
+import html
 import re
 
 # Bound the answer length a runaway / hostile model can return (UI / transport
-# DoS guard), re-applied after markup stripping.
+# DoS guard), re-applied after escaping.
 _MAX_ANSWER_LEN = 8000
 
 # Control chars (C0 minus tab/newline, plus DEL and C1) — never legitimate in a
 # rendered answer and prime injection vectors. Mirrors sanitize.py.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
-# Strip whole ``<...>`` spans so an injected ``<script>`` / fake tag can't reach a
-# Markdown/HTML consumer. Mirrors sanitize.py.
-_MARKUP_RE = re.compile(r"<[^>]*>")
+# Request-size caps for the free-form answer path (KTD10). Bound the request
+# before any subprocess spawn or cloud egress. Shared by the dispatcher AND
+# every backend so the cap travels with each egress point, not only the
+# dispatcher (a caller reaching a backend directly is still bounded).
+_MAX_EVIDENCE_BYTES = 512 * 1024
+_MAX_PROMPT_BYTES = 16 * 1024
+
+
+def evidence_gate_ok(prompt: str, evidence: object) -> bool:
+    """The single fail-closed gate every backend and the dispatcher share.
+
+    Returns ``True`` only when the request may proceed. Fail-closed on:
+    - a missing/non-``True`` ``stripped`` marker (R11 — strict identity, so a
+      truthy-but-not-``True`` value like ``1`` is refused);
+    - a non-``str`` ``evidence.text`` or ``prompt`` (R12 — no frame/image bytes
+      ride inside evidence; also keeps every backend's ``never raises`` contract
+      robust against a duck-typed caller object, since the encode/format below
+      would otherwise ``AttributeError``);
+    - a request over the size caps (KTD10 DoS/egress guard).
+
+    Duck-typed on purpose (``getattr``) — it never raises on a malformed caller
+    object; it returns ``False`` and the caller returns ``PROVIDER_UNAVAILABLE``.
+    """
+    if getattr(evidence, "stripped", False) is not True:
+        return False
+    text = getattr(evidence, "text", None)
+    if not isinstance(text, str) or not isinstance(prompt, str):
+        return False
+    if len(text.encode("utf-8")) > _MAX_EVIDENCE_BYTES:
+        return False
+    if len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        return False
+    return True
+
 
 _GROUNDING_INSTRUCTIONS = (
     "You are answering a question about the user's own recorded computer "
@@ -66,13 +98,19 @@ def build_answer_prompt(prompt: str, evidence) -> str:
 def sanitize_answer(text: str) -> str:
     """Harden a model-generated answer string before it leaves a backend.
 
-    Strips angle-bracket markup and control characters and bounds the length — a
-    text analogue of :func:`~screencap.segmentation.sanitize.sanitize_tasks`
-    (KTD10/KTD12). Returns the sanitized string (possibly empty; the caller maps
-    an empty/whitespace result to ``PROVIDER_UNAVAILABLE``).
+    Strips control characters, then **HTML-escapes** ``&`` / ``<`` / ``>`` and
+    bounds the length (KTD10). Escaping (rather than deleting ``<...>`` spans)
+    neutralizes injected markup like ``<script>`` losslessly: legitimate prose
+    such as ``x < y`` survives as ``x &lt; y`` instead of being partly deleted,
+    and a lone/unbalanced ``<`` cannot dangle through to a Markdown/HTML
+    consumer. Quotes are left as-is (``quote=False``) — they are common in prose
+    and not a markup vector here. Semantic prompt-injection is out of scope (the
+    consumer must treat the answer as untrusted). Returns the sanitized string
+    (possibly empty; the caller maps an empty/whitespace result to
+    ``PROVIDER_UNAVAILABLE``).
     """
     if not isinstance(text, str):
         return ""
-    cleaned = _MARKUP_RE.sub("", text)
-    cleaned = _CONTROL_RE.sub("", cleaned)
+    cleaned = _CONTROL_RE.sub("", text)
+    cleaned = html.escape(cleaned, quote=False)
     return cleaned[:_MAX_ANSWER_LEN]

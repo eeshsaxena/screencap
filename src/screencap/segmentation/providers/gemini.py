@@ -19,7 +19,11 @@ import os
 from typing import Callable
 
 from screencap.segmentation.generation import Evidence
-from screencap.segmentation.generation_finish import build_answer_prompt, sanitize_answer
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.schema import _RESPONSE_SCHEMA
 from screencap.segmentation.validate import validate_llm_tasks
@@ -173,9 +177,11 @@ class GeminiProvider:
         the sanitized answer string, or :data:`PROVIDER_UNAVAILABLE` when the
         model is unavailable/fails or produces empty output. Never raises.
         """
-        # Fail-closed privacy gate (R11): refuse unmarked evidence before any call.
-        if getattr(evidence, "stripped", False) is not True:
-            log.warning("GeminiProvider.answer refused unmarked evidence; unavailable")
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10). The cloud path is the only off-box
+        # egress, so it self-caps here rather than trusting the dispatcher.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("GeminiProvider.answer refused the request (gate); unavailable")
             return PROVIDER_UNAVAILABLE
 
         raw = self._answer_raw_call(build_answer_prompt(prompt, evidence))

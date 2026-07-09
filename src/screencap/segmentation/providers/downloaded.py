@@ -39,7 +39,11 @@ import sys
 from pathlib import Path
 
 from screencap.segmentation.generation import Evidence
-from screencap.segmentation.generation_finish import build_answer_prompt, sanitize_answer
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
 from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
@@ -277,9 +281,10 @@ class DownloadedProvider:
         tasks envelope. Returns the sanitized answer or
         :data:`PROVIDER_UNAVAILABLE`. Never raises.
         """
-        # Fail-closed privacy gate (R10/R11): refuse unmarked evidence, no spawn.
-        if getattr(evidence, "stripped", False) is not True:
-            log.warning("DownloadedProvider.answer refused unmarked evidence; unavailable")
+        # Single fail-closed gate: stripped marker (R10/R11), str text/prompt
+        # (R12), within the size caps (KTD10). No worker spawn on refusal.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("DownloadedProvider.answer refused the request (gate); unavailable")
             return PROVIDER_UNAVAILABLE
 
         model_path = _resolve_model_path()

@@ -110,3 +110,86 @@ def test_cloud_provider_without_answer_degrades(wire):
     wire(on_device=PROVIDER_UNAVAILABLE, cloud=_SegmentOnly(), recall_consent=True)
     # A cloud provider lacking answer() must degrade to unavailable, not raise (R8).
     assert answer_recall("q", _ev()) is PROVIDER_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Review hardening: size caps, duck-typed evidence, and never-raises.
+# ---------------------------------------------------------------------------
+
+import screencap.segmentation.routing as _routing  # noqa: E402
+
+
+def test_oversized_evidence_is_unavailable_and_builds_nothing(monkeypatch):
+    built: list = []
+    monkeypatch.setattr(_routing, "build_answer_provider", lambda: built.append(1) or _Chain("x"))
+    huge = Evidence(text="x" * (600 * 1024), stripped=True)
+    assert answer_recall("q", huge) is PROVIDER_UNAVAILABLE
+    assert built == []  # capped before build/egress
+
+
+def test_oversized_prompt_is_unavailable_and_builds_nothing(monkeypatch):
+    built: list = []
+    monkeypatch.setattr(_routing, "build_answer_provider", lambda: built.append(1) or _Chain("x"))
+    assert answer_recall("p" * (20 * 1024), _ev()) is PROVIDER_UNAVAILABLE
+    assert built == []
+
+
+@pytest.mark.privacy
+def test_non_str_evidence_text_refused_without_raising(monkeypatch):
+    built: list = []
+    monkeypatch.setattr(_routing, "build_answer_provider", lambda: built.append(1) or _Chain("x"))
+
+    class _Bytesy:
+        stripped = True
+        text = b"raw bytes"  # R12: bytes must never ride inside evidence text
+
+    # A duck-typed object bypassing Evidence.__post_init__ must be refused at the
+    # gate — not AttributeError out of the never-raises entry point.
+    assert answer_recall("q", _Bytesy()) is PROVIDER_UNAVAILABLE
+    assert built == []
+
+
+def test_raising_chain_degrades_not_raises(monkeypatch):
+    class _Boom:
+        def answer(self, prompt, evidence):
+            raise RuntimeError("routing/config exploded")
+
+    monkeypatch.setattr(_routing, "build_answer_provider", lambda: _Boom())
+    assert answer_recall("q", _ev()) is PROVIDER_UNAVAILABLE  # never raises
+
+
+def test_build_answer_provider_raising_degrades(monkeypatch):
+    def _boom():
+        raise ValueError("corrupt config.toml")
+
+    monkeypatch.setattr(_routing, "build_answer_provider", _boom)
+    assert answer_recall("q", _ev()) is PROVIDER_UNAVAILABLE  # config raise → unavailable
+
+
+def test_raising_cloud_provider_degrades(wire):
+    class _RaisingCloud:
+        def answer(self, prompt, evidence):
+            raise RuntimeError("cloud api exploded")
+
+    wire(on_device=PROVIDER_UNAVAILABLE, cloud=_RaisingCloud(), recall_consent=True)
+    assert answer_recall("q", _ev()) is PROVIDER_UNAVAILABLE
+
+
+def test_unknown_cloud_provider_name_degrades(monkeypatch):
+    # A bogus configured cloud name → get_provider ValueError → unavailable.
+    from screencap import config
+
+    monkeypatch.setattr(_routing, "build_answer_provider", lambda: _Chain(PROVIDER_UNAVAILABLE))
+    monkeypatch.setattr(config, "get_llm_cloud_provider", lambda: "bogus-provider")
+    monkeypatch.setattr(config, "get_recall_cloud_consent", lambda: True)
+    monkeypatch.setattr(config, "get_summary_cloud_consent", lambda: False)
+    assert answer_recall("q", _ev()) is PROVIDER_UNAVAILABLE
+
+
+def test_non_str_cloud_result_coerced_to_unavailable(wire):
+    class _WeirdCloud:
+        def answer(self, prompt, evidence):
+            return 12345  # non-str
+
+    wire(on_device=PROVIDER_UNAVAILABLE, cloud=_WeirdCloud(), recall_consent=True)
+    assert answer_recall("q", _ev()) is PROVIDER_UNAVAILABLE
