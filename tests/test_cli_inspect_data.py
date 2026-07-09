@@ -430,3 +430,169 @@ def test_cli_busy_emits_retryable_envelope_with_zero_exit(recordings_root, monke
     assert payload["ok"] is False
     assert payload["retryable"] is True
     assert "can't process this video" not in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# Blocked / protected intervals for the in-viewer "what was recorded" summary
+# (captured-events summary, U1).
+#
+#   blocked_intervals    — capture-time EXCLUDE-only spans (the honest "provably
+#                          not captured" reassurance line).
+#   protected_intervals  — the full SCRUB_BLOCK_ACTIONS set (EXCLUDE + MASK/etc.
+#                          + fail-closed residuals) the digest suppresses so a
+#                          masked app's window title is never surfaced.
+#
+# Privacy-bearing (it decides what is shown as "not captured" vs. suppressed) →
+# @pytest.mark.privacy, and Vision-free (mocks the derivation, no Apple Vision)
+# so CI's privacy lane runs it. The partition logic is tested directly on
+# ``_read_inspect_blocked_intervals``; a separate wiring test proves the envelope
+# carries the fields.
+# ---------------------------------------------------------------------------
+
+from screencap.privacy.actions import PrivacyAction  # noqa: E402
+from screencap.privacy.reasons import ReasonCode  # noqa: E402
+from screencap.review import _read_inspect_blocked_intervals  # noqa: E402
+from screencap.scrubber import BlockedInterval, ScrubContext  # noqa: E402
+
+_W_START = 1_716_800_000.0
+_W_DUR = 60.0
+
+
+def _iv(start_off: float, end_off: float, action: PrivacyAction, reason: str) -> BlockedInterval:
+    return BlockedInterval(
+        start=_W_START + start_off, end=_W_START + end_off, action=action, reason=reason,
+    )
+
+
+def _ms(off: float) -> int:
+    return int(round((_W_START + off) * 1000))
+
+
+def _patch_derivation(*, canonical: list, skip: list):
+    """Patch the three derivation seams ``_read_inspect_blocked_intervals`` calls.
+
+    ``canonical`` is the actioned ``build_scrub_context`` set (partitioned into
+    the EXCLUDE line); ``skip`` is the full ``derive_skip_intervals`` set (the
+    digest suppression set).
+    """
+    return (
+        mock.patch(
+            "screencap.backfill.skip_intervals.build_classifier_evaluator",
+            return_value=(object(), object()),
+        ),
+        mock.patch(
+            "screencap.scrubber.build_scrub_context",
+            return_value=ScrubContext(blocked_intervals=canonical),
+        ),
+        mock.patch(
+            "screencap.backfill.skip_intervals.derive_skip_intervals",
+            return_value=skip,
+        ),
+    )
+
+
+@pytest.mark.privacy
+def test_blocked_line_is_exclude_only_digest_skips_full_set(recordings_root):
+    """The EXCLUDE span is the only entry in the 'not captured' line; a masked
+    app is suppressed from the digest (protected_intervals) but never labelled
+    'not captured' — the excluded-only decision from the plan/doc-review fork."""
+    rec_dir = _make_recording(recordings_root, "rec-part")
+    excl = _iv(10, 20, PrivacyAction.EXCLUDE, "app_excluded")
+    mask = _iv(30, 40, PrivacyAction.MASK_WINDOW, "masked")
+
+    p1, p2, p3 = _patch_derivation(canonical=[excl, mask], skip=[excl, mask])
+    with p1, p2, p3:
+        blocked, protected = _read_inspect_blocked_intervals(rec_dir, _W_START, _W_DUR)
+
+    assert blocked == [{"start_ms": _ms(10), "end_ms": _ms(20)}]
+    assert protected == [
+        {"start_ms": _ms(10), "end_ms": _ms(20)},
+        {"start_ms": _ms(30), "end_ms": _ms(40)},
+    ]
+
+
+@pytest.mark.privacy
+def test_secure_field_excluded_from_blocked_line(recordings_root):
+    """A secure-field span is EXCLUDE-tagged but the screenshot IS captured (only
+    keystrokes are nulled), so it must not appear in the 'not captured' line —
+    though it is still suppressed from the digest via protected_intervals."""
+    rec_dir = _make_recording(recordings_root, "rec-secure")
+    sf = _iv(10, 20, PrivacyAction.EXCLUDE, ReasonCode.SECURE_FIELD_DETECTED)
+
+    p1, p2, p3 = _patch_derivation(canonical=[sf], skip=[sf])
+    with p1, p2, p3:
+        blocked, protected = _read_inspect_blocked_intervals(rec_dir, _W_START, _W_DUR)
+
+    assert blocked == []
+    assert protected == [{"start_ms": _ms(10), "end_ms": _ms(20)}]
+
+
+@pytest.mark.privacy
+def test_no_exclusion_yields_empty_blocked_intervals(recordings_root):
+    """A recording with nothing blocked yields empty (not null/missing) lists."""
+    rec_dir = _make_recording(recordings_root, "rec-clean")
+    p1, p2, p3 = _patch_derivation(canonical=[], skip=[])
+    with p1, p2, p3:
+        blocked, protected = _read_inspect_blocked_intervals(rec_dir, _W_START, _W_DUR)
+
+    assert blocked == []
+    assert protected == []
+
+
+@pytest.mark.privacy
+def test_overlapping_excluded_spans_collapse(recordings_root):
+    """Overlapping EXCLUDE spans collapse into one interval so the 'not captured'
+    total-span count is not double-counted."""
+    rec_dir = _make_recording(recordings_root, "rec-overlap")
+    a = _iv(10, 25, PrivacyAction.EXCLUDE, "app_excluded")
+    b = _iv(20, 40, PrivacyAction.EXCLUDE, "app_excluded")
+
+    p1, p2, p3 = _patch_derivation(canonical=[a, b], skip=[a, b])
+    with p1, p2, p3:
+        blocked, _ = _read_inspect_blocked_intervals(rec_dir, _W_START, _W_DUR)
+
+    assert blocked == [{"start_ms": _ms(10), "end_ms": _ms(40)}]
+
+
+@pytest.mark.privacy
+def test_nullable_timing_yields_empty_intervals(recordings_root):
+    """A video-only / event-free recording (null timing) has no resolvable window,
+    so both lists are empty and the derivation is never attempted."""
+    rec_dir = _make_recording(recordings_root, "rec-notiming")
+    with mock.patch("screencap.scrubber.build_scrub_context") as bsc:
+        blocked, protected = _read_inspect_blocked_intervals(rec_dir, None, None)
+
+    assert blocked == []
+    assert protected == []
+    bsc.assert_not_called()
+
+
+@pytest.mark.privacy
+def test_blocked_derivation_failure_is_fail_open(recordings_root):
+    """Any derivation error yields empty lists (fail-open read surface) — a bad
+    recording.db must never fail the inspect surface."""
+    rec_dir = _make_recording(recordings_root, "rec-derivefail")
+    with mock.patch(
+        "screencap.backfill.skip_intervals.build_classifier_evaluator",
+        side_effect=RuntimeError("boom"),
+    ):
+        blocked, protected = _read_inspect_blocked_intervals(rec_dir, _W_START, _W_DUR)
+
+    assert blocked == []
+    assert protected == []
+
+
+def test_envelope_carries_blocked_and_protected_intervals(recordings_root):
+    """Wiring: prepare_inspect_data surfaces both interval fields at schema 4,
+    additively next to the existing inspect envelope."""
+    rec_dir = _make_recording(recordings_root, "rec-env")
+    _write_video(rec_dir / "video.mp4")
+    (rec_dir / "events.jsonl").write_text(json.dumps({"_meta": True}) + "\n")
+
+    fake = ([{"start_ms": 1000, "end_ms": 2000}], [{"start_ms": 1000, "end_ms": 3000}])
+    with mock.patch("screencap.review._read_inspect_blocked_intervals", return_value=fake):
+        env = prepare_inspect_data("rec-env")
+
+    assert env["schema_version"] == REVIEW_SCHEMA_VERSION == 4
+    assert env["blocked_intervals"] == [{"start_ms": 1000, "end_ms": 2000}]
+    assert env["protected_intervals"] == [{"start_ms": 1000, "end_ms": 3000}]

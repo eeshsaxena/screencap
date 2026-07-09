@@ -63,7 +63,15 @@ console = Console(stderr=True)
 # corrupt) field. The pre-existing ``timing_error`` boolean is retained as a
 # back-compat alias (True for both locked and corrupt), so an older Swift
 # consumer that only reads ``timing_error`` keeps its current behavior.
-REVIEW_SCHEMA_VERSION = 3
+#
+# Bumped to 4 (captured-events summary): the inspect envelope gained the
+# additive, optional ``blocked_intervals`` (capture-time EXCLUDE-only "not
+# captured" spans) and ``protected_intervals`` (the full ``SCRUB_BLOCK_ACTIONS``
+# set the in-viewer digest suppresses). Both are empty-representable and
+# inspect-only; the shared constant also stamps ``prepare_review_data``'s
+# envelope, which gains no new field — harmless, since no consumer hard-gates on
+# the value and the Swift decoder ignores unknown keys.
+REVIEW_SCHEMA_VERSION = 4
 
 
 class ReviewPrepareError(RuntimeError):
@@ -304,6 +312,119 @@ def _read_recording_timing(
     return started_at, duration_seconds, timing_status
 
 
+def _collapse_intervals_ms(
+    intervals: list, win_start: float, win_end: float
+) -> list[dict[str, int]]:
+    """Clip ``BlockedInterval``s to ``[win_start, win_end)``, collapse overlaps,
+    and round to integer ms.
+
+    A clean, non-double-counting set for the summary's count + total-span
+    reassurance line. Merges in float space before rounding (mirrors the
+    ``day_segments`` ms rounding) so overlapping same-app spans don't inflate the
+    "not captured" total.
+    """
+    clipped: list[tuple[float, float]] = []
+    for iv in intervals:
+        lo = max(iv.start, win_start)
+        hi = min(iv.end, win_end)
+        if hi > lo:
+            clipped.append((lo, hi))
+    clipped.sort()
+
+    merged: list[list[float]] = []
+    for lo, hi in clipped:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [
+        {"start_ms": int(round(lo * 1000)), "end_ms": int(round(hi * 1000))}
+        for lo, hi in merged
+    ]
+
+
+def _read_inspect_blocked_intervals(
+    rec_dir: Path, started_at: float | None, duration_seconds: float | None,
+) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
+    """Return ``(blocked_intervals, protected_intervals)`` for the inspect summary.
+
+    ``blocked_intervals`` — capture-time **EXCLUDE**-only spans (an app fully
+    excluded from screenshot capture). Secure-field spans are EXCLUDE-tagged in
+    the interval model but leave the screenshot captured (they null keystrokes,
+    not frames), so they are omitted here: this is the honest "provably not
+    captured" set the summary's blocked line shows.
+
+    ``protected_intervals`` — the full ``SCRUB_BLOCK_ACTIONS`` set plus the
+    fail-closed residuals (EXCLUDE, MASK_WINDOW/REGION, TEXT_REDACT/OCR, coverage
+    gaps, NULL-column ambiguity). The in-viewer digest drops every event inside
+    these before counting/grouping, matching the repo's ALLOW-only index
+    discipline so a masked app's window title is never surfaced.
+    ``blocked_intervals`` is a subset of ``protected_intervals``.
+
+    Reuses the day-timeline derivation over the INTACT local ``recording.db`` — a
+    pure on-disk read, no daemon (KTD2). Strictly fail-open: a derivation error, a
+    missing DB, or a recording with no resolvable time window (nullable timing —
+    the video-only / event-free case) yields empty lists, matching
+    ``day_segments``' read-surface posture.
+    """
+    if started_at is None:
+        return [], []
+
+    from screencap.catalog import find_db
+
+    db_path = find_db(rec_dir)
+    if db_path is None:
+        return [], []
+
+    win_start = float(started_at)
+    win_end = win_start + float(duration_seconds or 0.0)
+    if win_end <= win_start:
+        return [], []
+
+    from screencap.backfill.skip_intervals import (
+        build_classifier_evaluator,
+        derive_skip_intervals,
+    )
+    from screencap.privacy.actions import PrivacyAction
+    from screencap.privacy.reasons import ReasonCode
+    from screencap.scrubber import build_scrub_context
+
+    try:
+        classifier, evaluator = build_classifier_evaluator(rec_dir)
+        # Canonical, ACTIONED intervals — one per window event, each tagged with
+        # its real action (build_blocked_intervals never collapses actions;
+        # merge_intervals only concatenates + sorts). The EXCLUDE subset, minus
+        # secure-field (which blocks keystrokes, not the screenshot), is the
+        # honest "not captured" set.
+        ctx = build_scrub_context(
+            db_path, evaluator, classifier, time_range=(win_start, win_end),
+        )
+        excluded = [
+            iv
+            for iv in ctx.blocked_intervals
+            if iv.action == PrivacyAction.EXCLUDE
+            and iv.reason != ReasonCode.SECURE_FIELD_DETECTED
+        ]
+        # Full protected + fail-closed residual set for the digest suppression.
+        protected = derive_skip_intervals(
+            db_path,
+            classifier=classifier,
+            evaluator=evaluator,
+            time_range=(win_start, win_end),
+            require_canonical=False,  # fail-open read surface
+        )
+    except Exception:
+        console.print(
+            "[yellow]inspect-data: blocked-interval derivation unavailable[/yellow]"
+        )
+        return [], []
+
+    return (
+        _collapse_intervals_ms(excluded, win_start, win_end),
+        _collapse_intervals_ms(protected, win_start, win_end),
+    )
+
+
 def prepare_review_data(name: str) -> dict:
     """Run the full review-data preparation pipeline for ``name``.
 
@@ -495,6 +616,12 @@ def prepare_inspect_data(name: str) -> dict:
 
     started_at, duration_seconds, timing_status = _read_recording_timing(rec_dir)
 
+    # Blocked/protected intervals for the in-viewer "what was recorded" summary,
+    # re-derived from the intact local recording.db (fail-open, no daemon).
+    blocked_intervals, protected_intervals = _read_inspect_blocked_intervals(
+        rec_dir, started_at, duration_seconds,
+    )
+
     return {
         "ok": True,
         "schema_version": REVIEW_SCHEMA_VERSION,
@@ -508,6 +635,12 @@ def prepare_inspect_data(name: str) -> dict:
         # Swift Optional fields decode cleanly and inspect renders no evidence).
         "redaction": None,
         "coverage": None,
+        # Additive, inspect-only (captured-events summary). ``blocked_intervals``:
+        # capture-time EXCLUDE-only "not captured" spans for the summary's blocked
+        # line. ``protected_intervals``: the full SCRUB_BLOCK_ACTIONS set the
+        # digest suppresses (a superset of blocked_intervals). Empty-representable.
+        "blocked_intervals": blocked_intervals,
+        "protected_intervals": protected_intervals,
         "started_at": started_at,
         "duration_seconds": duration_seconds,
         "timing_status": timing_status,
