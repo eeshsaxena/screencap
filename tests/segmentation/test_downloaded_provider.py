@@ -329,3 +329,74 @@ class TestFactoryAndImport:
         )
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
+
+
+# ===========================================================================
+# Free-form answer path (SCR-243, U10) — fake worker emits a TEXT envelope.
+# ===========================================================================
+
+from screencap.segmentation.generation import Evidence  # noqa: E402
+
+
+def _ev(text: str = "you edited main.py", stripped: bool = True) -> Evidence:
+    return Evidence(text=text, stripped=stripped)
+
+
+class TestAnswer:
+    def test_text_envelope_returns_sanitized(self, tmp_path, worker_env):
+        body = (
+            "import sys\nsys.stdin.read()\n"
+            "print('{\"status\":\"ok\",\"result\":\"You edited <b>main.py</b>.\"}')\n"
+        )
+        worker_env(_write_worker(tmp_path, body))
+        assert DownloadedProvider().answer("q", _ev()) == "You edited main.py."
+
+    def test_worker_receives_generate_text_mode(self, tmp_path, worker_env):
+        capture = tmp_path / "stdin.json"
+        body = (
+            "import sys\n"
+            f"open({str(capture)!r}, 'w').write(sys.stdin.read())\n"
+            "print('{\"status\":\"ok\",\"result\":\"ok\"}')\n"
+        )
+        worker_env(_write_worker(tmp_path, body))
+        DownloadedProvider().answer("q", _ev())
+        seen = json.loads(capture.read_text())
+        assert seen["mode"] == "generate_text"
+        assert isinstance(seen["prompt"], str) and seen["prompt"]
+
+    @pytest.mark.privacy
+    def test_unmarked_evidence_refused_without_spawn(self, tmp_path, worker_env):
+        sentinel = tmp_path / "spawned"
+        body = (
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(sentinel)!r}).write_text('x')\n"
+            "sys.stdin.read()\nprint('{\"status\":\"ok\",\"result\":\"x\"}')\n"
+        )
+        worker_env(_write_worker(tmp_path, body))
+        assert DownloadedProvider().answer("q", _ev(stripped=False)) is PROVIDER_UNAVAILABLE
+        assert not sentinel.exists()
+
+    def test_no_model_installed_unavailable(self, tmp_path, worker_env, monkeypatch):
+        monkeypatch.delenv("SCREENCAP_LOCAL_MODEL_PATH", raising=False)
+        body = "import sys; sys.stdin.read(); print('{\"status\":\"ok\",\"result\":\"x\"}')\n"
+        worker_env(_write_worker(tmp_path, body))
+        assert DownloadedProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_nonzero_exit_unavailable(self, tmp_path, worker_env):
+        worker_env(_write_worker(tmp_path, "import sys; sys.stdin.read(); sys.exit(2)\n"))
+        assert DownloadedProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_unavailable_envelope(self, tmp_path, worker_env):
+        body = "import sys; sys.stdin.read(); print('{\"status\":\"unavailable\",\"reason\":\"x\"}')\n"
+        worker_env(_write_worker(tmp_path, body))
+        assert DownloadedProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_non_string_result_unavailable(self, tmp_path, worker_env):
+        body = "import sys; sys.stdin.read(); print('{\"status\":\"ok\",\"result\":{\"a\":1}}')\n"
+        worker_env(_write_worker(tmp_path, body))
+        assert DownloadedProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_empty_result_unavailable(self, tmp_path, worker_env):
+        body = "import sys; sys.stdin.read(); print('{\"status\":\"ok\",\"result\":\"   \"}')\n"
+        worker_env(_write_worker(tmp_path, body))
+        assert DownloadedProvider().answer("q", _ev()) is PROVIDER_UNAVAILABLE
