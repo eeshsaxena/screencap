@@ -190,4 +190,96 @@ final class RecordedSummaryTests: XCTestCase {
             RecordedSummaryDisplay.blockedLine(count: 2, spanMs: 65_000),
             "2 blocked intervals · 1m 5s not captured")
     }
+
+    // Privacy regression (KTD3/KTD5): a window.switch to a masked/excluded app that
+    // falls inside a protected interval must NOT become the carry-forward app, so
+    // its name never labels a later non-protected event's group. Also pins the
+    // half-open boundary: the next (allowed) switch landing exactly on the
+    // protected interval's endMs is adopted, not frozen on the masked app.
+    func testMaskedAppNameNeverLeaksIntoDigest() {
+        let events = [
+            event("window.switch", at: 0, app: "Safari"),        // allowed
+            event("mouse.singleclick", at: 1),                   // Safari
+            event("window.switch", at: 10, app: "1Password"),    // masked; inside protected span
+            event("mouse.singleclick", at: 12),                  // masked; dropped
+            event("window.switch", at: 20, app: "Mail"),         // allowed; at protected end boundary
+            event("mouse.singleclick", at: 22),                  // Mail
+        ]
+        // Protect the masked app's whole frontmost span [10, 20); its end IS the
+        // next (allowed) switch's timestamp — the boundary the fold must not snag on.
+        let summary = RecordedSummaryBuilder.build(
+            events: events, blockedIntervals: [], protectedIntervals: [interval(10, 20)]
+        )
+
+        XCTAssertNil(summary.apps.first { $0.appName == "1Password" },
+                     "a masked app inside a protected span must never appear as a group")
+        XCTAssertEqual(summary.apps.first { $0.appName == "Mail" }?.totalCount, 2,
+                       "boundary switch adopted (half-open) → Mail's click credited to Mail")
+        XCTAssertEqual(summary.apps.map(\.appName).sorted(), ["Mail", "Safari"])
+    }
+
+    // Half-open [start, end): an event exactly at startMs is dropped; one exactly
+    // at endMs belongs to the next span and is kept.
+    func testProtectedIntervalBoundaryIsHalfOpen() {
+        let events = [
+            event("window.switch", at: 0, app: "Safari"),
+            event("mouse.singleclick", at: 10),  // == startMs of [10,20) -> dropped
+            event("mouse.singleclick", at: 20),  // == endMs of [10,20) -> kept
+        ]
+        let summary = RecordedSummaryBuilder.build(
+            events: events, blockedIntervals: [], protectedIntervals: [interval(10, 20)]
+        )
+        XCTAssertEqual(count(summary, .clicks), 1, "start boundary dropped, end boundary kept")
+    }
+
+    // Keyboard shortcuts (key.shortcut/key.special) count under .shortcuts;
+    // window.state both advances attribution and counts as a switch (KTD4).
+    func testShortcutsAndWindowStateKinds() {
+        let events = [
+            event("window.state", at: 0, app: "Xcode"),
+            event("key.shortcut", at: 1),
+            event("key.special", at: 2),
+        ]
+        let summary = RecordedSummaryBuilder.build(
+            events: events, blockedIntervals: [], protectedIntervals: []
+        )
+        XCTAssertEqual(count(summary, .shortcuts), 2)
+        XCTAssertEqual(count(summary, .windowSwitches), 1)
+        XCTAssertEqual(summary.apps.first?.appName, "Xcode")
+        XCTAssertEqual(summary.apps.first?.totalCount, 3)
+    }
+
+    // A window event with an absent/redacted app name leaves the prior app in
+    // force (defensive carry-forward fallback) — no spurious unknown bucket.
+    func testWindowEventWithoutNameKeepsPriorApp() {
+        let events = [
+            event("window.switch", at: 0, app: "Safari"),
+            event("mouse.singleclick", at: 1),   // Safari
+            event("window.state", at: 5),        // no app name -> currentApp stays Safari
+            event("mouse.singleclick", at: 6),   // still Safari
+        ]
+        let summary = RecordedSummaryBuilder.build(
+            events: events, blockedIntervals: [], protectedIntervals: []
+        )
+        XCTAssertEqual(summary.apps.first { $0.appName == "Safari" }?.totalCount, 4,
+                       "switch + unnamed window.state + 2 clicks all credited to Safari")
+        XCTAssertNil(summary.apps.first { $0.isUnknown }, "prior app carried; no unknown bucket")
+    }
+
+    // The unknown bucket is pinned last even when its count exceeds every named app.
+    func testUnknownBucketPinnedLastEvenWhenLargest() {
+        let events = [
+            event("mouse.singleclick", at: 0),   // unknown
+            event("mouse.singleclick", at: 1),   // unknown
+            event("mouse.singleclick", at: 2),   // unknown
+            event("window.switch", at: 3, app: "Safari"),
+            event("mouse.singleclick", at: 4),   // Safari
+        ]
+        let summary = RecordedSummaryBuilder.build(
+            events: events, blockedIntervals: [], protectedIntervals: []
+        )
+        XCTAssertEqual(summary.apps.map(\.isUnknown), [false, true],
+                       "named app first, unknown pinned last despite its higher count")
+        XCTAssertEqual(summary.apps.last?.totalCount, 3)
+    }
 }

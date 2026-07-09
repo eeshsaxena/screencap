@@ -1,6 +1,6 @@
 import Foundation
 
-/// A half-open `[startMs, endMs]` interval in absolute Unix epoch milliseconds,
+/// A half-open `[startMs, endMs)` interval in absolute Unix epoch milliseconds,
 /// as emitted by `inspect-data`'s `blocked_intervals` / `protected_intervals`
 /// (review schema v4). Decodes the Python `{start_ms, end_ms}` shape directly,
 /// and is the same coordinate space `DayStripAccessibility.hourMinuteText(ms:)`
@@ -20,11 +20,16 @@ struct CapturedInterval: Decodable, Equatable {
     }
 
     /// Whether an absolute epoch-millisecond instant lies within this interval.
-    /// Inclusive on both ends: an event landing exactly on a boundary is dropped,
-    /// keeping the digest fail-closed — it must never count or reveal content the
-    /// policy flagged, mirroring the ALLOW-only discipline of
-    /// `content_index` / `backfill` / `frame.nearest`.
-    func contains(ms: Int) -> Bool { ms >= startMs && ms <= endMs }
+    /// Half-open `[startMs, endMs)` — matching the Python producer's interval
+    /// model, where each interval's end IS the next window event's timestamp. An
+    /// instant exactly at `endMs` is the boundary to the *next* span (often an
+    /// allowed one), so it belongs to that span, not this one. Using inclusive
+    /// bounds would instead swallow the boundary window-switch and leave the fold
+    /// frozen on the prior (possibly protected) app — see `RecordedSummaryBuilder`.
+    /// This still fully covers the flagged span: a genuinely-flagged instant at a
+    /// protected boundary falls at the start of the adjacent protected interval
+    /// (adjacent protected spans are merged upstream), so nothing slips through.
+    func contains(ms: Int) -> Bool { ms >= startMs && ms < endMs }
 
     var durationMs: Int { max(0, endMs - startMs) }
 }
@@ -166,25 +171,29 @@ enum RecordedSummaryBuilder {
         var currentApp: String?
 
         for event in events {
-            // Advance the running frontmost app on any window event that names
-            // one — BEFORE attributing this event, so a switch counts under the
-            // app it switches TO. Only a `.value` name counts; a scrubbed/absent
-            // name leaves the previous app in force (defensive; inspect is
-            // unmasked so this is rarely hit).
-            if event.category == .window, case .value(let name) = event.content.appName {
+            // Events carry epoch SECONDS; intervals are epoch MS.
+            let ms = Int((event.absoluteTimestamp * 1000).rounded())
+            let isProtected = protectedIntervals.contains { $0.contains(ms: ms) }
+
+            // Advance the running frontmost app only from a NON-protected window
+            // event that names one — BEFORE attributing this event, so a switch
+            // counts under the app it switches TO. Adopting a *protected* window
+            // event's name (a masked/excluded app whose events are all dropped
+            // below) would let that name label a later non-protected event's group
+            // and surface an app the policy hid — so a protected switch never
+            // becomes `currentApp` (KTD3/KTD5). Only a `.value` name counts; a
+            // scrubbed/absent name leaves the previous app in force (defensive;
+            // inspect is unmasked).
+            if !isProtected, event.category == .window,
+               case .value(let name) = event.content.appName {
                 currentApp = name
             }
 
             guard let kind = MeaningfulEventKind.from(eventType: event.type) else {
                 continue  // raw low-level input — never in the digest
             }
-
-            // Drop anything inside a protected interval. Events carry epoch
-            // SECONDS; intervals are epoch MS.
-            let ms = Int((event.absoluteTimestamp * 1000).rounded())
-            if protectedIntervals.contains(where: { $0.contains(ms: ms) }) {
-                continue
-            }
+            // Drop anything inside a protected interval before counting/grouping.
+            if isProtected { continue }
 
             overall[kind, default: 0] += 1
 

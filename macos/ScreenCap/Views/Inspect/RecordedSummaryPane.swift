@@ -227,7 +227,10 @@ struct RecordedSummaryPane: View {
     private var blockedSection: some View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(summary.blockedIntervals, id: \.startMs) { interval in
+                // Index-keyed: robust even if two intervals ever shared a startMs
+                // (the upstream merge makes starts distinct today, but the id
+                // shouldn't silently depend on that invariant).
+                ForEach(Array(summary.blockedIntervals.enumerated()), id: \.offset) { _, interval in
                     Text(RecordedSummaryDisplay.rangeLabel(interval))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
