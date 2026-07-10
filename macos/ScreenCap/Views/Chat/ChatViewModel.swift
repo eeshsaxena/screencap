@@ -194,40 +194,81 @@ struct NoBackendGuidance: Equatable, Sendable {
 
     /// - Parameters:
     ///   - selected: the model the user picked (from `IntelligenceSettings.provider`).
-    ///   - canRunOnDevice: whether this OS is macOS 26+ (can run Apple Foundation
-    ///     Models at all). The caller supplies it from `#available`; passed in so
-    ///     this stays pure and testable.
-    static func make(selected: SelectedIntelligence, canRunOnDevice: Bool) -> NoBackendGuidance {
-        // The one case where the fix is a SYSTEM toggle, not an in-app setting: the
-        // on-device model is picked on a capable OS, but Apple Intelligence is off
-        // (or its model is still downloading). Name that exact step and deep-link to
-        // it — the generic "no model set up" copy reads as "but I already picked
-        // on-device" and strands the user (the bug this fixes).
-        if selected == .appleOnDevice, canRunOnDevice {
+    ///   - onDeviceStatus: the live Apple-on-device availability (probed natively).
+    ///     Only consulted when the on-device model is selected; it also encodes OS
+    ///     capability (`.osUnsupported` == below the macOS-26 floor).
+    static func make(
+        selected: SelectedIntelligence, onDeviceStatus: OnDeviceModelStatus
+    ) -> NoBackendGuidance {
+        // The transparent both-paths affordance (copy unchanged from before the
+        // per-status work): a cloud/BYO/downloaded selection, or on-device below the
+        // macOS-26 floor. Never hides a path; never a system-toggle nudge.
+        func generic() -> NoBackendGuidance {
+            let capable = onDeviceStatus != .osUnsupported
             return NoBackendGuidance(
-                title: "Turn on Apple Intelligence to answer on this Mac",
-                body: "You picked the on-device model, but Apple Intelligence is turned "
-                    + "off in System Settings. Turn it on under Apple Intelligence & Siri "
-                    + "to answer here — nothing leaves this Mac. If it's already on, its "
-                    + "model may still be downloading. You can also turn on cloud recall in "
-                    + "Intelligence Settings (your data leaves this Mac, only with your "
-                    + "consent).",
-                showsSystemSettings: true
+                title: "No AI model is set up to answer yet",
+                body: capable
+                    ? "Answer on this Mac with Apple Intelligence, or turn on cloud recall in "
+                        + "Intelligence Settings (your data leaves this Mac, only with your consent)."
+                    : "To answer here, turn on cloud recall in Intelligence Settings (your data "
+                        + "leaves this Mac, only with your consent). On-device answers need macOS 26 "
+                        + "with Apple Intelligence.",
+                showsSystemSettings: false
             )
         }
-        // Every other no-backend case keeps the transparent both-paths affordance
-        // (copy unchanged): a cloud/BYO/downloaded selection, or on-device on an OS
-        // below the macOS-26 floor. Never hides a path; never a system-toggle nudge.
-        return NoBackendGuidance(
-            title: "No AI model is set up to answer yet",
-            body: canRunOnDevice
-                ? "Answer on this Mac with Apple Intelligence, or turn on cloud recall in "
-                    + "Intelligence Settings (your data leaves this Mac, only with your consent)."
-                : "To answer here, turn on cloud recall in Intelligence Settings (your data "
-                    + "leaves this Mac, only with your consent). On-device answers need macOS 26 "
-                    + "with Apple Intelligence.",
-            showsSystemSettings: false
-        )
+
+        // Only the on-device model has a system-gated backend to explain; every
+        // other selection uses the generic affordance.
+        guard selected == .appleOnDevice else { return generic() }
+
+        switch onDeviceStatus {
+        case .appleIntelligenceOff:
+            // The confirmed system-toggle case — name the exact step and deep-link.
+            // The generic "no model set up" copy reads as "but I already picked
+            // on-device" and strands the user (the bug this feature fixes).
+            return NoBackendGuidance(
+                title: "Turn on Apple Intelligence to answer on this Mac",
+                body: "You picked the on-device model, but Apple Intelligence is turned off in "
+                    + "System Settings. Turn it on under Apple Intelligence & Siri to answer here "
+                    + "— nothing leaves this Mac. You can also turn on cloud recall in Intelligence "
+                    + "Settings (your data leaves this Mac, only with your consent).",
+                showsSystemSettings: true
+            )
+        case .modelDownloading:
+            return NoBackendGuidance(
+                title: "Apple Intelligence is getting ready",
+                body: "Apple Intelligence is still downloading its on-device model — answers on "
+                    + "this Mac will work once it finishes. In the meantime you can turn on cloud "
+                    + "recall in Intelligence Settings (your data leaves this Mac, only with your "
+                    + "consent).",
+                showsSystemSettings: false
+            )
+        case .notEligible:
+            return NoBackendGuidance(
+                title: "This Mac can't run the on-device model",
+                body: "This Mac isn't eligible for Apple Intelligence, so it can't answer "
+                    + "on-device. Turn on cloud recall in Intelligence Settings to answer here "
+                    + "(your data leaves this Mac, only with your consent).",
+                showsSystemSettings: false
+            )
+        case .unknown:
+            // Probe couldn't determine the state — on-device is selected, so the
+            // likely fix is enabling Apple Intelligence; keep the hedged copy (the
+            // pre-probe #364 behavior) and still offer the deep link.
+            return NoBackendGuidance(
+                title: "Turn on Apple Intelligence to answer on this Mac",
+                body: "You picked the on-device model, but Apple Intelligence may be turned off "
+                    + "in System Settings. Turn it on under Apple Intelligence & Siri to answer "
+                    + "here — nothing leaves this Mac. If it's already on, its model may still be "
+                    + "downloading. You can also turn on cloud recall in Intelligence Settings.",
+                showsSystemSettings: true
+            )
+        case .osUnsupported, .available:
+            // Below the macOS-26 floor → the generic OS-gated copy. `.available`
+            // shouldn't pair with a no-backend refusal, but if it does the specific
+            // Apple-Intelligence copy would be misleading, so fall back to generic.
+            return generic()
+        }
     }
 }
 

@@ -83,6 +83,11 @@ targets:
         PRODUCT_NAME: ScreenCap
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: ScreenCap/ScreenCap.entitlements
+        # FoundationModels is weak-linked (mirrors the IntelligenceHelper target)
+        # so the app loads on its macOS-13 floor where the framework is absent; the
+        # on-device availability probe (`OnDeviceModelStatus.probe`) is
+        # `#available(macOS 26)`-guarded and never touches a macOS-26 symbol below it.
+        OTHER_LDFLAGS: "-weak_framework FoundationModels"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Aurora signature accent (SCR-197). The global accent propagates the
         # derived solid spring-teal to every `.tint` / `.accentColor` site for

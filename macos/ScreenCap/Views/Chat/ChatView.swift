@@ -42,6 +42,11 @@ struct ChatView: View {
     /// Forward-only OCR-indexing consent state (R13). Read once from settings;
     /// `enableOcrConsent` flips it and re-runs the thin-evidence turn.
     @State private var contentIndexEnabled = false
+    /// Live Apple-on-device availability, so a no-backend refusal for the on-device
+    /// model names the exact reason (off / downloading / unsupported). Probed on
+    /// appear and re-probed when the app regains focus (e.g. after the user toggles
+    /// Apple Intelligence in System Settings and returns).
+    @State private var onDeviceStatus: OnDeviceModelStatus = .unknown
 
     var body: some View {
         VStack(spacing: 0) {
@@ -54,7 +59,11 @@ struct ChatView: View {
         .task {
             await intelligence.refresh()
             await loadSettings()
+            onDeviceStatus = OnDeviceModelStatus.probe()
             composerFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            onDeviceStatus = OnDeviceModelStatus.probe()
         }
     }
 
@@ -106,6 +115,7 @@ struct ChatView: View {
                                 selected: SelectedIntelligence(
                                     provider: intelligence.settings?.provider ?? "on-device"
                                 ),
+                                onDeviceStatus: onDeviceStatus,
                                 index: index,
                                 frameIndex: frameIndex,
                                 thumbnailLoader: thumbnailLoader,
@@ -114,7 +124,7 @@ struct ChatView: View {
                                 onRetry: { Task { await model.retry(turnID: turn.id) } },
                                 onEnableOcrConsent: { Task { await enableOcrConsent(turnID: turn.id) } },
                                 onOpenIntelligenceSettings: onOpenIntelligenceSettings,
-                                onOpenSystemSettings: openAppleIntelligenceSettings
+                                onOpenSystemSettings: { AppleIntelligenceSettings.open() }
                             )
                             .id(turn.id)
                         }
@@ -251,22 +261,6 @@ struct ChatView: View {
             .filter { $0.count > 2 }
     }
 
-    /// Open System Settings at the Apple Intelligence & Siri pane — the on-device
-    /// no-backend affordance's CTA (R6). The on-device model is gated by the
-    /// system-wide Apple Intelligence switch, which the app can't flip; deep-link to
-    /// it instead. Falls back to opening System Settings at its root if the OS
-    /// doesn't recognize the anchor (mirrors `PermissionController`'s open-with-
-    /// fallback).
-    private func openAppleIntelligenceSettings() {
-        let anchors = [
-            "x-apple.systempreferences:com.apple.Siri-Settings.extension",
-            "x-apple.systempreferences:",
-        ]
-        for raw in anchors {
-            if let url = URL(string: raw), NSWorkspace.shared.open(url) { return }
-        }
-    }
-
     // MARK: - Settings / OCR consent (R13, mirrors RecallPaletteView)
 
     private func loadSettings() async {
@@ -306,6 +300,9 @@ private struct ChatTurnView: View {
     /// The selected intelligence model, so the no-backend affordance can name the
     /// on-device (Apple Intelligence) system step vs the generic both-paths copy.
     let selected: SelectedIntelligence
+    /// Live Apple-on-device availability, so an on-device no-backend refusal names
+    /// the exact reason (off / downloading / unsupported).
+    let onDeviceStatus: OnDeviceModelStatus
     let index: RecordingsIndex
     let frameIndex: RecordingFrameIndex
     let thumbnailLoader: ThumbnailLoader
@@ -402,7 +399,7 @@ private struct ChatTurnView: View {
     /// the on-device model is picked on a capable OS, the block is the system-wide
     /// Apple Intelligence switch, so it names that step and deep-links to it.
     private var noBackendAffordance: some View {
-        let guidance = NoBackendGuidance.make(selected: selected, canRunOnDevice: Self.osCanRunOnDevice)
+        let guidance = NoBackendGuidance.make(selected: selected, onDeviceStatus: onDeviceStatus)
         return VStack(alignment: .leading, spacing: 8) {
             Text(guidance.title)
                 .font(SCTypography.sans(size: 13, weight: .semibold))
@@ -438,13 +435,6 @@ private struct ChatTurnView: View {
         // Buttons into one static element and make the CTAs unreachable by VoiceOver.
         // The Text views read out on their own; each Button keeps its own focusable
         // element (mirrors ocrConsentBanner).
-    }
-
-    /// Whether this OS can run Apple Foundation Models at all (macOS 26+). Isolated
-    /// so `NoBackendGuidance.make` stays a pure, fully-tested function and this
-    /// single `#available` line is the only untestable-in-CI bit.
-    static var osCanRunOnDevice: Bool {
-        if #available(macOS 26.0, *) { return true } else { return false }
     }
 
     /// The honest coverage state, inline on this turn (R12). Only surfaced when it
