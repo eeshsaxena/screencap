@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The Intelligence settings pane. Sections following the `PrivacySettingsView`
@@ -53,6 +54,14 @@ struct IntelligenceSettingsView: View {
     /// pre-selection when opened for a specific "needs attention" row.
     @State private var connectSheet: ConnectSheetState?
 
+    /// Live Apple-on-device availability. "On-device model" is Apple's
+    /// `SystemLanguageModel`, gated by the system-wide Apple Intelligence switch —
+    /// so selecting it here isn't the same as it being usable. Probed natively on
+    /// appear and re-probed when the app regains focus (e.g. right after the user
+    /// toggles Apple Intelligence in System Settings from the badge's link), so the
+    /// on-device row shows the true state instead of looking ready-when-it-isn't.
+    @State private var onDeviceStatus: OnDeviceModelStatus = .unknown
+
     var body: some View {
         ZStack {
             ScrollView {
@@ -92,6 +101,10 @@ struct IntelligenceSettingsView: View {
         }
         .task { await intelligence.refresh() }
         .task { await download.refreshStatus() }
+        .task { onDeviceStatus = OnDeviceModelStatus.probe() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            onDeviceStatus = OnDeviceModelStatus.probe()
+        }
     }
 
     /// Which vendor the connect sheet opens focused on.
@@ -148,6 +161,9 @@ struct IntelligenceSettingsView: View {
                 )
                 ForEach(opts) { option in
                     providerRow(option, settings: settings)
+                    if option.id == "on-device" {
+                        onDeviceStatusAccessory
+                    }
                     if option.id == "downloaded" {
                         downloadAccessory(settings)
                     }
@@ -382,6 +398,43 @@ struct IntelligenceSettingsView: View {
         }
         .padding(.horizontal, 44)
         .padding(.bottom, download.state == .installed ? 0 : 12)
+    }
+
+    /// The live on-device availability chip under the on-device row: "Ready" when
+    /// Apple Intelligence is on, else the actual blocker (off / downloading / not
+    /// supported). Renders nothing when the state can't be determined. For the one
+    /// system-toggle case (Apple Intelligence off) it also offers a "Turn on in
+    /// System Settings" deep link — the app can't flip the switch, only point at it.
+    @ViewBuilder
+    private var onDeviceStatusAccessory: some View {
+        if let badge = onDeviceStatus.settingsBadge {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(badgeColor(badge.tone))
+                    .frame(width: 6, height: 6)
+                Text(badge.text)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(badgeColor(badge.tone))
+                if badge.offersSystemSettings {
+                    Button("Turn on in System Settings") { AppleIntelligenceSettings.open() }
+                        .buttonStyle(.plain)
+                        .font(SCTypography.sans(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.scTeal)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 44)
+            .padding(.bottom, 12)
+        }
+    }
+
+    /// Map an on-device status-badge tone to its themed color.
+    private func badgeColor(_ tone: OnDeviceStatusBadge.Tone) -> Color {
+        switch tone {
+        case .ok: return Color.scSuccessFg
+        case .warn: return Color.scAmberText
+        case .info: return Color.scInkMuted
+        }
     }
 
     /// The endpoint text field for the Local-server row (U9 write via the CLI),

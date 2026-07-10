@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // Conversational-recall U8 — the multi-turn Chat destination (KTD7). A scrolling
@@ -41,6 +42,11 @@ struct ChatView: View {
     /// Forward-only OCR-indexing consent state (R13). Read once from settings;
     /// `enableOcrConsent` flips it and re-runs the thin-evidence turn.
     @State private var contentIndexEnabled = false
+    /// Live Apple-on-device availability, so a no-backend refusal for the on-device
+    /// model names the exact reason (off / downloading / unsupported). Probed on
+    /// appear and re-probed when the app regains focus (e.g. after the user toggles
+    /// Apple Intelligence in System Settings and returns).
+    @State private var onDeviceStatus: OnDeviceModelStatus = .unknown
 
     var body: some View {
         VStack(spacing: 0) {
@@ -53,7 +59,11 @@ struct ChatView: View {
         .task {
             await intelligence.refresh()
             await loadSettings()
+            onDeviceStatus = OnDeviceModelStatus.probe()
             composerFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            onDeviceStatus = OnDeviceModelStatus.probe()
         }
     }
 
@@ -102,6 +112,10 @@ struct ChatView: View {
                             ChatTurnView(
                                 turn: turn,
                                 queryTerms: terms(turn.question),
+                                selected: SelectedIntelligence(
+                                    provider: intelligence.settings?.provider ?? "on-device"
+                                ),
+                                onDeviceStatus: onDeviceStatus,
                                 index: index,
                                 frameIndex: frameIndex,
                                 thumbnailLoader: thumbnailLoader,
@@ -109,7 +123,8 @@ struct ChatView: View {
                                 onOpenSource: openSource,
                                 onRetry: { Task { await model.retry(turnID: turn.id) } },
                                 onEnableOcrConsent: { Task { await enableOcrConsent(turnID: turn.id) } },
-                                onOpenIntelligenceSettings: onOpenIntelligenceSettings
+                                onOpenIntelligenceSettings: onOpenIntelligenceSettings,
+                                onOpenSystemSettings: { AppleIntelligenceSettings.open() }
                             )
                             .id(turn.id)
                         }
@@ -282,6 +297,12 @@ struct ChatView: View {
 private struct ChatTurnView: View {
     let turn: ChatTurn
     let queryTerms: [String]
+    /// The selected intelligence model, so the no-backend affordance can name the
+    /// on-device (Apple Intelligence) system step vs the generic both-paths copy.
+    let selected: SelectedIntelligence
+    /// Live Apple-on-device availability, so an on-device no-backend refusal names
+    /// the exact reason (off / downloading / unsupported).
+    let onDeviceStatus: OnDeviceModelStatus
     let index: RecordingsIndex
     let frameIndex: RecordingFrameIndex
     let thumbnailLoader: ThumbnailLoader
@@ -290,6 +311,7 @@ private struct ChatTurnView: View {
     var onRetry: () -> Void
     var onEnableOcrConsent: () -> Void
     var onOpenIntelligenceSettings: () -> Void
+    var onOpenSystemSettings: () -> Void
 
     @State private var sourcesExpanded = true
 
@@ -371,41 +393,48 @@ private struct ChatTurnView: View {
     }
 
     /// The transparent no-backend affordance (R5/R6): no AI model is available, so
-    /// explain both paths and link to Intelligence Settings. Visually distinct from
-    /// the single-line `coverageLine` (a card with a call-to-action). Copy is
-    /// OS-aware but never hides a path and never nudges.
+    /// explain the path(s) forward and link out. Visually distinct from the
+    /// single-line `coverageLine` (a card with a call-to-action). Copy is
+    /// selected-model- and OS-aware but never hides a path and never nudges: when
+    /// the on-device model is picked on a capable OS, the block is the system-wide
+    /// Apple Intelligence switch, so it names that step and deep-links to it.
     private var noBackendAffordance: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("No AI model is set up to answer yet")
+        let guidance = NoBackendGuidance.make(selected: selected, onDeviceStatus: onDeviceStatus)
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(guidance.title)
                 .font(SCTypography.sans(size: 13, weight: .semibold))
                 .foregroundStyle(Color.scInk)
-            Text(Self.noBackendBody)
+            Text(guidance.body)
                 .font(SCTypography.sans(size: 12))
                 .foregroundStyle(Color.scInkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Open Intelligence Settings", action: onOpenIntelligenceSettings)
-                .buttonStyle(.borderedProminent)
-                .tint(Color.scTeal)
+            // When Apple Intelligence is the block, System Settings is the primary
+            // action and Intelligence Settings stays reachable as the secondary
+            // path; otherwise Intelligence Settings is the sole primary action.
+            // (The two button styles are distinct types, so branch the views rather
+            // than ternary the style.)
+            HStack(spacing: 8) {
+                if guidance.showsSystemSettings {
+                    Button("Open System Settings", action: onOpenSystemSettings)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.scTeal)
+                    Button("Open Intelligence Settings", action: onOpenIntelligenceSettings)
+                        .buttonStyle(.bordered)
+                        .tint(Color.scTeal)
+                } else {
+                    Button("Open Intelligence Settings", action: onOpenIntelligenceSettings)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.scTeal)
+                }
+            }
         }
         .padding(SCMetrics.space3)
         .frame(maxWidth: 640, alignment: .leading)
         .background(Color.scTealSoft.opacity(0.4), in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
         // Do NOT `.accessibilityElement(children: .combine)` here: it would fold the
-        // "Open Intelligence Settings" Button into one static element and make the
-        // CTA unreachable by VoiceOver. The Text views read out on their own;
-        // the Button keeps its own focusable element (mirrors ocrConsentBanner).
-    }
-
-    /// OS-aware copy (R6): on a host that can't run on-device (macOS < 26), lead
-    /// with the actionable cloud path while still disclosing the on-device
-    /// requirement; on a capable host, present both without steering. Never hides a
-    /// path — disclosure-complete, not a nudge.
-    static var noBackendBody: String {
-        if #available(macOS 26.0, *) {
-            return "Answer on this Mac with Apple Intelligence, or turn on cloud recall in Intelligence Settings (your data leaves this Mac, only with your consent)."
-        } else {
-            return "To answer here, turn on cloud recall in Intelligence Settings (your data leaves this Mac, only with your consent). On-device answers need macOS 26 with Apple Intelligence."
-        }
+        // Buttons into one static element and make the CTAs unreachable by VoiceOver.
+        // The Text views read out on their own; each Button keeps its own focusable
+        // element (mirrors ocrConsentBanner).
     }
 
     /// The honest coverage state, inline on this turn (R12). Only surfaced when it
