@@ -1,26 +1,29 @@
 import SwiftUI
 
-/// U9 — the Intelligence settings pane (R2, R6, R7, R8, R9). Two sections
-/// following the `PrivacySettingsView` layout:
+/// The Intelligence settings pane. Sections following the `PrivacySettingsView`
+/// layout, with the hosted-vs-user-owned separation (U7 — R9):
 ///
-/// 1. **MODEL** — a picker for the active provider: "On-device model" (the
-///    zero-config default, R3), a configured cloud provider ("Claude — your API
-///    key" in the design; the CLI's only cloud id today is `gemini`), and an
-///    "Add another provider…" affordance (a stub until the add-key flow lands —
-///    keys are daemon-owned, so there is no in-app key entry here).
-/// 2. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix:
+/// 1. **SCREENCAP-HOSTED CLOUD** — the active-provider picker for app-managed
+///    models: "On-device model" (the zero-config default, R3), the SCR-239
+///    downloaded + local-server rows. Whose bill: nothing on-device; a hosted
+///    cloud provider (when one exists) rides the Personal cloud subscription.
+/// 2. **YOUR OWN ACCOUNT** (U6/U7 — R1-R5, R9, R10, R12, R13) — the BYO section:
+///    connect OpenAI / Anthropic / Gemini by API key or CLI delegation, each
+///    against the user's own account and bill. Gemini appears once here (R10).
+///    Selecting a connected provider persists it as the consented
+///    `cloud_provider` (KTD2 — never the active `provider`). The "Connect a
+///    provider…" action opens `ConnectProviderSheet`.
+/// 3. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix:
 ///    - Summaries & titles (R8) — a real toggle wired to `summary_cloud_consent`.
+///    - Answering Recall searches — a real toggle (`recall_cloud_consent`).
 ///    - Splitting & labeling the day (R7) — shown as ON-DEVICE, *not* a cloud
 ///      toggle. It never leaves the Mac even with a cloud provider configured.
-///    - Screen frames or images (R9) — a FIXED "always off", non-interactive.
+///    - Screen frames or images (R9-frames) — a FIXED "always off".
 ///
-/// Recall-answering (`recall_cloud_consent`) is surfaced as a fourth cloud row
-/// so the pane matches the CLI's settable matrix; the design's three named rows
-/// map to summary/day-split/frames.
-///
-/// All writes flow through the U8 CLI settings layer via `IntelligenceController`
-/// (R8 — no Keychain; cloud keys stay daemon-owned). The consent toggles reuse
-/// the `AppRulesView` optimistic pending-state pattern.
+/// Consent + provider writes flow through the CLI settings layer via
+/// `IntelligenceController`; BYO keys are stored daemon-side (Keychain-class,
+/// R3) and the key value never enters this process on read-back. The consent
+/// toggles reuse the `AppRulesView` optimistic pending-state pattern.
 struct IntelligenceSettingsView: View {
     @EnvironmentObject private var intelligence: IntelligenceController
 
@@ -46,28 +49,54 @@ struct IntelligenceSettingsView: View {
     /// optimistic flip has already been reverted by the controller).
     @State private var writeError: String?
 
+    /// U6 — the connect-a-provider sheet presentation. nil when closed; a vendor
+    /// pre-selection when opened for a specific "needs attention" row.
+    @State private var connectSheet: ConnectSheetState?
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("Intelligence")
-                .font(SCTypography.paneHeading)
-                .foregroundStyle(Color.scInk)
-                .padding(.bottom, 6)
-            Text("Which model turns your recordings into named tasks, summaries, and answers.")
-                .font(SCTypography.sans(size: 13))
-                .foregroundStyle(Color.scInkMuted)
-                .padding(.bottom, 24)
+        ZStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Intelligence")
+                        .font(SCTypography.paneHeading)
+                        .foregroundStyle(Color.scInk)
+                        .padding(.bottom, 6)
+                    Text("Which model turns your recordings into named tasks, summaries, and answers.")
+                        .font(SCTypography.sans(size: 13))
+                        .foregroundStyle(Color.scInkMuted)
+                        .padding(.bottom, 24)
 
-            content
-                .frame(maxWidth: 720)
+                    content
+                        .frame(maxWidth: 720)
 
-            Spacer(minLength: 0)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 36)
+                .padding(.vertical, 30)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(Color.scCanvas)
+
+            // U6 — the connect flow, presented as an in-window overlay (the
+            // app's `NewRecordingSheet` pattern) rather than a native `.sheet`.
+            if let sheet = connectSheet, let settings = intelligence.settings {
+                ConnectProviderSheet(
+                    initialVendor: sheet.vendor,
+                    settings: settings,
+                    controller: intelligence,
+                    onClose: { connectSheet = nil }
+                )
+                .transition(.opacity)
+            }
         }
-        .padding(.horizontal, 36)
-        .padding(.vertical, 30)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color.scCanvas)
         .task { await intelligence.refresh() }
         .task { await download.refreshStatus() }
+    }
+
+    /// Which vendor the connect sheet opens focused on.
+    struct ConnectSheetState: Equatable {
+        var vendor: BYOVendor?
     }
 
     @ViewBuilder
@@ -75,6 +104,7 @@ struct IntelligenceSettingsView: View {
         if let settings = intelligence.settings {
             VStack(alignment: .leading, spacing: 28) {
                 modelSection(settings)
+                userOwnedSection(settings)
                 cloudTasksSection(settings)
                 if let writeError {
                     Text("Couldn't save: \(writeError)")
@@ -94,10 +124,23 @@ struct IntelligenceSettingsView: View {
 
     private func modelSection(_ settings: IntelligenceSettings) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("MODEL")
+            // R9 — the hosted section header + whose-bill caption. On-device rows
+            // don't bill at all; the configured hosted cloud provider (if any)
+            // rides ScreenCap's Personal cloud subscription.
+            sectionHeader("SCREENCAP-HOSTED CLOUD")
+            Text(ConnectProviderModel.hostedSectionCaption)
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scInkMuted)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 2)
+                .padding(.bottom, 2)
             VStack(alignment: .leading, spacing: 0) {
+                // The hosted section lists only on-device / downloaded / local
+                // rows (no BYO — those live in the "Your own account" section
+                // below, R9/R10). The stub "Add another provider…" affordance is
+                // gone; connecting happens in the user-owned section.
                 let opts = IntelligenceProviderOption.options(
-                    cloudProvider: settings.cloudProvider,
+                    cloudProvider: nil,
                     downloadedInstalled: settings.downloadedModelInstalled
                         || download.isDefaultModelInstalled,
                     localEndpoint: settings.localServerEndpoint,
@@ -111,7 +154,7 @@ struct IntelligenceSettingsView: View {
                     if option.id == "local-server" {
                         endpointField(settings)
                     }
-                    if option.id != IntelligenceProviderOption.addProviderID {
+                    if option.id != opts.last?.id {
                         rowDivider
                     }
                 }
@@ -125,16 +168,15 @@ struct IntelligenceSettingsView: View {
 
     private func providerRow(_ option: IntelligenceProviderOption, settings: IntelligenceSettings) -> some View {
         let isSelected = option.providerValue == settings.provider
-        let isAddRow = option.id == IntelligenceProviderOption.addProviderID
         return Button {
             selectProvider(option)
         } label: {
             HStack(alignment: .center, spacing: 12) {
-                radio(selected: isSelected, muted: isAddRow)
+                radio(selected: isSelected, muted: false)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(option.title)
-                        .font(SCTypography.sans(size: 14, weight: isAddRow ? .regular : .semibold))
-                        .foregroundStyle(isAddRow ? Color.scTeal : Color.scInk)
+                        .font(SCTypography.sans(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.scInk)
                     if let subtitle = option.subtitle {
                         Text(subtitle)
                             .font(SCTypography.sans(size: 12.5))
@@ -148,10 +190,9 @@ struct IntelligenceSettingsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // The "add provider" affordance is a stub; the downloaded model can't be
-        // selected until it's installed (the Download button below is the CTA).
-        .disabled(providerWriteInFlight || isAddRow || downloadedNotInstalled(option, settings))
-        .help(isAddRow ? "Coming soon — add a cloud provider with your own API key" : "")
+        // The downloaded model can't be selected until it's installed (the
+        // Download button below is the CTA).
+        .disabled(providerWriteInFlight || downloadedNotInstalled(option, settings))
     }
 
     /// The downloaded-model radio is inert until the model is on disk.
@@ -167,6 +208,141 @@ struct IntelligenceSettingsView: View {
         providerWriteInFlight = true
         Task {
             let ok = await intelligence.setProvider(value)
+            providerWriteInFlight = false
+            if !ok { writeError = intelligence.lastError ?? "the provider change." }
+        }
+    }
+
+    // MARK: - "Your own account" section (U6/U7 — R9/R10/R12)
+
+    /// The user-owned BYO section: connect OpenAI / Anthropic / Gemini by API key
+    /// or CLI delegation. Each connected option is selectable as the consented
+    /// `cloud_provider` (KTD2 — never the active `provider`). Gemini appears once
+    /// here (R10) and never in the hosted section above.
+    private func userOwnedSection(_ settings: IntelligenceSettings) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionHeader("YOUR OWN ACCOUNT")
+            Text(ConnectProviderModel.userOwnedSectionCaption)
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scInkMuted)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 2)
+                .padding(.bottom, 2)
+
+            let opts = ConnectProviderModel.userOwnedOptions(settings)
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(opts) { option in
+                    byoRow(option, settings: settings)
+                    if option.id != opts.last?.id { rowDivider }
+                }
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
+                    .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+            )
+
+            Button {
+                connectSheet = ConnectSheetState(vendor: nil)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus.circle")
+                    Text("Connect a provider…")
+                }
+                .font(SCTypography.sans(size: 13, weight: .semibold))
+                .foregroundStyle(Color.scTeal)
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 2)
+        }
+    }
+
+    /// A single BYO option row: a radio (when selectable) or a needs-attention
+    /// chip (R5/R13), the title + honest limits copy (R12), and a Manage/Connect
+    /// affordance. Selecting a connected row persists it as `cloud_provider`.
+    private func byoRow(_ option: BYOProviderOption, settings: IntelligenceSettings) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            if option.isSelectable {
+                Button { selectBYO(option) } label: {
+                    radio(selected: option.isSelected, muted: false)
+                }
+                .buttonStyle(.plain)
+                .disabled(providerWriteInFlight)
+            } else {
+                // Not connectable inline — needs attention / not connected.
+                radio(selected: false, muted: true)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(option.title)
+                    .font(SCTypography.sans(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.scInk)
+                Text(byoSubtitle(option))
+                    .font(SCTypography.sans(size: 12.5))
+                    .foregroundStyle(Color.scInkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            byoRowAccessory(option)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .contentShape(Rectangle())
+    }
+
+    /// The trailing chip/button per BYO row: a "needs attention" chip for an
+    /// unavailable CLI (R5/R13), a Manage button for a connected key, or a
+    /// Connect button otherwise.
+    @ViewBuilder
+    private func byoRowAccessory(_ option: BYOProviderOption) -> some View {
+        switch (option.mechanism, option.state) {
+        case (.cli, .needsAttention):
+            HStack(spacing: 8) {
+                chip("Needs attention", color: Color.scAmberText)
+                Button("Set up") { connectSheet = ConnectSheetState(vendor: option.vendor) }
+                    .buttonStyle(.plain)
+                    .font(SCTypography.sans(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.scTeal)
+            }
+        case (.apiKey, .connected):
+            Button("Manage") { connectSheet = ConnectSheetState(vendor: option.vendor) }
+                .buttonStyle(.plain)
+                .font(SCTypography.sans(size: 12, weight: .semibold))
+                .foregroundStyle(Color.scTeal)
+        case (.apiKey, _):
+            Button("Connect") { connectSheet = ConnectSheetState(vendor: option.vendor) }
+                .buttonStyle(.plain)
+                .font(SCTypography.sans(size: 12, weight: .semibold))
+                .foregroundStyle(Color.scTeal)
+        default:
+            EmptyView()
+        }
+    }
+
+    private func byoSubtitle(_ option: BYOProviderOption) -> String {
+        switch option.mechanism {
+        case .apiKey:
+            return option.vendor.keyBillingCopy
+        case .cli:
+            // Honest limits copy always; append the fix path when unavailable (R5).
+            if option.state == .needsAttention {
+                return option.vendor.cliLimitsCopy + " " + option.vendor.cliFixGuidance
+            }
+            return option.vendor.cliLimitsCopy
+        }
+    }
+
+    /// Select a connected BYO option as the consented `cloud_provider` (KTD2 —
+    /// NOT the active `provider`). Toggling the already-selected one off clears
+    /// the selection.
+    private func selectBYO(_ option: BYOProviderOption) {
+        guard !providerWriteInFlight else { return }
+        writeError = nil
+        providerWriteInFlight = true
+        let target: String? = option.isSelected ? nil : option.providerID
+        Task {
+            let ok = await intelligence.setCloudProvider(target)
             providerWriteInFlight = false
             if !ok { writeError = intelligence.lastError ?? "the provider change." }
         }
@@ -410,25 +586,26 @@ struct IntelligenceSettingsView: View {
     }
 }
 
-/// A pure model of the provider-picker rows (R2) — factored out so the "which
-/// options render, and which CLI provider value each writes" rules are unit
-/// testable without a running view.
+/// A pure model of the ScreenCap-hosted picker rows — factored out so the "which
+/// options render, and which provider value each writes" rules are unit testable
+/// without a running view. BYO (user-owned) rows are modeled separately by
+/// `ConnectProviderModel`; this covers only the on-device / downloaded /
+/// local-server hosted rows (R9 hosted section).
 struct IntelligenceProviderOption: Identifiable, Equatable {
-    /// Sentinel id for the non-selectable "add another provider" affordance.
-    static let addProviderID = "add"
-
     let id: String
     let title: String
     let subtitle: String?
-    /// The `provider set <value>` argument this row writes, or nil for the
-    /// non-selectable "add" row.
+    /// The `provider set <value>` argument this row writes.
     let providerValue: String?
 
-    /// Build the picker rows. Always leads with the on-device default (R3), then
+    /// Build the hosted picker rows. Leads with the on-device default (R3), then
     /// the SCR-239 opt-in **Downloaded model** and **Local server** rows, then a
-    /// configured cloud provider when set, then the "add another provider…"
-    /// affordance. Subtitles reflect the downloaded-model install state and the
-    /// BYO endpoint's LOCAL/REMOTE classification.
+    /// configured cloud provider when set. Subtitles reflect the downloaded-model
+    /// install state and the BYO endpoint's LOCAL/REMOTE classification.
+    ///
+    /// Note: the hosted section always passes `cloudProvider: nil` now — BYO
+    /// cloud lives in the "Your own account" section (R9/R10). The `cloudProvider`
+    /// parameter is retained for a future app-managed hosted cloud row.
     static func options(
         cloudProvider: String?,
         downloadedInstalled: Bool = false,
@@ -465,12 +642,6 @@ struct IntelligenceProviderOption: Identifiable, Equatable {
                 providerValue: cloud
             ))
         }
-        opts.append(IntelligenceProviderOption(
-            id: addProviderID,
-            title: "Add another provider…",
-            subtitle: nil,
-            providerValue: nil
-        ))
         return opts
     }
 

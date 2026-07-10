@@ -36,7 +36,13 @@ final class IntelligenceSettingsTests: XCTestCase {
         provider: String = "on-device",
         cloudProvider: String? = nil,
         summary: Bool = false,
-        recall: Bool = false
+        recall: Bool = false,
+        openaiKey: Bool = false,
+        anthropicKey: Bool = false,
+        geminiKey: Bool = false,
+        openaiCli: Bool = false,
+        anthropicCli: Bool = false,
+        geminiCli: Bool = false
     ) -> Data {
         let intelligence: [String: Any] = [
             "provider": provider,
@@ -45,9 +51,15 @@ final class IntelligenceSettingsTests: XCTestCase {
             "recall_cloud_consent": recall,
             "day_split_cloud_consent": false,
             "frames_cloud_consent": false,
+            "openai_key_present": openaiKey,
+            "anthropic_key_present": anthropicKey,
+            "gemini_key_present": geminiKey,
+            "openai_cli_available": openaiCli,
+            "anthropic_cli_available": anthropicCli,
+            "gemini_cli_available": geminiCli,
         ]
         let payload: [String: Any] = [
-            "ok": true, "schema_version": 1, "intelligence": intelligence,
+            "ok": true, "schema_version": 3, "intelligence": intelligence,
         ]
         return try! JSONSerialization.data(withJSONObject: payload, options: [])
     }
@@ -212,26 +224,25 @@ final class IntelligenceSettingsTests: XCTestCase {
 
     // MARK: - Provider picker model (R2/R7/R9 pane rules)
 
-    /// With no cloud provider configured the picker offers on-device (default),
-    /// the SCR-239 downloaded + local-server rows, and the non-selectable "add"
-    /// affordance.
+    /// The hosted section offers on-device (default) + the SCR-239 downloaded /
+    /// local-server rows. The inert "Add another provider…" stub is gone —
+    /// connecting now lives in the "Your own account" section (U7). BYO is never
+    /// listed here (R9 hosted/user-owned split).
     func testProviderOptionsWithoutCloudProvider() {
         let opts = IntelligenceProviderOption.options(cloudProvider: nil)
-        XCTAssertEqual(
-            opts.map(\.id),
-            ["on-device", "downloaded", "local-server", IntelligenceProviderOption.addProviderID]
-        )
+        XCTAssertEqual(opts.map(\.id), ["on-device", "downloaded", "local-server"])
         XCTAssertEqual(opts.first?.providerValue, "on-device")
-        // The "add" row is non-selectable — it writes nothing.
-        XCTAssertNil(opts.last?.providerValue)
+        // Every hosted row is selectable — no non-selectable stub remains.
+        XCTAssertTrue(opts.allSatisfy { $0.providerValue != nil })
     }
 
-    /// A configured cloud provider becomes a selectable row after the local rows.
+    /// A configured hosted cloud provider becomes a selectable row after the
+    /// local rows (retained for a future app-managed hosted cloud row).
     func testProviderOptionsWithCloudProvider() {
         let opts = IntelligenceProviderOption.options(cloudProvider: "gemini")
         XCTAssertEqual(
             opts.map(\.id),
-            ["on-device", "downloaded", "local-server", "gemini", IntelligenceProviderOption.addProviderID]
+            ["on-device", "downloaded", "local-server", "gemini"]
         )
         XCTAssertEqual(opts.first { $0.id == "gemini" }?.providerValue, "gemini")
     }
@@ -329,5 +340,230 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertEqual(row?.route, .intelligence)
         XCTAssertEqual(row?.isEnabled, true)
         XCTAssertNil(row?.helpText, "an enabled row has no coming-soon tooltip")
+    }
+
+    // MARK: - U6/U7 BYO: connect flow + hosted/user-owned separation
+
+    private func decode(_ data: Data) -> IntelligenceSettings {
+        try! JSONDecoder().decode(IntelligenceEnvelope.self, from: data).intelligence
+    }
+
+    /// R1/R2/R10 — the user-owned matrix is 3 vendors × 2 mechanisms, and Gemini
+    /// appears exactly once per mechanism (never a duplicate hosted/BYO listing).
+    func testUserOwnedOptionsAreSixWithGeminiListedOnce() {
+        let settings = decode(envelope())
+        let opts = ConnectProviderModel.userOwnedOptions(settings)
+
+        XCTAssertEqual(opts.count, 6, "3 vendors × 2 mechanisms")
+        // Gemini appears exactly once as a key option and once as a CLI option —
+        // and nowhere in the hosted section (R10, no double-Gemini).
+        let geminiKey = opts.filter { $0.providerID == "gemini" }
+        let geminiCli = opts.filter { $0.providerID == "gemini-cli" }
+        XCTAssertEqual(geminiKey.count, 1)
+        XCTAssertEqual(geminiCli.count, 1)
+        // The hosted picker never lists any BYO vendor id.
+        let hostedIDs = IntelligenceProviderOption.options(cloudProvider: nil).map(\.id)
+        XCTAssertFalse(hostedIDs.contains("gemini"))
+        XCTAssertFalse(hostedIDs.contains("gemini-cli"))
+    }
+
+    /// KTD2 — a BYO id resolves to the `cloud_provider` write surface, and the
+    /// full BYO id set matches the daemon's `_VALID_CLOUD_PROVIDERS`.
+    func testBYOProviderIDsMatchDaemonCloudProviders() {
+        XCTAssertEqual(
+            Set(ConnectProviderModel.allBYOProviderIDs),
+            ["openai", "anthropic", "gemini", "openai-cli", "anthropic-cli", "gemini-cli"]
+        )
+        XCTAssertTrue(ConnectProviderModel.isBYOProvider("openai"))
+        XCTAssertTrue(ConnectProviderModel.isBYOProvider("anthropic-cli"))
+        XCTAssertFalse(ConnectProviderModel.isBYOProvider("on-device"))
+        XCTAssertFalse(ConnectProviderModel.isBYOProvider(nil))
+    }
+
+    /// R3 — a stored key makes the key option `connected`/selectable; absent key
+    /// is `notConnected`. Presence is read from the `*_key_present` flags.
+    func testKeyPresenceDrivesConnectedState() {
+        let settings = decode(envelope(openaiKey: true))
+        let opts = ConnectProviderModel.userOwnedOptions(settings)
+        let openaiKey = opts.first { $0.providerID == "openai" }!
+        XCTAssertEqual(openaiKey.state, .connected)
+        XCTAssertTrue(openaiKey.isSelectable)
+
+        let anthropicKey = opts.first { $0.providerID == "anthropic" }!
+        XCTAssertEqual(anthropicKey.state, .notConnected)
+        XCTAssertFalse(anthropicKey.isSelectable)
+    }
+
+    /// R5/R13 — an unavailable CLI is `needsAttention` and not selectable; an
+    /// available one is `connected`/selectable. Never silently substituted.
+    func testCliAvailabilityDrivesNeedsAttention() {
+        let settings = decode(envelope(anthropicCli: true))
+        let opts = ConnectProviderModel.userOwnedOptions(settings)
+
+        let anthropicCli = opts.first { $0.providerID == "anthropic-cli" }!
+        XCTAssertEqual(anthropicCli.state, .connected)
+        XCTAssertTrue(anthropicCli.isSelectable)
+
+        let openaiCli = opts.first { $0.providerID == "openai-cli" }!
+        XCTAssertEqual(openaiCli.state, .needsAttention)
+        XCTAssertFalse(openaiCli.isSelectable, "an unavailable CLI can't be selected (R5)")
+    }
+
+    /// KTD2 — selecting a BYO provider writes `cloud_provider set <id>`, NOT the
+    /// active `provider`. The daemon rejects a BYO id as the active provider.
+    func testSetCloudProviderIssuesCloudProviderArgv() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        _ = await controller.setCloudProvider("openai-cli")
+
+        XCTAssertTrue(fake.calls.contains(
+            ["settings", "intelligence", "cloud_provider", "set", "openai-cli", "--json"]
+        ))
+        XCTAssertFalse(
+            fake.calls.contains(where: { $0.contains("provider") && $0.contains("openai-cli") && !$0.contains("cloud_provider") }),
+            "a BYO id must never be written as the active `provider` (KTD2)"
+        )
+    }
+
+    /// Deselect / disconnect writes `cloud_provider set none`.
+    func testSetCloudProviderNilClearsWithNone() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        _ = await controller.setCloudProvider(nil)
+
+        XCTAssertTrue(fake.calls.contains(
+            ["settings", "intelligence", "cloud_provider", "set", "none", "--json"]
+        ))
+    }
+
+    /// KTD3 — the BYO key reaches the CLI over STDIN, never as an argv element.
+    /// The argv carries `--set-key <vendor> --validate --json` and the key bytes
+    /// arrive on the injected stdin channel; no argv element equals the secret.
+    func testSetBYOKeyPipesSecretOverStdinNotArgv() async {
+        let controller = IntelligenceController()  // default invoke unused on this path
+        let secret = "sk-super-secret-value-123"
+        final class Captured: @unchecked Sendable {
+            var argv: [String] = []
+            var stdin = Data()
+        }
+        let captured = Captured()
+
+        let result = await controller.setBYOKey(
+            vendor: "openai", key: secret, validate: true,
+            injectInvoke: { args, stdin in
+                captured.argv = args
+                captured.stdin = stdin
+                return Data(#"{"ok":true,"schema_version":3,"vendor":"openai","key_present":true,"validation":"valid"}"#.utf8)
+            }
+        )
+
+        // The secret is on stdin.
+        XCTAssertEqual(String(data: captured.stdin, encoding: .utf8), secret)
+        // The secret is NOT in argv (KTD3 — argv is world-readable via ps).
+        XCTAssertFalse(captured.argv.contains(secret))
+        XCTAssertEqual(
+            captured.argv,
+            ["settings", "intelligence", "--set-key", "openai", "--validate", "--json"]
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.validation, BYOKeyResult.valid)
+    }
+
+    /// Store-only-if-valid: an invalid-key envelope (ok=false) surfaces the
+    /// `invalid` verdict and reports failure so the pane blocks the store.
+    func testSetBYOKeyInvalidSurfacesRejection() async {
+        let controller = IntelligenceController()
+        let result = await controller.setBYOKey(
+            vendor: "anthropic", key: "bad", validate: true,
+            injectInvoke: { _, _ in
+                Data(#"{"ok":false,"schema_version":3,"vendor":"anthropic","validation":"invalid","error":"key_invalid"}"#.utf8)
+            }
+        )
+        XCTAssertFalse(result.ok)
+        XCTAssertEqual(result.validation, BYOKeyResult.invalid)
+    }
+
+    /// R4 — clearing a key issues `--clear-key <vendor>` (no secret involved).
+    func testClearBYOKeyIssuesExpectedArgv() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        _ = await controller.clearBYOKey(vendor: "gemini")
+
+        XCTAssertTrue(fake.calls.contains(
+            ["settings", "intelligence", "--clear-key", "gemini", "--json"]
+        ))
+    }
+
+    /// R3 — a stored key never appears in the read-back; only a presence flag.
+    /// The decoded settings carry the boolean, and nothing key-shaped.
+    func testReadBackExposesPresenceFlagNotKeyValue() {
+        let settings = decode(envelope(openaiKey: true, geminiCli: true))
+        XCTAssertTrue(settings.openaiKeyPresent)
+        XCTAssertTrue(settings.geminiCliAvailable)
+        XCTAssertFalse(settings.anthropicKeyPresent)
+        // The struct has no property that could hold a key value.
+        XCTAssertTrue(settings.keyPresent(forVendor: "openai"))
+        XCTAssertFalse(settings.keyPresent(forVendor: "anthropic"))
+    }
+
+    // MARK: - U7 honest-copy audit (R12) + separation (R9)
+
+    /// R12 — no forbidden marketing string appears anywhere in the BYO copy:
+    /// no "end-to-end encryption" / "we can't see it" / "free unlimited". This
+    /// is the honesty gate for the whole user-owned surface.
+    func testHonestCopyAuditNoForbiddenStrings() {
+        var corpus: [String] = [
+            ConnectProviderModel.hostedSectionTitle,
+            ConnectProviderModel.hostedSectionCaption,
+            ConnectProviderModel.userOwnedSectionTitle,
+            ConnectProviderModel.userOwnedSectionCaption,
+        ]
+        for vendor in ConnectProviderModel.vendors {
+            corpus.append(vendor.keyBillingCopy)
+            corpus.append(vendor.cliLimitsCopy)
+            corpus.append(vendor.cliFixGuidance)
+        }
+        let haystack = corpus.joined(separator: " ").lowercased()
+
+        let forbidden = [
+            "end-to-end encryption", "end to end encryption", "e2ee",
+            "we can't see", "we cannot see", "we can't watch", "we can’t see",
+            "free unlimited", "unlimited free", "unlimited usage",
+        ]
+        for phrase in forbidden {
+            XCTAssertFalse(
+                haystack.contains(phrase),
+                "BYO copy must not promise '\(phrase)' (R12 honesty gate)"
+            )
+        }
+    }
+
+    /// R12 — the Gemini free-tier rate limit is surfaced plainly in its CLI copy.
+    func testGeminiCopyMentionsFreeTierLimits() {
+        let copy = BYOVendor.gemini.cliLimitsCopy.lowercased()
+        XCTAssertTrue(copy.contains("rate-limit") || copy.contains("requests/min")
+                      || copy.contains("per day") || copy.contains("/day"),
+                      "Gemini's free-tier caps must be stated plainly (R12)")
+    }
+
+    /// R9 — the hosted and user-owned sections have distinct whose-bill captions.
+    func testHostedAndUserOwnedSectionsAreDistinct() {
+        XCTAssertNotEqual(
+            ConnectProviderModel.hostedSectionTitle,
+            ConnectProviderModel.userOwnedSectionTitle
+        )
+        XCTAssertTrue(ConnectProviderModel.hostedSectionCaption.lowercased()
+            .contains("personal cloud subscription"),
+            "hosted caption names the ScreenCap subscription (whose bill, R9)")
+        XCTAssertTrue(ConnectProviderModel.userOwnedSectionCaption.lowercased()
+            .contains("your account") || ConnectProviderModel.userOwnedSectionCaption.lowercased()
+            .contains("your bill"),
+            "user-owned caption names the user's own account/bill (R9)")
     }
 }

@@ -32,6 +32,20 @@ struct IntelligenceSettings: Decodable, Equatable {
     /// SCR-239 — whether the downloadable model is installed on this Mac.
     let downloadedModelInstalled: Bool
 
+    /// BYO cloud (U2) — whether a stored API key exists for each vendor. A
+    /// *presence flag only*; the CLI never echoes the key value (R3). Drives the
+    /// "connected / not connected" state of each BYO-key row in the connect flow.
+    let openaiKeyPresent: Bool
+    let anthropicKeyPresent: Bool
+    let geminiKeyPresent: Bool
+
+    /// BYO cloud (U4) — whether each vendor's delegation CLI is available
+    /// (binary resolves AND an auth artifact exists; existence/stat only, KTD1).
+    /// Drives the available / needs-attention state of each `*-cli` row (R5/R13).
+    let openaiCliAvailable: Bool
+    let anthropicCliAvailable: Bool
+    let geminiCliAvailable: Bool
+
     enum CodingKeys: String, CodingKey {
         case provider
         case cloudProvider = "cloud_provider"
@@ -42,13 +56,23 @@ struct IntelligenceSettings: Decodable, Equatable {
         case localServerEndpoint = "local_server_endpoint"
         case endpointClassification = "endpoint_classification"
         case downloadedModelInstalled = "downloaded_model_installed"
+        case openaiKeyPresent = "openai_key_present"
+        case anthropicKeyPresent = "anthropic_key_present"
+        case geminiKeyPresent = "gemini_key_present"
+        case openaiCliAvailable = "openai_cli_available"
+        case anthropicCliAvailable = "anthropic_cli_available"
+        case geminiCliAvailable = "gemini_cli_available"
     }
 
     init(
         provider: String, cloudProvider: String?, summaryCloudConsent: Bool,
         recallCloudConsent: Bool, daySplitCloudConsent: Bool, framesCloudConsent: Bool,
         localServerEndpoint: String? = nil, endpointClassification: String? = nil,
-        downloadedModelInstalled: Bool = false
+        downloadedModelInstalled: Bool = false,
+        openaiKeyPresent: Bool = false, anthropicKeyPresent: Bool = false,
+        geminiKeyPresent: Bool = false,
+        openaiCliAvailable: Bool = false, anthropicCliAvailable: Bool = false,
+        geminiCliAvailable: Bool = false
     ) {
         self.provider = provider
         self.cloudProvider = cloudProvider
@@ -59,6 +83,12 @@ struct IntelligenceSettings: Decodable, Equatable {
         self.localServerEndpoint = localServerEndpoint
         self.endpointClassification = endpointClassification
         self.downloadedModelInstalled = downloadedModelInstalled
+        self.openaiKeyPresent = openaiKeyPresent
+        self.anthropicKeyPresent = anthropicKeyPresent
+        self.geminiKeyPresent = geminiKeyPresent
+        self.openaiCliAvailable = openaiCliAvailable
+        self.anthropicCliAvailable = anthropicCliAvailable
+        self.geminiCliAvailable = geminiCliAvailable
     }
 
     init(from decoder: Decoder) throws {
@@ -73,6 +103,13 @@ struct IntelligenceSettings: Decodable, Equatable {
         endpointClassification = try c.decodeIfPresent(String.self, forKey: .endpointClassification)
         downloadedModelInstalled =
             try c.decodeIfPresent(Bool.self, forKey: .downloadedModelInstalled) ?? false
+        // BYO fields — `decodeIfPresent` so an older CLI (schema < 3) still decodes.
+        openaiKeyPresent = try c.decodeIfPresent(Bool.self, forKey: .openaiKeyPresent) ?? false
+        anthropicKeyPresent = try c.decodeIfPresent(Bool.self, forKey: .anthropicKeyPresent) ?? false
+        geminiKeyPresent = try c.decodeIfPresent(Bool.self, forKey: .geminiKeyPresent) ?? false
+        openaiCliAvailable = try c.decodeIfPresent(Bool.self, forKey: .openaiCliAvailable) ?? false
+        anthropicCliAvailable = try c.decodeIfPresent(Bool.self, forKey: .anthropicCliAvailable) ?? false
+        geminiCliAvailable = try c.decodeIfPresent(Bool.self, forKey: .geminiCliAvailable) ?? false
     }
 }
 
@@ -226,6 +263,137 @@ final class IntelligenceController: ObservableObject {
             return false
         }
     }
+
+    // MARK: - BYO cloud writes (U6)
+
+    /// Persist the consented cloud fallback provider (`[intelligence].cloud_provider`),
+    /// or clear it with `"none"`. This is the key a BYO provider is selected under
+    /// — NOT the active `provider` (KTD2): a BYO id can never be the active/day-split
+    /// provider, and the daemon rejects `provider set <byo-id>` outright. Reconciles
+    /// against disk so the picker reflects what actually persisted. Returns success
+    /// so the pane can surface an inline error.
+    @discardableResult
+    func setCloudProvider(_ value: String?) async -> Bool {
+        let arg = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            _ = try await invoke([
+                "settings", "intelligence", "cloud_provider", "set",
+                (arg?.isEmpty ?? true) ? "none" : arg!, "--json",
+            ])
+            lastError = nil
+            await refresh()
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            await refresh()
+            return false
+        }
+    }
+
+    /// Store a BYO API key for `vendor` (`openai` | `anthropic` | `gemini`),
+    /// validating it against the vendor first. The secret is piped to the CLI's
+    /// STDIN — never an argv element (KTD3) — via `runJSONRawStdin`. Returns a
+    /// `BYOKeyResult` carrying the store outcome + validation verdict
+    /// (valid / invalid / unknown) so the pane can show store-only-if-valid
+    /// feedback; the daemon refuses to store an `invalid` key. On success the
+    /// pane should re-select the vendor as `cloud_provider`. Reconciles against
+    /// disk so the `*_key_present` flag reflects reality.
+    ///
+    /// `injectInvoke` is a test seam: the default path shells to the bundled CLI
+    /// with the key on stdin; tests substitute a fake that records the argv +
+    /// stdin without spawning a process.
+    @discardableResult
+    func setBYOKey(
+        vendor: String,
+        key: String,
+        validate: Bool = true,
+        injectInvoke: (@Sendable ([String], Data) async throws -> Data)? = nil
+    ) async -> BYOKeyResult {
+        var args = ["settings", "intelligence", "--set-key", vendor]
+        if validate { args.append("--validate") }
+        args.append("--json")
+        let stdinData = Data(key.utf8)
+        do {
+            let data: Data
+            if let injectInvoke {
+                data = try await injectInvoke(args, stdinData)
+            } else {
+                data = try await CLIClient.runJSONRawStdin(args, stdin: stdinData)
+            }
+            let result = (try? JSONDecoder().decode(BYOKeyResult.self, from: data))
+                ?? BYOKeyResult(ok: false, keyPresent: false, validation: nil, error: "decode_failed")
+            lastError = result.ok ? nil : (result.error ?? "the key couldn't be stored.")
+            await refresh()
+            return result
+        } catch {
+            // A non-zero exit (e.g. an invalid key the daemon rejected) surfaces
+            // as a thrown CLIError whose stderr the CLI already redacted of the
+            // key; try to recover the JSON envelope the CLI still emits on stdout.
+            lastError = error.localizedDescription
+            await refresh()
+            return BYOKeyResult(
+                ok: false, keyPresent: false, validation: nil,
+                error: error.localizedDescription
+            )
+        }
+    }
+
+    /// Remove a stored BYO API key for `vendor`. If that vendor's key-based id is
+    /// the currently-selected `cloud_provider`, the caller should also clear the
+    /// selection. Reconciles against disk. Returns success for inline errors.
+    @discardableResult
+    func clearBYOKey(vendor: String) async -> Bool {
+        do {
+            _ = try await invoke([
+                "settings", "intelligence", "--clear-key", vendor, "--json",
+            ])
+            lastError = nil
+            await refresh()
+            return true
+        } catch {
+            lastError = error.localizedDescription
+            await refresh()
+            return false
+        }
+    }
+}
+
+/// The decoded result of a BYO `--set-key` write. `validation` is the vendor's
+/// verdict: `"valid"` (confirmed), `"invalid"` (rejected — not stored), or
+/// `"unknown"` (couldn't reach the vendor — stored anyway, surfaced as unverified),
+/// or nil when validation was skipped.
+struct BYOKeyResult: Decodable, Equatable {
+    let ok: Bool
+    let keyPresent: Bool
+    let validation: String?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case keyPresent = "key_present"
+        case validation
+        case error
+    }
+
+    init(ok: Bool, keyPresent: Bool, validation: String?, error: String?) {
+        self.ok = ok
+        self.keyPresent = keyPresent
+        self.validation = validation
+        self.error = error
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+        keyPresent = try c.decodeIfPresent(Bool.self, forKey: .keyPresent) ?? false
+        validation = try c.decodeIfPresent(String.self, forKey: .validation)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    /// Verdict constants mirroring `screencap.segmentation.secrets`.
+    static let valid = "valid"
+    static let invalid = "invalid"
+    static let unknown = "unknown"
 }
 
 extension IntelligenceSettings {
@@ -240,7 +408,13 @@ extension IntelligenceSettings {
             framesCloudConsent: framesCloudConsent,
             localServerEndpoint: localServerEndpoint,
             endpointClassification: endpointClassification,
-            downloadedModelInstalled: downloadedModelInstalled
+            downloadedModelInstalled: downloadedModelInstalled,
+            openaiKeyPresent: openaiKeyPresent,
+            anthropicKeyPresent: anthropicKeyPresent,
+            geminiKeyPresent: geminiKeyPresent,
+            openaiCliAvailable: openaiCliAvailable,
+            anthropicCliAvailable: anthropicCliAvailable,
+            geminiCliAvailable: geminiCliAvailable
         )
     }
 
@@ -256,7 +430,35 @@ extension IntelligenceSettings {
             framesCloudConsent: framesCloudConsent,
             localServerEndpoint: localServerEndpoint,
             endpointClassification: endpointClassification,
-            downloadedModelInstalled: downloadedModelInstalled
+            downloadedModelInstalled: downloadedModelInstalled,
+            openaiKeyPresent: openaiKeyPresent,
+            anthropicKeyPresent: anthropicKeyPresent,
+            geminiKeyPresent: geminiKeyPresent,
+            openaiCliAvailable: openaiCliAvailable,
+            anthropicCliAvailable: anthropicCliAvailable,
+            geminiCliAvailable: geminiCliAvailable
         )
+    }
+
+    /// Convenience — the presence flag for a BYO-key vendor id
+    /// (`openai`/`anthropic`/`gemini`), or false for an unknown id.
+    func keyPresent(forVendor vendor: String) -> Bool {
+        switch vendor {
+        case "openai": return openaiKeyPresent
+        case "anthropic": return anthropicKeyPresent
+        case "gemini": return geminiKeyPresent
+        default: return false
+        }
+    }
+
+    /// Convenience — the availability flag for a BYO CLI id
+    /// (`openai-cli`/`anthropic-cli`/`gemini-cli`), or false for an unknown id.
+    func cliAvailable(forProviderID id: String) -> Bool {
+        switch id {
+        case "openai-cli": return openaiCliAvailable
+        case "anthropic-cli": return anthropicCliAvailable
+        case "gemini-cli": return geminiCliAvailable
+        default: return false
+        }
     }
 }

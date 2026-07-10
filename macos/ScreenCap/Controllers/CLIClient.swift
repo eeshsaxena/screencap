@@ -188,22 +188,63 @@ enum CLIClient {
         return stdoutBytes
     }
 
+    /// Like `runJSONRaw` but pipes `stdin` to the child's standard input, for
+    /// commands whose secret payload must NOT transit argv (KTD3 — argv is
+    /// world-readable via `ps`). The BYO `settings intelligence --set-key`
+    /// path reads the API key from stdin; the key is written to the pipe here
+    /// and never appears in `arguments`. Returns raw stdout bytes.
+    ///
+    /// The stdin pipe replaces the usual `/dev/null` stdin; the CLI's
+    /// `--set-key` handler explicitly reads stdin (it does not gate on a TTY
+    /// prompt), so the LLDB-pty concern that motivates `/dev/null` elsewhere
+    /// does not apply on this path.
+    ///
+    /// Non-zero exit is tolerated and the stdout envelope returned, because the
+    /// BYO `--set-key --validate` path exits non-zero on an *invalid* key while
+    /// still emitting a JSON `{"ok":false,"validation":"invalid",...}` envelope
+    /// the caller must decode to distinguish "rejected key" from "launch/crash".
+    static func runJSONRawStdin(
+        _ args: [String], stdin: Data, timeout: TimeInterval = 10
+    ) async throws -> Data {
+        assert(args.contains("--json"), "runJSONRawStdin requires the caller to pass --json explicitly. args=\(args)")
+        let (stdoutBytes, _) = try await runOneShot(
+            args, timeout: timeout, stdin: stdin, allowNonZeroExit: true
+        )
+        return stdoutBytes
+    }
+
     /// Spawn + drain + race timeout. Returns (stdout, stderr); throws on
     /// launch failure, timeout, or non-zero exit. Shared backbone for
     /// `runJSON` and `runAwaitingExit` so the timeout / pipe-drain logic
     /// only lives in one place.
-    private static func runOneShot(_ args: [String], timeout: TimeInterval) async throws -> (Data, Data) {
+    private static func runOneShot(
+        _ args: [String], timeout: TimeInterval, stdin: Data? = nil,
+        allowNonZeroExit: Bool = false
+    ) async throws -> (Data, Data) {
         let (executable, leading) = try resolveBinary()
         let process = Process()
         process.executableURL = executable
         process.arguments = leading + args
         process.environment = mergedEnv()
-        // /dev/null on stdin so the child's `sys.stdin.isatty()` returns false.
-        // SwiftUI is non-interactive, but Xcode's Run launches the app under
-        // LLDB which exposes a pty as stdin — without this, the inherited fd
-        // looks like a real terminal and the recorder's `if isatty(): prompt`
-        // guards bypass, blocking forever on `click.confirm` / `click.prompt`.
-        process.standardInput = FileHandle.nullDevice
+
+        // Default: /dev/null on stdin so the child's `sys.stdin.isatty()`
+        // returns false. SwiftUI is non-interactive, but Xcode's Run launches
+        // the app under LLDB which exposes a pty as stdin — without this, the
+        // inherited fd looks like a real terminal and the recorder's
+        // `if isatty(): prompt` guards bypass, blocking forever on
+        // `click.confirm` / `click.prompt`.
+        //
+        // When `stdin` is supplied (the BYO --set-key secret path, KTD3), pipe
+        // it instead: the CLI reads the key off stdin so it never transits argv.
+        let stdinPipe: Pipe?
+        if stdin != nil {
+            let pipe = Pipe()
+            process.standardInput = pipe
+            stdinPipe = pipe
+        } else {
+            process.standardInput = FileHandle.nullDevice
+            stdinPipe = nil
+        }
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -214,6 +255,18 @@ enum CLIClient {
             try process.run()
         } catch {
             throw CLIError.launchFailed(underlying: error)
+        }
+
+        // Write the secret and close the write end so the child sees EOF and
+        // its `sys.stdin.read()` returns. Done off the main path to avoid a
+        // deadlock if the payload ever exceeds the pipe buffer. A close-error
+        // is harmless — if the child already exited we still drain stdout below.
+        if let stdinPipe, let payload = stdin {
+            let handle = stdinPipe.fileHandleForWriting
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? handle.write(contentsOf: payload)
+                try? handle.close()
+            }
         }
 
         // SIGTERM the child if the awaiting Task is cancelled — e.g. the review
@@ -241,7 +294,7 @@ enum CLIClient {
             }
 
             let exitCode = process.terminationStatus
-            if exitCode != 0 {
+            if exitCode != 0 && !allowNonZeroExit {
                 let errText = String(data: stderrBytes, encoding: .utf8) ?? "<binary>"
                 throw CLIError.nonZeroExit(code: exitCode, stderr: errText)
             }
