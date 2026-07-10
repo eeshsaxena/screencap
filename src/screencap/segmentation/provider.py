@@ -96,10 +96,18 @@ class LLMProvider(Protocol):
 def get_provider(name: str) -> LLMProvider:
     """Return the backend for ``name`` (the factory / registry seam).
 
-    ``"gemini"`` → :class:`~screencap.segmentation.providers.gemini.GeminiProvider`.
+    ``"gemini"`` → :class:`~screencap.segmentation.providers.gemini.GeminiProvider`
+    (the reconciled BYO-key Gemini, R10).
+    ``"openai"`` / ``"anthropic"`` → the BYO API-key backends
+    (:class:`~screencap.segmentation.providers.openai.OpenAIProvider` /
+    :class:`~screencap.segmentation.providers.anthropic.AnthropicProvider`), thin
+    HTTP against the user's own account.
     ``"on-device"`` →
     :class:`~screencap.segmentation.providers.ondevice.OnDeviceProvider` (the
-    Apple Foundation Models Swift-helper subprocess client). Any other name is
+    Apple Foundation Models Swift-helper subprocess client).
+    ``"openai-cli"`` / ``"anthropic-cli"`` / ``"gemini-cli"`` →
+    :class:`~screencap.segmentation.providers.cli_delegate.CliDelegateProvider`
+    (BYO delegation to the user's installed vendor CLI). Any other name is
     rejected with a clear :class:`ValueError`.
 
     Backend modules are imported lazily so this factory (and the interface
@@ -108,7 +116,10 @@ def get_provider(name: str) -> LLMProvider:
     if name == "gemini":
         from screencap.segmentation.providers.gemini import GeminiProvider
 
-        return GeminiProvider()
+        # LOCAL BYO path: require the summary to be privacy-stripped (R7/R8),
+        # mirroring the openai/anthropic/cli_delegate siblings. The Cloud Run
+        # caller constructs GeminiProvider() directly (require_stripped=False).
+        return GeminiProvider(require_stripped=True)
     if name == "on-device":
         from screencap.segmentation.providers.ondevice import OnDeviceProvider
 
@@ -121,7 +132,24 @@ def get_provider(name: str) -> LLMProvider:
         from screencap.segmentation.providers.local_server import LocalServerProvider
 
         return LocalServerProvider()
+    if name == "openai":
+        # BYO API-key backend (U3): the user's own OpenAI account over thin HTTP.
+        from screencap.segmentation.providers.openai import OpenAIProvider
+
+        return OpenAIProvider()
+    if name == "anthropic":
+        # BYO API-key backend (U3): the user's own Anthropic account over thin HTTP.
+        from screencap.segmentation.providers.anthropic import AnthropicProvider
+
+        return AnthropicProvider()
+    if name in ("openai-cli", "anthropic-cli", "gemini-cli"):
+        # BYO CLI-delegation backends (U4): shell out to the user's installed
+        # ``codex`` / ``claude`` / ``gemini`` CLI. Cloud-fallback ids only.
+        from screencap.segmentation.providers.cli_delegate import CliDelegateProvider
+
+        return CliDelegateProvider(name)
     raise ValueError(
-        f"Unknown LLM provider: {name!r}. "
-        "Known providers: 'gemini', 'on-device', 'downloaded', 'local-server'."
+        f"Unknown LLM provider: {name!r}. Known providers: 'gemini', 'openai', "
+        "'anthropic', 'on-device', 'downloaded', 'local-server', 'openai-cli', "
+        "'anthropic-cli', 'gemini-cli'."
     )

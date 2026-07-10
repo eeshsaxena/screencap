@@ -632,11 +632,24 @@ def get_local_server_endpoint() -> str | None:
 #: construct are accepted; the CLI rejects anything else.
 _VALID_LLM_PROVIDERS = ("on-device", "gemini", "downloaded", "local-server")
 
-#: The cloud backend a consented fallback may use
-#: (``[intelligence].cloud_provider``). Only Gemini ships as a cloud backend in
-#: this plan; the interface accommodates more, but the CLI refuses to persist a
-#: cloud provider the daemon cannot run.
-_VALID_CLOUD_PROVIDERS = ("gemini",)
+#: The cloud backends a consented fallback may use
+#: (``[intelligence].cloud_provider``). Each is a bring-your-own account: an
+#: API-key backend (``gemini`` / ``openai`` / ``anthropic``) or a CLI-delegation
+#: backend (``*-cli``) that shells out to the user's already-signed-in provider
+#: CLI. BYO providers are cloud-fallback targets **only** — deliberately absent
+#: from :data:`_VALID_LLM_PROVIDERS`, because a non-on-device *active* provider
+#: never day-splits (``routing.build_day_split_provider`` routes it to
+#: Unavailable); a BYO provider only ever runs as the consented ``cloud_provider``
+#: fallback. The CLI still refuses to persist a cloud provider the daemon cannot
+#: run.
+_VALID_CLOUD_PROVIDERS = (
+    "gemini",
+    "openai",
+    "anthropic",
+    "openai-cli",
+    "anthropic-cli",
+    "gemini-cli",
+)
 
 #: The cloud-consent rows, keyed by their CLI/`[intelligence]` name → the
 #: getter that reads them back. Only summary/title and recall-answer may be

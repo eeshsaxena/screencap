@@ -11,6 +11,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Ignore SIGPIPE process-wide. `CLIClient.runOneShot` writes a BYO-key
+        // secret to the child's stdin on a background queue; if the child has
+        // already closed its read end (early exit / crash), that write would
+        // otherwise raise SIGPIPE and terminate the whole app. Handling the
+        // write error at the call site isn't enough — the signal fires first.
+        signal(SIGPIPE, SIG_IGN)
+
         // The design system is light-only (U1: the warm palette is authored as
         // universal color sets with no dark variant), so pin the Aqua
         // appearance app-wide — otherwise native chrome (title bars, menus,

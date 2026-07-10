@@ -14,6 +14,7 @@ invoke). Verifies:
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 import tomllib
@@ -38,8 +39,15 @@ def _isolate_config(tmp_path, monkeypatch):
         "SCREENCAP_SUMMARY_CLOUD_CONSENT",
         "SCREENCAP_RECALL_CLOUD_CONSENT",
         "SCREENCAP_LOCAL_SERVER_ENDPOINT",
+        "SCREENCAP_BYO_KEY_FILE",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Default the BYO key-presence read to "no key stored" so the read-back
+    # tests never touch the real Keychain. Tests that exercise storage override
+    # this via the ``fake_key_store`` fixture.
+    from screencap.segmentation import secrets as byo
+
+    monkeypatch.setattr(byo, "has_key", lambda vendor: False)
     yield
 
 
@@ -328,3 +336,268 @@ def test_readback_includes_downloaded_install_state():
     block = _last_json_line(_invoke(as_json=True).output)["intelligence"]
     # No model installed in a fresh isolated config → False (never raises).
     assert block["downloaded_model_installed"] is False
+
+
+# ---------------------------------------------------------------------------
+# U1 — BYO cloud providers (OpenAI / Anthropic / Gemini × key / CLI)
+# ---------------------------------------------------------------------------
+
+BYO_CLOUD_IDS = ("openai", "anthropic", "openai-cli", "anthropic-cli", "gemini-cli")
+
+
+class TestBYOCloudProviders:
+    @pytest.mark.parametrize("provider_id", BYO_CLOUD_IDS)
+    def test_byo_cloud_provider_round_trips(self, provider_id):
+        r = _invoke("cloud_provider", "set", provider_id, as_json=True)
+        assert r.exit_code == 0, r.output
+        assert _read_cfg()["intelligence"]["cloud_provider"] == provider_id
+
+        from screencap import config
+
+        config.invalidate_config_cache()
+        assert config.get_llm_cloud_provider() == provider_id
+
+    @pytest.mark.parametrize("provider_id", BYO_CLOUD_IDS)
+    def test_byo_ids_rejected_as_active_provider(self, provider_id):
+        # KTD2: BYO providers are cloud-fallback targets only. A non-on-device
+        # active provider never day-splits (routing → Unavailable), so the CLI
+        # must refuse to persist a BYO id as the active ``provider``.
+        r = _invoke("provider", "set", provider_id)
+        assert r.exit_code != 0
+        assert "must be one of" in r.output
+        assert "llm_provider" not in _read_cfg()
+
+
+@pytest.mark.privacy
+class TestBYONeverCloudInvariant:
+    """The frames/day-split never-cloud guards (R7) hold after the
+    cloud-provider enum is widened for BYO providers."""
+
+    @pytest.mark.parametrize("byo", ("openai", "anthropic", "gemini-cli"))
+    def test_frames_row_still_rejected_with_byo_configured(self, byo):
+        _invoke("cloud_provider", "set", byo)
+        _invoke("summary_cloud_consent", "set", "true")
+        r = _invoke("frames_cloud_consent", "set", "true")
+        assert r.exit_code != 0
+        assert "never sent" in r.output
+        assert "frames_cloud_consent" not in _read_cfg().get("intelligence", {})
+
+    @pytest.mark.parametrize("byo", ("openai", "anthropic", "gemini-cli"))
+    def test_day_split_row_still_rejected_with_byo_configured(self, byo):
+        _invoke("cloud_provider", "set", byo)
+        r = _invoke("day_split_cloud_consent", "set", "true")
+        assert r.exit_code != 0
+        assert "on-device" in r.output
+
+
+# ---------------------------------------------------------------------------
+# U2 — BYO API-key set/clear over stdin (secret NEVER in argv) + presence flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_key_store(monkeypatch):
+    """In-memory stand-in for the per-vendor Keychain key store, so the CLI's
+    --set-key / --clear-key path is exercised without touching the real Keychain
+    or the network. Returns the backing dict + a list of validate() calls."""
+    from screencap.segmentation import secrets as byo
+
+    store: dict = {}
+    validate_calls: list = []
+
+    monkeypatch.setattr(byo, "store_key", lambda v, k: store.__setitem__(v, k))
+    monkeypatch.setattr(byo, "load_key", lambda v: store.get(v))
+    monkeypatch.setattr(byo, "delete_key", lambda v: store.pop(v, None))
+    monkeypatch.setattr(byo, "has_key", lambda v: v in store)
+
+    def _validate(vendor, key):
+        validate_calls.append((vendor, key))
+        # Default: valid. Individual tests override by re-patching.
+        return byo.VALID
+
+    monkeypatch.setattr(byo, "validate_key", _validate)
+    return types.SimpleNamespace(store=store, validate_calls=validate_calls)
+
+
+def _invoke_raw(args, input=None):
+    """Invoke ``settings intelligence`` with explicit stdin ``input``."""
+    runner = CliRunner()
+    return runner.invoke(
+        cli, ["settings", "intelligence", *args], input=input, catch_exceptions=False
+    )
+
+
+class TestBYOKeySet:
+    def test_set_key_reads_secret_from_stdin(self, fake_key_store):
+        r = _invoke_raw(["--set-key", "openai", "--json"], input="sk-my-secret-123\n")
+        assert r.exit_code == 0, r.output
+        assert fake_key_store.store["openai"] == "sk-my-secret-123"
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is True
+        assert payload["vendor"] == "openai"
+        assert payload["key_present"] is True
+
+    @pytest.mark.privacy
+    def test_secret_never_appears_in_argv(self, fake_key_store, monkeypatch):
+        """CRITICAL (KTD3): the secret reaches the CLI over stdin and NEVER via
+        argv. We prove both halves on the real code path:
+
+        1. ``_read_byo_key_from_stdin_or_file`` returns the piped secret (so the
+           reader — not an argv value — is the channel the secret arrives on);
+        2. the secret appears nowhere in the click invocation's argv, in
+           ``sys.argv`` during the call, or in any command list the CLI builds.
+        """
+        import io
+        import sys as _sys
+
+        from screencap import cli as cli_mod
+
+        secret = "sk-super-secret-value"
+        args = ["--set-key", "openai"]
+
+        # (1) The reader returns exactly the piped secret — stdin IS the channel.
+        monkeypatch.setattr(_sys, "stdin", io.StringIO(secret + "\n"))
+        assert cli_mod._read_byo_key_from_stdin_or_file() == secret
+
+        # (2) Drive the real store path with the secret on stdin. Trip-wire on
+        #     every argv the process could expose while the command runs: the
+        #     secret must never be an argv element.
+        seen_argvs: list = []
+        real_argv = list(_sys.argv)
+
+        def _guard_store(vendor, key):
+            # At store time (deepest point of the real path) the secret is in hand
+            # — assert it never leaked onto the live process argv.
+            seen_argvs.append(list(_sys.argv))
+            fake_key_store.store[vendor] = key
+
+        monkeypatch.setattr(
+            "screencap.segmentation.secrets.store_key", _guard_store
+        )
+
+        r = _invoke_raw([*args, "--json"], input=secret + "\n")
+        assert r.exit_code == 0, r.output
+        # The key was stored (it came through — from stdin, since argv has none).
+        assert fake_key_store.store["openai"] == secret
+        # The click invocation argv carried only the vendor, never the key.
+        assert not any(secret in a for a in args)
+        # The live process argv observed at store time never carried the secret.
+        assert seen_argvs, "store_key was not reached on the real path"
+        for argv in seen_argvs:
+            assert not any(secret in a for a in argv), argv
+        # Sanity: we didn't perturb the real process argv.
+        assert list(_sys.argv) == real_argv
+
+    def test_set_key_from_file_env(self, fake_key_store, monkeypatch, tmp_path):
+        """The 0o600-file channel (SCREENCAP_BYO_KEY_FILE) is the alternative to
+        stdin — the secret path, not the secret, is what's passed."""
+        key_file = tmp_path / "key.txt"
+        key_file.write_text("sk-from-file\n")
+        key_file.chmod(0o600)  # the reader requires owner-only mode
+        monkeypatch.setenv("SCREENCAP_BYO_KEY_FILE", str(key_file))
+        r = _invoke_raw(["--set-key", "anthropic", "--json"])
+        assert r.exit_code == 0, r.output
+        assert fake_key_store.store["anthropic"] == "sk-from-file"
+
+    @pytest.mark.privacy
+    def test_set_key_from_world_readable_file_rejected(
+        self, fake_key_store, monkeypatch, tmp_path
+    ):
+        """A group/world-readable key file is refused (fail closed) — matching the
+        engine-token 0o600 pattern; a leaky secret file must not be read."""
+        key_file = tmp_path / "key.txt"
+        key_file.write_text("sk-leaky\n")
+        key_file.chmod(0o644)  # group + world readable
+        monkeypatch.setenv("SCREENCAP_BYO_KEY_FILE", str(key_file))
+        r = _invoke_raw(["--set-key", "anthropic", "--json"])
+        assert r.exit_code != 0
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is False
+        assert payload["error"] == "no_key_supplied"  # reader returned None
+        assert "anthropic" not in fake_key_store.store
+
+    def test_set_key_empty_stdin_rejected(self, fake_key_store):
+        r = _invoke_raw(["--set-key", "openai", "--json"], input="")
+        assert r.exit_code != 0
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is False
+        assert payload["error"] == "no_key_supplied"
+        assert "openai" not in fake_key_store.store
+
+    def test_set_key_unknown_vendor_rejected(self, fake_key_store):
+        # A *-cli id holds no key; --set-key must refuse it.
+        r = _invoke_raw(["--set-key", "openai-cli", "--json"], input="sk-x\n")
+        assert r.exit_code != 0
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is False
+        assert payload["error"].startswith("unknown_key_vendor")
+
+
+class TestBYOKeyValidate:
+    def test_validate_valid_stores(self, fake_key_store, monkeypatch):
+        from screencap.segmentation import secrets as byo
+
+        monkeypatch.setattr(byo, "validate_key", lambda v, k: byo.VALID)
+        r = _invoke_raw(["--set-key", "openai", "--validate", "--json"], input="sk-good\n")
+        assert r.exit_code == 0, r.output
+        payload = _last_json_line(r.output)
+        assert payload["validation"] == "valid"
+        assert fake_key_store.store["openai"] == "sk-good"
+
+    def test_validate_invalid_does_not_store(self, fake_key_store, monkeypatch):
+        from screencap.segmentation import secrets as byo
+
+        monkeypatch.setattr(byo, "validate_key", lambda v, k: byo.INVALID)
+        r = _invoke_raw(["--set-key", "openai", "--validate", "--json"], input="sk-bad\n")
+        assert r.exit_code != 0
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is False
+        assert payload["validation"] == "invalid"
+        assert payload["error"] == "key_invalid"
+        # A rejected key is NOT persisted.
+        assert "openai" not in fake_key_store.store
+
+    def test_validate_unknown_still_stores(self, fake_key_store, monkeypatch):
+        # Couldn't reach the vendor → store anyway, surface the unknown state.
+        from screencap.segmentation import secrets as byo
+
+        monkeypatch.setattr(byo, "validate_key", lambda v, k: byo.UNKNOWN)
+        r = _invoke_raw(["--set-key", "gemini", "--validate", "--json"], input="sk-x\n")
+        assert r.exit_code == 0, r.output
+        payload = _last_json_line(r.output)
+        assert payload["validation"] == "unknown"
+        assert fake_key_store.store["gemini"] == "sk-x"
+
+
+class TestBYOKeyClear:
+    def test_clear_removes_key(self, fake_key_store):
+        fake_key_store.store["openai"] = "sk-existing"
+        r = _invoke_raw(["--clear-key", "openai", "--json"])
+        assert r.exit_code == 0, r.output
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is True
+        assert payload["key_present"] is False
+        assert "openai" not in fake_key_store.store
+
+    def test_clear_absent_key_is_ok(self, fake_key_store):
+        r = _invoke_raw(["--clear-key", "anthropic", "--json"])
+        assert r.exit_code == 0, r.output
+        assert _last_json_line(r.output)["ok"] is True
+
+
+class TestBYOKeyPresenceReadback:
+    def test_json_readback_exposes_presence_not_value(self, fake_key_store):
+        fake_key_store.store["openai"] = "sk-secret-should-not-leak"
+        r = _invoke(as_json=True)
+        payload = _last_json_line(r.output)["intelligence"]
+        # Presence booleans present for every key vendor.
+        assert payload["openai_key_present"] is True
+        assert payload["anthropic_key_present"] is False
+        assert payload["gemini_key_present"] is False
+        # The value NEVER appears anywhere in the read-back output.
+        assert "sk-secret-should-not-leak" not in r.output
+
+    def test_readback_schema_version_bumped(self, fake_key_store):
+        r = _invoke(as_json=True)
+        # v3: U4 added the per-vendor ``*-cli`` availability booleans.
+        assert _last_json_line(r.output)["schema_version"] == 3

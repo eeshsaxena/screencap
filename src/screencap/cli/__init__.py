@@ -60,7 +60,13 @@ _SETTINGS_SCHEMA_VERSION = 2
 # provider / cloud provider / per-task consent rows), read by the Swift
 # Intelligence pane (U9) to reconcile its optimistic toggles. SCR local-first
 # intelligence, U8.
-_SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 1
+# v2 (BYO cloud, U2): adds per-vendor ``<vendor>_key_present`` booleans so the
+# Swift pane can render "connected" without ever seeing a key. Additive: every
+# v1 field is unchanged.
+# v3 (BYO cloud, U4): adds per-vendor ``<vendor>_cli_available`` booleans (the
+# ``*-cli`` delegation availability, existence/stat only) so the pane can render
+# each CLI option available / needs-attention (R5). Additive over v2.
+_SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 3
 _STOP_SCHEMA_VERSION = 1
 # `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed/
 # tier/trial_end), read by the SwiftUI shell to gate the Upload affordance on
@@ -3281,7 +3287,57 @@ def _build_intelligence_settings_block() -> dict:
         "local_server_endpoint": _redact_url(endpoint),
         "endpoint_classification": classify_endpoint(endpoint) if endpoint else None,
         "downloaded_model_installed": downloaded_installed,
+        # BYO API-key presence (U2). A per-vendor *presence boolean only* — the key
+        # value is NEVER exposed here (R3). ``*-cli`` delegation ids hold no key.
+        **_byo_key_presence(),
+        # BYO CLI-delegation availability (U4). A per-vendor *availability boolean*
+        # so the pane can render each ``*-cli`` option available / needs-attention
+        # (R5). Existence/stat only — never opens the vendor auth files (KTD1).
+        **_byo_cli_availability(),
     }
+
+
+def _byo_key_presence() -> dict:
+    """Return ``{"<vendor>_key_present": bool}`` for each BYO API-key vendor.
+
+    Presence only — the key value never appears in the read-back (R3). Fails
+    closed (a Keychain error reports ``False``) so a locked Keychain degrades the
+    flag rather than crashing the read. The whole map defaults to all-``False`` if
+    the secrets module can't be imported at all.
+    """
+    try:
+        from screencap.segmentation import secrets as byo_secrets
+    except Exception:
+        return {}
+    return {
+        f"{vendor}_key_present": byo_secrets.has_key(vendor)
+        for vendor in byo_secrets.KEY_VENDORS
+    }
+
+
+def _byo_cli_availability() -> dict:
+    """Return ``{"<vendor>_cli_available": bool}`` for each BYO CLI-delegation id.
+
+    Availability = the vendor CLI binary resolves AND a vendor auth artifact
+    exists on disk (existence/stat only — never reads the auth files, KTD1). The
+    Swift pane renders an unavailable option as needs-attention with an
+    install/sign-in path (R5). Fails closed (any error → ``False``) so a probe
+    failure degrades the flag rather than crashing the read; the whole map
+    defaults to empty if the module can't be imported.
+    """
+    try:
+        from screencap.segmentation.providers import cli_delegate
+    except Exception:
+        return {}
+    out: dict = {}
+    for vendor in cli_delegate.VENDOR_IDS:
+        # ``vendor`` is e.g. "openai-cli" → field "openai_cli_available".
+        field = vendor.replace("-", "_") + "_available"
+        try:
+            out[field] = cli_delegate.CliDelegateProvider(vendor).available()
+        except Exception:  # noqa: BLE001 — a probe error must not fail the read
+            out[field] = False
+    return out
 
 
 def _redact_url(url):
@@ -3300,6 +3356,60 @@ def _redact_url(url):
         return "<redacted>"
 
 
+# The out-of-band BYO-key delivery channel: a 0o600 file whose *path* (not the
+# secret) is passed via this env var, mirroring ``auth.ENGINE_TOKEN_FILE_ENV``.
+# The default key-set path reads the secret from **stdin**; this env var is the
+# alternative for a caller that would rather hand off a temp file. Either way the
+# secret NEVER transits argv (KTD3 — argv is world-readable via ``ps``).
+_BYO_KEY_FILE_ENV = "SCREENCAP_BYO_KEY_FILE"
+
+
+def _read_byo_key_from_stdin_or_file() -> str | None:
+    """Read a BYO API key from the :data:`_BYO_KEY_FILE_ENV` file, else stdin.
+
+    Returns the stripped key, or ``None`` if nothing was supplied (empty stdin /
+    missing-or-empty file). The secret is read from a 0o600 file path or piped on
+    stdin — **never** from an argv value (KTD3). A trailing newline (the shape a
+    ``echo`` / ``here-string`` pipe produces) is stripped.
+
+    The file channel is rejected unless it is **exactly mode 0o600** (owner
+    read/write only), matching the engine-token file pattern
+    (:data:`screencap.auth.ENGINE_TOKEN_FILE_ENV`): a world/group-readable secret
+    file is a leak, so we fail closed (``None``) rather than read it.
+    """
+    path = os.environ.get(_BYO_KEY_FILE_ENV)
+    if path:
+        import stat as _stat
+        from pathlib import Path
+
+        p = Path(path)
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        # Reject anything the group or world can read (or a non-regular file).
+        if not _stat.S_ISREG(st.st_mode) or (st.st_mode & 0o077):
+            from rich.console import Console
+
+            Console(stderr=True).print(
+                f"[red]Error:[/red] {_BYO_KEY_FILE_ENV} must point at a mode-0o600 "
+                "regular file (owner read/write only); refusing to read a "
+                "world/group-readable secret file."
+            )
+            return None
+        try:
+            raw = p.read_text()
+        except OSError:
+            return None
+        return raw.strip() or None
+    # Fall back to stdin. A TTY with nothing piped would block forever, so treat
+    # an interactive stdin as "no key supplied" rather than hang.
+    if sys.stdin.isatty():
+        return None
+    raw = sys.stdin.read()
+    return raw.strip() or None
+
+
 @settings.command("intelligence")
 @click.argument("row", required=False)
 @click.argument("op", required=False, type=click.Choice(["set"]))
@@ -3309,7 +3419,16 @@ def _redact_url(url):
               help="Emit the current intelligence settings as JSON (read-back "
                    "for the Swift pane), or the write result. Auto-detected "
                    "when stdout is not a TTY.")
-def settings_intelligence(row, op, value, as_json):
+@click.option("--set-key", "set_key_vendor", default=None,
+              help="Store a BYO API key for VENDOR (openai|anthropic|gemini). The "
+                   "key is read from stdin (or the SCREENCAP_BYO_KEY_FILE file) — "
+                   "NEVER from an argument. Add --validate to check it first.")
+@click.option("--clear-key", "clear_key_vendor", default=None,
+              help="Remove the stored BYO API key for VENDOR.")
+@click.option("--validate", "validate_key", is_flag=True,
+              help="With --set-key: validate the key against the vendor before "
+                   "storing (and report valid/invalid/unknown).")
+def settings_intelligence(row, op, value, as_json, set_key_vendor, clear_key_vendor, validate_key):
     """Show or change the Intelligence provider + per-task cloud consent.
 
     \b
@@ -3330,6 +3449,11 @@ def settings_intelligence(row, op, value, as_json):
       screencap settings intelligence summary_cloud_consent set true
       screencap settings intelligence recall_cloud_consent set false
 
+    \b
+    Store / clear a BYO API key (the key is read from STDIN, never argv):
+      printf %s "$KEY" | screencap settings intelligence --set-key openai --validate
+      screencap settings intelligence --clear-key openai
+
     Writes land in the ``[intelligence]`` section of config.toml through the
     same advisory-flock + tomlkit path as ``settings privacy``. Defense in
     depth over the U6 consent policy: the day-split/label row and the
@@ -3342,6 +3466,13 @@ def settings_intelligence(row, op, value, as_json):
     from screencap import config
 
     err_console = Console(stderr=True)
+
+    # --- BYO API-key management (secret over stdin/file, never argv) ---------
+    if set_key_vendor is not None or clear_key_vendor is not None:
+        _handle_byo_key(
+            set_key_vendor, clear_key_vendor, validate_key, as_json, err_console
+        )
+        return
 
     # --- Read-back: no positional args → emit the current settings ----------
     if row is None:
@@ -3521,6 +3652,99 @@ def _parse_intelligence_consent_bool(value: str) -> bool | None:
     if low in ("false", "0", "no", "off"):
         return False
     return None
+
+
+def _handle_byo_key(set_vendor, clear_vendor, validate, as_json, err_console) -> None:
+    """Store / clear a per-vendor BYO API key (U2).
+
+    The secret reaches this process over **stdin** (or the 0o600
+    ``SCREENCAP_BYO_KEY_FILE`` file) and is stored in the shared Keychain under a
+    per-vendor service name — it is **never** an argv value (KTD3) and is never
+    echoed back (the JSON result carries only a presence flag / validation
+    status, never the key). Exits non-zero on any error.
+    """
+    import json as _json
+
+    from screencap.segmentation import secrets as byo_secrets
+
+    def _emit(ok: bool, **fields) -> None:
+        if as_json:
+            sys.stdout.write(_json.dumps({
+                "ok": ok,
+                "schema_version": _SETTINGS_INTELLIGENCE_SCHEMA_VERSION,
+                **fields,
+            }) + "\n")
+            sys.stdout.flush()
+        if not ok:
+            raise SystemExit(1)
+
+    if set_vendor is not None and clear_vendor is not None:
+        err_console.print("[red]Error:[/red] pass only one of --set-key / --clear-key.")
+        _emit(False, error="set_and_clear_conflict")
+        return
+
+    vendor = (set_vendor or clear_vendor).strip()
+    if vendor not in byo_secrets.KEY_VENDORS:
+        err_console.print(
+            f"[red]Error:[/red] BYO API keys are only stored for "
+            f"{byo_secrets.KEY_VENDORS}; the *-cli providers hold no key. "
+            f"Got: {escape(str(vendor))}"
+        )
+        _emit(False, vendor=vendor, error=f"unknown_key_vendor:{vendor}")
+        return
+
+    # --- clear ---------------------------------------------------------------
+    if clear_vendor is not None:
+        try:
+            byo_secrets.delete_key(vendor)
+        except Exception as exc:  # noqa: BLE001 — surface a clean error, never the key
+            err_console.print(
+                f"[red]Error:[/red] couldn't clear the {escape(vendor)} key "
+                f"({type(exc).__name__})."
+            )
+            _emit(False, vendor=vendor, error="key_clear_failed")
+            return
+        err_console.print(f"  [bold]intelligence.{escape(vendor)}[/bold] key cleared")
+        _emit(True, vendor=vendor, key_present=False, cleared=True)
+        return
+
+    # --- set (read secret from stdin/file, optionally validate) --------------
+    key = _read_byo_key_from_stdin_or_file()
+    if not key:
+        err_console.print(
+            "[red]Error:[/red] no API key supplied — pipe it on stdin "
+            "(printf %s \"$KEY\" | ... --set-key VENDOR) or set "
+            f"{_BYO_KEY_FILE_ENV} to a 0o600 file path."
+        )
+        _emit(False, vendor=vendor, error="no_key_supplied")
+        return
+
+    validation = None
+    if validate:
+        validation = byo_secrets.validate_key(vendor, key)
+        if validation == byo_secrets.INVALID:
+            err_console.print(
+                f"[red]Error:[/red] the {escape(vendor)} key was rejected by the "
+                "vendor (invalid). Not stored."
+            )
+            _emit(False, vendor=vendor, validation=validation, error="key_invalid")
+            return
+        # VALID or UNKNOWN (couldn't reach vendor) → store it; the UI surfaces the
+        # unknown state so the user knows it wasn't confirmed.
+
+    try:
+        byo_secrets.store_key(vendor, key)
+    except Exception as exc:  # noqa: BLE001 — surface a clean error, never the key
+        err_console.print(
+            f"[red]Error:[/red] couldn't store the {escape(vendor)} key "
+            f"({type(exc).__name__})."
+        )
+        _emit(False, vendor=vendor, validation=validation, error="key_store_failed")
+        return
+
+    note = f" [dim](validation: {validation})[/dim]" if validation else ""
+    err_console.print(f"  [bold]intelligence.{escape(vendor)}[/bold] key stored{note}")
+    _emit(True, vendor=vendor, key_present=True, validation=validation)
 
 
 # ---------------------------------------------------------------------------
