@@ -262,6 +262,34 @@ def test_stale_delete_for_active_subscription_does_not_clear():
     setc.assert_called_once_with("userA", {"tier": "cloud", "subscribed": True})
 
 
+def test_updated_to_inactive_status_clears_claim():
+    # A subscription that lapses via `updated` (canceled / unpaid / paused /
+    # incomplete_expired) rather than a separate `deleted` must CLEAR the claim.
+    # An inactive status is a revoke signal, distinct from the ambiguous
+    # unresolvable-price case the no-op guard is for (test_unmapped_price_no_grant).
+    for bad_status in ("canceled", "unpaid", "paused", "incomplete_expired"):
+        ev = _event("customer.subscription.updated", _sub(CLOUD_PRICE, status=bad_status))
+        with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch.object(
+            billing.fb_auth, "set_custom_user_claims"
+        ) as setc:
+            status, _ = _invoke(_req())
+        assert status == 200
+        setc.assert_called_once_with("userA", {"tier": "none", "subscribed": False})
+
+
+def test_created_incomplete_does_not_clear_existing_claim():
+    # A `created` event that can't resolve a paid tier (e.g. a second, still
+    # incomplete sub) must NOT clear an existing claim -- only `updated` to an
+    # inactive status is a revoke signal.
+    ev = _event("customer.subscription.created", _sub(CLOUD_PRICE, status="incomplete"))
+    with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch.object(
+        billing.fb_auth, "set_custom_user_claims"
+    ) as setc:
+        status, _ = _invoke(_req())
+    assert status == 200
+    setc.assert_not_called()
+
+
 def test_payment_failed_clears_via_subscription_lookup():
     ev = _event("invoice.payment_failed", {"subscription": "sub_1", "metadata": {}})
     fetched = _sub(CLOUD_PRICE, status="past_due", uid="userA")

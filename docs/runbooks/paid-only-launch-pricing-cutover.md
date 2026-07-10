@@ -44,6 +44,13 @@ clients have no in-app way to pay and would be hard-gated (KTD-8, plan Stop cond
    sets `tier=cloud` for every account currently carrying `subscribed=true`. Safe to
    re-run if it partially fails. Their Stripe subscription keeps its $5 price; the
    webhook's legacy-price map keeps their ongoing events resolving `tier=cloud`.
+   **Scope caveat:** the backfill grants `tier=cloud` to *every* `subscribed=true`
+   account — it cannot tell a paying $5 cloud sub from a comp, demo, or since-canceled
+   grant that still carries the legacy claim. If any non-cloud comps exist, either
+   `--revoke` / re-`--tier local` them first, or accept that they get comped cloud
+   (fine for the negligible legacy population this launch assumes). Run **before**
+   flipping `SCREENCAP_LOCAL_PAYWALL_ENFORCE` (step 6) — a legacy subscriber whose
+   claim has no `tier` yet would be locally gated, since the lease keys on `tier`.
 
 5. **Verify the full loop on the dev function** (test-mode) before flipping any flag:
    - Card-required trial checkout on **both** tiers → `trialing` entitles → record +

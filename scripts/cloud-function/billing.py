@@ -420,20 +420,37 @@ def stripe_webhook(request):
         logger.info("stripe webhook %s: no resolvable uid; no-op", event_type)
         return (jsonify({"received": True}), 200)
 
-    # A grant-side event that resolves no known paid tier is a no-op, not a
-    # write of tier=none: only the revoke-side path (deleted / payment_failed)
-    # should clear an existing claim. This keeps an unmapped/empty-price
-    # created/updated event from clobbering a good claim, while a stale delete
-    # for a now-active sub still re-grants via _grant_from_subscription.
+    # A grant-side event that resolves no known paid tier is usually a no-op,
+    # not a write of tier=none — this keeps an unmapped/empty-price created/
+    # updated event (or a checkout whose sub can't be re-fetched) from clobbering
+    # a good claim, while a stale delete for a now-active sub still re-grants via
+    # _grant_from_subscription. The ONE exception is a `customer.subscription.
+    # updated` whose subscription is in an INACTIVE status (canceled / unpaid /
+    # paused / incomplete_expired): that is a genuine revoke delivered as
+    # `updated` rather than a separate `deleted`, so it must fall through and
+    # clear. `created` and `checkout.session.completed` stay no-op (a new/
+    # incomplete sub is not a revoke signal and must not clear an existing claim).
     if tier is None and event_type in (
         "checkout.session.completed",
         "customer.subscription.created",
         "customer.subscription.updated",
     ):
-        logger.info(
-            "stripe webhook %s: no resolvable paid tier for uid; no grant", event_type
+        is_revoking_update = (
+            event_type == "customer.subscription.updated"
+            and obj.get("status") is not None
+            and obj.get("status") not in _ACTIVE_STATUSES
         )
-        return (jsonify({"received": True}), 200)
+        if not is_revoking_update:
+            logger.info(
+                "stripe webhook %s: no resolvable paid tier for uid; no grant",
+                event_type,
+            )
+            return (jsonify({"received": True}), 200)
+        logger.info(
+            "stripe webhook customer.subscription.updated: inactive status %s; "
+            "clearing claim",
+            obj.get("status"),
+        )
 
     _apply_entitlement(uid, tier, trial_end)
     return (jsonify({"received": True}), 200)

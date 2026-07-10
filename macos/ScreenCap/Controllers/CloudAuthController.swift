@@ -116,9 +116,8 @@ final class LiveCloudAuthService: CloudAuthService {
     func fetchCheckoutURL(tier: String) async throws -> Data {
         // `--tier` selects the Stripe price (U3); the webhook stays the
         // entitlement authority. Passed as an argument, not baked in, so a
-        // price change is a config change, not a code change (KTD-7).
-        // TODO(build-verify): the U3 CLI change must add the `--tier` option to
-        // `checkout-url`; until it lands the CLI rejects the unknown flag.
+        // price change is a config change, not a code change (KTD-7). The CLI's
+        // `checkout-url --tier <local|cloud>` option is required and validated.
         try await CLIClient.runJSONRaw(["checkout-url", "--tier", tier, "--json"], timeout: 30)
     }
 
