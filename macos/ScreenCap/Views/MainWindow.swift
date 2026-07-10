@@ -441,6 +441,13 @@ struct MainWindow: View {
             // U9: the Intelligence pane — model picker + per-task cloud-consent
             // matrix, persisting through `screencap settings intelligence`.
             IntelligenceSettingsView()
+        case .chat:
+            // Conversational-recall U8: the multi-turn Chat surface. Grounded
+            // answers with the captured moments shown as sources; each source
+            // deep-links the Inspect window at that timestamp. Reuses Search's
+            // shipped result components (SnippetHighlighter, RecordingCardThumbnail)
+            // and the deep-link opener — no new pointer rendering (KTD7).
+            ChatView()
         case .timeline(let day, let seekMs):
             // U9: the day view. `.id(day)` gives each date a fresh engine +
             // search scope rather than mutating one view's state across days.

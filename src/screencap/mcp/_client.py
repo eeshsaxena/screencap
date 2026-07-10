@@ -152,6 +152,26 @@ class AsyncDaemonClient:
             body["staleness_cap_ms"] = staleness_cap_ms
         return await self._post("/v0/frame.nearest", body)
 
+    async def chat_answer(
+        self,
+        question: str,
+        *,
+        prior_turns: list[dict[str, Any]] | None = None,
+        window_ms: tuple[int, int] | None = None,
+        app: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"question": question}
+        if prior_turns:
+            body["prior_turns"] = prior_turns
+        if window_ms is not None:
+            body["window_ms"] = list(window_ms)
+        if app is not None:
+            body["app"] = app
+        if limit is not None:
+            body["limit"] = limit
+        return await self._post("/v0/chat.answer", body)
+
 
 class LivenessSubscription:
     """Holds one ``/v0/events`` subscription open for the agent session.

@@ -157,7 +157,7 @@ async def test_resolve_frame_is_registered():
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
         "search_screen_content", "search_transcript", "query_timeline",
-        "resolve_frame", "list_recordings", "whoami",
+        "resolve_frame", "list_recordings", "whoami", "chat_answer",
     }
 
 

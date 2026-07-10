@@ -840,6 +840,23 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/tasks.list", body: body)
     }
 
+    /// Conversational-recall answer (conversational-recall U5). Daemon-only,
+    /// local, POINTER-ONLY response (R2/R8 — sources carry `(recording,
+    /// timestamp_ms, stream)`, never image bytes). Prior-turn context is carried
+    /// as source pointers only (KTD6); the daemon re-derives snippet text
+    /// server-side, so raw captured text never round-trips through the client.
+    ///
+    /// Fail-safe by contract: the verb degrades a downstream miss to a graceful
+    /// refusal envelope (200 with `refusal=true`), never a 500 — so the only
+    /// errors surfaced here are a malformed request (typed 4xx envelope error) or
+    /// the daemon being unreachable (`socketUnavailable`/`connectionFailed`). On
+    /// those the caller surfaces a "daemon not running" state; there is no CLI
+    /// fallback for this verb.
+    static func chatAnswer(_ req: ChatAnswerRequest) async throws -> ChatAnswerResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/chat.answer", body: body)
+    }
+
     /// Query-parser vocabulary (SCR-179). Read-only GET, no parameters. Returns
     /// distinct app names / bundle ids + bare `browser_url` hostnames — never a
     /// full URL. A same-EUID-only browsing-profile artifact (R6): the caller must

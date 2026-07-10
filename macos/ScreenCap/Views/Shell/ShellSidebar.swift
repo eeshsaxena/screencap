@@ -9,6 +9,11 @@ import SwiftUI
 enum ShellRoute: Hashable {
     case library
     case journal
+    /// The conversational-recall Chat destination — the FIRST search-like sidebar
+    /// route (KTD7). Distinct from Search, which is the `RecallPaletteView` overlay
+    /// palette (NOT a sidebar destination). Chat and Search share the retrieval
+    /// backend and Search's result components, not a destination pattern.
+    case chat
     case timeline(day: Date, seekMs: Int?)
     case privacy
     case appRules
@@ -50,6 +55,10 @@ enum ShellSidebarModel {
     static let primaryNav: [ShellNavItem] = [
         ShellNavItem(id: "library", label: "Library", route: .library, availability: .enabled),
         ShellNavItem(id: "journal", label: "Journal", route: .journal, availability: .enabled),
+        // Chat — the first search-like sidebar destination (KTD7). Ask about your
+        // recorded history and get a grounded answer with the real moments as
+        // sources.
+        ShellNavItem(id: "chat", label: "Chat", route: .chat, availability: .enabled),
     ]
 
     /// The design's COLLECTIONS list is mock data (sample collection names,

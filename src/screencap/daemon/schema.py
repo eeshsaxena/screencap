@@ -41,6 +41,11 @@ _TASKS_LIST_API_VERSION = 1
 # SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
 # global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
 _MODELS_API_VERSION = 1
+# Conversational-recall chat read verb (U5). Additive (new verb) — no global
+# API_SCHEMA_VERSION bump (mirrors the frame.nearest / tasks.list additive
+# precedent). Pointer-only response (answer prose + source POINTERS, no image
+# bytes / paths) — the same R8 boundary as every other query verb.
+_CHAT_ANSWER_API_VERSION = 1
 
 
 @cache
@@ -104,6 +109,11 @@ _MODEL_NAMES = {
     "ModelDownloadStatusResponse",
     "InstalledModel",
     "ModelStatusResponse",
+    "ChatPriorTurn",
+    "ChatAnswerRequest",
+    "ChatSourcePointer",
+    "ChatCoverage",
+    "ChatAnswerResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -435,6 +445,13 @@ def _load_models() -> dict[str, Any]:
     _MAX_EPOCH_MS = 253_402_300_800_000  # year 9999 in unix ms
     _MAX_STALENESS_CAP_MS = 86_400_000   # 24 hours in ms
 
+    from typing import Annotated
+
+    # A bounded epoch-ms element (ge=0, le=year-9999), reused inside the
+    # ``ChatAnswerRequest.window_ms`` tuple so BOTH endpoints carry the same bound
+    # as the scalar ``timestamp_ms`` fields (FIX F).
+    _EpochMs = Annotated[int, Field(ge=0, le=_MAX_EPOCH_MS)]
+
     class FrameNearestRequest(_DaemonModel):
         """SCR-186 nearest-frame resolution input.
 
@@ -634,6 +651,88 @@ def _load_models() -> dict[str, Any]:
 
         models: list[InstalledModel]
 
+    class ChatPriorTurn(_DaemonModel):
+        """A prior-turn source POINTER the client carries forward (KTD6, R14).
+
+        Multi-turn memory is client-held, daemon-stateless: the client sends the
+        pointer (``recording`` + ``timestamp_ms`` + ``stream``) and the
+        orchestrator re-derives the snippet text SERVER-SIDE from it. Any
+        client-supplied prose is structurally absent from this shape — there is no
+        text field — so raw captured text can never round-trip through the client
+        (the daemon re-fetches it from the local index). ``recording`` is validated
+        by the canonical name validator in the handler (traversal-safe).
+        """
+
+        recording: str
+        timestamp_ms: int = Field(ge=0, le=_MAX_EPOCH_MS)
+        stream: str = "content"
+
+    class ChatAnswerRequest(_DaemonModel):
+        """U5 ``chat.answer`` input: a question + optional prior-turn context.
+
+        ``question`` is the operator's question (or a follow-up). ``prior_turns``
+        are prior-turn source POINTERS (R14) — never prose. ``window_ms`` is an
+        optional ``[start_ms, end_ms]`` pair for a period-summary (aggregate)
+        question (R5); a point question omits it. ``app`` narrows the aggregate
+        window / timeline; ``limit`` bounds retrieval.
+        """
+
+        question: str = Field(max_length=_MAX_QUERY_LEN)
+        prior_turns: list[ChatPriorTurn] = Field(default_factory=list)
+        # Bound BOTH window elements like ``timestamp_ms`` (ge=0, le=year-9999
+        # epoch ms) so a malformed/huge window is a typed 400 at the daemon
+        # boundary, not an unbounded-scan driver into aggregate_window.
+        window_ms: tuple[_EpochMs, _EpochMs] | None = None
+        app: str | None = Field(default=None, max_length=_MAX_QUERY_LEN)
+        limit: int | None = None
+
+    class ChatSourcePointer(_DaemonModel):
+        """A source the answer drew from — POINTER ONLY (R2, R8).
+
+        Structurally incapable of carrying a media path or image bytes:
+        ``(recording, timestamp_ms)`` is exactly what ``frame.nearest`` resolves to
+        a frame stem, so the sources panel deep-links the moment. ``stream`` records
+        which retrieval stream produced it (content / transcript / timeline).
+        """
+
+        recording: str
+        timestamp_ms: int
+        stream: str
+
+    class ChatCoverage(_DaemonModel):
+        """The honest coverage descriptor for a chat answer (R12).
+
+        ``state`` is a :class:`~screencap.recall.orchestrator.CoverageState` value
+        (``ok`` / ``no_matching_moments`` / ``not_indexed`` / ``index_degraded`` /
+        ``store_unavailable``); typed ``str`` (not ``Literal``) so a future state
+        decodes tolerantly. ``note`` is a short narration string; ``per_stream``
+        maps each stream to its index-state value so the UI can say "content is
+        still indexing; timeline is authoritative".
+        """
+
+        state: str
+        note: str
+        per_stream: dict[str, str]
+
+    class ChatAnswerResponse(EnvelopeResponse):
+        """A grounded chat answer + its sources + honest coverage — POINTER ONLY.
+
+        ``answer`` is the generated prose (or the canonical refusal text on a
+        refusal). ``sources`` are pointer-only source locators (never image bytes /
+        paths — R8). ``coverage`` is the honest coverage descriptor (R12).
+        ``refusal`` flags a no-evidence / no-execution-target / attribution-rejected
+        turn so the client renders it distinctly. ``question_kind`` is ``point`` /
+        ``aggregate``; ``target`` is the execution target this turn resolved to
+        (``on_device`` / ``cloud`` / ``none`` / …), recomputed per turn.
+        """
+
+        answer: str
+        sources: list[ChatSourcePointer]
+        coverage: ChatCoverage
+        refusal: bool
+        question_kind: str
+        target: str
+
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,
         "DaemonInfoResponse": DaemonInfoResponse,
@@ -676,6 +775,11 @@ def _load_models() -> dict[str, Any]:
         "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
         "InstalledModel": InstalledModel,
         "ModelStatusResponse": ModelStatusResponse,
+        "ChatPriorTurn": ChatPriorTurn,
+        "ChatAnswerRequest": ChatAnswerRequest,
+        "ChatSourcePointer": ChatSourcePointer,
+        "ChatCoverage": ChatCoverage,
+        "ChatAnswerResponse": ChatAnswerResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -713,6 +817,7 @@ __all__ = [
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
     "_MODELS_API_VERSION",
+    "_CHAT_ANSWER_API_VERSION",
     "daemon_version",
     "envelope",
 ] + sorted(_MODEL_NAMES)
