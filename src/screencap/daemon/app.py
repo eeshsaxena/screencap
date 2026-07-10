@@ -23,6 +23,23 @@ from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
 from screencap.pidfile import CLAIMANT_DAEMON
 
+# U5 (conversational recall): the ``chat.answer`` request-path modules are
+# imported at module scope (not lazily inside the handler) AND touched eagerly in
+# the app lifespan below, mirroring the stale-daemon-after-app-update lesson — a
+# request-path module must be resolved at daemon start, not on the first request,
+# so a swapped bundle can't leave a half-loaded handler. Both recall modules are
+# cloud-free at import time (they read config lazily), so this adds no network /
+# credential surface to daemon startup. Bound here so the handler dispatches
+# through module-level names (also the seam the U5 verb tests patch).
+from screencap.recall.dispatch import ChatAnswer, answer_from_bundle
+from screencap.recall.orchestrator import (
+    CoverageDescriptor,
+    CoverageState,
+    PriorTurnPointer,
+    QuestionKind,
+    build_evidence_bundle,
+)
+
 if TYPE_CHECKING:
     from screencap.daemon.permission_probe import GrantState
 
@@ -39,6 +56,13 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         from screencap.daemon.supervisor import Supervisor
 
         app.state.supervisor = Supervisor(app.state.event_bus)
+    # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
+    # daemon start (the stale-daemon-after-app-update lesson — a request-path
+    # module must be imported before the first request, never lazily inside the
+    # handler). They are already imported at this module's top; this reference
+    # pins that they are resolved (and fails fast at startup if a swapped bundle
+    # left them unimportable) rather than surfacing as a 500 on the first turn.
+    assert build_evidence_bundle is not None and answer_from_bundle is not None
     # Warm the TCC grant cache in the BACKGROUND so the daemon starts serving
     # immediately. A fresh probe can take up to ~5s; awaiting it before `yield`
     # would delay the daemon answering its first request — including the
@@ -1791,6 +1815,181 @@ async def model_status(request: Request) -> JSONResponse:
         )
 
 
+def _graceful_refusal(kind: QuestionKind = QuestionKind.POINT) -> ChatAnswer:
+    """A fail-safe refusal :class:`ChatAnswer` for a downstream miss (KTD8).
+
+    Returned when the orchestrator/dispatch raises (retrieval backend error, empty
+    index, provider fault, …) so the verb degrades to a graceful 200 envelope
+    rather than a 500. Carries NO sources and an honest ``store_unavailable``
+    coverage — never a leaked error string.
+    """
+    from screencap.segmentation.consent import ExecutionTarget
+
+    return ChatAnswer(
+        answer=(
+            "I couldn't reach your recorded history to answer that right now."
+        ),
+        sources=[],
+        coverage=CoverageDescriptor(
+            state=CoverageState.STORE_UNAVAILABLE,
+            note="the recall backend was unavailable for this question",
+            per_stream={},
+        ),
+        target=ExecutionTarget.NONE,
+        refusal=True,
+        question_kind=kind,
+    )
+
+
+def _run_chat_answer(
+    question: str,
+    prior_turns: list[PriorTurnPointer],
+    window_ms: tuple[int, int] | None,
+    app: str | None,
+    limit: int | None,
+) -> ChatAnswer:
+    """Build the evidence bundle (U3) then generate the grounded answer (U4).
+
+    Runs off the event loop via ``asyncio.to_thread`` (retrieval + the provider
+    seam are blocking). FAIL-SAFE (KTD8): any downstream exception — a retrieval
+    backend fault, an empty/corrupt index, a provider error — is caught here and
+    mapped to a graceful refusal :class:`ChatAnswer`, so the verb NEVER 500s on a
+    downstream miss. ``answer_from_bundle`` is itself already fail-closed (it
+    degrades an ordinary model/API error or an egress breach to a refusal); this
+    guard covers the bundle-builder path and any unexpected raise.
+
+    A refusal (no evidence, on-device unavailable + no cloud consent) is a normal
+    :class:`ChatAnswer` with ``refusal=True`` — NOT an error. The on-device answer
+    backend is gated on SCR-243 and reports unavailable today, so a real call with
+    no cloud consent legitimately refuses; that is a clean success here.
+    """
+    try:
+        bundle = build_evidence_bundle(
+            question,
+            prior_turns=prior_turns,
+            window_ms=window_ms,
+            app=app,
+            limit=limit,
+        )
+    except Exception:
+        logger.warning("chat.answer: evidence-bundle build failed; refusing", exc_info=True)
+        return _graceful_refusal()
+    try:
+        return answer_from_bundle(bundle, question=question)
+    except Exception:
+        logger.warning("chat.answer: answer generation failed; refusing", exc_info=True)
+        return _graceful_refusal(bundle.question_kind)
+
+
+def _chat_answer_payload(result: ChatAnswer) -> dict[str, Any]:
+    """Map a :class:`ChatAnswer` to the pointer-only wire payload (R2, R8).
+
+    Sources carry ONLY ``(recording, timestamp_ms, stream)`` — no path, no image
+    bytes. The typed :class:`schema.ChatAnswerResponse` (round-tripped through the
+    envelope) is the R8 boundary: the shape is structurally incapable of carrying
+    media.
+    """
+    return {
+        "answer": result.answer,
+        "sources": [
+            {
+                "recording": p.recording,
+                "timestamp_ms": p.timestamp_ms,
+                "stream": p.stream.value,
+            }
+            for p in result.sources
+        ],
+        "coverage": {
+            "state": result.coverage.state.value,
+            "note": result.coverage.note,
+            "per_stream": dict(result.coverage.per_stream),
+        },
+        "refusal": result.refusal,
+        "question_kind": result.question_kind.value,
+        "target": result.target.value,
+    }
+
+
+async def chat_answer(request: Request) -> JSONResponse:
+    """``POST /v0/chat.answer`` — a grounded conversational-recall answer (U5).
+
+    Exposes the U3 evidence-bundle builder + U4 dispatch as a FAIL-SAFE, read-only
+    verb (KTD8). A valid request returns generated prose + pointer-only source
+    locators + an honest coverage descriptor. Pointer-only response (R2/R8): the
+    :class:`schema.ChatAnswerResponse` shape is structurally incapable of carrying a
+    media path or image bytes.
+
+    Hygiene (KTD8):
+
+    * **Fail-safe** — a downstream miss (retrieval/provider error, empty index)
+      degrades to a graceful refusal envelope, NEVER a 500. A refusal (no evidence,
+      or on-device unavailable + no cloud consent) is a normal 200 with
+      ``refusal=true``, not an error.
+    * **Typed 4xx only for malformed INPUT** — a bad body / out-of-bounds field
+      returns 400 ``invalid_request``; a traversal recording name in a prior-turn
+      pointer returns 400 ``invalid_name``.
+    * **Same-EUID gated** — inherited from the socket / ASGI scope like every other
+      ``/v0`` verb (no new work).
+    * Deliberately NOT in ``_ACTIVITY_PATHS`` — a chat turn must not reset the
+      idle-shutdown clock (a cron / background caller can't pin an auto-spawned
+      daemon).
+    """
+    from pydantic import ValidationError
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.ChatAnswerRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._CHAT_ANSWER_API_VERSION,
+            )
+
+        # Prior-turn pointers carry a recording NAME the orchestrator re-derives
+        # snippet text from — validate each (traversal-safe) up front so a bad name
+        # returns a typed 4xx, never reaching the retrieval seam.
+        prior_turns: list[PriorTurnPointer] = []
+        for turn in parsed.prior_turns:
+            validate_recording_name(turn.recording)
+            prior_turns.append(
+                PriorTurnPointer(
+                    recording=turn.recording,
+                    timestamp_ms=turn.timestamp_ms,
+                    stream=turn.stream,
+                )
+            )
+
+        window_ms = tuple(parsed.window_ms) if parsed.window_ms is not None else None
+        limit = _clamp_limit(parsed.limit) if parsed.limit is not None else None
+
+        result = await asyncio.to_thread(
+            _run_chat_answer,
+            parsed.question,
+            prior_turns,
+            window_ms,
+            parsed.app,
+            limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._CHAT_ANSWER_API_VERSION,
+                **_chat_answer_payload(result),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._CHAT_ANSWER_API_VERSION,
+            request=request,
+        )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -1809,6 +2008,7 @@ def build_app() -> Starlette:
             Route("/v0/timeline.day", timeline_day, methods=["POST"]),
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
             Route("/v0/tasks.list", tasks_list, methods=["POST"]),
+            Route("/v0/chat.answer", chat_answer, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
