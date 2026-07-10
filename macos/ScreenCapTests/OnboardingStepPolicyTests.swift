@@ -226,6 +226,32 @@ final class OnboardingStepPolicyTests: XCTestCase {
         XCTAssertEqual(OnboardingStepPolicy.stepAfterAccount(tier: .teamCloud), .teamSetup)
     }
 
+    /// Under the paid-only launch (paywall on), Local Pro routes through the
+    /// account/checkout step and then continues to the on-device model step,
+    /// instead of skipping checkout. Cloud/Team routing is unchanged.
+    func testTierRoutingUnderPaywall() {
+        XCTAssertEqual(
+            OnboardingStepPolicy.stepAfterStorage(tier: .local, paywallEnabled: true),
+            .account
+        )
+        XCTAssertEqual(
+            OnboardingStepPolicy.stepAfterAccount(tier: .local, paywallEnabled: true),
+            .downloadModel
+        )
+        // Cloud/Team unchanged with the paywall on.
+        XCTAssertEqual(
+            OnboardingStepPolicy.stepAfterStorage(tier: .personalCloud, paywallEnabled: true),
+            .account
+        )
+        XCTAssertNil(
+            OnboardingStepPolicy.stepAfterAccount(tier: .personalCloud, paywallEnabled: true)
+        )
+        XCTAssertEqual(
+            OnboardingStepPolicy.stepAfterAccount(tier: .teamCloud, paywallEnabled: true),
+            .teamSetup
+        )
+    }
+
     /// Progress-dot count is 5/5/6 by picked tier (local gained the SCR-239
     /// download-model step).
     func testDotCountByTier() {

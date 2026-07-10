@@ -174,14 +174,30 @@ enum OnboardingStepPolicy {
 
     /// The step after the storage CTA: local continues to the SCR-239
     /// download-model offer, cloud tiers continue to the account step.
-    static func stepAfterStorage(tier: OnboardingStorageTier) -> OnboardingStep? {
-        tier == .local ? .downloadModel : .account
+    static func stepAfterStorage(
+        tier: OnboardingStorageTier, paywallEnabled: Bool = false
+    ) -> OnboardingStep? {
+        // Under the paid-only launch the `.local` tier is the paid "Local Pro"
+        // plan, so with the paywall on it must route through the account/checkout
+        // step like the cloud tiers (the account step maps `.local -> .localPro`).
+        // Default `paywallEnabled: false` preserves the pre-paywall routing
+        // (local -> on-device model step) and the pinned routing/dot tests.
+        if tier == .local {
+            return paywallEnabled ? .account : .downloadModel
+        }
+        return .account
     }
 
-    /// The step after a successful sign-in: team continues to team setup,
-    /// personal finishes.
-    static func stepAfterAccount(tier: OnboardingStorageTier) -> OnboardingStep? {
-        tier == .teamCloud ? .teamSetup : nil
+    /// The step after a successful sign-in: team continues to team setup;
+    /// paid Local Pro continues to the on-device model step; personal finishes.
+    static func stepAfterAccount(
+        tier: OnboardingStorageTier, paywallEnabled: Bool = false
+    ) -> OnboardingStep? {
+        if tier == .teamCloud { return .teamSetup }
+        // With the paywall on, Local Pro reaches the account step for checkout,
+        // then continues to the on-device model step it would otherwise skip to.
+        if tier == .local && paywallEnabled { return .downloadModel }
+        return nil
     }
 
     static func storageCTATitle(tier: OnboardingStorageTier) -> String {
