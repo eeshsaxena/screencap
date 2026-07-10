@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// First-run, non-blocking banner pinned above `RecordingBanner` in the main
-/// detail area (SCR-17 / U5). Discloses the as-configured privacy behavior
+/// First-run, non-blocking banner pinned at the top of the main detail area
+/// (SCR-17 / U5). Discloses the as-configured privacy behavior
 /// honestly — including the fact that browser content and AI tools remain
 /// visible in playback — and offers two CTAs plus a dismiss `[x]`.
 ///

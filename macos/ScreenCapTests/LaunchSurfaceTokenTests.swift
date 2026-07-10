@@ -13,7 +13,6 @@ final class LaunchSurfaceTokenTests: XCTestCase {
     /// The four launch-visible surfaces (R8), relative to the macOS source root.
     private let surfaces = [
         "ScreenCap/ScreenCapApp.swift",
-        "ScreenCap/Views/RecordingBanner.swift",
         "ScreenCap/Views/MainWindow.swift",
         "ScreenCap/Views/Privacy/PermissionSetupTakeover.swift",
         "ScreenCap/Views/Onboarding/OnboardingPermissionsStep.swift",
@@ -48,11 +47,6 @@ final class LaunchSurfaceTokenTests: XCTestCase {
                 )
             }
         }
-    }
-
-    func testRecordingBannerUsesRecordingRoleNotRed() throws {
-        let text = try source("ScreenCap/Views/RecordingBanner.swift")
-        XCTAssertTrue(text.contains("Color.scRecording"), "recording banner should use scRecording")
     }
 
     func testMenubarAttentionPipIsRetired() throws {
