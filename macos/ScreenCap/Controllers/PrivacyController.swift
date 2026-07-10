@@ -25,6 +25,18 @@ final class PrivacyController: ObservableObject {
     /// U12: the configured recordings directory (storage row). nil-tolerant.
     @Published private(set) var recordingsDir: String?
 
+    /// SCR-228 U6: storage-migration lifecycle for the Privacy pane's storage
+    /// row. `.migrating` covers the (near-instant, same-volume) CLI round-trip;
+    /// `.failed` carries the daemon's reason code + human message for the error
+    /// surface; `.succeeded` carries the new path for a brief confirmation.
+    enum MigrationState: Equatable {
+        case idle
+        case migrating
+        case succeeded(newPath: String)
+        case failed(reason: String, message: String)
+    }
+    @Published private(set) var migrationState: MigrationState = .idle
+
     /// Pluggable CLI invoker. Tests inject a fixture closure; production
     /// resolves to `CLIClient.runJSONRaw`. Keeping the seam at the controller
     /// boundary (rather than mocking `Process`) means tests can assert on
@@ -32,6 +44,14 @@ final class PrivacyController: ObservableObject {
     /// touching Foundation pipe machinery.
     typealias JSONInvoker = @Sendable ([String]) async throws -> Data
     private let invoke: JSONInvoker
+
+    /// Separate invoker for `storage migrate` (SCR-228 U6). Distinct from
+    /// `invoke` because the migrate CLI exits non-zero on a *handled* refusal
+    /// (cross-volume, cloud-synced, …) while still emitting a JSON envelope with
+    /// the reason — so it must tolerate a non-zero exit and let the controller
+    /// read `ok`/`reason`/`message`, which `runJSONRaw` (throws on non-zero)
+    /// would discard. Tests inject a fixture closure.
+    private let migrateInvoke: JSONInvoker
 
     /// In-flight toggles serialized per bundle_id. A double-tap on the toggle
     /// during the CLI round-trip would otherwise fire two writes against the
@@ -42,6 +62,10 @@ final class PrivacyController: ObservableObject {
     /// toggle mid-round-trip would otherwise race two `--set` writes and leave
     /// the optimistic value pointing at whichever landed last.
     private var uploadDefaultWriteInFlight: Bool = false
+
+    /// Serializes `startMigration` — the storage row disables its control while
+    /// `.migrating`, but this guards a re-entrant call regardless.
+    private var migrationInFlight: Bool = false
 
     /// Latches once `ensureFirstLaunchModeWritten()` has finished its work
     /// (either confirmed the section exists, or succeeded in writing it).
@@ -66,14 +90,24 @@ final class PrivacyController: ObservableObject {
         return !s.setupSkipped
     }
 
-    init(invoke: @escaping JSONInvoker = PrivacyController.defaultInvoke) {
+    init(
+        invoke: @escaping JSONInvoker = PrivacyController.defaultInvoke,
+        migrateInvoke: @escaping JSONInvoker = PrivacyController.defaultMigrateInvoke
+    ) {
         self.invoke = invoke
+        self.migrateInvoke = migrateInvoke
     }
 
     /// Default invoker — talks to the bundled `screencap` binary via
     /// `CLIClient`.
     static let defaultInvoke: JSONInvoker = { args in
         try await CLIClient.runJSONRaw(args)
+    }
+
+    /// Default migrate invoker — tolerates a non-zero exit so the refusal
+    /// envelope survives (see `migrateInvoke`).
+    static let defaultMigrateInvoke: JSONInvoker = { args in
+        try await CLIClient.runJSONRawTolerant(args)
     }
 
     // MARK: - Reads
@@ -192,6 +226,42 @@ final class PrivacyController: ObservableObject {
             uploadDefault = previous
             lastError = error.localizedDescription
             return false
+        }
+    }
+
+    /// Move the recordings library to `url` (SCR-228 U6). Drives the storage
+    /// row's progress/result surface via `migrationState`, then refreshes
+    /// `status`/`recordingsDir` on success so the displayed path updates. The
+    /// daemon enforces same-volume + no-active-recording; a refusal returns
+    /// `ok:false` with a reason code + human message on the JSON envelope.
+    func startMigration(to url: URL) async {
+        guard !migrationInFlight else { return }
+        migrationInFlight = true
+        defer { migrationInFlight = false }
+
+        migrationState = .migrating
+        do {
+            let data = try await migrateInvoke(
+                ["storage", "migrate", url.path, "--json"]
+            )
+            let result = try JSONDecoder().decode(
+                StorageMigrateEnvelope.self, from: data
+            )
+            if result.ok {
+                migrationState = .succeeded(newPath: result.movedTo ?? url.path)
+                lastError = nil
+                // Re-read settings so the storage row reflects the new path.
+                await refreshStatus()
+            } else {
+                let reason = result.reason ?? result.error ?? "unknown"
+                let message = result.message
+                    ?? PrivacySettingsPolicy.migrationFailureFallback(reason: reason)
+                migrationState = .failed(reason: reason, message: message)
+            }
+        } catch {
+            migrationState = .failed(
+                reason: "unexpected", message: error.localizedDescription
+            )
         }
     }
 

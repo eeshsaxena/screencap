@@ -74,3 +74,26 @@ struct SettingsEnvelope: Decodable {
         case settings
     }
 }
+
+/// The envelope returned by `screencap storage migrate --json` (SCR-228).
+/// On success `ok` is true and `movedTo` carries the new recordings path; on a
+/// refusal `ok` is false and `reason` (a `storage_migration.Reason` code) plus
+/// `message` (human copy) describe why. Tolerant of a non-zero CLI exit — the
+/// `ok` field is authoritative (see `CLIClient.runJSONRawTolerant`).
+struct StorageMigrateEnvelope: Decodable {
+    let ok: Bool
+    let movedFrom: String?
+    let movedTo: String?
+    let reason: String?
+    let message: String?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case movedFrom = "moved_from"
+        case movedTo = "moved_to"
+        case reason
+        case message
+        case error
+    }
+}

@@ -546,4 +546,66 @@ final class PrivacyControllerTests: XCTestCase {
         ])
         XCTAssertEqual(fake.calls.last, ["apps", "--json"])
     }
+
+    // MARK: - startMigration (SCR-228 U6)
+
+    /// Success flips state to `.succeeded`, sends the storage-migrate argv, and
+    /// re-reads settings so the displayed recordings path updates.
+    func testStartMigrationSuccessUpdatesPathAndState() async {
+        let migrate = FakeInvoker()
+        migrate.respond = { _ in Data(#"{"ok":true,"moved_to":"/new/recs"}"#.utf8) }
+        let settings = FakeInvoker()
+        settings.respond = { [weak self] args in
+            guard args == ["settings", "--json"], let self else { return nil }
+            return self.settingsEnvelope(privacy: nil, recordingsDir: "/new/recs")
+        }
+        let controller = PrivacyController(
+            invoke: settings.invoker(), migrateInvoke: migrate.invoker()
+        )
+
+        await controller.startMigration(to: URL(fileURLWithPath: "/new/recs"))
+
+        XCTAssertEqual(controller.migrationState, .succeeded(newPath: "/new/recs"))
+        XCTAssertEqual(controller.recordingsDir, "/new/recs")
+        XCTAssertEqual(migrate.calls.first, ["storage", "migrate", "/new/recs", "--json"])
+        XCTAssertEqual(settings.calls.last, ["settings", "--json"])  // refreshStatus ran
+        XCTAssertNil(controller.lastError)
+    }
+
+    /// A refusal (ok:false) carries the daemon reason code + human message into
+    /// `.failed`, and the displayed path is left unchanged.
+    func testStartMigrationFailureCarriesReasonAndMessage() async {
+        let migrate = FakeInvoker()
+        migrate.respond = { _ in
+            Data(#"""
+            {"ok":false,"error":"storage_migration_failed","reason":"cross_volume","message":"Pick a folder on the same disk."}
+            """#.utf8)
+        }
+        let controller = PrivacyController(
+            invoke: FakeInvoker().invoker(), migrateInvoke: migrate.invoker()
+        )
+
+        await controller.startMigration(to: URL(fileURLWithPath: "/Volumes/Ext/recs"))
+
+        XCTAssertEqual(
+            controller.migrationState,
+            .failed(reason: "cross_volume", message: "Pick a folder on the same disk.")
+        )
+        XCTAssertNil(controller.recordingsDir)  // unchanged on refusal
+    }
+
+    /// The chosen folder's filesystem path is forwarded verbatim as the target.
+    func testStartMigrationForwardsTargetPath() async {
+        let migrate = FakeInvoker()
+        migrate.respond = { _ in Data(#"{"ok":true,"moved_to":"/Volumes/Big/recs"}"#.utf8) }
+        let controller = PrivacyController(
+            invoke: FakeInvoker().invoker(), migrateInvoke: migrate.invoker()
+        )
+
+        await controller.startMigration(to: URL(fileURLWithPath: "/Volumes/Big/recs"))
+
+        XCTAssertEqual(
+            migrate.calls.first, ["storage", "migrate", "/Volumes/Big/recs", "--json"]
+        )
+    }
 }

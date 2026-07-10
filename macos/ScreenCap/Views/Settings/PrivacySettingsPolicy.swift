@@ -39,6 +39,40 @@ enum PrivacySettingsPolicy {
     static func uploadDefaultValue(togglingTo on: Bool) -> String {
         on ? "local" : "ask"
     }
+
+    /// SCR-228: map a storage-migration refusal `reason` code to honest copy.
+    /// The daemon's own `message` is preferred when present; this is the
+    /// fallback (older daemon that omits `message`) so the pane never shows a
+    /// bare machine code.
+    static func migrationFailureFallback(reason: String) -> String {
+        switch reason {
+        case "cross_volume":
+            return "That folder is on a different disk. Moving to an external "
+                + "or separate volume isn't supported yet — pick a folder on "
+                + "this disk."
+        case "cloud_synced":
+            return "That folder is synced to iCloud, Dropbox, or another cloud "
+                + "service, which would upload your recordings. Choose a folder "
+                + "that isn't synced."
+        case "target_not_empty":
+            return "Choose an empty folder."
+        case "not_writable":
+            return "That folder isn't writable. Choose another."
+        case "nested":
+            return "Choose a folder that isn't inside your current recordings "
+                + "folder."
+        case "recording_active":
+            return "Stop the current recording before moving the storage "
+                + "location."
+        case "migration_in_progress":
+            return "A move is already in progress."
+        case "env_override":
+            return "The storage location is pinned by an environment variable "
+                + "and can't be changed here."
+        default:
+            return "Couldn't move your recordings. Try a different folder."
+        }
+    }
 }
 
 /// The pane's honesty-gated copy (KTD-9): the E2EE row is informational with
@@ -73,10 +107,21 @@ enum PrivacySettingsCopy {
     static let pauseSub = "Not available yet — recording does not auto-pause over private windows today."
     static let pauseHelp = "Coming soon — SCR-224"
 
-    // Stub: SCR-228 change storage location with migration.
+    // SCR-228: change storage location with same-volume migration.
     static let storageTitle = "Storage location"
     static let storageChangeLabel = "Change…"
-    static let storageChangeHelp = "Coming soon — SCR-228"
+    static let storageChangeHelp = "Move your recordings to another folder on this disk."
+    static let storagePickerMessage = "Choose an empty folder on the same disk for your recordings."
+    static let storageConfirmTitle = "Move your recordings?"
+    static let storageMigratingLabel = "Moving your recordings…"
+
+    /// Confirmation body — names the destructive/blocking implications before
+    /// the move: the whole library relocates, recording is paused, same disk.
+    static func storageConfirmBody(target: String) -> String {
+        "Your entire recordings library will be moved to \(target). "
+            + "Recording is paused during the move, and the new folder must be "
+            + "on the same disk."
+    }
 
     /// Every row string, for the KTD-9 gate: no active-encryption claims while
     /// SCR-220 is open, no auto-pause claims while SCR-224 is open.
