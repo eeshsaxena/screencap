@@ -446,8 +446,9 @@ struct MainWindow: View {
             // answers with the captured moments shown as sources; each source
             // deep-links the Inspect window at that timestamp. Reuses Search's
             // shipped result components (SnippetHighlighter, RecordingCardThumbnail)
-            // and the deep-link opener — no new pointer rendering (KTD7).
-            ChatView()
+            // and the deep-link opener — no new pointer rendering (KTD7). The
+            // no-backend affordance (R6) deep-links to the Intelligence pane.
+            ChatView(onOpenIntelligenceSettings: { route = .intelligence })
         case .timeline(let day, let seekMs):
             // U9: the day view. `.id(day)` gives each date a fresh engine +
             // search scope rather than mutating one view's state across days.

@@ -262,4 +262,64 @@ final class ChatViewModelTests: XCTestCase {
         // The pointer shape has NO text field — client prose can't round-trip.
         XCTAssertNil(priors?.first?["text"], "prior-turn pointers carry no prose (KTD6)")
     }
+
+    // MARK: - Honest-state mapping (U4, R5/R6/R7)
+
+    private func chatAnswer(
+        refusal: Bool, reason: ChatRefusalReason?,
+        coverage: ChatCoverageState = .ok
+    ) -> ChatAnswer {
+        ChatAnswer(
+            text: "…", sources: [],
+            coverage: ChatCoverage(state: coverage, note: "n"),
+            refusal: refusal, reason: reason
+        )
+    }
+
+    func testAnsweredMapsToAnswered() {
+        XCTAssertEqual(chatAnswer(refusal: false, reason: nil).honestState, .answered)
+    }
+
+    func testNoBackendReasonMapsToNoBackend() {
+        XCTAssertEqual(chatAnswer(refusal: true, reason: .noBackend).honestState, .noBackend)
+    }
+
+    func testNoEvidenceReasonMapsToNoMatchingMoments() {
+        XCTAssertEqual(
+            chatAnswer(refusal: true, reason: .noEvidence).honestState, .noMatchingMoments
+        )
+    }
+
+    func testUnsupportedAndBlockedMapToSafeRefusal() {
+        XCTAssertEqual(chatAnswer(refusal: true, reason: .unsupported).honestState, .safeRefusal)
+        XCTAssertEqual(chatAnswer(refusal: true, reason: .blocked).honestState, .safeRefusal)
+    }
+
+    func testUnknownReasonPrefersCoverageThenSafeRefusal() {
+        // reason nil (e.g. a graceful-refusal or unknown wire value): fall back to
+        // coverage, else a generic safe refusal — never a no-backend affordance.
+        XCTAssertEqual(chatAnswer(refusal: true, reason: nil).honestState, .safeRefusal)
+        XCTAssertEqual(
+            chatAnswer(refusal: true, reason: nil, coverage: .noMatchingMoments).honestState,
+            .noMatchingMoments
+        )
+    }
+
+    func testNoBackendSuppressesOcrConsentAffordance() {
+        // R7: even with a thin-coverage state that would normally suggest OCR
+        // consent, a no-backend refusal must NOT tell the user to turn on indexing.
+        let a = chatAnswer(refusal: true, reason: .noBackend, coverage: .notIndexed)
+        XCTAssertEqual(a.honestState, .noBackend)
+        XCTAssertFalse(a.suggestsOcrConsent, "no-backend must suppress the OCR-consent affordance")
+    }
+
+    func testReasonDecodesFromWire() throws {
+        let json = """
+        {"answer":"x","sources":[],"coverage":{"state":"ok","note":"","per_stream":{}},
+         "refusal":true,"question_kind":"point","target":"none","reason":"no_backend"}
+        """
+        let decoded = try JSONDecoder().decode(ChatAnswerResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(ChatAnswer(response: decoded).reason, .noBackend)
+        XCTAssertEqual(ChatAnswer(response: decoded).honestState, .noBackend)
+    }
 }

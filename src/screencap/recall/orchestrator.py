@@ -525,15 +525,50 @@ _AGGREGATE_CUES = (
 )
 _AGGREGATE_RE = re.compile("|".join(_AGGREGATE_CUES), re.IGNORECASE)
 
+# Recap-intent cues (KTD4): an OPEN "what did I do / work on" recap is a period
+# summary, not a keyword point lookup over the literal words. The discriminator is
+# recap intent, NOT the mere presence of a time reference — "what was that error I
+# saw yesterday" carries a time reference but is a specific content lookup and must
+# stay POINT, so these patterns match only the open-recap shape ("what did/have I
+# do/done/work on / been up to", "walk me through my …"), never "what was that …".
+_RECAP_CUES = (
+    r"\bwhat (?:did|have) (?:i|we) (?:do|done|been doing|work(?:ed|ing)? on|"
+    r"get(?: done)?|been up to|been working on)\b",
+    r"\bwhat was (?:i|we) (?:doing|working on|up to)\b",
+    r"\bwalk me through (?:my|the|what)\b",
+)
+_RECAP_RE = re.compile("|".join(_RECAP_CUES), re.IGNORECASE)
+
+# KTD4's "no dominant content keyword" gate: a recap-shaped question that names a
+# specific SUBJECT ("… about the login bug", "… to fix that error") is a point
+# lookup for that moment, not an open day recap. These high-signal qualifiers are
+# chosen NOT to collide with the recap verb phrases themselves (e.g. a bare "on"
+# would wrongly fire on "what did I work on this week"), so they only demote a
+# genuine content-bearing recap.
+_CONTENT_QUALIFIER_CUES = (
+    r"\babout\b",
+    r"\bregarding\b",
+    r"\bto (?:fix|solve|debug|resolve|handle|figure out|deal with)\b",
+)
+_CONTENT_QUALIFIER_RE = re.compile("|".join(_CONTENT_QUALIFIER_CUES), re.IGNORECASE)
+
 
 def classify_question(question: str) -> QuestionKind:
-    """Rule-based v1 point-vs-aggregate classifier (R3).
+    """Rule-based v1 point-vs-aggregate classifier (R3, KTD4).
 
-    Aggregate cues ("how much/long time", "recap", "summarize", "total …")
-    → :attr:`QuestionKind.AGGREGATE`; everything else is a point lookup. A light on-
-    device intent model is the deferred alternative (Outstanding Questions).
+    Explicit aggregate cues ("how much/long time", "recap", "summarize", "total …")
+    always → :attr:`QuestionKind.AGGREGATE`. An open recap-intent question ("what
+    did I do …", "what did I work on …") → AGGREGATE **only when it carries no
+    dominant content keyword** (KTD4): a recap that names a specific subject ("what
+    did I do about the login bug yesterday") is a point lookup for that moment, and a
+    specific content lookup that merely carries a time reference ("what was that
+    error I saw yesterday") is POINT too. A light on-device intent model is the
+    deferred alternative (Outstanding Questions).
     """
-    if _AGGREGATE_RE.search(question or ""):
+    q = question or ""
+    if _AGGREGATE_RE.search(q):
+        return QuestionKind.AGGREGATE
+    if _RECAP_RE.search(q) and not _CONTENT_QUALIFIER_RE.search(q):
         return QuestionKind.AGGREGATE
     return QuestionKind.POINT
 
@@ -611,13 +646,19 @@ def _strip_blocked(
 ) -> list[EvidenceItem]:
     """Drop every candidate whose ``timestamp_ms`` falls in a blocked interval.
 
-    ALLOW-only selection via :func:`screencap.frame_blocked.build_is_blocked`, which
-    re-derives the ``SCRUB_BLOCK_ACTIONS`` skip set over the intact local
+    ALLOW-only selection via :func:`screencap.frame_blocked.build_is_blocked` with
+    ``screenshot_residuals=False``: it re-derives the genuine privacy set (canonical
+    ``SCRUB_BLOCK_ACTIONS`` + ambiguity + secure-field) over the intact local
     ``recording.db`` with ``require_canonical=True`` (fail-closed: a missing/partial
-    DB or indeterminate geometry flags EVERY frame). This is terminal over the WHOLE
-    bundle — fresh AND re-derived prior-turn items — so no masked/excluded content
-    can reach a provider (R11, KTD5). ``sanitize.py`` is NOT used here (it only
-    cleans model-emitted task text, does no content redaction).
+    DB or indeterminate geometry flags EVERY item). The screenshot-file residuals
+    (orphan-screenshot / uncovered-gap) are deliberately OMITTED here — an evidence
+    item's ``timestamp_ms`` is a ``window_event`` time (timeline) or chunk-start time
+    (transcript), not an on-disk ``screenshots/*.jpg`` file, so those residuals would
+    false-positive every item; the genuine intervals fully cover masked/excluded/
+    secure-field windows for every stream. This is terminal over the WHOLE bundle —
+    fresh AND re-derived prior-turn items — so no masked/excluded content can reach a
+    provider (R11, KTD5). ``sanitize.py`` is NOT used here (it only cleans
+    model-emitted task text, does no content redaction).
     """
     if not candidates:
         return []
@@ -640,7 +681,13 @@ def _strip_blocked(
             continue
         frame_tss = [item.timestamp_ms / 1000.0 for item in items]
         try:
-            is_blocked = build_is_blocked(rec_dir, frame_tss)
+            # screenshot_residuals=False: evidence timestamps are window-event
+            # (timeline) or chunk-start (transcript) times, NOT on-disk screenshot
+            # files, so the orphan-screenshot/uncovered-gap residuals are
+            # inapplicable and would flag every item. Test membership against the
+            # genuine privacy intervals only (canonical + ambiguity + secure-field);
+            # require_canonical still fails closed on a missing/partial DB.
+            is_blocked = build_is_blocked(rec_dir, frame_tss, screenshot_residuals=False)
         except Exception:
             # build_is_blocked is itself fail-closed and does not raise, but guard
             # anyway: an unexpected error drops the whole recording's items.
@@ -734,6 +781,8 @@ def build_evidence_bundle(
         prior_turns=prior_turns or (),
         limit=limit,
         redact=redact,
+        window_ms=window_ms,
+        app=app,
     )
 
 
@@ -786,12 +835,22 @@ def _build_point_bundle(
     prior_turns: Sequence[PriorTurnPointer],
     limit: int | None,
     redact: TextRedactor,
+    window_ms: tuple[int, int] | None = None,
+    app: str | None = None,
 ) -> EvidenceBundle:
-    """Point flow: retrieve fresh + re-derive prior-turn pointers, then strip."""
+    """Point flow: retrieve fresh + re-derive prior-turn pointers, then strip.
+
+    When a time window is resolved (``window_ms``), the timeline query is scoped to
+    it (R8) — a time-referenced point question retrieves the moments in that period,
+    not the globally-earliest events. ``app`` narrows the timeline the same way.
+    """
     # 1. Fresh retrieval for the new question.
+    start_ms, end_ms = window_ms if window_ms else (None, None)
     content = retriever.search_content(question, limit=limit)
     transcript = retriever.search_transcript(question, limit=limit)
-    timeline = retriever.query_timeline(recording=None, limit=limit)
+    timeline = retriever.query_timeline(
+        start_ms=start_ms, end_ms=end_ms, app=app, recording=None, limit=limit,
+    )
 
     candidates: list[EvidenceItem] = []
     for hit in content.hits:

@@ -66,6 +66,7 @@ class FakeRetriever:
         self._snippet_by_pointer = snippet_by_pointer or {}
         self.content_queries: list[str] = []
         self.reresolved: list[tuple[str, int]] = []
+        self.timeline_calls: list[dict] = []
 
     def search_content(self, query, *, recording=None, limit=None) -> RetrievalResult:
         self.content_queries.append(query)
@@ -77,6 +78,10 @@ class FakeRetriever:
     def query_timeline(
         self, *, start_ms=None, end_ms=None, app=None, recording=None, limit=None
     ) -> list[dict]:
+        self.timeline_calls.append(
+            {"start_ms": start_ms, "end_ms": end_ms, "app": app,
+             "recording": recording, "limit": limit}
+        )
         return list(self._timeline)
 
     def resolve_pointer_text(self, recording: str, timestamp_ms: int) -> str | None:
@@ -137,6 +142,10 @@ def _make_recording_with_masked_window(
         "recap my morning",
         "summarize what I did yesterday afternoon",
         "total time in Slack this week",
+        # Recap-intent (KTD4): open "what did I do / work on" recaps are aggregates.
+        "what did I do yesterday",
+        "what did I work on this week",
+        "walk me through my afternoon",
     ],
 )
 def test_aggregate_questions_classify_aggregate(question):
@@ -149,10 +158,33 @@ def test_aggregate_questions_classify_aggregate(question):
         "what was that vendor-portal refund error around 2pm?",
         "which site had the login bug",
         "find the invoice number I saw earlier",
+        # KTD4 discriminator: a specific content lookup that merely carries a time
+        # reference stays POINT (recap-intent, not time-presence, is the signal).
+        "what was that error I saw yesterday afternoon",
+        # KTD4 content-keyword gate: a recap SHAPE that names a subject is a point
+        # lookup for that moment, not an open day recap.
+        "what did I do about the login bug yesterday",
+        "what did I do to fix that error yesterday",
     ],
 )
 def test_point_questions_classify_point(question):
     assert orchestrator.classify_question(question) is QuestionKind.POINT
+
+
+def test_point_question_scopes_timeline_to_resolved_window(tmp_path):
+    """A time-referenced point question scopes the timeline query to the resolved
+    window (R8) — not the globally-earliest events."""
+    retriever = FakeRetriever(timeline=[])
+    window = (1_770_000_000_000, 1_770_003_600_000)
+    build_evidence_bundle(
+        "which site had the login bug",
+        retriever=retriever,
+        recordings_dir=tmp_path,
+        window_ms=window,
+    )
+    assert retriever.timeline_calls, "the point path must query the timeline"
+    last = retriever.timeline_calls[-1]
+    assert (last["start_ms"], last["end_ms"]) == window
 
 
 # ===========================================================================
@@ -255,6 +287,70 @@ def test_masked_interval_content_absent_from_bundle(tmp_path):
     # The genuinely-allowed item from the open recording survives.
     recordings_present = {item.recording for item in bundle.evidence}
     assert "rec-secret" not in recordings_present
+
+
+def test_timeline_evidence_at_allow_window_survives_strip(tmp_path):
+    """Regression (the root-cause bug): a TIMELINE evidence item at an ALLOW
+    window's timestamp survives the strip.
+
+    A timeline item carries a ``window_event`` timestamp, not an on-disk
+    screenshot file. Before the ``screenshot_residuals=False`` fix, the strip fed
+    that timestamp through the screenshot-file residuals and flagged it an
+    orphan-screenshot, wiping every timeline/transcript item and emptying the
+    bundle. The strip must now keep genuinely-ALLOW timeline evidence.
+    """
+    rec = tmp_path / "rec-allow"
+    allow_ts = 1_770_000_100.0
+    # A benign (non-sensitive) window classifies ALLOW under PUBLIC.
+    _make_recording_with_masked_window(
+        rec, masked_ts=allow_ts, masked_bundle="com.apple.TextEdit"
+    )
+    allow_ms = int(allow_ts * 1000)
+
+    retriever = FakeRetriever(
+        timeline=[
+            {"recording": "rec-allow", "timestamp_ms": allow_ms,
+             "app": "TextEdit", "title": "Notes"},
+        ],
+    )
+    # A POINT question (not a recap) so the timeline-retrieval path runs.
+    bundle = build_evidence_bundle(
+        "which app window was open", retriever=retriever, recordings_dir=tmp_path,
+    )
+    recordings_present = {item.recording for item in bundle.evidence}
+    assert "rec-allow" in recordings_present, (
+        "ALLOW timeline evidence must survive the strip (the root-cause regression)"
+    )
+    assert bundle.coverage.state is CoverageState.OK
+
+
+def test_transcript_evidence_strip_is_stream_agnostic(tmp_path):
+    """The strip gates TRANSCRIPT evidence (chunk-start timestamps — the other
+    non-frame stream U1 must handle) the same way as timeline: an ALLOW item
+    survives, a masked-window item is dropped."""
+    allow = tmp_path / "rec-allow"
+    _make_recording_with_masked_window(
+        allow, masked_ts=1_770_000_100.0, masked_bundle="com.apple.TextEdit"
+    )
+    secret = tmp_path / "rec-secret"
+    _make_recording_with_masked_window(secret, masked_ts=1_770_000_100.0)  # 1Password
+
+    retriever = FakeRetriever(
+        transcript=[
+            {"recording": "rec-allow", "timestamp_ms": 1_770_000_100_000,
+             "snippet": "quarterly review call"},
+            {"recording": "rec-secret", "timestamp_ms": 1_770_000_100_000,
+             "snippet": "vault master password is hunter2"},
+        ],
+    )
+    bundle = build_evidence_bundle(
+        "which app window was open", retriever=retriever, recordings_dir=tmp_path,
+    )
+    recordings_present = {item.recording for item in bundle.evidence}
+    assert "rec-allow" in recordings_present, "ALLOW transcript evidence survives the strip"
+    assert "rec-secret" not in recordings_present, "masked-window transcript evidence is dropped"
+    texts = " ".join(item.text for item in bundle.evidence)
+    assert "hunter2" not in texts
 
 
 def test_coverage_gap_is_treated_as_blocked_fail_closed(tmp_path):

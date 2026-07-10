@@ -46,19 +46,33 @@ def _always_blocked(_ts: float) -> bool:
 
 
 def build_is_blocked(
-    recording_dir: Path, frame_tss: Sequence[float]
+    recording_dir: Path,
+    frame_tss: Sequence[float],
+    *,
+    screenshot_residuals: bool = True,
 ) -> Callable[[float], bool]:
     """Return ``is_blocked(ts)`` for a recording's frames, fail-closed on error.
 
-    ``frame_tss`` is the epoch-second timestamps of the recording's flat
-    ``screenshots/*.jpg`` frames (already parsed by the adapter), needed so the
-    re-derivation can add its uncovered-gap and orphan-screenshot residual for
-    exactly those frames. The returned predicate answers, for a frame's ``ts``,
-    whether it falls in any ``SCRUB_BLOCK_ACTIONS`` (or fail-closed residual)
-    interval.
+    ``frame_tss`` is the epoch-second timestamps the caller wants to test. The
+    returned predicate answers, for a ``ts``, whether it falls in any
+    ``SCRUB_BLOCK_ACTIONS`` (or fail-closed residual) interval. Heavy imports
+    (scrubber / backfill / privacy) are deferred to the call so importing this
+    module stays light.
 
-    Heavy imports (scrubber / backfill / privacy) are deferred to the call so
-    importing this module stays light.
+    ``screenshot_residuals`` selects which interval set the predicate tests:
+
+    * ``True`` (default, the ``frame.nearest`` contract) — ``frame_tss`` are the
+      recording's flat ``screenshots/*.jpg`` timestamps, and the derivation adds
+      its uncovered-gap and orphan-screenshot residual for exactly those files,
+      validating on-disk screenshots.
+    * ``False`` (the recall evidence-strip) — the caller's timestamps are NOT
+      on-disk screenshot files (timeline evidence carries ``window_event`` times,
+      transcript evidence carries chunk-start times), so the screenshot-file
+      residuals are inapplicable and would false-positive every item. Test
+      membership against the **genuine** privacy set only (canonical
+      ``SCRUB_BLOCK_ACTIONS`` + ambiguity + secure-field); ``frame_tss`` still
+      bounds the derivation time range. ``require_canonical`` is preserved, so a
+      missing/partial ``recording.db`` still fails closed (all blocked).
     """
     recording_dir = Path(recording_dir)
     if not frame_tss:
@@ -83,13 +97,19 @@ def build_is_blocked(
             classifier=classifier,
             evaluator=evaluator,
             time_range=(start, end),
-            screenshot_timestamps=list(frame_tss),
+            # Screenshot-file residuals (uncovered-gap + orphan-screenshot) are
+            # added ONLY when the caller's timestamps are actual on-disk frames.
+            # For non-frame evidence timestamps (screenshot_residuals=False), pass
+            # None so only the genuine canonical/ambiguity/secure-field intervals
+            # apply — the file residuals would otherwise flag every item.
+            screenshot_timestamps=list(frame_tss) if screenshot_residuals else None,
             # Fail closed on a partial canonical read: build_scrub_context empties
             # the canonical set gracefully (no raise) on a partial recording.db
             # read, which is indistinguishable from a genuine all-ALLOW recording.
             # require_canonical makes derive_skip_intervals raise instead, so the
             # except below maps it to the all-blocked sentinel rather than
-            # surfacing an under-blocked frame (SCR-198).
+            # surfacing an under-blocked frame (SCR-198). Preserved on BOTH
+            # residual modes — the fail-closed guarantee is independent of them.
             require_canonical=True,
         )
         # derive_skip_intervals returns a merged, start-sorted list; pre-build the
