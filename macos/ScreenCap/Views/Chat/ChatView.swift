@@ -55,7 +55,7 @@ struct ChatView: View {
             composer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(Color.scCanvas)
+        .background(Color.scPaper)
         .task {
             await intelligence.refresh()
             await loadSettings()
@@ -69,19 +69,19 @@ struct ChatView: View {
 
     // MARK: - Header
 
+    /// Screen header matching the Library/Journal convention: the Space Grotesk
+    /// screen heading left, mono metadata (the provider badge) right, on the
+    /// shared 36pt content gutters.
     private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+        HStack(alignment: .center) {
             Text("Chat")
-                .font(SCTypography.serifDayHeading)
+                .font(SCTypography.screenHeading)
                 .foregroundStyle(Color.scInk)
-            Text("ask about your recorded history")
-                .font(SCTypography.sans(size: 13))
-                .foregroundStyle(Color.scInkMuted)
             Spacer(minLength: 0)
             providerBadge
         }
-        .padding(.horizontal, SCMetrics.space6)
-        .padding(.top, SCMetrics.space6)
+        .padding(.horizontal, 36)
+        .padding(.top, 28)
         .padding(.bottom, SCMetrics.space4)
     }
 
@@ -129,7 +129,10 @@ struct ChatView: View {
                             .id(turn.id)
                         }
                     }
-                    .padding(.horizontal, SCMetrics.space6)
+                    // A capped reading column, centered by the ScrollView, so the
+                    // conversation stays composed on wide windows.
+                    .frame(maxWidth: 760, alignment: .leading)
+                    .padding(.horizontal, 36)
                     .padding(.vertical, SCMetrics.space4)
                 }
                 .onChange(of: model.turns.count) { _ in
@@ -142,48 +145,41 @@ struct ChatView: View {
         }
     }
 
+    /// The first-run hero, centered like Journal's empty state: brand mark, serif
+    /// heading, grounded copy, and the example questions as capsule chips under a
+    /// mono eyebrow.
     private var emptyState: some View {
-        VStack(alignment: .leading, spacing: SCMetrics.space4) {
+        VStack(spacing: SCMetrics.space4) {
             Spacer(minLength: 0)
+            ShellLogoMark(size: 44)
             Text("Ask about your recorded history")
                 .font(SCTypography.serifHeading)
                 .foregroundStyle(Color.scInk)
+                .multilineTextAlignment(.center)
             Text("Get a written answer grounded in the real moments you recorded — with the moments it drew from shown as sources. It runs on this Mac by default.")
                 .font(SCTypography.sans(size: 13.5))
                 .foregroundStyle(Color.scInkSecondary)
+                .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 440, alignment: .leading)
-            VStack(alignment: .leading, spacing: SCMetrics.space2) {
+                .frame(maxWidth: 460)
+            VStack(spacing: SCMetrics.space2) {
+                Text("try asking")
+                    .kerning(1.2)
+                    .font(SCTypography.metaMonoSmall)
+                    .foregroundStyle(Color.scInkMuted)
+                    .textCase(.uppercase)
+                    .padding(.top, SCMetrics.space3)
                 ForEach(Self.exampleQuestions, id: \.self) { example in
-                    Button {
+                    ExampleQuestionChip(text: example) {
                         draft = example
                         Task { await submit() }
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "sparkles")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Color.scTeal)
-                            Text(example)
-                                .font(SCTypography.sans(size: 13))
-                                .foregroundStyle(Color.scInk)
-                        }
-                        .padding(.horizontal, SCMetrics.space3)
-                        .padding(.vertical, 9)
-                        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusInner))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: SCMetrics.radiusInner)
-                                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
-                        )
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                 }
             }
-            .padding(.top, SCMetrics.space2)
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .padding(.horizontal, SCMetrics.space6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 36)
     }
 
     /// Example questions mirroring F1 (point lookup) and F2 (period summary).
@@ -195,25 +191,34 @@ struct ChatView: View {
 
     // MARK: - Composer
 
+    /// The composer as a floating card (the Journal-card vocabulary: scSurface on
+    /// paper with a warm hairline), teal-ringed while focused and aligned to the
+    /// transcript's reading column.
     private var composer: some View {
-        VStack(spacing: 0) {
-            Divider().overlay(Color.scBorderWarm)
-            HStack(alignment: .bottom, spacing: SCMetrics.space2) {
-                TextField("Ask about a moment or a stretch of time…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(SCTypography.sans(size: 14))
-                    .foregroundStyle(Color.scInk)
-                    .lineLimit(1...5)
-                    .focused($composerFocused)
-                    .disabled(model.isLoading)
-                    .onSubmit { Task { await submit() } }
-                    .accessibilityLabel("Ask about your recorded history. Answers only from what's on this Mac.")
-                sendButton
-            }
-            .padding(.horizontal, SCMetrics.space5)
-            .padding(.vertical, SCMetrics.space3)
+        HStack(alignment: .bottom, spacing: SCMetrics.space3) {
+            TextField("Ask about a moment or a stretch of time…", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(SCTypography.sans(size: 14))
+                .foregroundStyle(Color.scInk)
+                .lineLimit(1...5)
+                .focused($composerFocused)
+                .disabled(model.isLoading)
+                .onSubmit { Task { await submit() } }
+                .accessibilityLabel("Ask about your recorded history. Answers only from what's on this Mac.")
+            sendButton
         }
-        .background(Color.scSurface)
+        .padding(.horizontal, SCMetrics.space4)
+        .padding(.vertical, SCMetrics.space3)
+        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusCard))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusCard)
+                .strokeBorder(composerFocused ? Color.scTealSoft : Color.scBorderWarm, lineWidth: 1)
+        )
+        .shadow(color: Color.scDarkCanvas.opacity(0.06), radius: 14, y: 5)
+        .frame(maxWidth: 760)
+        .padding(.horizontal, 36)
+        .padding(.top, SCMetrics.space2)
+        .padding(.bottom, SCMetrics.space6)
     }
 
     @ViewBuilder
@@ -221,15 +226,20 @@ struct ChatView: View {
         if model.isLoading {
             ProgressView()
                 .controlSize(.small)
-                .frame(width: 30, height: 24)
+                .frame(width: 28, height: 28)
                 .accessibilityLabel("Generating answer")
         } else {
             Button {
                 Task { await submit() }
             } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 22))
-                    .foregroundStyle(model.canSend(draft) ? Color.scTeal : Color.scInkFaint)
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(model.canSend(draft) ? Color.scCanvas : Color.scInkFaint)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle().fill(model.canSend(draft) ? Color.scTeal : Color.scFillSubtle)
+                    )
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .disabled(!model.canSend(draft))
@@ -287,6 +297,37 @@ struct ChatView: View {
             return
         }
         await model.retry(turnID: turnID)
+    }
+}
+
+// MARK: - Example-question chip
+
+/// A first-run example question as a capsule chip (the Library pill vocabulary:
+/// canvas fill, warm hairline, teal border on hover).
+private struct ExampleQuestionChip: View {
+    let text: String
+    var action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.scTeal)
+                Text(text)
+                    .font(SCTypography.sans(size: 13))
+                    .foregroundStyle(Color.scInk)
+            }
+            .padding(.horizontal, SCMetrics.space4)
+            .padding(.vertical, 9)
+            .background(Color.scCanvas, in: Capsule())
+            .overlay(Capsule().strokeBorder(hovering ? Color.scTeal : Color.scBorderWarm, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 
