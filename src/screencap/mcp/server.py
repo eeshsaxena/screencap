@@ -1,11 +1,13 @@
 """FastMCP stdio server exposing ScreenCap's retrieval surface to an agent.
 
-Six tools — ``search_screen_content``, ``search_transcript``,
-``query_timeline``, ``resolve_frame``, ``list_recordings``, ``whoami`` — each
-forward to a daemon ``/v0/*`` read verb and re-wrap the response as a typed,
-POINTER-ONLY result (text snippets + ``(recording, timestamp)`` pointers and, for
-``resolve_frame``, a bare on-disk screenshot stem; never frame pixels). The
-server holds no query logic of its own (R1).
+Seven tools — ``search_screen_content``, ``search_transcript``,
+``query_timeline``, ``resolve_frame``, ``list_recordings``, ``whoami``,
+``chat_answer`` — each forward to a daemon ``/v0/*`` read verb and re-wrap the
+response as a typed, POINTER-ONLY result (text snippets + ``(recording, timestamp)``
+pointers and, for ``resolve_frame``, a bare on-disk screenshot stem; never frame
+pixels). The server holds no query logic of its own (R1). ``chat_answer`` (R15) is
+the one tool that returns model-generated PROSE — output-sanitized before it
+reaches the agent — but its sources stay pointer-only.
 
 stdio discipline: with the stdio transport the server owns stdout (the JSON-RPC
 stream), so NOTHING may be written to stdout — all logging goes to stderr. Heavy
@@ -126,6 +128,50 @@ class WhoAmIResult(BaseModel):
     # True when signed in but the token could not be refreshed (offline), so
     # uid/email are unknown.
     stale: bool = False
+
+
+class ChatSource(BaseModel):
+    """A moment the answer drew from — POINTER-ONLY (R15).
+
+    Structurally incapable of carrying a media path or image bytes:
+    ``(recording, timestamp_ms)`` is exactly what ``resolve_frame`` resolves to a
+    frame stem, so the agent can deep-link the moment itself. ``stream`` records
+    which retrieval stream produced it (content / transcript / timeline).
+    """
+
+    recording: str
+    timestamp_ms: int
+    stream: str
+
+
+class ChatCoverage(BaseModel):
+    """The honest coverage descriptor for a chat answer (R12).
+
+    ``state`` is ``ok`` / ``no_matching_moments`` / ``not_indexed`` /
+    ``index_degraded`` / ``store_unavailable`` so the agent never mistakes an
+    empty/degraded index for ground truth; ``per_stream`` maps each stream to its
+    index-state value.
+    """
+
+    state: str
+    note: str
+    per_stream: dict[str, str]
+
+
+class ChatAnswerResult(BaseModel):
+    """A grounded conversational-recall answer + its sources — POINTER-ONLY (R15).
+
+    ``answer`` is model-generated prose (OUTPUT-SANITIZED before it reaches the
+    agent — see :func:`chat_answer`); ``sources`` are pointer-only locators (never
+    image bytes / paths). ``refusal`` flags a no-evidence turn; ``question_kind``
+    is ``point`` / ``aggregate``.
+    """
+
+    answer: str
+    sources: list[ChatSource]
+    coverage: ChatCoverage
+    refusal: bool
+    question_kind: str
 
 
 # -- lazy daemon runtime (connect + held subscription on first tool call) ---
@@ -318,6 +364,71 @@ async def whoami() -> WhoAmIResult:
     return WhoAmIResult(**{k: v for k, v in env.items() if k in keep})
 
 
+# Answer prose can be long (a period summary narrates several sources); bound it
+# well above any plausible answer while still capping a runaway/hostile model.
+_MAX_ANSWER_LEN = 4000
+
+
+async def chat_answer(
+    question: str,
+    prior_turns: list[dict] | None = None,
+    window_ms: tuple[int, int] | None = None,
+    app: str | None = None,
+    limit: int | None = None,
+) -> ChatAnswerResult:
+    """Ask a grounded question about the recorded history; get generated prose + sources.
+
+    Fields both **point lookups** ("what was that error at 2pm?") and **period
+    summaries** ("how much time in Salesforce today?"). The answer is drawn ONLY
+    from retrieved, privacy-stripped evidence — when nothing matches, ``refusal``
+    is true and the answer says so rather than fabricating.
+
+    POINTER-ONLY (R15): ``sources`` are ``(recording, timestamp_ms, stream)``
+    locators — never image bytes or file paths. Resolve a source to a frame with
+    ``resolve_frame(recording, timestamp_ms)``. Check ``coverage.state`` (``ok`` /
+    ``no_matching_moments`` / ``not_indexed`` / …) before trusting completeness.
+
+    ``prior_turns`` carries prior-turn source pointers
+    (``[{recording, timestamp_ms, stream}]``) for a multi-turn follow-up (R14) —
+    NEVER prose; the daemon re-derives the evidence from the pointers.
+    ``window_ms`` is an optional ``(start_ms, end_ms)`` pair for a period-summary
+    question; ``app`` narrows it; ``limit`` bounds retrieval.
+    """
+    env = await (await _client()).chat_answer(
+        question,
+        prior_turns=prior_turns or None,
+        window_ms=window_ms,
+        app=app,
+        limit=_clamp_or_none(limit),
+    )
+    # OUTPUT-sanitize the model prose before it reaches the agent. This is the
+    # first MCP surface returning model-generated text, and the answer is
+    # influenced by on-screen/transcript content (attacker-influenceable), so it
+    # can carry injected markup / control sequences aimed at the downstream
+    # consumer. Reuse the exact primitive that hardens model-emitted task names.
+    from screencap.segmentation.sanitize import _clean_text
+
+    cov = env.get("coverage") or {}
+    return ChatAnswerResult(
+        answer=_clean_text(env.get("answer", ""), _MAX_ANSWER_LEN),
+        sources=[
+            ChatSource(
+                recording=s["recording"],
+                timestamp_ms=s["timestamp_ms"],
+                stream=s["stream"],
+            )
+            for s in env.get("sources", [])
+        ],
+        coverage=ChatCoverage(
+            state=cov.get("state", "store_unavailable"),
+            note=cov.get("note", ""),
+            per_stream=cov.get("per_stream", {}),
+        ),
+        refusal=bool(env.get("refusal", False)),
+        question_kind=env.get("question_kind", "point"),
+    )
+
+
 # -- server ------------------------------------------------------------------
 
 
@@ -343,7 +454,7 @@ def build_server() -> FastMCP:
     )
     for fn in (
         search_screen_content, search_transcript, query_timeline,
-        resolve_frame, list_recordings, whoami,
+        resolve_frame, list_recordings, whoami, chat_answer,
     ):
         mcp.tool()(fn)
     return mcp
