@@ -4426,6 +4426,94 @@ def backfill_cancel_cmd() -> None:
     console.print(f"  {_backfill_snapshot_line(snapshot)}")
 
 
+@cli.group("storage")
+def storage_group() -> None:
+    """Manage where recordings are stored (SCR-228).
+
+    Thin one-shot HTTP client of the daemon's ``storage.migrate`` verb over
+    the UNIX socket. The macOS Privacy pane is the supported UI; this CLI
+    ships ``migrate`` for headless use and scripting.
+    """
+
+
+@storage_group.command("migrate")
+@click.argument("path", type=click.Path())
+@click.option(
+    "--json", "as_json", is_flag=True,
+    default=lambda: _should_default_to_json(),
+    help="Emit the raw result payload as JSON (no styling). Auto-detected "
+         "when stdout is not a TTY.",
+)
+def storage_migrate_cmd(path: str, as_json: bool) -> None:
+    """Move your recordings library to a new folder on the SAME disk.
+
+    Thin client of ``POST /v0/storage.migrate``. The move is atomic and
+    near-instant (a same-volume rename). Cross-volume / external-drive
+    targets are refused for now. Recording must not be in progress.
+    """
+    import json as _json
+    import os
+
+    from screencap.cli._autospawn import (
+        DaemonAutoSpawnError,
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonClientError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    target = os.path.abspath(os.path.expanduser(path))
+
+    try:
+        ensure_daemon_or_spawn(auto_spawn=True)
+    except (LaunchAgentNotRunningError, DaemonAutoSpawnError) as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        if isinstance(exc, DaemonAutoSpawnError) and exc.log_tail:
+            console.print(escape(exc.log_tail))
+        raise SystemExit(1) from exc
+
+    with DaemonHTTPClient() as client:
+        try:
+            payload = client.storage_migrate(target)
+        except DaemonUnreachableError as exc:
+            console.print(
+                f"[red]Error:[/red] could not reach the ScreenCap daemon: "
+                f"{escape(str(exc))}"
+            )
+            raise SystemExit(1) from exc
+        except SchemaMismatchError as exc:
+            console.print(f"[red]Error:[/red] {escape(str(exc))}")
+            raise SystemExit(1) from exc
+        except DaemonClientError as exc:
+            # storage_migration_failed carries a human `message` + `reason`.
+            env = exc.envelope
+            if as_json:
+                click.echo(_json.dumps({
+                    "ok": False,
+                    "error": env.get("error"),
+                    "reason": env.get("reason"),
+                    "message": env.get("message"),
+                }))
+            else:
+                msg = env.get("message") or env.get("error", "migration failed")
+                console.print(
+                    f"[red]Couldn't move recordings:[/red] {escape(str(msg))}"
+                )
+            raise SystemExit(1) from exc
+
+    if as_json:
+        click.echo(_json.dumps(payload))
+    else:
+        console.print(
+            f"[green]Recordings moved to[/green] "
+            f"{escape(str(payload.get('moved_to', target)))}"
+        )
+
+
 @cli.group("model")
 def model_group() -> None:
     """Download and manage the optional local Intelligence model (SCR-239).
