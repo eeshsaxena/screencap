@@ -416,10 +416,13 @@ enum IntelligenceSelectionModel {
         return writes(forPick: kind)
     }
 
-    /// The persisted cloud slot, normalized: nil/empty/"none" all mean unset
-    /// (the CLI clears with the literal `none`; the read-back should emit null,
-    /// but the mapping stays total either way).
-    private static func normalizedCloudProvider(_ raw: String?) -> String? {
+    /// The persisted cloud slot, normalized: nil/empty/whitespace/"none" all
+    /// mean unset (the CLI clears with the literal `none`; the read-back should
+    /// emit null, but the mapping stays total either way). The single source of
+    /// truth for this rule — `ShellSidebarModel.shouldShowLocalModelHint` and
+    /// `IntelligenceController.setCloudProvider` both read the cloud slot through
+    /// it so the three sites can never drift.
+    static func normalizedCloudProvider(_ raw: String?) -> String? {
         guard let value = trimmedNonEmpty(raw), value != "none" else { return nil }
         return value
     }

@@ -255,15 +255,7 @@ struct IntelligenceSettingsView: View {
         isSelected: Bool
     ) -> some View {
         HStack(alignment: .center, spacing: 12) {
-            if row.selectable {
-                Button { tapRow(row, settings: settings) } label: {
-                    radio(selected: isSelected, muted: false)
-                }
-                .buttonStyle(.plain)
-                .disabled(providerWriteInFlight)
-            } else {
-                radio(selected: isSelected, muted: true)
-            }
+            selectableRadio(row, settings: settings, isSelected: isSelected)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
@@ -308,17 +300,7 @@ struct IntelligenceSettingsView: View {
         let option = ConnectProviderModel.userOwnedOptions(settings)
             .first { $0.providerID == row.id }
         return HStack(alignment: .center, spacing: 12) {
-            if row.selectable {
-                Button { tapRow(row, settings: settings) } label: {
-                    radio(selected: isSelected, muted: false)
-                }
-                .buttonStyle(.plain)
-                .disabled(providerWriteInFlight)
-            } else {
-                // Not pickable — a stranded (selected-but-unavailable) row still
-                // renders its selection honestly, muted.
-                radio(selected: isSelected, muted: true)
-            }
+            selectableRadio(row, settings: settings, isSelected: isSelected)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
@@ -768,6 +750,27 @@ struct IntelligenceSettingsView: View {
         case .ok: return Color.scSuccessFg
         case .warn: return Color.scAmberText
         case .info: return Color.scInkMuted
+        }
+    }
+
+    /// The leading radio for a "Your own" row (BYO + local-server share it): a
+    /// tappable radio when the row is selectable, else a muted, non-interactive
+    /// one so a stranded (selected-but-unavailable) row still renders its
+    /// selection honestly.
+    @ViewBuilder
+    private func selectableRadio(
+        _ row: IntelligenceModelRow,
+        settings: IntelligenceSettings,
+        isSelected: Bool
+    ) -> some View {
+        if row.selectable {
+            Button { tapRow(row, settings: settings) } label: {
+                radio(selected: isSelected, muted: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(providerWriteInFlight)
+        } else {
+            radio(selected: isSelected, muted: true)
         }
     }
 

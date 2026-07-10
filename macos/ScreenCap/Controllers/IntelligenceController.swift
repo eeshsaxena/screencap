@@ -357,16 +357,18 @@ final class IntelligenceController: ObservableObject {
         providerWriteInFlight = true
         defer { providerWriteInFlight = false }
 
-        let arg = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalized = (arg?.isEmpty ?? true) ? "none" : arg!
+        // One normalization rule for the cloud slot (nil/empty/whitespace/"none"
+        // → unset), shared with the read path so the optimistic flip and the CLI
+        // clear-literal can never disagree.
+        let normalized = IntelligenceSelectionModel.normalizedCloudProvider(value)
 
         let previous = settings
         if let current = settings {
-            settings = current.with(cloudProvider: normalized == "none" ? nil : normalized)
+            settings = current.with(cloudProvider: normalized)
         }
         do {
             _ = try await invoke([
-                "settings", "intelligence", "cloud_provider", "set", normalized, "--json",
+                "settings", "intelligence", "cloud_provider", "set", normalized ?? "none", "--json",
             ])
             lastError = nil
             await refresh()

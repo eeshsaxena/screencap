@@ -96,17 +96,16 @@ enum ShellSidebarModel {
     /// installed model hides it. The cloud slot is checked explicitly because
     /// under the two-slot semantics a BYO pick sets only `cloud_provider` and
     /// leaves `provider == "on-device"`; nil, empty/whitespace, and the CLI's
-    /// clear-literal "none" all mean unset (mirrors
-    /// `IntelligenceSelectionModel.normalizedCloudProvider`).
+    /// clear-literal "none" all mean unset — read through
+    /// `IntelligenceSelectionModel.normalizedCloudProvider` so the two sites
+    /// share one normalization rule.
     static func shouldShowLocalModelHint(
         provider: String?,
         cloudProvider: String?,
         downloadedInstalled: Bool,
         dismissed: Bool
     ) -> Bool {
-        let cloudUnset = cloudProvider
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .map { $0.isEmpty || $0 == "none" } ?? true
+        let cloudUnset = IntelligenceSelectionModel.normalizedCloudProvider(cloudProvider) == nil
         return provider == "on-device" && cloudUnset && !downloadedInstalled && !dismissed
     }
 
