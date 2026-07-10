@@ -14,6 +14,17 @@ struct OnboardingStorageStep: View {
     @Binding var tier: OnboardingStorageTier
     let onContinue: () -> Void
 
+    /// The Cloud card's meta line. Paywall off → the pre-billing label. Paywall
+    /// on → the priced trial meta, OR the F3 "add cloud" upsell when the user
+    /// already holds Local Pro (a Local Pro holder is upgrading, not choosing a
+    /// fresh tier).
+    private var cloudCardMeta: String {
+        guard auth.paywallEnabled else { return OnboardingCopy.personalCardMetaFree }
+        return auth.tier == .localPro
+            ? OnboardingCopy.cloudUpgradeCardMeta
+            : OnboardingCopy.cloudCardMeta
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Text(OnboardingCopy.storageHeadline)
@@ -29,35 +40,59 @@ struct OnboardingStorageStep: View {
                 .padding(.bottom, 28)
 
             HStack(alignment: .top, spacing: 14) {
+                // Paid-only launch (U11): behind `paywallEnabled`, the two
+                // storage tiers read as the two PAID subscriptions — Local Pro
+                // (this Mac) and Cloud (adds upload/sync/AI) — each fronted by a
+                // free trial. The `OnboardingStorageTier` values are unchanged
+                // (`.local`/`.personalCloud`) so wizard routing + dot counts
+                // (OnboardingStepPolicyTests) stay pinned; only the surfaced
+                // title/meta/bullets differ. Paywall OFF → the pre-billing copy.
                 storageCard(
                     tier: .local,
-                    title: OnboardingCopy.localCardTitle,
-                    meta: OnboardingCopy.localCardMeta,
+                    title: auth.paywallEnabled ? OnboardingCopy.localProCardTitle : OnboardingCopy.localCardTitle,
+                    meta: auth.paywallEnabled ? OnboardingCopy.localProCardMeta : OnboardingCopy.localCardMeta,
                     metaColor: .scTeal,
-                    bullets: OnboardingCopy.localCardBullets
+                    bullets: auth.paywallEnabled ? OnboardingCopy.localProCardBullets : OnboardingCopy.localCardBullets,
+                    subscriptionGated: auth.paywallEnabled
                 )
                 storageCard(
                     tier: .personalCloud,
-                    title: OnboardingCopy.personalCardTitle,
-                    // Show the $5/mo price only when the client paywall is on
-                    // (KTD-6); otherwise fall back to the pre-billing label so
-                    // the app makes no pricing claim it isn't enforcing.
-                    meta: auth.paywallEnabled
-                        ? OnboardingCopy.personalCardMeta
-                        : OnboardingCopy.personalCardMetaFree,
+                    title: auth.paywallEnabled ? OnboardingCopy.cloudCardTitle : OnboardingCopy.personalCardTitle,
+                    // Show the priced meta only when the client paywall is on
+                    // (KTD-6/KTD-7); otherwise fall back to the pre-billing label
+                    // so the app makes no pricing claim it isn't enforcing. F3
+                    // upgrade path: a Local Pro holder sees the Cloud card as an
+                    // "add cloud" upsell rather than a fresh price.
+                    meta: cloudCardMeta,
                     metaColor: .scInkMuted,
-                    bullets: OnboardingCopy.personalCardBullets
+                    bullets: auth.paywallEnabled ? OnboardingCopy.cloudCardBullets : OnboardingCopy.personalCardBullets,
+                    subscriptionGated: auth.paywallEnabled
                 )
                 storageCard(
                     tier: .teamCloud,
                     title: OnboardingCopy.teamCardTitle,
                     meta: OnboardingCopy.teamCardMeta,
                     metaColor: .scInkMuted,
-                    bullets: OnboardingCopy.teamCardBullets
+                    bullets: OnboardingCopy.teamCardBullets,
+                    subscriptionGated: false
                 )
             }
             .frame(maxWidth: 860)
             .padding(.bottom, 16)
+
+            // R12 — disclose the trial's auto-conversion + cancellation before
+            // any charge, right under the priced cards (paywall on only).
+            if auth.paywallEnabled {
+                Text(OnboardingCopy.trialDisclosure)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkMuted)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, 14)
+                    .accessibilityLabel("Free trial terms")
+                    .accessibilityHint(OnboardingCopy.trialDisclosure)
+            }
 
             Text(OnboardingCopy.storageFootnote)
                 .font(SCTypography.sans(size: 12.5))
@@ -79,7 +114,8 @@ struct OnboardingStorageStep: View {
         title: String,
         meta: String,
         metaColor: Color,
-        bullets: [String]
+        bullets: [String],
+        subscriptionGated: Bool
     ) -> some View {
         let selected = tier == cardTier
         return Button {
@@ -128,6 +164,18 @@ struct OnboardingStorageStep: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+        // U11 accessibility: a priced/gated card is more than a bare selectable
+        // pixel — VoiceOver reads the tier, its price, and that it requires a
+        // paid subscription with a free trial (R5/R12), not just "button". The
+        // Button is already one a11y element, so we label it directly rather
+        // than `.accessibilityElement(children: .combine)` (which would drop the
+        // button's own trait/action).
+        .accessibilityLabel("\(title). \(meta).")
+        .accessibilityHint(
+            subscriptionGated
+                ? "Paid subscription with a free trial. \(OnboardingCopy.trialDisclosure)"
+                : ""
+        )
     }
 }
 
@@ -143,22 +191,55 @@ struct OnboardingAccountStep: View {
 
     /// Short reason surfaced when minting the checkout URL fails (U9).
     @State private var upgradeError: String?
+    /// Post-checkout pending: set true when the user opens Stripe Checkout, so
+    /// the return path shows "unlocks automatically" (a spinner + reconcile),
+    /// never a fresh "start trial" that reads like a failed payment (U11).
+    @State private var checkoutPending = false
 
-    /// After sign-in, Personal cloud stays on this step until the $5/mo
-    /// subscription is active — the upgrade panel drives checkout (U8/U9). Only
-    /// when the client paywall is on (KTD-6); off → no soft gate (pre-billing).
+    /// The paid tier this step checks out — the storage selection mapped to the
+    /// entitlement/price tier (U11). Local Pro on the `.local` storage tier,
+    /// Cloud on `.personalCloud`. Passed to `startCheckout` for PRICE selection
+    /// only; the webhook is the entitlement authority (KTD-2).
+    private var checkoutTier: EntitlementTier {
+        switch tier {
+        case .local: return .localPro
+        case .personalCloud: return .cloud
+        case .teamCloud: return .none // Team is waitlist-only (R4), never checkout.
+        }
+    }
+
+    /// After sign-in, a paid cloud tier stays on this step until the trial /
+    /// subscription is active — the upgrade panel drives checkout (U8/U9/U11).
+    /// Only when the client paywall is on (KTD-6); off → no soft gate.
+    ///
+    /// Grace/stale (KTD-4): while `whoami` is stale the daemon grace-allows via
+    /// the lease, so we must NOT show the upgrade/"expired" surface then — an
+    /// offline payer would see a spurious paywall. `trialState == .indeterminate`
+    /// captures the stale case (and the pre-resolution case), so gating on
+    /// "not indeterminate" keeps the offline payer out of the upgrade panel.
     private var showUpgrade: Bool {
-        auth.paywallEnabled && auth.isSignedIn && tier == .personalCloud && !auth.isSubscribed
+        auth.paywallEnabled
+            && auth.isSignedIn
+            && checkoutTier != .none
+            && !auth.isSubscribed
+            && auth.trialState != .indeterminate
+            && auth.trialState != .subscribed
+    }
+
+    /// The lapsed / never-entitled re-entry renders a gated RE-subscribe surface
+    /// (not a fresh chooser) per U11.
+    private var isLapsed: Bool {
+        showUpgrade && auth.trialState == .lapsed
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(showUpgrade ? "One more step to unlock cloud." : OnboardingCopy.accountHeadline)
+            Text(upgradeHeadline)
                 .font(SCTypography.serifHeading)
                 .foregroundStyle(Color.scInk)
                 .multilineTextAlignment(.center)
                 .padding(.bottom, 10)
-            Text(showUpgrade ? OnboardingCopy.upgradeSub : OnboardingCopy.accountSub)
+            Text(upgradeSubcopy)
                 .font(SCTypography.sans(size: 14))
                 .foregroundStyle(Color.scInkSecondary)
                 .multilineTextAlignment(.center)
@@ -185,23 +266,81 @@ struct OnboardingAccountStep: View {
         // instead of the upgrade panel. The account step is an explicit cloud
         // surface, so decrypting the Keychain (and any prompt) here is expected.
         .task { await auth.refreshIfNeeded() }
-        // Subscription just became active (webhook granted it) → finish the step.
+        // Trial/subscription just became active (webhook granted it) → finish.
+        // Cloud maps to `isSubscribed`; Local Pro converts once the tier resolves
+        // (not `isSubscribed`, which is cloud-only), so also finish when the
+        // resolved entitlement tier now matches what this step checked out.
         .onChange(of: auth.isSubscribed) { subscribed in
-            if subscribed, tier == .personalCloud { onSignedIn() }
+            if subscribed, checkoutTier == .cloud { onSignedIn() }
         }
-        // Returning from the browser checkout → re-check entitlement.
+        .onChange(of: auth.tier) { newTier in
+            if newTier == checkoutTier, checkoutTier != .none { onSignedIn() }
+        }
+        // Returning from the browser checkout → re-check entitlement (both
+        // tiers). The pending flag survives the app-switch so the return shows
+        // the pending panel, not "start trial".
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didBecomeActiveNotification)) { _ in
-            if showUpgrade { Task { await auth.refreshEntitlement() } }
+            if showUpgrade || checkoutPending { Task { await auth.refreshEntitlement() } }
         }
+    }
+
+    /// Headline reflects the entitlement state: lapsed re-subscribe, the paid
+    /// upgrade, or the pre-billing account creation.
+    private var upgradeHeadline: String {
+        if isLapsed { return OnboardingCopy.lapsedHeadline }
+        if showUpgrade { return "One more step to unlock \(checkoutTier == .cloud ? "cloud" : "Local Pro")." }
+        return OnboardingCopy.accountHeadline
+    }
+
+    private var upgradeSubcopy: String {
+        if isLapsed { return OnboardingCopy.lapsedSub }
+        if showUpgrade { return OnboardingCopy.upgradeSub }
+        return OnboardingCopy.accountSub
+    }
+
+    /// The tier's price line, sourced from `PricingCatalog` (single source,
+    /// KTD-7). Cloud gets the Cloud price; Local Pro the Local Pro price.
+    private var upgradePriceLine: String {
+        checkoutTier == .cloud
+            ? "\(PricingCatalog.cloudPriceLine) · cancel anytime"
+            : "\(PricingCatalog.localProPriceLine) · cancel anytime"
+    }
+
+    /// The tier's selling bullets — Cloud vs Local Pro card bullets (KTD-7).
+    private var upgradeBullets: [String] {
+        checkoutTier == .cloud ? OnboardingCopy.cloudCardBullets : OnboardingCopy.localProCardBullets
+    }
+
+    /// The checkout CTA label — "Resubscribe" on a lapsed re-entry, a trial
+    /// "Start free trial" otherwise (R5). Both carry the tier's price.
+    private var checkoutButtonTitle: String {
+        let price = checkoutTier == .cloud ? PricingCatalog.cloudMonthly : PricingCatalog.localProMonthly
+        return isLapsed
+            ? "Resubscribe — \(price)/month"
+            : "Start free trial — then \(price)/month"
     }
 
     private var upgradePanel: some View {
         VStack(spacing: 12) {
-            Text(OnboardingCopy.upgradePriceLine)
+            Text(upgradePriceLine)
                 .font(SCTypography.metaMono)
                 .foregroundStyle(Color.scTeal)
-            ForEach(OnboardingCopy.upgradeBullets, id: \.self) { bullet in
+
+            // Trial lifecycle banner (U11): calm "N days left" → escalated
+            // near-expiry → urgent last-day. Color escalates with urgency; the
+            // copy discloses auto-conversion (R12). No banner on lapsed (that is
+            // the whole-panel re-subscribe framing) or subscribed.
+            if let banner = OnboardingCopy.trialBanner(for: auth.trialState) {
+                Text(banner)
+                    .font(SCTypography.sans(size: 12.5, weight: .semibold))
+                    .foregroundStyle(trialBannerColor)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
+
+            ForEach(upgradeBullets, id: \.self) { bullet in
                 HStack(alignment: .top, spacing: 8) {
                     Text("—").foregroundStyle(Color.scInkMuted)
                     Text(bullet).foregroundStyle(Color.scInkSecondary)
@@ -209,6 +348,14 @@ struct OnboardingAccountStep: View {
                 .font(SCTypography.sans(size: 12.5))
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            // R12 — auto-conversion + cancellation disclosed before any charge.
+            Text(OnboardingCopy.trialDisclosure)
+                .font(SCTypography.sans(size: 11.5))
+                .foregroundStyle(Color.scInkMuted)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
             if let upgradeError {
                 Text(upgradeError)
                     .font(SCTypography.sans(size: 12.5))
@@ -217,17 +364,36 @@ struct OnboardingAccountStep: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 2)
             }
-            OnboardingPrimaryButton(title: "Continue to payment — $5/month") {
+
+            OnboardingPrimaryButton(title: checkoutButtonTitle) {
                 upgradeError = nil
-                auth.startCheckout { reason in upgradeError = reason }
+                checkoutPending = true
+                // Pass the chosen tier so Checkout selects the right price; the
+                // webhook re-derives the entitlement (KTD-2). Failure clears the
+                // pending flag so the user can retry, not sit on a false spinner.
+                auth.startCheckout(tier: checkoutTier) { reason in
+                    upgradeError = reason
+                    checkoutPending = false
+                }
             }
             .padding(.top, 4)
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Unlocks automatically once payment completes.")
-                    .font(SCTypography.sans(size: 12))
-                    .foregroundStyle(Color.scInkMuted)
+            .accessibilityLabel(checkoutButtonTitle)
+            .accessibilityHint("Requires a paid subscription. \(OnboardingCopy.trialDisclosure)")
+
+            // Post-checkout pending (U11): once Checkout is opened, show the
+            // "unlocks automatically" reassurance so the return from Stripe never
+            // reads as a failed payment. Shown for BOTH tiers.
+            if checkoutPending {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Unlocks automatically once payment completes.")
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkMuted)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Waiting for payment to complete. Your subscription unlocks automatically.")
             }
+
             OnboardingLinkButton(title: "I've paid — check now") {
                 // Reconcile first (grant-only self-heal for a dropped checkout
                 // webhook), then force-refresh — so a paid customer is never
@@ -236,6 +402,17 @@ struct OnboardingAccountStep: View {
             }
         }
         .frame(width: 360)
+    }
+
+    /// The trial banner color escalates with urgency — teal (calm) → amber
+    /// (near-expiry) → rust (last day). Neutral for the non-banner states.
+    private var trialBannerColor: Color {
+        switch auth.trialState {
+        case .active: return .scTeal
+        case .nearExpiry: return .scAmber
+        case .lastDay: return .scRust
+        case .indeterminate, .subscribed, .lapsed: return .scInkMuted
+        }
     }
 
     private var signInWaiting: some View {
@@ -288,12 +465,14 @@ struct OnboardingAccountStep: View {
         }
     }
 
-    /// With the paywall on, Personal cloud requires an active subscription before
-    /// finishing — the upgrade panel (shown reactively when `showUpgrade`) drives
-    /// it. Paywall-off, Team, and already-subscribed accounts proceed immediately
-    /// (U9 / KTD-6).
+    /// With the paywall on, a paid cloud tier requires an active trial /
+    /// subscription before finishing — the upgrade panel (shown reactively when
+    /// `showUpgrade`) drives it. Paywall-off, Team, already-entitled, and
+    /// offline-stale accounts proceed immediately (U9 / KTD-6 / KTD-4). Uses the
+    /// same `showUpgrade` gate as the panel so the "stay on this step" decision
+    /// can't drift from what is actually rendered.
     private func proceedAfterSignIn() {
-        if auth.paywallEnabled, tier == .personalCloud, !auth.isSubscribed { return }
+        if showUpgrade { return }
         onSignedIn()
     }
 

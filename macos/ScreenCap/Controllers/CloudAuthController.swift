@@ -61,9 +61,13 @@ protocol CloudAuthService {
     /// (billing U5/U9, post-checkout).
     func fetchWhoAmIForceRefresh() async throws -> Data
 
-    /// Raw stdout of `screencap checkout-url --json` — a hosted Stripe Checkout
-    /// URL for the $5/mo plan (billing U9). Token handling stays in Python.
-    func fetchCheckoutURL() async throws -> Data
+    /// Raw stdout of `screencap checkout-url --tier <local|cloud> --json` — a
+    /// hosted Stripe Checkout URL for the chosen paid tier (billing U9 / paid-only
+    /// U11). `tier` selects the Stripe PRICE only (`--tier local` → Local Pro,
+    /// `--tier cloud` → Cloud); the webhook re-derives the entitlement from the
+    /// paid price and is the sole authority (KTD-2), so the client-supplied tier
+    /// can never over-grant. Token handling stays in Python.
+    func fetchCheckoutURL(tier: String) async throws -> Data
 
     /// Raw stdout of `screencap reconcile-entitlement --json` — a GRANT-ONLY
     /// dropped-webhook self-heal (billing U14). If Stripe confirms an active
@@ -109,8 +113,13 @@ final class LiveCloudAuthService: CloudAuthService {
         try await CLIClient.runJSONRaw(["whoami", "--force-refresh", "--json"], timeout: 30)
     }
 
-    func fetchCheckoutURL() async throws -> Data {
-        try await CLIClient.runJSONRaw(["checkout-url", "--json"], timeout: 30)
+    func fetchCheckoutURL(tier: String) async throws -> Data {
+        // `--tier` selects the Stripe price (U3); the webhook stays the
+        // entitlement authority. Passed as an argument, not baked in, so a
+        // price change is a config change, not a code change (KTD-7).
+        // TODO(build-verify): the U3 CLI change must add the `--tier` option to
+        // `checkout-url`; until it lands the CLI rejects the unknown flag.
+        try await CLIClient.runJSONRaw(["checkout-url", "--tier", tier, "--json"], timeout: 30)
     }
 
     func fetchReconcileEntitlement() async throws -> Data {
@@ -136,8 +145,20 @@ final class CloudAuthController: ObservableObject {
     @Published private(set) var signInFlow: SignInFlowState = .idle
     /// Cloud-paywall entitlement (billing U8). Display/UX only — the signer's
     /// hard gate is the real enforcement. Read from the `whoami` envelope's
-    /// `subscribed` field; false when signed out or absent.
+    /// `subscribed` field; false when signed out or absent. Under the two-tier
+    /// split it is the DERIVED cloud signal (`tier == .cloud`) — kept for
+    /// compatibility with the existing upload / onboarding gates.
     @Published private(set) var isSubscribed: Bool = false
+    /// Two-tier entitlement (paid-only launch, U11 / KTD-1). Resolved from the
+    /// `whoami` envelope's open `tier` string; `.none` when signed out, absent,
+    /// or offline-stale (the picker reads `status`'s `stale` to avoid a spurious
+    /// "lapsed" — never `tier` presence alone, per KTD-4).
+    @Published private(set) var tier: EntitlementTier = .none
+    /// The trial → convert → lapse lifecycle position (U11), derived from `tier`,
+    /// the envelope's `trial_end`, and whether `status` is stale. Drives the
+    /// active / near-expiry / last-day / lapsed picker copy and the R12
+    /// auto-conversion disclosure. `.indeterminate` while unresolved or stale.
+    @Published private(set) var trialState: TrialState = .indeterminate
     /// Client paywall flag (billing KTD-6). When OFF, the app shows no pricing /
     /// soft gate / checkout — cloud onboarding behaves exactly as before billing.
     /// Read from the `whoami` envelope's `paywall_enabled`; false when absent.
@@ -208,14 +229,45 @@ final class CloudAuthController: ObservableObject {
             let envelope = AuthWhoAmIEnvelope.parse(data)
             warnOnSchemaDrift(envelope)
             status = AuthStatus.from(envelope: envelope)
-            isSubscribed = envelope?.subscribed ?? false
+            applyEntitlement(from: envelope, status: status)
             paywallEnabled = envelope?.paywallEnabled ?? false
         } catch {
             authLogger.debug("whoami refresh failed: \(error.localizedDescription, privacy: .public); treating as signed out")
             status = .signedOut
-            isSubscribed = false
+            clearEntitlement()
             paywallEnabled = false
         }
+    }
+
+    /// Recompute the entitlement surfaces (`isSubscribed`, `tier`, `trialState`)
+    /// from a decoded envelope and the resolved `AuthStatus`. Single seam so the
+    /// three read paths (`refresh`, `refreshEntitlement`, post-`login`) stay in
+    /// sync. `isSubscribed` stays the derived cloud signal (`tier == .cloud`),
+    /// falling back to the envelope's own `subscribed` for compatibility. The
+    /// `stale` bit is sourced from the resolved status so an offline payer's
+    /// trial state is `.indeterminate` (KTD-4 grace), never a spurious "lapsed".
+    private func applyEntitlement(from envelope: AuthWhoAmIEnvelope?, status: AuthStatus) {
+        let resolvedTier = EntitlementTier.from(claim: envelope?.tier)
+        tier = resolvedTier
+        // Prefer the derived signal; fall back to the raw claim so an older CLI
+        // that sends `subscribed` without `tier` still reads as subscribed.
+        isSubscribed = resolvedTier == .cloud || (envelope?.subscribed ?? false)
+        let isStale: Bool
+        if case .signedIn(_, _, let stale) = status { isStale = stale } else { isStale = false }
+        let previous = trialState
+        trialState = TrialState.from(
+            tier: resolvedTier,
+            trialEnd: envelope?.trialEnd,
+            stale: isStale
+        )
+        announceTrialTransitionIfNeeded(from: previous, to: trialState)
+    }
+
+    /// Reset entitlement state to the signed-out / unresolved baseline.
+    private func clearEntitlement() {
+        isSubscribed = false
+        tier = .none
+        trialState = .indeterminate
     }
 
     /// Lazily resolves sign-in state the first time a cloud surface actually
@@ -259,8 +311,11 @@ final class CloudAuthController: ObservableObject {
             warnOnSchemaDrift(envelope)
             if envelope?.signedIn == true {
                 status = AuthStatus.from(envelope: envelope)
+                // Only recompute the tier/trial from a positively signed-in
+                // envelope — an offline force-refresh must not clobber a cached
+                // positive entitlement to `.none` (KTD-4).
+                applyEntitlement(from: envelope, status: status)
             }
-            isSubscribed = envelope?.subscribed ?? isSubscribed
             paywallEnabled = envelope?.paywallEnabled ?? paywallEnabled
         } catch {
             authLogger.debug("entitlement refresh failed: \(error.localizedDescription, privacy: .public)")
@@ -283,14 +338,23 @@ final class CloudAuthController: ObservableObject {
         await refreshEntitlement()
     }
 
-    /// Opens hosted Stripe Checkout for the $5/mo plan in the browser (U9). The
-    /// URL is minted by `checkout-url` (token stays in Python); `onFailure`
-    /// carries a short reason for the UI when the mint fails.
-    func startCheckout(onFailure: @escaping @MainActor (String) -> Void = { _ in }) {
+    /// Opens hosted Stripe Checkout for the chosen paid `tier` in the browser
+    /// (U9 / paid-only U11). The tier selects the Stripe PRICE only — the webhook
+    /// re-derives the entitlement from the paid price and is the sole authority
+    /// (KTD-2), so this never over-grants. The URL is minted by `checkout-url`
+    /// (token stays in Python); `onFailure` carries a short reason on mint failure.
+    func startCheckout(
+        tier: EntitlementTier,
+        onFailure: @escaping @MainActor (String) -> Void = { _ in }
+    ) {
+        guard let checkoutTier = tier.checkoutTier else {
+            onFailure("Pick a plan to continue.")
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             do {
-                let data = try await self.service.fetchCheckoutURL()
+                let data = try await self.service.fetchCheckoutURL(tier: checkoutTier)
                 let env = CheckoutURLEnvelope.parse(data)
                 guard env?.ok != false, let urlString = env?.url,
                       let url = URL(string: urlString) else {
@@ -301,6 +365,43 @@ final class CloudAuthController: ObservableObject {
             } catch {
                 onFailure(error.localizedDescription)
             }
+        }
+    }
+
+    /// Post a VoiceOver announcement when the trial lifecycle crosses into a more
+    /// urgent (or lapsed) state, so a non-sighted user hears "2 days left in your
+    /// trial" rather than only seeing an escalated banner (U11 accessibility;
+    /// mirrors `HUDHintPanel`'s `announcementRequested` post and the
+    /// `SearchViewModel` terminal-state announcement discipline — announce once
+    /// on a real transition, never on every refresh tick).
+    private func announceTrialTransitionIfNeeded(from previous: TrialState, to next: TrialState) {
+        guard previous != next, let message = Self.trialAnnouncement(for: next) else { return }
+        NSAccessibility.post(
+            element: NSApp,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
+    }
+
+    /// The spoken announcement for a trial state, or nil for states that need no
+    /// spoken escalation (`.indeterminate` / `.subscribed` are calm).
+    private static func trialAnnouncement(for state: TrialState) -> String? {
+        switch state {
+        case .active(let days):
+            return "\(days) days left in your free trial."
+        case .nearExpiry(let days):
+            return "Your free trial ends in \(days) day\(days == 1 ? "" : "s"). It converts to a paid subscription unless you cancel."
+        case .lastDay(let hours):
+            return hours <= 1
+                ? "Your free trial ends within the hour. It converts to a paid subscription unless you cancel."
+                : "Your free trial ends in \(hours) hours. It converts to a paid subscription unless you cancel."
+        case .lapsed:
+            return "Your subscription has lapsed. Recording and search are paused; your recordings stay on this Mac."
+        case .indeterminate, .subscribed:
+            return nil
         }
     }
 
@@ -417,7 +518,7 @@ final class CloudAuthController: ObservableObject {
         let resolved = AuthStatus.from(envelope: envelope)
         if exitCode == 0, resolved.isSignedIn {
             status = resolved
-            isSubscribed = envelope?.subscribed ?? false
+            applyEntitlement(from: envelope, status: resolved)
             paywallEnabled = envelope?.paywallEnabled ?? paywallEnabled
             signInFlow = .idle
             finishResult(true)
@@ -474,5 +575,6 @@ final class CloudAuthController: ObservableObject {
             authLogger.warning("logout shell-out failed: \(error.localizedDescription, privacy: .public)")
         }
         status = .signedOut
+        clearEntitlement()
     }
 }

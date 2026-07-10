@@ -20,8 +20,22 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
     let stale: Bool?
     /// Cloud-paywall entitlement (billing U5/U8). Display/UX only — the signer's
     /// hard gate is the real enforcement. Additive/optional, so an older CLI that
-    /// omits it decodes fine and resolves to "not subscribed".
+    /// omits it decodes fine and resolves to "not subscribed". Kept for
+    /// compatibility; under the two-tier split it is the DERIVED cloud signal
+    /// (`subscribed == (tier == "cloud")`), never read independently of `tier`.
     let subscribed: Bool?
+    /// Two-tier entitlement (paid-only launch, KTD-1/U6): the OPEN `tier` claim
+    /// the webhook resolves from the paid price — `"local"` (Local Pro) or
+    /// `"cloud"` (Cloud) today; a future `"free_capped"` slots in without a Swift
+    /// change. Additive/optional; absent → nil (fresh not-entitled). When the
+    /// token is `stale` (offline), `tier` is deliberately nil WITH `stale: true`
+    /// — the two cases are told apart only by `stale`, so a paying-but-offline
+    /// user is never read as "not entitled".
+    let tier: String?
+    /// The subscription's `trial_end` (epoch seconds) the webhook writes while
+    /// `trialing` (KTD-2/KTD-3), for the "days left" trial UI. Absent when the
+    /// token carries no trial (converted, lapsed, or never trialed).
+    let trialEnd: Int?
     /// Client paywall flag (billing KTD-6). Config-driven and independent of
     /// sign-in, so it rides every whoami envelope (incl. signed-out). Gates
     /// whether the app shows pricing / the soft gate at all; absent → OFF, i.e.
@@ -37,6 +51,8 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
         case email
         case stale
         case subscribed
+        case tier
+        case trialEnd = "trial_end"
         case paywallEnabled = "paywall_enabled"
         case error
     }
@@ -90,5 +106,120 @@ enum AuthStatus: Equatable {
         if let email, !email.isEmpty { return email }
         if let uid, !uid.isEmpty { return uid }
         return nil
+    }
+}
+
+/// The resolved two-tier entitlement the paid-only picker reads (U11, KTD-1).
+/// Mapped from the `whoami` envelope's OPEN `tier` string, keeping the client
+/// forward-compatible with tiers it doesn't render yet (an unknown value maps to
+/// `.none`, so a future `free_capped` never crashes or over-grants a gated
+/// surface). `cloud` implies `local` (R3): a Cloud subscriber has the full local
+/// recall surface plus upload.
+enum EntitlementTier: Equatable {
+    /// No positively-resolved paid tier — a fresh not-entitled or lapsed account
+    /// (told apart from offline only by `AuthStatus`'s `stale`, never by this).
+    case none
+    /// Local Pro — unlimited local recording + recall, no cloud upload.
+    case localPro
+    /// Cloud — everything in Local Pro plus cloud upload/sync/AI (server-readable).
+    case cloud
+
+    /// Map the envelope's open `tier` string. Absent/unknown → `.none` so an
+    /// older CLI or a future tier the app doesn't render can't be mistaken for an
+    /// entitled state (fail-closed for display; the daemon lease is the real
+    /// gate). The Python side writes `"local"` / `"cloud"` (auth.py `WhoAmI`).
+    static func from(claim: String?) -> EntitlementTier {
+        switch claim {
+        case "local": return .localPro
+        case "cloud": return .cloud
+        default: return .none
+        }
+    }
+
+    /// The tier string the checkout call selects the Stripe price with (U3). This
+    /// is price-selection ONLY — the webhook re-derives the entitlement from the
+    /// paid price and is the sole authority (KTD-2), so a spoofed value here can
+    /// never over-grant. `.none` has no checkout tier.
+    var checkoutTier: String? {
+        switch self {
+        case .localPro: return "local"
+        case .cloud: return "cloud"
+        case .none: return nil
+        }
+    }
+}
+
+/// Where a user sits in the trial → convert → lapse lifecycle, derived purely
+/// from the envelope's `trial_end` and the resolved `tier` (U11). There is no
+/// prior `AuthStatus` precedent for this, so the states are enumerated here and
+/// unit-tested via `TrialState.from`.
+///
+/// `trial_end` is present ONLY while Stripe reports `trialing` (KTD-3); once the
+/// trial auto-converts to paid, the claim carries a tier but no `trial_end`, so
+/// `.subscribed` (a converted payer) is the natural "no trial_end but entitled"
+/// case. A lapsed account clears the tier AND the trial_end → `.lapsed`.
+enum TrialState: Equatable {
+    /// Not signed in / paywall off / offline-stale — no trial claim to reason
+    /// about. The picker must NOT render "trial expired" here (KTD-4 grace).
+    case indeterminate
+    /// Active paid subscription (converted, or grandfathered) — no trial banner.
+    case subscribed
+    /// In a trial with comfortable runway. `daysLeft` ≥ the near-expiry cutoff.
+    case active(daysLeft: Int)
+    /// Trial nearing expiry — escalate the conversion prompt (calm → urgent).
+    case nearExpiry(daysLeft: Int)
+    /// Last day / hours of the trial — the most urgent, pre-charge prompt.
+    case lastDay(hoursLeft: Int)
+    /// No active tier and no live trial — a fresh not-entitled OR a lapsed
+    /// trial/subscription. The gated re-subscribe surface (routes into U12).
+    case lapsed
+
+    /// Days below which the prompt escalates from calm to `.nearExpiry`.
+    static let nearExpiryDayCutoff = 3
+
+    /// Derive the lifecycle state from the resolved tier, an optional
+    /// `trial_end` (epoch seconds), and whether the auth status is `stale`
+    /// (offline — the KTD-4 grace case that must never read as expired). `now`
+    /// is injectable for deterministic tests.
+    ///
+    /// Precedence: stale → `.indeterminate` (grace, never a spurious lockout);
+    /// an entitled tier with no live `trial_end` → `.subscribed`; a live
+    /// `trial_end` in the future → active/near-expiry/last-day by remaining time;
+    /// everything else (no tier, or a `trial_end` already in the past) → `.lapsed`.
+    static func from(
+        tier: EntitlementTier,
+        trialEnd: Int?,
+        stale: Bool,
+        now: Date = Date()
+    ) -> TrialState {
+        // KTD-4 / R7: an offline payer's token is stale with a nil tier — never
+        // render "expired". The lease keeps the daemon grace-allowing.
+        if stale { return .indeterminate }
+
+        let entitled = tier != .none
+
+        // A live trial: `trial_end` in the future. Its urgency is by remaining
+        // time, independent of whether `tier` already reads entitled (a trialing
+        // token carries the tier it will convert into, KTD-2/KTD-3).
+        if let trialEnd {
+            let remaining = Date(timeIntervalSince1970: TimeInterval(trialEnd))
+                .timeIntervalSince(now)
+            if remaining > 0 {
+                let hoursLeft = Int(remaining / 3600)
+                if hoursLeft < 24 {
+                    return .lastDay(hoursLeft: max(hoursLeft, 0))
+                }
+                // Ceil to whole days so "1.4 days" reads as "2 days left".
+                let daysLeft = Int((remaining / 86_400).rounded(.up))
+                return daysLeft <= nearExpiryDayCutoff
+                    ? .nearExpiry(daysLeft: daysLeft)
+                    : .active(daysLeft: daysLeft)
+            }
+            // trial_end already passed: fall through — entitled means it
+            // converted, otherwise it lapsed.
+        }
+
+        if entitled { return .subscribed }
+        return .lapsed
     }
 }

@@ -79,9 +79,13 @@ final class FakeCloudAuthService: CloudAuthService {
     var checkoutURLData = Data()
     var checkoutURLError: Error?
     private(set) var checkoutURLCallCount = 0
+    /// The tier the last `fetchCheckoutURL(tier:)` was called with (U11) — lets
+    /// a test assert Local Pro passes `"local"` and Cloud passes `"cloud"`.
+    private(set) var lastCheckoutTier: String?
 
-    func fetchCheckoutURL() async throws -> Data {
+    func fetchCheckoutURL(tier: String) async throws -> Data {
         checkoutURLCallCount += 1
+        lastCheckoutTier = tier
         if let checkoutURLError { throw checkoutURLError }
         return checkoutURLData
     }
@@ -637,5 +641,117 @@ final class CloudAuthControllerTests: XCTestCase {
 
         XCTAssertEqual(service.forceRefreshCallCount, 1)
         XCTAssertTrue(controller.isSubscribed)
+    }
+
+    // MARK: - two-tier entitlement + trial state (paid-only launch, U11)
+
+    /// A `tier=cloud` token resolves to `.cloud` AND `subscribed=true` (the
+    /// derived signal); `tier=local` resolves to `.localPro` with `subscribed`
+    /// false (Local Pro has no cloud upload — R3/KTD-1).
+    func testRefreshReadsTwoTierEntitlement() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.tier, .cloud)
+        XCTAssertTrue(controller.isSubscribed)
+
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local"}"#.utf8)
+        await controller.refresh()
+        XCTAssertEqual(controller.tier, .localPro)
+        XCTAssertFalse(controller.isSubscribed, "Local Pro is not the cloud entitlement")
+    }
+
+    /// No tier claim → `.none`; the app treats this as not-entitled (fresh or
+    /// lapsed, disambiguated from offline by `stale`).
+    func testRefreshNoTierIsNone() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.tier, .none)
+        XCTAssertEqual(controller.trialState, .lapsed, "signed-in, no tier, no trial → lapsed/not-entitled")
+    }
+
+    /// Offline-stale must NOT read as "lapsed/expired" (KTD-4 grace): `tier` is
+    /// nil WITH `stale=true`, so the trial state is `.indeterminate` and no
+    /// spurious paywall surfaces for an offline payer.
+    func testStaleEntitlementIsIndeterminateNotLapsed() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":null,"email":null,"stale":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.tier, .none)
+        XCTAssertEqual(controller.trialState, .indeterminate, "a stale token must not read as expired")
+    }
+
+    /// A live `trial_end` in the future drives the active-trial state; a
+    /// converted subscription (tier present, no `trial_end`) is `.subscribed`.
+    func testTrialEndDrivesTrialState() async {
+        let service = FakeCloudAuthService()
+        let farFuture = Int(Date().timeIntervalSince1970) + 10 * 86_400
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","trial_end":\#(farFuture)}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        if case .active(let days) = controller.trialState {
+            XCTAssertGreaterThan(days, 3, "10 days out is a calm active trial, not near-expiry")
+        } else {
+            XCTFail("expected .active trial, got \(controller.trialState)")
+        }
+
+        // Converted: tier present, no trial_end → subscribed (no trial banner).
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
+        await controller.refresh()
+        XCTAssertEqual(controller.trialState, .subscribed)
+    }
+
+    /// Sign out clears the two-tier entitlement too (not just `status`).
+    func testSignOutClearsTierAndTrialState() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
+        let controller = CloudAuthController(service: service)
+        await controller.refresh()
+        XCTAssertEqual(controller.tier, .cloud)
+
+        await controller.signOut()
+        XCTAssertEqual(controller.tier, .none)
+        XCTAssertEqual(controller.trialState, .indeterminate)
+    }
+
+    /// Checkout passes the chosen tier to the price-selection call: Local Pro
+    /// sends `"local"`, Cloud sends `"cloud"` (U11 / KTD-2 — price only).
+    func testStartCheckoutPassesTier() async {
+        let service = FakeCloudAuthService()
+        service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        controller.startCheckout(tier: .localPro)
+        // Let the detached checkout Task run.
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(service.lastCheckoutTier, "local")
+
+        controller.startCheckout(tier: .cloud)
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(service.lastCheckoutTier, "cloud")
+    }
+
+    /// A `.none` checkout tier (no plan chosen) never opens a checkout and
+    /// surfaces a "pick a plan" reason rather than minting a URL.
+    func testStartCheckoutRejectsNoneTier() async {
+        let service = FakeCloudAuthService()
+        let controller = CloudAuthController(service: service)
+        var failure: String?
+
+        controller.startCheckout(tier: .none) { failure = $0 }
+        await Task.yield()
+
+        XCTAssertEqual(service.checkoutURLCallCount, 0, "no tier → no Stripe call")
+        XCTAssertNotNil(failure)
     }
 }

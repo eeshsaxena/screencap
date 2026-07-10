@@ -238,6 +238,18 @@ struct OnboardingWizard: View {
     }
 
     private func storageContinue() {
+        // TODO(build-verify): U11 paid-launch routing decision for the HUMAN.
+        // Under the paid-only launch the `.local` storage tier is surfaced as
+        // "Local Pro" — a PAID subscription (U11 cards). But `stepAfterStorage`
+        // still routes `.local` straight to `.downloadModel`, skipping the
+        // account/checkout step, so Local Pro never reaches the tier-aware
+        // checkout panel (which lives in `OnboardingAccountStep`). This unit did
+        // NOT rewire the step graph (that breaks the pinned OnboardingStepPolicy
+        // routing/dot tests and is outside U11's surgical scope). Decide before
+        // flipping `SCREENCAP_STRIPE_PAYWALL`: either (a) route `.local` through
+        // an account/checkout step when `auth.paywallEnabled`, or (b) keep Local
+        // Pro checkout on a dedicated surface. The account step already maps
+        // `.local -> .localPro` for checkout, so it is checkout-ready either way.
         if let next = OnboardingStepPolicy.stepAfterStorage(tier: tier) {
             step = next
             return

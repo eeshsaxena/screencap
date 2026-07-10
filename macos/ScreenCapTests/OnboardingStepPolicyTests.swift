@@ -263,6 +263,131 @@ final class OnboardingStepPolicyTests: XCTestCase {
         XCTAssertFalse(all.contains("shared team library"))
     }
 
+    // MARK: - Paid-only launch: two-tier cards + prices (U11 / KTD-7)
+
+    /// The two paid cards source their price from ONE place (`PricingCatalog`),
+    /// so the card meta contains the catalog price and Cloud is priced above
+    /// Local Pro (R3/R10). This pins the single-source-of-price contract (KTD-7).
+    func testTwoTierCardsSourcePriceFromCatalog() {
+        XCTAssertTrue(
+            OnboardingCopy.localProCardMeta.contains(PricingCatalog.localProMonthly),
+            "Local Pro card meta must surface the catalog Local Pro price"
+        )
+        XCTAssertTrue(
+            OnboardingCopy.cloudCardMeta.contains(PricingCatalog.cloudMonthly),
+            "Cloud card meta must surface the catalog Cloud price"
+        )
+        // Both cards advertise the free trial (R5).
+        XCTAssertTrue(OnboardingCopy.localProCardMeta.lowercased().contains("trial"))
+        XCTAssertTrue(OnboardingCopy.cloudCardMeta.lowercased().contains("trial"))
+    }
+
+    /// R12: the trial disclosure states auto-conversion AND cancellation before
+    /// any charge, and no paid card claims end-to-end encryption / "we can't
+    /// watch" (the Cloud path is server-readable). AE5.
+    func testPaidCardsAndTrialCopyAreHonest() {
+        let disclosure = OnboardingCopy.trialDisclosure.lowercased()
+        XCTAssertTrue(disclosure.contains("convert"), "must disclose auto-conversion")
+        XCTAssertTrue(disclosure.contains("cancel"), "must disclose cancellation")
+        XCTAssertTrue(disclosure.contains("card"), "must disclose the card requirement")
+
+        let paidStrings = ([OnboardingCopy.localProCardTitle, OnboardingCopy.localProCardMeta,
+                            OnboardingCopy.cloudCardTitle, OnboardingCopy.cloudCardMeta,
+                            OnboardingCopy.trialDisclosure]
+            + OnboardingCopy.localProCardBullets + OnboardingCopy.cloudCardBullets)
+            .joined(separator: " ").lowercased()
+        for forbidden in ["encrypt", "e2e", "we can't watch", "can't watch", "keys stay"] {
+            XCTAssertFalse(paidStrings.contains(forbidden), "paid card copy contains \"\(forbidden)\"")
+        }
+        // The Cloud card is affirmatively truthful that storage is server-readable.
+        XCTAssertTrue(
+            OnboardingCopy.cloudCardBullets.joined(separator: " ").lowercased().contains("our servers"),
+            "Cloud card must be truthful that uploads are stored on our servers"
+        )
+    }
+
+    // MARK: - EntitlementTier mapping (KTD-1)
+
+    /// The open `tier` claim maps to the client enum; an unknown/absent value is
+    /// `.none` (fail-closed for display — a future `free_capped` never reads as
+    /// entitled without a client change).
+    func testEntitlementTierMapping() {
+        XCTAssertEqual(EntitlementTier.from(claim: "local"), .localPro)
+        XCTAssertEqual(EntitlementTier.from(claim: "cloud"), .cloud)
+        XCTAssertEqual(EntitlementTier.from(claim: nil), .none)
+        XCTAssertEqual(EntitlementTier.from(claim: "free_capped"), .none)
+        // The checkout price-selection string round-trips for the paid tiers.
+        XCTAssertEqual(EntitlementTier.localPro.checkoutTier, "local")
+        XCTAssertEqual(EntitlementTier.cloud.checkoutTier, "cloud")
+        XCTAssertNil(EntitlementTier.none.checkoutTier)
+    }
+
+    // MARK: - TrialState lifecycle (U11)
+
+    private func date(_ epoch: Int) -> Date { Date(timeIntervalSince1970: TimeInterval(epoch)) }
+
+    /// The trial lifecycle derives active → near-expiry → last-day from the
+    /// remaining time to `trial_end`, and lapses once it passes with no tier.
+    func testTrialStateLifecycle() {
+        let now = date(1_000_000)
+        // 10 days out → calm active.
+        if case .active(let d) = TrialState.from(tier: .cloud, trialEnd: 1_000_000 + 10 * 86_400, stale: false, now: now) {
+            XCTAssertEqual(d, 10)
+        } else { XCTFail("expected active") }
+
+        // 2 days out → near-expiry (escalated).
+        if case .nearExpiry(let d) = TrialState.from(tier: .cloud, trialEnd: 1_000_000 + 2 * 86_400, stale: false, now: now) {
+            XCTAssertEqual(d, 2)
+        } else { XCTFail("expected near-expiry") }
+
+        // 5 hours out → last-day (urgent).
+        if case .lastDay(let h) = TrialState.from(tier: .cloud, trialEnd: 1_000_000 + 5 * 3_600, stale: false, now: now) {
+            XCTAssertEqual(h, 5)
+        } else { XCTFail("expected last-day") }
+
+        // Passed, no tier → lapsed.
+        XCTAssertEqual(
+            TrialState.from(tier: .none, trialEnd: 1_000_000 - 3_600, stale: false, now: now),
+            .lapsed
+        )
+        // Passed, tier present → converted (subscribed), not lapsed.
+        XCTAssertEqual(
+            TrialState.from(tier: .cloud, trialEnd: 1_000_000 - 3_600, stale: false, now: now),
+            .subscribed
+        )
+    }
+
+    /// KTD-4 grace: a stale token is `.indeterminate` regardless of tier/trial —
+    /// an offline payer must never see "expired".
+    func testTrialStateStaleIsIndeterminate() {
+        let now = date(1_000_000)
+        XCTAssertEqual(
+            TrialState.from(tier: .none, trialEnd: nil, stale: true, now: now),
+            .indeterminate
+        )
+        XCTAssertEqual(
+            TrialState.from(tier: .none, trialEnd: 1_000_000 - 3_600, stale: true, now: now),
+            .indeterminate,
+            "even a passed trial_end must not read as expired while stale"
+        )
+    }
+
+    /// The on-screen trial banner escalates in copy and always discloses
+    /// auto-conversion (R12); the non-banner states produce no banner.
+    func testTrialBannerCopy() {
+        XCTAssertNil(OnboardingCopy.trialBanner(for: .indeterminate))
+        XCTAssertNil(OnboardingCopy.trialBanner(for: .subscribed))
+        XCTAssertNil(OnboardingCopy.trialBanner(for: .lapsed))
+        for state: TrialState in [.active(daysLeft: 8), .nearExpiry(daysLeft: 2), .lastDay(hoursLeft: 3)] {
+            let banner = OnboardingCopy.trialBanner(for: state)
+            XCTAssertNotNil(banner, "expected a banner for \(state)")
+            XCTAssertTrue(
+                banner!.lowercased().contains("convert"),
+                "trial banner must disclose auto-conversion (R12): \(banner!)"
+            )
+        }
+    }
+
     /// The Personal card shows its price now; the Team card (coming soon) must
     /// not carry any price until the team tier actually ships (R11).
     func testPersonalCardPricedButTeamCardIsNot() {
