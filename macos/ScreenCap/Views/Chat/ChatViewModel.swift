@@ -85,6 +85,8 @@ struct ChatAnswer: Equatable, Sendable {
     let refusal: Bool
     let questionKind: ChatQuestionKind
     let target: String?
+    /// Why the turn refused (U2), or `nil` on a real answer. Drives `honestState`.
+    let reason: ChatRefusalReason?
 
     init(response: ChatAnswerResponse) {
         self.text = response.answer
@@ -93,12 +95,13 @@ struct ChatAnswer: Equatable, Sendable {
         self.refusal = response.refusal
         self.questionKind = response.questionKind
         self.target = response.target
+        self.reason = ChatRefusalReason(wire: response.reason)
     }
 
     init(
         text: String, sources: [ChatSource], coverage: ChatCoverage,
         refusal: Bool = false, questionKind: ChatQuestionKind = .point,
-        target: String? = "on_device"
+        target: String? = "on_device", reason: ChatRefusalReason? = nil
     ) {
         self.text = text
         self.sources = sources
@@ -106,11 +109,54 @@ struct ChatAnswer: Equatable, Sendable {
         self.refusal = refusal
         self.questionKind = questionKind
         self.target = target
+        self.reason = reason
+    }
+
+    /// The single honest state this answer renders as (R5/R7) — a unified mapping
+    /// from the refusal reason and the coverage state so the view never derives it
+    /// ad hoc. (The daemon/helper-unreachable state is a TRANSPORT failure — a
+    /// `.failed` turn — resolved at the turn level, not from a `ChatAnswer`.)
+    ///
+    /// Precedence: a real answer is `.answered`; else `no_backend` → `.noBackend`;
+    /// else `no_evidence` (or a coverage `no_matching_moments`) → `.noMatchingMoments`;
+    /// else (`unsupported` / `blocked` / unknown) → `.safeRefusal`.
+    var honestState: ChatHonestState {
+        guard refusal else { return .answered }
+        switch reason {
+        case .noBackend:
+            return .noBackend
+        case .noEvidence:
+            return .noMatchingMoments
+        case .unsupported, .blocked, .none:
+            return coverage.state == .noMatchingMoments ? .noMatchingMoments : .safeRefusal
+        }
     }
 
     /// True when this turn's coverage indicates OCR indexing would help and the
     /// UI should surface the one-time consent affordance inline on THIS turn (R13).
-    var suggestsOcrConsent: Bool { coverage.state.suggestsOcrConsent }
+    /// Suppressed for `.noBackend` (R7): telling the user to turn on indexing when
+    /// the real blocker is that no AI backend exists re-creates the exact
+    /// conflation the honest-state work removes.
+    var suggestsOcrConsent: Bool {
+        honestState != .noBackend && coverage.state.suggestsOcrConsent
+    }
+}
+
+/// The distinct user-facing states a Chat turn renders as (R5). `daemonUnreachable`
+/// is a transport failure (a `.failed` turn); the rest derive from a `ChatAnswer`.
+enum ChatHonestState: Sendable, Equatable {
+    /// A grounded answer was produced.
+    case answered
+    /// No answer backend was available (on-device gated off + no consented cloud) —
+    /// the transparent both-paths affordance (R6).
+    case noBackend
+    /// Retrieval ran but nothing matched — distinct from no-backend (R5).
+    case noMatchingMoments
+    /// A safety refusal (attribution rejection / egress guard / unknown reason) —
+    /// render the daemon's own refusal text, not the no-backend affordance.
+    case safeRefusal
+    /// The daemon or helper couldn't be reached (transport failure).
+    case daemonUnreachable
 }
 
 // MARK: - View model

@@ -21,6 +21,10 @@ import SwiftUI
 //    affordance, re-running that turn on consent.
 
 struct ChatView: View {
+    /// Navigate to the Intelligence settings pane — the no-backend affordance's CTA
+    /// (R6). Wired by `MainWindow` to its `ShellRoute` (`route = .intelligence`); a
+    /// no-op default keeps previews and standalone instantiation working.
+    var onOpenIntelligenceSettings: () -> Void = {}
     @StateObject private var model = ChatViewModel()
     /// Recall-consent state surfacing (KTD1) — the existing recall row governs
     /// cloud use; on-device is the default and shown at rest.
@@ -104,7 +108,8 @@ struct ChatView: View {
                                 showOcrConsent: turn.answer?.suggestsOcrConsent == true && !contentIndexEnabled,
                                 onOpenSource: openSource,
                                 onRetry: { Task { await model.retry(turnID: turn.id) } },
-                                onEnableOcrConsent: { Task { await enableOcrConsent(turnID: turn.id) } }
+                                onEnableOcrConsent: { Task { await enableOcrConsent(turnID: turn.id) } },
+                                onOpenIntelligenceSettings: onOpenIntelligenceSettings
                             )
                             .id(turn.id)
                         }
@@ -284,6 +289,7 @@ private struct ChatTurnView: View {
     var onOpenSource: (ChatSource) -> Void
     var onRetry: () -> Void
     var onEnableOcrConsent: () -> Void
+    var onOpenIntelligenceSettings: () -> Void
 
     @State private var sourcesExpanded = true
 
@@ -345,7 +351,14 @@ private struct ChatTurnView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: 640, alignment: .leading)
 
-            coverageLine(answer)
+            // The no-backend state gets its own affordance (a distinct, actionable
+            // card), NOT the muted single-line coverage note used for every other
+            // state — so "no AI is available" never reads like "nothing matched".
+            if answer.honestState == .noBackend {
+                noBackendAffordance
+            } else {
+                coverageLine(answer)
+            }
 
             if showOcrConsent {
                 ocrConsentBanner
@@ -354,6 +367,42 @@ private struct ChatTurnView: View {
             if !answer.sources.isEmpty {
                 sourcesStrip(answer.sources)
             }
+        }
+    }
+
+    /// The transparent no-backend affordance (R5/R6): no AI model is available, so
+    /// explain both paths and link to Intelligence Settings. Visually distinct from
+    /// the single-line `coverageLine` (a card with a call-to-action). Copy is
+    /// OS-aware but never hides a path and never nudges.
+    private var noBackendAffordance: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("No AI model is set up to answer yet")
+                .font(SCTypography.sans(size: 13, weight: .semibold))
+                .foregroundStyle(Color.scInk)
+            Text(Self.noBackendBody)
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scInkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open Intelligence Settings", action: onOpenIntelligenceSettings)
+                .buttonStyle(.borderedProminent)
+                .tint(Color.scTeal)
+        }
+        .padding(SCMetrics.space3)
+        .frame(maxWidth: 640, alignment: .leading)
+        .background(Color.scTealSoft.opacity(0.4), in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("No AI model is set up to answer yet. \(Self.noBackendBody)")
+    }
+
+    /// OS-aware copy (R6): on a host that can't run on-device (macOS < 26), lead
+    /// with the actionable cloud path while still disclosing the on-device
+    /// requirement; on a capable host, present both without steering. Never hides a
+    /// path — disclosure-complete, not a nudge.
+    static var noBackendBody: String {
+        if #available(macOS 26.0, *) {
+            return "Answer on this Mac with Apple Intelligence, or turn on cloud recall in Intelligence Settings (your data leaves this Mac, only with your consent)."
+        } else {
+            return "To answer here, turn on cloud recall in Intelligence Settings (your data leaves this Mac, only with your consent). On-device answers need macOS 26 with Apple Intelligence."
         }
     }
 

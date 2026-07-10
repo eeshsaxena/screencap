@@ -216,12 +216,30 @@ struct ChatCoverage: Decodable, Sendable, Equatable {
     }
 }
 
+/// The reason a chat turn REFUSED (U2), so the client renders the honest state
+/// instead of collapsing every refusal into one message. `nil`/unknown on a real
+/// answer. Mirrors the daemon dispatch's reason codes.
+enum ChatRefusalReason: String, Sendable, Equatable {
+    case noBackend = "no_backend"
+    case noEvidence = "no_evidence"
+    case unsupported
+    case blocked
+
+    /// Tolerant: an unrecognized reason maps to `nil` so the client falls back to a
+    /// generic safe refusal rather than crashing or mislabeling.
+    init?(wire: String?) {
+        guard let wire, let r = ChatRefusalReason(rawValue: wire) else { return nil }
+        self = r
+    }
+}
+
 /// `chat.answer` response — a grounded answer + its sources + honest coverage,
 /// POINTER ONLY. `answer` is the generated prose (or the canonical refusal text
-/// on a refusal). `refusal` flags a no-evidence / no-execution-target /
-/// attribution-rejected turn so the client renders it distinctly. `questionKind`
-/// is `point` / `aggregate`; `target` is the execution target this turn resolved
-/// to (`on_device` / `cloud` / `none`), recomputed per turn.
+/// on a refusal). `refusal` flags a refused turn; `reason` says WHY (`no_backend`
+/// / `no_evidence` / `unsupported` / `blocked`, `nil` on a real answer) so the
+/// client renders the honest state. `questionKind` is `point` / `aggregate`;
+/// `target` is the execution target this turn resolved to (`on_device` / `cloud`
+/// / `none`), recomputed per turn.
 struct ChatAnswerResponse: Decodable, Sendable, Equatable {
     let ok: Bool
     let schemaVersion: Int
@@ -235,6 +253,9 @@ struct ChatAnswerResponse: Decodable, Sendable, Equatable {
     /// The execution target the turn resolved to — surfaced verbatim so the UI can
     /// show "answered on this Mac" vs "cloud". Optional-tolerant.
     let target: String?
+    /// The refusal reason code (`no_backend` / `no_evidence` / `unsupported` /
+    /// `blocked`), or `nil` on a real answer. Optional-tolerant.
+    let reason: String?
 
     var questionKind: ChatQuestionKind { ChatQuestionKind(wire: questionKindRaw) }
 
@@ -242,7 +263,8 @@ struct ChatAnswerResponse: Decodable, Sendable, Equatable {
         ok: Bool = true, schemaVersion: Int = 1, daemonVersion: String = "test",
         apiSchemaVersion: Int = 1, answer: String, sources: [ChatSource],
         coverage: ChatCoverage, refusal: Bool = false,
-        questionKind: ChatQuestionKind = .point, target: String? = "on_device"
+        questionKind: ChatQuestionKind = .point, target: String? = "on_device",
+        reason: String? = nil
     ) {
         self.ok = ok
         self.schemaVersion = schemaVersion
@@ -254,6 +276,7 @@ struct ChatAnswerResponse: Decodable, Sendable, Equatable {
         self.refusal = refusal
         self.questionKindRaw = questionKind.rawValue
         self.target = target
+        self.reason = reason
     }
 
     enum CodingKeys: String, CodingKey {
@@ -267,6 +290,7 @@ struct ChatAnswerResponse: Decodable, Sendable, Equatable {
         case refusal
         case questionKindRaw = "question_kind"
         case target
+        case reason
     }
 
     init(from decoder: Decoder) throws {
@@ -281,5 +305,6 @@ struct ChatAnswerResponse: Decodable, Sendable, Equatable {
         refusal = try c.decodeIfPresent(Bool.self, forKey: .refusal) ?? false
         questionKindRaw = try c.decodeIfPresent(String.self, forKey: .questionKindRaw)
         target = try c.decodeIfPresent(String.self, forKey: .target)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
     }
 }
