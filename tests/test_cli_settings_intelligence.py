@@ -328,3 +328,55 @@ def test_readback_includes_downloaded_install_state():
     block = _last_json_line(_invoke(as_json=True).output)["intelligence"]
     # No model installed in a fresh isolated config → False (never raises).
     assert block["downloaded_model_installed"] is False
+
+
+# ---------------------------------------------------------------------------
+# U1 — BYO cloud providers (OpenAI / Anthropic / Gemini × key / CLI)
+# ---------------------------------------------------------------------------
+
+BYO_CLOUD_IDS = ("openai", "anthropic", "openai-cli", "anthropic-cli", "gemini-cli")
+
+
+class TestBYOCloudProviders:
+    @pytest.mark.parametrize("provider_id", BYO_CLOUD_IDS)
+    def test_byo_cloud_provider_round_trips(self, provider_id):
+        r = _invoke("cloud_provider", "set", provider_id, as_json=True)
+        assert r.exit_code == 0, r.output
+        assert _read_cfg()["intelligence"]["cloud_provider"] == provider_id
+
+        from screencap import config
+
+        config.invalidate_config_cache()
+        assert config.get_llm_cloud_provider() == provider_id
+
+    @pytest.mark.parametrize("provider_id", BYO_CLOUD_IDS)
+    def test_byo_ids_rejected_as_active_provider(self, provider_id):
+        # KTD2: BYO providers are cloud-fallback targets only. A non-on-device
+        # active provider never day-splits (routing → Unavailable), so the CLI
+        # must refuse to persist a BYO id as the active ``provider``.
+        r = _invoke("provider", "set", provider_id)
+        assert r.exit_code != 0
+        assert "must be one of" in r.output
+        assert "llm_provider" not in _read_cfg()
+
+
+@pytest.mark.privacy
+class TestBYONeverCloudInvariant:
+    """The frames/day-split never-cloud guards (R7) hold after the
+    cloud-provider enum is widened for BYO providers."""
+
+    @pytest.mark.parametrize("byo", ("openai", "anthropic", "gemini-cli"))
+    def test_frames_row_still_rejected_with_byo_configured(self, byo):
+        _invoke("cloud_provider", "set", byo)
+        _invoke("summary_cloud_consent", "set", "true")
+        r = _invoke("frames_cloud_consent", "set", "true")
+        assert r.exit_code != 0
+        assert "never sent" in r.output
+        assert "frames_cloud_consent" not in _read_cfg().get("intelligence", {})
+
+    @pytest.mark.parametrize("byo", ("openai", "anthropic", "gemini-cli"))
+    def test_day_split_row_still_rejected_with_byo_configured(self, byo):
+        _invoke("cloud_provider", "set", byo)
+        r = _invoke("day_split_cloud_consent", "set", "true")
+        assert r.exit_code != 0
+        assert "on-device" in r.output
