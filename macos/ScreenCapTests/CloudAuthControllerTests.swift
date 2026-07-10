@@ -809,4 +809,39 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertEqual(service.checkoutURLCallCount, 0, "no tier → no Stripe call")
         XCTAssertNotNil(failure)
     }
+
+    /// End-to-end regression for the swallowed-checkout-error bug: `checkout-url`
+    /// reports failure as a `{ok:false, error}` envelope on **stdout** and exits
+    /// 1 with *empty* stderr. This drives the real `LiveCloudAuthService` →
+    /// `CLIClient` path (which the `FakeCloudAuthService` seam bypasses) against a
+    /// fake `screencap`, and asserts `startCheckout` surfaces that real reason —
+    /// not the bare "screencap exited with code 1:" the user saw before
+    /// `fetchCheckoutURL` opted into `allowNonZeroExit`.
+    func testStartCheckoutSurfacesEnvelopeErrorNotBareExitCode() async throws {
+        fakeCLI = try FakeCLIBinary(
+            stdout: #"{"ok": false, "error": "Sign in to upgrade: run `screencap login`."}"#,
+            exitCode: 1
+        )
+        let controller = CloudAuthController(service: LiveCloudAuthService())
+
+        let failure = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            controller.startCheckout(tier: .localPro) { cont.resume(returning: $0) }
+        }
+
+        XCTAssertEqual(failure, "Sign in to upgrade: run `screencap login`.")
+        XCTAssertFalse(
+            failure.contains("exited with code"),
+            "the real reason must surface, never a bare CLI exit code"
+        )
+    }
+
+    // MARK: - fake CLI injection (for LiveCloudAuthService integration)
+
+    private var fakeCLI: FakeCLIBinary?
+
+    override func tearDown() {
+        fakeCLI?.remove()
+        fakeCLI = nil
+        super.tearDown()
+    }
 }

@@ -118,7 +118,15 @@ final class LiveCloudAuthService: CloudAuthService {
         // entitlement authority. Passed as an argument, not baked in, so a
         // price change is a config change, not a code change (KTD-7). The CLI's
         // `checkout-url --tier <local|cloud>` option is required and validated.
-        try await CLIClient.runJSONRaw(["checkout-url", "--tier", tier, "--json"], timeout: 30)
+        //
+        // `allowNonZeroExit`: on failure the CLI writes a `{ok:false, error}`
+        // envelope to stdout and exits 1 with *empty* stderr. Without this, the
+        // non-zero exit throws `nonZeroExit(stderr: "")` and `startCheckout`
+        // surfaces a bare "screencap exited with code 1:"; tolerating it lets the
+        // envelope through so the real reason (sign-in, offline, backend) shows.
+        try await CLIClient.runJSONRaw(
+            ["checkout-url", "--tier", tier, "--json"], timeout: 30, allowNonZeroExit: true
+        )
     }
 
     func fetchReconcileEntitlement() async throws -> Data {

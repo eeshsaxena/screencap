@@ -182,9 +182,19 @@ enum CLIClient {
     /// process spawning + test injection, or when the caller needs to inspect
     /// the `ok` / `error` envelope fields before deciding what to decode into
     /// a typed model.
-    static func runJSONRaw(_ args: [String], timeout: TimeInterval = 10) async throws -> Data {
+    ///
+    /// `allowNonZeroExit` mirrors `runJSONRawStdin`: some CLI commands emit a
+    /// `{"ok":false,"error":...}` envelope on **stdout** and then `sys.exit(1)`
+    /// with nothing on stderr (e.g. `checkout-url`). With the default (false) a
+    /// non-zero exit throws `CLIError.nonZeroExit` carrying the *empty* stderr,
+    /// discarding that envelope — the caller loses the real reason. Pass `true`
+    /// on those paths so the stdout envelope is returned for the caller to decode.
+    /// Launch failures, timeouts, and binary-not-found still throw regardless.
+    static func runJSONRaw(
+        _ args: [String], timeout: TimeInterval = 10, allowNonZeroExit: Bool = false
+    ) async throws -> Data {
         assert(args.contains("--json"), "runJSONRaw requires the caller to pass --json explicitly. args=\(args)")
-        let (stdoutBytes, _) = try await runOneShot(args, timeout: timeout)
+        let (stdoutBytes, _) = try await runOneShot(args, timeout: timeout, allowNonZeroExit: allowNonZeroExit)
         return stdoutBytes
     }
 
