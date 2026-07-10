@@ -98,20 +98,50 @@ final class ShellSidebarModelTests: XCTestCase {
     // MARK: - SCR-239 (U11) local-model hint visibility
 
     func testLocalModelHintVisibilityRules() {
-        // Shown: on-device active, no model, not dismissed.
+        // Shown: on-device active, no cloud fallback, no model, not dismissed.
         XCTAssertTrue(ShellSidebarModel.shouldShowLocalModelHint(
-            provider: "on-device", downloadedInstalled: false, dismissed: false))
+            provider: "on-device", cloudProvider: nil,
+            downloadedInstalled: false, dismissed: false))
         // Hidden once installed.
         XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
-            provider: "on-device", downloadedInstalled: true, dismissed: false))
+            provider: "on-device", cloudProvider: nil,
+            downloadedInstalled: true, dismissed: false))
         // Hidden once dismissed (R7 — no re-prompt).
         XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
-            provider: "on-device", downloadedInstalled: false, dismissed: true))
-        // Hidden for a cloud provider (which already names tasks).
+            provider: "on-device", cloudProvider: nil,
+            downloadedInstalled: false, dismissed: true))
+        // Hidden for a legacy cloud value in the provider slot.
         XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
-            provider: "gemini", downloadedInstalled: false, dismissed: false))
+            provider: "gemini", cloudProvider: nil,
+            downloadedInstalled: false, dismissed: false))
         // Hidden when settings unknown (nil provider).
         XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
-            provider: nil, downloadedInstalled: false, dismissed: false))
+            provider: nil, cloudProvider: nil,
+            downloadedInstalled: false, dismissed: false))
+    }
+
+    /// R13 (U6) — under the two-slot semantics a BYO pick sets `cloud_provider`
+    /// and leaves `provider == "on-device"`, so the hint must check the cloud
+    /// slot explicitly: never nag to download a local model while a cloud
+    /// provider is the rendered selection.
+    func testLocalModelHintHiddenWhileCloudProviderSelected() {
+        XCTAssertFalse(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", cloudProvider: "anthropic",
+            downloadedInstalled: false, dismissed: false))
+    }
+
+    /// The cloud slot is normalized the way IntelligenceSelectionModel reads it
+    /// back: nil, empty/whitespace, and the CLI's clear-literal "none" all mean
+    /// unset — none of them hides the hint.
+    func testLocalModelHintTreatsNoneAndEmptyCloudProviderAsUnset() {
+        XCTAssertTrue(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", cloudProvider: "none",
+            downloadedInstalled: false, dismissed: false))
+        XCTAssertTrue(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", cloudProvider: "",
+            downloadedInstalled: false, dismissed: false))
+        XCTAssertTrue(ShellSidebarModel.shouldShowLocalModelHint(
+            provider: "on-device", cloudProvider: "  ",
+            downloadedInstalled: false, dismissed: false))
     }
 }
