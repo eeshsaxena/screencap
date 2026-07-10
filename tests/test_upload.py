@@ -421,6 +421,41 @@ def test_request_signed_urls_success():
     assert "rec1" in prefix
 
 
+def test_request_checkout_url_sends_tier():
+    """request_checkout_url forwards the selected tier in the POST body (U3/U11)."""
+    from screencap.upload import request_checkout_url
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"url": "https://checkout.stripe/session_abc"}
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp) as mp:
+        url = request_checkout_url("local")
+
+    assert url == "https://checkout.stripe/session_abc"
+    # authed_post forwards our json kwarg to the underlying post; tier must ride it.
+    assert mp.call_args.kwargs["json"] == {"tier": "local"}
+
+
+def test_checkout_url_cmd_requires_and_forwards_tier():
+    """The `checkout-url` CLI requires --tier and forwards it (U11 integration)."""
+    runner = CliRunner()
+
+    # Missing --tier is a usage error (exit 2), no request made.
+    with mock.patch("screencap.upload.request_checkout_url") as req:
+        result = runner.invoke(cli, ["checkout-url", "--json"])
+    assert result.exit_code == 2
+    req.assert_not_called()
+
+    # --tier cloud is forwarded to request_checkout_url.
+    with mock.patch(
+        "screencap.upload.request_checkout_url", return_value="https://co/x"
+    ) as req:
+        result = runner.invoke(cli, ["checkout-url", "--tier", "cloud", "--json"])
+    assert result.exit_code == 0
+    req.assert_called_once_with("cloud")
+
+
 def test_request_signed_urls_connection_error():
     from screencap.upload import request_signed_urls
     import pytest

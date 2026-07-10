@@ -1710,20 +1710,24 @@ def whoami_cmd(as_json, force_refresh):
 
 
 @cli.command("checkout-url")
+@click.option("--tier", type=click.Choice(["local", "cloud"]), required=True,
+              help="Which paid tier to check out: local (unlimited local) or cloud.")
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
-def checkout_url_cmd(as_json):
-    """Print a hosted Stripe Checkout URL for the $5/mo Personal cloud plan.
+def checkout_url_cmd(tier, as_json):
+    """Print a hosted Stripe Checkout URL for the given paid tier.
 
     Requires sign-in (the uid is derived server-side from the bearer token). The
     macOS app opens the printed URL in the browser; on return it force-refreshes
-    the entitlement (`whoami --force-refresh`) to pick up the granted plan.
+    the entitlement (`whoami --force-refresh`) to pick up the granted plan. The
+    tier selects the price only — the webhook re-derives entitlement from the
+    paid price.
     """
     from screencap import upload
 
     try:
-        url = upload.request_checkout_url()
+        url = upload.request_checkout_url(tier)
     except Exception as e:
         if as_json:
             click.echo(json.dumps(
