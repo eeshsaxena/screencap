@@ -344,6 +344,16 @@ class Supervisor:
         """Clear the migration reservation (paired with acquire_migration)."""
         self._migration_active = False
 
+    def is_migrating(self) -> bool:
+        """True while a storage migration holds the daemon (SCR-228).
+
+        Consulted by the idle-shutdown watchdog: ``/v0/storage.migrate`` is not
+        in ``_ACTIVITY_PATHS`` and its handler yields the event loop across an
+        ``asyncio.to_thread`` move, so without this an auto-spawned daemon could
+        idle-exit mid-migration.
+        """
+        return self._migration_active
+
     async def spawn(self, request: "RecordingStartRequest") -> dict[str, Any]:
         """Claim the daemon lock, spawn the engine worker, and await started."""
         async with self._operation_lock:

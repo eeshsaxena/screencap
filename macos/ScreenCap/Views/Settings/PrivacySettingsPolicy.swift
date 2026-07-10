@@ -56,6 +56,10 @@ enum PrivacySettingsPolicy {
                 + "that isn't synced."
         case "target_not_empty":
             return "Choose an empty folder."
+        case "same_as_source":
+            return "That's already where your recordings are stored."
+        case "source_missing":
+            return "Your current recordings folder couldn't be found."
         case "not_writable":
             return "That folder isn't writable. Choose another."
         case "nested":

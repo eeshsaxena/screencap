@@ -46,6 +46,23 @@ final class DaemonSessionServiceTests: XCTestCase {
         XCTAssertEqual(service.translateFailure(error), .lockContended)
     }
 
+    // SCR-228: recording.start refused during a storage migration surfaces the
+    // honest "a move is already in progress" copy, not a generic system error.
+    func testTranslateMigrationInProgressCarriesHonestCopy() {
+        let service = LiveDaemonSessionService()
+        let error = DaemonClientError.envelopeError(
+            code: DaemonErrorCode.migrationInProgress, rawBody: Data()
+        )
+        guard case .other(let description) = service.translateFailure(error) else {
+            return XCTFail("expected .other")
+        }
+        XCTAssertEqual(
+            description,
+            PrivacySettingsPolicy.migrationFailureFallback(reason: "migration_in_progress")
+        )
+        XCTAssertFalse(description.contains("_"))  // human copy, not a raw code
+    }
+
     func testTranslatePermissionRequiredDecodesMissingList() {
         let service = LiveDaemonSessionService()
         let body = #"{"ok":false,"error":"permission_required","missing":["screen_recording","accessibility"]}"#

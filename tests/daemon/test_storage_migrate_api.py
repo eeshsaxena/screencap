@@ -7,6 +7,9 @@ migration mutual-exclusion guard.
 
 from __future__ import annotations
 
+import fcntl
+import os
+
 import httpx
 import pytest
 
@@ -144,6 +147,48 @@ async def test_recording_active_rejected(isolated_config, monkeypatch):
     assert resp.status_code == 409
     assert resp.json()["reason"] == "recording_active"
     assert (isolated_config / "recordings" / "rec-1").exists()  # untouched
+
+
+@pytest.mark.asyncio
+async def test_terminal_stage_in_flight_rejected(isolated_config, monkeypatch):
+    # A just-stopped recording's terminal stage (scrub/upload/finalize) holds a
+    # terminal-<name>.lock; migration must refuse rather than rename the tree out
+    # from under it, even though no recording pidfile is active.
+    from screencap.daemon import app as appmod
+
+    monkeypatch.setattr(appmod, "_storage_recording_active", lambda: False)
+    run_dir = isolated_config / "run"
+    lock_path = run_dir / "terminal-rec-1.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # simulate a live terminal stage
+    try:
+        target = isolated_config / "new_recordings"
+        app = _app_with_supervisor()
+        async with _client(app) as client:
+            resp = await client.post(
+                "/v0/storage.migrate", json={"target": str(target)}
+            )
+        assert resp.status_code == 409
+        assert resp.json()["reason"] == "recording_active"
+        assert (isolated_config / "recordings" / "rec-1").exists()  # untouched
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@pytest.mark.asyncio
+async def test_daemon_is_busy_while_migrating(isolated_config):
+    # An auto-spawned daemon must not idle-shutdown mid-migration.
+    from screencap.daemon._idle_shutdown import _daemon_is_busy
+
+    app = _app_with_supervisor()
+    assert _daemon_is_busy(app) is False
+    await app.state.supervisor.acquire_migration(schema_version=1)
+    try:
+        assert _daemon_is_busy(app) is True
+    finally:
+        app.state.supervisor.release_migration()
+    assert _daemon_is_busy(app) is False
 
 
 @pytest.mark.asyncio

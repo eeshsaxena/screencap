@@ -265,6 +265,15 @@ final class PrivacyController: ObservableObject {
         }
     }
 
+    /// Clear the migration status surface back to idle (SCR-228 U6). The
+    /// storage row calls this when the pane disappears and when the user
+    /// re-engages the picker, so a prior success/failure banner doesn't linger
+    /// as stale state across pane visits.
+    func clearMigrationState() {
+        if case .migrating = migrationState { return }  // don't interrupt a run
+        migrationState = .idle
+    }
+
     /// Mark first-run setup complete (`setup_skipped = true`). Both banner
     /// CTAs and the pane's `.onAppear` call this — overlapping invocations
     /// short-circuit so the CLI write fires exactly once per dismiss.

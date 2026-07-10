@@ -25,6 +25,7 @@ This module imports :mod:`screencap.config` (a leaf config module) but never
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from dataclasses import dataclass
@@ -257,17 +258,42 @@ def migrate(
     crumb.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"from": str(source), "to": str(target)})
     _atomic_write(crumb, payload)
+    _fsync_dir(crumb.parent)  # durability: breadcrumb must survive power-loss
 
+    # validate_target only probed the nearest EXISTING ancestor; a headless CLI
+    # caller may pass a nested path whose parent doesn't exist yet. Create it so
+    # os.rename doesn't fail with ENOENT after the breadcrumb is written.
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # A pre-existing empty target must be removed so os.rename lands cleanly (a
+    # stray get_recordings_dir() read may have mkdir'd it). A racing writer that
+    # filled it since validation makes rmdir raise ENOTEMPTY — surface a clean
+    # typed outcome, not a raw 500, with source untouched.
     if target.exists():
-        target.rmdir()  # validated empty
+        try:
+            target.rmdir()
+        except OSError:
+            _unlink_quiet(crumb)
+            return MigrationOutcome(
+                ok=False,
+                code=Reason.TARGET_NOT_EMPTY,
+                message=MESSAGES[Reason.TARGET_NOT_EMPTY],
+            )
+
     os.rename(source, target)
 
+    # The tree now lives at `target`. Everything below must either fully commit
+    # (the config flip) or roll the rename back — a failure must never leave
+    # config pointing at the vanished source (a split-brain the live daemon
+    # can't recover from until restart). The same-volume rename-back is atomic
+    # and O(1), so rollback is safe.
     try:
-        os.chmod(target, 0o700)
-    except OSError:
-        pass  # best-effort; rename already succeeded
-
-    commit_config(target)
+        _harden_root(target)  # chmod 0o700 + verify; raises if it didn't land
+        commit_config(target)  # the single commit point
+    except Exception:
+        os.rename(target, source)  # roll back to the pre-move state
+        _unlink_quiet(crumb)
+        raise
 
     _unlink_quiet(crumb)
     return MigrationOutcome(
@@ -300,22 +326,75 @@ def reconcile_pending(
     to_exists = to_p.exists()
     from_exists = from_p.exists()
 
+    # Converge on whichever location actually holds the library. The rename
+    # either happened (data at `to`) or didn't (data at `from`). When BOTH
+    # exist — e.g. a crash between the rename and the config flip left `to`
+    # populated, and a later get_recordings_dir() mkdir recreated an empty
+    # `from` — pick the non-empty one rather than blindly keeping `from`, which
+    # would strand the moved library permanently.
+    converge: Path | None = None
     if to_exists and not from_exists:
-        # Rename completed; the crash was before/at the config flip. Ensure
-        # config points at the new location (idempotent) and clear.
-        commit_config(to_p)
+        converge = to_p
+    elif _nonempty_dir(to_p) and not _nonempty_dir(from_p):
+        converge = to_p
+
+    if converge is not None:
+        # Re-apply the 0o700 gate: a crash between rename and chmod leaves the
+        # tree at the source's original mode. Best-effort in recovery — a chmod
+        # failure must never block daemon start.
+        with contextlib.suppress(OSError):
+            os.chmod(converge, 0o700)
+        commit_config(converge)
         _unlink_quiet(crumb)
         return MigrationOutcome(
-            ok=True, moved_from=str(from_p), moved_to=str(to_p)
+            ok=True, moved_from=str(from_p), moved_to=str(converge)
         )
 
-    # Rename never happened (only `from` exists), or the ambiguous both-exist
-    # case (target was pre-created empty and the rename didn't run): leave
-    # config at the source and clear. Data is intact at `from`.
+    # Rename never happened (data intact at `from`) — leave config at the
+    # source and clear.
     _unlink_quiet(crumb)
     return MigrationOutcome(
         ok=True, moved_from=str(from_p), moved_to=str(from_p)
     )
+
+
+def _harden_root(root: Path) -> None:
+    """``chmod`` the new recordings root to ``0o700`` and verify it landed.
+
+    A ``0o700`` root is the load-bearing cross-user gate — it blocks directory
+    traversal regardless of per-file mode, which is what protects a library
+    relocated outside ``~`` to a world-traversable parent. A silently-failed or
+    ineffective chmod there would leave the tree exposed while the caller
+    reports success, so this raises on failure (the caller rolls the move back).
+    """
+    os.chmod(root, 0o700)
+    mode = os.stat(root).st_mode & 0o777
+    if mode & 0o077:
+        raise OSError(
+            f"could not harden {root} to 0o700 (mode is {oct(mode)})"
+        )
+
+
+def _nonempty_dir(p: Path) -> bool:
+    """True if ``p`` is a directory containing at least one entry."""
+    try:
+        return p.is_dir() and any(p.iterdir())
+    except OSError:
+        return False
+
+
+def _fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory entry (breadcrumb durability)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -324,6 +403,7 @@ def _atomic_write(path: Path, text: str) -> None:
     )
     try:
         os.write(fd, text.encode())
+        os.fsync(fd)  # durable before the rename it guards (KTD-3)
     finally:
         os.close(fd)
 

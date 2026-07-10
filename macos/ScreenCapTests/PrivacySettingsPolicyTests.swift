@@ -95,6 +95,7 @@ final class PrivacySettingsPolicyTests: XCTestCase {
             "cross_volume", "cloud_synced", "target_not_empty",
             "not_writable", "nested", "recording_active",
             "migration_in_progress", "env_override",
+            "same_as_source", "source_missing",
         ]
         var seen = Set<String>()
         for reason in reasons {

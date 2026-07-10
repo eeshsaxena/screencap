@@ -2199,6 +2199,38 @@ def _storage_recording_active() -> bool:
     return bool(meta and meta.get("recording_started_at") is not None)
 
 
+def _terminal_stage_active() -> bool:
+    """True if any recording's terminal stage holds its advisory flock (SCR-228).
+
+    A just-stopped recording's terminal stage (scrub -> upload -> sentinel) runs
+    AFTER ``recording_started_at`` is cleared, and — for a CLI-initiated
+    recording — out of the daemon process, so neither ``_storage_recording_active``
+    nor ``supervisor.has_inflight_resume`` sees it. It holds
+    ``~/.screencap/run/terminal-<name>.lock`` (``terminal_stage.terminal_lock``)
+    the whole time. A non-blocking probe of those locks catches an in-flight
+    finalize that an ``os.rename`` of the tree would corrupt.
+    """
+    import fcntl
+    import glob
+
+    from screencap.config import _DEFAULT_BASE
+
+    run_dir = _DEFAULT_BASE / "run"
+    for lock_path in glob.glob(str(run_dir / "terminal-*.lock")):
+        try:
+            fd = os.open(lock_path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)  # acquired -> not held; release it
+        except OSError:
+            return True  # held by a live terminal stage
+        finally:
+            os.close(fd)
+    return False
+
+
 async def storage_migrate(request: Request) -> JSONResponse:
     """``POST /v0/storage.migrate`` — relocate the recordings library (SCR-228).
 
@@ -2238,6 +2270,13 @@ async def storage_migrate(request: Request) -> JSONResponse:
                 "location.",
                 schema_version=schema_version,
             )
+        if await asyncio.to_thread(_terminal_stage_active):
+            raise errors.StorageMigrationError(
+                "recording_active",
+                "A recording is still finishing processing. Try again once "
+                "it completes.",
+                schema_version=schema_version,
+            )
 
         source = config.get_recordings_dir()
         target = Path(parsed.target).expanduser()
@@ -2256,6 +2295,14 @@ async def storage_migrate(request: Request) -> JSONResponse:
             target,
             config.set_recordings_dir,
         )
+        if not outcome.ok:
+            # A recoverable pre-commit failure (e.g. the target filled between
+            # validation and the move) — surface a typed reason, not a 500.
+            raise errors.StorageMigrationError(
+                outcome.code or "invalid_target",
+                outcome.message or "The chosen folder can't be used.",
+                schema_version=schema_version,
+            )
         return JSONResponse(
             schema.envelope(
                 schema_version=schema_version,

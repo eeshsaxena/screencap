@@ -594,6 +594,24 @@ final class PrivacyControllerTests: XCTestCase {
         XCTAssertNil(controller.recordingsDir)  // unchanged on refusal
     }
 
+    /// clearMigrationState resets a terminal banner to idle so it doesn't
+    /// linger across pane visits.
+    func testClearMigrationStateResetsTerminalBanner() async {
+        let migrate = FakeInvoker()
+        migrate.respond = { _ in
+            Data(#"{"ok":false,"reason":"cross_volume","message":"x"}"#.utf8)
+        }
+        let controller = PrivacyController(
+            invoke: FakeInvoker().invoker(), migrateInvoke: migrate.invoker()
+        )
+        await controller.startMigration(to: URL(fileURLWithPath: "/x"))
+        guard case .failed = controller.migrationState else {
+            return XCTFail("expected .failed")
+        }
+        controller.clearMigrationState()
+        XCTAssertEqual(controller.migrationState, .idle)
+    }
+
     /// The chosen folder's filesystem path is forwarded verbatim as the target.
     func testStartMigrationForwardsTargetPath() async {
         let migrate = FakeInvoker()

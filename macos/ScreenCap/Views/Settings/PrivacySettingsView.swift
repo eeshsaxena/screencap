@@ -317,6 +317,7 @@ private struct StorageRow: View {
             migrationStatus
         }
         .padding(.vertical, 16)
+        .onDisappear { privacy.clearMigrationState() }  // no stale banner on return
         .confirmationDialog(
             PrivacySettingsCopy.storageConfirmTitle,
             isPresented: $showConfirm,
@@ -324,6 +325,7 @@ private struct StorageRow: View {
             presenting: pendingURL
         ) { url in
             Button("Move Recordings") {
+                pendingURL = nil
                 Task { await privacy.startMigration(to: url) }
             }
             Button("Cancel", role: .cancel) { pendingURL = nil }
@@ -336,6 +338,7 @@ private struct StorageRow: View {
 
     private var changeButton: some View {
         Button {
+            privacy.clearMigrationState()  // clear a prior result before re-engaging
             if let url = Self.pickFolder(startingAt: privacy.recordingsDir) {
                 pendingURL = url
                 showConfirm = true

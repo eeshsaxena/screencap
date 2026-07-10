@@ -219,7 +219,7 @@ enum CLIClient {
     /// the caller must decode to distinguish a refusal (e.g. SCR-228
     /// `storage migrate` rejecting a cross-volume/cloud-synced target) from a
     /// launch/crash. Mirrors `runJSONRawStdin`'s `allowNonZeroExit` rationale.
-    static func runJSONRawTolerant(_ args: [String], timeout: TimeInterval = 15) async throws -> Data {
+    static func runJSONRawTolerant(_ args: [String], timeout: TimeInterval = 60) async throws -> Data {
         assert(args.contains("--json"), "runJSONRawTolerant requires the caller to pass --json explicitly. args=\(args)")
         let (stdoutBytes, _) = try await runOneShot(
             args, timeout: timeout, allowNonZeroExit: true

@@ -148,6 +148,56 @@ class TestMigrate:
         assert outcome.ok
         assert (target / "rec-1" / "recording.db").exists()
 
+    def test_creates_missing_target_parent(self, tmp_path):
+        # A headless CLI may pass a nested path whose parents don't exist yet.
+        source = _seed_library(tmp_path / "recordings")
+        target = tmp_path / "a" / "b" / "new"
+        outcome = migrate(source, target, lambda p: None, run_dir=tmp_path / "run")
+        assert outcome.ok
+        assert (target / "rec-1" / "recording.db").exists()
+
+    def test_nonempty_target_returns_typed_failure_source_intact(self, tmp_path):
+        # Target filled between validation and the move → clean typed outcome,
+        # not a raw error, and the source is left untouched.
+        source = _seed_library(tmp_path / "recordings")
+        target = tmp_path / "new"
+        target.mkdir()
+        (target / "stray").write_text("x")
+        outcome = migrate(source, target, lambda p: None, run_dir=tmp_path / "run")
+        assert not outcome.ok and outcome.code == Reason.TARGET_NOT_EMPTY
+        assert (source / "rec-1" / "recording.db").exists()
+        assert not (tmp_path / "run" / sm.BREADCRUMB_NAME).exists()
+
+    def test_commit_config_failure_rolls_back_rename(self, tmp_path):
+        # The config flip is the single commit point; if it raises, the atomic
+        # move must roll back so config never points at a vanished source.
+        source = _seed_library(tmp_path / "recordings")
+        target = tmp_path / "new"
+
+        def failing_commit(_p):
+            raise RuntimeError("config lock timeout")
+
+        with pytest.raises(RuntimeError):
+            migrate(source, target, failing_commit, run_dir=tmp_path / "run")
+
+        assert (source / "rec-1" / "recording.db").read_text() == "SQLITE-LOCAL-ONLY"
+        assert not target.exists()
+        assert not (tmp_path / "run" / sm.BREADCRUMB_NAME).exists()
+
+    def test_failed_root_hardening_rolls_back(self, tmp_path, monkeypatch):
+        # A chmod that doesn't land 0o700 (silent failure on a world-traversable
+        # parent) must fail the migration, not report success — verified by
+        # re-stat, then rolled back.
+        source = _seed_library(tmp_path / "recordings")
+        target = tmp_path / "new"
+        monkeypatch.setattr(os, "chmod", lambda *a, **k: None)  # chmod no-ops
+        committed = []
+        with pytest.raises(OSError):
+            migrate(source, target, committed.append, run_dir=tmp_path / "run")
+        assert (source / "rec-1").exists()  # rolled back
+        assert not target.exists()
+        assert committed == []  # config never flipped
+
 
 # --- reconciliation (crash recovery) ---
 
@@ -186,6 +236,23 @@ class TestReconcile:
 
         assert outcome.ok and outcome.moved_to == str(from_p)
         assert committed == []  # config already at source; not touched
+        assert not (run_dir / sm.BREADCRUMB_NAME).exists()
+
+    def test_both_exist_prefers_nonempty_target(self, tmp_path):
+        # Crash between rename and config-flip left the real library at `to`;
+        # a later get_recordings_dir() mkdir recreated an empty `from`. Reconcile
+        # must converge on the non-empty `to`, not strand it by keeping `from`.
+        run_dir = tmp_path / "run"
+        from_p = tmp_path / "recordings"
+        from_p.mkdir()  # empty, freshly recreated
+        to_p = _seed_library(tmp_path / "new")  # the real moved library
+        self._write_breadcrumb(run_dir, from_p, to_p)
+
+        committed = []
+        outcome = reconcile_pending(committed.append, run_dir=run_dir)
+
+        assert outcome.moved_to == str(to_p)
+        assert committed == [to_p]
         assert not (run_dir / sm.BREADCRUMB_NAME).exists()
 
     def test_idempotent(self, tmp_path):
