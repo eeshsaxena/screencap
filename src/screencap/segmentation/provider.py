@@ -96,7 +96,12 @@ class LLMProvider(Protocol):
 def get_provider(name: str) -> LLMProvider:
     """Return the backend for ``name`` (the factory / registry seam).
 
-    ``"gemini"`` → :class:`~screencap.segmentation.providers.gemini.GeminiProvider`.
+    ``"gemini"`` → :class:`~screencap.segmentation.providers.gemini.GeminiProvider`
+    (the reconciled BYO-key Gemini, R10).
+    ``"openai"`` / ``"anthropic"`` → the BYO API-key backends
+    (:class:`~screencap.segmentation.providers.openai.OpenAIProvider` /
+    :class:`~screencap.segmentation.providers.anthropic.AnthropicProvider`), thin
+    HTTP against the user's own account.
     ``"on-device"`` →
     :class:`~screencap.segmentation.providers.ondevice.OnDeviceProvider` (the
     Apple Foundation Models Swift-helper subprocess client).
@@ -124,6 +129,16 @@ def get_provider(name: str) -> LLMProvider:
         from screencap.segmentation.providers.local_server import LocalServerProvider
 
         return LocalServerProvider()
+    if name == "openai":
+        # BYO API-key backend (U3): the user's own OpenAI account over thin HTTP.
+        from screencap.segmentation.providers.openai import OpenAIProvider
+
+        return OpenAIProvider()
+    if name == "anthropic":
+        # BYO API-key backend (U3): the user's own Anthropic account over thin HTTP.
+        from screencap.segmentation.providers.anthropic import AnthropicProvider
+
+        return AnthropicProvider()
     if name in ("openai-cli", "anthropic-cli", "gemini-cli"):
         # BYO CLI-delegation backends (U4): shell out to the user's installed
         # ``codex`` / ``claude`` / ``gemini`` CLI. Cloud-fallback ids only.
@@ -131,6 +146,7 @@ def get_provider(name: str) -> LLMProvider:
 
         return CliDelegateProvider(name)
     raise ValueError(
-        f"Unknown LLM provider: {name!r}. Known providers: 'gemini', 'on-device', "
-        "'downloaded', 'local-server', 'openai-cli', 'anthropic-cli', 'gemini-cli'."
+        f"Unknown LLM provider: {name!r}. Known providers: 'gemini', 'openai', "
+        "'anthropic', 'on-device', 'downloaded', 'local-server', 'openai-cli', "
+        "'anthropic-cli', 'gemini-cli'."
     )
