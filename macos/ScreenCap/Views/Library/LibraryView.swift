@@ -11,12 +11,17 @@ import SwiftUI
 struct LibraryView: View {
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var recorder: RecorderController
+    @EnvironmentObject private var auth: CloudAuthController
     @Environment(\.openWindow) private var openWindow
 
     /// Present the New-recording sheet (U6). U5 wires this to the existing start
     /// path via MainWindow; the closure keeps LibraryView independent of the
     /// sheet that lands in U6.
     var onNewRecording: () -> Void
+    /// U12: present the upgrade prompt when a lapsed user taps the gated
+    /// New-recording control. Owned by MainWindow (like `onNewRecording`) so the
+    /// sheet layers over the whole shell.
+    var onUpgradePrompt: () -> Void
     /// U10: the header search pill opens the Recall palette (KTD-13).
     var onOpenSearch: () -> Void
     /// U9: a card click lands on the Day timeline seeked to the recording
@@ -66,6 +71,10 @@ struct LibraryView: View {
     private var populated: some View {
         VStack(alignment: .leading, spacing: 0) {
             if index.usingCLIFallback { fallbackBanner }
+            // U12: reassure a lapsed user that gating recording/search does NOT
+            // touch their already-captured local recordings (R8), so gated never
+            // reads as data loss. Only shown while actually gated.
+            if auth.isGatedForLapse { recordingsSafeBanner }
             header
                 .padding(.bottom, 22)
             chipRow
@@ -155,6 +164,20 @@ struct LibraryView: View {
     @ViewBuilder
     private var newRecordingButton: some View {
         if !recorder.state.isRecording {
+            newRecordingPill
+        }
+    }
+
+    /// The New-recording CTA — the normal filled teal pill, or, for a lapsed /
+    /// not-entitled user (U12), a distinct gated pill whose press opens the
+    /// upgrade prompt instead of the New-recording sheet. Never a silent no-op:
+    /// the gated variant carries a lock glyph, muted styling, and an
+    /// accessibility label + hint stating the subscription requirement.
+    @ViewBuilder
+    private var newRecordingPill: some View {
+        if auth.isGatedForLapse {
+            GatedRecordingPill(action: onUpgradePrompt)
+        } else {
             LibraryPill(title: "New recording", filled: true, tint: .scTeal) {
                 onNewRecording()
             }
@@ -206,6 +229,29 @@ struct LibraryView: View {
         .padding(.bottom, 18)
     }
 
+    /// U12 reassurance affordance: a lapsed user keeps browse + export of their
+    /// own local recordings (R8). Reuses the advisory (not error) surface so it
+    /// reads as calm "your data is safe", never as a failure.
+    private var recordingsSafeBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "internaldrive")
+                .foregroundStyle(Color.scInkSecondary)
+            Text("Your recordings are safe on this Mac — browse and export them anytime. Recording and search need an active subscription.")
+                .font(SCTypography.sans(size: 12.5))
+                .foregroundStyle(Color.scInkSecondary)
+            Spacer(minLength: 0)
+            Button("Subscribe") { onUpgradePrompt() }
+                .buttonStyle(.plain)
+                .font(SCTypography.sans(size: 12.5, weight: .semibold))
+                .foregroundStyle(Color.scTeal)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .padding(.bottom, 18)
+        .accessibilityElement(children: .combine)
+    }
+
     private var zeroMatchNote: some View {
         VStack(spacing: SCMetrics.space3) {
             Text("No \(selectedChip.label.lowercased()) recordings")
@@ -231,10 +277,8 @@ struct LibraryView: View {
                 .foregroundStyle(Color.scInkSecondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 340)
-            LibraryPill(title: "New recording", filled: true, tint: .scTeal) {
-                onNewRecording()
-            }
-            .padding(.top, SCMetrics.space2)
+            newRecordingPill
+                .padding(.top, SCMetrics.space2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(SCMetrics.space8)
@@ -384,5 +428,38 @@ struct LibraryPill: View {
         .padding(.vertical, 10)
         .background(hovering ? tint.opacity(0.88) : tint, in: Capsule())
         .contentShape(Capsule())
+    }
+}
+
+/// The gated New-recording pill for a lapsed / not-entitled user (U12). Visually
+/// distinct from the live teal `LibraryPill` — a muted outline pill with a lock
+/// glyph — so the gated state reads at a glance rather than looking like a dead
+/// button. It is NOT `.disabled`: pressing it opens the upgrade prompt (never a
+/// silent no-op), so the a11y traits stay `.isButton`. The label + hint state the
+/// subscription requirement for VoiceOver.
+struct GatedRecordingPill: View {
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("New recording")
+                    .font(SCTypography.sans(size: 13.5, weight: .semibold))
+            }
+            .foregroundStyle(Color.scInkSecondary)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(hovering ? Color.scFillSubtle : Color.clear, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.scBorderWarm, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .accessibilityLabel("New recording — subscription required")
+        .accessibilityHint("Recording needs an active subscription. Opens the upgrade options.")
     }
 }

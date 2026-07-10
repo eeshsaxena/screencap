@@ -22,6 +22,10 @@ enum RecallPalette {
             case searching
             /// Daemon unreachable — the palette's error variant.
             case daemonDown
+            /// Lapsed / not-entitled (U12) — the palette's upgrade-CTA variant.
+            /// Distinct from `daemonDown` so lapsed search reads as "upgrade to
+            /// search", never "search is broken".
+            case subscriptionRequired
             case results
             case empty
         }
@@ -46,6 +50,8 @@ enum RecallPalette {
             body = .searching
         case .daemonDown:
             body = .daemonDown
+        case .subscriptionRequired:
+            body = .subscriptionRequired
         case .loaded(let results):
             consentNeeded = results.consentNeeded
             body = results.items.isEmpty ? .empty : .results

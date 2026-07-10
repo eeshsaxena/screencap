@@ -22,6 +22,14 @@ final class SearchViewModel: ObservableObject {
         case searching
         case loaded(SearchResults)
         case daemonDown
+        /// Paid-only launch (U12): the daemon returned 402 `subscription_required`
+        /// from the recall verbs — the user is lapsed / not-entitled and the local
+        /// paywall is enforced. DISTINCT from `.daemonDown` (helper unreachable)
+        /// and per-stream `.unavailable` (a store error) so the surface reads as
+        /// "upgrade to search", not "search is broken". The five recall verbs all
+        /// gate together, so the always-attempted timeline fetch surfacing this is
+        /// authoritative for the whole search.
+        case subscriptionRequired
     }
 
     /// SCR-182 U3 — per-stream daemon fetch cap. The wire carries no `has_more`,
@@ -174,6 +182,15 @@ final class SearchViewModel: ObservableObject {
         // always-attempted timeline call means the daemon is unreachable.
         if case .down = timeline {
             phase = .daemonDown
+            return
+        }
+        // U12: the local paywall gates all five recall verbs together, so the
+        // always-attempted timeline verb returning 402 `subscription_required` is
+        // authoritative for the whole search — the user is lapsed. Surface the
+        // dedicated upgrade phase, distinct from `.daemonDown` and any per-stream
+        // `.unavailable`, before assembling partial results.
+        if case .subscriptionRequired = timeline {
+            phase = .subscriptionRequired
             return
         }
 
@@ -450,9 +467,18 @@ final class SearchViewModel: ObservableObject {
     private enum Fetched<Payload> {
         case notRun
         case down
+        /// Daemon 402 `subscription_required` (U12) — the local paywall gated this
+        /// recall verb. Told apart from `.errored` so the model can raise the
+        /// dedicated `.subscriptionRequired` phase (upgrade CTA), not the generic
+        /// per-stream `.unavailable`.
+        case subscriptionRequired
         case errored
         case ok(Payload)
     }
+
+    /// The daemon envelope code for the local-paywall gate (mirrors
+    /// `errors.py::SUBSCRIPTION_REQUIRED`). Surfaced as a 402 `envelopeError`.
+    private static let subscriptionRequiredCode = "subscription_required"
 
     private struct ContentPayload { let hits: [ContentHit]; let indexState: ContentIndexState }
 
@@ -465,6 +491,8 @@ final class SearchViewModel: ObservableObject {
             return .ok(resp.rows)
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
+        } catch DaemonClientError.envelopeError(Self.subscriptionRequiredCode, _) {
+            return .subscriptionRequired
         } catch {
             return .errored
         }
@@ -476,6 +504,8 @@ final class SearchViewModel: ObservableObject {
             return .ok(ContentPayload(hits: resp.hits, indexState: resp.indexState))
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
+        } catch DaemonClientError.envelopeError(Self.subscriptionRequiredCode, _) {
+            return .subscriptionRequired
         } catch {
             return .errored
         }
@@ -487,6 +517,8 @@ final class SearchViewModel: ObservableObject {
             return .ok(resp.hits)
         } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
             return .down
+        } catch DaemonClientError.envelopeError(Self.subscriptionRequiredCode, _) {
+            return .subscriptionRequired
         } catch {
             return .errored
         }

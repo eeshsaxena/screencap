@@ -252,6 +252,13 @@ struct DayTimelineView: View {
     /// Anchored search hits inside this day — the amber markers + the header's
     /// "N moments" count.
     private var dayMatchesMs: [Int] {
+        // U12: only `.loaded` yields markers. A lapsed user's day-scoped search
+        // resolves to `.subscriptionRequired` (recall gated) → no markers, while
+        // the day timeline itself (browse verb `timeline.day`) stays fully
+        // available. Graceful degradation of the in-day search overlay; the
+        // primary upgrade CTA lives on the Library + Recall-palette surfaces.
+        // TODO(build-verify): confirm the day-scoped search field's placeholder
+        // reads acceptably with zero markers when gated (no explicit CTA here).
         guard case .loaded(let results) = searchModel.phase else { return [] }
         return results.items.compactMap { item in
             guard let ms = item.anchorMs, ms >= dayStartMs, ms < dayEndMs else { return nil }

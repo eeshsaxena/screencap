@@ -217,6 +217,25 @@ final class CloudAuthController: ObservableObject {
     /// Sign Out is offered only when signed in AND no upload is in flight.
     var canSignOut: Bool { status.isSignedIn && !isUploadInFlight() }
 
+    /// Whether the paid-only local paywall should gate the record + recall
+    /// affordances for this user (U12). True only for a definitively lapsed /
+    /// not-entitled account while the paywall is enabled — the same state the
+    /// daemon's KTD-4 lease blocks on. Deliberately keyed on `trialState ==
+    /// .lapsed`, NOT on `tier == .none` alone: `TrialState.from` resolves an
+    /// offline-stale token to `.indeterminate` (never `.lapsed`), so an offline
+    /// payer within the daemon's lease window is never gated here (KTD-4 grace,
+    /// plan point 4). An active trial (`.active`/`.nearExpiry`/`.lastDay`) and a
+    /// converted subscriber (`.subscribed`) both read as entitled → not gated.
+    ///
+    /// UX-only, like `isSubscribed`: the daemon's soft lease gate is the real
+    /// enforcement and returns 402 `subscription_required` regardless. This just
+    /// lets the affordances render the gated appearance + upgrade prompt up front
+    /// instead of only after a round-trip. When `paywallEnabled` is off the whole
+    /// feature is dark, so this is always false (pre-billing behavior).
+    var isGatedForLapse: Bool {
+        paywallEnabled && trialState == .lapsed
+    }
+
     // MARK: - whoami refresh
 
     /// Refreshes `status` from `screencap whoami --json`. Any failure (launch

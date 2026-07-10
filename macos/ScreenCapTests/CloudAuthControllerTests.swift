@@ -722,6 +722,61 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertEqual(controller.trialState, .indeterminate)
     }
 
+    // MARK: - lapse gating (U12)
+
+    /// A definitively lapsed user (signed-in, no tier, no live trial) WITH the
+    /// paywall enabled gates the record + recall affordances.
+    func testIsGatedForLapseWhenLapsedAndPaywallOn() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.trialState, .lapsed)
+        XCTAssertTrue(controller.isGatedForLapse, "lapsed + paywall on must gate")
+    }
+
+    /// The paywall flag is the master switch: a lapsed user with the paywall OFF
+    /// (pre-billing / dark) is never gated.
+    func testNotGatedWhenPaywallOff() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.trialState, .lapsed)
+        XCTAssertFalse(controller.isGatedForLapse, "paywall off → never gate (dark)")
+    }
+
+    /// KTD-4 grace (plan point 4): an offline-stale token reads `.indeterminate`,
+    /// never `.lapsed`, so an offline payer within the daemon lease is NOT gated
+    /// even with the paywall on.
+    func testNotGatedWhenStaleEvenWithPaywallOn() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":null,"email":null,"stale":true,"paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.trialState, .indeterminate)
+        XCTAssertFalse(controller.isGatedForLapse, "an offline-stale payer must not be gated (KTD-4)")
+    }
+
+    /// An entitled user (active trial or converted subscriber) is never gated,
+    /// paywall on or off.
+    func testNotGatedWhenEntitled() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local","paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+        XCTAssertEqual(controller.tier, .localPro)
+        XCTAssertFalse(controller.isGatedForLapse, "an entitled Local Pro user must not be gated")
+
+        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","paywall_enabled":true}"#.utf8)
+        await controller.refresh()
+        XCTAssertFalse(controller.isGatedForLapse, "an entitled Cloud user must not be gated")
+    }
+
     /// Checkout passes the chosen tier to the price-selection call: Local Pro
     /// sends `"local"`, Cloud sends `"cloud"` (U11 / KTD-2 — price only).
     func testStartCheckoutPassesTier() async {

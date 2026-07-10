@@ -6,6 +6,12 @@ extension Notification.Name {
     /// main window; MainWindow observes it and opens the Recall palette
     /// (KTD-13: the ⌘⇧F shortcut itself stays window-scoped, no global tap).
     static let screenCapOpenRecallPalette = Notification.Name("com.screencap.recallPalette.open")
+
+    /// U12 — posted by the menu-bar gated "Start Recording" item (lapsed user)
+    /// after focusing/opening the main window; MainWindow observes it and opens
+    /// the upgrade prompt. Same pattern as the Search item, so the menu-bar
+    /// affordance surfaces the same upgrade sheet as the in-window controls.
+    static let screenCapOpenUpgradePrompt = Notification.Name("com.screencap.upgradePrompt.open")
 }
 
 /// Menu bar dropdown — Start Recording, Stop, account, Open ScreenCap,
@@ -37,6 +43,19 @@ struct MenuBarMenu: View {
             // .starting or .stopping — surface progress, don't offer an action
             // that would re-enter the state machine.
             Text(recorder.state.isStopping ? "Stopping…" : "Starting…")
+        } else if auth.isGatedForLapse {
+            // U12: a lapsed / not-entitled user. The Start control gates to an
+            // upgrade prompt rather than a silent no-op (or a start that the
+            // daemon would 402). Opens the main window and surfaces the same
+            // upgrade sheet as the in-window affordances. The lock glyph + label
+            // state the subscription requirement (VoiceOver reads the title).
+            Button {
+                openMainWindow()
+                NotificationCenter.default.post(name: .screenCapOpenUpgradePrompt, object: nil)
+            } label: {
+                Label("Start Recording — Subscription Required", systemImage: "lock.fill")
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
         } else {
             // U14: starts with the New-recording sheet's last-used options —
             // `audio: nil` defers to the persisted `audio_default`, which is

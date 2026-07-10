@@ -32,6 +32,19 @@ final class RecallPaletteStateTests: XCTestCase {
         )
     }
 
+    // U12 — the gated phase derives its own body variant, distinct from
+    // daemonDown, so the palette renders the upgrade CTA (not the "isn't running"
+    // error). No consent banner rides a gated result.
+    func testSubscriptionRequiredVariant() {
+        let state = RecallPalette.state(
+            phase: .subscriptionRequired, consentDeclined: false,
+            backfillState: .hidden, recents: []
+        )
+        XCTAssertEqual(state.body, .subscriptionRequired)
+        XCTAssertNotEqual(state.body, .daemonDown)
+        XCTAssertFalse(state.showsConsentBanner)
+    }
+
     func testConsentNeededShowsBannerUnlessDeclinedOrBackfillActive() {
         let phase = SearchViewModel.Phase.loaded(SearchFixtures.consentNeededResults())
         let shown = RecallPalette.state(
@@ -224,6 +237,7 @@ final class RecallPaletteStateTests: XCTestCase {
             host(.idle, recents: ["payroll"]),
             host(.searching),
             host(.daemonDown),
+            host(.subscriptionRequired),
             host(.loaded(SearchFixtures.multiDayResults())),
             host(.loaded(SearchFixtures.noMatchesResults())),
             host(.loaded(SearchFixtures.consentNeededResults())),
