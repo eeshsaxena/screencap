@@ -269,6 +269,103 @@ def test_download_and_list_never_gated_when_enforced(gcs, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# U5 — signer two-tier contract (paid-only-launch, billing plan KTD-1)
+#
+# The signer's cloud hard gate (`_subscription_refusal`) is intentionally
+# UNCHANGED under the two-tier split: it keeps signing only when `subscribed`
+# reads exactly True, and the webhook keeps writing `subscribed = (tier ==
+# "cloud")` (billing plan KTD-1). These tests are the durable regression guard
+# that the cloud gate admits ONLY a cloud token under the new two-tier claim
+# shape — a Local-Pro token (`tier=local` / `subscribed=false`) must never
+# obtain a cloud upload URL (the cross-tier escalation the split exists to
+# prevent) — while the signer prod diff stays empty. If a future edit ever lets
+# `subscribed` mean "any paid tier", or lets a `tier=local` claim through, these
+# fail loudly alongside `test_signing_contract.py`.
+# --------------------------------------------------------------------------
+
+
+def test_upload_signs_for_cloud_tier_token(gcs, monkeypatch):
+    # Enforce on + a cloud-tier token (tier=cloud => subscribed=true, exactly as
+    # the webhook writes it) -> signs as today. Cloud is the only tier the hard
+    # gate admits.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA", "tier": "cloud", "subscribed": True}):
+        status, payload = _invoke(_req(body))
+    assert status == 200
+    assert payload["urls"]["video.mp4"] and "m=PUT" in payload["urls"]["video.mp4"]
+
+
+def test_upload_refused_for_local_tier_token(gcs, monkeypatch):
+    # Cross-tier escalation guard: a Local-Pro token (tier=local, subscribed=false
+    # per the fail-closed invariant `subscribed = (tier == "cloud")`) must NEVER
+    # obtain a cloud upload URL. Enforce on -> 402, zero URLs signed, bucket
+    # untouched.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA", "tier": "local", "subscribed": False}):
+        status, payload = _invoke(_req(body))
+    assert status == 402
+    assert payload.get("code") == "subscription_required"
+    assert "urls" not in payload
+    assert gcs.blob_calls == [], "a tier=local token must not reach any signing path"
+
+
+def test_upload_refused_for_local_tier_even_if_subscribed_absent(gcs, monkeypatch):
+    # Belt-and-suspenders: even a malformed local claim that omits `subscribed`
+    # (only ever written by a broken producer) is refused — the gate reads
+    # `subscribed`, which is not positively True, so tier=local can never escalate.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA", "tier": "local"}):
+        status, payload = _invoke(_req(body))
+    assert status == 402
+    assert gcs.blob_calls == []
+
+
+def test_upload_refused_for_no_tier_token(gcs, monkeypatch):
+    # A none/lapsed token (no tier, no subscribed) still hits the existing
+    # fail-closed refusal — the two-tier shape does not weaken the base gate.
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    body = {"recording": "rec1", "files": [{"name": "video.mp4"}]}
+    with _auth(uid="userA", claims={"uid": "userA"}):
+        status, _ = _invoke(_req(body))
+    assert status == 402
+    assert gcs.blob_calls == []
+
+
+def test_subscription_refusal_admits_only_cloud_under_two_tier_shape(monkeypatch):
+    # Direct unit assertion on the gate itself: under enforce, ONLY subscribed=True
+    # (which the webhook writes iff tier==cloud) is admitted; every non-cloud tier
+    # shape is refused. `subscribed` remains the single field the gate reads — the
+    # additive `tier` claim never widens it (billing plan KTD-1).
+    monkeypatch.setenv("STRIPE_PAYWALL_ENFORCE", "1")
+    # Cloud tier as the webhook writes it -> admitted.
+    assert main._subscription_refusal({"tier": "cloud", "subscribed": True}) is None
+    # Local tier (and any future non-cloud tier) -> refused.
+    assert main._subscription_refusal({"tier": "local", "subscribed": False}) is not None
+    assert main._subscription_refusal({"tier": "local"}) is not None
+    assert main._subscription_refusal({"tier": "free_capped", "subscribed": False}) is not None
+    # A tier=cloud claim WITHOUT subscribed=True must not slip through — the gate
+    # never trusts `tier` in place of the derived `subscribed` field.
+    assert main._subscription_refusal({"tier": "cloud"}) is not None
+
+
+def test_tokenless_boundary_contract_holds_under_two_tier(gcs):
+    """The tokenless-boundary contract is unchanged by the two-tier split: an
+    unauthenticated request to any gated action (upload included) still 401s and
+    reaches no GCS call — no unsigned/tokenless request ever reaches a `users/`
+    signing path, regardless of the claim shape. This re-asserts the durable
+    signing-contract invariant alongside the new tier cases above."""
+    for body in GATED_BODIES:
+        with _auth(exc=AuthInvalid("no token")):
+            status, _ = _invoke(_req(body))
+        assert status == 401, body
+    assert gcs.list_calls == [], "tokenless request reached list_blobs"
+    assert gcs.blob_calls == [], "tokenless request reached bucket.blob"
+
+
+# --------------------------------------------------------------------------
 # R6 / R2 — auth gate on every handler
 # --------------------------------------------------------------------------
 
