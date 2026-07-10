@@ -227,6 +227,89 @@ async def recording_list(request: Request) -> JSONResponse:
     )
 
 
+def _apply_whoami_to_lease(info: dict[str, Any]) -> None:
+    """Reconcile the KTD-4 entitlement lease against a ``whoami`` result (U14).
+
+    Thin adapter onto ``entitlement_lease.reconcile_from_whoami`` — the single
+    write policy shared by the regular ``auth.whoami`` touchpoint, the
+    ``entitlement.refresh`` re-mint verb, and the CLI post-checkout path — so the
+    daemon and CLI can never drift on when the lease is written/cleared/preserved.
+    """
+    from screencap.daemon import entitlement_lease
+
+    entitlement_lease.reconcile_from_whoami(info)
+
+
+async def _enforce_recording_subscription_gate() -> None:
+    """U8: block ``recording.start`` unless an active tier entitles it (KTD-4).
+
+    No-op unless ``SCREENCAP_LOCAL_PAYWALL_ENFORCE`` is on, so the default path is
+    byte-identical to today. When on:
+
+    1. If the KTD-4 lease grants an unexpired paid tier, allow — an offline PAYER
+       within the 72h window is never locked out (R8), and no network call is made.
+    2. Else attempt ONE fresh ``auth.whoami()`` + :func:`_apply_whoami_to_lease` to
+       refresh the lease from current state (an online payer whose lease just
+       expired self-heals here; a definitive not-entitled clears; an ambiguous
+       stale/offline whoami preserves the lease), then re-read.
+    3. If still not entitled, raise :class:`SubscriptionRequiredError` (no spawn).
+
+    Unlike the recall gate this DOES a single whoami on a lease miss — the
+    start path is infrequent (once per recording), so a fresh refresh at the
+    chokepoint is worth un-gating a just-lapsed-but-now-renewed payer without a
+    ~1h wait. A ``whoami`` that raises is swallowed (best-effort): the pre-fetch
+    lease read is the source of truth and the gate falls through to it.
+    """
+    from screencap.config import get_local_paywall_enforced
+    from screencap.daemon import entitlement_lease
+
+    if not get_local_paywall_enforced():
+        return
+
+    if entitlement_lease.lease_entitled_tier() is not None:
+        return
+
+    # Lease miss: refresh from current whoami state once, then re-read.
+    from screencap import auth
+
+    try:
+        info = await asyncio.to_thread(auth.whoami)
+    except Exception:  # noqa: BLE001 — whoami is built not to raise; degrade to lease
+        logger.warning("recording.start subscription gate: whoami failed", exc_info=True)
+    else:
+        _apply_whoami_to_lease(info)
+
+    if entitlement_lease.lease_entitled_tier() is None:
+        raise errors.SubscriptionRequiredError(
+            schema_version=schema._RECORDING_START_API_VERSION,
+        )
+
+
+def _check_subscription_for_recall(*, schema_version: int) -> None:
+    """U9: block a recall/search verb unless an unexpired entitled lease grants it.
+
+    No-op unless ``SCREENCAP_LOCAL_PAYWALL_ENFORCE`` is on (default path unchanged).
+    When on, reads the KTD-4 lease ONLY — deliberately NO per-search ``whoami``
+    network call: the lease is kept fresh by the ``auth.whoami`` verb's reconcile and
+    by U8's recording-start path, so a per-search refresh would be too chatty for a
+    surface hit on every keystroke of autocomplete. Raises
+    :class:`SubscriptionRequiredError` when the lease is invalid / expired / cleared;
+    an offline PAYER within the lease window still passes (R8).
+
+    Called at the top of the five recall handlers (``content.search`` /
+    ``transcript.search`` / ``timeline.query`` / ``frame.nearest`` / ``apps.list``);
+    the browse verbs (``recording.list`` / ``timeline.day`` / ``tasks.list`` /
+    ``auth.whoami``) never call it.
+    """
+    from screencap.config import get_local_paywall_enforced
+    from screencap.daemon import entitlement_lease
+
+    if not get_local_paywall_enforced():
+        return
+    if entitlement_lease.lease_entitled_tier() is None:
+        raise errors.SubscriptionRequiredError(schema_version=schema_version)
+
+
 async def auth_whoami(request: Request) -> JSONResponse:
     """SCR-148: report the cloud account currently signed in on this daemon.
 
@@ -238,6 +321,11 @@ async def auth_whoami(request: Request) -> JSONResponse:
     Fails OPEN to ``signed_in=false`` (never a 500): ``auth.whoami`` is built
     not to raise, but an unexpected Keychain error must degrade like every other
     read verb rather than drop a polling client to its error path.
+
+    Side effect (U14): refreshes the KTD-4 entitlement lease from the result
+    (:func:`_apply_whoami_to_lease`). This is the daemon's *regular* lease-refresh
+    cadence — a poll whose internal ``_ensure_fresh`` re-mints the ID token re-arms
+    offline grace for the U8/U9 gates.
     """
     from screencap import auth
 
@@ -246,6 +334,7 @@ async def auth_whoami(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 — a read verb must never 500
         logger.warning("auth.whoami probe failed", exc_info=True)
         info = {"signed_in": False}
+    _apply_whoami_to_lease(info)
     return JSONResponse(
         schema.envelope(
             schema_version=schema._AUTH_WHOAMI_API_VERSION,
@@ -253,6 +342,63 @@ async def auth_whoami(request: Request) -> JSONResponse:
             uid=info.get("uid"),
             email=info.get("email"),
             stale=info.get("stale", False),
+            # U6: forward the two-tier entitlement + trial state (the handler
+            # previously dropped all three) so the Swift picker (U11) reads the
+            # real tier instead of a defaulted one. ``subscribed`` stays the
+            # derived cloud signal; ``tier``/``trial_end`` default to None.
+            subscribed=bool(info.get("subscribed")),
+            tier=info.get("tier"),
+            trial_end=info.get("trial_end"),
+        )
+    )
+
+
+async def entitlement_refresh(request: Request) -> JSONResponse:
+    """U14: force an ID-token re-mint in the daemon's own context, then re-arm the lease.
+
+    The post-checkout signal. A just-converted user's ``tier`` claim only
+    re-materializes on a token refresh (~1h buffer), so the app calls this after
+    returning from Stripe to un-gate the local recording/recall gates (U8/U9)
+    promptly rather than waiting out the buffer. Forces
+    ``auth.get_id_token(force_refresh=True)`` — the daemon holds the refresh token,
+    so it CAN re-mint (the engine subprocess, which does not, cannot) — then reads
+    ``whoami`` and reconciles the KTD-4 lease (:func:`_apply_whoami_to_lease`): a
+    now-entitled tier writes/refreshes the lease immediately; a confirmed
+    not-entitled clears it; an ambiguous (stale/offline) result preserves it.
+
+    Re-mint happens ONLY on this explicit signal (and the regular ``whoami``
+    cadence) — there is no spurious loop that would re-mint on its own. Fails OPEN
+    to ``signed_in=false`` (never a 500), mirroring ``auth.whoami``; the lease is
+    left untouched on a hard failure so an offline payer is never locked out.
+    """
+    from screencap import auth
+
+    def _force_refresh_whoami() -> dict[str, Any]:
+        # Best-effort re-mint, then read the freshly-materialized state. A refresh
+        # failure is not fatal — whoami() reports ``stale`` rather than raising, and
+        # the lease reconcile then preserves the current lease.
+        try:
+            auth.get_id_token(force_refresh=True)
+        except Exception:  # noqa: BLE001 — offline / not-signed-in: fall through to whoami
+            logger.debug("entitlement.refresh: force re-mint failed", exc_info=True)
+        return dict(auth.whoami())
+
+    try:
+        info = await asyncio.to_thread(_force_refresh_whoami)
+    except Exception:  # noqa: BLE001 — a control verb must never 500
+        logger.warning("entitlement.refresh probe failed", exc_info=True)
+        info = {"signed_in": False}
+    _apply_whoami_to_lease(info)
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema._ENTITLEMENT_REFRESH_API_VERSION,
+            signed_in=bool(info.get("signed_in")),
+            uid=info.get("uid"),
+            email=info.get("email"),
+            stale=info.get("stale", False),
+            subscribed=bool(info.get("subscribed")),
+            tier=info.get("tier"),
+            trial_end=info.get("trial_end"),
         )
     )
 
@@ -469,6 +615,13 @@ async def recording_start(request: Request) -> JSONResponse:
                 missing,
                 schema_version=schema._RECORDING_START_API_VERSION,
             )
+
+        # Local paywall gate (U8, KTD-4). Only when SCREENCAP_LOCAL_PAYWALL_ENFORCE
+        # is on — otherwise a no-op, byte-identical to today. Raised BEFORE the
+        # spawn (typed-error-before-spawn, like the permission gate) so a refused
+        # start never spawns an engine worker. This one daemon chokepoint covers
+        # CLI, MCP, and the app (all POST /v0/recording.start).
+        await _enforce_recording_subscription_gate()
 
         result = await request.app.state.supervisor.spawn(parsed)
         # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what
@@ -844,6 +997,9 @@ async def content_search(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._CONTENT_SEARCH_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1253,6 +1409,7 @@ async def apps_list(request: Request) -> JSONResponse:
     same-EUID caller can read from disk directly).
     """
     try:
+        _check_subscription_for_recall(schema_version=schema._APPS_LIST_API_VERSION)
         result = await asyncio.to_thread(_run_apps_list)
         return JSONResponse(
             schema.envelope(
@@ -1278,6 +1435,9 @@ async def transcript_search(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1310,6 +1470,9 @@ async def timeline_query(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._TIMELINE_QUERY_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1397,6 +1560,9 @@ async def frame_nearest(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._FRAME_NEAREST_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -2010,6 +2176,7 @@ def build_app() -> Starlette:
             Route("/v0/daemon.info", daemon_info, methods=["GET"]),
             Route("/v0/recording.list", recording_list, methods=["GET"]),
             Route("/v0/auth.whoami", auth_whoami, methods=["GET"]),
+            Route("/v0/entitlement.refresh", entitlement_refresh, methods=["POST"]),
             Route("/v0/session.snapshot", session_snapshot, methods=["GET"]),
             Route("/v0/events", events_stream, methods=["GET"]),
             Route("/v0/recording.start", recording_start, methods=["POST"]),

@@ -10,6 +10,7 @@ import SwiftUI
 // per the design but disabled with their ticket tooltips (KTD-8).
 struct NewRecordingSheet: View {
     @EnvironmentObject private var recorder: RecorderController
+    @EnvironmentObject private var auth: CloudAuthController
     @Binding var isPresented: Bool
 
     @StateObject private var meter = MicLevelMeter()
@@ -216,6 +217,16 @@ struct NewRecordingSheet: View {
     }
 
     private func startTapped() {
+        // U12: a lapsed / not-entitled user reaching Start (e.g. the trial
+        // expired while this sheet was open) routes to the upgrade prompt instead
+        // of a start the daemon would 402. Close this sheet first, then surface
+        // the shared upgrade prompt — never a silent no-op. Checked before the
+        // permission gate so the subscription requirement is the leading message.
+        if auth.isGatedForLapse {
+            close()
+            NotificationCenter.default.post(name: .screenCapOpenUpgradePrompt, object: nil)
+            return
+        }
         // Pre-spawn permission gate renders inline (KTD-8) rather than popping a
         // modal over the sheet. Only call start() once the gate passes.
         if let reason = recorder.newRecordingBlockReason() {

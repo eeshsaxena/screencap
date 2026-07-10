@@ -174,14 +174,30 @@ enum OnboardingStepPolicy {
 
     /// The step after the storage CTA: local continues to the SCR-239
     /// download-model offer, cloud tiers continue to the account step.
-    static func stepAfterStorage(tier: OnboardingStorageTier) -> OnboardingStep? {
-        tier == .local ? .downloadModel : .account
+    static func stepAfterStorage(
+        tier: OnboardingStorageTier, paywallEnabled: Bool = false
+    ) -> OnboardingStep? {
+        // Under the paid-only launch the `.local` tier is the paid "Local Pro"
+        // plan, so with the paywall on it must route through the account/checkout
+        // step like the cloud tiers (the account step maps `.local -> .localPro`).
+        // Default `paywallEnabled: false` preserves the pre-paywall routing
+        // (local -> on-device model step) and the pinned routing/dot tests.
+        if tier == .local {
+            return paywallEnabled ? .account : .downloadModel
+        }
+        return .account
     }
 
-    /// The step after a successful sign-in: team continues to team setup,
-    /// personal finishes.
-    static func stepAfterAccount(tier: OnboardingStorageTier) -> OnboardingStep? {
-        tier == .teamCloud ? .teamSetup : nil
+    /// The step after a successful sign-in: team continues to team setup;
+    /// paid Local Pro continues to the on-device model step; personal finishes.
+    static func stepAfterAccount(
+        tier: OnboardingStorageTier, paywallEnabled: Bool = false
+    ) -> OnboardingStep? {
+        if tier == .teamCloud { return .teamSetup }
+        // With the paywall on, Local Pro reaches the account step for checkout,
+        // then continues to the on-device model step it would otherwise skip to.
+        if tier == .local && paywallEnabled { return .downloadModel }
+        return nil
     }
 
     static func storageCTATitle(tier: OnboardingStorageTier) -> String {
@@ -191,6 +207,28 @@ enum OnboardingStepPolicy {
         case .teamCloud: return "Continue — set up your team"
         }
     }
+}
+
+/// The single source of paid-tier prices (KTD-7). Every priced surface — the
+/// picker cards, the upgrade panel, the trial disclosure — composes its copy
+/// from here, so tuning a price (R10) is a one-line change, never a hunt for
+/// duplicated `$`-literals. Indicative launch numbers (Local Pro ~$8, Cloud
+/// ~$15) are placeholders to finalize before launch; the Stripe price is the
+/// billed truth (these strings are display only).
+///
+/// TODO(build-verify): once the server can surface the live price (via `whoami`
+/// or a config read, per U11's "source prices from config/whoami"), swap these
+/// static strings for that read so the displayed price can't drift from the
+/// Stripe price without a rebuild. Static constants are the interim single
+/// source until that wiring lands.
+enum PricingCatalog {
+    /// Indicative Local Pro monthly price (R10 placeholder).
+    static let localProMonthly = "$8"
+    /// Indicative Cloud monthly price (R10 placeholder), above Local Pro (R3).
+    static let cloudMonthly = "$15"
+
+    static var localProPriceLine: String { "\(localProMonthly)/month" }
+    static var cloudPriceLine: String { "\(cloudMonthly)/month" }
 }
 
 /// Honesty-gated copy (KTD-9 / R7): no pricing, billing, encryption, or
@@ -257,6 +295,79 @@ enum OnboardingCopy {
         "Cross-Mac backup is on the way",
     ]
 
+    // MARK: - Paid-only launch two-tier picker (U11 / KTD-7)
+    //
+    // The paid-only launch replaces the single "$5/month" Personal-cloud card
+    // with two priced tiers — Local Pro and Cloud — each fronted by a free
+    // trial. Prices come from ONE place per tier (`PricingCatalog`, below): the
+    // card meta, the upgrade panel, and the trial disclosure all compose from
+    // the same string, so tuning a price (R10) touches a single constant.
+    //
+    // Honesty (R12): the Cloud card is truthful that storage is server-readable
+    // and no card claims end-to-end encryption. The trial's auto-conversion and
+    // cancellation path are disclosed before any charge (`trialDisclosure`).
+
+    static let localProCardTitle = "Local Pro"
+    /// Priced card meta, sourced from `PricingCatalog` (single source, KTD-7).
+    static var localProCardMeta: String { "\(PricingCatalog.localProPriceLine) · free trial" }
+    static let localProCardBullets = [
+        "Unlimited recording on this Mac",
+        "Full local search, timeline, and replay",
+        "MCP-connected agents can search your recordings",
+        "Nothing leaves this Mac",
+    ]
+
+    static let cloudCardTitle = "Cloud"
+    static var cloudCardMeta: String { "\(PricingCatalog.cloudPriceLine) · free trial" }
+    static let cloudCardBullets = [
+        "Everything in Local Pro",
+        "Upload and sync the recordings you approve",
+        "Cloud-powered AI and cross-Mac access",
+        // R12 — truthful about server-readable storage; NO E2EE / "we can't
+        // watch" claim on the paid cloud path.
+        "Uploaded recordings are stored on our servers",
+    ]
+
+    /// R12 — the pre-charge disclosure both cards carry: the trial takes a card,
+    /// auto-converts, and can be cancelled before any charge. Length is a
+    /// placeholder pending the finalized `TRIAL_PERIOD_DAYS` (U1).
+    static let trialDisclosure =
+        "Your free trial requires a card and converts to a paid subscription "
+        + "when it ends. Cancel anytime before then and you won't be charged."
+
+    /// The upsell shown on the Cloud card when the user already holds Local Pro
+    /// (F3 upgrade path): the card becomes "add cloud", not a fresh chooser.
+    static let cloudUpgradeCardMeta = "Upgrade — add cloud"
+    static let cloudUpgradeBadge = "Upgrade"
+
+    /// Gated re-subscribe surface copy for a lapsed / never-entitled re-entry
+    /// (KTD-4 / R7): not a fresh trial chooser, but a "resume your subscription"
+    /// framing. The reassurance line states data is retained (R8).
+    static let lapsedHeadline = "Your subscription has lapsed."
+    static let lapsedSub =
+        "Recording and search are paused. Your recordings are safe on this Mac — "
+        + "browse and export them anytime. Resubscribe to record and search again."
+
+    /// The on-screen trial banner text for each lifecycle state (U11). Pure copy
+    /// (string-assertable in `OnboardingStepPolicyTests` without a render tree);
+    /// the escalation (calm → urgent) is expressed by the words, and the color is
+    /// chosen at the view. `.indeterminate` / `.subscribed` show no banner (nil).
+    /// Every trial banner discloses the auto-conversion (R12).
+    static func trialBanner(for state: TrialState) -> String? {
+        switch state {
+        case .active(let days):
+            return "\(days) days left in your free trial. It converts to a paid subscription unless you cancel."
+        case .nearExpiry(let days):
+            return "Only \(days) day\(days == 1 ? "" : "s") left in your free trial — it converts to a paid subscription unless you cancel first."
+        case .lastDay(let hours):
+            return hours <= 1
+                ? "Your free trial ends within the hour. It converts to a paid subscription unless you cancel now."
+                : "Your free trial ends in \(hours) hours. It converts to a paid subscription unless you cancel first."
+        case .indeterminate, .subscribed, .lapsed:
+            return nil
+        }
+    }
+
     static let teamCardTitle = "Team cloud"
     static let teamCardMeta = "you + your team"
     static let teamCardBullets = [
@@ -308,8 +419,10 @@ enum OnboardingCopy {
         + "in Settings → Intelligence."
     static let downloadModelSkip = "Not now"
 
-    /// Every string the storage + account steps render, for the KTD-9
-    /// string-level gate (no pricing, encryption, or team-sharing claims).
+    /// Every string the storage + account steps render, for the KTD-9 / R12
+    /// string-level gate (no E2EE / "we can't watch" claims). Includes the
+    /// paid-launch two-tier cards, the trial disclosure, and the lapsed surface
+    /// so the honesty assertion covers the new copy too.
     static var storageAndAccountStrings: [String] {
         [
             storageHeadline, storageSub, storageFootnote,
@@ -317,10 +430,16 @@ enum OnboardingCopy {
             personalCardTitle, personalCardMeta, personalCardMetaFree,
             teamCardTitle, teamCardMeta,
             accountHeadline, accountSub,
+            // Paid-only launch (U11): the two priced cards + trial + lapsed copy.
+            localProCardTitle, localProCardMeta,
+            cloudCardTitle, cloudCardMeta,
+            cloudUpgradeCardMeta, cloudUpgradeBadge,
+            trialDisclosure, lapsedHeadline, lapsedSub,
             OnboardingStepPolicy.storageCTATitle(tier: .local),
             OnboardingStepPolicy.storageCTATitle(tier: .personalCloud),
             OnboardingStepPolicy.storageCTATitle(tier: .teamCloud),
         ]
         + localCardBullets + personalCardBullets + teamCardBullets
+        + localProCardBullets + cloudCardBullets
     }
 }

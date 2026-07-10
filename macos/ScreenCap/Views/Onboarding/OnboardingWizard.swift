@@ -238,7 +238,13 @@ struct OnboardingWizard: View {
     }
 
     private func storageContinue() {
-        if let next = OnboardingStepPolicy.stepAfterStorage(tier: tier) {
+        // Under the paid-only launch, `.local` is the paid "Local Pro" tier, so
+        // when the paywall is on it routes through the account/checkout step
+        // (which maps `.local -> .localPro` checkout) before finishing. With the
+        // paywall off it keeps the pre-paywall routing (straight to the model step).
+        if let next = OnboardingStepPolicy.stepAfterStorage(
+            tier: tier, paywallEnabled: auth.paywallEnabled
+        ) {
             step = next
             return
         }
@@ -257,7 +263,9 @@ struct OnboardingWizard: View {
     }
 
     private func accountSignedIn() {
-        if let next = OnboardingStepPolicy.stepAfterAccount(tier: tier) {
+        if let next = OnboardingStepPolicy.stepAfterAccount(
+            tier: tier, paywallEnabled: auth.paywallEnabled
+        ) {
             step = next
         } else {
             complete()

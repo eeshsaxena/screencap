@@ -102,6 +102,7 @@ struct MainWindow: View {
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var privacy: PrivacyController
+    @EnvironmentObject private var auth: CloudAuthController
 
     /// U11: how the onboarding wizard is being shown, when it is. `.firstRun`
     /// persists progress/completion; `.replay` (sidebar "Replay onboarding")
@@ -129,6 +130,10 @@ struct MainWindow: View {
     /// from the Library header. Kept here (not in LibraryView) so it layers over
     /// the whole shell like the prototype's z-41 overlay.
     @State private var showingNewRecording = false
+    /// U12: the upgrade prompt — an in-window overlay presented when a lapsed
+    /// user taps a gated record/search affordance (mirrors the New-recording
+    /// overlay layering). Kept here so it layers over the whole shell.
+    @State private var showingUpgradePrompt = false
     /// U10: the Recall palette — an in-window overlay (KTD-4) opened by the
     /// window-scoped ⌘⇧F (KTD-13), the Library/Journal search pills, and the
     /// menu-bar "Search…" item (via notification).
@@ -271,6 +276,12 @@ struct MainWindow: View {
                 NewRecordingSheet(isPresented: $showingNewRecording)
             }
         }
+        .sheet(isPresented: $showingUpgradePrompt) {
+            // U12: the lapse upgrade prompt. A native sheet (mirroring
+            // SignInPromptView's presentation) shared by every gated
+            // record/search affordance across the shell.
+            UpgradePromptView(auth: auth, onDismiss: { showingUpgradePrompt = false })
+        }
         .overlay {
             // U10: the Recall palette overlay (the prototype's z-40/41 scrim +
             // panel). ↵ on a hit routes to the Day timeline at that moment.
@@ -292,6 +303,11 @@ struct MainWindow: View {
         )
         .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenRecallPalette)) { _ in
             showingPalette = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenUpgradePrompt)) { _ in
+            // U12: the menu-bar gated Start item routed here after focusing the
+            // window — open the shared upgrade prompt.
+            showingUpgradePrompt = true
         }
     }
 
@@ -462,6 +478,7 @@ struct MainWindow: View {
             // on the Day timeline seeked to the recording (U9).
             LibraryView(
                 onNewRecording: presentNewRecording,
+                onUpgradePrompt: { showingUpgradePrompt = true },
                 onOpenSearch: { showingPalette = true },
                 onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
             )

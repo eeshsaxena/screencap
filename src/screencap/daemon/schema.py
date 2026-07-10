@@ -31,6 +31,10 @@ _FRAME_NEAREST_API_VERSION = 1
 _APPS_LIST_API_VERSION = 1
 # SCR-148 cloud account-mismatch observability.
 _AUTH_WHOAMI_API_VERSION = 1
+# U14 (paid-only launch): the post-checkout entitlement re-mint verb. Additive
+# (new verb) — no global API_SCHEMA_VERSION bump (mirrors the frame.nearest /
+# apps.list / tasks.list additive precedent).
+_ENTITLEMENT_REFRESH_API_VERSION = 1
 # SCR-178 content-index backfill lifecycle verbs.
 _BACKFILL_API_VERSION = 1
 # U10 (local-first intelligence) read verb: the named-task segments a LOCAL
@@ -514,6 +518,14 @@ def _load_models() -> dict[str, Any]:
         # Cloud-paywall entitlement (display/UX only; the signer's hard gate is
         # the real enforcement). Additive, defaulted, backward-compatible.
         subscribed: bool = False
+        # Two-tier entitlement (U6, KTD-1): the open ``tier`` claim
+        # (``"local"`` | ``"cloud"`` | None) the Swift picker (U11) reads to tell
+        # local from cloud, and the trial's ``trial_end`` (epoch seconds) for the
+        # "days left" UI. Both additive/defaulted/backward-compatible; ``tier``
+        # is None whenever no paid tier is positively resolved OR when offline
+        # (the ``stale`` flag disambiguates, never tier presence).
+        tier: str | None = None
+        trial_end: int | None = None
 
     class BackfillStartRequest(_DaemonModel):
         """SCR-178 ``backfill.start`` input.
@@ -817,6 +829,7 @@ __all__ = [
     "_FRAME_NEAREST_API_VERSION",
     "_APPS_LIST_API_VERSION",
     "_AUTH_WHOAMI_API_VERSION",
+    "_ENTITLEMENT_REFRESH_API_VERSION",
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
     "_MODELS_API_VERSION",

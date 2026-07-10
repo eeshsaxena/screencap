@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Comp (or un-comp) an account's cloud entitlement — Stripe-independent (U12 / R12).
+"""Comp (or un-comp) an account's entitlement tier — Stripe-independent (U12 / U4).
 
-Sets or clears the ``subscribed`` Firebase custom claim DIRECTLY via the Admin
-SDK, so internal / demo / press accounts get cloud access WITHOUT going through
-Stripe Checkout or the webhook. Run it for your own + demo accounts BEFORE
-flipping ``STRIPE_PAYWALL_ENFORCE`` on, so the team is never locked out mid-launch
-even if the Stripe wiring is not yet green. This is the launch-day seatbelt; an
-external-comp coupon is a separate, later concern.
+Sets or clears the two-tier ``{tier, subscribed}`` Firebase custom claim DIRECTLY
+via the Admin SDK, so internal / demo / press accounts get access WITHOUT going
+through Stripe Checkout or the webhook. ``subscribed`` is always written as a pure
+function of ``tier`` (``subscribed = (tier == "cloud")``, KTD-1), so a comp can
+never drift into ``subscribed=true`` with a non-cloud tier. Run it for your own +
+demo accounts BEFORE flipping ``STRIPE_PAYWALL_ENFORCE`` on, so the team is never
+locked out mid-launch even if the Stripe wiring is not yet green.
 
 Usage:
-    # Grant (default):
+    # Grant cloud (default):
     python scripts/set_entitlement.py --uid <UID>
     python scripts/set_entitlement.py --email <EMAIL>
+    # Grant Local Pro:
+    python scripts/set_entitlement.py --email <EMAIL> --tier local
     # Revoke:
     python scripts/set_entitlement.py --email <EMAIL> --revoke
+    # One-off grandfather backfill (legacy subscribed=true -> tier=cloud, KTD-6;
+    # idempotent + re-runnable):
+    python scripts/set_entitlement.py --backfill-grandfathered
 
 Requires Firebase Admin credentials for the target project
 (``GOOGLE_APPLICATION_CREDENTIALS`` or ADC). Never routes through Stripe.
@@ -29,37 +35,77 @@ import firebase_admin
 from firebase_admin import auth as fb_auth
 
 
-def set_entitlement(
-    identifier: str, *, is_email: bool, subscribed: bool, project_id: str
-) -> str:
-    """Set/clear ``subscribed`` for a uid or email; return the resolved uid.
-
-    Merges with any existing custom claims so unrelated claims are preserved.
-    """
+def _ensure_app(project_id: str) -> None:
     if not firebase_admin._apps:
         firebase_admin.initialize_app(options={"projectId": project_id})
+
+
+def set_entitlement(
+    identifier: str, *, is_email: bool, tier: str | None, project_id: str
+) -> str:
+    """Set/clear the two-tier entitlement claim for a uid or email; return uid.
+
+    Writes ``{tier, subscribed = (tier == "cloud")}`` (KTD-1) so ``subscribed``
+    is always a pure function of ``tier`` and can never drift. A ``tier`` of
+    ``None`` is the revoke/clear state (``tier="none"``, ``subscribed=false``).
+    Merges with any existing custom claims so unrelated claims are preserved.
+    """
+    _ensure_app(project_id)
     user = (
         fb_auth.get_user_by_email(identifier)
         if is_email
         else fb_auth.get_user(identifier)
     )
+    resolved = tier or "none"
     claims = dict(user.custom_claims or {})
-    claims["subscribed"] = bool(subscribed)
+    claims["tier"] = resolved
+    claims["subscribed"] = resolved == "cloud"
     fb_auth.set_custom_user_claims(user.uid, claims)
     return user.uid
 
 
+def backfill_grandfathered(*, project_id: str) -> list[str]:
+    """Migrate legacy ``subscribed=true`` accounts to ``tier=cloud`` (KTD-6).
+
+    Idempotent + re-runnable: only accounts carrying ``subscribed=true`` but no
+    ``tier`` are written (an already-migrated account carrying ``tier=cloud`` is
+    skipped), so a partial run can be safely re-run. Preserves other claims.
+    Returns the list of uids migrated this pass.
+    """
+    _ensure_app(project_id)
+    migrated: list[str] = []
+    for user in fb_auth.list_users().users:
+        claims = dict(user.custom_claims or {})
+        if claims.get("subscribed") and not claims.get("tier"):
+            claims["tier"] = "cloud"
+            fb_auth.set_custom_user_claims(user.uid, claims)
+            migrated.append(user.uid)
+    return migrated
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Comp/un-comp an account's cloud entitlement (Stripe-independent)."
+        description="Comp/un-comp an account's entitlement tier (Stripe-independent)."
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--uid", help="Firebase uid to comp.")
-    target.add_argument("--email", help="Account email to comp.")
+    # Target is required for the per-account grant/revoke path but not for the
+    # one-off --backfill-grandfathered sweep (validated below).
+    parser.add_argument("--uid", help="Firebase uid to comp.")
+    parser.add_argument("--email", help="Account email to comp.")
+    parser.add_argument(
+        "--tier",
+        choices=("local", "cloud"),
+        default="cloud",
+        help="Entitlement tier to grant (default: cloud). Ignored with --revoke.",
+    )
     parser.add_argument(
         "--revoke",
         action="store_true",
-        help="Clear the subscription entitlement (default: grant).",
+        help="Clear the entitlement (tier=none, subscribed=false).",
+    )
+    parser.add_argument(
+        "--backfill-grandfathered",
+        action="store_true",
+        help="One-off: set tier=cloud for all legacy subscribed=true accounts.",
     )
     parser.add_argument(
         "--project",
@@ -68,15 +114,28 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.backfill_grandfathered:
+        migrated = backfill_grandfathered(project_id=args.project)
+        print(f"Grandfather backfill: migrated {len(migrated)} account(s) to tier=cloud")
+        return 0
+
+    if args.uid and args.email:
+        parser.error("argument --email: not allowed with argument --uid")
+    if not (args.uid or args.email):
+        parser.error("one of the arguments --uid --email --backfill-grandfathered is required")
+
+    tier = None if args.revoke else args.tier
     identifier = args.email or args.uid
     uid = set_entitlement(
         identifier,
         is_email=bool(args.email),
-        subscribed=not args.revoke,
+        tier=tier,
         project_id=args.project,
     )
-    action = "Revoked" if args.revoke else "Granted"
-    print(f"{action} cloud entitlement (subscribed={not args.revoke}) for uid={uid}")
+    if args.revoke:
+        print(f"Revoked entitlement (tier=none, subscribed=false) for uid={uid}")
+    else:
+        print(f"Granted tier={tier} (subscribed={tier == 'cloud'}) for uid={uid}")
     return 0
 
 

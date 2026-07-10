@@ -76,7 +76,8 @@ struct RecallPaletteView: View {
                 onResumeBackfill: model.resumeBackfill,
                 onRunChip: runChipQuery,
                 onOpen: jump,
-                onRetry: { runner?.search(query, debounced: false) }
+                onRetry: { runner?.search(query, debounced: false) },
+                onUpgrade: upgrade
             )
             footer
         }
@@ -194,6 +195,15 @@ struct RecallPaletteView: View {
         isPresented = false
     }
 
+    /// U12: the subscription-required CTA — close the palette, then surface the
+    /// shared upgrade prompt (MainWindow observes the notification). The palette
+    /// overlays the shell, so dismissing it first prevents the sheet from
+    /// presenting under the scrim.
+    private func upgrade() {
+        dismiss()
+        NotificationCenter.default.post(name: .screenCapOpenUpgradePrompt, object: nil)
+    }
+
     // MARK: - Settings + consent (inherited from the retired SearchView, palette-scoped)
 
     private func loadSettings() async {
@@ -270,6 +280,8 @@ struct RecallPaletteContent: View {
     var onOpen: (SearchResultItem) -> Void = { _ in }
     /// Re-run the current query — the daemon-down state's retry affordance.
     var onRetry: () -> Void = {}
+    /// Open the upgrade prompt — the subscription-required state's CTA (U12).
+    var onUpgrade: () -> Void = {}
 
     private var state: RecallPalette.State {
         RecallPalette.state(
@@ -307,6 +319,18 @@ struct RecallPaletteContent: View {
                 title: "ScreenCap isn't running",
                 note: "Start ScreenCap's background helper to search your history.",
                 retry: onRetry
+            )
+        case .subscriptionRequired:
+            // U12: lapsed / not-entitled. An upgrade CTA — NOT the error/retry
+            // treatment — so search reads as "upgrade to search", not broken. The
+            // reassurance mirrors the Library banner: existing recordings stay
+            // browsable + exportable on this Mac.
+            message(
+                icon: "lock.circle",
+                title: "Subscribe to search",
+                note: "Search needs an active subscription. Your recordings are safe on this Mac — you can still browse and export them.",
+                actionTitle: "Subscribe",
+                action: onUpgrade
             )
         case .empty:
             message(
@@ -463,7 +487,9 @@ struct RecallPaletteContent: View {
         icon: String,
         title: String,
         note: String,
-        retry: (() -> Void)? = nil
+        retry: (() -> Void)? = nil,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
     ) -> some View {
         VStack(spacing: 8) {
             Image(systemName: icon)
@@ -481,6 +507,16 @@ struct RecallPaletteContent: View {
             if let retry {
                 Button("Retry") { retry() }
                     .padding(.top, 4)
+            }
+            // U12: a labeled call-to-action (e.g. "Subscribe" for the
+            // subscription-required state) — prominent so it reads as the way
+            // forward, not an error acknowledgement.
+            if let actionTitle, let action {
+                Button(actionTitle) { action() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.scTeal)
+                    .padding(.top, 4)
+                    .accessibilityHint("Opens the upgrade options.")
             }
         }
         .frame(maxWidth: .infinity)

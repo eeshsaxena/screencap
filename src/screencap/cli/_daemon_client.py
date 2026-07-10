@@ -315,6 +315,19 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/timeline.query", json_body=body)
         )
 
+    def entitlement_refresh(self) -> dict[str, Any]:
+        """``POST /v0/entitlement.refresh`` — force a daemon-context ID-token re-mint (U14).
+
+        The post-checkout signal: the daemon holds the refresh token, so it
+        re-mints its cached ID token and re-arms the KTD-4 entitlement lease that
+        the local recording/recall gates (U8/U9) read — un-gating a just-converted
+        user promptly instead of waiting out the ~1h token buffer. Returns the
+        refreshed ``whoami`` envelope (``signed_in``/``tier``/``trial_end``/…).
+        """
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/entitlement.refresh", json_body={})
+        )
+
     def backfill_start(self) -> dict[str, Any]:
         """``POST /v0/backfill.start`` — start (or resume) the content-index backfill.
 

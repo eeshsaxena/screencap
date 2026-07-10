@@ -251,6 +251,42 @@ final class SearchViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isSearching, "isSearching must clear on the daemon-down exit")
     }
 
+    // U12 — the daemon's 402 `subscription_required` on the always-attempted
+    // timeline verb resolves to the dedicated `.subscriptionRequired` phase,
+    // DISTINCT from `.daemonDown` (helper unreachable) and per-stream
+    // `.unavailable` (a store error), so lapsed search reads as "upgrade", not
+    // "broken".
+    func testSubscriptionRequiredWhenTimelineGated() async {
+        let fake = FakeSearchService()
+        fake.timelineError = DaemonClientError.envelopeError(
+            code: "subscription_required", rawBody: Data()
+        )
+        let vm = makeVM(fake)
+        await vm.search("today refund", contentIndexEnabled: true)
+
+        XCTAssertEqual(vm.phase, .subscriptionRequired)
+        XCTAssertNotEqual(vm.phase, .daemonDown, "gated search must not read as daemon-down")
+        XCTAssertFalse(vm.isSearching, "isSearching must clear on the subscription-required exit")
+    }
+
+    // U12 — the gate returns 402 before any results assemble, so a lapsed search
+    // publishes no `.loaded` results (no partial leak of a gated recall surface).
+    func testSubscriptionRequiredDoesNotPublishResults() async {
+        let fake = FakeSearchService()
+        fake.timelineError = DaemonClientError.envelopeError(
+            code: "subscription_required", rawBody: Data()
+        )
+        fake.contentResponse = ContentSearchResponse(
+            hits: [ContentHit(recording: "rec", timestampMs: 1000, snippet: "x", score: -1)],
+            indexState: .ok
+        )
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+
+        XCTAssertNil(loaded(vm), "a gated search must not publish .loaded results")
+        XCTAssertEqual(vm.phase, .subscriptionRequired)
+    }
+
     func testPartialContentErrorStillReturnsTimeline() async {
         let fake = FakeSearchService()
         fake.contentError = DaemonClientError.envelopeError(code: "store_unavailable", rawBody: Data())

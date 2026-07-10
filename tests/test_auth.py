@@ -282,6 +282,8 @@ def test_whoami_signed_in_reads_subscribed_claim(fake_keyring, monkeypatch):
         "uid": "uid1",
         "email": "e@x.com",
         "subscribed": True,
+        # U6: `tier` now rides every signed-in envelope; absent claim -> None.
+        "tier": None,
         "paywall_enabled": False,
     }
 
@@ -324,6 +326,86 @@ def test_whoami_offline_reports_stale_not_crash(fake_keyring, monkeypatch):
     assert info.get("stale") is True
 
 
+# --------------------------------------------------------------------------
+# whoami — two-tier `tier` + `trial_end` claims (U6, KTD-1/KTD-4)
+# --------------------------------------------------------------------------
+
+
+def test_whoami_cloud_tier_claim(fake_keyring, monkeypatch):
+    """A ``tier=cloud`` token surfaces ``tier: cloud`` with ``subscribed: True``
+    and the ``trial_end`` written by the webhook while trialing (U2)."""
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: False)
+    fake_keyring[_KEY] = "rt"
+    tok = _jwt(
+        {
+            "user_id": "uid1",
+            "email": "e@x.com",
+            "subscribed": True,
+            "tier": "cloud",
+            "trial_end": 1_800_000_000,
+        }
+    )
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda: a.AuthState(tok, "rt", time.time() + 3600, "uid1", "e@x.com"),
+    )
+    info = a.whoami()
+    assert info["tier"] == "cloud"
+    assert info["subscribed"] is True
+    assert info["trial_end"] == 1_800_000_000
+
+
+def test_whoami_local_tier_claim_not_subscribed(fake_keyring, monkeypatch):
+    """A ``tier=local`` token surfaces ``tier: local`` and ``subscribed`` stays
+    False — the local-entitled user must never pass the cloud gate (KTD-1)."""
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: False)
+    fake_keyring[_KEY] = "rt"
+    tok = _jwt({"user_id": "uid1", "email": "e@x.com", "subscribed": False, "tier": "local"})
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda: a.AuthState(tok, "rt", time.time() + 3600, "uid1", "e@x.com"),
+    )
+    info = a.whoami()
+    assert info["tier"] == "local"
+    assert info["subscribed"] is False
+    # No trial in flight -> the key is absent (not a spurious None).
+    assert "trial_end" not in info
+
+
+def test_whoami_absent_tier_is_none(fake_keyring, monkeypatch):
+    """A token carrying no ``tier`` claim yields ``tier: None`` (fresh
+    not-entitled) WITHOUT a ``stale`` flag — distinct from the offline path."""
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: False)
+    fake_keyring[_KEY] = "rt"
+    tok = _jwt({"user_id": "uid1", "email": "e@x.com"})
+    monkeypatch.setattr(
+        a, "_ensure_fresh",
+        lambda: a.AuthState(tok, "rt", time.time() + 3600, "uid1", "e@x.com"),
+    )
+    info = a.whoami()
+    assert info["tier"] is None
+    assert info["subscribed"] is False
+    assert info.get("stale") is not True
+
+
+def test_whoami_offline_tier_none_with_stale(fake_keyring, monkeypatch):
+    """CRITICAL (KTD-4): the offline/AuthError branch returns ``tier: None``
+    **with** ``stale: True`` so a downstream gate distinguishes
+    paying-but-offline (grace via the lease) from genuinely not-entitled — never
+    via tier presence, always via the ``stale`` flag."""
+    monkeypatch.setattr("screencap.config.get_stripe_paywall_enabled", lambda: False)
+    fake_keyring[_KEY] = "rt"
+
+    def boom():
+        raise a.AuthError("offline")
+
+    monkeypatch.setattr(a, "_ensure_fresh", boom)
+    info = a.whoami()
+    assert info["signed_in"] is True
+    assert info["stale"] is True
+    assert info["tier"] is None
+
+
 def test_pkce_challenge_is_url_safe_sha256():
     verifier = a._gen_code_verifier()
     challenge = a._code_challenge(verifier)
@@ -353,13 +435,21 @@ def test_cli_whoami_json_envelope_both_states(monkeypatch):
 
     monkeypatch.setattr(
         a, "whoami",
-        lambda: {"signed_in": True, "uid": "u", "email": "e@x.com", "subscribed": True},
+        lambda: {
+            "signed_in": True,
+            "uid": "u",
+            "email": "e@x.com",
+            "subscribed": True,
+            "tier": "cloud",
+        },
     )
     res = runner.invoke(whoami_cmd, ["--json"])
     payload = json.loads(res.output)
     assert payload["signed_in"] is True
     assert payload["email"] == "e@x.com"
     assert payload["subscribed"] is True
+    # U6: the CLI envelope spreads whoami() wholesale, so `tier` rides through.
+    assert payload["tier"] == "cloud"
 
 
 def test_cli_whoami_force_refresh_remints_token(monkeypatch):

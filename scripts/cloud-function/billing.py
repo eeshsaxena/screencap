@@ -43,9 +43,11 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --entry-point create_checkout_session \
         --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py \
         --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
-        --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_PRICE_ID=price_...
+        --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_PRICE_ID_LOCAL=price_...,STRIPE_PRICE_ID_CLOUD=price_...,TRIAL_PERIOD_DAYS=7
 
-    # stripe-webhook — Stripe-signature-verified (tokenless by design)
+    # stripe-webhook — Stripe-signature-verified (tokenless by design). Also
+    # needs the price->tier map: STRIPE_PRICE_ID_LOCAL, STRIPE_PRICE_ID_CLOUD,
+    # and the legacy STRIPE_PRICE_ID (grandfathered to tier=cloud, KTD-2/R11).
     gcloud functions deploy stripe-webhook \
         --project proteus-photos --gen2 --runtime python312 \
         --trigger-http --allow-unauthenticated \
@@ -53,7 +55,7 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --entry-point stripe_webhook \
         --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py \
         --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
-        --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_WEBHOOK_SECRET=whsec_...
+        --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_WEBHOOK_SECRET=whsec_...,STRIPE_PRICE_ID_LOCAL=price_...,STRIPE_PRICE_ID_CLOUD=price_...,STRIPE_PRICE_ID=price_...
 
     # reconcile-entitlement — Firebase-token-gated, grant-only dropped-webhook self-heal
     gcloud functions deploy reconcile-entitlement \
@@ -137,18 +139,94 @@ def _webhook_secret() -> str:
 
 
 # --------------------------------------------------------------------------
+# Two-tier entitlement (KTD-1/KTD-2)
+# --------------------------------------------------------------------------
+#
+# The custom claim is ``{tier, subscribed}`` where the security invariant is
+# ``subscribed = (tier == "cloud")`` — the signer (unchanged) still gates cloud
+# on ``subscribed``. ``tier`` is an open string; the gates test set membership,
+# so a future ``free_capped`` slots in as a new value. ``TIERS_BY_RANK`` orders
+# tiers low→high so "highest tier wins" (reconcile, multi-sub) is a max().
+
+TIERS_BY_RANK = ("local", "cloud")
+
+
+def _price_tier_map() -> dict:
+    """Build the ``price_id -> tier`` map from env, skipping empty ids.
+
+    An empty/missing price env is NEVER inserted, so a subscription carrying an
+    empty ('') price id can never match an unset env and be granted a tier (U1).
+    The legacy single ``STRIPE_PRICE_ID`` is mapped to ``cloud`` so existing $5
+    subscribers keep resolving instead of hitting the no-grant path (KTD-2, R11).
+    """
+    mapping: dict = {}
+    for env_name, tier in (
+        ("STRIPE_PRICE_ID_LOCAL", "local"),
+        ("STRIPE_PRICE_ID_CLOUD", "cloud"),
+        ("STRIPE_PRICE_ID", "cloud"),  # legacy grandfather
+    ):
+        price_id = os.environ.get(env_name, "")
+        if price_id:  # never treat '' as a tier key
+            mapping.setdefault(price_id, tier)
+    return mapping
+
+
+def _price_for_tier(tier: str) -> str:
+    """Return the configured price id for a checkout tier, or '' if unset."""
+    env_name = {"local": "STRIPE_PRICE_ID_LOCAL", "cloud": "STRIPE_PRICE_ID_CLOUD"}.get(tier)
+    return os.environ.get(env_name, "") if env_name else ""
+
+
+def _tier_from_price(price_id) -> str | None:
+    """Map a subscription's price id to a known paid tier, or None (fail-closed)."""
+    if not price_id:
+        return None
+    return _price_tier_map().get(price_id)
+
+
+def _subscription_price_id(sub) -> str | None:
+    """Extract the first line-item's price id from a Stripe subscription object."""
+    items = (sub.get("items") or {}).get("data") or []
+    if not items:
+        return None
+    return ((items[0] or {}).get("price") or {}).get("id")
+
+
+def _tier_from_subscription(sub) -> str | None:
+    """Resolve the tier from a subscription's price (None if unmapped/empty)."""
+    return _tier_from_price(_subscription_price_id(sub))
+
+
+def _trial_period_days() -> int | None:
+    """Trial length for a card-required checkout, or None if unset (KTD-3)."""
+    raw = os.environ.get("TRIAL_PERIOD_DAYS", "")
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return days if days > 0 else None
+
+
+# --------------------------------------------------------------------------
 # U3 — create-checkout-session (Firebase-token-gated)
 # --------------------------------------------------------------------------
 
 
 @functions_framework.http
 def create_checkout_session(request):
-    """Create a $5/mo hosted Checkout Session bound to the caller's uid.
+    """Create a hosted Checkout Session for a tier, bound to the caller's uid.
 
     The uid is derived server-side from the verified Firebase bearer and is
     NEVER read from the request body (KTD-4). It is stamped onto the session
     (``client_reference_id`` + ``metadata``) and the subscription metadata so
     every downstream webhook event can resolve it (KTD-9).
+
+    The request body's validated ``tier`` (``local`` | ``cloud``) selects the
+    price ONLY — an unknown tier is rejected 400 with no Stripe call, and any
+    client-supplied uid/price is ignored. The webhook (U2) stays the sole
+    entitlement authority, re-deriving the tier from the paid price, so a
+    spoofed tier cannot over-grant. The trial is card-required
+    (``payment_method_collection='always'`` + ``trial_period_days``, KTD-3).
     """
     if request.method == "OPTIONS":
         return ("", 204, CORS_HEADERS)
@@ -164,13 +242,27 @@ def create_checkout_session(request):
     except AuthInvalid:
         return _cors((jsonify({"error": "Authentication required"}), 401))
 
-    price_id = os.environ.get("STRIPE_PRICE_ID", "")
+    body = request.get_json(silent=True) or {}
+    tier = body.get("tier")
+    price_id = _price_for_tier(tier) if tier in TIERS_BY_RANK else ""
+    if not price_id:
+        # Unknown tier, or its price env is unset — reject before any Stripe call
+        # (never fall back to a default price and mis-charge).
+        return _cors((jsonify({"error": "Invalid or unavailable tier"}), 400))
+
     success_url = os.environ.get(
         "STRIPE_CHECKOUT_SUCCESS_URL", "https://screencap.sh/checkout/success"
     )
     cancel_url = os.environ.get(
         "STRIPE_CHECKOUT_CANCEL_URL", "https://screencap.sh/checkout/cancel"
     )
+
+    # Stamp uid onto the subscription so revoke-side events (deleted /
+    # payment_failed), which carry no client_reference_id, can still resolve it.
+    subscription_data = {"metadata": {"uid": uid}}
+    trial_days = _trial_period_days()
+    if trial_days is not None:
+        subscription_data["trial_period_days"] = trial_days
 
     stripe.api_key = _stripe_key()
     try:
@@ -179,10 +271,11 @@ def create_checkout_session(request):
             line_items=[{"price": price_id, "quantity": 1}],
             client_reference_id=uid,
             metadata={"uid": uid},
-            # Stamp uid onto the subscription so revoke-side events
-            # (subscription.deleted / invoice.payment_failed), which carry no
-            # client_reference_id, can still resolve it (KTD-9).
-            subscription_data={"metadata": {"uid": uid}},
+            subscription_data=subscription_data,
+            # Card-required trial: collect a payment method upfront so the trial
+            # auto-converts (R5). trial_period_days alone can yield a card-
+            # OPTIONAL trial, so this must accompany it.
+            payment_method_collection="always",
             allow_promotion_codes=True,
             success_url=success_url,
             cancel_url=cancel_url,
@@ -200,36 +293,63 @@ def create_checkout_session(request):
 
 
 def _current_subscription(subscription_id):
-    """Return ``(status, uid)`` for a subscription id, re-fetched from Stripe.
+    """Return the re-fetched Stripe subscription object, or ``None``.
 
-    Used on the clear-side so a stale/out-of-order event cannot revoke a
-    now-active subscription (KTD-9). Returns ``(None, None)`` if the id is
-    missing or the lookup fails.
+    Used to resolve the CURRENT status + price from an event's subscription id
+    (grant-side checkout completed, and clear-side deleted/payment_failed), so a
+    stale/out-of-order event cannot revoke a now-active subscription (KTD-9).
+    Returns ``None`` if the id is missing or the lookup fails.
     """
     if not subscription_id:
-        return None, None
+        return None
     try:
-        sub = stripe.Subscription.retrieve(subscription_id)
+        return stripe.Subscription.retrieve(subscription_id)
     except Exception as exc:  # transient lookup failure — caller no-ops safely.
         logger.warning("subscription retrieve failed for %s: %s", subscription_id, exc)
+        return None
+
+
+def _grant_from_subscription(sub):
+    """Resolve ``(tier, trial_end)`` from a live subscription object (KTD-1/2).
+
+    Returns ``(None, None)`` unless the subscription is currently in an active
+    status AND its price maps to a known paid tier (fail-closed). When
+    ``trialing`` the subscription's ``trial_end`` is surfaced for the "days
+    left" UI (U6/U11).
+    """
+    if not sub or sub.get("status") not in _ACTIVE_STATUSES:
         return None, None
-    return sub.get("status"), (sub.get("metadata") or {}).get("uid")
+    tier = _tier_from_subscription(sub)
+    if tier is None:
+        return None, None
+    trial_end = sub.get("trial_end") if sub.get("status") == "trialing" else None
+    return tier, trial_end
 
 
 def _resolve_entitlement(event_type, obj):
-    """Map a Stripe event to ``(uid, active)``, or ``(None, None)`` if no uid.
+    """Map a Stripe event to ``(uid, tier, trial_end)``.
 
-    Grant-side events (checkout completed, subscription active) set the claim
-    directly. Clear-side events re-fetch the subscription's CURRENT status, so a
-    stale ``deleted`` for a subscription that is now active does not revoke it.
+    ``tier`` is ``None`` when the event resolves no known paid tier — the
+    fail-closed path (clear the claim / no grant). The tier is ALWAYS resolved
+    from the subscription's PRICE, never assumed: a ``checkout.session.completed``
+    carries no price, so it re-fetches the subscription and resolves from there —
+    a completed checkout can never mint ``tier=cloud`` by default. Returns
+    ``(None, None, None)`` when no uid is resolvable (logged no-op).
     """
     if event_type == "checkout.session.completed":
         uid = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("uid")
-        return uid, True
+        if uid is None:
+            return None, None, None
+        sub = _current_subscription(obj.get("subscription"))
+        tier, trial_end = _grant_from_subscription(sub)
+        return uid, tier, trial_end
 
     if event_type in ("customer.subscription.created", "customer.subscription.updated"):
         uid = (obj.get("metadata") or {}).get("uid")
-        return uid, obj.get("status") in _ACTIVE_STATUSES
+        if uid is None:
+            return None, None, None
+        tier, trial_end = _grant_from_subscription(obj)
+        return uid, tier, trial_end
 
     if event_type in ("customer.subscription.deleted", "invoice.payment_failed"):
         sub_id = (
@@ -238,22 +358,35 @@ def _resolve_entitlement(event_type, obj):
             else obj.get("subscription")
         )
         event_uid = (obj.get("metadata") or {}).get("uid")
-        status, fetched_uid = _current_subscription(sub_id)
+        sub = _current_subscription(sub_id)
+        fetched_uid = (sub.get("metadata") or {}).get("uid") if sub else None
         uid = event_uid or fetched_uid
-        active = status in _ACTIVE_STATUSES if status is not None else False
-        return uid, active
+        if uid is None:
+            return None, None, None
+        # Re-fetched status/price: a stale delete for a now-active sub keeps it.
+        tier, trial_end = _grant_from_subscription(sub)
+        return uid, tier, trial_end
 
-    return None, None
+    return None, None, None
 
 
-def _apply_entitlement(uid, active) -> None:
-    """Set the ``subscribed`` custom claim (idempotent by value).
+def _apply_entitlement(uid, tier, trial_end=None) -> None:
+    """Set the two-tier custom claim (KTD-1).
 
-    ``subscribed`` is the only custom claim in this system; if others are added
-    later this must merge rather than overwrite. Setting the same value twice is
-    a no-op in effect, so duplicate webhook delivery is idempotent.
+    Writes ``{tier, subscribed = (tier == "cloud")}`` — ``subscribed`` is always
+    a pure function of ``tier``, never set independently, so the two fields can
+    never drift into ``subscribed=true`` with ``tier != cloud``. A ``None`` tier
+    is the fail-closed no-grant/clear state (``tier="none"``, ``subscribed=false``).
+    ``trial_end`` is written only when present (during a trial). The webhook is
+    the sole authority for these claims and owns the whole ``tier``-derived set,
+    so it writes them directly; setting the same value twice is a no-op in
+    effect, so duplicate delivery is idempotent.
     """
-    fb_auth.set_custom_user_claims(uid, {"subscribed": bool(active)})
+    resolved = tier or "none"
+    claims = {"tier": resolved, "subscribed": resolved == "cloud"}
+    if trial_end is not None:
+        claims["trial_end"] = trial_end
+    fb_auth.set_custom_user_claims(uid, claims)
 
 
 @functions_framework.http
@@ -282,12 +415,44 @@ def stripe_webhook(request):
     event_type = event["type"]
     obj = event["data"]["object"]
 
-    uid, active = _resolve_entitlement(event_type, obj)
+    uid, tier, trial_end = _resolve_entitlement(event_type, obj)
     if uid is None:
         logger.info("stripe webhook %s: no resolvable uid; no-op", event_type)
         return (jsonify({"received": True}), 200)
 
-    _apply_entitlement(uid, active)
+    # A grant-side event that resolves no known paid tier is usually a no-op,
+    # not a write of tier=none — this keeps an unmapped/empty-price created/
+    # updated event (or a checkout whose sub can't be re-fetched) from clobbering
+    # a good claim, while a stale delete for a now-active sub still re-grants via
+    # _grant_from_subscription. The ONE exception is a `customer.subscription.
+    # updated` whose subscription is in an INACTIVE status (canceled / unpaid /
+    # paused / incomplete_expired): that is a genuine revoke delivered as
+    # `updated` rather than a separate `deleted`, so it must fall through and
+    # clear. `created` and `checkout.session.completed` stay no-op (a new/
+    # incomplete sub is not a revoke signal and must not clear an existing claim).
+    if tier is None and event_type in (
+        "checkout.session.completed",
+        "customer.subscription.created",
+        "customer.subscription.updated",
+    ):
+        is_revoking_update = (
+            event_type == "customer.subscription.updated"
+            and obj.get("status") is not None
+            and obj.get("status") not in _ACTIVE_STATUSES
+        )
+        if not is_revoking_update:
+            logger.info(
+                "stripe webhook %s: no resolvable paid tier for uid; no grant",
+                event_type,
+            )
+            return (jsonify({"received": True}), 200)
+        logger.info(
+            "stripe webhook customer.subscription.updated: inactive status %s; "
+            "clearing claim",
+            obj.get("status"),
+        )
+
+    _apply_entitlement(uid, tier, trial_end)
     return (jsonify({"received": True}), 200)
 
 
@@ -296,21 +461,30 @@ def stripe_webhook(request):
 # --------------------------------------------------------------------------
 
 
-def _has_active_subscription(uid) -> bool:
-    """True if the account has a currently-active Stripe subscription.
+def _active_subscription_tier(uid) -> str | None:
+    """Highest paid tier among the account's currently-active subscriptions.
 
-    Searches by the uid stamped into subscription metadata (KTD-9). Any lookup
-    failure returns False — never hand out access on an error.
+    Searches by the uid stamped into subscription metadata (KTD-9) and resolves
+    each active sub's tier from its PRICE — NOT a tier-blind "any active" bool,
+    which would let a Local-Pro user self-heal into cloud (KTD-1). If multiple
+    active subs exist, the highest tier wins (``local`` < ``cloud``). Any lookup
+    failure returns ``None`` — never hand out access on an error.
     """
     try:
         result = stripe.Subscription.search(query=f"metadata['uid']:'{uid}'")
     except Exception as exc:  # transient / search error — do not grant on failure.
         logger.warning("subscription search failed for uid %s: %s", uid, exc)
-        return False
+        return None
+    best: str | None = None
     for sub in result.get("data", []):
-        if sub.get("status") in _ACTIVE_STATUSES:
-            return True
-    return False
+        if sub.get("status") not in _ACTIVE_STATUSES:
+            continue
+        tier = _tier_from_subscription(sub)
+        if tier is None:
+            continue
+        if best is None or TIERS_BY_RANK.index(tier) > TIERS_BY_RANK.index(best):
+            best = tier
+    return best
 
 
 @functions_framework.http
@@ -339,7 +513,7 @@ def reconcile_entitlement(request):
         return _cors((jsonify({"error": "Authentication required"}), 401))
 
     stripe.api_key = _stripe_key()
-    active = _has_active_subscription(uid)
-    if active:
-        _apply_entitlement(uid, True)
-    return _cors(jsonify({"subscribed": bool(active)}))
+    tier = _active_subscription_tier(uid)
+    if tier is not None:
+        _apply_entitlement(uid, tier)
+    return _cors(jsonify({"tier": tier, "subscribed": tier == "cloud"}))

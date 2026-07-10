@@ -89,19 +89,22 @@ def _get_reconcile_url() -> str:
     return os.environ.get("SCREENCAP_RECONCILE_URL", DEFAULT_RECONCILE_URL)
 
 
-def request_checkout_url() -> str:
+def request_checkout_url(tier: str) -> str:
     """POST to create-checkout-session with the caller's bearer token; return the
-    hosted Stripe Checkout URL for the $5/mo Personal cloud plan (billing U9).
+    hosted Stripe Checkout URL for the selected ``tier`` ("local" or "cloud").
 
-    Mirrors :func:`request_signed_urls`'s auth/error handling: ``NotSignedIn`` ->
-    a clear "sign in" message, a transient ``AuthError`` -> retryable message.
-    The uid is derived server-side from the token, never sent by the client.
+    ``tier`` selects which price the card-required trial checkout charges; the
+    webhook remains the sole entitlement authority, re-deriving tier from the
+    paid price (U2/U3). Mirrors :func:`request_signed_urls`'s auth/error handling:
+    ``NotSignedIn`` -> a clear "sign in" message, a transient ``AuthError`` ->
+    retryable message. The uid is derived server-side from the token, never sent
+    by the client.
     """
     from screencap import auth
 
     url = _get_checkout_url()
     try:
-        resp = auth.authed_post(requests.post, url, json={}, timeout=30)
+        resp = auth.authed_post(requests.post, url, json={"tier": tier}, timeout=30)
     except auth.NotSignedIn:
         raise RuntimeError("Sign in to upgrade: run `screencap login`.")
     except auth.AuthError as e:

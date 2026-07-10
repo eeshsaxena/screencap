@@ -62,13 +62,17 @@ _SETTINGS_SCHEMA_VERSION = 2
 # intelligence, U8.
 _SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 1
 _STOP_SCHEMA_VERSION = 1
-# `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed),
-# read by the SwiftUI shell to gate the Upload affordance on auth + entitlement.
-# Deliberately NOT bumped when `subscribed` was added: it is an additive,
-# defaulted, backward-compatible field, and the Swift drift check is warn-only —
-# bumping would emit spurious warnings on older app builds during the two-track
-# paywall rollout for no compatibility gain.
-_AUTH_SCHEMA_VERSION = 1
+# `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed/
+# tier/trial_end), read by the SwiftUI shell to gate the Upload affordance on
+# auth + entitlement and drive the two-tier picker + trial UI (U11).
+# Bumped 1 -> 2 for U6: the two-tier `tier` + `trial_end` claims joined the
+# envelope shape (and the daemon `auth.whoami` handler, previously dropping
+# `subscribed`, now forwards all three). The Swift drift check is warn-only, so
+# the bump is a low-cost signal that the shape grew — a conscious call for a
+# real shape change (contrast `subscribed`, which was left unbumped as it never
+# altered the handler-forwarded set). Additive + defaulted, so older app builds
+# stay compatible.
+_AUTH_SCHEMA_VERSION = 2
 # `backfill status --json` envelope (ok + schema_version + the privacy-safe
 # status snapshot the daemon publishes). SCR-178 U6.
 _BACKFILL_SCHEMA_VERSION = 1
@@ -778,6 +782,21 @@ def _run_start_via_daemon(
                         err=True,
                     )
                     return 2
+                if code == "subscription_required":
+                    # SCR (paid-only launch, U10): the daemon's local paywall
+                    # (``SCREENCAP_LOCAL_PAYWALL_ENFORCE``) refused the start
+                    # with a 402 ``subscription_required`` envelope. Render a
+                    # concise upgrade message via ``rich.console.Console``
+                    # (mirroring the upload-side ``SubscriptionRequired`` tone)
+                    # and exit non-zero with no traceback — never the generic
+                    # "Daemon rejected start" line below. With the flag off the
+                    # daemon never emits this code, so the start path is
+                    # byte-identical to today.
+                    console.print(
+                        "[red]Recording requires an active subscription — "
+                        "upgrade in the app to continue.[/red]"
+                    )
+                    return 1
                 if code == "permission_required":
                     # SCR-142: the daemon's pre-spawn permission gate rejected
                     # the start and named every denied permission in ``missing``.
@@ -1664,6 +1683,20 @@ def whoami_cmd(as_json, force_refresh):
             sys.exit(1)
         console.print(f"[red]Error checking sign-in state:[/red] {escape(str(e))}")
         sys.exit(1)
+
+    # U14 (KTD-4): refresh the last-known-good entitlement lease the local gates
+    # (U8/U9) read. This is the app's actual post-checkout signal path — the macOS
+    # app polls `whoami --json` and calls `whoami --force-refresh` on return from
+    # Stripe — so a just-converted user's freshly-materialized `tier` re-arms the
+    # lease here (a shared on-disk file the daemon gates read). A definitive
+    # not-entitled clears it; a stale/offline result preserves it. Best-effort —
+    # lease upkeep must never break `whoami`.
+    try:
+        from screencap.daemon import entitlement_lease
+
+        entitlement_lease.reconcile_from_whoami(dict(info))
+    except Exception:  # noqa: BLE001 — lease upkeep must never break `whoami`
+        pass
     if as_json:
         envelope = {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, **info}
         click.echo(json.dumps(envelope))
@@ -1677,20 +1710,24 @@ def whoami_cmd(as_json, force_refresh):
 
 
 @cli.command("checkout-url")
+@click.option("--tier", type=click.Choice(["local", "cloud"]), required=True,
+              help="Which paid tier to check out: local (unlimited local) or cloud.")
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
-def checkout_url_cmd(as_json):
-    """Print a hosted Stripe Checkout URL for the $5/mo Personal cloud plan.
+def checkout_url_cmd(tier, as_json):
+    """Print a hosted Stripe Checkout URL for the given paid tier.
 
     Requires sign-in (the uid is derived server-side from the bearer token). The
     macOS app opens the printed URL in the browser; on return it force-refreshes
-    the entitlement (`whoami --force-refresh`) to pick up the granted plan.
+    the entitlement (`whoami --force-refresh`) to pick up the granted plan. The
+    tier selects the price only — the webhook re-derives entitlement from the
+    paid price.
     """
     from screencap import upload
 
     try:
-        url = upload.request_checkout_url()
+        url = upload.request_checkout_url(tier)
     except Exception as e:
         if as_json:
             click.echo(json.dumps(
