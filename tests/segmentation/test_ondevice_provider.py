@@ -462,3 +462,79 @@ class TestImportLightness:
         )
         assert proc.returncode == 0, proc.stderr
         assert "OK" in proc.stdout
+
+
+# ===========================================================================
+# Free-form answer path (SCR-243, U4)
+# ===========================================================================
+
+from screencap.segmentation.generation import Evidence  # noqa: E402
+
+
+def _stripped_evidence(text: str = "You edited main.py and ran pytest.") -> Evidence:
+    return Evidence(text=text, stripped=True)
+
+
+def _answer_helper(printed: str) -> str:
+    """Fake helper body: drain stdin, print a fixed answer envelope string."""
+    return "import sys\nsys.stdin.read()\n" + f"print({printed!r})\n"
+
+
+class TestAnswer:
+    def test_ok_envelope_returns_sanitized_text(self, tmp_path, helper_env):
+        env = json.dumps({"status": "ok", "result": "You worked on <b>auth</b>."})
+        helper_env(_write_helper(tmp_path, _answer_helper(env)))
+        out = OnDeviceProvider().answer("what did I do?", _stripped_evidence())
+        assert "<" not in out and ">" not in out  # markup neutralized by sanitize_answer (KTD10)
+        assert "auth" in out
+
+    @pytest.mark.privacy
+    def test_unmarked_evidence_refused_without_spawn(self, tmp_path, helper_env):
+        sentinel = tmp_path / "spawned"
+        body = (
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(sentinel)!r}).write_text('x')\n"
+            "sys.stdin.read()\nprint('{\"status\":\"ok\",\"result\":\"x\"}')\n"
+        )
+        helper_env(_write_helper(tmp_path, body))
+        out = OnDeviceProvider().answer("q", Evidence(text="raw", stripped=False))
+        assert out is PROVIDER_UNAVAILABLE
+        assert not sentinel.exists()  # helper never spawned
+
+    def test_oversized_evidence_unavailable(self, tmp_path, helper_env):
+        helper_env(_write_helper(tmp_path, _answer_helper('{"status":"ok","result":"hi"}')))
+        huge = Evidence(text="x" * (600 * 1024), stripped=True)
+        assert OnDeviceProvider().answer("q", huge) is PROVIDER_UNAVAILABLE
+
+    def test_oversized_prompt_unavailable(self, tmp_path, helper_env):
+        # The prompt cap is an order of magnitude smaller than evidence (16KiB);
+        # exercise its half of the size gate independently.
+        helper_env(_write_helper(tmp_path, _answer_helper('{"status":"ok","result":"hi"}')))
+        assert OnDeviceProvider().answer("p" * (20 * 1024), _stripped_evidence()) is PROVIDER_UNAVAILABLE
+
+    def test_missing_helper_unavailable(self, monkeypatch):
+        monkeypatch.setenv("SCREENCAP_ONDEVICE_HELPER", "/nonexistent/helper")
+        assert OnDeviceProvider().answer("q", _stripped_evidence()) is PROVIDER_UNAVAILABLE
+
+    def test_unavailable_envelope(self, tmp_path, helper_env):
+        env = json.dumps({"status": "unavailable", "reason": "os-below-macos-26"})
+        helper_env(_write_helper(tmp_path, _answer_helper(env)))
+        assert OnDeviceProvider().answer("q", _stripped_evidence()) is PROVIDER_UNAVAILABLE
+
+    def test_nonzero_exit_unavailable(self, tmp_path, helper_env):
+        helper_env(_write_helper(tmp_path, "import sys\nsys.stdin.read()\nsys.exit(3)\n"))
+        assert OnDeviceProvider().answer("q", _stripped_evidence()) is PROVIDER_UNAVAILABLE
+
+    def test_garbage_stdout_unavailable(self, tmp_path, helper_env):
+        helper_env(_write_helper(tmp_path, "import sys\nsys.stdin.read()\nprint('not json')\n"))
+        assert OnDeviceProvider().answer("q", _stripped_evidence()) is PROVIDER_UNAVAILABLE
+
+    def test_non_string_result_unavailable(self, tmp_path, helper_env):
+        env = json.dumps({"status": "ok", "result": {"not": "a string"}})
+        helper_env(_write_helper(tmp_path, _answer_helper(env)))
+        assert OnDeviceProvider().answer("q", _stripped_evidence()) is PROVIDER_UNAVAILABLE
+
+    def test_empty_result_unavailable(self, tmp_path, helper_env):
+        env = json.dumps({"status": "ok", "result": "   "})
+        helper_env(_write_helper(tmp_path, _answer_helper(env)))
+        assert OnDeviceProvider().answer("q", _stripped_evidence()) is PROVIDER_UNAVAILABLE

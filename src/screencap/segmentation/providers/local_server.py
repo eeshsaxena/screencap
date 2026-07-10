@@ -27,6 +27,12 @@ import logging
 from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
+from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
 from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
@@ -59,9 +65,37 @@ class LocalServerProvider:
         self,
         endpoint: str | None = None,
         raw_call: Callable[[str, str], dict | None] | None = None,
+        answer_raw_call: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._raw_call = raw_call if raw_call is not None else self._default_raw_call
+        self._answer_raw_call = (
+            answer_raw_call if answer_raw_call is not None
+            else self._default_answer_raw_call
+        )
+
+    def _resolve_local_endpoint(self) -> str | None:
+        """Resolve + re-assert the endpoint is LOCAL at send time, or None.
+
+        Shared by ``segment`` and ``answer``: routing classifies at build time,
+        but the endpoint is re-read from config here, so the value we will
+        actually egress is re-classified (KTD8) — never send off-box.
+        """
+        endpoint = self._endpoint
+        if endpoint is None:
+            from screencap import config
+
+            endpoint = config.get_local_server_endpoint()
+        if not endpoint:
+            log.info("No local-server endpoint configured; provider unavailable")
+            return None
+
+        from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+
+        if classify_endpoint(endpoint) != LOCAL:
+            log.warning("Local-server endpoint is not LOCAL at send time; unavailable")
+            return None
+        return endpoint
 
     def segment(self, activity_summary: dict) -> dict | None | ProviderUnavailable:
         # Fail-closed privacy gate (R10): refuse unmarked input.
@@ -148,4 +182,79 @@ class LocalServerProvider:
             return parsed if isinstance(parsed, dict) else None
         except Exception:
             log.warning("Local-server call failed", exc_info=True)
+            return None
+
+    # -- Free-form generation path (SCR-243, U9) ---------------------------
+
+    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+        """Answer ``prompt`` grounded in ``evidence`` via a plain BYO completion.
+
+        Same connect-time hardening as :meth:`segment` (LOCAL re-assert,
+        localhost pin, redirects off, response size cap), but a **free-form**
+        chat completion (no JSON response format). Returns the sanitized answer
+        string or :data:`PROVIDER_UNAVAILABLE`. Never raises.
+        """
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10).
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("LocalServerProvider.answer refused the request (gate); unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        endpoint = self._resolve_local_endpoint()
+        if endpoint is None:
+            return PROVIDER_UNAVAILABLE
+
+        raw = self._answer_raw_call(
+            _pin_localhost(endpoint), build_answer_prompt(prompt, evidence)
+        )
+        if raw is None:
+            return PROVIDER_UNAVAILABLE
+        cleaned = sanitize_answer(raw)
+        if not cleaned.strip():
+            return PROVIDER_UNAVAILABLE
+        return cleaned
+
+    @staticmethod
+    def _default_answer_raw_call(endpoint: str, prompt: str) -> str | None:
+        """Live OpenAI-compatible free-form call (no JSON response format).
+
+        Mirrors :meth:`_default_raw_call`'s connect-time hardening (redirects
+        off, streamed read bounded by the size cap) but returns the message
+        content as plain text instead of parsing it as JSON.
+        """
+        try:
+            import requests
+        except ImportError:  # pragma: no cover
+            return None
+        base = endpoint.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")].rstrip("/")
+        url = base + "/v1/chat/completions"
+        body = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "stream": False,
+        }
+        try:
+            with requests.post(
+                url,
+                json=body,
+                timeout=_REQUEST_TIMEOUT_S,
+                allow_redirects=False,  # a 302 must not bounce us off-box (KTD8)
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    return None
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    total += len(chunk)
+                    if total > _MAX_RESPONSE_BYTES:
+                        log.warning("Local-server answer exceeds the size cap; unavailable")
+                        return None
+                    chunks.append(chunk)
+            content = json.loads(b"".join(chunks))["choices"][0]["message"]["content"]
+            return content if isinstance(content, str) else None
+        except Exception:
+            log.warning("Local-server answer call failed", exc_info=True)
             return None

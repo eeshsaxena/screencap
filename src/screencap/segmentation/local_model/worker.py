@@ -67,11 +67,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # pragma: no cover - defensive
         return _unavailable("runtime-import-failed")
 
+    # Mode discriminator (SCR-243): absent / "segment" → the JSON tasks path
+    # (unchanged); "generate_text" → the free-form recall-answer path. Keeping
+    # the default as segment leaves the existing request shape byte-compatible.
+    mode = request.get("mode", "segment")
+
     try:
         runtime = get_runtime(select_runtime())
-        result = runtime.generate(model_path, prompt)
+        if mode == "generate_text":
+            result: dict | str | None = runtime.generate_text(model_path, prompt)
+        else:
+            result = runtime.generate(model_path, prompt)
     except Exception:
-        # generate() is documented never to raise, but guard the boundary so a
+        # generate*/ are documented never to raise, but guard the boundary so a
         # surprise never crashes the worker with a traceback the parent can't parse.
         return _unavailable("generation-crashed")
 

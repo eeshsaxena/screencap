@@ -3,10 +3,15 @@
 // (`src/screencap/segmentation/providers/ondevice.py`, U5 / KTD2).
 //
 // Contract (must match the Python side's IPC envelope):
-//   • stdin  — the privacy-STRIPPED activity summary as JSON (the `summary`
-//     sub-dict `build_activity_summary` produces; already ALLOW-only, U3/U4).
+//   • stdin  — one JSON object. A top-level `"task"` key selects the path
+//     (absent / "segment" → segmentation; "answer" → free-form recall-answer,
+//     SCR-243). For segmentation the object IS the privacy-STRIPPED activity
+//     summary (`build_activity_summary`'s `summary` sub-dict; ALLOW-only). For
+//     the answer path it is `{"task":"answer","prompt":…,"evidence":…}` where
+//     `evidence` is already privacy-stripped text.
 //   • stdout — exactly one JSON object:
-//        {"status":"ok","result":{ tasks…, summary…, tags… }}
+//        {"status":"ok","result":{ tasks…, summary…, tags… }}   (segmentation)
+//        {"status":"ok","result":"<answer text>"}                (recall-answer)
 //        {"status":"unavailable","reason":"<why>"}
 //     The `result` shape mirrors `segmentation/schema.py::_RESPONSE_SCHEMA`;
 //     Python runs it through the shared `validate_llm_tasks` repair/reject net,
@@ -58,6 +63,19 @@ func emitOK(result: [String: Any]) -> Never {
     emitUnavailable("result-encode-failed")
 }
 
+/// Emit an `ok` envelope whose `result` is a free-form answer STRING (the
+/// recall-answer path), and exit 0. Python's `_parse_text_envelope` expects a
+/// string `result` here, distinct from the segmentation dict `result`.
+func emitOKText(_ text: String) -> Never {
+    let obj: [String: Any] = ["status": "ok", "result": text]
+    if let data = try? JSONSerialization.data(withJSONObject: obj),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+        exit(0)
+    }
+    emitUnavailable("result-encode-failed")
+}
+
 /// Read all of stdin and decode the activity-summary JSON object.
 func readSummary() -> [String: Any]? {
     let data = FileHandle.standardInput.readDataToEndOfFile()
@@ -90,6 +108,18 @@ matching the timeline, a 2-3 word intent name, a 3-5 sentence description, a \
 category, the apps involved, and a confidence. Also give a session summary \
 (overview, primary_focus, time_breakdown, key_accomplishments) and 3-8 \
 lowercase-hyphenated tags for the whole session.
+"""
+
+// Grounding instructions for the free-form recall-answer path (SCR-243). This
+// MUST mirror the Python-side `_GROUNDING_INSTRUCTIONS` in
+// `segmentation/generation_finish.py` (KTD3) — the two copies drive on-device
+// and cloud answers with the same "answer only from the evidence" framing, and
+// there is no shared validator to mask drift, so keep them in sync.
+let answerInstructions = """
+You are answering a question about the user's own recorded computer activity, \
+using ONLY the evidence provided. Ground every claim in that evidence. If the \
+evidence does not contain enough to answer, say so plainly and briefly — do not \
+guess, invent, or draw on outside knowledge. Keep the answer concise.
 """
 
 // MARK: - Foundation Models path (macOS 26+, guided generation)
@@ -193,17 +223,58 @@ func runOnDevice(summary: [String: Any]) async -> Never {
     }
 }
 
+/// The free-form recall-answer path (SCR-243, U3): answer `prompt` grounded in
+/// `evidence` and emit a STRING `result`. Unlike `runOnDevice`, this uses NO
+/// guided generation (`@Generable`) — `respond(to:)` returns plain text, so a
+/// grounded refusal is just a normal string. The Python `sanitize_answer`
+/// hardens the returned text on the far side of the envelope.
+@available(macOS 26.0, *)
+func runAnswer(prompt: String, evidence: String) async -> Never {
+    let model = SystemLanguageModel.default
+    switch model.availability {
+    case .available:
+        break
+    case .unavailable(let reason):
+        emitUnavailable("model-unavailable-\(reason)")
+    }
+
+    let session = LanguageModelSession(instructions: answerInstructions)
+    let modelInput = "EVIDENCE:\n" + evidence + "\n\nQUESTION:\n" + prompt
+
+    do {
+        let response = try await session.respond(
+            to: modelInput,
+            options: GenerationOptions(temperature: 0.2)
+        )
+        emitOKText(response.content)
+    } catch {
+        emitUnavailable("answer-failed")
+    }
+}
+
 #endif
 
 // MARK: - Entry point (top-level async — Swift 5.7+ in `main.swift`)
 
-guard let summary = readSummary() else {
+guard let request = readSummary() else {
     emitUnavailable("no-input")
 }
 
+// Task discriminator (SCR-243): absent / "segment" → the existing segmentation
+// path (the bare summary dict is passed through unchanged); "answer" → the
+// free-form recall-answer path. Keeping the default as segment leaves the
+// existing stdin shape byte-compatible.
+let task = (request["task"] as? String) ?? "segment"
+
 #if canImport(FoundationModels)
 if #available(macOS 26.0, *) {
-    await runOnDevice(summary: summary)
+    if task == "answer" {
+        let prompt = request["prompt"] as? String ?? ""
+        let evidence = request["evidence"] as? String ?? ""
+        await runAnswer(prompt: prompt, evidence: evidence)
+    } else {
+        await runOnDevice(summary: request)
+    }
 } else {
     emitUnavailable("os-below-macos-26")
 }

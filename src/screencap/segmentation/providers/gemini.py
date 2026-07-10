@@ -18,6 +18,13 @@ import logging
 import os
 from typing import Callable
 
+from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
+from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.schema import _RESPONSE_SCHEMA
 from screencap.segmentation.validate import validate_llm_tasks
 
@@ -88,9 +95,14 @@ class GeminiProvider:
     """
 
     def __init__(
-        self, raw_call: Callable[[str], dict | None] | None = None
+        self,
+        raw_call: Callable[[str], dict | None] | None = None,
+        answer_raw_call: Callable[[str], str | None] | None = None,
     ) -> None:
         self._raw_call = raw_call if raw_call is not None else self._call_gemini
+        self._answer_raw_call = (
+            answer_raw_call if answer_raw_call is not None else self._answer_gemini
+        )
 
     def segment(self, activity_summary: dict) -> dict | None:
         """Segment the session into named tasks via Gemini.
@@ -154,4 +166,57 @@ class GeminiProvider:
             return None
         except Exception:
             log.warning("Gemini call failed", exc_info=True)
+            return None
+
+    # -- Free-form generation path (SCR-243, U5) ---------------------------
+
+    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+        """Answer ``prompt`` grounded in ``evidence`` via a free-form Gemini call.
+
+        Unlike :meth:`segment`, this uses NO structured response schema. Returns
+        the sanitized answer string, or :data:`PROVIDER_UNAVAILABLE` when the
+        model is unavailable/fails or produces empty output. Never raises.
+        """
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10). The cloud path is the only off-box
+        # egress, so it self-caps here rather than trusting the dispatcher.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("GeminiProvider.answer refused the request (gate); unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        raw = self._answer_raw_call(build_answer_prompt(prompt, evidence))
+        if raw is None:
+            return PROVIDER_UNAVAILABLE
+        cleaned = sanitize_answer(raw)
+        if not cleaned.strip():
+            return PROVIDER_UNAVAILABLE
+        return cleaned
+
+    def _answer_gemini(self, prompt: str) -> str | None:
+        """Free-form Gemini call (no response schema). Returns text or None.
+
+        ``google.genai`` is imported lazily here so this module stays cloud-free
+        at import time.
+        """
+        try:
+            from google import genai
+            from google.genai import types
+
+            api_key = os.environ.get("GOOGLE_GENAI_API_KEY")
+            if not api_key:
+                log.info("No GOOGLE_GENAI_API_KEY configured, skipping Gemini answer")
+                return None
+
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2),
+            )
+            return response.text
+        except ImportError:
+            log.info("google-genai not installed, skipping Gemini answer")
+            return None
+        except Exception:
+            log.warning("Gemini answer call failed", exc_info=True)
             return None
