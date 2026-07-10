@@ -256,7 +256,26 @@ def _aggregate_recording(
     samples = sorted(action_ts + screenshot_ts)
 
     spans = _focus_spans(relevant, win_start, win_end)
+
+    # FIX A — the fail-closed strip. Re-derive this recording's blocked intervals
+    # (the same SCRUB_BLOCK_ACTIONS set the point flow's _strip_blocked uses, over
+    # the intact local recording.db, require_canonical=True) and DROP any focus span
+    # overlapping a blocked interval BEFORE crediting its per-app name / duration.
+    # A masked (MASK_WINDOW/EXCLUDE) app's NAME and time must never reach the
+    # figures. Fail-closed: if the intervals can't be derived, treat EVERY span as
+    # blocked → this recording contributes nothing (mirrors build_is_blocked's
+    # _always_blocked sentinel and the point flow's whole-recording drop).
+    is_span_blocked = _build_blocked_span_test(
+        rec_dir, win_start, win_end, samples,
+    )
+
     for app, s_start, s_end in spans:
+        if is_span_blocked(s_start, s_end):
+            # A masked/excluded focus span: drop its name AND its credited active
+            # time entirely. Do NOT surface it as uncovered either — an uncovered
+            # span still carries the recording + timing, which for a masked window
+            # is exactly the metadata we must not egress.
+            continue
         # Active windows around each sample inside this focus span.
         active = [
             (max(t - _ACTIVITY_WINDOW_S, s_start), min(t + _ACTIVITY_WINDOW_S, s_end))
@@ -303,6 +322,73 @@ def _screenshot_timestamps(
     except Exception:
         logger.debug("aggregate: screenshot enum failed %s", rec_dir.name, exc_info=True)
         return []
+
+
+def _always_span_blocked(_s: float, _e: float) -> bool:
+    """Fail-closed sentinel: every focus span is treated as blocked."""
+    return True
+
+
+def _build_blocked_span_test(
+    rec_dir: Path,
+    win_start: float,
+    win_end: float,
+    samples: list[float],
+):
+    """Return ``is_span_blocked(s, e)`` for this recording's window (FIX A).
+
+    Re-derives the recording's ``SCRUB_BLOCK_ACTIONS`` skip set over
+    ``[win_start, win_end)`` — the SAME machinery ``frame_blocked.build_is_blocked``
+    and the point flow's ``_strip_blocked`` use (``build_classifier_evaluator`` +
+    ``derive_skip_intervals(require_canonical=True)`` over the intact local
+    ``recording.db``, with the ``PrivacyMode`` frozen at capture) — then returns a
+    predicate that answers whether a focus span ``[s, e)`` overlaps any blocked
+    interval. A masked (MASK_WINDOW/EXCLUDE / secure-field) window's whole span
+    lands in that set, so the caller drops it.
+
+    Fail-closed: ANY failure to derive the canonical block set (a partial/locked/
+    missing ``recording.db`` under ``require_canonical`` → ``CanonicalDerivationError``,
+    or any other error) returns :func:`_always_span_blocked`, so the caller drops
+    this recording's ENTIRE contribution rather than risk crediting masked time.
+    Heavy imports (scrubber / backfill / privacy) are deferred to the call so the
+    aggregate module stays light.
+    """
+    try:
+        from screencap.backfill.skip_intervals import (
+            build_classifier_evaluator,
+            derive_skip_intervals,
+        )
+
+        classifier, evaluator = build_classifier_evaluator(rec_dir)
+        intervals = derive_skip_intervals(
+            rec_dir / "recording.db",
+            classifier=classifier,
+            evaluator=evaluator,
+            time_range=(win_start, win_end),
+            screenshot_timestamps=list(samples),
+            require_canonical=True,
+        )
+    except Exception:
+        # MUST stay broad enough to catch CanonicalDerivationError (the fail-closed
+        # signal a partial canonical read raises under require_canonical=True) —
+        # mapping it to the all-blocked sentinel is what fails closed. Matched via
+        # Exception (not by name) so the heavy skip_intervals stack isn't imported
+        # at module top.
+        logger.warning(
+            "aggregate: blocked-interval derivation failed for %s; failing closed "
+            "(dropping the whole recording's contribution)",
+            rec_dir.name, exc_info=True,
+        )
+        return _always_span_blocked
+
+    # Pre-extract the merged, start-sorted [start, end) intervals for an overlap test.
+    blocked = [(iv.start, iv.end) for iv in intervals]
+
+    def is_span_blocked(s: float, e: float) -> bool:
+        # A focus span [s, e) is blocked if it overlaps ANY blocked interval.
+        return any(bs < e and s < be for bs, be in blocked)
+
+    return is_span_blocked
 
 
 # ---------------------------------------------------------------------------

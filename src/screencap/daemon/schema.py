@@ -445,6 +445,13 @@ def _load_models() -> dict[str, Any]:
     _MAX_EPOCH_MS = 253_402_300_800_000  # year 9999 in unix ms
     _MAX_STALENESS_CAP_MS = 86_400_000   # 24 hours in ms
 
+    from typing import Annotated
+
+    # A bounded epoch-ms element (ge=0, le=year-9999), reused inside the
+    # ``ChatAnswerRequest.window_ms`` tuple so BOTH endpoints carry the same bound
+    # as the scalar ``timestamp_ms`` fields (FIX F).
+    _EpochMs = Annotated[int, Field(ge=0, le=_MAX_EPOCH_MS)]
+
     class FrameNearestRequest(_DaemonModel):
         """SCR-186 nearest-frame resolution input.
 
@@ -672,7 +679,10 @@ def _load_models() -> dict[str, Any]:
 
         question: str = Field(max_length=_MAX_QUERY_LEN)
         prior_turns: list[ChatPriorTurn] = Field(default_factory=list)
-        window_ms: tuple[int, int] | None = None
+        # Bound BOTH window elements like ``timestamp_ms`` (ge=0, le=year-9999
+        # epoch ms) so a malformed/huge window is a typed 400 at the daemon
+        # boundary, not an unbounded-scan driver into aggregate_window.
+        window_ms: tuple[_EpochMs, _EpochMs] | None = None
         app: str | None = Field(default=None, max_length=_MAX_QUERY_LEN)
         limit: int | None = None
 

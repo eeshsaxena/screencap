@@ -22,6 +22,9 @@ Vision-free, provider mocked — NO real model calls.
 
 from __future__ import annotations
 
+import os
+from unittest import mock
+
 import pytest
 
 from screencap.recall.dispatch import (
@@ -212,6 +215,66 @@ def test_no_consent_and_on_device_unavailable_refuses():
     )
     assert result.refusal is True
     assert result.target in (ExecutionTarget.NONE, ExecutionTarget.ON_DEVICE)
+
+
+# ===========================================================================
+# FIX C — the on-device availability probe is UNAVAILABLE until SCR-243 lands
+# ===========================================================================
+
+
+def test_probe_reports_unavailable_for_a_cloud_primary(monkeypatch):
+    """The real availability probe must report on-device UNAVAILABLE until the
+    SCR-243 generation path lands — INCLUDING when the primary provider is a cloud
+    provider (gemini). The old probe returned ``not isinstance(provider,
+    OnDeviceProvider)``, which is True for a cloud primary → RECALL_ANSWER resolves
+    to ON_DEVICE and the cloud egress guard (gated on target is CLOUD) never runs
+    even though the prompt still egresses to Gemini."""
+    import screencap.config as cfg
+    from screencap.recall.dispatch import _probe_on_device_available
+
+    with mock.patch.dict(os.environ, {"SCREENCAP_LLM_PROVIDER": "gemini"}):
+        cfg._config_cache = {}
+        assert _probe_on_device_available() is False
+
+
+def test_cloud_primary_resolves_to_cloud_not_on_device_via_probe(monkeypatch):
+    """With a cloud PRIMARY provider (gemini) configured and the availability decided
+    by the REAL probe (on_device_available left as None), the turn must NOT resolve to
+    ON_DEVICE — it degrades through the consent ladder to CLOUD (running the egress
+    guard) when consented."""
+    import screencap.config as cfg
+
+    provider = CapturingProvider()
+    with mock.patch.dict(os.environ, {"SCREENCAP_LLM_PROVIDER": "gemini"}):
+        cfg._config_cache = {}
+        result = answer_from_bundle(
+            _bundle([_item("evidence snippet about the dashboard")]),
+            policy=_CLOUD_CONSENTED,
+            provider_factory=_factory(provider),
+            on_device_available=None,  # let the (real) probe decide
+        )
+    # A cloud primary must never launder into ON_DEVICE (which would skip the
+    # cloud egress guard). Consented → CLOUD; the egress guard ran.
+    assert result.target is ExecutionTarget.CLOUD
+    assert provider.calls, "the cloud turn ran the provider after the egress guard"
+
+
+def test_cloud_primary_no_consent_refuses_via_probe():
+    """A cloud primary with the real probe + NO consent resolves to NONE → refuse,
+    never silently to ON_DEVICE (which would bypass the egress guard)."""
+    import screencap.config as cfg
+
+    provider = CapturingProvider()
+    with mock.patch.dict(os.environ, {"SCREENCAP_LLM_PROVIDER": "gemini"}):
+        cfg._config_cache = {}
+        result = answer_from_bundle(
+            _bundle([_item("evidence snippet")]),
+            policy=_NO_CONSENT,
+            provider_factory=_factory(provider),
+            on_device_available=None,  # let the (real) probe decide
+        )
+    assert result.refusal is True
+    assert result.target is not ExecutionTarget.ON_DEVICE
 
 
 # ===========================================================================

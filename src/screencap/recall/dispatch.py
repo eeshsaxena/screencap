@@ -452,21 +452,21 @@ def _is_refusal_text(answer: str) -> bool:
 def _probe_on_device_available() -> bool:
     """Best-effort probe of whether the on-device answer backend can run right now.
 
-    Defaults conservatively: the on-device generation path (SCR-243) is not in this
-    tree, so today this returns ``False`` and the ladder degrades per consent. Kept a
-    single function so U5 / a future SCR-243 landing has one place to wire the real
-    availability check. Never raises."""
-    try:
-        from screencap import config
+    The on-device *generation* path (SCR-243) is not in this tree — NO backend can
+    generate a recall answer on-device today — so this unconditionally returns
+    ``False`` and the ladder degrades through the consent ladder per turn. This is
+    the single place a future SCR-243 landing wires the real availability check.
+    Never raises.
 
-        name = config.get_llm_provider()
-        provider = get_answer_provider(name)
-        # A probe answer over a marked-but-empty bundle: a runnable on-device backend
-        # would attempt generation; the SCR-243-absent backend returns the sentinel.
-        # We do NOT call the model here (that would be a real call) — we treat the
-        # on-device backend as unavailable until SCR-243 wires a real probe.
-        from screencap.segmentation.providers.ondevice import OnDeviceProvider
+    Returning ``False`` is load-bearing for the egress guard: a cloud primary (e.g.
+    ``llm_provider="gemini"``) must degrade to :attr:`ExecutionTarget.CLOUD` (where
+    :func:`assert_cloud_payload_bounded` runs) or refuse, NOT resolve to ON_DEVICE.
+    The previous ``not isinstance(provider, OnDeviceProvider)`` heuristic reported
+    True for a cloud primary → RECALL_ANSWER resolved to ON_DEVICE and the cloud
+    egress guard (gated on target is CLOUD) was skipped while the prompt still
+    egressed to the cloud provider.
 
-        return not isinstance(provider, OnDeviceProvider)
-    except Exception:
-        return False
+    # TODO(SCR-243): return a real availability probe of the on-device generation
+    # backend (helper/worker present + model ready) instead of the constant False.
+    """
+    return False

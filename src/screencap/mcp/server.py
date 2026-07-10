@@ -164,7 +164,9 @@ class ChatAnswerResult(BaseModel):
     ``answer`` is model-generated prose (OUTPUT-SANITIZED before it reaches the
     agent — see :func:`chat_answer`); ``sources`` are pointer-only locators (never
     image bytes / paths). ``refusal`` flags a no-evidence turn; ``question_kind``
-    is ``point`` / ``aggregate``.
+    is ``point`` / ``aggregate``. ``target`` is the execution target the turn
+    resolved to (``on_device`` / ``cloud`` / ``none`` / …), carried through from the
+    daemon envelope (which the Swift client also surfaces).
     """
 
     answer: str
@@ -172,6 +174,7 @@ class ChatAnswerResult(BaseModel):
     coverage: ChatCoverage
     refusal: bool
     question_kind: str
+    target: str
 
 
 # -- lazy daemon runtime (connect + held subscription on first tool call) ---
@@ -426,6 +429,7 @@ async def chat_answer(
         ),
         refusal=bool(env.get("refusal", False)),
         question_kind=env.get("question_kind", "point"),
+        target=env.get("target", "none"),
     )
 
 

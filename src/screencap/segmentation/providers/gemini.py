@@ -139,8 +139,20 @@ class GeminiProvider:
 
         ``evidence`` is accepted for interface parity (U4 folds it into the
         prompt) and to keep the seam uniform across backends; this backend does
-        not re-read it.
+        not re-read it for content, but it DOES enforce the fail-closed
+        ``stripped=True`` gate below.
         """
+        # Fail-closed privacy gate (defense-in-depth): this is the ONLY real
+        # cloud-egressing backend, so an evidence bundle not marked stripped=True
+        # (i.e. not run through U3's ALLOW-only terminal strip) must never reach
+        # the cloud model. Refuse WITHOUT calling out — the same posture
+        # downloaded/ondevice/local_server all carry.
+        if evidence.get("stripped") is not True:
+            log.warning(
+                "GeminiProvider.answer refused evidence not marked "
+                "stripped=True (fail-closed); returning unavailable."
+            )
+            return PROVIDER_UNAVAILABLE
         try:
             text = self._raw_answer(prompt)
         except Exception:

@@ -135,6 +135,22 @@ class TestGeminiAnswer:
             # Missing SDK → unavailable, never an exception.
             assert provider.answer(_PROMPT, _stripped_evidence()) is PROVIDER_UNAVAILABLE
 
+    def test_fail_closed_on_unmarked_evidence(self):
+        """FIX D: the ONLY real cloud-egressing backend must carry the same
+        fail-closed ``stripped=True`` gate the local backends have — evidence not
+        marked stripped is refused WITHOUT ever calling the model."""
+        provider_cls = _gemini()
+        called: list[str] = []
+
+        def _spy(prompt):
+            called.append(prompt)
+            return "leaked cloud answer"
+
+        provider = provider_cls(raw_answer=_spy)
+        result = provider.answer(_PROMPT, {"snippets": []})  # no stripped=True marker
+        assert result is PROVIDER_UNAVAILABLE
+        assert called == [], "an unmarked bundle must never reach the cloud model"
+
 
 # ---------------------------------------------------------------------------
 # On-device answer — SCR-243 generation path absent → unavailable

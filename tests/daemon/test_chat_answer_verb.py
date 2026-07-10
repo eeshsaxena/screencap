@@ -173,6 +173,22 @@ async def test_chat_answer_malformed_request_is_typed_4xx() -> None:
     assert r2.status_code == 400
     assert r2.json()["error"] == "invalid_request"
 
+    # FIX F: an out-of-bounds ``window_ms`` element → typed 400 at the boundary,
+    # never an unbounded scan into aggregate_window.
+    r3 = await _asgi_post(
+        "/v0/chat.answer",
+        {"question": "recap", "window_ms": [0, 10**18]},
+    )
+    assert r3.status_code == 400
+    assert r3.json()["error"] == "invalid_request"
+
+    r4 = await _asgi_post(
+        "/v0/chat.answer",
+        {"question": "recap", "window_ms": [-1, 1000]},
+    )
+    assert r4.status_code == 400
+    assert r4.json()["error"] == "invalid_request"
+
 
 @pytest.mark.asyncio
 async def test_chat_answer_downstream_failure_is_graceful_not_500(

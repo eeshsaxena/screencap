@@ -129,7 +129,14 @@ def _figure_numbers(figures: object | None) -> set[str]:
     """Every number a computed figure can be narrated as, from a duck-typed
     ``WindowAggregate`` (never a hard import of U2). We accept the raw ms value AND
     the common human renderings (whole minutes / hours) so an answer that says "90
-    minutes" over a 5_400_000 ms figure is BACKED."""
+    minutes" over a 5_400_000 ms figure is BACKED.
+
+    The backing set MUST include every rendering the guardrail prompt can actually
+    show (``dispatch._figure_lines``), or a faithfully-echoed figure is flagged
+    unbacked and the answer is blanked to a refusal. ``_figure_lines`` renders
+    minutes at ONE decimal (``int`` when whole, else ``round(minutes, 1)``), so we
+    add that exact 1-decimal rendering here as well as the coarser 2-decimal /
+    seconds / hours forms (FIX B)."""
     if figures is None:
         return set()
     nums: set[str] = set()
@@ -141,7 +148,8 @@ def _figure_numbers(figures: object | None) -> set[str]:
         ms = float(ms)
         nums.add(_fmt_num(ms))
         nums.add(_fmt_num(ms / 1000.0))          # seconds
-        nums.add(_fmt_num(ms / 60_000.0))        # minutes
+        nums.add(_fmt_num(ms / 60_000.0))        # minutes (2-decimal)
+        nums.add(_fmt_minutes_line(ms))          # minutes (1-decimal, as shown)
         nums.add(_fmt_num(ms / 3_600_000.0))     # hours
     # Per-app event counts are legitimate figures too.
     for app in getattr(figures, "apps", []) or []:
@@ -151,6 +159,7 @@ def _figure_numbers(figures: object | None) -> set[str]:
         covered = getattr(app, "covered_active_ms", None)
         if isinstance(covered, (int, float)):
             nums.add(_fmt_num(covered / 60_000.0))
+            nums.add(_fmt_minutes_line(float(covered)))  # 1-decimal, as shown
             nums.add(_fmt_num(covered / 3_600_000.0))
     return nums
 
@@ -161,6 +170,19 @@ def _fmt_num(value: float) -> str:
     if abs(value - round(value)) < 1e-9:
         return str(int(round(value)))
     return _numbers(f"{value:.2f}").pop() if _numbers(f"{value:.2f}") else str(value)
+
+
+def _fmt_minutes_line(ms: float) -> str:
+    """The minute rendering ``dispatch._figure_lines`` shows the model, VERBATIM:
+    an integer when whole, else ``round(minutes, 1)`` (one decimal). Kept in lockstep
+    with ``_figure_lines`` so a faithfully-echoed "1.7 minutes" is a backed number."""
+    minutes = ms / 60_000.0
+    if abs(minutes - round(minutes)) < 1e-9:
+        return str(int(round(minutes)))
+    # Normalize through _numbers so "1.70" → "1.7" compares canonically.
+    rendered = f"{round(minutes, 1)}"
+    parsed = _numbers(rendered)
+    return parsed.pop() if parsed else rendered
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +282,22 @@ def validate_attribution(
     # spans") is grounded, not fabricated.
     #
     # For an AGGREGATE answer whose numbers all check out (rule a passed above), the
-    # trust comes from the number matching the computed figure VERBATIM (R5), not from
-    # token overlap — the substantive content IS the figure narration. So rule (c) is
-    # relaxed for a figures-backed aggregate: the number-match is the load-bearing
-    # gate there. (Point answers still require overlap.)
+    # verbatim number-match (R5) is the load-bearing gate, so the general
+    # token-overlap requirement is relaxed there — an aggregate narration is mostly
+    # coverage phrasing the overlap heuristic would otherwise over-reject. But a
+    # number-match ALONE is not enough: the answer must not mis-ATTRIBUTE that number
+    # to an app absent from the computed figures ("90 minutes in Salesforce" when 90
+    # is Slack's figure). So we keep a bounded app-attribution check for aggregates
+    # (FIX E) instead of blanket-passing. (Point answers still require full overlap.)
     if bundle.question_kind is QuestionKind.AGGREGATE and bundle.figures is not None:
+        if _aggregate_names_absent_app(
+            answer, bundle.figures, question=question, evidence_text=evidence_text
+        ):
+            return AttributionVerdict(
+                ok=False,
+                reason="aggregate answer attributes a figure to an app absent from the computed figures",
+                sources=sources,
+            )
         return AttributionVerdict(ok=True, reason="", sources=sources)
 
     answer_tokens = _content_tokens(answer)
@@ -284,6 +317,80 @@ def validate_attribution(
             )
 
     return AttributionVerdict(ok=True, reason="", sources=sources)
+
+
+# The prepositions that, in an aggregate narration, mark the app a figure is
+# attributed TO ("… in Salesforce", "… on Slack", "… using Figma"). Bounded and
+# documented: this is a v1 heuristic, not full claim mapping.
+_APP_ATTRIBUTION_PREPOSITIONS = ("in", "on", "using", "within")
+
+# A candidate app name in the answer is a Capitalized word (proper-noun-shaped) —
+# app names the model narrates ("Slack", "Salesforce", "Figma") are capitalized,
+# while generic prose ("over covered spans") is not. Matched only right after an
+# attribution preposition so ordinary sentence-initial capitals don't trip it.
+_CAPITALIZED_WORD_RE = re.compile(r"[A-Z][A-Za-z0-9]{2,}")
+
+
+def _figure_app_tokens(figures: object | None) -> set[str]:
+    """Lowercase name-fragments of every app in ``figures.apps`` — each bundle-id /
+    name split on non-alphanumerics so "com.tinyspeck.slackmacgap" yields
+    {"com","tinyspeck","slackmacgap"}. Used for substring-matching an app the answer
+    names against the computed figures."""
+    frags: set[str] = set()
+    for app in getattr(figures, "apps", []) or []:
+        name = getattr(app, "app", None)
+        if isinstance(name, str):
+            frags.add(name.lower())
+            for frag in re.split(r"[^a-z0-9]+", name.lower()):
+                if frag:
+                    frags.add(frag)
+    return frags
+
+
+def _aggregate_names_absent_app(
+    answer: str,
+    figures: object | None,
+    *,
+    question: str = "",
+    evidence_text: str = "",
+) -> bool:
+    """True when the aggregate ``answer`` attributes a figure to an app that is
+    ABSENT from the computed ``figures.apps`` (FIX E — bounded heuristic).
+
+    Detection: a Capitalized word immediately following an attribution preposition
+    ("in/on/using X") is treated as the app the figure is credited to. It is
+    considered PRESENT (i.e. NOT a mis-attribution) when it substring-matches (either
+    direction) any app fragment in ``figures.apps`` — so "Slack" matches
+    "com.tinyspeck.slackmacgap" — OR appears in the user's own question (the app they
+    asked about) OR appears in the retrieved evidence text (a snippet mentioning it).
+    A named app that matches none of those is a mis-attribution → reject. An answer
+    that names no app is not a mis-attribution.
+
+    Bounded to when ``figures.apps`` is NON-EMPTY: a total-only figure (no per-app
+    breakdown — e.g. a window-total or an app-filtered window that credited zero
+    covered time) has no per-app claim to contradict, so we do not fire there (an
+    app name then comes from the question, not a per-app figure).
+    """
+    apps = getattr(figures, "apps", None) or []
+    if not apps:
+        return False
+    app_frags = _figure_app_tokens(figures)
+    question_low = (question or "").lower()
+    evidence_low = (evidence_text or "").lower()
+    words = answer.split()
+    for i, raw in enumerate(words[:-1]):
+        prep = re.sub(r"[^a-z]", "", raw.lower())
+        if prep not in _APP_ATTRIBUTION_PREPOSITIONS:
+            continue
+        m = _CAPITALIZED_WORD_RE.match(words[i + 1])
+        if not m:
+            continue
+        named = m.group(0).lower()
+        present = any(named in frag or frag in named for frag in app_frags)
+        present = present or (named in question_low) or (named in evidence_low)
+        if not present:
+            return True
+    return False
 
 
 def _figures_text(figures: object | None) -> str:

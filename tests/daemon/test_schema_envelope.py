@@ -215,6 +215,28 @@ def test_recording_stop_request_carries_force_cas_fields() -> None:
     assert parsed.expected_started_at == 1778198400.25
 
 
+def test_chat_answer_request_window_ms_bounds_are_enforced() -> None:
+    """FIX F: ``ChatAnswerRequest.window_ms`` elements are bounded like
+    ``timestamp_ms`` (ge=0, le=year-9999 epoch ms) so a malformed/huge window is a
+    typed validation error at the daemon boundary, not an unbounded scan driver."""
+    from pydantic import ValidationError
+
+    # A valid in-range window parses.
+    ok = schema.ChatAnswerRequest(question="q", window_ms=(1_000, 2_000))
+    assert ok.window_ms == (1_000, 2_000)
+
+    # A negative element is rejected.
+    with pytest.raises(ValidationError):
+        schema.ChatAnswerRequest(question="q", window_ms=(-1, 2_000))
+
+    # An absurdly huge element (beyond the year-9999 epoch ceiling) is rejected.
+    with pytest.raises(ValidationError):
+        schema.ChatAnswerRequest(question="q", window_ms=(0, 10**18))
+
+    # None (a point question) is still accepted.
+    assert schema.ChatAnswerRequest(question="q").window_ms is None
+
+
 def test_pydantic_models_round_trip_through_json_without_information_loss() -> None:
     recording = schema.RecordingSummary(
         name="demo",

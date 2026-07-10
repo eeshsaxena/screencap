@@ -89,6 +89,8 @@ async def test_chat_answer_forwards_and_maps_pointer_sources(monkeypatch):
     assert result.coverage.state == "ok"
     assert result.refusal is False
     assert result.question_kind == "point"
+    # FIX G: the execution target the daemon carries is surfaced on the result.
+    assert result.target == "on_device"
 
 
 @pytest.mark.asyncio
@@ -105,6 +107,19 @@ async def test_chat_answer_result_is_pointer_only(monkeypatch):
     dumped = result.sources[0].model_dump()
     assert "path" not in dumped
     assert "image" not in dumped and "bytes" not in dumped and "jpg" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_chat_answer_target_defaults_to_none_when_absent(monkeypatch):
+    """FIX G: an older daemon that omits ``target`` decodes to the safe "none"
+    default rather than dropping the field or erroring."""
+    env = _envelope("answer")
+    del env["target"]
+    stub = _StubClient(env)
+    _use_client(monkeypatch, stub)
+
+    result = await server.chat_answer("q")
+    assert result.target == "none"
 
 
 @pytest.mark.asyncio

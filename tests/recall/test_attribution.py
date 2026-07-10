@@ -77,6 +77,16 @@ class _FakeAggregate:
         self.apps = apps or []
 
 
+class _FakeApp:
+    """A stand-in for U2's AppActivity (the fields ``_figures_text`` /
+    ``_figure_numbers`` read)."""
+
+    def __init__(self, app: str, covered_active_ms: int = 0, event_count: int = 0) -> None:
+        self.app = app
+        self.covered_active_ms = covered_active_ms
+        self.event_count = event_count
+
+
 # ===========================================================================
 # Rule (b): empty bundle → must be a refusal
 # ===========================================================================
@@ -139,12 +149,99 @@ def test_echoed_computed_figure_passes():
     assert verdict.ok is True
 
 
+def test_fractional_minute_figure_rendering_is_backed():
+    """FIX B: the guardrail prompt renders minutes at 1 decimal (``_figure_lines``:
+    ``round(minutes, 1)`` → "1.7 minutes"), so an answer that faithfully echoes that
+    "1.7" must be BACKED. Previously ``_figure_numbers`` only rendered the 2-decimal
+    "1.67", so the model's honest "1.7" was flagged unbacked and the answer was
+    blanked to a refusal — a faithful answer refused."""
+    from screencap.recall.dispatch import _figure_lines
+
+    figures = _FakeAggregate(covered_active_ms=100_000)  # 100000/60000 = 1.6667 min
+    # The guardrail prompt the model actually sees renders "1.7 minutes".
+    lines = " ".join(_figure_lines(figures))
+    assert "1.7 minutes" in lines
+
+    bundle = _bundle(
+        [_item("Salesforce dashboard")],
+        figures=figures,
+        kind=QuestionKind.AGGREGATE,
+    )
+    verdict = validate_attribution(
+        answer="You spent about 1.7 minutes in Salesforce, over covered spans.",
+        bundle=bundle,
+    )
+    assert verdict.ok is True, "a faithfully-echoed 1-decimal minute figure must pass"
+
+
 def test_number_present_in_evidence_text_passes():
     """A number that appears in an evidence SNIPPET (not only a computed figure)
     is a backed number — e.g. an invoice number the user saw on screen."""
     bundle = _bundle([_item("Invoice #4471 total was 12 percent over budget")])
     verdict = validate_attribution(
         answer="The invoice you saw was #4471.",
+        bundle=bundle,
+    )
+    assert verdict.ok is True
+
+
+# ===========================================================================
+# FIX E: aggregate answers must not blanket-pass — an app absent from the
+# computed figures cannot be named as the subject of a figure
+# ===========================================================================
+
+
+def test_aggregate_answer_naming_app_absent_from_figures_is_rejected():
+    """FIX E: an aggregate answer that attributes a figure to an app NOT present in
+    the computed figures.apps is rejected — e.g. "90 minutes in Salesforce" when the
+    90-minute figure belongs to Slack and Salesforce is absent. The old code
+    early-returned ok=True for any AGGREGATE bundle once the number matched, so the
+    figure could be mis-attributed to a wrong (absent) app."""
+    bundle = _bundle(
+        [],
+        figures=_FakeAggregate(
+            covered_active_ms=90 * 60 * 1000,
+            apps=[_FakeApp("com.tinyspeck.slackmacgap", covered_active_ms=90 * 60 * 1000)],
+        ),
+        kind=QuestionKind.AGGREGATE,
+    )
+    verdict = validate_attribution(
+        answer="You spent about 90 minutes in Salesforce this morning.",
+        bundle=bundle,
+    )
+    assert verdict.ok is False
+    assert verdict.reason
+
+
+def test_aggregate_answer_naming_a_present_app_passes():
+    """The counterpart: an aggregate answer naming an app that IS in figures.apps
+    (matched on a substring of the bundle id / name) passes — the bounded heuristic
+    only rejects an app absent from the computed figures."""
+    bundle = _bundle(
+        [],
+        figures=_FakeAggregate(
+            covered_active_ms=90 * 60 * 1000,
+            apps=[_FakeApp("com.tinyspeck.slackmacgap", covered_active_ms=90 * 60 * 1000)],
+        ),
+        kind=QuestionKind.AGGREGATE,
+    )
+    verdict = validate_attribution(
+        answer="You spent about 90 minutes in Slack this morning, over covered spans.",
+        bundle=bundle,
+    )
+    assert verdict.ok is True
+
+
+def test_aggregate_answer_with_no_app_names_still_passes():
+    """An aggregate answer that narrates only the total (no app named) still passes —
+    the app-presence check only fires when the answer actually names an app."""
+    bundle = _bundle(
+        [],
+        figures=_FakeAggregate(covered_active_ms=90 * 60 * 1000),
+        kind=QuestionKind.AGGREGATE,
+    )
+    verdict = validate_attribution(
+        answer="You were active about 90 minutes total, over covered spans.",
         bundle=bundle,
     )
     assert verdict.ok is True
