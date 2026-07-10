@@ -59,9 +59,13 @@ class LocalServerProvider:
         self,
         endpoint: str | None = None,
         raw_call: Callable[[str, str], dict | None] | None = None,
+        raw_answer: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._raw_call = raw_call if raw_call is not None else self._default_raw_call
+        self._raw_answer = (
+            raw_answer if raw_answer is not None else self._default_raw_answer
+        )
 
     def segment(self, activity_summary: dict) -> dict | None | ProviderUnavailable:
         # Fail-closed privacy gate (R10): refuse unmarked input.
@@ -101,6 +105,48 @@ class LocalServerProvider:
         # Validate → sanitize (KTD12) → confidence-gate (KTD9), shared with the
         # downloaded backend (both surface model-generated names to the same sink).
         return finalize_local_result(raw, activity_summary)
+
+    def answer(self, prompt: str, evidence: dict) -> str | ProviderUnavailable:
+        """Recall-answer via the BYO local model server (SCR-243 path).
+
+        Net-new generation seam. Mirrors :meth:`segment`'s posture — the same
+        fail-closed ``stripped`` gate, the same endpoint resolution and the
+        **connect-time LOCAL re-assertion** (KTD8: never egress off-box) — then
+        posts the guardrail ``prompt`` for free-prose completion (no
+        ``json_object`` response format; a recall answer is prose, not tasks).
+        Returns the model's text on success, or
+        :data:`~screencap.segmentation.provider.PROVIDER_UNAVAILABLE` when the
+        backend could not run. Never raises for an ordinary failure.
+        """
+        if evidence.get("stripped") is not True:
+            log.warning("LocalServerProvider.answer refused an unmarked bundle; unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        endpoint = self._endpoint
+        if endpoint is None:
+            from screencap import config
+
+            endpoint = config.get_local_server_endpoint()
+        if not endpoint:
+            log.info("No local-server endpoint configured; answer unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        # Re-assert LOCAL on the exact string about to be POSTed (KTD8) — same
+        # send-time guard segment uses; never egress an answer off-box.
+        from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+
+        if classify_endpoint(endpoint) != LOCAL:
+            log.warning("Local-server endpoint is not LOCAL at send time; answer unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        try:
+            text = self._raw_answer(_pin_localhost(endpoint), prompt)
+        except Exception:
+            log.warning("Local-server answer call raised; unavailable", exc_info=True)
+            return PROVIDER_UNAVAILABLE
+        if text is None:
+            return PROVIDER_UNAVAILABLE
+        return text
 
     @staticmethod
     def _default_raw_call(endpoint: str, prompt: str) -> dict | None:
@@ -148,4 +194,51 @@ class LocalServerProvider:
             return parsed if isinstance(parsed, dict) else None
         except Exception:
             log.warning("Local-server call failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _default_raw_answer(endpoint: str, prompt: str) -> str | None:
+        """Live OpenAI-compatible completion for recall-answering. Text or None.
+
+        Mirrors :meth:`_default_raw_call` (same KTD8 hardening: no redirects,
+        capped streamed body, pinned host) but WITHOUT the ``json_object``
+        response format — the completion is free prose, and the inner content is
+        returned verbatim rather than parsed as task JSON. Not run in CI (needs a
+        server + ``requests``).
+        """
+        try:
+            import requests
+        except ImportError:  # pragma: no cover
+            return None
+        base = endpoint.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")].rstrip("/")
+        url = base + "/v1/chat/completions"
+        body = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            with requests.post(
+                url,
+                json=body,
+                timeout=_REQUEST_TIMEOUT_S,
+                allow_redirects=False,  # a 302 must not bounce us off-box (KTD8)
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    return None
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    total += len(chunk)
+                    if total > _MAX_RESPONSE_BYTES:
+                        log.warning("Local-server answer exceeds the size cap; unavailable")
+                        return None
+                    chunks.append(chunk)
+            content = json.loads(b"".join(chunks))["choices"][0]["message"]["content"]
+            return content if isinstance(content, str) else None
+        except Exception:
+            log.warning("Local-server answer call failed", exc_info=True)
             return None

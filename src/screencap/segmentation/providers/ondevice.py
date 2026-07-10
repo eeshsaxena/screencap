@@ -226,6 +226,37 @@ class OnDeviceProvider:
             log.warning("On-device helper output failed validation", exc_info=True)
             return None
 
+    def answer(self, prompt: str, evidence: dict) -> str | ProviderUnavailable:
+        """Recall-answer via the on-device model — unavailable until SCR-243 lands.
+
+        The Apple Foundation Models Swift-helper exposes only the segmentation
+        (task-JSON) path today; the ``prompt→answer`` generation path does NOT
+        exist yet. Until it lands, this reports unavailable so U1's degradation
+        ladder degrades to a downloaded/consented-cloud backend rather than
+        raising — the same tri-state posture ``segment`` uses.
+
+        The fail-closed ``stripped`` gate is kept consistent with ``segment``:
+        an evidence bundle not marked ``stripped=True`` is refused first, so the
+        posture is already correct when SCR-243 wires in a real helper call here.
+
+        # TODO(SCR-243): on-device generation path — replace the unconditional
+        # unavailable return with a Swift-helper generation call (write the
+        # guardrail prompt + delimited evidence to the helper, read the answer
+        # envelope back), reusing the discovery/timeout/scrubbed-env machinery
+        # ``segment`` already has above.
+        """
+        if evidence.get("stripped") is not True:
+            log.warning(
+                "OnDeviceProvider.answer refused evidence not marked "
+                "stripped=True (fail-closed); returning unavailable."
+            )
+            return PROVIDER_UNAVAILABLE
+        log.info(
+            "On-device generation path not available (SCR-243 not landed); "
+            "answer reports unavailable."
+        )
+        return PROVIDER_UNAVAILABLE
+
     @staticmethod
     def _parse_envelope(stdout: str) -> dict | None | ProviderUnavailable:
         """Decode the helper's stdout envelope.

@@ -177,6 +177,41 @@ class DownloadedProvider:
         # (KTD12) → confidence-gate (KTD9), shared with the BYO backend.
         return finalize_local_result(raw_result, activity_summary)
 
+    def answer(self, prompt: str, evidence: dict) -> str | ProviderUnavailable:
+        """Recall-answer via the hardened downloaded-model worker (SCR-243 path).
+
+        Net-new generation seam. Mirrors :meth:`segment`'s posture — the same
+        fail-closed ``stripped`` gate (no worker spawn on unmarked input), the
+        same model-resolution / stdin-cap / single-flight + RAM guard — but the
+        worker runs in an ``answer`` mode (prompt in → prose out) and the
+        envelope carries ``answer`` text, not tasks. Returns the model's text on
+        success, or :data:`~screencap.segmentation.provider.PROVIDER_UNAVAILABLE`
+        when the backend could not run. Never raises for an ordinary failure.
+        """
+        if evidence.get("stripped") is not True:
+            log.warning(
+                "DownloadedProvider.answer refused evidence not marked "
+                "stripped=True (fail-closed); returning unavailable."
+            )
+            return PROVIDER_UNAVAILABLE
+
+        model_path = _resolve_model_path()
+        if model_path is None:
+            log.info("No downloaded model installed; answer unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        payload = json.dumps(
+            {"mode": "answer", "prompt": prompt, "model_path": model_path}
+        )
+        if len(payload.encode("utf-8")) > _MAX_STDIN_BYTES:
+            log.warning("Downloaded-model answer request exceeds the stdin cap; unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        stdout = self._run_worker_raw(payload)
+        if stdout is PROVIDER_UNAVAILABLE:
+            return PROVIDER_UNAVAILABLE
+        return self._parse_answer_envelope(stdout)
+
     def _run_worker(self, payload: str) -> dict | None | ProviderUnavailable:
         """Spawn the worker and return its raw ``result`` dict, ``None``, or the sentinel.
 
@@ -195,9 +230,39 @@ class DownloadedProvider:
                 return PROVIDER_UNAVAILABLE
             if not has_ram_headroom(_installed_model_size()):
                 return PROVIDER_UNAVAILABLE
-            return self._spawn_worker(payload)
+            stdout = self._spawn_worker_raw(payload)
+            if stdout is PROVIDER_UNAVAILABLE:
+                return PROVIDER_UNAVAILABLE
+            return self._parse_envelope(stdout)
 
-    def _spawn_worker(self, payload: str) -> dict | None | ProviderUnavailable:
+    def _run_worker_raw(self, payload: str) -> str | ProviderUnavailable:
+        """Guarded raw worker spawn for the answer path — returns stdout or sentinel.
+
+        Same single-flight + RAM-headroom guard as :meth:`_run_worker`, but hands
+        back the worker's raw stdout so the answer path parses its own
+        (``{status, answer}``) envelope rather than the tasks (``{status, result}``)
+        one — the guard/spawn machinery is shared, only the envelope shape differs.
+        """
+        from screencap.segmentation.inference_guard import (
+            has_ram_headroom,
+            inference_slot,
+        )
+
+        with inference_slot() as acquired:
+            if not acquired:
+                log.info("Another inference worker is in flight; skipping (unavailable)")
+                return PROVIDER_UNAVAILABLE
+            if not has_ram_headroom(_installed_model_size()):
+                return PROVIDER_UNAVAILABLE
+            return self._spawn_worker_raw(payload)
+
+    def _spawn_worker_raw(self, payload: str) -> str | ProviderUnavailable:
+        """Spawn the worker and return its raw stdout, or the unavailable sentinel.
+
+        The shared subprocess spawn (nice, allowlist env, timeout, size caps,
+        stderr-not-logged) for BOTH the segment and answer paths — each parses
+        the returned stdout into its own envelope shape.
+        """
         cmd = _worker_command()
 
         def _preexec() -> None:  # pragma: no cover - child-side, POSIX only
@@ -232,7 +297,37 @@ class DownloadedProvider:
             log.warning("Downloaded-model worker output exceeds the stdout cap; unavailable")
             return PROVIDER_UNAVAILABLE
 
-        return self._parse_envelope(proc.stdout)
+        return proc.stdout
+
+    @staticmethod
+    def _parse_answer_envelope(stdout: str) -> str | ProviderUnavailable:
+        """Decode the worker's ``{status, answer}`` envelope into the answer text.
+
+        Returns the ``answer`` string on ``status == "ok"`` (a recall answer is
+        free prose, not tasks), or :data:`PROVIDER_UNAVAILABLE` on
+        ``status == "unavailable"`` or any unparseable/garbage output.
+        """
+        text = (stdout or "").strip()
+        if not text:
+            log.warning("Downloaded-model answer worker produced empty stdout; unavailable")
+            return PROVIDER_UNAVAILABLE
+        try:
+            envelope = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Downloaded-model answer worker stdout was not JSON; unavailable")
+            return PROVIDER_UNAVAILABLE
+        if not isinstance(envelope, dict):
+            return PROVIDER_UNAVAILABLE
+
+        status = envelope.get("status")
+        if status == "ok":
+            answer = envelope.get("answer")
+            return answer if isinstance(answer, str) else PROVIDER_UNAVAILABLE
+        if status == "unavailable":
+            log.info("Downloaded-model answer worker unavailable: %s",
+                     envelope.get("reason", ""))
+            return PROVIDER_UNAVAILABLE
+        return PROVIDER_UNAVAILABLE
 
     @staticmethod
     def _parse_envelope(stdout: str) -> dict | None | ProviderUnavailable:

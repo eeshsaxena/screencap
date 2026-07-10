@@ -78,6 +78,17 @@ PROVIDER_UNAVAILABLE = ProviderUnavailable()
 #: The full return type of :meth:`LLMProvider.segment`.
 SegmentResult = Union[dict, None, ProviderUnavailable]
 
+#: The full return type of :meth:`AnswerProvider.answer`.
+#:
+#: Unlike :data:`SegmentResult`, there is no ``None`` shape: a recall answer is
+#: either the model's prose (a ``str``, possibly empty when the model declined
+#: to answer over thin evidence — grounding is a *behavioral* property enforced
+#: downstream, not a return-shape) or :data:`PROVIDER_UNAVAILABLE` (the backend
+#: could not run at all). This mirrors ``segment``'s "never raise for an
+#: ordinary model/API error" contract with the sentinel standing in for every
+#: could-not-run outcome.
+AnswerResult = Union[str, ProviderUnavailable]
+
 
 @runtime_checkable
 class LLMProvider(Protocol):
@@ -90,6 +101,27 @@ class LLMProvider(Protocol):
     """
 
     def segment(self, activity_summary: dict) -> SegmentResult:
+        ...
+
+
+@runtime_checkable
+class AnswerProvider(Protocol):
+    """Narrow generation seam for recall-answering (SCR-243 / the chat feature).
+
+    Net-new alongside :class:`LLMProvider` and deliberately NOT an overload of
+    ``segment`` — recall-answering is ``prompt + evidence → prose``, not the
+    session→task-JSON shape ``segment`` produces. Every segmentation backend
+    also implements this seam.
+
+    ``answer`` takes a guardrail ``prompt`` and a stripped ``evidence`` bundle
+    (the ALLOW-only snippets + computed figures U3 assembles) and returns the
+    model's prose (:class:`str`) or :data:`PROVIDER_UNAVAILABLE` when the
+    backend could not run at all. Like ``segment``, it **never raises** for an
+    ordinary model/API error — a failed cloud call, a missing model, or an
+    unmarked (fail-closed) evidence bundle all resolve to the sentinel.
+    """
+
+    def answer(self, prompt: str, evidence: dict) -> AnswerResult:
         ...
 
 
@@ -125,3 +157,20 @@ def get_provider(name: str) -> LLMProvider:
         f"Unknown LLM provider: {name!r}. "
         "Known providers: 'gemini', 'on-device', 'downloaded', 'local-server'."
     )
+
+
+def get_answer_provider(name: str) -> AnswerProvider:
+    """Return the recall-answer backend for ``name`` (the generation-seam factory).
+
+    Same name→backend mapping as :func:`get_provider` — every segmentation
+    backend also implements :class:`AnswerProvider`, so this reuses the same
+    lazy-import registry rather than a parallel one. ``name`` is resolved by the
+    caller the same way (``config.get_llm_provider`` env > toml > default for the
+    preferred/on-device path; ``config.get_llm_cloud_provider`` for a consented
+    cloud fallback).
+
+    Backend modules stay lazily imported so this factory (and the interface
+    module) remain cloud-free and import-light at import time.
+    """
+    # The registry is identical; the return is typed to the generation seam.
+    return get_provider(name)

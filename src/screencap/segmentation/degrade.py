@@ -40,7 +40,11 @@ from screencap.segmentation.consent import (
     ExecutionTarget,
     TaskKind,
 )
-from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, SegmentResult
+from screencap.segmentation.provider import (
+    PROVIDER_UNAVAILABLE,
+    AnswerResult,
+    SegmentResult,
+)
 
 
 class DegradeAction(enum.Enum):
@@ -69,10 +73,17 @@ class DegradeAction(enum.Enum):
 
 @dataclass(frozen=True)
 class Degradation:
-    """The resolved decision for one task. ``tasks`` is set only for USE_PROVIDER."""
+    """The resolved decision for one task.
+
+    ``tasks`` is set only for a segmentation ``USE_PROVIDER`` (a validated tasks
+    dict); ``answer`` is set only for a recall-answer ``USE_PROVIDER`` (the
+    generated prose). They are the two provider-result payloads the two resolve
+    entry points carry; both are ``None`` for HEURISTIC/CLOUD/NONE.
+    """
 
     action: DegradeAction
     tasks: dict | None = None
+    answer: str | None = None
 
 
 def resolve(
@@ -136,3 +147,41 @@ def resolve_day_split(
             "ConsentPolicy.resolve returned CLOUD for DAY_SPLIT"
         )
     return decision
+
+
+def resolve_answer(
+    answer_result: AnswerResult,
+    policy: ConsentPolicy,
+) -> Degradation:
+    """Map a recall-answer ``(str | PROVIDER_UNAVAILABLE)`` onto a :class:`Degradation`.
+
+    The generation seam (U1) returns a two-shape :data:`AnswerResult` — prose
+    (:class:`str`) or :data:`PROVIDER_UNAVAILABLE` — NOT the tri-state
+    :data:`SegmentResult` :func:`resolve` is typed to (there is no ``None``
+    "ran, no usable output" shape: an empty/declined prose answer is still a
+    ``str``, and grounding is enforced behaviorally downstream, not here). So it
+    can't reuse :func:`resolve` as-is; it reuses the **routing logic** —
+    :data:`PROVIDER_UNAVAILABLE` + :class:`ConsentPolicy` on
+    :attr:`TaskKind.RECALL_ANSWER` — over the answer shape:
+
+    - a prose ``str`` → :attr:`DegradeAction.USE_PROVIDER` (the provider ran and
+      answered; ``answer`` on the :class:`Degradation` carries the text).
+    - :data:`PROVIDER_UNAVAILABLE` → route through :class:`ConsentPolicy` with
+      ``on_device_available=False`` for ``RECALL_ANSWER``: a consented cloud
+      fallback resolves to :attr:`DegradeAction.CLOUD`; otherwise
+      :attr:`DegradeAction.NONE`. It never raises for an unavailable backend —
+      the ladder degrades to a consented cloud provider or leaves the turn
+      unanswered.
+    """
+    # Provider ran and produced prose (str) — use it, regardless of consent.
+    if isinstance(answer_result, str):
+        return Degradation(DegradeAction.USE_PROVIDER, answer=answer_result)
+
+    # Anything that is not a str is the could-not-run sentinel — consult the
+    # consent matrix (on-device off) on the RECALL_ANSWER kind.
+    target = policy.resolve(TaskKind.RECALL_ANSWER, on_device_available=False)
+    if target is ExecutionTarget.CLOUD:
+        return Degradation(DegradeAction.CLOUD)
+    # RECALL_ANSWER never resolves to HEURISTIC (that is the day-split fallback);
+    # ON_DEVICE is unreachable with on_device_available=False. NONE otherwise.
+    return Degradation(DegradeAction.NONE)
