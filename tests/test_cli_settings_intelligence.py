@@ -545,4 +545,5 @@ class TestBYOKeyPresenceReadback:
 
     def test_readback_schema_version_bumped(self, fake_key_store):
         r = _invoke(as_json=True)
-        assert _last_json_line(r.output)["schema_version"] == 2
+        # v3: U4 added the per-vendor ``*-cli`` availability booleans.
+        assert _last_json_line(r.output)["schema_version"] == 3

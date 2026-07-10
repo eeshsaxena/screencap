@@ -63,7 +63,10 @@ _SETTINGS_SCHEMA_VERSION = 2
 # v2 (BYO cloud, U2): adds per-vendor ``<vendor>_key_present`` booleans so the
 # Swift pane can render "connected" without ever seeing a key. Additive: every
 # v1 field is unchanged.
-_SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 2
+# v3 (BYO cloud, U4): adds per-vendor ``<vendor>_cli_available`` booleans (the
+# ``*-cli`` delegation availability, existence/stat only) so the pane can render
+# each CLI option available / needs-attention (R5). Additive over v2.
+_SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 3
 _STOP_SCHEMA_VERSION = 1
 # `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed),
 # read by the SwiftUI shell to gate the Upload affordance on auth + entitlement.
@@ -3250,6 +3253,10 @@ def _build_intelligence_settings_block() -> dict:
         # BYO API-key presence (U2). A per-vendor *presence boolean only* — the key
         # value is NEVER exposed here (R3). ``*-cli`` delegation ids hold no key.
         **_byo_key_presence(),
+        # BYO CLI-delegation availability (U4). A per-vendor *availability boolean*
+        # so the pane can render each ``*-cli`` option available / needs-attention
+        # (R5). Existence/stat only — never opens the vendor auth files (KTD1).
+        **_byo_cli_availability(),
     }
 
 
@@ -3269,6 +3276,31 @@ def _byo_key_presence() -> dict:
         f"{vendor}_key_present": byo_secrets.has_key(vendor)
         for vendor in byo_secrets.KEY_VENDORS
     }
+
+
+def _byo_cli_availability() -> dict:
+    """Return ``{"<vendor>_cli_available": bool}`` for each BYO CLI-delegation id.
+
+    Availability = the vendor CLI binary resolves AND a vendor auth artifact
+    exists on disk (existence/stat only — never reads the auth files, KTD1). The
+    Swift pane renders an unavailable option as needs-attention with an
+    install/sign-in path (R5). Fails closed (any error → ``False``) so a probe
+    failure degrades the flag rather than crashing the read; the whole map
+    defaults to empty if the module can't be imported.
+    """
+    try:
+        from screencap.segmentation.providers import cli_delegate
+    except Exception:
+        return {}
+    out: dict = {}
+    for vendor in cli_delegate.VENDOR_IDS:
+        # ``vendor`` is e.g. "openai-cli" → field "openai_cli_available".
+        field = vendor.replace("-", "_") + "_available"
+        try:
+            out[field] = cli_delegate.CliDelegateProvider(vendor).available()
+        except Exception:  # noqa: BLE001 — a probe error must not fail the read
+            out[field] = False
+    return out
 
 
 def _redact_url(url):

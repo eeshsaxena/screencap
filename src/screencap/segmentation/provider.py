@@ -99,7 +99,10 @@ def get_provider(name: str) -> LLMProvider:
     ``"gemini"`` → :class:`~screencap.segmentation.providers.gemini.GeminiProvider`.
     ``"on-device"`` →
     :class:`~screencap.segmentation.providers.ondevice.OnDeviceProvider` (the
-    Apple Foundation Models Swift-helper subprocess client). Any other name is
+    Apple Foundation Models Swift-helper subprocess client).
+    ``"openai-cli"`` / ``"anthropic-cli"`` / ``"gemini-cli"`` →
+    :class:`~screencap.segmentation.providers.cli_delegate.CliDelegateProvider`
+    (BYO delegation to the user's installed vendor CLI). Any other name is
     rejected with a clear :class:`ValueError`.
 
     Backend modules are imported lazily so this factory (and the interface
@@ -121,7 +124,13 @@ def get_provider(name: str) -> LLMProvider:
         from screencap.segmentation.providers.local_server import LocalServerProvider
 
         return LocalServerProvider()
+    if name in ("openai-cli", "anthropic-cli", "gemini-cli"):
+        # BYO CLI-delegation backends (U4): shell out to the user's installed
+        # ``codex`` / ``claude`` / ``gemini`` CLI. Cloud-fallback ids only.
+        from screencap.segmentation.providers.cli_delegate import CliDelegateProvider
+
+        return CliDelegateProvider(name)
     raise ValueError(
-        f"Unknown LLM provider: {name!r}. "
-        "Known providers: 'gemini', 'on-device', 'downloaded', 'local-server'."
+        f"Unknown LLM provider: {name!r}. Known providers: 'gemini', 'on-device', "
+        "'downloaded', 'local-server', 'openai-cli', 'anthropic-cli', 'gemini-cli'."
     )
