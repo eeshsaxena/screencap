@@ -611,13 +611,19 @@ def _strip_blocked(
 ) -> list[EvidenceItem]:
     """Drop every candidate whose ``timestamp_ms`` falls in a blocked interval.
 
-    ALLOW-only selection via :func:`screencap.frame_blocked.build_is_blocked`, which
-    re-derives the ``SCRUB_BLOCK_ACTIONS`` skip set over the intact local
+    ALLOW-only selection via :func:`screencap.frame_blocked.build_is_blocked` with
+    ``screenshot_residuals=False``: it re-derives the genuine privacy set (canonical
+    ``SCRUB_BLOCK_ACTIONS`` + ambiguity + secure-field) over the intact local
     ``recording.db`` with ``require_canonical=True`` (fail-closed: a missing/partial
-    DB or indeterminate geometry flags EVERY frame). This is terminal over the WHOLE
-    bundle — fresh AND re-derived prior-turn items — so no masked/excluded content
-    can reach a provider (R11, KTD5). ``sanitize.py`` is NOT used here (it only
-    cleans model-emitted task text, does no content redaction).
+    DB or indeterminate geometry flags EVERY item). The screenshot-file residuals
+    (orphan-screenshot / uncovered-gap) are deliberately OMITTED here — an evidence
+    item's ``timestamp_ms`` is a ``window_event`` time (timeline) or chunk-start time
+    (transcript), not an on-disk ``screenshots/*.jpg`` file, so those residuals would
+    false-positive every item; the genuine intervals fully cover masked/excluded/
+    secure-field windows for every stream. This is terminal over the WHOLE bundle —
+    fresh AND re-derived prior-turn items — so no masked/excluded content can reach a
+    provider (R11, KTD5). ``sanitize.py`` is NOT used here (it only cleans
+    model-emitted task text, does no content redaction).
     """
     if not candidates:
         return []
@@ -640,7 +646,13 @@ def _strip_blocked(
             continue
         frame_tss = [item.timestamp_ms / 1000.0 for item in items]
         try:
-            is_blocked = build_is_blocked(rec_dir, frame_tss)
+            # screenshot_residuals=False: evidence timestamps are window-event
+            # (timeline) or chunk-start (transcript) times, NOT on-disk screenshot
+            # files, so the orphan-screenshot/uncovered-gap residuals are
+            # inapplicable and would flag every item. Test membership against the
+            # genuine privacy intervals only (canonical + ambiguity + secure-field);
+            # require_canonical still fails closed on a missing/partial DB.
+            is_blocked = build_is_blocked(rec_dir, frame_tss, screenshot_residuals=False)
         except Exception:
             # build_is_blocked is itself fail-closed and does not raise, but guard
             # anyway: an unexpected error drops the whole recording's items.

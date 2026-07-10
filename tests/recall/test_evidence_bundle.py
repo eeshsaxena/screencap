@@ -257,6 +257,40 @@ def test_masked_interval_content_absent_from_bundle(tmp_path):
     assert "rec-secret" not in recordings_present
 
 
+def test_timeline_evidence_at_allow_window_survives_strip(tmp_path):
+    """Regression (the root-cause bug): a TIMELINE evidence item at an ALLOW
+    window's timestamp survives the strip.
+
+    A timeline item carries a ``window_event`` timestamp, not an on-disk
+    screenshot file. Before the ``screenshot_residuals=False`` fix, the strip fed
+    that timestamp through the screenshot-file residuals and flagged it an
+    orphan-screenshot, wiping every timeline/transcript item and emptying the
+    bundle. The strip must now keep genuinely-ALLOW timeline evidence.
+    """
+    rec = tmp_path / "rec-allow"
+    allow_ts = 1_770_000_100.0
+    # A benign (non-sensitive) window classifies ALLOW under PUBLIC.
+    _make_recording_with_masked_window(
+        rec, masked_ts=allow_ts, masked_bundle="com.apple.TextEdit"
+    )
+    allow_ms = int(allow_ts * 1000)
+
+    retriever = FakeRetriever(
+        timeline=[
+            {"recording": "rec-allow", "timestamp_ms": allow_ms,
+             "app": "TextEdit", "title": "Notes"},
+        ],
+    )
+    bundle = build_evidence_bundle(
+        "what did I do", retriever=retriever, recordings_dir=tmp_path,
+    )
+    recordings_present = {item.recording for item in bundle.evidence}
+    assert "rec-allow" in recordings_present, (
+        "ALLOW timeline evidence must survive the strip (the root-cause regression)"
+    )
+    assert bundle.coverage.state is CoverageState.OK
+
+
 def test_coverage_gap_is_treated_as_blocked_fail_closed(tmp_path):
     """A hit for a recording whose recording.db is MISSING (indeterminate blocked
     geometry) is dropped — fail-closed. build_is_blocked flags every frame when it

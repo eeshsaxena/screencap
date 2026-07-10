@@ -146,3 +146,111 @@ def test_partial_canonical_read_fails_closed(tmp_path, monkeypatch):
     # Fail-closed: the masked frame (and every frame) is blocked → miss.
     assert is_blocked(150.0) is True
     assert is_blocked(999.0) is True
+
+
+def _add_screenshot_rows(db_path: Path, timestamps: list[float]) -> None:
+    """Add a ``screenshot`` table with the given surviving-row timestamps.
+
+    Presence of the table activates the orphan-screenshot cross-check in
+    ``derive_skip_intervals`` (SCR-191): a queried timestamp NOT among these rows
+    is flagged an orphan when screenshot residuals are on.
+    """
+    with contextlib.closing(sqlite3.connect(str(db_path))) as db:
+        db.execute(
+            "CREATE TABLE screenshot ("
+            "id INTEGER PRIMARY KEY, recording_id INTEGER, timestamp REAL, image_path TEXT)"
+        )
+        for i, ts in enumerate(timestamps):
+            db.execute(
+                "INSERT INTO screenshot (id, recording_id, timestamp, image_path) "
+                "VALUES (?, 1, ?, NULL)",
+                (i + 1, ts),
+            )
+        db.commit()
+
+
+@pytest.mark.privacy
+def test_screenshot_residuals_false_keeps_allow_non_frame_timestamp(tmp_path, monkeypatch):
+    """The recall evidence-strip contract (screenshot_residuals=False).
+
+    A non-screenshot timestamp (a window-event/chunk-start time, as recall
+    evidence carries) inside an ALLOW window is flagged an ORPHAN under the
+    default screenshot-file mode (True) — the exact false-positive that wiped all
+    timeline/transcript evidence — but survives under screenshot_residuals=False,
+    which tests only the genuine privacy intervals.
+    """
+    rec = tmp_path / "rec"
+    # Benign ALLOW window covering [100, inf); a screenshot row exists only at 100.
+    _make_window_db(
+        rec / "recording.db", ts=100.0,
+        bundle="com.apple.TextEdit", title="Notes",
+    )
+    _add_screenshot_rows(rec / "recording.db", [100.0])
+
+    from screencap.backfill.skip_intervals import build_classifier_evaluator
+
+    classifier, evaluator = build_classifier_evaluator(mode=PrivacyMode.PUBLIC)
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.build_classifier_evaluator",
+        lambda *a, **k: (classifier, evaluator),
+    )
+
+    # 150.0 is an ALLOW-window time with no matching screenshot row.
+    blocked_as_frame = frame_blocked.build_is_blocked(rec, [150.0])
+    assert blocked_as_frame(150.0) is True  # orphan-screenshot → blocked (file mode)
+
+    blocked_as_evidence = frame_blocked.build_is_blocked(
+        rec, [150.0], screenshot_residuals=False
+    )
+    assert blocked_as_evidence(150.0) is False  # genuine intervals only → survives
+
+
+@pytest.mark.privacy
+def test_screenshot_residuals_false_still_blocks_masked_window(tmp_path, monkeypatch):
+    """screenshot_residuals=False must NOT under-block: a canonical
+    SCRUB_BLOCK_ACTIONS (1Password) window still blocks its span."""
+    rec = tmp_path / "rec"
+    _make_window_db(
+        rec / "recording.db", ts=100.0,
+        bundle="com.1password.1password", title="Vault",
+    )
+    from screencap.backfill.skip_intervals import build_classifier_evaluator
+
+    classifier, evaluator = build_classifier_evaluator(mode=PrivacyMode.PUBLIC)
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.build_classifier_evaluator",
+        lambda *a, **k: (classifier, evaluator),
+    )
+    is_blocked = frame_blocked.build_is_blocked(rec, [150.0], screenshot_residuals=False)
+    assert is_blocked(150.0) is True  # inside the masked window's span
+
+
+@pytest.mark.privacy
+def test_screenshot_residuals_false_still_blocks_secure_field(tmp_path, monkeypatch):
+    """screenshot_residuals=False retains the ambiguity/secure-field pass: a NULL
+    ``element_state`` span (a secure field could have been there) still blocks."""
+    rec = tmp_path / "rec"
+    db_path = rec / "recording.db"
+    _make_window_db(db_path, ts=100.0, bundle="com.apple.TextEdit", title="Notes")
+    # A NULL element_state action at 200 → AMBIGUOUS_SECURE_FIELD interval,
+    # independent of URL/title policy (deterministic).
+    with contextlib.closing(sqlite3.connect(str(db_path))) as db:
+        db.execute(
+            "CREATE TABLE action_event ("
+            "id INTEGER PRIMARY KEY, recording_id INTEGER, timestamp REAL, element_state TEXT)"
+        )
+        db.execute(
+            "INSERT INTO action_event (id, recording_id, timestamp, element_state) "
+            "VALUES (1, 1, 200.0, NULL)"
+        )
+        db.commit()
+
+    from screencap.backfill.skip_intervals import build_classifier_evaluator
+
+    classifier, evaluator = build_classifier_evaluator(mode=PrivacyMode.PUBLIC)
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.build_classifier_evaluator",
+        lambda *a, **k: (classifier, evaluator),
+    )
+    is_blocked = frame_blocked.build_is_blocked(rec, [200.0], screenshot_residuals=False)
+    assert is_blocked(200.0) is True  # secure-field hold window still blocks
