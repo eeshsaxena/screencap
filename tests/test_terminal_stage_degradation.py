@@ -186,12 +186,34 @@ def _install_provider(monkeypatch, provider) -> None:
 
 
 def _install_consent(monkeypatch, policy: ConsentPolicy) -> None:
-    """Force ``ConsentPolicy.from_config`` to return a specific policy."""
+    """Force ``ConsentPolicy.from_config`` to return a specific policy.
+
+    Also mirrors the policy's ``cloud_provider`` into ``config.get_llm_cloud_provider``
+    so the SUMMARY cloud fallback (U5) — which resolves the provider *name* via that
+    config getter, exactly like ``recall._cloud_fallback`` — sees a consistent
+    configured/unconfigured cloud provider rather than the test host's real config.
+    """
+    import screencap.config as config
     import screencap.segmentation.consent as consent
 
     monkeypatch.setattr(
         consent.ConsentPolicy, "from_config", classmethod(lambda cls: policy),
     )
+    monkeypatch.setattr(
+        config, "get_llm_cloud_provider", lambda: policy.cloud_provider,
+    )
+
+
+def _install_cloud_provider(monkeypatch, provider) -> None:
+    """Wire ``get_provider`` to return ``provider`` for the SUMMARY cloud fallback.
+
+    Patches the ``get_provider`` symbol imported by ``_summary_cloud_fallback``
+    (``screencap.segmentation.provider.get_provider``) so the consented SUMMARY
+    cloud path resolves to the given fake cloud backend rather than a live one.
+    """
+    import screencap.segmentation.provider as prov
+
+    monkeypatch.setattr(prov, "get_provider", lambda name: provider)
 
 
 def _run_terminal(rec_dir: Path):
@@ -281,30 +303,38 @@ def test_unavailable_no_cloud_falls_back_to_heuristic(tmp_path, monkeypatch):
     assert result.destination == "local"
 
 
-def test_unavailable_with_cloud_still_heuristic_never_cloud(tmp_path, monkeypatch):
-    """R7 over R5: cloud configured + consented, yet day-split stays heuristic and
-    no cloud/provider-cloud path is invoked."""
+def test_unavailable_summary_consent_off_stays_heuristic_never_cloud(
+    tmp_path, monkeypatch,
+):
+    """R7 over R5 / R6: on-device day-split unavailable, but SUMMARY cloud consent
+    OFF → day-split stays heuristic and NO cloud provider is ever resolved.
+
+    This pins the two invariants together: (1) the day-split *boundaries* come
+    from the idle-gap heuristic, never cloud (KTD6); (2) with the SUMMARY cloud
+    consent row OFF, the net-new SUMMARY cloud fallback (U5) does not fire, so
+    ``get_provider`` is never called with a cloud name at all."""
     import screencap.segmentation.provider as prov
 
     rec_dir = _make_local_recording(tmp_path)
     fake = _FakeProvider(PROVIDER_UNAVAILABLE)
     _install_provider(monkeypatch, fake)
+    # A cloud provider is configured, but SUMMARY consent is OFF → no cloud path.
     _install_consent(monkeypatch, ConsentPolicy(
         cloud_provider="gemini",
-        summary_cloud_consent=True,
+        summary_cloud_consent=False,
         recall_cloud_consent=True,
     ))
 
     # Trip-wire: get_provider is only allowed to hand back our single fake (the
-    # on-device backend under test). Any attempt to resolve a *second*, cloud
-    # backend for day-split is a violation of KTD6.
+    # on-device backend under test). With SUMMARY consent OFF, no cloud backend
+    # may be resolved for day-split OR for a summary fallback.
     original_get_provider = prov.get_provider
 
     def _guarded_get_provider(name):  # noqa: ANN001
         if name != "fake":
             raise AssertionError(
-                f"cloud provider {name!r} resolved for a day-split fallback "
-                "(R7 over R5 violated)"
+                f"cloud provider {name!r} resolved with SUMMARY consent off "
+                "(R7 over R5 / R6 violated)"
             )
         return fake
 
@@ -365,6 +395,178 @@ def test_provider_none_is_fail_open_heuristic_not_run(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# U5 — the net-new consented SUMMARY cloud fallback (R6/R8/KTD4).
+#
+# When on-device day-split is UNAVAILABLE and the SUMMARY cloud consent row is on
+# with a BYO cloud provider configured, the recording is named by that cloud
+# provider over the SAME already-stripped summary — never frames, never for the
+# day-split *boundary* decision (which stays heuristic when cloud declines).
+# ---------------------------------------------------------------------------
+
+
+def _cloud_named_tasks() -> dict:
+    """A validated cloud-provider tasks dict, distinguishable from heuristic/on-device."""
+    return {
+        "tasks": [
+            {"start_ts": 1000.0, "end_ts": 2800.0,
+             "name": "Cloud-named session", "derived_name": "cloud-named-session",
+             "description": "Named by the BYO cloud provider", "category": "development",
+             "apps_used": ["VS Code"], "confidence": "high"},
+        ],
+        "summary": {"overview": "A cloud summary.", "primary_focus": "development",
+                    "time_breakdown": {}, "key_accomplishments": []},
+        "tags": ["cloud"],
+    }
+
+
+@pytest.mark.privacy
+def test_summary_cloud_fallback_invoked_with_stripped_summary_no_frames(
+    tmp_path, monkeypatch,
+):
+    """R6/R8/KTD4: on-device unavailable + SUMMARY consent on + cloud configured →
+    the BYO cloud provider's segment() is invoked with the ALLOW-only stripped
+    summary (never frames), and its named tasks are persisted (not the heuristic)."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    result = _run_terminal(rec_dir)
+
+    # The cloud provider WAS invoked exactly once with the stripped summary.
+    assert len(cloud.calls) == 1
+    handed = cloud.calls[0]
+    assert isinstance(handed, dict)
+    # The payload is the ALLOW-only text summary, authoritatively marked stripped.
+    assert handed.get("stripped") is True
+    # No frame bytes / image paths of any kind reach the cloud payload.
+    blob = json.dumps(handed)
+    for marker in ("\\xff\\xd8\\xff", "\\x89PNG", ".jpg", ".png", "screenshots/"):
+        assert marker not in blob, f"frame reference {marker!r} leaked to cloud payload"
+
+    # The cloud provider's named task is persisted — NOT the mechanical heuristic.
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Cloud-named session"]
+    assert persisted["summary"].get("source") != "idle_gap_heuristic"
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert [s.name for s in ledger.read_task_segments()] == ["Cloud-named session"]
+    assert result.tasks_persisted == 1
+    # LOCAL recording: the cloud NAMING never triggers an upload.
+    assert result.destination == "local"
+    assert result.n_uploaded == 0
+    assert result.sentinel_uploaded is False
+
+
+@pytest.mark.privacy
+def test_summary_cloud_declines_falls_through_to_heuristic(tmp_path, monkeypatch):
+    """Fail-open: consent on + cloud configured, but the cloud provider returns
+    None (ran, no usable tasks) → the recording falls through to the idle-gap
+    heuristic; it is never left unnamed just because cloud declined."""
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(None)  # ran, produced nothing.
+    _install_cloud_provider(monkeypatch, cloud)
+
+    result = _run_terminal(rec_dir)
+
+    assert len(cloud.calls) == 1  # the cloud path WAS tried first.
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    # Fell through to the heuristic's mechanical names.
+    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert persisted["summary"]["source"] == "idle_gap_heuristic"
+    assert result.tasks_persisted == 2
+
+
+@pytest.mark.privacy
+def test_summary_cloud_unavailable_falls_through_to_heuristic(tmp_path, monkeypatch):
+    """Fail-open: a cloud provider that returns PROVIDER_UNAVAILABLE (could not run
+    — e.g. no stored key) leaves the recording to the idle-gap heuristic; never a
+    crash, never left unnamed."""
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="gemini-cli", summary_cloud_consent=True,
+    ))
+    _install_cloud_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+
+    result = _run_terminal(rec_dir)
+
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert persisted["summary"]["source"] == "idle_gap_heuristic"
+    assert result.tasks_persisted == 2
+
+
+@pytest.mark.privacy
+def test_summary_cloud_provider_raising_fails_open_to_heuristic(tmp_path, monkeypatch):
+    """The SUMMARY cloud fallback never raises: a cloud provider whose segment()
+    raises degrades to the heuristic, and terminal completion is never blocked."""
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+
+    class _RaisingCloud:
+        def segment(self, activity_summary):  # noqa: ANN001, ANN201
+            raise RuntimeError("cloud api exploded")
+
+    _install_cloud_provider(monkeypatch, _RaisingCloud())
+
+    result = _run_terminal(rec_dir)
+
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert result.tasks_persisted == 2
+
+
+def test_summary_cloud_not_invoked_when_provider_ran_with_tasks(tmp_path, monkeypatch):
+    """When the on-device day-split provider RAN and produced tasks (USE_PROVIDER),
+    the SUMMARY cloud fallback is never reached — cloud is a fallback only for the
+    on-device-UNAVAILABLE state."""
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(_canned_tasks()))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    result = _run_terminal(rec_dir)
+
+    assert cloud.calls == []  # the on-device result short-circuits any cloud path.
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Implement auth module"]
+    assert result.tasks_persisted == 1
+
+
+def test_summary_cloud_not_invoked_when_provider_ran_empty(tmp_path, monkeypatch):
+    """A genuine None (provider ran, produced nothing) is fail-open — neither the
+    heuristic NOR the SUMMARY cloud fallback is a backstop for a real empty result."""
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(None))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    result = _run_terminal(rec_dir)
+
+    assert cloud.calls == []  # None is not routed to cloud.
+    assert result.tasks_persisted == 0
+    assert not (rec_dir / "tasks.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # No degradation path uploads for a LOCAL recording.
 # ---------------------------------------------------------------------------
 
@@ -378,6 +580,11 @@ def test_heuristic_fallback_never_uploads(tmp_path, monkeypatch):
     _install_consent(monkeypatch, ConsentPolicy(
         cloud_provider="gemini", summary_cloud_consent=True,
     ))
+    # Consent is ON here, so the SUMMARY cloud fallback WILL resolve the cloud
+    # provider — wire a cloud backend that declines (None), so the recording falls
+    # through to the idle-gap heuristic. This keeps the test's subject (no upload,
+    # no cloud copy) while exercising the net-new SUMMARY path without a live call.
+    _install_cloud_provider(monkeypatch, _FakeProvider(None))
 
     def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
         raise AssertionError("upload seam invoked during a heuristic fallback")

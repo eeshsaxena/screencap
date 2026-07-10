@@ -904,17 +904,23 @@ def _run_local_segmentation(
     ``tasks.json`` and the ``pipeline_task_segments`` ledger table (idempotent —
     re-entry REPLACES, never duplicates).
 
-    **Graceful degradation ladder (U7, R5 / KTD6).** The provider's outcome is
-    routed through :func:`screencap.segmentation.degrade.resolve_day_split`:
+    **Graceful degradation ladder (U7/U5, R5 / R6 / KTD6).** The day-split
+    provider's outcome is routed through
+    :func:`screencap.segmentation.degrade.resolve_day_split`:
 
     * a real tasks dict → persisted unchanged;
     * ``PROVIDER_UNAVAILABLE`` (could not run — e.g. no on-device model on a
-      CLI-only / pre-macOS-26 install) → fall back to the **local idle-gap
-      heuristic** (``task_manifest._segment_tasks`` over the recording's local
-      events) and persist THOSE mechanically-named tasks. Cloud is **never** a
-      day-split fallback (R7 over R5), so this path never touches the network;
-    * ``None`` (ran, produced nothing) → left unnamed (fail-open); the heuristic
-      is NOT run for a genuine empty result.
+      CLI-only / pre-macOS-26 install) → the day-split **boundaries** fall back to
+      the **local idle-gap heuristic** (``task_manifest._segment_tasks`` over the
+      recording's local events). Day-split is on-device/heuristic only — cloud is
+      **never** a day-split fallback (R7 over R5, KTD6). BUT the on-device-
+      unavailable state ALSO unlocks the consented **SUMMARY cloud fallback** (U5,
+      R6/R8): if ``summary_cloud_consent`` is on and a cloud provider is
+      configured, the recording is first named/summarized by that BYO cloud
+      provider over the SAME already-stripped summary; only if it declines do we
+      fall to the mechanically-named idle-gap heuristic;
+    * ``None`` (ran, produced nothing) → left unnamed (fail-open); neither cloud
+      nor the heuristic is run for a genuine empty result.
 
     **Strictly fail-open.** An empty/invalid summary or any unexpected error
     leaves the recording unnamed but NEVER blocks terminal completion and NEVER
@@ -924,7 +930,7 @@ def _run_local_segmentation(
     from screencap.segmentation.degrade import DegradeAction, resolve_day_split
 
     try:
-        provider_result = _segment_local_tasks(recording_dir)
+        summary, provider_result = _segment_local_tasks(recording_dir)
     except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
         logger.debug(
             "terminal_stage: local segmentation failed open for %s (%s)",
@@ -944,15 +950,33 @@ def _run_local_segmentation(
     if decision.action is DegradeAction.USE_PROVIDER:
         tasks = decision.tasks
     elif decision.action is DegradeAction.HEURISTIC:
-        # On-device unavailable → idle-gap heuristic ONLY (never cloud, KTD6).
+        # On-device day-split unavailable. Two independent fallbacks, in order:
+        #   1. The consented SUMMARY cloud fallback (U5, R6/R8) — a BYO cloud
+        #      provider names the session over the SAME already-stripped summary.
+        #      This is the SUMMARY task, resolved independently of DAY_SPLIT; the
+        #      never-cloud day-split guard (KTD6) is untouched — the input is the
+        #      ALLOW-only text summary, never frames.
+        #   2. The local idle-gap heuristic (KTD6) — mechanically-named boundaries
+        #      when there is no consented cloud path (or it declines).
+        # Both are strictly fail-open and never block terminal / never upload.
+        tasks = None
         try:
-            tasks = _heuristic_local_tasks(recording_dir)
-        except Exception as exc:  # noqa: BLE001 — heuristic must never block terminal
+            tasks = _summary_cloud_fallback(summary)
+        except Exception as exc:  # noqa: BLE001 — the cloud fallback must never block
             logger.debug(
-                "terminal_stage: idle-gap heuristic failed open for %s (%s)",
+                "terminal_stage: summary cloud fallback failed open for %s (%s)",
                 recording_dir.name, exc,
             )
-            return
+            tasks = None
+        if not tasks:
+            try:
+                tasks = _heuristic_local_tasks(recording_dir)
+            except Exception as exc:  # noqa: BLE001 — heuristic must never block terminal
+                logger.debug(
+                    "terminal_stage: idle-gap heuristic failed open for %s (%s)",
+                    recording_dir.name, exc,
+                )
+                return
     else:
         # NONE (provider ran, no tasks) or CLOUD (never reachable for day-split)
         # → fail open, nothing to persist.
@@ -971,15 +995,26 @@ def _run_local_segmentation(
     result.tasks_persisted = n
 
 
-def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
-    """Build the stripped activity summary and run the configured provider.
+def _segment_local_tasks(
+    recording_dir: Path,
+) -> "tuple[dict | None, SegmentResult]":
+    """Build the stripped activity summary and run the configured day-split provider.
 
-    Returns the provider's raw :class:`~screencap.segmentation.provider.SegmentResult`
-    — a validated tasks dict, ``None`` (ran, no usable tasks / no activity), or
-    ``PROVIDER_UNAVAILABLE`` (could not run). The sentinel is preserved (not
-    collapsed to a falsy ``None``) so the caller's degradation ladder can route
-    on the None-vs-unavailable distinction. All heavy imports are deferred so
-    the terminal-stage import surface stays light.
+    Returns ``(stripped_summary, provider_result)``:
+
+    * ``stripped_summary`` — the ALLOW-only, ``stripped=True``-marked activity
+      summary dict (or ``None`` when there is no local activity to summarize). It
+      is returned so the caller can reuse the SAME already-stripped input for the
+      net-new consented SUMMARY cloud fallback (U5) without rebuilding/re-stripping
+      it — the BYO cloud backends fail-close on any summary not marked stripped.
+    * ``provider_result`` — the day-split provider's raw
+      :class:`~screencap.segmentation.provider.SegmentResult`: a validated tasks
+      dict, ``None`` (ran, no usable tasks / no activity), or ``PROVIDER_UNAVAILABLE``
+      (could not run). The sentinel is preserved (not collapsed to a falsy ``None``)
+      so the caller's degradation ladder can route on the None-vs-unavailable
+      distinction.
+
+    All heavy imports are deferred so the terminal-stage import surface stays light.
     """
     from screencap.segmentation.activity_summary import build_activity_summary
     from screencap.segmentation.local_source import (
@@ -990,7 +1025,7 @@ def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
 
     manifests = load_local_manifests(recording_dir)
     if not manifests:
-        return None
+        return None, None
 
     summary = build_activity_summary(
         recording_dir.name,
@@ -1002,7 +1037,7 @@ def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
         blocked_source=recording_dir,
     )
     if summary is None:
-        return None
+        return None, None
 
     # The summary was built with blocked_source, so build_activity_summary has
     # run the R11 strip and marked the summary stripped AUTHORITATIVELY — the
@@ -1017,7 +1052,78 @@ def _segment_local_tasks(recording_dir: Path) -> "SegmentResult":
     # (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not run — routed to
     # the idle-gap heuristic by the caller's ladder, KTD6).
     provider = build_day_split_provider()
-    return provider.segment(summary)
+    return summary, provider.segment(summary)
+
+
+def _summary_cloud_fallback(
+    summary: dict | None,
+) -> dict | None:
+    """Consented SUMMARY cloud fallback over the ALREADY-stripped summary (U5, R6/R8).
+
+    Net-new dispatch: when the on-device day-split provider could not run, a
+    recording may still be named/summarized by the user's configured **cloud**
+    provider — but ONLY as the consented, on-device-unavailable SUMMARY fallback.
+    This is the SUMMARY task (naming the session), resolved independently of the
+    DAY_SPLIT task, whose boundaries stay on-device/heuristic (R7 over R5 — a
+    guard this path never touches).
+
+    Resolution mirrors ``recall._cloud_fallback`` — the ONLY sanctioned
+    consented-cloud dispatch pattern: resolve ``TaskKind.SUMMARY`` with
+    ``on_device_available=False``; a target other than ``CLOUD`` (consent off, no
+    provider configured) returns ``None`` (leave unnamed). On ``CLOUD``, hand the
+    resolved cloud provider the SAME ``stripped=True``-marked summary the
+    on-device path built (never frames — the backends fail-close on unmarked
+    input and only ever receive the ALLOW-only text summary, R7/R8/KTD4).
+
+    Strictly fail-open (R5): missing provider, unknown name, a provider that
+    doesn't implement ``segment``, ``None`` / ``PROVIDER_UNAVAILABLE``, or any
+    error → ``None`` (leave the recording unnamed). NEVER raises, NEVER uploads.
+
+    Returns a validated tasks dict on a successful cloud segmentation, else
+    ``None``. The DAY_SPLIT idle-gap heuristic remains the caller's fallback for
+    boundaries when this returns ``None``.
+    """
+    if summary is None:
+        return None
+
+    from screencap import config
+    from screencap.segmentation.consent import (
+        ConsentPolicy,
+        ExecutionTarget,
+        TaskKind,
+    )
+    from screencap.segmentation.provider import LLMProvider, get_provider
+
+    target = ConsentPolicy.from_config().resolve(
+        TaskKind.SUMMARY, on_device_available=False
+    )
+    if target is not ExecutionTarget.CLOUD:
+        return None  # consent off / no provider → leave unnamed (never cloud).
+
+    cloud_name = config.get_llm_cloud_provider()
+    if not cloud_name:
+        return None
+
+    try:
+        provider = get_provider(cloud_name)
+    except ValueError:
+        logger.warning(
+            "terminal_stage: configured cloud provider %r is unknown; leaving unnamed",
+            cloud_name,
+        )
+        return None
+
+    # A cloud provider name that does not implement segment() must degrade, not
+    # raise. (LLMProvider is runtime_checkable, so this duck-types safely.)
+    if not isinstance(provider, LLMProvider):
+        return None
+
+    # segment() returns a validated tasks dict, None (ran, no usable tasks), or
+    # PROVIDER_UNAVAILABLE (could not run). Only a real dict is usable; the
+    # sentinel is a distinct non-dict class, so the isinstance check excludes it —
+    # every other outcome leaves the recording to the caller's heuristic fallback.
+    result = provider.segment(summary)
+    return result if isinstance(result, dict) else None
 
 
 def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
