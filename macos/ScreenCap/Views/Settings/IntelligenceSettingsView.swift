@@ -18,14 +18,17 @@ import SwiftUI
 ///    seams. Empty writes = no-op; re-tap deselection is removed (radio
 ///    semantics). A legacy persisted value renders the on-device row with the
 ///    reconcile treatment prompting a re-pick.
-/// 2. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix:
+/// 2. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix (U5 —
+///    all copy lives in `IntelligenceSelectionModel` statics, KTD7):
 ///    - Summaries & titles (R8) — a real toggle wired to `summary_cloud_consent`.
-///    - Answering Recall searches — a real toggle (`recall_cloud_consent`).
+///    - Answers about your recordings — a real toggle (`recall_cloud_consent`).
 ///    - Splitting & labeling the day (R7) — shown as ON-DEVICE, *not* a cloud
 ///      toggle. It never leaves the Mac even with a cloud provider configured.
 ///    - Screen frames or images (R9-frames) — a FIXED "always off".
 ///    A standing nudge renders by the section header exactly when
 ///    `consentNudgeVisible(...)` says so (AE1) — it is the consent pointer.
+///    The trust footer (R12) states masked/blocked apps are stripped before
+///    any model — local or cloud — sees content.
 ///
 /// Consent + provider writes flow through the CLI settings layer via
 /// `IntelligenceController`; BYO keys are stored daemon-side (Keychain-class,
@@ -596,9 +599,11 @@ struct IntelligenceSettingsView: View {
 
     // MARK: - WHAT CLOUD MODELS MAY DO section (consent matrix)
 
+    /// U5 — every rendered string here is a pure copy static on
+    /// `IntelligenceSelectionModel` (KTD7) so the honest-copy audit reaches it.
     private func cloudTasksSection(_ settings: IntelligenceSettings) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("WHAT CLOUD MODELS MAY DO")
+            sectionHeader(IntelligenceSelectionModel.cloudTasksSectionTitle)
             // AE1 — the standing nudge: rendered exactly when the pure predicate
             // says so (a cloud row is the rendered selection and a relevant
             // toggle is off). This IS the consent pointer — no auto-scroll.
@@ -615,20 +620,19 @@ struct IntelligenceSettingsView: View {
                     .padding(.bottom, 2)
             }
             VStack(alignment: .leading, spacing: 0) {
-                // R8 — summaries/titles: the one real cloud toggle.
+                // R8 — summaries/titles: a real cloud toggle.
                 consentToggleRow(
-                    title: "Summaries & titles",
-                    subtitle: "Sends transcript text — never screen images.",
+                    title: IntelligenceSelectionModel.summaryConsentRowTitle,
+                    subtitle: IntelligenceSelectionModel.summaryConsentRowCaption,
                     row: "summary_cloud_consent",
                     on: settings.summaryCloudConsent
                 )
                 rowDivider
-                // R10 — recall answers: also a real cloud toggle once a provider
-                // is configured. (The design's three rows omit it; the CLI
-                // exposes it, so it's surfaced here for parity.)
+                // R10 — recall answers: also a real cloud toggle (Chat depends
+                // on it — the design's three rows predate Chat).
                 consentToggleRow(
-                    title: "Answering Recall searches",
-                    subtitle: "Sends transcript text — never screen images.",
+                    title: IntelligenceSelectionModel.recallConsentRowTitle,
+                    subtitle: IntelligenceSelectionModel.recallConsentRowCaption,
                     row: "recall_cloud_consent",
                     on: settings.recallCloudConsent
                 )
@@ -637,25 +641,30 @@ struct IntelligenceSettingsView: View {
                 // Mac even with a cloud provider configured; shown as a fixed
                 // "On-device" chip, no toggle.
                 fixedRow(
-                    title: "Splitting & labeling the day",
-                    subtitle: "Always runs on this Mac — never sent to a cloud model.",
-                    badge: ("On-device", Color.scTeal)
+                    title: IntelligenceSelectionModel.daySplitRowTitle,
+                    subtitle: IntelligenceSelectionModel.daySplitRowCaption,
+                    badge: (IntelligenceSelectionModel.daySplitChipLabel, Color.scTeal)
                 )
                 rowDivider
                 // R9 — frames/images: fixed "always off", non-interactive.
                 fixedRow(
-                    title: "Screen frames or images",
-                    subtitle: "Never sent to any cloud model. This isn't a setting.",
-                    badge: ("Always off", Color.scInkMuted)
+                    title: IntelligenceSelectionModel.framesRowTitle,
+                    subtitle: IntelligenceSelectionModel.framesRowCaption,
+                    badge: (IntelligenceSelectionModel.framesChipLabel, Color.scInkMuted)
                 )
             }
             .overlay(
                 RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
                     .strokeBorder(Color.scBorderWarm, lineWidth: 1)
             )
-            Text("Cloud tasks only run when the active model above is a cloud provider.")
+            // R12 — the trust footer. (The earlier "Cloud tasks only run when
+            // the active model above is a cloud provider" line was removed as
+            // false: the consent toggles gate the cloud *fallback*, which can
+            // run while a local row is the rendered selection.)
+            Text(IntelligenceSelectionModel.consentTrustFooter)
                 .font(SCTypography.sans(size: 12))
                 .foregroundStyle(Color.scInkMuted)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 2)
         }
     }
@@ -789,77 +798,3 @@ struct IntelligenceSettingsView: View {
     }
 }
 
-/// A pure model of the ScreenCap-hosted picker rows — factored out so the "which
-/// options render, and which provider value each writes" rules are unit testable
-/// without a running view. No longer rendered by the pane (the U3 redesign
-/// renders from `IntelligenceSelectionModel.groups` instead); retained because
-/// existing tests reference it — a later unit retires it with its tests.
-struct IntelligenceProviderOption: Identifiable, Equatable {
-    let id: String
-    let title: String
-    let subtitle: String?
-    /// The `provider set <value>` argument this row writes.
-    let providerValue: String?
-
-    /// Build the hosted picker rows. Leads with the on-device default (R3), then
-    /// the SCR-239 opt-in **Downloaded model** and **Local server** rows, then a
-    /// configured cloud provider when set. Subtitles reflect the downloaded-model
-    /// install state and the BYO endpoint's LOCAL/REMOTE classification.
-    static func options(
-        cloudProvider: String?,
-        downloadedInstalled: Bool = false,
-        localEndpoint: String? = nil,
-        endpointClassification: String? = nil
-    ) -> [IntelligenceProviderOption] {
-        var opts: [IntelligenceProviderOption] = [
-            IntelligenceProviderOption(
-                id: "on-device",
-                title: "On-device model",
-                subtitle: "Built into macOS · runs on this Mac · nothing leaves",
-                providerValue: "on-device"
-            ),
-            IntelligenceProviderOption(
-                id: "downloaded",
-                title: "Downloaded model",
-                subtitle: downloadedInstalled
-                    ? "Downloaded · runs on this Mac · nothing leaves"
-                    : "Download to get named tasks on any Mac (~2 GB, opt-in)",
-                providerValue: "downloaded"
-            ),
-            IntelligenceProviderOption(
-                id: "local-server",
-                title: "Local server (bring your own)",
-                subtitle: localServerSubtitle(localEndpoint, endpointClassification),
-                providerValue: "local-server"
-            ),
-        ]
-        if let cloud = cloudProvider {
-            opts.append(IntelligenceProviderOption(
-                id: cloud,
-                title: displayName(for: cloud),
-                subtitle: "Cloud model · your API key",
-                providerValue: cloud
-            ))
-        }
-        return opts
-    }
-
-    /// Subtitle for the Local-server row: the redacted endpoint + its treatment,
-    /// or a prompt to configure one.
-    static func localServerSubtitle(_ endpoint: String?, _ classification: String?) -> String? {
-        guard let endpoint, !endpoint.isEmpty else {
-            return "Ollama / LM Studio on this Mac — set an endpoint below"
-        }
-        return classification == "LOCAL"
-            ? "\(endpoint) · on-device · day-splitting on"
-            : "\(endpoint) · remote · treated as cloud (day-split off)"
-    }
-
-    /// A human label for a cloud provider id.
-    static func displayName(for provider: String) -> String {
-        switch provider {
-        case "gemini": return "Gemini — your API key"
-        default: return "\(provider.capitalized) — your API key"
-        }
-    }
-}

@@ -210,6 +210,70 @@ enum IntelligenceSelectionModel {
     static let onDeviceCheckingCopy = "Checking availability…"
     static let onDeviceUnavailableCopy = "On-device model isn't available on this Mac."
 
+    // MARK: Consent section copy (U5 — R10 plain per-row language)
+
+    /// The consent section header.
+    static let cloudTasksSectionTitle = "WHAT CLOUD MODELS MAY DO"
+    /// R8 — the summaries/titles toggle (`summary_cloud_consent`). The cloud
+    /// fallback receives the recording's already-stripped activity summary —
+    /// text only (app names, window titles, transcript snippets), never frames.
+    static let summaryConsentRowTitle = "Summaries & titles"
+    static let summaryConsentRowCaption =
+        "Sends text from that one recording — app and window titles plus the transcript. Never screen images or video."
+    /// R10 — the recall-answers toggle (`recall_cloud_consent`). The recall
+    /// path sends the question plus the retrieved ALLOW-only text snippets;
+    /// the egress guard rejects frame bytes.
+    static let recallConsentRowTitle = "Answers about your recordings"
+    static let recallConsentRowCaption =
+        "Sends your question and the matching text snippets from your recordings. Never screen images or video."
+    /// R7 — day-split/label is a fixed on-device rule (degrades to a local
+    /// heuristic, never cloud), shown as a chip, not a toggle.
+    static let daySplitRowTitle = "Splitting & labeling the day"
+    static let daySplitRowCaption =
+        "Stays on this Mac — never a cloud task, even with a cloud model connected."
+    static let daySplitChipLabel = "On-device"
+    /// R9 — frames/images never reach any cloud model; a fixed rule, not a toggle.
+    static let framesRowTitle = "Screen frames or images"
+    static let framesRowCaption =
+        "Never sent to any cloud model. A fixed rule, not a toggle."
+    static let framesChipLabel = "Always off"
+    /// R12 — the trust footer under the consent card. Scoped to what models
+    /// *see*: the segmentation privacy strip (the single chokepoint in
+    /// `activity_summary.py` / the recall evidence bundle, fail-closed) removes
+    /// masked and blocked apps' content before any provider — local on-device
+    /// or cloud — is invoked. It deliberately claims nothing about uploads.
+    static let consentTrustFooter =
+        "Masked and blocked apps are stripped before any model sees a word — local or cloud."
+
+    // MARK: Honest-copy audit corpus (KTD7)
+
+    /// Every user-facing copy string this model owns, enumerated for the
+    /// honest-copy audit (`testHonestCopyAuditNoForbiddenStrings` scans exactly
+    /// this list plus `ConnectProviderModel.allAuditedCopy`). Add every new
+    /// copy static here — a string missing from this list escapes the R12
+    /// honesty gate.
+    static let allAuditedCopy: [String] = [
+        includedGroupTitle, yourOwnGroupTitle,
+        onDeviceRowTitle, onDeviceRowSubtitle,
+        localServerRowTitle,
+        remoteEndpointNotSelectableCopy,
+        startDaemonDownloadReason,
+        modelSectionTitle, addProviderRowTitle,
+        reconcileNeededCopy,
+        consentNudgeCopy,
+        justAddedChipLabel,
+        manageAccessoryTitle, setUpAccessoryTitle, connectAccessoryTitle,
+        onDeviceReadyAppleCopy, onDeviceReadyDownloadedCopy,
+        onDeviceAppleModelDownloadingCopy, onDeviceCheckingCopy,
+        onDeviceUnavailableCopy,
+        cloudTasksSectionTitle,
+        summaryConsentRowTitle, summaryConsentRowCaption,
+        recallConsentRowTitle, recallConsentRowCaption,
+        daySplitRowTitle, daySplitRowCaption, daySplitChipLabel,
+        framesRowTitle, framesRowCaption, framesChipLabel,
+        consentTrustFooter,
+    ]
+
     // MARK: Grouped options (R1/R5)
 
     /// Build the two ownership groups from a settings read-back.

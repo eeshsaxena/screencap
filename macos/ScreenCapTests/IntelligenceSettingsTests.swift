@@ -222,59 +222,7 @@ final class IntelligenceSettingsTests: XCTestCase {
         ))
     }
 
-    // MARK: - Provider picker model (R2/R7/R9 pane rules)
-
-    /// The hosted section offers on-device (default) + the SCR-239 downloaded /
-    /// local-server rows. The inert "Add another provider…" stub is gone —
-    /// connecting now lives in the "Your own account" section (U7). BYO is never
-    /// listed here (R9 hosted/user-owned split).
-    func testProviderOptionsWithoutCloudProvider() {
-        let opts = IntelligenceProviderOption.options(cloudProvider: nil)
-        XCTAssertEqual(opts.map(\.id), ["on-device", "downloaded", "local-server"])
-        XCTAssertEqual(opts.first?.providerValue, "on-device")
-        // Every hosted row is selectable — no non-selectable stub remains.
-        XCTAssertTrue(opts.allSatisfy { $0.providerValue != nil })
-    }
-
-    /// A configured hosted cloud provider becomes a selectable row after the
-    /// local rows (retained for a future app-managed hosted cloud row).
-    func testProviderOptionsWithCloudProvider() {
-        let opts = IntelligenceProviderOption.options(cloudProvider: "gemini")
-        XCTAssertEqual(
-            opts.map(\.id),
-            ["on-device", "downloaded", "local-server", "gemini"]
-        )
-        XCTAssertEqual(opts.first { $0.id == "gemini" }?.providerValue, "gemini")
-    }
-
-    // MARK: - SCR-239 (U10) — downloaded + local-server rows
-
-    func testDownloadedAndLocalServerRowsWriteExpectedProviderValues() {
-        let opts = IntelligenceProviderOption.options(cloudProvider: nil)
-        XCTAssertEqual(opts.first { $0.id == "downloaded" }?.providerValue, "downloaded")
-        XCTAssertEqual(opts.first { $0.id == "local-server" }?.providerValue, "local-server")
-    }
-
-    func testDownloadedSubtitleReflectsInstallState() {
-        let notInstalled = IntelligenceProviderOption.options(cloudProvider: nil, downloadedInstalled: false)
-        XCTAssertTrue(notInstalled.first { $0.id == "downloaded" }!.subtitle!.contains("Download"))
-        let installed = IntelligenceProviderOption.options(cloudProvider: nil, downloadedInstalled: true)
-        XCTAssertTrue(installed.first { $0.id == "downloaded" }!.subtitle!.contains("runs on this Mac"))
-    }
-
-    func testLocalServerSubtitleReflectsClassification() {
-        XCTAssertTrue(
-            IntelligenceProviderOption.localServerSubtitle("http://127.0.0.1:11434", "LOCAL")!
-                .contains("on-device")
-        )
-        XCTAssertTrue(
-            IntelligenceProviderOption.localServerSubtitle("http://1.2.3.4:1234", "REMOTE")!
-                .contains("treated as cloud")
-        )
-        XCTAssertTrue(
-            IntelligenceProviderOption.localServerSubtitle(nil, nil)!.contains("set an endpoint")
-        )
-    }
+    // MARK: - SCR-239 (U10) — endpoint + decode contracts
 
     func testDecodeNewFieldsWithDefaults() {
         // An old envelope without the SCR-239 fields still decodes (defaults).
@@ -348,23 +296,28 @@ final class IntelligenceSettingsTests: XCTestCase {
         try! JSONDecoder().decode(IntelligenceEnvelope.self, from: data).intelligence
     }
 
-    /// R1/R2/R10 — the user-owned matrix is 3 vendors × 2 mechanisms, and Gemini
-    /// appears exactly once per mechanism (never a duplicate hosted/BYO listing).
+    /// R1/R2 — the user-owned matrix is 3 vendors × 2 mechanisms, and Gemini
+    /// appears exactly once per mechanism (never a duplicate listing): once per
+    /// mechanism in the option matrix, once on the flow's pick step, and never
+    /// inside the "Included with ScreenCap" group.
     func testUserOwnedOptionsAreSixWithGeminiListedOnce() {
         let settings = decode(envelope())
         let opts = ConnectProviderModel.userOwnedOptions(settings)
 
         XCTAssertEqual(opts.count, 6, "3 vendors × 2 mechanisms")
-        // Gemini appears exactly once as a key option and once as a CLI option —
-        // and nowhere in the hosted section (R10, no double-Gemini).
         let geminiKey = opts.filter { $0.providerID == "gemini" }
         let geminiCli = opts.filter { $0.providerID == "gemini-cli" }
         XCTAssertEqual(geminiKey.count, 1)
         XCTAssertEqual(geminiCli.count, 1)
-        // The hosted picker never lists any BYO vendor id.
-        let hostedIDs = IntelligenceProviderOption.options(cloudProvider: nil).map(\.id)
-        XCTAssertFalse(hostedIDs.contains("gemini"))
-        XCTAssertFalse(hostedIDs.contains("gemini-cli"))
+        // The add-provider flow's pick step lists Gemini exactly once.
+        XCTAssertEqual(
+            ConnectProviderModel.flowChoices.filter { $0.id == "gemini" }.count, 1)
+        // The "Included with ScreenCap" group holds only the on-device row —
+        // never any BYO vendor id (R5: no placeholder, no double-Gemini).
+        let includedIDs = IntelligenceSelectionModel.groups(settings)
+            .first { $0.title == IntelligenceSelectionModel.includedGroupTitle }!
+            .rows.map(\.id)
+        XCTAssertEqual(includedIDs, ["on-device"])
     }
 
     /// KTD2 — a BYO id resolves to the `cloud_provider` write surface, and the
@@ -512,58 +465,32 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertFalse(settings.keyPresent(forVendor: "anthropic"))
     }
 
-    // MARK: - U7 honest-copy audit (R12) + separation (R9)
+    // MARK: - U5 honest-copy audit (R12) + consent copy (R10)
 
-    /// R12 — no forbidden marketing string appears anywhere in the BYO copy:
-    /// no "end-to-end encryption" / "we can't see it" / "free unlimited". This
-    /// is the honesty gate for the whole user-owned surface.
+    /// R12 — no forbidden marketing string appears anywhere in the pane's copy:
+    /// no "end-to-end encryption" / "we can't see it" / "free unlimited". The
+    /// corpus is the two models' `allAuditedCopy` lists — every copy static
+    /// (including the U5 consent rows and trust footer) is enumerated there, so
+    /// a newly added static lands in the audit or visibly next to the list it
+    /// was omitted from. Enumeration completeness is spot-checked below.
     func testHonestCopyAuditNoForbiddenStrings() {
-        var corpus: [String] = [
-            ConnectProviderModel.hostedSectionTitle,
-            ConnectProviderModel.hostedSectionCaption,
-            ConnectProviderModel.userOwnedSectionTitle,
-            ConnectProviderModel.userOwnedSectionCaption,
-        ]
-        for vendor in ConnectProviderModel.vendors {
-            corpus.append(vendor.keyBillingCopy)
-            corpus.append(vendor.cliLimitsCopy)
-            corpus.append(vendor.cliFixGuidance)
-        }
-        // U4 — the add-provider flow's copy statics (KTD7: every new string is
-        // a static precisely so this audit can enumerate it).
-        corpus += [
-            ConnectProviderModel.flowPickStepTitle,
-            ConnectProviderModel.flowPickCaption,
-            ConnectProviderModel.flowBackButtonTitle,
-            ConnectProviderModel.flowDoneButtonTitle,
-            ConnectProviderModel.vendorChoiceCaption,
-            ConnectProviderModel.localServerChoiceTitle,
-            ConnectProviderModel.localServerChoiceCaption,
-            ConnectProviderModel.cliAvailabilityHonestCopy,
-            ConnectProviderModel.localServerConfigureCaption,
-            ConnectProviderModel.endpointFieldLabel,
-            ConnectProviderModel.endpointFieldPlaceholder,
-            ConnectProviderModel.endpointSaveButtonTitle,
-            ConnectProviderModel.endpointClearButtonTitle,
-            ConnectProviderModel.endpointLocalResultCopy,
-            ConnectProviderModel.keyVerdictValidCopy,
-            ConnectProviderModel.disconnectedFeedbackCopy,
-            ConnectProviderModel.keyStoreFailedFallback,
-            ConnectProviderModel.keyClearFailedFallback,
-            ConnectProviderModel.endpointWriteFailedFallback,
-            ConnectProviderModel.providerSelectFailedFallback,
-            IntelligenceSelectionModel.remoteEndpointNotSelectableCopy,
-            IntelligenceSelectionModel.justAddedChipLabel,
-        ]
-        for choice in ConnectProviderModel.flowChoices {
-            corpus.append(ConnectProviderModel.flowConfigureStepTitle(for: choice))
-        }
-        for vendor in ConnectProviderModel.vendors {
-            corpus.append(ConnectProviderModel.keyVerdictInvalidCopy(vendorName: vendor.displayName))
-            corpus.append(ConnectProviderModel.keyVerdictUnknownCopy(vendorName: vendor.displayName))
-        }
-        let haystack = corpus.joined(separator: " ").lowercased()
+        let corpus = ConnectProviderModel.allAuditedCopy
+            + IntelligenceSelectionModel.allAuditedCopy
 
+        // Guard the guard: an emptied corpus would pass vacuously.
+        XCTAssertFalse(ConnectProviderModel.allAuditedCopy.isEmpty)
+        XCTAssertFalse(IntelligenceSelectionModel.allAuditedCopy.isEmpty)
+        // Enumeration completeness: the U5 consent copy, the trust footer, the
+        // flow copy, and the per-vendor copy are all reachable via the corpus.
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.summaryConsentRowCaption))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.recallConsentRowCaption))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.daySplitRowCaption))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.framesRowCaption))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.consentTrustFooter))
+        XCTAssertTrue(corpus.contains(ConnectProviderModel.flowPickCaption))
+        XCTAssertTrue(corpus.contains(BYOVendor.gemini.cliLimitsCopy))
+
+        let haystack = corpus.joined(separator: " ").lowercased()
         let forbidden = [
             "end-to-end encryption", "end to end encryption", "e2ee",
             "we can't see", "we cannot see", "we can't watch", "we can’t see",
@@ -572,9 +499,13 @@ final class IntelligenceSettingsTests: XCTestCase {
         for phrase in forbidden {
             XCTAssertFalse(
                 haystack.contains(phrase),
-                "BYO copy must not promise '\(phrase)' (R12 honesty gate)"
+                "pane copy must not promise '\(phrase)' (R12 honesty gate)"
             )
         }
+        // R12 — the removed false footer must not resurface in any copy static:
+        // the consent toggles gate the cloud fallback, which can run while a
+        // local row is the rendered selection.
+        XCTAssertFalse(haystack.contains("only run when the active model"))
     }
 
     /// R12 — the Gemini free-tier rate limit is surfaced plainly in its CLI copy.
@@ -585,19 +516,61 @@ final class IntelligenceSettingsTests: XCTestCase {
                       "Gemini's free-tier caps must be stated plainly (R12)")
     }
 
-    /// R9 — the hosted and user-owned sections have distinct whose-bill captions.
-    func testHostedAndUserOwnedSectionsAreDistinct() {
-        XCTAssertNotEqual(
-            ConnectProviderModel.hostedSectionTitle,
-            ConnectProviderModel.userOwnedSectionTitle
-        )
-        XCTAssertTrue(ConnectProviderModel.hostedSectionCaption.lowercased()
-            .contains("personal cloud subscription"),
-            "hosted caption names the ScreenCap subscription (whose bill, R9)")
-        XCTAssertTrue(ConnectProviderModel.userOwnedSectionCaption.lowercased()
-            .contains("your account") || ConnectProviderModel.userOwnedSectionCaption.lowercased()
-            .contains("your bill"),
-            "user-owned caption names the user's own account/bill (R9)")
+    /// R1 — the two ownership group headers of the MODEL card are distinct,
+    /// non-empty, and legible: whose infrastructure each group uses reads from
+    /// the titles alone. (Rewritten from the retired 3-section
+    /// `testHostedAndUserOwnedSectionsAreDistinct` — the hosted-section copy
+    /// was retired with the reserved-slot decision, R5.)
+    func testOwnershipGroupHeadersAreDistinctAndLegible() {
+        let included = IntelligenceSelectionModel.includedGroupTitle
+        let yourOwn = IntelligenceSelectionModel.yourOwnGroupTitle
+        XCTAssertNotEqual(included, yourOwn)
+        XCTAssertFalse(included.isEmpty)
+        XCTAssertFalse(yourOwn.isEmpty)
+        XCTAssertTrue(included.contains("ScreenCap"),
+                      "the included group names whose infrastructure it is (R1)")
+        XCTAssertTrue(yourOwn.lowercased().contains("your own"),
+                      "the user-owned group states ownership plainly (R1)")
+    }
+
+    // MARK: - U5 consent-row copy (R10) + trust footer (R12)
+
+    /// R10 — each of the four consent rows has a pure title/caption static (the
+    /// exact strings the view renders), captioned in plain language: the two
+    /// send rows state what is sent AND what never leaves; the two fixed rows
+    /// state that nothing reaches a cloud model.
+    func testConsentRowCopyStaticsExistPerRow() {
+        typealias M = IntelligenceSelectionModel
+        let rows: [(title: String, caption: String)] = [
+            (M.summaryConsentRowTitle, M.summaryConsentRowCaption),
+            (M.recallConsentRowTitle, M.recallConsentRowCaption),
+            (M.daySplitRowTitle, M.daySplitRowCaption),
+            (M.framesRowTitle, M.framesRowCaption),
+        ]
+        for row in rows {
+            XCTAssertFalse(row.title.isEmpty)
+            XCTAssertFalse(row.caption.isEmpty)
+        }
+        XCTAssertTrue(M.summaryConsentRowCaption.hasPrefix("Sends"))
+        XCTAssertTrue(M.summaryConsentRowCaption.contains("Never screen images"))
+        XCTAssertTrue(M.recallConsentRowCaption.hasPrefix("Sends"))
+        XCTAssertTrue(M.recallConsentRowCaption.contains("Never screen images"))
+        XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("never a cloud task"))
+        XCTAssertTrue(M.framesRowCaption.lowercased().contains("never sent to any cloud model"))
+    }
+
+    /// R12 — the trust footer states the strip scope honestly: masked and
+    /// blocked apps are stripped before any model — local or cloud — sees
+    /// content (the segmentation privacy strip, fail-closed at the helper
+    /// boundary). It claims nothing about uploads.
+    func testTrustFooterStatesStripBeforeAnyModel() {
+        let footer = IntelligenceSelectionModel.consentTrustFooter.lowercased()
+        XCTAssertTrue(footer.contains("masked"))
+        XCTAssertTrue(footer.contains("blocked"))
+        XCTAssertTrue(footer.contains("before any model"))
+        XCTAssertTrue(footer.contains("local or cloud"))
+        XCTAssertFalse(footer.contains("upload"),
+                       "the footer is scoped to models seeing content, not uploads")
     }
 
     // MARK: - U2 fixtures — suspension gate + call counter

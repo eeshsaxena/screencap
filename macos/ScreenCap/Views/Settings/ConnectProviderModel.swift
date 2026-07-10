@@ -1,7 +1,9 @@
 import Foundation
 
 /// U6/U7 — the pure model behind the "connect your own account" flow and the
-/// hosted-vs-user-owned separation of the Intelligence provider picker.
+/// user-owned (BYO) option matrix of the Intelligence provider picker. (The
+/// ownership *grouping* of the rendered MODEL list lives in
+/// `IntelligenceSelectionModel.groups` since the U3 redesign.)
 ///
 /// Factored out of the view so the load-bearing rules are unit-testable without
 /// a running SwiftUI hierarchy:
@@ -295,17 +297,44 @@ enum ConnectProviderModel {
     static let endpointWriteFailedFallback = "Couldn't save the endpoint."
     static let providerSelectFailedFallback = "Couldn't select the provider."
 
-    // MARK: - Hosted section copy (R9)
+    // MARK: - Honest-copy audit corpus (KTD7)
 
-    /// The section header for ScreenCap-managed cloud (whose bill = ScreenCap's
-    /// Personal cloud subscription).
-    static let hostedSectionTitle = "ScreenCap-hosted cloud"
-    static let hostedSectionCaption =
-        "App-managed models with cloud upload and storage, run on ScreenCap's infrastructure behind the Personal cloud subscription."
-
-    /// The section header for user-owned intelligence (whose bill = the user's
-    /// own provider account).
-    static let userOwnedSectionTitle = "Your own account"
-    static let userOwnedSectionCaption =
-        "Bring your own OpenAI, Anthropic, or Gemini account — by API key or by delegating to your signed-in CLI. Runs on your account and your bill, with no ScreenCap subscription."
+    /// Every user-facing copy string this model owns — the flow statics, the
+    /// per-vendor copy, and every instantiation of the parametrized copy
+    /// builders — enumerated for the honest-copy audit
+    /// (`testHonestCopyAuditNoForbiddenStrings` scans exactly this list plus
+    /// `IntelligenceSelectionModel.allAuditedCopy`). Add every new copy string
+    /// here — a string missing from this list escapes the R12 honesty gate.
+    static var allAuditedCopy: [String] {
+        var out: [String] = [
+            flowPickStepTitle, flowPickCaption,
+            flowBackButtonTitle, flowDoneButtonTitle,
+            vendorChoiceCaption,
+            localServerChoiceTitle, localServerChoiceCaption,
+            cliAvailabilityHonestCopy,
+            localServerConfigureCaption,
+            endpointFieldLabel, endpointFieldPlaceholder,
+            endpointSaveButtonTitle, endpointClearButtonTitle,
+            endpointLocalResultCopy,
+            keyVerdictValidCopy, disconnectedFeedbackCopy,
+            keyStoreFailedFallback, keyClearFailedFallback,
+            endpointWriteFailedFallback, providerSelectFailedFallback,
+        ]
+        for vendor in vendors {
+            out.append(vendor.displayName)
+            out.append(vendor.keyBillingCopy)
+            out.append(vendor.cliLimitsCopy)
+            out.append(vendor.cliFixGuidance)
+            out.append(keyVerdictInvalidCopy(vendorName: vendor.displayName))
+            out.append(keyVerdictUnknownCopy(vendorName: vendor.displayName))
+        }
+        for choice in flowChoices {
+            out.append(choice.displayName)
+            out.append(flowConfigureStepTitle(for: choice))
+        }
+        for mechanism in BYOMechanism.allCases {
+            out.append(mechanism.label)
+        }
+        return out
+    }
 }
