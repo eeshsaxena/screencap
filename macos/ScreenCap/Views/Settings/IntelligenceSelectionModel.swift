@@ -196,6 +196,13 @@ enum IntelligenceSelectionModel {
     /// selection and a relevant task toggle is off (fallback-honest: off = not sent).
     static let consentNudgeCopy =
         "Your cloud model only handles the tasks you turn on below — while a task is off, nothing is sent for it."
+    /// R8 — the just-added chip rendered (with an accent border) on the row the
+    /// flow reported, until `JustAddedHighlight`'s predicate clears it.
+    static let justAddedChipLabel = "JUST ADDED"
+    /// U4 — the row accessories that open the flow at its configure step.
+    static let manageAccessoryTitle = "Manage"
+    static let setUpAccessoryTitle = "Set up"
+    static let connectAccessoryTitle = "Connect"
     /// KTD3 — on-device row status lines for the merged availability render.
     static let onDeviceReadyAppleCopy = "Ready (Apple Intelligence)"
     static let onDeviceReadyDownloadedCopy = "Ready (downloaded model)"

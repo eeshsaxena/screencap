@@ -55,9 +55,14 @@ struct IntelligenceSettingsView: View {
     /// optimistic flip has already been reverted by the controller).
     @State private var writeError: String?
 
-    /// U6 — the connect-a-provider sheet presentation. nil when closed; a vendor
-    /// pre-selection when opened for a specific "needs attention" row.
-    @State private var connectSheet: ConnectSheetState?
+    /// U4 — the add-provider flow presentation. nil when closed; `.addNew`
+    /// opens at the pick step, `.manage(choice)` enters at configure with the
+    /// row's choice preset.
+    @State private var connectFlow: ConnectFlowEntry?
+
+    /// R8 — the just-added highlight, set from the flow's completion report and
+    /// cleared by the pure predicate (next selection change or pane disappear).
+    @State private var justAdded = JustAddedHighlight()
 
     /// Live Apple-on-device availability. "On-device model" is Apple's
     /// `SystemLanguageModel`, gated by the system-wide Apple Intelligence switch —
@@ -92,14 +97,16 @@ struct IntelligenceSettingsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(Color.scCanvas)
 
-            // U6 — the connect flow, presented as an in-window overlay (the
-            // app's `NewRecordingSheet` pattern) rather than a native `.sheet`.
-            if let sheet = connectSheet, let settings = intelligence.settings {
+            // U4 — the add-provider flow, presented as an in-window overlay
+            // (the app's `NewRecordingSheet` pattern) rather than a native
+            // `.sheet`. Completion reports the added row id for the highlight.
+            if let entry = connectFlow, let settings = intelligence.settings {
                 ConnectProviderSheet(
-                    initialVendor: sheet.vendor,
+                    entry: entry,
                     settings: settings,
                     controller: intelligence,
-                    onClose: { connectSheet = nil }
+                    onClose: { connectFlow = nil },
+                    onComplete: { rowID in justAdded.flowCompleted(addedRowID: rowID) }
                 )
                 .transition(.opacity)
             }
@@ -110,11 +117,18 @@ struct IntelligenceSettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             onDeviceStatus = OnDeviceModelStatus.probe()
         }
+        // R8 — the highlight's clearing edges live in the pure predicate: a
+        // selection change to another row clears it (the flow's own auto-select
+        // of the added row does not); leaving the pane clears it.
+        .onChange(of: renderedSelectionRowID) { newRowID in
+            justAdded.selectionChanged(to: newRowID)
+        }
+        .onDisappear { justAdded.paneDisappeared() }
     }
 
-    /// Which vendor the connect sheet opens focused on.
-    struct ConnectSheetState: Equatable {
-        var vendor: BYOVendor?
+    /// The rendered selection's row id, for the highlight's clearing edge.
+    private var renderedSelectionRowID: String? {
+        intelligence.settings.map { IntelligenceSelectionModel.renderedSelection($0).rowID }
     }
 
     @ViewBuilder
@@ -182,11 +196,12 @@ struct IntelligenceSettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// One row of the grouped MODEL list. On-device and local-server rows are
-    /// whole-row radio buttons (a non-selectable REMOTE local-server row renders
-    /// disabled, exposing the disabled accessibility state — R9/AE3); BYO rows
-    /// keep the radio-as-button idiom because their trailing Manage/Set up/
-    /// Connect accessories are interactive even when the radio isn't.
+    /// One row of the grouped MODEL list. The on-device row is a whole-row
+    /// radio button; local-server and BYO rows use the radio-as-button idiom
+    /// because their trailing Manage/Set up/Connect accessories (which open the
+    /// flow at its configure step, U4) stay interactive even when the radio
+    /// isn't (a non-selectable REMOTE local-server row renders its radio muted
+    /// and disabled — R9/AE3).
     @ViewBuilder
     private func modelRow(
         _ row: IntelligenceModelRow,
@@ -197,7 +212,9 @@ struct IntelligenceSettingsView: View {
         switch row.kind {
         case .byo:
             byoModelRow(row, settings: settings, isSelected: isSelected)
-        case .onDevice, .localServer:
+        case .localServer:
+            localServerModelRow(row, settings: settings, isSelected: isSelected)
+        case .onDevice:
             Button {
                 tapRow(row, settings: settings)
             } label: {
@@ -225,6 +242,58 @@ struct IntelligenceSettingsView: View {
         }
     }
 
+    /// The local-server row under "Your own": radio (selectable only when the
+    /// endpoint classifies LOCAL — R9/AE3), title + classification subtitle,
+    /// and a Manage accessory opening the flow at the local-server configure
+    /// step (U4 re-homed the endpoint field there).
+    private func localServerModelRow(
+        _ row: IntelligenceModelRow,
+        settings: IntelligenceSettings,
+        isSelected: Bool
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            if row.selectable {
+                Button { tapRow(row, settings: settings) } label: {
+                    radio(selected: isSelected, muted: false)
+                }
+                .buttonStyle(.plain)
+                .disabled(providerWriteInFlight)
+            } else {
+                radio(selected: isSelected, muted: true)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(row.title)
+                        .font(SCTypography.sans(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.scInk)
+                    if justAdded.isHighlighted(row.id) {
+                        chip(IntelligenceSelectionModel.justAddedChipLabel, color: Color.scTeal)
+                    }
+                }
+                if let subtitle = row.subtitle {
+                    Text(subtitle)
+                        .font(SCTypography.sans(size: 12.5))
+                        .foregroundStyle(Color.scInkMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Button(IntelligenceSelectionModel.manageAccessoryTitle) {
+                connectFlow = .manage(.localServer)
+            }
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: .semibold))
+            .foregroundStyle(Color.scTeal)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .contentShape(Rectangle())
+        .overlay(justAddedBorder(row.id))
+    }
+
     /// A BYO row under "Your own": radio (when selectable), title + the existing
     /// honest billing/limits copy, and the existing needs-attention chip +
     /// Manage/Set up/Connect accessory opening `ConnectProviderSheet`.
@@ -249,9 +318,14 @@ struct IntelligenceSettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(row.title)
-                    .font(SCTypography.sans(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.scInk)
+                HStack(spacing: 8) {
+                    Text(row.title)
+                        .font(SCTypography.sans(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.scInk)
+                    if justAdded.isHighlighted(row.id) {
+                        chip(IntelligenceSelectionModel.justAddedChipLabel, color: Color.scTeal)
+                    }
+                }
                 if let option {
                     Text(byoSubtitle(option))
                         .font(SCTypography.sans(size: 12.5))
@@ -269,13 +343,25 @@ struct IntelligenceSettingsView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .contentShape(Rectangle())
+        .overlay(justAddedBorder(row.id))
+    }
+
+    /// R8 — the accent border on the just-added row, rendered alongside the
+    /// chip until the predicate clears the highlight.
+    @ViewBuilder
+    private func justAddedBorder(_ rowID: String) -> some View {
+        if justAdded.isHighlighted(rowID) {
+            RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
+                .strokeBorder(Color.scTeal, lineWidth: 1.5)
+                .padding(3)
+        }
     }
 
     /// The "Add another provider…" row at the foot of the "Your own" group —
-    /// opens the connect flow with no vendor preset.
+    /// opens the flow at its pick step (U4).
     private var addProviderRow: some View {
         Button {
-            connectSheet = ConnectSheetState(vendor: nil)
+            connectFlow = .addNew
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "plus.circle")
@@ -293,28 +379,35 @@ struct IntelligenceSettingsView: View {
 
     /// The trailing chip/button per BYO row: a "needs attention" chip for an
     /// unavailable CLI (R5/R13), a Manage button for a connected key, or a
-    /// Connect button otherwise.
+    /// Connect button otherwise — each opening the flow at the vendor's
+    /// configure step (U4).
     @ViewBuilder
     private func byoRowAccessory(_ option: BYOProviderOption) -> some View {
         switch (option.mechanism, option.state) {
         case (.cli, .needsAttention):
             HStack(spacing: 8) {
                 chip("Needs attention", color: Color.scAmberText)
-                Button("Set up") { connectSheet = ConnectSheetState(vendor: option.vendor) }
-                    .buttonStyle(.plain)
-                    .font(SCTypography.sans(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.scTeal)
+                Button(IntelligenceSelectionModel.setUpAccessoryTitle) {
+                    connectFlow = .manage(.vendor(option.vendor))
+                }
+                .buttonStyle(.plain)
+                .font(SCTypography.sans(size: 12, weight: .semibold))
+                .foregroundStyle(Color.scTeal)
             }
         case (.apiKey, .connected):
-            Button("Manage") { connectSheet = ConnectSheetState(vendor: option.vendor) }
-                .buttonStyle(.plain)
-                .font(SCTypography.sans(size: 12, weight: .semibold))
-                .foregroundStyle(Color.scTeal)
+            Button(IntelligenceSelectionModel.manageAccessoryTitle) {
+                connectFlow = .manage(.vendor(option.vendor))
+            }
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: .semibold))
+            .foregroundStyle(Color.scTeal)
         case (.apiKey, _):
-            Button("Connect") { connectSheet = ConnectSheetState(vendor: option.vendor) }
-                .buttonStyle(.plain)
-                .font(SCTypography.sans(size: 12, weight: .semibold))
-                .foregroundStyle(Color.scTeal)
+            Button(IntelligenceSelectionModel.connectAccessoryTitle) {
+                connectFlow = .manage(.vendor(option.vendor))
+            }
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: .semibold))
+            .foregroundStyle(Color.scTeal)
         default:
             EmptyView()
         }

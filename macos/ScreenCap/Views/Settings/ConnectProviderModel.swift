@@ -88,6 +88,29 @@ enum BYOVendor: String, CaseIterable, Identifiable {
     }
 }
 
+/// One choice on the add-provider flow's pick step (U4/R6): one of the three
+/// BYO cloud vendors, or the user's own local server. The vendor list gains
+/// Local server here because the flow — not the pane — now owns the endpoint.
+enum ProviderChoice: Equatable, Identifiable {
+    case vendor(BYOVendor)
+    case localServer
+
+    var id: String {
+        switch self {
+        case .vendor(let vendor): return vendor.rawValue
+        case .localServer: return IntelligenceSelectionModel.localServerRowID
+        }
+    }
+
+    /// The pick-step row title.
+    var displayName: String {
+        switch self {
+        case .vendor(let vendor): return vendor.displayName
+        case .localServer: return ConnectProviderModel.localServerChoiceTitle
+        }
+    }
+}
+
 /// The two ways to connect a vendor (R2).
 enum BYOMechanism: String, CaseIterable, Identifiable {
     /// Paste a provider API key (stored daemon-side as a Keychain-class secret).
@@ -203,6 +226,74 @@ enum ConnectProviderModel {
     /// `_VALID_CLOUD_PROVIDERS`.
     static let allBYOProviderIDs: [String] =
         vendors.map(\.keyProviderID) + vendors.map(\.cliProviderID)
+
+    // MARK: - Add-provider flow (U4)
+
+    /// The pick step's choices, in display order: the three BYO vendors plus
+    /// the user's own local server (R6).
+    static let flowChoices: [ProviderChoice] =
+        vendors.map(ProviderChoice.vendor) + [.localServer]
+
+    // MARK: - Flow copy (U4, KTD7 — statics so the honest-copy audit can
+    // enumerate every string; fallback-honest: nothing here claims a cloud pick
+    // replaces the local answerer)
+
+    /// The pick step's title and caption.
+    static let flowPickStepTitle = "Add a provider"
+    static let flowPickCaption =
+        "Connect a model that runs on your own account or hardware. It only handles the tasks you turn on."
+
+    /// The configure step's title, per choice.
+    static func flowConfigureStepTitle(for choice: ProviderChoice) -> String {
+        switch choice {
+        case .vendor(let vendor): return "Connect \(vendor.displayName)"
+        case .localServer: return "Connect a local server"
+        }
+    }
+
+    static let flowBackButtonTitle = "Back"
+    static let flowDoneButtonTitle = "Done"
+
+    /// Pick-step row captions.
+    static let vendorChoiceCaption = "Connect with your API key or your signed-in CLI."
+    static let localServerChoiceTitle = "Local server"
+    static let localServerChoiceCaption =
+        "Ollama or LM Studio running on this Mac — connect by URL."
+
+    /// KTD5 — the CLI availability check is a local stat-check; the copy states
+    /// plainly that no test call is made to the provider.
+    static let cliAvailabilityHonestCopy =
+        "Availability is checked on this Mac only — no test call is sent to the provider."
+
+    /// Local-server configure copy (KTD5 — classification is syntactic; no
+    /// network probe or model discovery is performed, R7).
+    static let localServerConfigureCaption =
+        "Point ScreenCap at an OpenAI-compatible server on this Mac, like Ollama or LM Studio. The URL is classified by its address alone — no request is sent to it."
+    static let endpointFieldLabel = "SERVER URL"
+    static let endpointFieldPlaceholder = "http://localhost:11434/v1"
+    static let endpointSaveButtonTitle = "Save"
+    static let endpointClearButtonTitle = "Remove server"
+    /// AE3 — the LOCAL classification's stated consequence. (The REMOTE result
+    /// reuses `IntelligenceSelectionModel.remoteEndpointNotSelectableCopy` so
+    /// the flow and the pane can never state different consequences.)
+    static let endpointLocalResultCopy =
+        "Local endpoint — runs on this Mac. Answers and day-splitting can use it."
+
+    /// Key-verdict feedback (R7) — the three verdicts render distinct states.
+    static let keyVerdictValidCopy = "Key verified and connected."
+    static func keyVerdictInvalidCopy(vendorName: String) -> String {
+        "That key was rejected by \(vendorName). Nothing was stored."
+    }
+    static func keyVerdictUnknownCopy(vendorName: String) -> String {
+        "Stored, but couldn't reach \(vendorName) to verify it. It'll be used as-is."
+    }
+    static let disconnectedFeedbackCopy = "Disconnected."
+
+    /// Inline-error fallbacks when the controller carries no message.
+    static let keyStoreFailedFallback = "Couldn't store the key."
+    static let keyClearFailedFallback = "Couldn't clear the key."
+    static let endpointWriteFailedFallback = "Couldn't save the endpoint."
+    static let providerSelectFailedFallback = "Couldn't select the provider."
 
     // MARK: - Hosted section copy (R9)
 

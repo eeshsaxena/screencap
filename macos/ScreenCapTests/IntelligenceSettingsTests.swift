@@ -529,6 +529,39 @@ final class IntelligenceSettingsTests: XCTestCase {
             corpus.append(vendor.cliLimitsCopy)
             corpus.append(vendor.cliFixGuidance)
         }
+        // U4 — the add-provider flow's copy statics (KTD7: every new string is
+        // a static precisely so this audit can enumerate it).
+        corpus += [
+            ConnectProviderModel.flowPickStepTitle,
+            ConnectProviderModel.flowPickCaption,
+            ConnectProviderModel.flowBackButtonTitle,
+            ConnectProviderModel.flowDoneButtonTitle,
+            ConnectProviderModel.vendorChoiceCaption,
+            ConnectProviderModel.localServerChoiceTitle,
+            ConnectProviderModel.localServerChoiceCaption,
+            ConnectProviderModel.cliAvailabilityHonestCopy,
+            ConnectProviderModel.localServerConfigureCaption,
+            ConnectProviderModel.endpointFieldLabel,
+            ConnectProviderModel.endpointFieldPlaceholder,
+            ConnectProviderModel.endpointSaveButtonTitle,
+            ConnectProviderModel.endpointClearButtonTitle,
+            ConnectProviderModel.endpointLocalResultCopy,
+            ConnectProviderModel.keyVerdictValidCopy,
+            ConnectProviderModel.disconnectedFeedbackCopy,
+            ConnectProviderModel.keyStoreFailedFallback,
+            ConnectProviderModel.keyClearFailedFallback,
+            ConnectProviderModel.endpointWriteFailedFallback,
+            ConnectProviderModel.providerSelectFailedFallback,
+            IntelligenceSelectionModel.remoteEndpointNotSelectableCopy,
+            IntelligenceSelectionModel.justAddedChipLabel,
+        ]
+        for choice in ConnectProviderModel.flowChoices {
+            corpus.append(ConnectProviderModel.flowConfigureStepTitle(for: choice))
+        }
+        for vendor in ConnectProviderModel.vendors {
+            corpus.append(ConnectProviderModel.keyVerdictInvalidCopy(vendorName: vendor.displayName))
+            corpus.append(ConnectProviderModel.keyVerdictUnknownCopy(vendorName: vendor.displayName))
+        }
         let haystack = corpus.joined(separator: " ").lowercased()
 
         let forbidden = [
@@ -840,5 +873,379 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertFalse(controller.daemonUnreachable,
                        "any successful read clears the flag")
         XCTAssertNil(controller.lastError)
+    }
+
+    // MARK: - U4 fixtures — flow settings + "Your own" rows
+
+    private func flowSettings(
+        provider: String = "on-device",
+        cloudProvider: String? = nil,
+        endpoint: String? = nil,
+        classification: String? = nil
+    ) -> IntelligenceSettings {
+        IntelligenceSettings(
+            provider: provider,
+            cloudProvider: cloudProvider,
+            summaryCloudConsent: false,
+            recallCloudConsent: false,
+            daySplitCloudConsent: false,
+            framesCloudConsent: false,
+            localServerEndpoint: endpoint,
+            endpointClassification: classification
+        )
+    }
+
+    private func yourOwnRows(_ settings: IntelligenceSettings) -> [IntelligenceModelRow] {
+        IntelligenceSelectionModel.groups(settings)
+            .first { $0.title == IntelligenceSelectionModel.yourOwnGroupTitle }!
+            .rows
+    }
+
+    // MARK: - U4 — step-policy transitions (R6)
+
+    /// "Add another provider…" starts at the pick step.
+    func testFlowAddNewEntryStartsAtPick() {
+        XCTAssertEqual(ConnectProviderStepPolicy.initialStep(for: .addNew), .pick)
+    }
+
+    /// A Manage/Set-up entry lands directly on configure with the row's choice
+    /// preset — vendor and local-server alike.
+    func testFlowManageEntryStartsAtConfigureWithPreset() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.initialStep(for: .manage(.vendor(.openai))),
+            .configure(.vendor(.openai))
+        )
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.initialStep(for: .manage(.localServer)),
+            .configure(.localServer)
+        )
+    }
+
+    /// The pick step offers the three vendors plus Local server (R6), each
+    /// advancing to its own configure step — never skipping ahead.
+    func testFlowPickAdvancesToConfigureForEveryChoiceNoSkips() {
+        XCTAssertEqual(
+            ConnectProviderModel.flowChoices.map(\.id),
+            ["openai", "anthropic", "gemini", "local-server"]
+        )
+        for choice in ConnectProviderModel.flowChoices {
+            XCTAssertEqual(
+                ConnectProviderStepPolicy.step(afterPicking: choice),
+                .configure(choice)
+            )
+        }
+        XCTAssertFalse(ConnectProviderStepPolicy.canFinish(from: .pick),
+                       "done is unreachable from pick — no step skips")
+    }
+
+    /// Back from configure returns to pick ONLY for the add-new entry; a manage
+    /// entry never saw a pick step, so Back is omitted there. Pick itself has
+    /// no back.
+    func testFlowBackFromConfigureOnlyForAddNewEntry() {
+        let configure = ConnectFlowStep.configure(.vendor(.anthropic))
+        XCTAssertTrue(ConnectProviderStepPolicy.canGoBack(from: configure, entry: .addNew))
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.stepAfterBack(from: configure, entry: .addNew),
+            .pick
+        )
+        XCTAssertFalse(ConnectProviderStepPolicy.canGoBack(
+            from: configure, entry: .manage(.vendor(.anthropic))))
+        XCTAssertNil(ConnectProviderStepPolicy.stepAfterBack(
+            from: configure, entry: .manage(.vendor(.anthropic))))
+        XCTAssertFalse(ConnectProviderStepPolicy.canGoBack(from: .pick, entry: .addNew))
+    }
+
+    /// Done is reachable only from a configure step (a completion is minted
+    /// only by a terminal configure action — the sheet gates Done on holding one).
+    func testFlowDoneOnlyAfterTerminalConfigureAction() {
+        XCTAssertFalse(ConnectProviderStepPolicy.canFinish(from: .pick))
+        XCTAssertTrue(ConnectProviderStepPolicy.canFinish(from: .configure(.localServer)))
+        XCTAssertTrue(ConnectProviderStepPolicy.canFinish(from: .configure(.vendor(.gemini))))
+    }
+
+    // MARK: - U4/R8 — completion auto-selects only selectable rows
+
+    /// A stored key's row is selectable — the completion reports it and selects
+    /// it through the cloud seam (KTD2: never the active `provider`).
+    func testFlowKeyCompletionSelectsKeyRow() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.completion(afterKeyStored: .anthropic),
+            ConnectProviderStepPolicy.Completion(
+                addedRowID: "anthropic", autoSelect: .cloudRow(id: "anthropic"))
+        )
+    }
+
+    /// R8 — a CLI add selects only when the delegation CLI is available; a
+    /// needs-attention CLI add finishes WITHOUT selection.
+    func testFlowCLICompletionSelectsOnlyWhenAvailable() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.completion(afterCLIConfirmed: .openai, cliAvailable: true),
+            ConnectProviderStepPolicy.Completion(
+                addedRowID: "openai-cli", autoSelect: .cloudRow(id: "openai-cli"))
+        )
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.completion(afterCLIConfirmed: .openai, cliAvailable: false),
+            ConnectProviderStepPolicy.Completion(addedRowID: "openai-cli", autoSelect: .none)
+        )
+    }
+
+    // MARK: - U4/AE3 — endpoint classification, both verdicts
+
+    /// AE3 — a LOCAL classification (`http://localhost:11434/v1`) auto-selects
+    /// the local-server row via the local seam, and the row it lands on is
+    /// selectable.
+    func testFlowEndpointLocalClassificationSelectsSelectableRow() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.completion(afterEndpointSaved: "LOCAL"),
+            ConnectProviderStepPolicy.Completion(
+                addedRowID: "local-server",
+                autoSelect: .localRow(provider: "local-server"))
+        )
+        let rows = yourOwnRows(flowSettings(
+            endpoint: "http://localhost:11434/v1", classification: "LOCAL"
+        ))
+        XCTAssertEqual(rows.first { $0.id == "local-server" }?.selectable, true)
+    }
+
+    /// AE3/R9 — a DNS-name URL classifies REMOTE: the flow completes WITHOUT
+    /// selection; the row renders present, unselectable, with the honest copy;
+    /// the reported row id still drives the just-added highlight.
+    func testFlowEndpointRemoteAddFinishesUnselectedHighlightedWithHonestCopy() {
+        let completion = ConnectProviderStepPolicy.completion(afterEndpointSaved: "REMOTE")
+        XCTAssertEqual(completion.addedRowID, "local-server")
+        XCTAssertEqual(completion.autoSelect, .none)
+
+        let settings = flowSettings(
+            endpoint: "http://models.example.com/v1", classification: "REMOTE"
+        )
+        let server = yourOwnRows(settings).first { $0.id == "local-server" }
+        XCTAssertEqual(server?.selectable, false)
+        XCTAssertTrue(server?.subtitle?.contains("require a local endpoint") == true,
+                      "the REMOTE row must state the consequence (AE3)")
+
+        var highlight = JustAddedHighlight()
+        highlight.flowCompleted(addedRowID: completion.addedRowID)
+        XCTAssertTrue(highlight.isHighlighted("local-server"))
+        XCTAssertEqual(
+            IntelligenceSelectionModel.renderedSelection(settings).rowID, "on-device",
+            "no auto-select happened — the selection stays where it was"
+        )
+    }
+
+    /// An unreadable classification is treated as not-local — no auto-select.
+    func testFlowEndpointUnclassifiedSaveFinishesWithoutSelection() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.completion(afterEndpointSaved: nil).autoSelect,
+            .none
+        )
+    }
+
+    // MARK: - U4/R7 — key verdicts + the stdin contract on the flow path
+
+    /// The three key verdicts render distinct feedback copy.
+    func testKeyVerdictCopyIsDistinctPerVerdict() {
+        let valid = ConnectProviderModel.keyVerdictValidCopy
+        let invalid = ConnectProviderModel.keyVerdictInvalidCopy(vendorName: "OpenAI")
+        let unknown = ConnectProviderModel.keyVerdictUnknownCopy(vendorName: "OpenAI")
+        XCTAssertEqual(Set([valid, invalid, unknown]).count, 3,
+                       "valid/invalid/unknown must render distinct states")
+        XCTAssertTrue(invalid.contains("Nothing was stored"),
+                      "the invalid verdict states the store was blocked")
+        XCTAssertTrue(unknown.lowercased().contains("verify"),
+                      "the unknown verdict states the key is unverified")
+    }
+
+    /// KTD5 pinned on the flow path: across the whole terminal-action sequence
+    /// (store via the stdin seam, then the completion's cloud-slot auto-select)
+    /// the secret travels on STDIN and appears in no argv element anywhere.
+    func testFlowKeyConnectSequencePipesSecretOverStdinNeverArgv() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+        let secret = "sk-flow-secret-value-456"
+        final class Captured: @unchecked Sendable {
+            var argv: [String] = []
+            var stdin = Data()
+        }
+        let captured = Captured()
+
+        let result = await controller.setBYOKey(
+            vendor: "openai", key: secret, validate: true,
+            injectInvoke: { args, stdin in
+                captured.argv = args
+                captured.stdin = stdin
+                return Data(#"{"ok":true,"schema_version":3,"vendor":"openai","key_present":true,"validation":"valid"}"#.utf8)
+            }
+        )
+        XCTAssertTrue(result.ok)
+
+        let completion = ConnectProviderStepPolicy.completion(afterKeyStored: .openai)
+        XCTAssertEqual(completion.autoSelect, .cloudRow(id: "openai"))
+        _ = await controller.selectCloudProvider("openai")
+
+        XCTAssertEqual(String(data: captured.stdin, encoding: .utf8), secret)
+        XCTAssertFalse(captured.argv.contains(secret))
+        XCTAssertEqual(
+            captured.argv,
+            ["settings", "intelligence", "--set-key", "openai", "--validate", "--json"]
+        )
+        XCTAssertTrue(fake.calls.contains(
+            ["settings", "intelligence", "cloud_provider", "set", "openai", "--json"]
+        ))
+        XCTAssertFalse(fake.calls.contains { $0.contains(secret) },
+                       "no argv anywhere on the flow path carries the secret")
+    }
+
+    // MARK: - U4 — disconnect: deselect-then-clear
+
+    /// Disconnecting the currently-selected key vendor deselects FIRST
+    /// (selection returns to on-device), then clears the key; a non-selected
+    /// vendor — including one whose CLI id is selected — just clears.
+    func testDisconnectPlanDeselectsFirstOnlyWhenVendorSelected() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.disconnectPlan(
+                vendor: .openai, persistedCloudProvider: "openai"),
+            [.selectOnDevice, .clearKey(vendor: "openai")]
+        )
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.disconnectPlan(
+                vendor: .openai, persistedCloudProvider: nil),
+            [.clearKey(vendor: "openai")]
+        )
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.disconnectPlan(
+                vendor: .openai, persistedCloudProvider: "openai-cli"),
+            [.clearKey(vendor: "openai")],
+            "the CLI id being selected is not the key row — clearing the key must not deselect it"
+        )
+    }
+
+    /// EFFECT — running the plan through the controller ships the deselect
+    /// (cloud slot cleared, provider back to on-device) BEFORE `--clear-key`.
+    func testDisconnectSelectedProviderIssuesDeselectThenClearArgvOrder() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        for operation in ConnectProviderStepPolicy.disconnectPlan(
+            vendor: .openai, persistedCloudProvider: "openai"
+        ) {
+            switch operation {
+            case .selectOnDevice:
+                _ = await controller.selectLocalProvider("on-device")
+            case .clearKey(let vendor):
+                _ = await controller.clearBYOKey(vendor: vendor)
+            }
+        }
+
+        let writes = fake.calls.filter { $0 != ["settings", "intelligence", "--json"] }
+        XCTAssertEqual(writes, [
+            ["settings", "intelligence", "cloud_provider", "set", "none", "--json"],
+            ["settings", "intelligence", "provider", "set", "on-device", "--json"],
+            ["settings", "intelligence", "--clear-key", "openai", "--json"],
+        ])
+    }
+
+    // MARK: - U4 — endpoint writes: provider-reset-first
+
+    /// Clearing the endpoint while `local-server` is the persisted provider
+    /// resets to on-device FIRST; while it isn't, the clear stands alone.
+    func testEndpointClearPlanResetsProviderFirstWhileActive() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.endpointWritePlan(
+                newValue: "", persistedProvider: "local-server"),
+            [.selectOnDevice, .writeEndpoint("")]
+        )
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.endpointWritePlan(
+                newValue: "", persistedProvider: "on-device"),
+            [.writeEndpoint("")]
+        )
+    }
+
+    /// A re-save while active resets FIRST too: the LOCAL/REMOTE verdict is
+    /// only known after the daemon round-trip, so a REMOTE result must never
+    /// leave `provider=local-server` pointing at it even transiently (a LOCAL
+    /// result re-selects via the completion's auto-select).
+    func testEndpointRemoteResavePlanResetsProviderFirstWhileActive() {
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.endpointWritePlan(
+                newValue: "http://models.example.com/v1",
+                persistedProvider: "local-server"),
+            [.selectOnDevice, .writeEndpoint("http://models.example.com/v1")]
+        )
+        XCTAssertEqual(
+            ConnectProviderStepPolicy.endpointWritePlan(
+                newValue: "http://localhost:11434/v1",
+                persistedProvider: "on-device"),
+            [.writeEndpoint("http://localhost:11434/v1")]
+        )
+    }
+
+    /// EFFECT — the clear-while-active plan ships the provider reset argv
+    /// BEFORE the endpoint write.
+    func testEndpointClearWhileActiveIssuesProviderResetBeforeEndpointWrite() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        for operation in ConnectProviderStepPolicy.endpointWritePlan(
+            newValue: "", persistedProvider: "local-server"
+        ) {
+            switch operation {
+            case .selectOnDevice:
+                _ = await controller.selectLocalProvider("on-device")
+            case .writeEndpoint(let value):
+                _ = await controller.setEndpoint(value)
+            }
+        }
+
+        let writes = fake.calls.filter { $0 != ["settings", "intelligence", "--json"] }
+        XCTAssertEqual(writes, [
+            ["settings", "intelligence", "cloud_provider", "set", "none", "--json"],
+            ["settings", "intelligence", "provider", "set", "on-device", "--json"],
+            ["settings", "intelligence", "local_server_endpoint", "set", "none", "--json"],
+        ])
+    }
+
+    // MARK: - U4/F2 — completion returns the row id; highlight + nudge
+
+    /// F2/R8 — completion returns the added row id; the highlight sets from it
+    /// and survives the flow's own auto-select of that row; the standing nudge
+    /// fires for the newly selected cloud row exactly while its toggles are off.
+    func testFlowCompletionReportsRowIDHighlightAndNudgeFollowToggles() {
+        let completion = ConnectProviderStepPolicy.completion(afterKeyStored: .anthropic)
+        XCTAssertEqual(completion.addedRowID, "anthropic")
+
+        var highlight = JustAddedHighlight()
+        highlight.flowCompleted(addedRowID: completion.addedRowID)
+        // The auto-select lands as a selection change to the same row — the
+        // chip it just set must survive.
+        highlight.selectionChanged(to: completion.addedRowID)
+        XCTAssertTrue(highlight.isHighlighted("anthropic"))
+
+        XCTAssertTrue(IntelligenceSelectionModel.consentNudgeVisible(
+            selectedRowID: completion.addedRowID,
+            summaryCloudConsent: false, recallCloudConsent: false
+        ), "off toggles → the standing nudge points at the consent section")
+        XCTAssertFalse(IntelligenceSelectionModel.consentNudgeVisible(
+            selectedRowID: completion.addedRowID,
+            summaryCloudConsent: true, recallCloudConsent: true
+        ), "no nudge when the toggles are already on")
+    }
+
+    // MARK: - U4 honest copy (KTD5 / AE3)
+
+    /// KTD5 — the CLI configure step states plainly that no test call is made.
+    func testCliConfigureCopyStatesNoTestCall() {
+        XCTAssertTrue(ConnectProviderModel.cliAvailabilityHonestCopy.lowercased()
+            .contains("no test call"))
+    }
+
+    /// R9/AE3 — the flow's REMOTE result copy IS the pane's non-selectable-row
+    /// copy (one string, one consequence), and it states the requirement.
+    func testFlowRemoteResultCopyStatesLocalEndpointRequirement() {
+        XCTAssertTrue(IntelligenceSelectionModel.remoteEndpointNotSelectableCopy
+            .contains("require a local endpoint"))
     }
 }
