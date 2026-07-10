@@ -539,19 +539,36 @@ _RECAP_CUES = (
 )
 _RECAP_RE = re.compile("|".join(_RECAP_CUES), re.IGNORECASE)
 
+# KTD4's "no dominant content keyword" gate: a recap-shaped question that names a
+# specific SUBJECT ("… about the login bug", "… to fix that error") is a point
+# lookup for that moment, not an open day recap. These high-signal qualifiers are
+# chosen NOT to collide with the recap verb phrases themselves (e.g. a bare "on"
+# would wrongly fire on "what did I work on this week"), so they only demote a
+# genuine content-bearing recap.
+_CONTENT_QUALIFIER_CUES = (
+    r"\babout\b",
+    r"\bregarding\b",
+    r"\bto (?:fix|solve|debug|resolve|handle|figure out|deal with)\b",
+)
+_CONTENT_QUALIFIER_RE = re.compile("|".join(_CONTENT_QUALIFIER_CUES), re.IGNORECASE)
+
 
 def classify_question(question: str) -> QuestionKind:
     """Rule-based v1 point-vs-aggregate classifier (R3, KTD4).
 
-    Aggregate cues ("how much/long time", "recap", "summarize", "total …") OR an
-    open recap-intent question ("what did I do …", "what did I work on …")
-    → :attr:`QuestionKind.AGGREGATE`; everything else is a point lookup. A specific
-    content lookup that merely carries a time reference ("what was that error I saw
-    yesterday") stays POINT. A light on-device intent model is the deferred
-    alternative (Outstanding Questions).
+    Explicit aggregate cues ("how much/long time", "recap", "summarize", "total …")
+    always → :attr:`QuestionKind.AGGREGATE`. An open recap-intent question ("what
+    did I do …", "what did I work on …") → AGGREGATE **only when it carries no
+    dominant content keyword** (KTD4): a recap that names a specific subject ("what
+    did I do about the login bug yesterday") is a point lookup for that moment, and a
+    specific content lookup that merely carries a time reference ("what was that
+    error I saw yesterday") is POINT too. A light on-device intent model is the
+    deferred alternative (Outstanding Questions).
     """
     q = question or ""
-    if _AGGREGATE_RE.search(q) or _RECAP_RE.search(q):
+    if _AGGREGATE_RE.search(q):
+        return QuestionKind.AGGREGATE
+    if _RECAP_RE.search(q) and not _CONTENT_QUALIFIER_RE.search(q):
         return QuestionKind.AGGREGATE
     return QuestionKind.POINT
 

@@ -338,6 +338,15 @@ def _answered_target(reporting_target: ExecutionTarget) -> ExecutionTarget:
     must have come from the on-device chain. Report ``CLOUD`` when cloud was the
     consented target, else ``ON_DEVICE`` — never the misleading ``NONE`` that would
     tag a real answer as "no backend".
+
+    Known imprecision (deliberate, privacy-conservative): when cloud IS consented,
+    ``answer_recall`` still tries on-device FIRST, so a locally-produced answer is
+    reported as ``CLOUD``. That over-claims egress — the SAFE direction: it never
+    falsely tells the user their data "stayed on this Mac". Reporting the exact
+    producing stage would require ``answer_recall`` to surface it (its contract is
+    ``str | PROVIDER_UNAVAILABLE`` today); deferred. U8's honest-state selector keys
+    off ``refusal``/``reason``, not ``target``, so this label has no honest-state
+    impact.
     """
     if reporting_target is ExecutionTarget.CLOUD:
         return ExecutionTarget.CLOUD

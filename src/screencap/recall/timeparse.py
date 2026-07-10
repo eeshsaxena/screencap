@@ -46,7 +46,21 @@ def resolve_time_window(
     ``now_ms`` is the current wall clock (the daemon passes ``time.time()*1000``;
     tests pass a fixed value). ``tz`` defaults to the host's local timezone. Returns
     ``None`` when no supported phrase is present or the window clamps empty.
+
+    NEVER raises. A recognized phrase with an out-of-range magnitude (e.g. "last
+    99999999999 days" overflows ``timedelta``) degrades to no-window, exactly like
+    an unrecognized phrase — so the fail-safe ``chat.answer`` verb never 500s on
+    adversarial question text.
     """
+    try:
+        return _resolve_window(question, now_ms, tz)
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+def _resolve_window(
+    question: str, now_ms: int, tz: _dt.tzinfo | None
+) -> tuple[int, int] | None:
     q = (question or "").lower()
     if tz is None:
         tz = _dt.datetime.now().astimezone().tzinfo

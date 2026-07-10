@@ -108,3 +108,13 @@ def test_this_month():
 )
 def test_unrecognized_phrase_returns_none(question):
     assert resolve_time_window(question, now_ms=NOW, tz=UTC) is None
+
+
+def test_out_of_range_last_n_degrades_to_none_never_raises():
+    # A recognized phrase with an absurd magnitude overflows timedelta; it must
+    # degrade to no-window (not raise), so the fail-safe chat.answer verb never 500s.
+    assert resolve_time_window(
+        "what happened in the last 999999999999999999 days", now_ms=NOW, tz=UTC
+    ) is None
+    # "last 0 hours" clamps to an empty window → None (not a crash, not a bad window).
+    assert resolve_time_window("last 0 hours", now_ms=NOW, tz=UTC) is None

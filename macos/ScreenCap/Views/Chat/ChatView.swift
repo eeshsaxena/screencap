@@ -390,8 +390,10 @@ private struct ChatTurnView: View {
         .padding(SCMetrics.space3)
         .frame(maxWidth: 640, alignment: .leading)
         .background(Color.scTealSoft.opacity(0.4), in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("No AI model is set up to answer yet. \(Self.noBackendBody)")
+        // Do NOT `.accessibilityElement(children: .combine)` here: it would fold the
+        // "Open Intelligence Settings" Button into one static element and make the
+        // CTA unreachable by VoiceOver. The Text views read out on their own;
+        // the Button keeps its own focusable element (mirrors ocrConsentBanner).
     }
 
     /// OS-aware copy (R6): on a host that can't run on-device (macOS < 26), lead
