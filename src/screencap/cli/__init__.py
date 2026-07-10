@@ -782,6 +782,21 @@ def _run_start_via_daemon(
                         err=True,
                     )
                     return 2
+                if code == "subscription_required":
+                    # SCR (paid-only launch, U10): the daemon's local paywall
+                    # (``SCREENCAP_LOCAL_PAYWALL_ENFORCE``) refused the start
+                    # with a 402 ``subscription_required`` envelope. Render a
+                    # concise upgrade message via ``rich.console.Console``
+                    # (mirroring the upload-side ``SubscriptionRequired`` tone)
+                    # and exit non-zero with no traceback — never the generic
+                    # "Daemon rejected start" line below. With the flag off the
+                    # daemon never emits this code, so the start path is
+                    # byte-identical to today.
+                    console.print(
+                        "[red]Recording requires an active subscription — "
+                        "upgrade in the app to continue.[/red]"
+                    )
+                    return 1
                 if code == "permission_required":
                     # SCR-142: the daemon's pre-spawn permission gate rejected
                     # the start and named every denied permission in ``missing``.

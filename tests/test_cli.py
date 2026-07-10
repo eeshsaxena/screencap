@@ -409,6 +409,82 @@ def test_stop_not_owned_by_daemon_is_zero_exit():
     assert payload["error"] == "not_owned_by_daemon"
 
 
+# --- start command: local-paywall subscription gate (U10) ---
+
+
+def _start_ok_envelope(**payload):
+    body = {
+        "ok": True,
+        "schema_version": 1,
+        "daemon_version": "test",
+        "api_schema_version": 1,
+    }
+    body.update(payload)
+    return body
+
+
+def test_start_subscription_required_prints_friendly_message_and_exits_nonzero():
+    """When the daemon's local paywall refuses recording.start with a 402
+    ``subscription_required`` envelope, ``screencap start`` renders a concise
+    upgrade message (rich Console) and exits non-zero with no traceback — not
+    the generic "Daemon rejected start" line."""
+    import httpx
+
+    def handler(request):
+        assert request.url.path == "/v0/recording.start"
+        return httpx.Response(
+            402,
+            json={
+                "ok": False,
+                "error": "subscription_required",
+                "schema_version": 1,
+                "api_schema_version": 1,
+                "daemon_version": "test",
+            },
+        )
+
+    client_p, autospawn_p = _patch_stop_daemon_client(handler)
+    runner = CliRunner()
+    with _safe_start_prompts(), client_p, autospawn_p:
+        result = runner.invoke(cli, ["start", "--name", "gated-rec", "--local"])
+
+    assert result.exit_code != 0
+    assert "requires an active subscription" in result.output
+    assert "upgrade in the app" in result.output
+    # No traceback and not the generic rejection line.
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert "Daemon rejected start" not in result.output
+
+
+def test_start_normal_start_does_not_print_subscription_message():
+    """Flag-off / normal start (daemon accepts recording.start and the stream
+    finalizes) is unchanged — the new subscription branch is inert and its
+    upgrade copy never appears."""
+    import httpx
+
+    def handler(request):
+        if request.url.path == "/v0/recording.start":
+            return httpx.Response(
+                200,
+                json=_start_ok_envelope(session_id="abc123", cursor=0),
+            )
+        if request.url.path == "/v0/events":
+            # Single NDJSON event that terminates the stream cleanly.
+            finalized = {"type": "recording_finalized", "cursor": 1}
+            return httpx.Response(200, content=(json.dumps(finalized) + "\n"))
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    client_p, autospawn_p = _patch_stop_daemon_client(handler)
+    runner = CliRunner()
+    with _safe_start_prompts(), client_p, autospawn_p:
+        result = runner.invoke(cli, ["start", "--name", "ok-rec", "--local"])
+
+    assert result.exit_code == 0, result.output
+    assert "requires an active subscription" not in result.output
+    assert "upgrade in the app" not in result.output
+
+
 # --- missing [record] extras tests ---
 
 
