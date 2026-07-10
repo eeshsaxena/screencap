@@ -720,10 +720,12 @@ def _load_models() -> dict[str, Any]:
         ``answer`` is the generated prose (or the canonical refusal text on a
         refusal). ``sources`` are pointer-only source locators (never image bytes /
         paths — R8). ``coverage`` is the honest coverage descriptor (R12).
-        ``refusal`` flags a no-evidence / no-execution-target / attribution-rejected
-        turn so the client renders it distinctly. ``question_kind`` is ``point`` /
-        ``aggregate``; ``target`` is the execution target this turn resolved to
-        (``on_device`` / ``cloud`` / ``none`` / …), recomputed per turn.
+        ``refusal`` flags a refused turn so the client renders it distinctly, and
+        ``reason`` says WHY (``no_backend`` / ``no_evidence`` / ``unsupported`` /
+        ``blocked``, ``null`` on a real answer) so the client shows the honest state
+        instead of collapsing every refusal into one message. ``question_kind`` is
+        ``point`` / ``aggregate``; ``target`` is the execution target this turn
+        resolved to (``on_device`` / ``cloud`` / ``none`` / …), recomputed per turn.
         """
 
         answer: str
@@ -732,6 +734,7 @@ def _load_models() -> dict[str, Any]:
         refusal: bool
         question_kind: str
         target: str
+        reason: str | None = None
 
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,

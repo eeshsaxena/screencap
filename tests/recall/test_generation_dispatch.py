@@ -27,6 +27,10 @@ from __future__ import annotations
 import pytest
 
 from screencap.recall.dispatch import (
+    REASON_BLOCKED,
+    REASON_NO_BACKEND,
+    REASON_NO_EVIDENCE,
+    REASON_UNSUPPORTED,
     ChatAnswer,
     EgressViolation,
     answer_from_bundle,
@@ -126,6 +130,7 @@ def test_empty_bundle_refuses_without_calling_answer_fn():
     )
     assert isinstance(result, ChatAnswer)
     assert result.refusal is True
+    assert result.reason == REASON_NO_EVIDENCE
     # The model was never consulted, and the fabricated text never surfaces.
     assert fn.calls == [], "an empty bundle must refuse before the delegated call"
     assert "made something up" not in result.answer.lower()
@@ -143,7 +148,27 @@ def test_attribution_failure_is_blanked_to_refusal():
         answer_fn=fn,
     )
     assert result.refusal is True
+    assert result.reason == REASON_UNSUPPORTED
     assert "kubernetes" not in result.answer.lower()
+
+
+def test_egress_guard_breach_refuses_with_blocked_reason(monkeypatch):
+    """A whole-payload egress-guard breach → a refusal tagged ``blocked`` — not
+    ``no_backend`` — on a machine that has a working backend and matching evidence."""
+    def _boom(*_a, **_k):
+        raise EgressViolation("simulated leak")
+
+    monkeypatch.setattr("screencap.recall.dispatch.assert_cloud_payload_bounded", _boom)
+    fn = FakeAnswerFn()
+    result = answer_from_bundle(
+        _bundle([_item("evidence snippet")]),
+        question="q",
+        policy=_CLOUD_CONSENTED,
+        answer_fn=fn,
+    )
+    assert result.refusal is True
+    assert result.reason == REASON_BLOCKED
+    assert fn.calls == [], "the egress guard refuses before the delegated call"
 
 
 # ===========================================================================
@@ -166,10 +191,30 @@ def test_consented_turn_resolves_to_cloud():
     assert fn.calls, "a consented turn runs the delegated model call after the guard"
 
 
-def test_no_consent_resolves_to_none_and_refuses():
-    """No recall consent → no cloud fallback → NONE → a refusal, never a leak, and
-    the delegated model call is never made."""
-    fn = FakeAnswerFn()
+def test_no_cloud_consent_still_attempts_on_device_and_answers():
+    """KTD2: with no cloud consent the dispatch NO LONGER refuses up-front — it
+    attempts the provider chain (on-device first). A working backend (the fake
+    returns a str) → an answer, and the reported target is not the misleading NONE
+    (KTD5: a successful answer must never report NONE)."""
+    # The answer must be backed by the evidence to pass the attribution validator,
+    # so the fake echoes the snippet text (a genuinely-grounded answer).
+    fn = FakeAnswerFn(answer_text="evidence snippet about the dashboard")
+    result = answer_from_bundle(
+        _bundle([_item("evidence snippet about the dashboard")]),
+        question="q",
+        policy=_NO_CONSENT,
+        answer_fn=fn,
+    )
+    assert result.refusal is False
+    assert result.reason is None
+    assert result.target is ExecutionTarget.ON_DEVICE  # never NONE on a real answer
+    assert fn.calls, "the on-device attempt must run even without cloud consent"
+
+
+def test_provider_chain_unavailable_refuses_with_no_backend_reason():
+    """When the whole provider chain is unavailable (on-device gated off + no
+    consented cloud), the dispatch attempts, then refuses with reason ``no_backend``."""
+    fn = FakeAnswerFn(available=False)  # PROVIDER_UNAVAILABLE
     result = answer_from_bundle(
         _bundle([_item("evidence snippet")]),
         question="q",
@@ -177,8 +222,8 @@ def test_no_consent_resolves_to_none_and_refuses():
         answer_fn=fn,
     )
     assert result.refusal is True
-    assert result.target is ExecutionTarget.NONE
-    assert fn.calls == [], "a no-target turn must refuse before the delegated call"
+    assert result.reason == REASON_NO_BACKEND
+    assert fn.calls, "the chain was attempted before the no_backend refusal"
 
 
 # ===========================================================================

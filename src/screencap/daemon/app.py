@@ -1907,6 +1907,7 @@ def _chat_answer_payload(result: ChatAnswer) -> dict[str, Any]:
         "refusal": result.refusal,
         "question_kind": result.question_kind.value,
         "target": result.target.value,
+        "reason": result.reason,
     }
 
 

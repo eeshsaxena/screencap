@@ -80,6 +80,20 @@ logger = logging.getLogger(__name__)
 # re-validation of the refusal itself passes.
 REFUSAL_TEXT = "I don't have that in your recorded history."
 
+# Refusal reasons (U2) — a distinct code per refusal BRANCH so the client can render
+# the honest state instead of collapsing every refusal into "not in your history":
+#   * no_backend  — the provider chain (on-device, then consented cloud) was
+#                   unavailable; nothing could generate an answer.
+#   * no_evidence — the bundle was empty (no evidence, no figures), or the model
+#                   itself refused over the retrieved evidence.
+#   * unsupported — the answer-side attribution validator rejected the model's prose.
+#   * blocked     — the whole-payload egress guard tripped (a safety refusal).
+# ``reason`` is ``None`` on a successful answer.
+REASON_NO_BACKEND = "no_backend"
+REASON_NO_EVIDENCE = "no_evidence"
+REASON_UNSUPPORTED = "unsupported"
+REASON_BLOCKED = "blocked"
+
 
 # ---------------------------------------------------------------------------
 # Result type (U5 serializes this)
@@ -99,6 +113,9 @@ class ChatAnswer:
     * ``refusal`` — whether the answer is a refusal (empty bundle, no target, or an
       attribution rejection). U5/U8 render a refusal distinctly.
     * ``question_kind`` — point vs aggregate (carried through from the bundle).
+    * ``reason`` — WHY a refusal happened (``no_backend`` / ``no_evidence`` /
+      ``unsupported`` / ``blocked``), so the client renders the honest state rather
+      than collapsing every refusal into one message. ``None`` on a real answer.
     """
 
     answer: str
@@ -107,6 +124,7 @@ class ChatAnswer:
     target: ExecutionTarget
     refusal: bool
     question_kind: QuestionKind = QuestionKind.POINT
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +313,10 @@ def _default_answer_fn(question: str, evidence: Evidence) -> str | ProviderUnava
     return answer_recall(question, evidence)
 
 
-def _refusal(bundle: EvidenceBundle, target: ExecutionTarget) -> ChatAnswer:
-    """A canonical refusal ChatAnswer — no sources, no leak."""
+def _refusal(
+    bundle: EvidenceBundle, target: ExecutionTarget, *, reason: str
+) -> ChatAnswer:
+    """A canonical refusal ChatAnswer — no sources, no leak, tagged with WHY."""
     return ChatAnswer(
         answer=REFUSAL_TEXT,
         sources=[],
@@ -304,7 +324,24 @@ def _refusal(bundle: EvidenceBundle, target: ExecutionTarget) -> ChatAnswer:
         target=target,
         refusal=True,
         question_kind=bundle.question_kind,
+        reason=reason,
     )
+
+
+def _answered_target(reporting_target: ExecutionTarget) -> ExecutionTarget:
+    """The target to REPORT for a successful answer — never ``NONE`` (KTD5).
+
+    The dispatch resolves ``reporting_target`` with ``on_device_available=False``,
+    which is ``NONE`` on a machine with no consented cloud. But a produced answer
+    means the provider chain succeeded: ``answer_recall`` tries on-device first and
+    only falls back to consented cloud, so a ``str`` result with no cloud target
+    must have come from the on-device chain. Report ``CLOUD`` when cloud was the
+    consented target, else ``ON_DEVICE`` — never the misleading ``NONE`` that would
+    tag a real answer as "no backend".
+    """
+    if reporting_target is ExecutionTarget.CLOUD:
+        return ExecutionTarget.CLOUD
+    return ExecutionTarget.ON_DEVICE
 
 
 def answer_from_bundle(
@@ -334,20 +371,19 @@ def answer_from_bundle(
     """
     policy = policy or ConsentPolicy.from_config()
 
-    # --- 1. Per-turn consent: resolve the RECALL_ANSWER target for REPORTING +
-    # egress gating. On-device *generation* is unavailable in this tree, so we
-    # resolve with on_device_available=False — the same cloud-fallback resolution
-    # answer_recall performs internally. -----------------------------------------
-    target = policy.resolve(TaskKind.RECALL_ANSWER, on_device_available=False)
-
-    # No execution target (on-device unavailable, no consented cloud) → refuse.
-    if target in (ExecutionTarget.NONE, ExecutionTarget.NEVER, ExecutionTarget.HEURISTIC):
-        return _refusal(bundle, target)
+    # --- 1. Resolve the reporting target (egress reporting only). We NO LONGER
+    # refuse on it up-front (KTD2): the target resolves with on_device_available=
+    # False, which is NONE on a machine with no consented cloud — but answer_recall
+    # DOES try the on-device chain first and only falls back to consented cloud, so
+    # an early gate here would refuse a viable on-device answer. answer_recall
+    # returns PROVIDER_UNAVAILABLE when the whole chain cannot answer; the egress
+    # guard below still runs on every turn before any provider call. --------------
+    reporting_target = policy.resolve(TaskKind.RECALL_ANSWER, on_device_available=False)
 
     # --- 2. Empty/insufficient bundle → refuse BEFORE any model call. -----------
     # An empty bundle must never reach a provider that could fabricate over it.
     if not bundle.evidence and bundle.figures is None:
-        return _refusal(bundle, target)
+        return _refusal(bundle, reporting_target, reason=REASON_NO_EVIDENCE)
 
     # --- 3. Build the evidence text (bundle-derived only) + the stripped Evidence.
     # The dispatch is the CONSUMER (outside segmentation/), so it is allowed to mint
@@ -361,35 +397,41 @@ def answer_from_bundle(
         assert_cloud_payload_bounded(payload, bundle, question=question)
     except EgressViolation:
         logger.warning("recall dispatch: payload failed the egress guard; refusing")
-        return _refusal(bundle, target)
+        return _refusal(bundle, reporting_target, reason=REASON_BLOCKED)
 
-    # --- 5. Delegate the model call to answer_recall (main's recall entry). -----
+    # --- 5. Delegate the model call to answer_recall (on-device, then cloud). ----
     try:
         result = (answer_fn or _default_answer_fn)(question, evidence)
     except Exception:
         logger.warning("recall dispatch: answer_fn raised; treating as unavailable")
         result = None
     if not isinstance(result, str):
-        # PROVIDER_UNAVAILABLE (or a raised error mapped above) → refuse.
-        return _refusal(bundle, target)
+        # PROVIDER_UNAVAILABLE (or a raised error mapped above) — the whole provider
+        # chain could not answer. This is the honest "no backend" refusal.
+        return _refusal(bundle, reporting_target, reason=REASON_NO_BACKEND)
 
     model_answer = result
 
-    # --- 6. Answer-side attribution: blank a failing answer to a refusal. -------
+    # --- 6. Answer-side attribution: a failing verdict is a safe refusal. -------
     verdict = validate_attribution(model_answer, bundle, question=question)
     if not verdict.ok:
         logger.info("recall dispatch: attribution rejected the answer (%s); refusing",
                     verdict.reason)
-        return _refusal(bundle, target)
+        return _refusal(bundle, reporting_target, reason=REASON_UNSUPPORTED)
 
-    is_refusal_answer = _is_refusal_text(model_answer)
+    # A model that emitted a refusal over real evidence → honest no-evidence state.
+    if _is_refusal_text(model_answer):
+        return _refusal(bundle, reporting_target, reason=REASON_NO_EVIDENCE)
+
+    # --- 7. Answered: report a target that reflects success, never NONE (KTD5). --
     return ChatAnswer(
-        answer=model_answer if not is_refusal_answer else REFUSAL_TEXT,
-        sources=[] if is_refusal_answer else list(verdict.sources),
+        answer=model_answer,
+        sources=list(verdict.sources),
         coverage=bundle.coverage,
-        target=target,
-        refusal=is_refusal_answer,
+        target=_answered_target(reporting_target),
+        refusal=False,
         question_kind=bundle.question_kind,
+        reason=None,
     )
 
 
