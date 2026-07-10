@@ -151,7 +151,13 @@ final class IntelligenceController: ObservableObject {
     /// independent rows (summary vs recall) never block each other.
     private var pendingRows: Set<String> = []
 
-    /// Serializes provider-picker writes for the same reason.
+    /// Serializes provider-picker writes for the same reason. Shared across
+    /// `setProvider`, `setCloudProvider`, and the `selectLocalProvider` /
+    /// `selectCloudProvider` seam — the picker is one radio group, so only one
+    /// selection write may be in flight at a time (KTD6). A guarded-out call
+    /// returns false without touching `lastError`: the view keeps its own
+    /// in-flight guard (the documented double-guard), and a noisy bounce here
+    /// would surface a spurious inline error.
     private var providerWriteInFlight: Bool = false
 
     init(invoke: @escaping JSONInvoker = IntelligenceController.defaultInvoke) {
@@ -264,6 +270,74 @@ final class IntelligenceController: ObservableObject {
         }
     }
 
+    // MARK: - Row selection seam (U2, KTD1)
+
+    /// Select a local model row. `value` is `on-device` or `local-server` —
+    /// never `downloaded` (a legacy read-back value the daemon's on-device chain
+    /// subsumes, KTD2) and never a BYO id (those route through
+    /// ``selectCloudProvider(_:)``; the daemon hard-rejects a BYO id on
+    /// `provider`).
+    ///
+    /// KTD1's two-write sequence: the cloud-fallback slot is cleared FIRST
+    /// (`cloud_provider set none`), then the active provider is written — so a
+    /// mid-sequence failure can never leave a cloud fallback consented while the
+    /// picker renders a local selection. If the clear fails, the provider write
+    /// is aborted entirely. Either failure reconciles against disk via
+    /// `refresh()` and then surfaces the write's error (in that order — a
+    /// successful reconcile must not wipe the inline error). Returns success so
+    /// the pane can show the existing inline-error pattern.
+    @discardableResult
+    func selectLocalProvider(_ value: String) async -> Bool {
+        guard !providerWriteInFlight else { return false }
+        providerWriteInFlight = true
+        defer { providerWriteInFlight = false }
+
+        // Optimistic flip on the user-action edge (KTD6): the local row renders
+        // selected immediately — provider set, cloud fallback cleared.
+        let previous = settings
+        if let current = settings {
+            settings = current.with(provider: value).with(cloudProvider: nil)
+        }
+
+        // Write 1 — clear the fallback slot. A failure aborts the sequence.
+        do {
+            _ = try await invoke([
+                "settings", "intelligence", "cloud_provider", "set", "none", "--json",
+            ])
+        } catch {
+            settings = previous
+            await refresh()
+            lastError = error.localizedDescription
+            return false
+        }
+
+        // Write 2 — the active provider.
+        do {
+            _ = try await invoke([
+                "settings", "intelligence", "provider", "set", value, "--json",
+            ])
+            lastError = nil
+            await refresh()
+            return true
+        } catch {
+            // Disk now holds cloud_provider=none plus the old provider; the
+            // reverted snapshot is stale, so reconcile against disk.
+            settings = previous
+            await refresh()
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Select a BYO cloud row: writes the `cloud_provider` slot only — never
+    /// the active `provider`, which the daemon hard-rejects for BYO ids (KTD2).
+    /// Delegates to ``setCloudProvider(_:)`` for the optimistic flip, in-flight
+    /// guard, and revert-on-failure discipline.
+    @discardableResult
+    func selectCloudProvider(_ id: String) async -> Bool {
+        await setCloudProvider(id)
+    }
+
     // MARK: - BYO cloud writes (U6)
 
     /// Persist the consented cloud fallback provider (`[intelligence].cloud_provider`),
@@ -272,20 +346,35 @@ final class IntelligenceController: ObservableObject {
     /// provider, and the daemon rejects `provider set <byo-id>` outright. Reconciles
     /// against disk so the picker reflects what actually persisted. Returns success
     /// so the pane can surface an inline error.
+    ///
+    /// KTD6 — mirrors `setProvider`'s discipline: optimistic flip on the
+    /// user-action edge, revert + reconcile + error on failure, and an in-flight
+    /// guard whose bounce is quiet (returns false without touching `lastError`)
+    /// so the view's double-guard never shows a spurious error.
     @discardableResult
     func setCloudProvider(_ value: String?) async -> Bool {
+        guard !providerWriteInFlight else { return false }
+        providerWriteInFlight = true
+        defer { providerWriteInFlight = false }
+
         let arg = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = (arg?.isEmpty ?? true) ? "none" : arg!
+
+        let previous = settings
+        if let current = settings {
+            settings = current.with(cloudProvider: normalized == "none" ? nil : normalized)
+        }
         do {
             _ = try await invoke([
-                "settings", "intelligence", "cloud_provider", "set",
-                (arg?.isEmpty ?? true) ? "none" : arg!, "--json",
+                "settings", "intelligence", "cloud_provider", "set", normalized, "--json",
             ])
             lastError = nil
             await refresh()
             return true
         } catch {
-            lastError = error.localizedDescription
+            settings = previous
             await refresh()
+            lastError = error.localizedDescription
             return false
         }
     }
@@ -402,6 +491,29 @@ extension IntelligenceSettings {
         IntelligenceSettings(
             provider: provider,
             cloudProvider: cloudProvider,
+            summaryCloudConsent: summaryCloudConsent,
+            recallCloudConsent: recallCloudConsent,
+            daySplitCloudConsent: daySplitCloudConsent,
+            framesCloudConsent: framesCloudConsent,
+            localServerEndpoint: localServerEndpoint,
+            endpointClassification: endpointClassification,
+            downloadedModelInstalled: downloadedModelInstalled,
+            openaiKeyPresent: openaiKeyPresent,
+            anthropicKeyPresent: anthropicKeyPresent,
+            geminiKeyPresent: geminiKeyPresent,
+            openaiCliAvailable: openaiCliAvailable,
+            anthropicCliAvailable: anthropicCliAvailable,
+            geminiCliAvailable: geminiCliAvailable
+        )
+    }
+
+    /// A copy with the cloud fallback provider replaced or cleared (optimistic
+    /// flip for `setCloudProvider` / the local-row clear in
+    /// `selectLocalProvider`, KTD6).
+    func with(cloudProvider newValue: String?) -> IntelligenceSettings {
+        IntelligenceSettings(
+            provider: provider,
+            cloudProvider: newValue,
             summaryCloudConsent: summaryCloudConsent,
             recallCloudConsent: recallCloudConsent,
             daySplitCloudConsent: daySplitCloudConsent,

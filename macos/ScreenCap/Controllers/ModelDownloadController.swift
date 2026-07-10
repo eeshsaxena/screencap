@@ -88,6 +88,15 @@ final class ModelDownloadController: ObservableObject {
     @Published private(set) var installed: [ModelInstalledInfo.Model] = []
     @Published private(set) var lastError: String?
 
+    /// KTD3 — the daemon-reachability input to the on-device row's state
+    /// matrix. Set when a `refreshStatus` read fails (the invocation throws or
+    /// its payload doesn't decode), cleared by any successful read. Distinct
+    /// from `lastError`, which also carries write-verb failures: the pane
+    /// renders the disabled-download row from this flag alone, separate from
+    /// the whole-pane error state a failed `IntelligenceController.refresh()`
+    /// produces.
+    @Published private(set) var daemonUnreachable: Bool = false
+
     typealias JSONInvoker = @Sendable ([String]) async throws -> Data
     private let invoke: JSONInvoker
 
@@ -140,8 +149,14 @@ final class ModelDownloadController: ObservableObject {
                 state = ModelDownloadState(env.download)
             }
             lastError = nil
+            daemonUnreachable = false
+            // KTD8 — a download started elsewhere (onboarding) must animate
+            // here too: observing `.downloading` starts the poll loop, not just
+            // `startDownload`. No-op when already polling or not downloading.
+            startPollingIfNeeded()
         } catch {
             lastError = error.localizedDescription
+            daemonUnreachable = true
         }
     }
 
@@ -171,6 +186,11 @@ final class ModelDownloadController: ObservableObject {
         }
         await refreshStatus()
     }
+
+    /// Test seam (U2) — whether the status-poll loop is active. Internal so
+    /// `@testable` tests can pin KTD8 (a refresh that observes `.downloading`
+    /// leaves the loop running) without reaching into the private task.
+    var isPolling: Bool { pollTask != nil }
 
     /// Poll `model status` on a ~1s cadence while a download is in flight so the
     /// pane's ProgressView advances. The `model download` verb returns immediately

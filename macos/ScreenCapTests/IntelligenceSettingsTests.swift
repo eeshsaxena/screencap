@@ -566,4 +566,279 @@ final class IntelligenceSettingsTests: XCTestCase {
             .contains("your bill"),
             "user-owned caption names the user's own account/bill (R9)")
     }
+
+    // MARK: - U2 fixtures — suspension gate + call counter
+
+    /// Open-once gate for suspending a fake invoke mid-flight, so tests can
+    /// observe in-flight state (optimistic flips, in-flight guards)
+    /// deterministically instead of sleeping.
+    final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                if isOpen {
+                    lock.unlock()
+                    c.resume()
+                    return
+                }
+                waiters.append(c)
+                lock.unlock()
+            }
+        }
+
+        func open() {
+            lock.lock()
+            isOpen = true
+            let resumable = waiters
+            waiters = []
+            lock.unlock()
+            for w in resumable { w.resume() }
+        }
+    }
+
+    /// Thread-safe invocation counter for respond closures that must succeed
+    /// once (the seed refresh) and fail thereafter, or vice versa.
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func next() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            n += 1
+            return n
+        }
+    }
+
+    // MARK: - U2/KTD1 — selectRow seam: two-write local selection
+
+    /// KTD1 — selecting a local row clears the cloud fallback FIRST
+    /// (`cloud_provider set none`), then writes the active provider, then
+    /// reconciles. The exact argv order is the contract that ships to Python.
+    func testSelectLocalProviderIssuesClearBeforeProviderWrite() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()  // seed settings (call 0)
+
+        let ok = await controller.selectLocalProvider("on-device")
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(
+            Array(fake.calls.dropFirst()),
+            [
+                ["settings", "intelligence", "cloud_provider", "set", "none", "--json"],
+                ["settings", "intelligence", "provider", "set", "on-device", "--json"],
+                ["settings", "intelligence", "--json"],
+            ],
+            "clear-first ordering (KTD1), then the provider write, then the read-back reconcile"
+        )
+    }
+
+    /// KTD1 — a failed clear aborts the sequence: the provider write is never
+    /// issued, the controller reconciles against disk, and the inline error
+    /// surfaces (and survives the reconcile).
+    func testSelectLocalProviderClearFailureAbortsProviderWrite() async {
+        let fake = FakeInvoker()
+        fake.respond = { args in
+            if args.contains("cloud_provider"), args.contains("set") {
+                throw NSError(
+                    domain: "t", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "clear-failed"])
+            }
+            return nil  // default success envelope
+        }
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        let ok = await controller.selectLocalProvider("local-server")
+
+        XCTAssertFalse(ok)
+        XCTAssertFalse(
+            fake.calls.contains {
+                $0.contains("provider") && $0.contains("set") && !$0.contains("cloud_provider")
+            },
+            "the provider write must be aborted when the clear fails (KTD1)"
+        )
+        XCTAssertEqual(fake.calls.last, ["settings", "intelligence", "--json"],
+                       "aborting still reconciles against disk")
+        XCTAssertEqual(controller.lastError, "clear-failed")
+        XCTAssertEqual(controller.settings?.provider, "on-device",
+                       "no stranded optimistic state after the abort")
+        XCTAssertNil(controller.settings?.cloudProvider)
+    }
+
+    /// KTD1 — a failed provider write (after a successful clear) reconciles via
+    /// refresh and surfaces the error; the optimistic flip never strands.
+    func testSelectLocalProviderProviderWriteFailureRefreshesAndSurfacesError() async {
+        let fake = FakeInvoker()
+        fake.respond = { args in
+            if args.contains("provider"), args.contains("set"), !args.contains("cloud_provider") {
+                throw NSError(
+                    domain: "t", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
+            }
+            return nil
+        }
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        let ok = await controller.selectLocalProvider("local-server")
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(fake.calls.last, ["settings", "intelligence", "--json"],
+                       "provider-write failure reconciles against disk (the clear already landed)")
+        XCTAssertEqual(controller.lastError, "boom",
+                       "the write failure — not the reconcile — is the surfaced error")
+        XCTAssertEqual(controller.settings?.provider, "on-device",
+                       "no stranded optimistic provider flip")
+    }
+
+    /// KTD2 — the cloud half of the seam routes to the `cloud_provider` slot
+    /// only; a BYO id is never written as the active `provider`.
+    func testSelectCloudProviderRoutesToCloudProviderSlotOnly() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+
+        let ok = await controller.selectCloudProvider("anthropic")
+
+        XCTAssertTrue(ok)
+        XCTAssertTrue(fake.calls.contains(
+            ["settings", "intelligence", "cloud_provider", "set", "anthropic", "--json"]
+        ))
+        XCTAssertFalse(
+            fake.calls.contains {
+                $0.contains("provider") && !$0.contains("cloud_provider") && $0.contains("anthropic")
+            },
+            "a BYO id must never reach the active `provider` slot (KTD2)"
+        )
+    }
+
+    // MARK: - U2/KTD6 — setCloudProvider optimistic flip + in-flight guard
+
+    /// KTD6 — while a cloud-provider write is in flight, the optimistic flip is
+    /// already visible, and a racing second call returns false WITHOUT touching
+    /// `lastError` (the view-level double-guard depends on the quiet bounce)
+    /// and without issuing a second write.
+    func testSetCloudProviderRacingReturnsFalseWithoutSpuriousError() async {
+        let fake = FakeInvoker()
+        let payload = envelope()
+        let firstWriteEntered = Gate()
+        let release = Gate()
+        let controller = IntelligenceController(invoke: { args in
+            fake.record(args)
+            if args.contains("cloud_provider"), args.contains("openai") {
+                firstWriteEntered.open()
+                await release.wait()
+            }
+            return payload
+        })
+        await controller.refresh()
+
+        let first = Task { await controller.setCloudProvider("openai") }
+        await firstWriteEntered.wait()
+
+        // The first write is suspended inside the CLI invoke: the optimistic
+        // flip already landed on the user-action edge (KTD6)…
+        XCTAssertEqual(controller.settings?.cloudProvider, "openai",
+                       "optimistic flip lands before the write completes")
+        // …and a racing call bounces quietly.
+        let second = await controller.setCloudProvider("anthropic")
+        XCTAssertFalse(second)
+        XCTAssertNil(controller.lastError,
+                     "a racing call must not surface a spurious error")
+        XCTAssertFalse(fake.calls.contains { $0.contains("anthropic") },
+                       "the racing write never reaches the CLI")
+
+        release.open()
+        let firstResult = await first.value
+        XCTAssertTrue(firstResult)
+    }
+
+    /// KTD6 — a failed cloud-provider write reverts the optimistic flip. The
+    /// reconcile read is made to fail too, so a lingering flip would be visible:
+    /// only a genuine revert restores the pre-write value.
+    func testSetCloudProviderRevertsOptimisticFlipOnFailure() async {
+        let fake = FakeInvoker()
+        let count = Counter()
+        fake.respond = { _ in
+            if count.next() == 1 { return nil }  // seed refresh succeeds
+            throw NSError(domain: "t", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
+        }
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+        XCTAssertNil(controller.settings?.cloudProvider)
+
+        let ok = await controller.setCloudProvider("openai")
+
+        XCTAssertFalse(ok)
+        XCTAssertNil(controller.settings?.cloudProvider,
+                     "failed write must revert the optimistic flip")
+        XCTAssertEqual(controller.lastError, "boom",
+                       "the write failure survives the (failed) reconcile as the surfaced error")
+    }
+
+    // MARK: - U2/KTD8 + KTD3 — ModelDownloadController polling + reachability
+
+    private func modelStatus(state: String, done: Int = 0, total: Int = 0) -> Data {
+        Data(
+            #"{"download":{"state":"\#(state)","bytes_done":\#(done),"bytes_total":\#(total),"reason":null},"installed":{"models":[]}}"#
+                .utf8)
+    }
+
+    /// KTD8 — a FRESH controller whose FIRST refresh decodes `.downloading`
+    /// starts the poll loop. This is the onboarding-started-download case: the
+    /// pane opens mid-download and must animate, not freeze — today only
+    /// `startDownload` polls.
+    func testRefreshStatusObservingDownloadingStartsPolling() async {
+        let payload = modelStatus(state: "downloading", done: 10, total: 100)
+        let controller = ModelDownloadController(invoke: { _ in payload })
+        XCTAssertFalse(controller.isPolling)
+
+        await controller.refreshStatus()
+
+        XCTAssertTrue(controller.state.isDownloading)
+        XCTAssertTrue(controller.isPolling,
+                      "refreshStatus must start polling when it observes .downloading (KTD8)")
+    }
+
+    /// KTD8 guard — a non-downloading status read does not spin up the loop.
+    func testRefreshStatusIdleDoesNotStartPolling() async {
+        let payload = modelStatus(state: "idle")
+        let controller = ModelDownloadController(invoke: { _ in payload })
+
+        await controller.refreshStatus()
+
+        XCTAssertFalse(controller.isPolling)
+        XCTAssertFalse(controller.daemonUnreachable)
+    }
+
+    /// KTD3 — a status read whose invocation throws sets the typed
+    /// `daemonUnreachable` flag (the on-device row's matrix input); any
+    /// subsequent successful read clears it.
+    func testRefreshStatusThrowSetsDaemonUnreachableSuccessClears() async {
+        let count = Counter()
+        let payload = modelStatus(state: "idle")
+        let controller = ModelDownloadController(invoke: { _ in
+            if count.next() == 1 {
+                throw NSError(
+                    domain: "t", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "socket down"])
+            }
+            return payload
+        })
+        XCTAssertFalse(controller.daemonUnreachable)
+
+        await controller.refreshStatus()
+        XCTAssertTrue(controller.daemonUnreachable,
+                      "a failed status read is KTD3's reachability input")
+        XCTAssertNotNil(controller.lastError)
+
+        await controller.refreshStatus()
+        XCTAssertFalse(controller.daemonUnreachable,
+                       "any successful read clears the flag")
+        XCTAssertNil(controller.lastError)
+    }
 }
