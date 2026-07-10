@@ -1668,6 +1668,20 @@ def whoami_cmd(as_json, force_refresh):
             sys.exit(1)
         console.print(f"[red]Error checking sign-in state:[/red] {escape(str(e))}")
         sys.exit(1)
+
+    # U14 (KTD-4): refresh the last-known-good entitlement lease the local gates
+    # (U8/U9) read. This is the app's actual post-checkout signal path — the macOS
+    # app polls `whoami --json` and calls `whoami --force-refresh` on return from
+    # Stripe — so a just-converted user's freshly-materialized `tier` re-arms the
+    # lease here (a shared on-disk file the daemon gates read). A definitive
+    # not-entitled clears it; a stale/offline result preserves it. Best-effort —
+    # lease upkeep must never break `whoami`.
+    try:
+        from screencap.daemon import entitlement_lease
+
+        entitlement_lease.reconcile_from_whoami(dict(info))
+    except Exception:  # noqa: BLE001 — lease upkeep must never break `whoami`
+        pass
     if as_json:
         envelope = {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, **info}
         click.echo(json.dumps(envelope))

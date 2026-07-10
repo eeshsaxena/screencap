@@ -33,12 +33,20 @@ def _isolate_recordings_and_run_dir(tmp_path, monkeypatch):
     isolation those would touch the developer's REAL recordings / run dir during
     the test suite. Pointing both at a per-test tmp dir keeps the daemon tests
     hermetic (the sweep finds an empty dir → no-op; the flock lives in tmp)."""
+    import screencap.config as cfg
     import screencap.terminal_stage as ts
 
     isolated = tmp_path / "recordings-isolated"
     isolated.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(isolated))
     monkeypatch.setattr(ts, "_RUN_DIR", tmp_path / "ts-run")
+    # U14: the daemon's whoami / entitlement.refresh verbs now reconcile an
+    # on-disk entitlement lease under ``get_base_dir()/run/``. Point the base dir
+    # at a per-test tmp so those writes never touch the developer's real
+    # ``~/.screencap/run/`` (mirrors the recordings isolation above).
+    base = tmp_path / "base-isolated"
+    base.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cfg, "_DEFAULT_BASE", base)
 
 
 @pytest.fixture(autouse=True)
