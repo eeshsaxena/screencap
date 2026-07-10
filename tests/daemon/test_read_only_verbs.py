@@ -476,6 +476,79 @@ async def test_auth_whoami_signed_in(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_auth_whoami_forwards_tier_and_subscribed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """U6: the envelope must forward ``tier``, ``trial_end``, AND ``subscribed``
+    (the handler previously dropped all three) so the Swift picker (U11) can tell
+    local from cloud instead of reading a defaulted tier."""
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {
+            "signed_in": True,
+            "uid": "uid-xyz",
+            "email": "a@b.com",
+            "subscribed": True,
+            "tier": "cloud",
+            "trial_end": 1_800_000_000,
+        },
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    _assert_envelope(payload, expected_schema_version=schema._AUTH_WHOAMI_API_VERSION)
+    assert payload["tier"] == "cloud"
+    assert payload["subscribed"] is True
+    assert payload["trial_end"] == 1_800_000_000
+
+
+@pytest.mark.asyncio
+async def test_auth_whoami_local_tier_not_subscribed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``tier=local`` account surfaces ``tier: local`` with ``subscribed`` False
+    in the envelope — the cloud gate must never see it as entitled (KTD-1)."""
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {
+            "signed_in": True,
+            "uid": "uid-xyz",
+            "email": "a@b.com",
+            "subscribed": False,
+            "tier": "local",
+        },
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["tier"] == "local"
+    assert payload["subscribed"] is False
+
+
+@pytest.mark.asyncio
+async def test_auth_whoami_no_tier_defaults_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whoami() result without a ``tier`` (older auth / signed-out) still yields
+    a well-formed envelope whose ``tier`` defaults to None."""
+    from screencap import auth
+
+    monkeypatch.setattr(
+        auth, "whoami",
+        lambda: {"signed_in": True, "uid": "uid-xyz", "email": "a@b.com"},
+    )
+    response = await _asgi_get("/v0/auth.whoami")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["tier"] is None
+    assert payload["subscribed"] is False
+
+
+@pytest.mark.asyncio
 async def test_auth_whoami_signed_out(monkeypatch: pytest.MonkeyPatch) -> None:
     """Signed-out reports signed_in=false and null uid/email (never raises)."""
     from screencap import auth

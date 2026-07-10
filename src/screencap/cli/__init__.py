@@ -62,13 +62,17 @@ _SETTINGS_SCHEMA_VERSION = 2
 # intelligence, U8.
 _SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 1
 _STOP_SCHEMA_VERSION = 1
-# `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed),
-# read by the SwiftUI shell to gate the Upload affordance on auth + entitlement.
-# Deliberately NOT bumped when `subscribed` was added: it is an additive,
-# defaulted, backward-compatible field, and the Swift drift check is warn-only —
-# bumping would emit spurious warnings on older app builds during the two-track
-# paywall rollout for no compatibility gain.
-_AUTH_SCHEMA_VERSION = 1
+# `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed/
+# tier/trial_end), read by the SwiftUI shell to gate the Upload affordance on
+# auth + entitlement and drive the two-tier picker + trial UI (U11).
+# Bumped 1 -> 2 for U6: the two-tier `tier` + `trial_end` claims joined the
+# envelope shape (and the daemon `auth.whoami` handler, previously dropping
+# `subscribed`, now forwards all three). The Swift drift check is warn-only, so
+# the bump is a low-cost signal that the shape grew — a conscious call for a
+# real shape change (contrast `subscribed`, which was left unbumped as it never
+# altered the handler-forwarded set). Additive + defaulted, so older app builds
+# stay compatible.
+_AUTH_SCHEMA_VERSION = 2
 # `backfill status --json` envelope (ok + schema_version + the privacy-safe
 # status snapshot the daemon publishes). SCR-178 U6.
 _BACKFILL_SCHEMA_VERSION = 1

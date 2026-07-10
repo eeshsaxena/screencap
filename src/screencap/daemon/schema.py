@@ -497,6 +497,14 @@ def _load_models() -> dict[str, Any]:
         # Cloud-paywall entitlement (display/UX only; the signer's hard gate is
         # the real enforcement). Additive, defaulted, backward-compatible.
         subscribed: bool = False
+        # Two-tier entitlement (U6, KTD-1): the open ``tier`` claim
+        # (``"local"`` | ``"cloud"`` | None) the Swift picker (U11) reads to tell
+        # local from cloud, and the trial's ``trial_end`` (epoch seconds) for the
+        # "days left" UI. Both additive/defaulted/backward-compatible; ``tier``
+        # is None whenever no paid tier is positively resolved OR when offline
+        # (the ``stale`` flag disambiguates, never tier presence).
+        tier: str | None = None
+        trial_end: int | None = None
 
     class BackfillStartRequest(_DaemonModel):
         """SCR-178 ``backfill.start`` input.

@@ -229,6 +229,13 @@ async def auth_whoami(request: Request) -> JSONResponse:
             uid=info.get("uid"),
             email=info.get("email"),
             stale=info.get("stale", False),
+            # U6: forward the two-tier entitlement + trial state (the handler
+            # previously dropped all three) so the Swift picker (U11) reads the
+            # real tier instead of a defaulted one. ``subscribed`` stays the
+            # derived cloud signal; ``tier``/``trial_end`` default to None.
+            subscribed=bool(info.get("subscribed")),
+            tier=info.get("tier"),
+            trial_end=info.get("trial_end"),
         )
     )
 

@@ -233,6 +233,20 @@ class WhoAmI(TypedDict, total=False):
     email: str | None
     stale: bool
     subscribed: bool
+    # Two-tier entitlement (KTD-1): the ``tier`` claim written by the webhook,
+    # an OPEN string (``"local"`` | ``"cloud"`` today; a future ``"free_capped"``
+    # slots in without touching gate call-sites). ``subscribed`` is the derived
+    # cloud gate (``subscribed == (tier == "cloud")``) and is kept for
+    # compatibility. ``tier`` is None when no paid tier is positively resolved
+    # (fresh not-entitled) OR when offline (AuthError) — the two cases are told
+    # apart ONLY by the ``stale`` flag (KTD-4), never by tier presence, so a
+    # downstream lease-based gate can grace-allow a paying-but-offline user
+    # without ever reading it as "not entitled".
+    tier: str | None
+    # The subscription's ``trial_end`` (epoch seconds) written by the webhook
+    # while ``trialing`` (KTD-2/KTD-3), for the "days left" trial UI (U11).
+    # Absent when the token carries no trial.
+    trial_end: int | None
     # Client paywall flag (KTD-6): config-driven, independent of sign-in, so it
     # rides EVERY envelope (incl. signed-out). The app reads it to decide whether
     # to show pricing / the soft gate at all; the signer's hard gate is governed
@@ -872,26 +886,41 @@ def whoami() -> WhoAmI:
         return {"signed_in": False, "paywall_enabled": paywall_enabled}
     try:
         state = _ensure_fresh()
-        # ``subscribed`` is read (unverified) from the ID token's custom claims —
-        # a display/UX signal for the soft gate only; the signer's hard gate is
-        # the real entitlement enforcement. Absent claim -> False.
+        # ``subscribed``/``tier`` are read (unverified) from the ID token's custom
+        # claims — a display/UX signal for the soft gate only; the signer's hard
+        # gate is the real entitlement enforcement. ``tier`` is the open
+        # two-tier claim (KTD-1); absent -> None (fresh not-entitled).
+        # ``subscribed`` stays the derived cloud signal; absent claim -> False.
         claims = _decode_id_token_claims(state.id_token)
-        return {
+        tier = claims.get("tier")
+        result: WhoAmI = {
             "signed_in": True,
             "uid": state.uid,
             "email": state.email,
             "subscribed": bool(claims.get("subscribed")),
+            "tier": tier if isinstance(tier, str) else None,
             "paywall_enabled": paywall_enabled,
         }
+        # ``trial_end`` rides only when the webhook wrote it (trialing) — kept
+        # absent otherwise so the app can tell "no trial" from a spurious null.
+        trial_end = claims.get("trial_end")
+        if isinstance(trial_end, (int, float)) and not isinstance(trial_end, bool):
+            result["trial_end"] = int(trial_end)
+        return result
     except NotSignedIn:
         return {"signed_in": False, "paywall_enabled": paywall_enabled}
     except AuthError:
         # We have a refresh token but couldn't refresh right now (e.g. offline).
+        # CRITICAL (KTD-4): report ``tier: None`` WITH ``stale: True`` so a
+        # downstream lease-based gate distinguishes paying-but-offline (grace
+        # within the lease) from genuinely not-entitled via the ``stale`` flag —
+        # never via tier presence. ``subscribed`` stays False (unchanged).
         return {
             "signed_in": True,
             "uid": None,
             "email": None,
             "stale": True,
             "subscribed": False,
+            "tier": None,
             "paywall_enabled": paywall_enabled,
         }
