@@ -159,6 +159,78 @@ enum ChatHonestState: Sendable, Equatable {
     case daemonUnreachable
 }
 
+// MARK: - No-backend affordance guidance (R6)
+
+/// The selected intelligence model, narrowed to what the no-backend affordance
+/// needs to know: whether the user picked Apple's built-in on-device model —
+/// whose runtime availability is a *system* switch (Apple Intelligence) the app
+/// can't flip — versus anything else, whose fix lives in Intelligence Settings.
+enum SelectedIntelligence: Equatable, Sendable {
+    /// The built-in Apple Foundation Models ("On-device model"). Gated at runtime
+    /// by the system-wide Apple Intelligence switch, not by any in-app setting.
+    case appleOnDevice
+    /// Any other selection (cloud/BYO provider, the downloaded model, a local
+    /// server) — or unknown/unloaded.
+    case other
+
+    /// Map an `[intelligence].provider` id (see `IntelligenceSettings.provider`)
+    /// to the affordance-relevant kind. Only `"on-device"` is Apple's system-gated
+    /// model; `"downloaded"` runs WITHOUT Apple Intelligence, so it is `.other`.
+    init(provider: String?) {
+        self = (provider == "on-device") ? .appleOnDevice : .other
+    }
+}
+
+/// Pure, testable copy + actions for the "no AI backend" affordance (R5/R6). The
+/// mapping — selected model × whether this OS can run Apple's on-device model —
+/// lives here so it is unit-tested without SwiftUI; `ChatTurnView` renders it.
+struct NoBackendGuidance: Equatable, Sendable {
+    let title: String
+    let body: String
+    /// Show the "Open System Settings" button — only when Apple's on-device model
+    /// is selected on an OS that can run it, where the block is the system-wide
+    /// Apple Intelligence switch (which the app can only deep-link to, not flip).
+    let showsSystemSettings: Bool
+
+    /// - Parameters:
+    ///   - selected: the model the user picked (from `IntelligenceSettings.provider`).
+    ///   - canRunOnDevice: whether this OS is macOS 26+ (can run Apple Foundation
+    ///     Models at all). The caller supplies it from `#available`; passed in so
+    ///     this stays pure and testable.
+    static func make(selected: SelectedIntelligence, canRunOnDevice: Bool) -> NoBackendGuidance {
+        // The one case where the fix is a SYSTEM toggle, not an in-app setting: the
+        // on-device model is picked on a capable OS, but Apple Intelligence is off
+        // (or its model is still downloading). Name that exact step and deep-link to
+        // it — the generic "no model set up" copy reads as "but I already picked
+        // on-device" and strands the user (the bug this fixes).
+        if selected == .appleOnDevice, canRunOnDevice {
+            return NoBackendGuidance(
+                title: "Turn on Apple Intelligence to answer on this Mac",
+                body: "You picked the on-device model, but Apple Intelligence is turned "
+                    + "off in System Settings. Turn it on under Apple Intelligence & Siri "
+                    + "to answer here — nothing leaves this Mac. If it's already on, its "
+                    + "model may still be downloading. You can also turn on cloud recall in "
+                    + "Intelligence Settings (your data leaves this Mac, only with your "
+                    + "consent).",
+                showsSystemSettings: true
+            )
+        }
+        // Every other no-backend case keeps the transparent both-paths affordance
+        // (copy unchanged): a cloud/BYO/downloaded selection, or on-device on an OS
+        // below the macOS-26 floor. Never hides a path; never a system-toggle nudge.
+        return NoBackendGuidance(
+            title: "No AI model is set up to answer yet",
+            body: canRunOnDevice
+                ? "Answer on this Mac with Apple Intelligence, or turn on cloud recall in "
+                    + "Intelligence Settings (your data leaves this Mac, only with your consent)."
+                : "To answer here, turn on cloud recall in Intelligence Settings (your data "
+                    + "leaves this Mac, only with your consent). On-device answers need macOS 26 "
+                    + "with Apple Intelligence.",
+            showsSystemSettings: false
+        )
+    }
+}
+
 // MARK: - View model
 
 @MainActor

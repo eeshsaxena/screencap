@@ -322,4 +322,53 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(ChatAnswer(response: decoded).reason, .noBackend)
         XCTAssertEqual(ChatAnswer(response: decoded).honestState, .noBackend)
     }
+
+    // MARK: - No-backend affordance guidance (U8, R6) — Apple Intelligence off
+
+    func testSelectedIntelligenceMapsOnDeviceProvider() {
+        XCTAssertEqual(SelectedIntelligence(provider: "on-device"), .appleOnDevice)
+    }
+
+    func testSelectedIntelligenceMapsOtherProviders() {
+        XCTAssertEqual(SelectedIntelligence(provider: "gemini"), .other)
+        XCTAssertEqual(
+            SelectedIntelligence(provider: "downloaded"), .other,
+            "the downloaded model runs without Apple Intelligence, so its no-backend "
+                + "fix is not the system toggle"
+        )
+        XCTAssertEqual(SelectedIntelligence(provider: nil), .other)
+    }
+
+    func testOnDeviceCapableGuidanceNamesAppleIntelligenceToggle() {
+        // The reported bug: the on-device model is selected on a macOS-26 host, but
+        // Apple Intelligence is off system-wide. The affordance must name the SYSTEM
+        // step (and offer the deep link) instead of the generic "no model set up"
+        // dead-end that reads as "but I already picked on-device".
+        let g = NoBackendGuidance.make(selected: .appleOnDevice, canRunOnDevice: true)
+        XCTAssertTrue(g.showsSystemSettings, "on-device + capable OS should offer System Settings")
+        XCTAssertTrue(g.body.contains("Apple Intelligence"))
+        XCTAssertTrue(g.body.localizedCaseInsensitiveContains("System Settings"))
+        XCTAssertNotEqual(
+            g.title, "No AI model is set up to answer yet",
+            "the on-device case gets a specific, actionable title"
+        )
+    }
+
+    func testOnDeviceBelowFloorKeepsGenericGuidance() {
+        // macOS < 26 cannot run the on-device model at all — no system toggle helps,
+        // so keep the both-paths copy and hide the System Settings button.
+        let g = NoBackendGuidance.make(selected: .appleOnDevice, canRunOnDevice: false)
+        XCTAssertFalse(g.showsSystemSettings)
+        XCTAssertTrue(g.body.contains("macOS 26"))
+        XCTAssertEqual(g.title, "No AI model is set up to answer yet")
+    }
+
+    func testOtherProviderKeepsGenericGuidance() {
+        // A cloud/BYO selection that produced no backend keeps the existing
+        // both-paths affordance; the fix is in Intelligence Settings, not a system
+        // toggle, so no System Settings button.
+        let g = NoBackendGuidance.make(selected: .other, canRunOnDevice: true)
+        XCTAssertFalse(g.showsSystemSettings)
+        XCTAssertEqual(g.title, "No AI model is set up to answer yet")
+    }
 }
