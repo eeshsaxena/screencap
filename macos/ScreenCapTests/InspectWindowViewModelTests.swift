@@ -159,6 +159,70 @@ final class InspectWindowViewModelTests: XCTestCase {
         XCTAssertEqual(data.timingStatus, .corrupt)
     }
 
+    // U4: schema-4 blocked/protected intervals map into InspectData; a payload
+    // without them (older CLI / review shape) decodes with empty arrays.
+    func test_blockedIntervalsMapIntoInspectData() async {
+        let loader = FakeInspectDataLoader()
+        loader.nextEnvelope = .init(
+            ok: true, schemaVersion: 4,
+            videoPath: "/tmp/video.mp4",
+            eventsPath: "/tmp/events.jsonl",
+            startedAt: 1700000000, durationSeconds: 30,
+            videoPixfmtRemediated: false, error: nil,
+            eventsPaths: ["/tmp/events.jsonl"],
+            blockedIntervals: [CapturedInterval(startMs: 1000, endMs: 2000)],
+            protectedIntervals: [CapturedInterval(startMs: 1000, endMs: 3000)]
+        )
+        let model = makeModel(loader: loader)
+
+        await model.loadInspectData()
+
+        guard case .ready(let data) = model.state else {
+            return XCTFail("expected ready, got \(model.state)")
+        }
+        XCTAssertEqual(data.blockedIntervals, [CapturedInterval(startMs: 1000, endMs: 2000)])
+        XCTAssertEqual(data.protectedIntervals, [CapturedInterval(startMs: 1000, endMs: 3000)])
+    }
+
+    func test_missingBlockedIntervals_decodeToEmpty_backCompat() async {
+        // The default envelope carries no interval fields (older schema).
+        let loader = FakeInspectDataLoader()
+        let model = makeModel(loader: loader)
+
+        await model.loadInspectData()
+
+        guard case .ready(let data) = model.state else {
+            return XCTFail("expected ready, got \(model.state)")
+        }
+        XCTAssertTrue(data.blockedIntervals.isEmpty)
+        XCTAssertTrue(data.protectedIntervals.isEmpty)
+    }
+
+    // The snake_case CodingKeys decode the Python `{start_ms, end_ms}` payload
+    // (schema v4); an envelope omitting them still decodes (nil → empty).
+    func test_envelopeJSONDecodesBlockedIntervals() throws {
+        let json = """
+        {
+          "ok": true,
+          "schema_version": 4,
+          "video_path": "/tmp/video.mp4",
+          "blocked_intervals": [{"start_ms": 1000, "end_ms": 2000}],
+          "protected_intervals": [{"start_ms": 1000, "end_ms": 3000}]
+        }
+        """.data(using: .utf8)!
+
+        let env = try JSONDecoder().decode(ReviewDataEnvelope.self, from: json)
+        XCTAssertEqual(env.blockedIntervals, [CapturedInterval(startMs: 1000, endMs: 2000)])
+        XCTAssertEqual(env.protectedIntervals, [CapturedInterval(startMs: 1000, endMs: 3000)])
+
+        let older = """
+        {"ok": true, "schema_version": 3, "video_path": "/tmp/video.mp4"}
+        """.data(using: .utf8)!
+        let olderEnv = try JSONDecoder().decode(ReviewDataEnvelope.self, from: older)
+        XCTAssertNil(olderEnv.blockedIntervals)
+        XCTAssertNil(olderEnv.protectedIntervals)
+    }
+
     func test_okFalse_landsFailedWithEnvelopeError() async {
         let loader = FakeInspectDataLoader()
         loader.nextEnvelope = .init(

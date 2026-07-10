@@ -96,7 +96,9 @@ final class InspectWindowOpenerTests: XCTestCase {
             eventsURLs: [],
             startedAt: 0,
             durationSeconds: 0,
-            timingStatus: .ok
+            timingStatus: .ok,
+            blockedIntervals: [],
+            protectedIntervals: []
         )
         XCTAssertFalse(InspectShareAffordance.isEnabled(for: .preparing))
         XCTAssertFalse(InspectShareAffordance.isEnabled(for: .failed(message: "boom")))

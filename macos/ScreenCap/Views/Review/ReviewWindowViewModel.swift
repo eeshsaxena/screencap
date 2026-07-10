@@ -103,6 +103,17 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     /// finalizing retry instead of "Could not load this recording." Absent
     /// (older CLI / any success) → nil → treated as non-retryable.
     var retryable: Bool? = nil
+    /// Captured-events summary (schema v4, `inspect-data` only): capture-time
+    /// EXCLUDE-only "provably not captured" spans, backing the in-viewer summary's
+    /// blocked reassurance line. `{start_ms, end_ms}` in absolute epoch ms. Absent
+    /// (review-data, or an older CLI) → nil → the inspect window treats it as no
+    /// blocked intervals. See `RecordedSummary`.
+    var blockedIntervals: [CapturedInterval]? = nil
+    /// Captured-events summary (schema v4, `inspect-data` only): the full
+    /// `SCRUB_BLOCK_ACTIONS` set (a superset of `blockedIntervals`) the digest
+    /// drops events inside before counting/grouping, so it never counts or reveals
+    /// policy-flagged content. Absent → nil → empty.
+    var protectedIntervals: [CapturedInterval]? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -120,6 +131,8 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case timingError = "timing_error"
         case timingStatus = "timing_status"
         case retryable
+        case blockedIntervals = "blocked_intervals"
+        case protectedIntervals = "protected_intervals"
     }
 }
 
