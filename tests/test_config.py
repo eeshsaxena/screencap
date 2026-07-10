@@ -117,6 +117,83 @@ def test_set_audio_default_creates_file(tmp_path):
         assert get_audio_default() is False
 
 
+# --- recordings_dir setter tests (SCR-228 / U1) ---
+
+
+class TestSetRecordingsDir:
+    """Tests for set_recordings_dir() — the SCR-228 config write."""
+
+    @staticmethod
+    def _env_without_override():
+        return {k: v for k, v in os.environ.items() if k != "SCREENCAP_RECORDINGS_DIR"}
+
+    def test_round_trip(self, tmp_path):
+        """set_recordings_dir → get_recordings_dir round-trips; cache invalidated."""
+        import screencap.config as cfg
+        from screencap.config import get_recordings_dir, set_recordings_dir
+
+        base = tmp_path / "base"
+        base.mkdir()
+        cfg_path = base / "config.toml"
+        cfg_path.write_text("# header comment\naudio_default = true\n")
+        target = tmp_path / "new_recordings"
+        target.mkdir()
+
+        with (
+            mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+            mock.patch.object(cfg, "_DEFAULT_BASE", base),
+            mock.patch.dict(os.environ, self._env_without_override(), clear=True),
+        ):
+            cfg._config_cache = None
+            set_recordings_dir(target)
+            # Cache invalidated on writer exit → fresh read sees the new path.
+            assert get_recordings_dir() == target.resolve()
+
+    def test_preserves_other_keys_and_comments(self, tmp_path):
+        import screencap.config as cfg
+        from screencap.config import set_recordings_dir
+
+        base = tmp_path / "base"
+        base.mkdir()
+        cfg_path = base / "config.toml"
+        cfg_path.write_text("# header comment\naudio_default = true\n")
+        target = tmp_path / "recs2"
+        target.mkdir()
+
+        with (
+            mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+            mock.patch.object(cfg, "_DEFAULT_BASE", base),
+            mock.patch.dict(os.environ, self._env_without_override(), clear=True),
+        ):
+            cfg._config_cache = None
+            set_recordings_dir(target)
+            text = cfg_path.read_text()
+            assert "# header comment" in text
+            assert "audio_default = true" in text
+            assert str(target.resolve()) in text
+
+    def test_creates_file_when_absent(self, tmp_path):
+        import screencap.config as cfg
+        from screencap.config import get_recordings_dir, set_recordings_dir
+
+        base = tmp_path / "base"
+        base.mkdir()
+        cfg_path = base / "config.toml"
+        assert not cfg_path.exists()
+        target = tmp_path / "recs3"
+        target.mkdir()
+
+        with (
+            mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+            mock.patch.object(cfg, "_DEFAULT_BASE", base),
+            mock.patch.dict(os.environ, self._env_without_override(), clear=True),
+        ):
+            cfg._config_cache = None
+            set_recordings_dir(target)
+            assert cfg_path.exists()
+            assert get_recordings_dir() == target.resolve()
+
+
 # --- disk threshold config tests ---
 
 
