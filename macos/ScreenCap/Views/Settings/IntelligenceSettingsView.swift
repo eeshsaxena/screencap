@@ -1,25 +1,31 @@
 import AppKit
 import SwiftUI
 
-/// The Intelligence settings pane. Sections following the `PrivacySettingsView`
-/// layout, with the hosted-vs-user-owned separation (U7 — R9):
+/// The Intelligence settings pane — the two-section redesign (U3):
 ///
-/// 1. **SCREENCAP-HOSTED CLOUD** — the active-provider picker for app-managed
-///    models: "On-device model" (the zero-config default, R3), the SCR-239
-///    downloaded + local-server rows. Whose bill: nothing on-device; a hosted
-///    cloud provider (when one exists) rides the Personal cloud subscription.
-/// 2. **YOUR OWN ACCOUNT** (U6/U7 — R1-R5, R9, R10, R12, R13) — the BYO section:
-///    connect OpenAI / Anthropic / Gemini by API key or CLI delegation, each
-///    against the user's own account and bill. Gemini appears once here (R10).
-///    Selecting a connected provider persists it as the consented
-///    `cloud_provider` (KTD2 — never the active `provider`). The "Connect a
-///    provider…" action opens `ConnectProviderSheet`.
-/// 3. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix:
+/// 1. **MODEL** — one grouped card with a single rendered selection:
+///    - *Included with ScreenCap* — only the merged on-device row (R5). The row
+///      absorbs the Apple-availability badge and the downloaded-model
+///      download/progress/retry affordances, rendered from the pure
+///      `IntelligenceSelectionModel.onDeviceRowRender` state matrix (KTD3).
+///    - *Your own* — connected BYO provider rows (membership derived by
+///      `IntelligenceSelectionModel.groups`) plus the local-server row when an
+///      endpoint is set (selectable only when it classifies LOCAL — R9/AE3),
+///      then the "Add another provider…" row opening `ConnectProviderSheet`.
+///    The rendered selection comes from `renderedSelection(...)` (KTD1's read
+///    path); a tap computes `tapWrites(...)` against the *persisted* slots and
+///    dispatches to the controller's `selectLocalProvider`/`selectCloudProvider`
+///    seams. Empty writes = no-op; re-tap deselection is removed (radio
+///    semantics). A legacy persisted value renders the on-device row with the
+///    reconcile treatment prompting a re-pick.
+/// 2. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix:
 ///    - Summaries & titles (R8) — a real toggle wired to `summary_cloud_consent`.
 ///    - Answering Recall searches — a real toggle (`recall_cloud_consent`).
 ///    - Splitting & labeling the day (R7) — shown as ON-DEVICE, *not* a cloud
 ///      toggle. It never leaves the Mac even with a cloud provider configured.
 ///    - Screen frames or images (R9-frames) — a FIXED "always off".
+///    A standing nudge renders by the section header exactly when
+///    `consentNudgeVisible(...)` says so (AE1) — it is the consent pointer.
 ///
 /// Consent + provider writes flow through the CLI settings layer via
 /// `IntelligenceController`; BYO keys are stored daemon-side (Keychain-class,
@@ -29,16 +35,15 @@ struct IntelligenceSettingsView: View {
     @EnvironmentObject private var intelligence: IntelligenceController
 
     /// Drives the opt-in downloadable model (SCR-239 U10) — the download state
-    /// machine + install state, polled from `screencap model status`.
+    /// machine + install state, polled from `screencap model status`. Its
+    /// `daemonUnreachable` flag is the KTD3 matrix's reachability input.
     @StateObject private var download = ModelDownloadController()
-
-    /// The endpoint field draft for the Local-server row (committed on Save).
-    @State private var endpointDraft: String = ""
 
     /// Locks the provider picker while a write round-trips (the AppRulesView
     /// pending pattern). Without it a rapid re-pick races the controller's
     /// in-flight guard, whose `false` return would render as a spurious error
-    /// for a write that actually succeeded.
+    /// for a write that actually succeeded. (Documented double guard — the
+    /// controller keeps its own quiet in-flight guard, KTD6.)
     @State private var providerWriteInFlight = false
 
     /// Consent rows with a write in flight (the `pendingSegments` analogue):
@@ -117,7 +122,6 @@ struct IntelligenceSettingsView: View {
         if let settings = intelligence.settings {
             VStack(alignment: .leading, spacing: 28) {
                 modelSection(settings)
-                userOwnedSection(settings)
                 cloudTasksSection(settings)
                 if let writeError {
                     Text("Couldn't save: \(writeError)")
@@ -133,47 +137,30 @@ struct IntelligenceSettingsView: View {
         }
     }
 
-    // MARK: - MODEL section (provider picker)
+    // MARK: - MODEL section (grouped single-selection card, U3)
 
+    /// One bordered card holding both ownership groups (R1). Group membership,
+    /// row order, and selectability all come from the pure model — the view
+    /// never re-derives them (KTD4).
+    @ViewBuilder
     private func modelSection(_ settings: IntelligenceSettings) -> some View {
+        let groups = IntelligenceSelectionModel.groups(settings)
+        let selection = IntelligenceSelectionModel.renderedSelection(settings)
         VStack(alignment: .leading, spacing: 10) {
-            // R9 — the hosted section header + whose-bill caption. On-device rows
-            // don't bill at all; the configured hosted cloud provider (if any)
-            // rides ScreenCap's Personal cloud subscription.
-            sectionHeader("SCREENCAP-HOSTED CLOUD")
-            Text(ConnectProviderModel.hostedSectionCaption)
-                .font(SCTypography.sans(size: 12))
-                .foregroundStyle(Color.scInkMuted)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 2)
-                .padding(.bottom, 2)
+            sectionHeader(IntelligenceSelectionModel.modelSectionTitle)
             VStack(alignment: .leading, spacing: 0) {
-                // The hosted section lists only on-device / downloaded / local
-                // rows (no BYO — those live in the "Your own account" section
-                // below, R9/R10). The stub "Add another provider…" affordance is
-                // gone; connecting happens in the user-owned section.
-                let opts = IntelligenceProviderOption.options(
-                    cloudProvider: nil,
-                    downloadedInstalled: settings.downloadedModelInstalled
-                        || download.isDefaultModelInstalled,
-                    localEndpoint: settings.localServerEndpoint,
-                    endpointClassification: settings.endpointClassification
-                )
-                ForEach(opts) { option in
-                    providerRow(option, settings: settings)
-                    if option.id == "on-device" {
-                        onDeviceStatusAccessory
-                    }
-                    if option.id == "downloaded" {
-                        downloadAccessory(settings)
-                    }
-                    if option.id == "local-server" {
-                        endpointField(settings)
-                    }
-                    if option.id != opts.last?.id {
+                ForEach(groups) { group in
+                    groupHeaderRow(group.title)
+                    rowDivider
+                    ForEach(group.rows) { row in
+                        modelRow(row, settings: settings, selection: selection)
+                        if row.kind == .onDevice {
+                            onDeviceAccessory(settings, reconcile: selection.needsReconcile)
+                        }
                         rowDivider
                     }
                 }
+                addProviderRow
             }
             .overlay(
                 RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
@@ -182,129 +169,126 @@ struct IntelligenceSettingsView: View {
         }
     }
 
-    private func providerRow(_ option: IntelligenceProviderOption, settings: IntelligenceSettings) -> some View {
-        let isSelected = option.providerValue == settings.provider
-        return Button {
-            selectProvider(option)
-        } label: {
-            HStack(alignment: .center, spacing: 12) {
-                radio(selected: isSelected, muted: false)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(option.title)
-                        .font(SCTypography.sans(size: 14, weight: .semibold))
-                        .foregroundStyle(Color.scInk)
-                    if let subtitle = option.subtitle {
-                        Text(subtitle)
-                            .font(SCTypography.sans(size: 12.5))
-                            .foregroundStyle(Color.scInkMuted)
-                    }
-                }
-                Spacer(minLength: 8)
-            }
+    /// An in-card ownership group header (R1) — styled like `sectionHeader`,
+    /// placed between `rowDivider`s, exposed as a header to accessibility.
+    private func groupHeaderRow(_ title: String) -> some View {
+        Text(title)
+            .font(SCTypography.metaMonoSmall)
+            .tracking(1.05)
+            .foregroundStyle(Color.scInkMuted)
+            .accessibilityAddTraits(.isHeader)
             .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        // The downloaded model can't be selected until it's installed (the
-        // Download button below is the CTA).
-        .disabled(providerWriteInFlight || downloadedNotInstalled(option, settings))
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// The downloaded-model radio is inert until the model is on disk.
-    private func downloadedNotInstalled(_ option: IntelligenceProviderOption, _ settings: IntelligenceSettings) -> Bool {
-        option.id == "downloaded"
-            && !(settings.downloadedModelInstalled || download.isDefaultModelInstalled)
-    }
-
-    private func selectProvider(_ option: IntelligenceProviderOption) {
-        guard !providerWriteInFlight, let value = option.providerValue else { return }
-        guard value != intelligence.settings?.provider else { return }
-        writeError = nil
-        providerWriteInFlight = true
-        Task {
-            let ok = await intelligence.setProvider(value)
-            providerWriteInFlight = false
-            if !ok { writeError = intelligence.lastError ?? "the provider change." }
-        }
-    }
-
-    // MARK: - "Your own account" section (U6/U7 — R9/R10/R12)
-
-    /// The user-owned BYO section: connect OpenAI / Anthropic / Gemini by API key
-    /// or CLI delegation. Each connected option is selectable as the consented
-    /// `cloud_provider` (KTD2 — never the active `provider`). Gemini appears once
-    /// here (R10) and never in the hosted section above.
-    private func userOwnedSection(_ settings: IntelligenceSettings) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("YOUR OWN ACCOUNT")
-            Text(ConnectProviderModel.userOwnedSectionCaption)
-                .font(SCTypography.sans(size: 12))
-                .foregroundStyle(Color.scInkMuted)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 2)
-                .padding(.bottom, 2)
-
-            let opts = ConnectProviderModel.userOwnedOptions(settings)
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(opts) { option in
-                    byoRow(option, settings: settings)
-                    if option.id != opts.last?.id { rowDivider }
-                }
-            }
-            .overlay(
-                RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
-                    .strokeBorder(Color.scBorderWarm, lineWidth: 1)
-            )
-
+    /// One row of the grouped MODEL list. On-device and local-server rows are
+    /// whole-row radio buttons (a non-selectable REMOTE local-server row renders
+    /// disabled, exposing the disabled accessibility state — R9/AE3); BYO rows
+    /// keep the radio-as-button idiom because their trailing Manage/Set up/
+    /// Connect accessories are interactive even when the radio isn't.
+    @ViewBuilder
+    private func modelRow(
+        _ row: IntelligenceModelRow,
+        settings: IntelligenceSettings,
+        selection: RenderedModelSelection
+    ) -> some View {
+        let isSelected = row.id == selection.rowID
+        switch row.kind {
+        case .byo:
+            byoModelRow(row, settings: settings, isSelected: isSelected)
+        case .onDevice, .localServer:
             Button {
-                connectSheet = ConnectSheetState(vendor: nil)
+                tapRow(row, settings: settings)
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "plus.circle")
-                    Text("Connect a provider…")
+                HStack(alignment: .center, spacing: 12) {
+                    radio(selected: isSelected, muted: !row.selectable)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(row.title)
+                            .font(SCTypography.sans(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.scInk)
+                        if let subtitle = row.subtitle {
+                            Text(subtitle)
+                                .font(SCTypography.sans(size: 12.5))
+                                .foregroundStyle(Color.scInkMuted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 8)
                 }
-                .font(SCTypography.sans(size: 13, weight: .semibold))
-                .foregroundStyle(Color.scTeal)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.top, 2)
+            .disabled(providerWriteInFlight || !row.selectable)
         }
     }
 
-    /// A single BYO option row: a radio (when selectable) or a needs-attention
-    /// chip (R5/R13), the title + honest limits copy (R12), and a Manage/Connect
-    /// affordance. Selecting a connected row persists it as `cloud_provider`.
-    private func byoRow(_ option: BYOProviderOption, settings: IntelligenceSettings) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            if option.isSelectable {
-                Button { selectBYO(option) } label: {
-                    radio(selected: option.isSelected, muted: false)
+    /// A BYO row under "Your own": radio (when selectable), title + the existing
+    /// honest billing/limits copy, and the existing needs-attention chip +
+    /// Manage/Set up/Connect accessory opening `ConnectProviderSheet`.
+    private func byoModelRow(
+        _ row: IntelligenceModelRow,
+        settings: IntelligenceSettings,
+        isSelected: Bool
+    ) -> some View {
+        let option = ConnectProviderModel.userOwnedOptions(settings)
+            .first { $0.providerID == row.id }
+        return HStack(alignment: .center, spacing: 12) {
+            if row.selectable {
+                Button { tapRow(row, settings: settings) } label: {
+                    radio(selected: isSelected, muted: false)
                 }
                 .buttonStyle(.plain)
                 .disabled(providerWriteInFlight)
             } else {
-                // Not connectable inline — needs attention / not connected.
-                radio(selected: false, muted: true)
+                // Not pickable — a stranded (selected-but-unavailable) row still
+                // renders its selection honestly, muted.
+                radio(selected: isSelected, muted: true)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(option.title)
+                Text(row.title)
                     .font(SCTypography.sans(size: 14, weight: .semibold))
                     .foregroundStyle(Color.scInk)
-                Text(byoSubtitle(option))
-                    .font(SCTypography.sans(size: 12.5))
-                    .foregroundStyle(Color.scInkMuted)
-                    .fixedSize(horizontal: false, vertical: true)
+                if let option {
+                    Text(byoSubtitle(option))
+                        .font(SCTypography.sans(size: 12.5))
+                        .foregroundStyle(Color.scInkMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Spacer(minLength: 8)
 
-            byoRowAccessory(option)
+            if let option {
+                byoRowAccessory(option)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .contentShape(Rectangle())
+    }
+
+    /// The "Add another provider…" row at the foot of the "Your own" group —
+    /// opens the connect flow with no vendor preset.
+    private var addProviderRow: some View {
+        Button {
+            connectSheet = ConnectSheetState(vendor: nil)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus.circle")
+                Text(IntelligenceSelectionModel.addProviderRowTitle)
+            }
+            .font(SCTypography.sans(size: 13, weight: .semibold))
+            .foregroundStyle(Color.scTeal)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// The trailing chip/button per BYO row: a "needs attention" chip for an
@@ -349,73 +333,90 @@ struct IntelligenceSettingsView: View {
         }
     }
 
-    /// Select a connected BYO option as the consented `cloud_provider` (KTD2 —
-    /// NOT the active `provider`). Toggling the already-selected one off clears
-    /// the selection.
-    private func selectBYO(_ option: BYOProviderOption) {
-        guard !providerWriteInFlight else { return }
+    // MARK: - Row taps (KTD1 write path)
+
+    /// A row tap: the pure model computes the writes against the *persisted*
+    /// slots (so a rendered-selected row with a legacy persisted value still
+    /// heals on tap); an empty list is a no-op (re-tap deselection removed).
+    /// Local picks dispatch through `selectLocalProvider` (clear-cloud-first,
+    /// abort-on-failure — KTD1's ordering lives in the controller seam); BYO
+    /// picks through `selectCloudProvider`.
+    private func tapRow(_ row: IntelligenceModelRow, settings: IntelligenceSettings) {
+        guard !providerWriteInFlight, row.selectable else { return }
+        let writes = IntelligenceSelectionModel.tapWrites(
+            forPick: row.kind,
+            persistedProvider: settings.provider,
+            persistedCloudProvider: settings.cloudProvider
+        )
+        guard let terminal = writes.last else { return }
         writeError = nil
         providerWriteInFlight = true
-        let target: String? = option.isSelected ? nil : option.providerID
         Task {
-            let ok = await intelligence.setCloudProvider(target)
+            let ok: Bool
+            switch terminal {
+            case .setProvider(let value):
+                ok = await intelligence.selectLocalProvider(value)
+            case .setCloudProvider(let id):
+                ok = await intelligence.selectCloudProvider(id)
+            case .clearCloudProvider:
+                // Never terminal in the model's write plans; nothing to do.
+                ok = true
+            }
             providerWriteInFlight = false
             if !ok { writeError = intelligence.lastError ?? "the provider change." }
         }
     }
 
-    // MARK: - SCR-239 Downloaded-model + Local-server accessories
+    // MARK: - Merged on-device row accessories (KTD3)
 
-    /// The Download button / progress / failed-Retry affordance for the
-    /// Downloaded-model row (KTD11 progress; failed surfaces the backend cause).
+    /// The availability/download accessory under the on-device row, rendered
+    /// from the pure state matrix (`onDeviceRowRender`) — status line first,
+    /// download affordance below, in the accessory-under-row idiom. When the
+    /// rendered selection carries the reconcile flag, the needs-attention
+    /// re-pick prompt replaces the status line (KTD1).
     @ViewBuilder
-    private func downloadAccessory(_ settings: IntelligenceSettings) -> some View {
-        let sizeGB = (download.disclosedSizeBytes ?? 0) > 0
-            ? ShellSidebarModel.formatStorage(download.disclosedSizeBytes!)
-            : "~2 GB"
-        HStack(spacing: 10) {
-            switch download.state {
-            case .installed:
-                EmptyView()
-            case let .downloading(done, total):
-                ProgressView(value: total > 0 ? Double(done) / Double(total) : nil)
-                    .frame(maxWidth: 220)
-                Button("Cancel") { Task { await download.cancel() } }
-                    .buttonStyle(.plain).font(SCTypography.sans(size: 12))
-                    .foregroundStyle(Color.scTeal)
-            case let .failed(reason):
-                Text("Download failed: \(reason)")
-                    .font(SCTypography.sans(size: 12)).foregroundStyle(Color.scRust)
-                Button("Retry") { Task { await download.startDownload() } }
-                    .font(SCTypography.sans(size: 12)).foregroundStyle(Color.scTeal)
-            case .idle, .cancelled:
-                if !(settings.downloadedModelInstalled || download.isDefaultModelInstalled) {
-                    Button("Download (\(sizeGB))") { Task { await download.startDownload() } }
-                        .buttonStyle(.borderedProminent).controlSize(.small)
-                }
+    private func onDeviceAccessory(_ settings: IntelligenceSettings, reconcile: Bool) -> some View {
+        let render = IntelligenceSelectionModel.onDeviceRowRender(
+            probe: onDeviceStatus,
+            installed: settings.downloadedModelInstalled || download.isDefaultModelInstalled,
+            download: download.state,
+            daemonUnreachable: download.daemonUnreachable
+        )
+        VStack(alignment: .leading, spacing: 8) {
+            if reconcile {
+                statusLine(text: IntelligenceSelectionModel.reconcileNeededCopy, tone: .warn)
+            } else {
+                onDeviceStatusLine(render.status)
             }
-            Spacer(minLength: 0)
+            downloadAffordance(render.affordance, demoted: render.affordanceDemoted)
         }
         .padding(.horizontal, 44)
-        .padding(.bottom, download.state == .installed ? 0 : 12)
+        .padding(.bottom, 12)
     }
 
-    /// The live on-device availability chip under the on-device row: "Ready" when
-    /// Apple Intelligence is on, else the actual blocker (off / downloading / not
-    /// supported). Renders nothing when the state can't be determined. For the one
-    /// system-toggle case (Apple Intelligence off) it also offers a "Turn on in
-    /// System Settings" deep link — the app can't flip the switch, only point at it.
+    /// The status line for the merged row's render case. The needs-attention
+    /// text reuses the probe's existing badge copy (the specific blocker), and
+    /// the System Settings deep link is offered exactly when the render says a
+    /// system toggle fixes it.
     @ViewBuilder
-    private var onDeviceStatusAccessory: some View {
-        if let badge = onDeviceStatus.settingsBadge {
+    private func onDeviceStatusLine(_ status: OnDeviceRowRender.Status) -> some View {
+        switch status {
+        case .readyApple:
+            statusLine(text: IntelligenceSelectionModel.onDeviceReadyAppleCopy, tone: .ok)
+        case .readyDownloaded:
+            statusLine(text: IntelligenceSelectionModel.onDeviceReadyDownloadedCopy, tone: .ok)
+        case .appleModelDownloading:
+            statusLine(text: IntelligenceSelectionModel.onDeviceAppleModelDownloadingCopy, tone: .info)
+        case .needsAttention(let offersSystemSettings):
             HStack(spacing: 8) {
                 Circle()
-                    .fill(badgeColor(badge.tone))
+                    .fill(badgeColor(.warn))
                     .frame(width: 6, height: 6)
-                Text(badge.text)
+                Text(onDeviceStatus.settingsBadge?.text
+                    ?? IntelligenceSelectionModel.onDeviceUnavailableCopy)
                     .font(SCTypography.sans(size: 12))
-                    .foregroundStyle(badgeColor(badge.tone))
-                if badge.offersSystemSettings {
+                    .foregroundStyle(badgeColor(.warn))
+                if offersSystemSettings {
                     Button("Turn on in System Settings") { AppleIntelligenceSettings.open() }
                         .buttonStyle(.plain)
                         .font(SCTypography.sans(size: 12, weight: .semibold))
@@ -423,49 +424,81 @@ struct IntelligenceSettingsView: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 44)
-            .padding(.bottom, 12)
+        case .checking:
+            statusLine(text: IntelligenceSelectionModel.onDeviceCheckingCopy, tone: .info)
+        case .plain:
+            EmptyView()
         }
     }
 
-    /// Map an on-device status-badge tone to its themed color.
-    private func badgeColor(_ tone: OnDeviceStatusBadge.Tone) -> Color {
-        switch tone {
-        case .ok: return Color.scSuccessFg
-        case .warn: return Color.scAmberText
-        case .info: return Color.scInkMuted
+    /// A dot + text status line in a badge tone.
+    private func statusLine(text: String, tone: OnDeviceStatusBadge.Tone) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(badgeColor(tone))
+                .frame(width: 6, height: 6)
+            Text(text)
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(badgeColor(tone))
+            Spacer(minLength: 0)
         }
     }
 
-    /// The endpoint text field for the Local-server row (U9 write via the CLI),
-    /// showing the resolved LOCAL/REMOTE classification and its treatment.
-    private func endpointField(_ settings: IntelligenceSettings) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                TextField("http://127.0.0.1:11434", text: $endpointDraft)
-                    .textFieldStyle(.roundedBorder)
-                    .font(SCTypography.mono(size: 12))
-                    .frame(maxWidth: 320)
-                Button("Save") {
-                    Task {
-                        _ = await intelligence.setEndpoint(endpointDraft)
-                        endpointDraft = intelligence.settings?.localServerEndpoint ?? endpointDraft
-                    }
-                }
-                .controlSize(.small)
-                .disabled(endpointDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+    /// The download affordance for the merged row's render case — Download /
+    /// progress+Cancel / failed+Retry, wired to `ModelDownloadController`.
+    /// Demoted (a local engine is ready or arriving) renders the Download
+    /// button secondary so it never competes with a Ready badge; disabled
+    /// (daemon unreachable) renders it inert with the model's reason.
+    @ViewBuilder
+    private func downloadAffordance(
+        _ affordance: OnDeviceRowRender.DownloadAffordance, demoted: Bool
+    ) -> some View {
+        let sizeGB = (download.disclosedSizeBytes ?? 0) > 0
+            ? ShellSidebarModel.formatStorage(download.disclosedSizeBytes!)
+            : "~2 GB"
+        switch affordance {
+        case .hidden:
+            EmptyView()
+        case .download:
+            if demoted {
+                Button("Download (\(sizeGB))") { Task { await download.startDownload() } }
+                    .buttonStyle(.plain)
+                    .font(SCTypography.sans(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.scTeal)
+            } else {
+                Button("Download (\(sizeGB))") { Task { await download.startDownload() } }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
             }
-            if let cls = settings.endpointClassification {
-                Text(cls == "LOCAL"
-                    ? "Local — day-splitting runs against this server; nothing leaves the Mac."
-                    : "Remote — treated as a cloud provider (consent-gated; day-splitting stays off).")
-                    .font(SCTypography.sans(size: 11.5))
-                    .foregroundStyle(cls == "LOCAL" ? Color.scTeal : Color.scInkMuted)
+        case .progressCancel:
+            HStack(spacing: 10) {
+                ProgressView(value: download.state.fractionComplete)
+                    .frame(maxWidth: 220)
+                Button("Cancel") { Task { await download.cancel() } }
+                    .buttonStyle(.plain).font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scTeal)
+                Spacer(minLength: 0)
+            }
+        case .retry(let reason):
+            HStack(spacing: 10) {
+                Text("Download failed: \(reason)")
+                    .font(SCTypography.sans(size: 12)).foregroundStyle(Color.scRust)
+                Button("Retry") { Task { await download.startDownload() } }
+                    .font(SCTypography.sans(size: 12)).foregroundStyle(Color.scTeal)
+                Spacer(minLength: 0)
+            }
+        case .disabled(let reason):
+            HStack(spacing: 10) {
+                Button("Download (\(sizeGB))") {}
+                    .controlSize(.small)
+                    .disabled(true)
+                Text(reason)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
             }
         }
-        .padding(.horizontal, 44)
-        .padding(.bottom, 12)
-        .onAppear { endpointDraft = settings.localServerEndpoint ?? "" }
     }
 
     // MARK: - WHAT CLOUD MODELS MAY DO section (consent matrix)
@@ -473,6 +506,21 @@ struct IntelligenceSettingsView: View {
     private func cloudTasksSection(_ settings: IntelligenceSettings) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionHeader("WHAT CLOUD MODELS MAY DO")
+            // AE1 — the standing nudge: rendered exactly when the pure predicate
+            // says so (a cloud row is the rendered selection and a relevant
+            // toggle is off). This IS the consent pointer — no auto-scroll.
+            if IntelligenceSelectionModel.consentNudgeVisible(
+                selectedRowID: IntelligenceSelectionModel.renderedSelection(settings).rowID,
+                summaryCloudConsent: settings.summaryCloudConsent,
+                recallCloudConsent: settings.recallCloudConsent
+            ) {
+                Text(IntelligenceSelectionModel.consentNudgeCopy)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scAmberText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 2)
+                    .padding(.bottom, 2)
+            }
             VStack(alignment: .leading, spacing: 0) {
                 // R8 — summaries/titles: the one real cloud toggle.
                 consentToggleRow(
@@ -612,8 +660,17 @@ struct IntelligenceSettingsView: View {
             .accessibilityAddTraits(.isHeader)
     }
 
+    /// Map an on-device status-badge tone to its themed color.
+    private func badgeColor(_ tone: OnDeviceStatusBadge.Tone) -> Color {
+        switch tone {
+        case .ok: return Color.scSuccessFg
+        case .warn: return Color.scAmberText
+        case .info: return Color.scInkMuted
+        }
+    }
+
     /// The provider picker's radio dot — teal filled when selected, hollow
-    /// otherwise (muted for the non-selectable "add" row).
+    /// otherwise (muted for non-selectable rows).
     private func radio(selected: Bool, muted: Bool) -> some View {
         Circle()
             .strokeBorder(
@@ -641,9 +698,9 @@ struct IntelligenceSettingsView: View {
 
 /// A pure model of the ScreenCap-hosted picker rows — factored out so the "which
 /// options render, and which provider value each writes" rules are unit testable
-/// without a running view. BYO (user-owned) rows are modeled separately by
-/// `ConnectProviderModel`; this covers only the on-device / downloaded /
-/// local-server hosted rows (R9 hosted section).
+/// without a running view. No longer rendered by the pane (the U3 redesign
+/// renders from `IntelligenceSelectionModel.groups` instead); retained because
+/// existing tests reference it — a later unit retires it with its tests.
 struct IntelligenceProviderOption: Identifiable, Equatable {
     let id: String
     let title: String
@@ -655,10 +712,6 @@ struct IntelligenceProviderOption: Identifiable, Equatable {
     /// the SCR-239 opt-in **Downloaded model** and **Local server** rows, then a
     /// configured cloud provider when set. Subtitles reflect the downloaded-model
     /// install state and the BYO endpoint's LOCAL/REMOTE classification.
-    ///
-    /// Note: the hosted section always passes `cloudProvider: nil` now — BYO
-    /// cloud lives in the "Your own account" section (R9/R10). The `cloudProvider`
-    /// parameter is retained for a future app-managed hosted cloud row.
     static func options(
         cloudProvider: String?,
         downloadedInstalled: Bool = false,

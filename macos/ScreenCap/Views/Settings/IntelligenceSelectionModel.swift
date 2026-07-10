@@ -183,6 +183,25 @@ enum IntelligenceSelectionModel {
     /// KTD3 — the disabled-download reason when the model status read fails.
     static let startDaemonDownloadReason =
         "Can't reach the daemon — start the daemon to manage the model download."
+    /// U3 — the section header above the grouped MODEL card.
+    static let modelSectionTitle = "MODEL"
+    /// U3 — the add-provider row at the foot of the "Your own" group.
+    static let addProviderRowTitle = "Add another provider…"
+    /// KTD1 — the reconcile treatment's prompt on the on-device row when a
+    /// legacy persisted value (`gemini`, endpoint-less `local-server`) is
+    /// mapped render-only; tapping a row performs the healing write-through.
+    static let reconcileNeededCopy =
+        "Saved model setting is from an earlier version — pick a model to update it."
+    /// AE1 — the standing consent nudge while a cloud row is the rendered
+    /// selection and a relevant task toggle is off (fallback-honest: off = not sent).
+    static let consentNudgeCopy =
+        "Your cloud model only handles the tasks you turn on below — while a task is off, nothing is sent for it."
+    /// KTD3 — on-device row status lines for the merged availability render.
+    static let onDeviceReadyAppleCopy = "Ready (Apple Intelligence)"
+    static let onDeviceReadyDownloadedCopy = "Ready (downloaded model)"
+    static let onDeviceAppleModelDownloadingCopy = "Model downloading…"
+    static let onDeviceCheckingCopy = "Checking availability…"
+    static let onDeviceUnavailableCopy = "On-device model isn't available on this Mac."
 
     // MARK: Grouped options (R1/R5)
 
