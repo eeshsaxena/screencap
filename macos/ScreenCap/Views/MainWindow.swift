@@ -242,12 +242,7 @@ struct MainWindow: View {
             // visible over the sidebar's reserved chrome slot (ShellSidebarView).
             HStack(spacing: 0) {
                 sidebar
-                VStack(spacing: 0) {
-                    RecordingBanner()
-                        .padding(.horizontal, 16)
-                        .padding(.top, recorder.state.isRecording ? 12 : 0)
-                    detail
-                }
+                detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .top) {
                     if let err = recorder.lastError {
