@@ -163,6 +163,22 @@ def get_stripe_paywall_enabled() -> bool:
     return _parse_bool_env("SCREENCAP_STRIPE_PAYWALL", "stripe_paywall", False)
 
 
+def get_local_paywall_enforced() -> bool:
+    """Return whether the client-side local paywall gates are enforced (True = on).
+
+    Default OFF: when off, starting a recording and the local recall/search
+    verbs behave exactly as before this feature — no gate. Flipping it on lets
+    the daemon's recording-start and recall gates refuse an unentitled account
+    (bounded by the last-known-good entitlement lease). This is separate from
+    the client ``SCREENCAP_STRIPE_PAYWALL`` (UI/checkout surfaces) and the
+    signer's ``STRIPE_PAYWALL_ENFORCE`` (cloud upload hard gate), so local
+    enforcement lands dark and flips independently at cutover.
+    """
+    return _parse_bool_env(
+        "SCREENCAP_LOCAL_PAYWALL_ENFORCE", "local_paywall_enforce", False
+    )
+
+
 def get_app_versions() -> bool:
     """Return whether running-application version capture is enabled (True = on)."""
     return _parse_bool_env("SCREENCAP_APP_VERSIONS", "app_versions", True)

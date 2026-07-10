@@ -344,6 +344,56 @@ class TestStripePaywall:
             assert get_stripe_paywall_enabled() is False
 
 
+class TestLocalPaywallEnforce:
+    """Tests for get_local_paywall_enforced() (default OFF)."""
+
+    def test_default_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_local_paywall_enforced
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "SCREENCAP_LOCAL_PAYWALL_ENFORCE"
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {}  # empty config — no local_paywall_enforce key
+            assert get_local_paywall_enforced() is False
+
+    def test_env_var_true(self):
+        from screencap.config import get_local_paywall_enforced
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_LOCAL_PAYWALL_ENFORCE": "1"}):
+            assert get_local_paywall_enforced() is True
+
+    def test_env_var_false(self):
+        from screencap.config import get_local_paywall_enforced
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_LOCAL_PAYWALL_ENFORCE": "false"}):
+            assert get_local_paywall_enforced() is False
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_local_paywall_enforced
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "SCREENCAP_LOCAL_PAYWALL_ENFORCE"
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"local_paywall_enforce": True}
+            assert get_local_paywall_enforced() is True
+
+    def test_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_local_paywall_enforced
+
+        cfg._config_cache = {"local_paywall_enforce": True}
+        with mock.patch.dict(os.environ, {"SCREENCAP_LOCAL_PAYWALL_ENFORCE": "no"}):
+            assert get_local_paywall_enforced() is False
+
+
 # --- upload default config tests ---
 
 
