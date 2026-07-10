@@ -216,6 +216,76 @@ def _apply_whoami_to_lease(info: dict[str, Any]) -> None:
     entitlement_lease.reconcile_from_whoami(info)
 
 
+async def _enforce_recording_subscription_gate() -> None:
+    """U8: block ``recording.start`` unless an active tier entitles it (KTD-4).
+
+    No-op unless ``SCREENCAP_LOCAL_PAYWALL_ENFORCE`` is on, so the default path is
+    byte-identical to today. When on:
+
+    1. If the KTD-4 lease grants an unexpired paid tier, allow — an offline PAYER
+       within the 72h window is never locked out (R8), and no network call is made.
+    2. Else attempt ONE fresh ``auth.whoami()`` + :func:`_apply_whoami_to_lease` to
+       refresh the lease from current state (an online payer whose lease just
+       expired self-heals here; a definitive not-entitled clears; an ambiguous
+       stale/offline whoami preserves the lease), then re-read.
+    3. If still not entitled, raise :class:`SubscriptionRequiredError` (no spawn).
+
+    Unlike the recall gate this DOES a single whoami on a lease miss — the
+    start path is infrequent (once per recording), so a fresh refresh at the
+    chokepoint is worth un-gating a just-lapsed-but-now-renewed payer without a
+    ~1h wait. A ``whoami`` that raises is swallowed (best-effort): the pre-fetch
+    lease read is the source of truth and the gate falls through to it.
+    """
+    from screencap.config import get_local_paywall_enforced
+    from screencap.daemon import entitlement_lease
+
+    if not get_local_paywall_enforced():
+        return
+
+    if entitlement_lease.lease_entitled_tier() is not None:
+        return
+
+    # Lease miss: refresh from current whoami state once, then re-read.
+    from screencap import auth
+
+    try:
+        info = await asyncio.to_thread(auth.whoami)
+    except Exception:  # noqa: BLE001 — whoami is built not to raise; degrade to lease
+        logger.warning("recording.start subscription gate: whoami failed", exc_info=True)
+    else:
+        _apply_whoami_to_lease(info)
+
+    if entitlement_lease.lease_entitled_tier() is None:
+        raise errors.SubscriptionRequiredError(
+            schema_version=schema._RECORDING_START_API_VERSION,
+        )
+
+
+def _check_subscription_for_recall(*, schema_version: int) -> None:
+    """U9: block a recall/search verb unless an unexpired entitled lease grants it.
+
+    No-op unless ``SCREENCAP_LOCAL_PAYWALL_ENFORCE`` is on (default path unchanged).
+    When on, reads the KTD-4 lease ONLY — deliberately NO per-search ``whoami``
+    network call: the lease is kept fresh by the ``auth.whoami`` verb's reconcile and
+    by U8's recording-start path, so a per-search refresh would be too chatty for a
+    surface hit on every keystroke of autocomplete. Raises
+    :class:`SubscriptionRequiredError` when the lease is invalid / expired / cleared;
+    an offline PAYER within the lease window still passes (R8).
+
+    Called at the top of the five recall handlers (``content.search`` /
+    ``transcript.search`` / ``timeline.query`` / ``frame.nearest`` / ``apps.list``);
+    the browse verbs (``recording.list`` / ``timeline.day`` / ``tasks.list`` /
+    ``auth.whoami``) never call it.
+    """
+    from screencap.config import get_local_paywall_enforced
+    from screencap.daemon import entitlement_lease
+
+    if not get_local_paywall_enforced():
+        return
+    if entitlement_lease.lease_entitled_tier() is None:
+        raise errors.SubscriptionRequiredError(schema_version=schema_version)
+
+
 async def auth_whoami(request: Request) -> JSONResponse:
     """SCR-148: report the cloud account currently signed in on this daemon.
 
@@ -521,6 +591,13 @@ async def recording_start(request: Request) -> JSONResponse:
                 missing,
                 schema_version=schema._RECORDING_START_API_VERSION,
             )
+
+        # Local paywall gate (U8, KTD-4). Only when SCREENCAP_LOCAL_PAYWALL_ENFORCE
+        # is on — otherwise a no-op, byte-identical to today. Raised BEFORE the
+        # spawn (typed-error-before-spawn, like the permission gate) so a refused
+        # start never spawns an engine worker. This one daemon chokepoint covers
+        # CLI, MCP, and the app (all POST /v0/recording.start).
+        await _enforce_recording_subscription_gate()
 
         result = await request.app.state.supervisor.spawn(parsed)
         # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what
@@ -896,6 +973,9 @@ async def content_search(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._CONTENT_SEARCH_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1305,6 +1385,7 @@ async def apps_list(request: Request) -> JSONResponse:
     same-EUID caller can read from disk directly).
     """
     try:
+        _check_subscription_for_recall(schema_version=schema._APPS_LIST_API_VERSION)
         result = await asyncio.to_thread(_run_apps_list)
         return JSONResponse(
             schema.envelope(
@@ -1330,6 +1411,9 @@ async def transcript_search(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1362,6 +1446,9 @@ async def timeline_query(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._TIMELINE_QUERY_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1449,6 +1536,9 @@ async def frame_nearest(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        _check_subscription_for_recall(
+            schema_version=schema._FRAME_NEAREST_API_VERSION
+        )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}

@@ -21,6 +21,12 @@ INVALID_OUTPUT_DIR = "invalid_output_dir"
 PERMISSION_REQUIRED = "permission_required"
 INVALID_PERMISSION = "invalid_permission"
 INVALID_RANGE = "invalid_range"
+# SCR (paid-only launch, U8/U9): the local paywall is enforced
+# (``SCREENCAP_LOCAL_PAYWALL_ENFORCE``) and no unexpired entitlement lease grants a
+# paid tier — recording-start and the recall/search verbs refuse. Distinct
+# 402-equivalent code so the client maps it to an "upgrade" affordance rather than
+# a generic failure.
+SUBSCRIPTION_REQUIRED = "subscription_required"
 # SCR-186: a request body that fails model validation (missing required field or
 # an out-of-bounds value) — returned as a typed 400 rather than a generic 500.
 INVALID_REQUEST = "invalid_request"
@@ -496,6 +502,29 @@ class InvalidOutputDirError(DaemonAPIError):
         )
 
 
+class SubscriptionRequiredError(DaemonAPIError):
+    """The local paywall is enforced and no active tier entitles the request (U8/U9).
+
+    Raised by ``recording.start`` (before ``supervisor.spawn`` signals success —
+    per the typed-error-before-spawn convention, mirroring
+    :class:`PermissionRequiredError`) and by the five recall/search verbs
+    (``content.search`` / ``transcript.search`` / ``timeline.query`` /
+    ``frame.nearest`` / ``apps.list``) when ``SCREENCAP_LOCAL_PAYWALL_ENFORCE`` is on
+    and the KTD-4 entitlement lease grants no unexpired paid tier. The gate is a
+    no-op (never raised) with the flag off, so the default path is byte-identical.
+
+    Maps to HTTP 402 (Payment Required) so it routes through
+    ``_api_error_response`` as a typed 4xx — never the ``except Exception`` 500 —
+    and the client can map the ``subscription_required`` code to an upgrade
+    affordance. Browse + export verbs (``recording.list`` / ``timeline.day`` /
+    ``tasks.list`` / ``auth.whoami``) are deliberately never gated: a lapsed user
+    keeps their own local data (R8).
+    """
+
+    error_code = SUBSCRIPTION_REQUIRED
+    http_status = 402
+
+
 __all__ = [
     "LOCK_CONTENDED",
     "NOT_OWNED_BY_DAEMON",
@@ -511,6 +540,7 @@ __all__ = [
     "PERMISSION_REQUIRED",
     "INVALID_PERMISSION",
     "INVALID_RANGE",
+    "SUBSCRIPTION_REQUIRED",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
@@ -542,4 +572,5 @@ __all__ = [
     "InvalidOutputDirError",
     "PermissionRequiredError",
     "InvalidPermissionError",
+    "SubscriptionRequiredError",
 ]
