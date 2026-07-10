@@ -175,6 +175,56 @@ class TestSegmentUsesKeychainKey:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.privacy
+class TestFailClosedStrippedGate:
+    """The LOCAL BYO path (``get_provider("gemini")``) fail-closes on an
+    activity summary not marked ``stripped=True`` — matching the
+    openai/anthropic/cli_delegate siblings (R7/R8). The Cloud Run construction
+    (``GeminiProvider()``, default) stays un-gated so its server-side, un-stripped
+    activity data still segments."""
+
+    def _unstripped(self) -> dict:
+        s = _stripped()
+        s.pop("stripped", None)  # no stripped marker at all
+        return s
+
+    def test_local_byo_refuses_unstripped_without_calling_model(self, monkeypatch):
+        called: list = []
+
+        def _raw(prompt):
+            called.append(prompt)
+            return {"tasks": []}
+
+        # get_provider("gemini") opts into require_stripped=True. Inject a raw_call
+        # spy on the SAME object to prove the model is NEVER reached on refusal.
+        provider = get_provider("gemini")
+        provider._raw_call = _raw  # type: ignore[attr-defined]
+        assert provider.segment(self._unstripped()) is None
+        assert called == []  # fail-closed: no model call on unmarked input
+
+    def test_cloud_run_default_still_segments_unstripped(self, monkeypatch):
+        # The Cloud Run caller constructs GeminiProvider(raw_call=...) with the
+        # default require_stripped=False, so un-stripped activity data segments.
+        provider = GeminiProvider(raw_call=lambda prompt: _raw_tasks())
+        result = provider.segment(self._unstripped())
+        assert isinstance(result, dict)
+        assert result["tasks"][0]["name"] == "Fix login"
+
+
+def _raw_tasks() -> dict:
+    """A well-formed raw tasks object (relative timestamps, pre-validation)."""
+    return {
+        "tasks": [
+            {"start_time": "0:00:00", "end_time": "0:30:00", "name": "Fix login",
+             "description": "d", "category": "development", "apps_used": ["VS Code"],
+             "confidence": "high"},
+        ],
+        "summary": {"overview": "o", "primary_focus": "development",
+                    "time_breakdown": {}, "key_accomplishments": []},
+        "tags": ["python"],
+    }
+
+
 class TestSingleGeminiEntry:
     def test_gemini_factory_id_maps_to_one_backend(self):
         assert isinstance(get_provider("gemini"), GeminiProvider)

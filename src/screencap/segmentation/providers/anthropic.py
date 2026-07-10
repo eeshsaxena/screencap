@@ -43,7 +43,11 @@ from screencap.segmentation.generation_finish import (
     evidence_gate_ok,
     sanitize_answer,
 )
-from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
+from screencap.segmentation.local_finish import (
+    _strip_code_fence,
+    build_local_prompt,
+    finalize_local_result,
+)
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
 log = logging.getLogger(__name__)
@@ -247,21 +251,3 @@ def _post_messages(api_key: str, prompt: str, *, temperature: float) -> str | No
     except Exception:  # noqa: BLE001 — any transport/parse error is unavailable, not fatal
         log.warning("Anthropic call failed", exc_info=True)
         return None
-
-
-def _strip_code_fence(text: str) -> str:
-    """Return ``text`` with a leading/trailing Markdown code fence removed.
-
-    A model often wraps a JSON reply in a ```` ```json … ``` ```` block; strip a
-    single outer fence so the JSON parses. A plain (unfenced) reply is returned
-    unchanged.
-    """
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    lines = stripped.splitlines()
-    if lines and lines[0].startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
-    return "\n".join(lines).strip()

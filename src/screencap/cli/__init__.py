@@ -3334,13 +3334,34 @@ def _read_byo_key_from_stdin_or_file() -> str | None:
     missing-or-empty file). The secret is read from a 0o600 file path or piped on
     stdin — **never** from an argv value (KTD3). A trailing newline (the shape a
     ``echo`` / ``here-string`` pipe produces) is stripped.
+
+    The file channel is rejected unless it is **exactly mode 0o600** (owner
+    read/write only), matching the engine-token file pattern
+    (:data:`screencap.auth.ENGINE_TOKEN_FILE_ENV`): a world/group-readable secret
+    file is a leak, so we fail closed (``None``) rather than read it.
     """
     path = os.environ.get(_BYO_KEY_FILE_ENV)
     if path:
-        try:
-            from pathlib import Path
+        import stat as _stat
+        from pathlib import Path
 
-            raw = Path(path).read_text()
+        p = Path(path)
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        # Reject anything the group or world can read (or a non-regular file).
+        if not _stat.S_ISREG(st.st_mode) or (st.st_mode & 0o077):
+            from rich.console import Console
+
+            Console(stderr=True).print(
+                f"[red]Error:[/red] {_BYO_KEY_FILE_ENV} must point at a mode-0o600 "
+                "regular file (owner read/write only); refusing to read a "
+                "world/group-readable secret file."
+            )
+            return None
+        try:
+            raw = p.read_text()
         except OSError:
             return None
         return raw.strip() or None

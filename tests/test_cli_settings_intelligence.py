@@ -437,30 +437,84 @@ class TestBYOKeySet:
         assert payload["vendor"] == "openai"
         assert payload["key_present"] is True
 
+    @pytest.mark.privacy
     def test_secret_never_appears_in_argv(self, fake_key_store, monkeypatch):
-        """CRITICAL (KTD3): the secret is piped on stdin — the constructed argv
-        must contain NO secret. We assert both the click args and the process
-        argv the CLI would see carry only the vendor, never the key."""
+        """CRITICAL (KTD3): the secret reaches the CLI over stdin and NEVER via
+        argv. We prove both halves on the real code path:
+
+        1. ``_read_byo_key_from_stdin_or_file`` returns the piped secret (so the
+           reader — not an argv value — is the channel the secret arrives on);
+        2. the secret appears nowhere in the click invocation's argv, in
+           ``sys.argv`` during the call, or in any command list the CLI builds.
+        """
+        import io
+        import sys as _sys
+
+        from screencap import cli as cli_mod
+
         secret = "sk-super-secret-value"
         args = ["--set-key", "openai"]
-        # The invocation args (what becomes argv) must not contain the secret.
-        assert secret not in args
+
+        # (1) The reader returns exactly the piped secret — stdin IS the channel.
+        monkeypatch.setattr(_sys, "stdin", io.StringIO(secret + "\n"))
+        assert cli_mod._read_byo_key_from_stdin_or_file() == secret
+
+        # (2) Drive the real store path with the secret on stdin. Trip-wire on
+        #     every argv the process could expose while the command runs: the
+        #     secret must never be an argv element.
+        seen_argvs: list = []
+        real_argv = list(_sys.argv)
+
+        def _guard_store(vendor, key):
+            # At store time (deepest point of the real path) the secret is in hand
+            # — assert it never leaked onto the live process argv.
+            seen_argvs.append(list(_sys.argv))
+            fake_key_store.store[vendor] = key
+
+        monkeypatch.setattr(
+            "screencap.segmentation.secrets.store_key", _guard_store
+        )
+
         r = _invoke_raw([*args, "--json"], input=secret + "\n")
         assert r.exit_code == 0, r.output
-        # The stored key is the secret (proving it was read from stdin, not argv).
+        # The key was stored (it came through — from stdin, since argv has none).
         assert fake_key_store.store["openai"] == secret
-        # And nothing in the invocation args leaked it.
+        # The click invocation argv carried only the vendor, never the key.
         assert not any(secret in a for a in args)
+        # The live process argv observed at store time never carried the secret.
+        assert seen_argvs, "store_key was not reached on the real path"
+        for argv in seen_argvs:
+            assert not any(secret in a for a in argv), argv
+        # Sanity: we didn't perturb the real process argv.
+        assert list(_sys.argv) == real_argv
 
     def test_set_key_from_file_env(self, fake_key_store, monkeypatch, tmp_path):
         """The 0o600-file channel (SCREENCAP_BYO_KEY_FILE) is the alternative to
         stdin — the secret path, not the secret, is what's passed."""
         key_file = tmp_path / "key.txt"
         key_file.write_text("sk-from-file\n")
+        key_file.chmod(0o600)  # the reader requires owner-only mode
         monkeypatch.setenv("SCREENCAP_BYO_KEY_FILE", str(key_file))
         r = _invoke_raw(["--set-key", "anthropic", "--json"])
         assert r.exit_code == 0, r.output
         assert fake_key_store.store["anthropic"] == "sk-from-file"
+
+    @pytest.mark.privacy
+    def test_set_key_from_world_readable_file_rejected(
+        self, fake_key_store, monkeypatch, tmp_path
+    ):
+        """A group/world-readable key file is refused (fail closed) — matching the
+        engine-token 0o600 pattern; a leaky secret file must not be read."""
+        key_file = tmp_path / "key.txt"
+        key_file.write_text("sk-leaky\n")
+        key_file.chmod(0o644)  # group + world readable
+        monkeypatch.setenv("SCREENCAP_BYO_KEY_FILE", str(key_file))
+        r = _invoke_raw(["--set-key", "anthropic", "--json"])
+        assert r.exit_code != 0
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is False
+        assert payload["error"] == "no_key_supplied"  # reader returned None
+        assert "anthropic" not in fake_key_store.store
 
     def test_set_key_empty_stdin_rejected(self, fake_key_store):
         r = _invoke_raw(["--set-key", "openai", "--json"], input="")

@@ -116,7 +116,10 @@ def get_provider(name: str) -> LLMProvider:
     if name == "gemini":
         from screencap.segmentation.providers.gemini import GeminiProvider
 
-        return GeminiProvider()
+        # LOCAL BYO path: require the summary to be privacy-stripped (R7/R8),
+        # mirroring the openai/anthropic/cli_delegate siblings. The Cloud Run
+        # caller constructs GeminiProvider() directly (require_stripped=False).
+        return GeminiProvider(require_stripped=True)
     if name == "on-device":
         from screencap.segmentation.providers.ondevice import OnDeviceProvider
 

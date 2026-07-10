@@ -19,6 +19,10 @@ import pytest
 
 from screencap.segmentation import secrets as byo
 
+# The whole file is a Vision-free keychain / validation / secret-handling guard,
+# so it must run on CI's privacy-only lane (`pytest -m privacy`).
+pytestmark = pytest.mark.privacy
+
 
 # --------------------------------------------------------------------------
 # Fixtures — mirror tests/test_auth.py's fake_group / fake_keyring shape.

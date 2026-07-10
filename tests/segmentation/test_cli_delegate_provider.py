@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import stat
+import time
 
 import pytest
 
@@ -387,6 +389,7 @@ class TestNoFrameBytes:
         assert all("SENTINEL-EVIDENCE-TEXT" not in a for a in seen["argv"])
 
 
+@pytest.mark.privacy
 class TestStderrHygiene:
     """A non-zero exit must not log the child's stderr verbatim (KTD5)."""
 
@@ -417,6 +420,86 @@ class TestRealSubprocessTimeout:
         monkeypatch.setenv("SCREENCAP_ANTHROPIC_CLI_PATH", str(fake))
         monkeypatch.setenv(cli_delegate._TIMEOUT_ENV, "0.3")
         assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+
+@pytest.mark.privacy
+class TestRealSubprocessDoSGuards:
+    """The REAL ``_default_run_cli`` path enforces the byte cap + reaps the whole
+    process group — a flooding or hanging (grandchild-spawning) CLI can't drive
+    daemon memory pressure or leak an orphaned process (FIX4/FIX6 DoS guards)."""
+
+    def test_stdout_flood_is_unavailable_and_bounded(self, monkeypatch, tmp_path):
+        # A fake CLI that writes far past the (lowered) byte cap, forever. The
+        # provider must kill it and return unavailable QUICKLY, holding only a
+        # bounded buffer — never accumulating the whole flood.
+        fake = _write_fake_cli(
+            tmp_path,
+            "import sys, os\n"
+            "buf = b'x' * 65536\n"
+            "while True:\n"
+            "    try:\n"
+            "        os.write(1, buf)\n"
+            "    except OSError:\n"
+            "        break\n",
+        )
+        p = CliDelegateProvider("anthropic-cli")
+        monkeypatch.setenv("SCREENCAP_ANTHROPIC_CLI_PATH", str(fake))
+        # Lower the cap so the test floods past it in a handful of chunks.
+        monkeypatch.setattr(cli_delegate, "_MAX_STDOUT_BYTES", 256 * 1024)
+        monkeypatch.setenv(cli_delegate._TIMEOUT_ENV, "10")  # cap should trip first
+
+        started = time.monotonic()
+        assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE
+        elapsed = time.monotonic() - started
+        # The byte cap (not the 10s timeout) tripped: a quick, bounded return.
+        assert elapsed < 5.0, f"flood was not bounded quickly (took {elapsed:.1f}s)"
+
+    def test_timeout_reaps_child_and_grandchild(self, monkeypatch, tmp_path):
+        # A fake CLI that spawns a grandchild (a sleeper), records both PIDs, then
+        # hangs. On timeout the provider SIGKILLs the whole session, so BOTH the
+        # direct child and the grandchild must be gone (os.killpg reaps the tree,
+        # not just the direct child).
+        pid_file = tmp_path / "pids.txt"
+        fake = _write_fake_cli(
+            tmp_path,
+            "import os, sys, subprocess, time\n"
+            # Grandchild: an independent sleeper in the same session/group.
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()) + ' ' + str(g.pid))\n"
+            "time.sleep(120)\n",
+        )
+        p = CliDelegateProvider("anthropic-cli")
+        monkeypatch.setenv("SCREENCAP_ANTHROPIC_CLI_PATH", str(fake))
+        monkeypatch.setenv(cli_delegate._TIMEOUT_ENV, "0.5")
+
+        assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+        # Wait for the pid file (the fake writes it before its own sleep).
+        deadline = time.monotonic() + 3.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pid_file.exists(), "fake CLI never recorded its PIDs"
+        child_pid, grandchild_pid = (int(x) for x in pid_file.read_text().split())
+
+        # Give the group-kill a moment to land, then assert BOTH are dead.
+        def _alive(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True  # exists but not signalable by us
+            return True
+
+        gone_deadline = time.monotonic() + 5.0
+        while time.monotonic() < gone_deadline and (
+            _alive(child_pid) or _alive(grandchild_pid)
+        ):
+            time.sleep(0.05)
+        assert not _alive(child_pid), "direct child was not reaped on timeout"
+        assert not _alive(grandchild_pid), (
+            "grandchild was not reaped — os.killpg must signal the whole group"
+        )
 
 
 # ---------------------------------------------------------------------------

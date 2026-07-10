@@ -57,8 +57,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import shutil
+import signal
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from screencap.segmentation.generation import Evidence
@@ -67,7 +71,11 @@ from screencap.segmentation.generation_finish import (
     evidence_gate_ok,
     sanitize_answer,
 )
-from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
+from screencap.segmentation.local_finish import (
+    _strip_code_fence,
+    build_local_prompt,
+    finalize_local_result,
+)
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.providers.ondevice import _scrubbed_env
 
@@ -167,6 +175,39 @@ def _timeout_s() -> float:
         except ValueError:
             pass
     return _DEFAULT_TIMEOUT_S
+
+
+# Grace after SIGTERM before escalating to SIGKILL on the process group.
+_GROUP_KILL_GRACE_S = 2.0
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGTERM then (after a grace) SIGKILL the child's whole process group.
+
+    The child is spawned with ``start_new_session=True``, so it is its own group
+    leader; signalling the group reaps agent-CLI **grandchildren** too, not just
+    the direct child. Strictly best-effort — a child that already exited (its pgid
+    gone) is a no-op. Never raises.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return  # already gone
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return  # group gone → done
+        try:
+            proc.wait(timeout=_GROUP_KILL_GRACE_S)
+            return  # reaped after this signal
+        except subprocess.TimeoutExpired:
+            continue  # still alive → escalate to SIGKILL
+    # Final reap attempt so we don't leave a zombie even if SIGKILL raced.
+    try:
+        proc.wait(timeout=_GROUP_KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _configured_binary_path(config_key: str) -> str | None:
@@ -359,47 +400,123 @@ class CliDelegateProvider:
 
         Prompt is delivered on stdin for claude/gemini and as a positional arg for
         codex (its documented contract). Scrubbed env (KTD5), wall-clock timeout,
-        stderr never logged verbatim. Returns the raw stdout ``str`` on success or
-        :data:`PROVIDER_UNAVAILABLE` on non-zero exit / timeout / spawn failure /
-        oversized output.
+        stderr never logged verbatim.
+
+        Hardened spawn (FIX4/FIX6): the child runs in its **own session/process
+        group** (``start_new_session=True``), and stdout is read **incrementally
+        against a hard BYTE budget** — once the running byte total exceeds
+        :data:`_MAX_STDOUT_BYTES` the whole group is killed and the call returns
+        :data:`PROVIDER_UNAVAILABLE`, so a flooding child can't drive daemon memory
+        pressure. On timeout the entire process group is signalled (``SIGTERM`` then
+        ``SIGKILL``) so an agent-CLI's grandchildren are reaped, not just the direct
+        child. Strictly fail-open: any spawn/read error → ``PROVIDER_UNAVAILABLE``,
+        never a raise.
+
+        Returns the raw stdout ``str`` on success or :data:`PROVIDER_UNAVAILABLE`
+        on non-zero exit / timeout / spawn failure / oversized output.
         """
         argv = self._argv(binary)
         # codex takes the prompt as a positional; claude/gemini read it on stdin.
-        stdin_input: str | None
+        stdin_bytes: bytes | None
         if self.vendor == "openai-cli":
             argv = argv + [prompt]
-            stdin_input = None
+            stdin_bytes = None
         else:
-            stdin_input = prompt
+            stdin_bytes = prompt.encode("utf-8", "surrogatepass")
 
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 argv,
-                input=stdin_input,
-                capture_output=True,
-                text=True,
-                timeout=_timeout_s(),
+                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # stderr never read → never logged verbatim
                 env=_scrubbed_env(),
+                # Own session so os.killpg() reaps the whole tree (agent-CLI
+                # grandchildren), not just the direct child.
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            log.warning("%s: CLI timed out; unavailable", self.vendor)
-            return PROVIDER_UNAVAILABLE
         except OSError:
             log.warning("%s: CLI could not be spawned; unavailable", self.vendor,
                         exc_info=True)
             return PROVIDER_UNAVAILABLE
 
-        if proc.returncode != 0:
+        # Feed stdin off-thread so a large prompt can't deadlock against a child
+        # that is streaming stdout before it finishes reading stdin.
+        if stdin_bytes is not None and proc.stdin is not None:
+            def _feed(handle, data):
+                try:
+                    handle.write(data)
+                    handle.close()
+                except OSError:
+                    pass  # child may have exited early; harmless
+
+            threading.Thread(
+                target=_feed, args=(proc.stdin, stdin_bytes), daemon=True
+            ).start()
+
+        deadline = time.monotonic() + _timeout_s()
+        chunks: list[bytes] = []
+        total = 0
+        oversized = False
+        assert proc.stdout is not None
+        # Read the raw fd so a select() gate enforces the deadline even while the
+        # child produces no output (a plain blocking read() would sit inside the
+        # child and never check the clock — defeating the timeout).
+        out_fd = proc.stdout.fileno()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning("%s: CLI timed out; unavailable", self.vendor)
+                    _kill_process_group(proc)
+                    return PROVIDER_UNAVAILABLE
+                # Wait up to the remaining budget for readable stdout; a wakeup with
+                # no fd ready means the budget window elapsed → loop re-checks.
+                ready, _, _ = select.select([out_fd], [], [], min(remaining, 1.0))
+                if not ready:
+                    continue
+                chunk = os.read(out_fd, 64 * 1024)
+                if not chunk:
+                    break  # EOF — child closed stdout (typically on exit)
+                total += len(chunk)  # BYTE budget, not str length
+                if total > _MAX_STDOUT_BYTES:
+                    log.warning(
+                        "%s: CLI output exceeds the stdout cap; unavailable",
+                        self.vendor,
+                    )
+                    _kill_process_group(proc)
+                    oversized = True
+                    break
+                chunks.append(chunk)
+        except OSError:
+            log.warning("%s: CLI stdout read failed; unavailable", self.vendor,
+                        exc_info=True)
+            _kill_process_group(proc)
+            return PROVIDER_UNAVAILABLE
+        finally:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+        if oversized:
+            return PROVIDER_UNAVAILABLE
+
+        # Reap the child within the remaining budget; a hang here is also a timeout.
+        try:
+            returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            log.warning("%s: CLI timed out; unavailable", self.vendor)
+            _kill_process_group(proc)
+            return PROVIDER_UNAVAILABLE
+
+        if returncode != 0:
             # Do NOT log stderr verbatim — it can carry recording-derived text or a
             # leaked secret. Only the class of failure (exit code) is logged.
-            log.warning("%s: CLI exited %d; unavailable", self.vendor, proc.returncode)
+            log.warning("%s: CLI exited %d; unavailable", self.vendor, returncode)
             return PROVIDER_UNAVAILABLE
 
-        if len(proc.stdout or "") > _MAX_STDOUT_BYTES:
-            log.warning("%s: CLI output exceeds the stdout cap; unavailable", self.vendor)
-            return PROVIDER_UNAVAILABLE
-
-        return proc.stdout or ""
+        return b"".join(chunks).decode("utf-8", "replace")
 
     # -- Output parsing -----------------------------------------------------
 
@@ -465,23 +582,3 @@ class CliDelegateProvider:
     def _parse_answer(self, stdout: str):
         """Parse the CLI's final text for the free-form ``answer`` path."""
         return self._extract_text(stdout)
-
-
-def _strip_code_fence(text: str) -> str:
-    """Return ``text`` with a leading/trailing Markdown code fence removed.
-
-    An agent CLI often wraps a JSON reply in a ```` ```json … ``` ```` block. Strip
-    a single outer fence so the JSON parses; a plain (unfenced) reply is returned
-    unchanged.
-    """
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    lines = stripped.splitlines()
-    # Drop the opening fence line (```` ``` ```` or ```` ```json ````) and a
-    # trailing fence line if present.
-    if lines and lines[0].startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
-    return "\n".join(lines).strip()

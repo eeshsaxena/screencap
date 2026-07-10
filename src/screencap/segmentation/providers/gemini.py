@@ -131,11 +131,16 @@ class GeminiProvider:
         self,
         raw_call: Callable[[str], dict | None] | None = None,
         answer_raw_call: Callable[[str], str | None] | None = None,
+        require_stripped: bool = False,
     ) -> None:
         self._raw_call = raw_call if raw_call is not None else self._call_gemini
         self._answer_raw_call = (
             answer_raw_call if answer_raw_call is not None else self._answer_gemini
         )
+        # LOCAL BYO path opts in (``get_provider("gemini")``); the Cloud Run
+        # caller (scripts/process-recording/main.py) leaves this False so its
+        # already-server-side, un-stripped activity data still segments.
+        self._require_stripped = require_stripped
 
     def segment(self, activity_summary: dict) -> dict | None:
         """Segment the session into named tasks via Gemini.
@@ -146,6 +151,18 @@ class GeminiProvider:
         or ``None`` if the model is unavailable/fails or its output does not
         validate. Never raises for an ordinary model/API failure.
         """
+        # Fail-closed privacy gate (R7/R8), enabled only on the LOCAL BYO path:
+        # refuse anything not explicitly marked privacy-stripped WITHOUT making a
+        # request. Gemini's contract is ``dict | None``, so fail-closed = ``None``.
+        # (The Cloud Run caller constructs with ``require_stripped=False`` and is
+        # unaffected.)
+        if self._require_stripped and activity_summary.get("stripped") is not True:
+            log.warning(
+                "GeminiProvider refused an activity summary not marked "
+                "stripped=True (fail-closed); no tasks."
+            )
+            return None
+
         prompt = _LLM_PROMPT.format(
             activity_json=json.dumps(activity_summary["summary"], indent=2),
         )

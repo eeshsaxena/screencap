@@ -1,10 +1,12 @@
 """Shared local-model finish: prompt build + validate→sanitize→gate (SCR-239).
 
-The downloaded-model and BYO local-server backends share one post-processing tail —
-they are "the two weakest links" the confidence gate (KTD9) and the untrusted-output
-sanitizer (KTD12) exist to protect. Keeping that tail (and its load-bearing
-sanitize-before-gate ordering) in one place means a change to it can't be applied to
-only one backend.
+The downloaded-model, BYO local-server, OpenAI, Anthropic, and CLI-delegate
+backends share one post-processing tail — they are "the weakest links" the
+confidence gate (KTD9) and the untrusted-output sanitizer (KTD12) exist to
+protect. Keeping that tail (and its load-bearing sanitize-before-gate ordering)
+in one place means a change to it can't be applied to only one backend. This
+module also owns :func:`_strip_code_fence`, the shared Markdown-fence stripper the
+Anthropic and CLI-delegate backends both use before JSON-parsing a model reply.
 """
 
 from __future__ import annotations
@@ -51,3 +53,23 @@ def finalize_local_result(raw: dict, activity_summary: dict) -> dict | None:
 
     sanitized = sanitize_tasks(validated)
     return apply_confidence_gate(sanitized, config.get_confidence_gate_threshold())
+
+
+def _strip_code_fence(text: str) -> str:
+    """Return ``text`` with a leading/trailing Markdown code fence removed.
+
+    A model (or an agent CLI) often wraps a JSON reply in a ```` ```json … ``` ````
+    block; strip a single outer fence so the JSON parses. A plain (unfenced) reply
+    is returned unchanged. Shared by the Anthropic and CLI-delegate backends.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    # Drop the opening fence line (```` ``` ```` or ```` ```json ````) and a
+    # trailing fence line if present.
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
