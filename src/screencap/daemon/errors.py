@@ -31,6 +31,13 @@ SUBSCRIPTION_REQUIRED = "subscription_required"
 # an out-of-bounds value) — returned as a typed 400 rather than a generic 500.
 INVALID_REQUEST = "invalid_request"
 
+# SCR-228: storage-location migration. STORAGE_MIGRATION_FAILED carries a
+# specific `reason` (a storage_migration.Reason code, or "recording_active") plus
+# a human `message`. MIGRATION_IN_PROGRESS is the recording.start refusal while a
+# migration holds the daemon.
+STORAGE_MIGRATION_FAILED = "storage_migration_failed"
+MIGRATION_IN_PROGRESS = "migration_in_progress"
+
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
 # as named constants prevents drift between handlers and tests.
@@ -265,6 +272,46 @@ class NotOwnedByDaemonError(DaemonAPIError):
             schema_version=self.schema_version,
             hint=self.hint,
         )
+
+
+class StorageMigrationError(DaemonAPIError):
+    """A storage-location migration was refused or failed (SCR-228).
+
+    Carries a specific ``reason`` (a ``storage_migration.Reason`` code such as
+    ``cross_volume`` / ``cloud_synced`` / ``target_not_empty``, or
+    ``recording_active``) plus a human ``message`` so the CLI can print it and
+    the macOS UI can map the code to copy.
+    """
+
+    error_code = STORAGE_MIGRATION_FAILED
+    http_status = 409
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        schema_version: int,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        self.message = message
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return error_envelope(
+            schema_version=self.schema_version,
+            error=self.error_code,
+            reason=self.reason,
+            message=self.message,
+        )
+
+
+class MigrationInProgressError(DaemonAPIError):
+    """A recording.start was refused because a storage migration is running."""
+
+    error_code = MIGRATION_IN_PROGRESS
+    http_status = 409
 
 
 class SchemaMismatchError(DaemonAPIError):

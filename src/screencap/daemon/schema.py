@@ -37,6 +37,7 @@ _AUTH_WHOAMI_API_VERSION = 1
 _ENTITLEMENT_REFRESH_API_VERSION = 1
 # SCR-178 content-index backfill lifecycle verbs.
 _BACKFILL_API_VERSION = 1
+_STORAGE_MIGRATE_API_VERSION = 1
 # U10 (local-first intelligence) read verb: the named-task segments a LOCAL
 # recording's terminal-stage segmentation persisted (U4). Additive (new verb) —
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
@@ -105,6 +106,7 @@ _MODEL_NAMES = {
     "BackfillCancelRequest",
     "BackfillStatusResponse",
     "BackfillProgressEvent",
+    "StorageMigrateRequest",
     "TasksListRequest",
     "TaskSegment",
     "TasksListResponse",
@@ -545,6 +547,16 @@ def _load_models() -> dict[str, Any]:
     class BackfillCancelRequest(_DaemonModel):
         """SCR-178 ``backfill.cancel`` input (no parameters)."""
 
+    class StorageMigrateRequest(_DaemonModel):
+        """SCR-228 ``storage.migrate`` input: the new recordings directory.
+
+        ``target`` is the absolute path the user chose. Bounded so a single
+        request can't carry an unreasonable path payload; the engine performs
+        the real safety validation (same-volume, not-nested, cloud-synced, …).
+        """
+
+        target: str = Field(min_length=1, max_length=4096)
+
     class BackfillStatusResponse(EnvelopeResponse):
         """The privacy-safe backfill status snapshot (R9).
 
@@ -782,6 +794,7 @@ def _load_models() -> dict[str, Any]:
         "BackfillCancelRequest": BackfillCancelRequest,
         "BackfillStatusResponse": BackfillStatusResponse,
         "BackfillProgressEvent": BackfillProgressEvent,
+        "StorageMigrateRequest": StorageMigrateRequest,
         "TasksListRequest": TasksListRequest,
         "TaskSegment": TaskSegment,
         "TasksListResponse": TasksListResponse,

@@ -56,6 +56,18 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         from screencap.daemon.supervisor import Supervisor
 
         app.state.supervisor = Supervisor(app.state.event_bus)
+    # SCR-228: reconcile a storage migration that crashed between the tree
+    # rename and the config flip, so the daemon serves the correct recordings
+    # dir from the first request. Fail-open — a reconcile error must never
+    # block daemon start.
+    try:
+        from screencap import config, storage_migration
+
+        await asyncio.to_thread(
+            storage_migration.reconcile_pending, config.set_recordings_dir
+        )
+    except Exception:  # noqa: BLE001 - reconcile must never break startup
+        logger.warning("storage-migration reconcile failed", exc_info=True)
     # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
     # daemon start (the stale-daemon-after-app-update lesson — a request-path
     # module must be imported before the first request, never lazily inside the
@@ -2170,6 +2182,97 @@ async def chat_answer(request: Request) -> JSONResponse:
         )
 
 
+def _storage_recording_active() -> bool:
+    """True if any process (daemon or CLI) is mid-recording (SCR-228 U3).
+
+    Mirrors ``session_snapshot``'s pidfile invariant: an active flock alone is
+    not enough — a long-lived SessionController holds the lock between
+    recordings without ``recording_started_at``. Catches a non-daemon-owned
+    recording that ``supervisor.acquire_migration`` (which only sees
+    ``_proc``) would miss.
+    """
+    from screencap import pidfile
+
+    if not pidfile.lock_is_active():
+        return False
+    meta = pidfile.read_lock_metadata()
+    return bool(meta and meta.get("recording_started_at") is not None)
+
+
+async def storage_migrate(request: Request) -> JSONResponse:
+    """``POST /v0/storage.migrate`` — relocate the recordings library (SCR-228).
+
+    Synchronous and same-volume-only: an ``os.rename`` of the recordings tree is
+    atomic and O(1), so there is no background job, progress stream, or cancel.
+    Mutual exclusion (a recording must not run during the move, and no recording
+    may start while it runs) is enforced by ``supervisor.acquire_migration`` +
+    the ``spawn`` guard under the shared operation lock; a non-daemon recording
+    is caught by the pidfile check. The config flip runs inside the move via
+    ``config.set_recordings_dir`` (the single commit point, which invalidates the
+    daemon's in-process cache). Deliberately NOT in ``_ACTIVITY_PATHS``.
+    """
+    from pathlib import Path
+
+    from screencap import config, storage_migration
+
+    schema_version = schema._STORAGE_MIGRATE_API_VERSION
+    try:
+        body = await request.json()
+        parsed = schema.StorageMigrateRequest.model_validate(body)
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception:
+        return _validation_error_response(schema_version=schema_version)
+
+    supervisor = request.app.state.supervisor
+    try:
+        await supervisor.acquire_migration(schema_version=schema_version)
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+
+    try:
+        if await asyncio.to_thread(_storage_recording_active):
+            raise errors.StorageMigrationError(
+                "recording_active",
+                "Stop the current recording before moving the storage "
+                "location.",
+                schema_version=schema_version,
+            )
+
+        source = config.get_recordings_dir()
+        target = Path(parsed.target).expanduser()
+
+        result = storage_migration.validate_target(source, target)
+        if not result.ok:
+            raise errors.StorageMigrationError(
+                result.code or "invalid_target",
+                result.message or "The chosen folder can't be used.",
+                schema_version=schema_version,
+            )
+
+        outcome = await asyncio.to_thread(
+            storage_migration.migrate,
+            source,
+            target,
+            config.set_recordings_dir,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                moved_from=outcome.moved_from,
+                moved_to=outcome.moved_to,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+    finally:
+        supervisor.release_migration()
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -2194,6 +2297,7 @@ def build_app() -> Starlette:
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
             Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),
+            Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
             Route("/v0/model.download.start", model_download_start, methods=["POST"]),
             Route("/v0/model.download.status", model_download_status, methods=["GET"]),
             Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),

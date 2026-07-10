@@ -281,6 +281,9 @@ class Supervisor:
         self._exit_handled = False
         self._operation_lock = asyncio.Lock()
         self._exit_lock = asyncio.Lock()
+        # SCR-228: set while a storage-location migration holds the daemon.
+        # Guarded by `_operation_lock` so it serializes against spawn/stop.
+        self._migration_active = False
 
         if reconcile_on_init:
             self.start_reconcile()
@@ -304,9 +307,53 @@ class Supervisor:
             snapshot["engine_pid"] = self._engine_pid
         return snapshot
 
+    async def acquire_migration(self, *, schema_version: int) -> None:
+        """Reserve the daemon for a storage-location migration (SCR-228 U3/U4).
+
+        Under ``_operation_lock`` so it serializes against ``spawn``/``stop``:
+        refuses if a daemon-owned recording is in progress, a terminal-stage
+        resume is in flight, or a migration is already active. On success sets
+        ``_migration_active`` (which ``spawn`` checks under the same lock, so a
+        recording.start during the migration is refused). The caller MUST pair
+        this with :meth:`release_migration` in a ``finally``.
+        """
+        async with self._operation_lock:
+            if self._migration_active:
+                raise errors.StorageMigrationError(
+                    "migration_in_progress",
+                    "A storage migration is already in progress.",
+                    schema_version=schema_version,
+                )
+            if self._proc is not None and self._proc.is_alive():
+                raise errors.StorageMigrationError(
+                    "recording_active",
+                    "Stop the current recording before moving the "
+                    "storage location.",
+                    schema_version=schema_version,
+                )
+            if self.has_inflight_resume():
+                raise errors.StorageMigrationError(
+                    "recording_active",
+                    "A recording is still finishing processing. Try again "
+                    "once it completes.",
+                    schema_version=schema_version,
+                )
+            self._migration_active = True
+
+    def release_migration(self) -> None:
+        """Clear the migration reservation (paired with acquire_migration)."""
+        self._migration_active = False
+
     async def spawn(self, request: "RecordingStartRequest") -> dict[str, Any]:
         """Claim the daemon lock, spawn the engine worker, and await started."""
         async with self._operation_lock:
+            if self._migration_active:
+                # SCR-228 U4: a storage migration holds the daemon; refuse to
+                # start a recording rather than let it write into a directory
+                # that is being relocated out from under it.
+                raise errors.MigrationInProgressError(
+                    schema_version=schema._RECORDING_START_API_VERSION
+                )
             if self._recovering:
                 raise errors.ReconcilingError(
                     schema_version=schema._RECORDING_START_API_VERSION
