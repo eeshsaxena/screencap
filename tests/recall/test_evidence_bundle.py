@@ -66,6 +66,7 @@ class FakeRetriever:
         self._snippet_by_pointer = snippet_by_pointer or {}
         self.content_queries: list[str] = []
         self.reresolved: list[tuple[str, int]] = []
+        self.timeline_calls: list[dict] = []
 
     def search_content(self, query, *, recording=None, limit=None) -> RetrievalResult:
         self.content_queries.append(query)
@@ -77,6 +78,10 @@ class FakeRetriever:
     def query_timeline(
         self, *, start_ms=None, end_ms=None, app=None, recording=None, limit=None
     ) -> list[dict]:
+        self.timeline_calls.append(
+            {"start_ms": start_ms, "end_ms": end_ms, "app": app,
+             "recording": recording, "limit": limit}
+        )
         return list(self._timeline)
 
     def resolve_pointer_text(self, recording: str, timestamp_ms: int) -> str | None:
@@ -137,6 +142,10 @@ def _make_recording_with_masked_window(
         "recap my morning",
         "summarize what I did yesterday afternoon",
         "total time in Slack this week",
+        # Recap-intent (KTD4): open "what did I do / work on" recaps are aggregates.
+        "what did I do yesterday",
+        "what did I work on this week",
+        "walk me through my afternoon",
     ],
 )
 def test_aggregate_questions_classify_aggregate(question):
@@ -149,10 +158,29 @@ def test_aggregate_questions_classify_aggregate(question):
         "what was that vendor-portal refund error around 2pm?",
         "which site had the login bug",
         "find the invoice number I saw earlier",
+        # KTD4 discriminator: a specific content lookup that merely carries a time
+        # reference stays POINT (recap-intent, not time-presence, is the signal).
+        "what was that error I saw yesterday afternoon",
     ],
 )
 def test_point_questions_classify_point(question):
     assert orchestrator.classify_question(question) is QuestionKind.POINT
+
+
+def test_point_question_scopes_timeline_to_resolved_window(tmp_path):
+    """A time-referenced point question scopes the timeline query to the resolved
+    window (R8) — not the globally-earliest events."""
+    retriever = FakeRetriever(timeline=[])
+    window = (1_770_000_000_000, 1_770_003_600_000)
+    build_evidence_bundle(
+        "which site had the login bug",
+        retriever=retriever,
+        recordings_dir=tmp_path,
+        window_ms=window,
+    )
+    assert retriever.timeline_calls, "the point path must query the timeline"
+    last = retriever.timeline_calls[-1]
+    assert (last["start_ms"], last["end_ms"]) == window
 
 
 # ===========================================================================
@@ -281,8 +309,9 @@ def test_timeline_evidence_at_allow_window_survives_strip(tmp_path):
              "app": "TextEdit", "title": "Notes"},
         ],
     )
+    # A POINT question (not a recap) so the timeline-retrieval path runs.
     bundle = build_evidence_bundle(
-        "what did I do", retriever=retriever, recordings_dir=tmp_path,
+        "which app window was open", retriever=retriever, recordings_dir=tmp_path,
     )
     recordings_present = {item.recording for item in bundle.evidence}
     assert "rec-allow" in recordings_present, (

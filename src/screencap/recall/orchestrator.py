@@ -525,15 +525,33 @@ _AGGREGATE_CUES = (
 )
 _AGGREGATE_RE = re.compile("|".join(_AGGREGATE_CUES), re.IGNORECASE)
 
+# Recap-intent cues (KTD4): an OPEN "what did I do / work on" recap is a period
+# summary, not a keyword point lookup over the literal words. The discriminator is
+# recap intent, NOT the mere presence of a time reference — "what was that error I
+# saw yesterday" carries a time reference but is a specific content lookup and must
+# stay POINT, so these patterns match only the open-recap shape ("what did/have I
+# do/done/work on / been up to", "walk me through my …"), never "what was that …".
+_RECAP_CUES = (
+    r"\bwhat (?:did|have) (?:i|we) (?:do|done|been doing|work(?:ed|ing)? on|"
+    r"get(?: done)?|been up to|been working on)\b",
+    r"\bwhat was (?:i|we) (?:doing|working on|up to)\b",
+    r"\bwalk me through (?:my|the|what)\b",
+)
+_RECAP_RE = re.compile("|".join(_RECAP_CUES), re.IGNORECASE)
+
 
 def classify_question(question: str) -> QuestionKind:
-    """Rule-based v1 point-vs-aggregate classifier (R3).
+    """Rule-based v1 point-vs-aggregate classifier (R3, KTD4).
 
-    Aggregate cues ("how much/long time", "recap", "summarize", "total …")
-    → :attr:`QuestionKind.AGGREGATE`; everything else is a point lookup. A light on-
-    device intent model is the deferred alternative (Outstanding Questions).
+    Aggregate cues ("how much/long time", "recap", "summarize", "total …") OR an
+    open recap-intent question ("what did I do …", "what did I work on …")
+    → :attr:`QuestionKind.AGGREGATE`; everything else is a point lookup. A specific
+    content lookup that merely carries a time reference ("what was that error I saw
+    yesterday") stays POINT. A light on-device intent model is the deferred
+    alternative (Outstanding Questions).
     """
-    if _AGGREGATE_RE.search(question or ""):
+    q = question or ""
+    if _AGGREGATE_RE.search(q) or _RECAP_RE.search(q):
         return QuestionKind.AGGREGATE
     return QuestionKind.POINT
 
@@ -746,6 +764,8 @@ def build_evidence_bundle(
         prior_turns=prior_turns or (),
         limit=limit,
         redact=redact,
+        window_ms=window_ms,
+        app=app,
     )
 
 
@@ -798,12 +818,22 @@ def _build_point_bundle(
     prior_turns: Sequence[PriorTurnPointer],
     limit: int | None,
     redact: TextRedactor,
+    window_ms: tuple[int, int] | None = None,
+    app: str | None = None,
 ) -> EvidenceBundle:
-    """Point flow: retrieve fresh + re-derive prior-turn pointers, then strip."""
+    """Point flow: retrieve fresh + re-derive prior-turn pointers, then strip.
+
+    When a time window is resolved (``window_ms``), the timeline query is scoped to
+    it (R8) — a time-referenced point question retrieves the moments in that period,
+    not the globally-earliest events. ``app`` narrows the timeline the same way.
+    """
     # 1. Fresh retrieval for the new question.
+    start_ms, end_ms = window_ms if window_ms else (None, None)
     content = retriever.search_content(question, limit=limit)
     transcript = retriever.search_transcript(question, limit=limit)
-    timeline = retriever.query_timeline(recording=None, limit=limit)
+    timeline = retriever.query_timeline(
+        start_ms=start_ms, end_ms=end_ms, app=app, recording=None, limit=limit,
+    )
 
     candidates: list[EvidenceItem] = []
     for hit in content.hits:

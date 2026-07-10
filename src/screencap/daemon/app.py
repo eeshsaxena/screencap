@@ -1965,6 +1965,19 @@ async def chat_answer(request: Request) -> JSONResponse:
             )
 
         window_ms = tuple(parsed.window_ms) if parsed.window_ms is not None else None
+        # No explicit client window → resolve a natural-language time reference from
+        # the question daemon-side (U3), so "yesterday" / "this morning" scope the
+        # turn. An explicit client window_ms takes precedence (left as-is above).
+        if window_ms is None:
+            import time
+
+            from screencap.recall.timeparse import resolve_time_window
+
+            resolved = resolve_time_window(
+                parsed.question, now_ms=int(time.time() * 1000)
+            )
+            if resolved is not None:
+                window_ms = resolved
         limit = _clamp_limit(parsed.limit) if parsed.limit is not None else None
 
         result = await asyncio.to_thread(
