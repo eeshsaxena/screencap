@@ -43,6 +43,12 @@ struct InspectWindow: View {
     @State private var timelineEvents: [TimelineEvent] = []
     @State private var currentTime: Double = 0
     @State private var timelineLoaded = false
+    // The "what was recorded" digest, rebuilt from the completed event array
+    // (KTD1) — never gated on the `.ready` transition. `eventsParsed` flips true
+    // once the detached parse lands, so the pane can distinguish "still reading"
+    // from "genuinely empty" (KTD7).
+    @State private var recordedSummary: RecordedSummary = .empty
+    @State private var eventsParsed = false
 
     init(recordingName: String) {
         self.recordingName = recordingName
@@ -177,6 +183,15 @@ struct InspectWindow: View {
                     videoModel.seek(toSeconds: seconds)
                 }
                 .frame(height: 80)
+                Divider()
+                // Collapsed-by-default "what was recorded" digest (R1/R2). Built
+                // from the completed event array, so it shows a loading placeholder
+                // until the detached parse lands, then the digest or honest empty
+                // state — readiness never waits on it.
+                RecordedSummaryPane(
+                    summary: recordedSummary,
+                    isParsing: !eventsParsed
+                )
             }
         } else {
             preparingState
@@ -198,13 +213,26 @@ struct InspectWindow: View {
         if !timelineLoaded {
             timelineLoaded = true
             // Parse the full local event set off the main actor (a long
-            // recording's events.jsonl can be large).
+            // recording's events.jsonl can be large), then fold the digest from
+            // the completed array on the same detached task (pure, O(N)) so the
+            // main actor only takes the finished values. Recomputing here — where
+            // `timelineEvents` is produced — rather than on the `.ready`
+            // transition keeps the digest built from the whole array (KTD1).
             Task.detached(priority: .userInitiated) {
                 let parsed = TimelineEventParser.parse(
                     urls: data.eventsURLs,
                     recordingStartedAt: data.startedAt
                 )
-                await MainActor.run { timelineEvents = parsed }
+                let summary = RecordedSummaryBuilder.build(
+                    events: parsed,
+                    blockedIntervals: data.blockedIntervals,
+                    protectedIntervals: data.protectedIntervals
+                )
+                await MainActor.run {
+                    timelineEvents = parsed
+                    recordedSummary = summary
+                    eventsParsed = true
+                }
             }
         }
     }

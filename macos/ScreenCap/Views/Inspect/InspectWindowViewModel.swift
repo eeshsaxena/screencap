@@ -21,6 +21,12 @@ struct InspectData: Equatable {
     let startedAt: Double
     let durationSeconds: Double
     let timingStatus: ReviewTimingStatus
+    /// Capture-time-excluded-only "not captured" spans for the summary's blocked
+    /// reassurance line (schema v4). Empty when absent (older CLI / review shape).
+    let blockedIntervals: [CapturedInterval]
+    /// The full protected set the digest drops events inside before counting.
+    /// Empty when absent. A superset of `blockedIntervals`.
+    let protectedIntervals: [CapturedInterval]
 }
 
 /// Read-only state machine for the inspect window. Deliberately just three
@@ -162,7 +168,11 @@ final class InspectWindowViewModel: ObservableObject {
                     durationSeconds: envelope.durationSeconds ?? 0,
                     timingStatus: ReviewTimingStatus.resolve(
                         status: envelope.timingStatus, legacyError: envelope.timingError
-                    )
+                    ),
+                    // Additive schema-4 fields; a missing key decodes to nil →
+                    // empty, so an older CLI / the review shape still lands ready.
+                    blockedIntervals: envelope.blockedIntervals ?? [],
+                    protectedIntervals: envelope.protectedIntervals ?? []
                 )
                 state = .ready(data)
                 return

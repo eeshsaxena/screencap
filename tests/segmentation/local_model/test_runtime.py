@@ -148,3 +148,95 @@ class TestGrammarBuild:
 
         grammar = build_json_grammar(_RESPONSE_SCHEMA)  # must not raise
         assert grammar is not None
+
+
+# ---------------------------------------------------------------------------
+# Free-form text generation (SCR-243, U10/KTD8) — grammar-free, no JSON parse.
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterGenerateText:
+    def test_mlx_returns_raw_text(self):
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: "You edited main.py.")
+        assert rt.generate_text("model", "prompt") == "You edited main.py."
+
+    def test_mlx_does_not_json_parse(self):
+        # Free-form prose that is NOT JSON must pass through unchanged (unlike generate()).
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: "just prose, no braces")
+        assert rt.generate_text("model", "prompt") == "just prose, no braces"
+
+    def test_mlx_load_failure_returns_none(self):
+        rt = MlxRuntime(load=lambda mp: None, gen=lambda h, p: "x")
+        assert rt.generate_text("model", "prompt") is None
+
+    def test_mlx_empty_output_returns_none(self):
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: "   ")
+        assert rt.generate_text("model", "prompt") is None
+
+    def test_mlx_gen_error_returns_none(self):
+        rt = MlxRuntime(load=lambda mp: "h", gen=lambda h, p: None)
+        assert rt.generate_text("model", "prompt") is None
+
+    def test_llamacpp_returns_raw_text(self):
+        rt = LlamaCppRuntime(raw_text_generate=lambda mp, p: "You ran pytest.")
+        assert rt.generate_text("model", "prompt") == "You ran pytest."
+
+    def test_llamacpp_empty_returns_none(self):
+        assert LlamaCppRuntime(raw_text_generate=lambda mp, p: "").generate_text("m", "p") is None
+
+    def test_llamacpp_none_returns_none(self):
+        assert LlamaCppRuntime(raw_text_generate=lambda mp, p: None).generate_text("m", "p") is None
+
+
+class _FakeRuntime:
+    def __init__(self, tasks=None, text=None):
+        self._tasks, self._text = tasks, text
+
+    def generate(self, model_path, prompt):
+        return self._tasks
+
+    def generate_text(self, model_path, prompt):
+        return self._text
+
+
+class TestWorkerModeRouting:
+    def _run(self, monkeypatch, request: dict, fake: _FakeRuntime) -> dict:
+        import io
+        import json
+
+        from screencap.segmentation.local_model import runtime as rt_mod
+        from screencap.segmentation.local_model import worker
+
+        monkeypatch.setattr(rt_mod, "select_runtime", lambda: "mlx")
+        monkeypatch.setattr(rt_mod, "get_runtime", lambda name: fake)
+        out = io.StringIO()
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
+        monkeypatch.setattr("sys.stdout", out)
+        worker.main([])
+        return json.loads(out.getvalue())
+
+    def test_generate_text_mode_emits_text_result(self, monkeypatch):
+        env = self._run(
+            monkeypatch,
+            {"mode": "generate_text", "prompt": "p", "model_path": "m"},
+            _FakeRuntime(text="hi there"),
+        )
+        assert env == {"status": "ok", "result": "hi there"}
+
+    def test_absent_mode_defaults_to_segment(self, monkeypatch):
+        # Backward compatibility: the existing request shape (no "mode") still
+        # routes to generate() and returns the tasks dict unchanged.
+        env = self._run(
+            monkeypatch,
+            {"prompt": "p", "model_path": "m"},
+            _FakeRuntime(tasks={"tasks": []}),
+        )
+        assert env == {"status": "ok", "result": {"tasks": []}}
+
+    def test_generate_text_none_is_unavailable(self, monkeypatch):
+        env = self._run(
+            monkeypatch,
+            {"mode": "generate_text", "prompt": "p", "model_path": "m"},
+            _FakeRuntime(text=None),
+        )
+        assert env["status"] == "unavailable"

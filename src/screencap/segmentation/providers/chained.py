@@ -11,6 +11,7 @@ through the unchanged ``resolve_day_split``, so the consent policy's
 
 from __future__ import annotations
 
+from screencap.segmentation.generation import Evidence, GenerationProvider, GenerationResult
 from screencap.segmentation.provider import (
     PROVIDER_UNAVAILABLE,
     LLMProvider,
@@ -46,4 +47,46 @@ class UnavailableProvider:
     """
 
     def segment(self, activity_summary: dict) -> ProviderUnavailable:
+        return PROVIDER_UNAVAILABLE
+
+
+class ChainedGenerationProvider:
+    """Try each on-device-class generation backend in order; cascade only on
+    ``PROVIDER_UNAVAILABLE`` (SCR-243, U6).
+
+    The answer-path analogue of :class:`ChainedOnDeviceProvider`. A ``str`` (a
+    grounded answer, including a grounded refusal) stops the chain and is
+    returned; only :data:`PROVIDER_UNAVAILABLE` falls through to the next
+    backend. An empty chain returns :data:`PROVIDER_UNAVAILABLE`. There is no
+    ``None`` state — the generation contract is two-state (KTD9).
+    """
+
+    def __init__(self, backends: list[GenerationProvider]) -> None:
+        self._backends = backends
+
+    def answer(self, prompt: str, evidence: Evidence) -> GenerationResult:
+        # Empty chain → nothing on-device-class is available.
+        for backend in self._backends:
+            result = backend.answer(prompt, evidence)
+            # Only a non-empty str is a real answer that stops the chain. A
+            # backend that returns PROVIDER_UNAVAILABLE — or (defensively) None,
+            # "", whitespace, or any non-str from a future/buggy backend — is
+            # treated as "could not run": cascade to the next rather than leak a
+            # blank/invalid answer or suppress a healthy downstream backend (KTD9).
+            if isinstance(result, str) and result.strip():
+                return result
+        return PROVIDER_UNAVAILABLE
+
+
+class UnavailableGenerationProvider:
+    """A generation provider that always reports unavailable (SCR-243, U6).
+
+    The answer-path analogue of :class:`UnavailableProvider` — used by the
+    answer router for a configuration with no on-device-class generation
+    backend (a REMOTE BYO endpoint, or a cloud-only active provider), so the
+    dispatcher falls through to the consented-cloud step rather than an
+    on-device answer.
+    """
+
+    def answer(self, prompt: str, evidence: Evidence) -> ProviderUnavailable:
         return PROVIDER_UNAVAILABLE

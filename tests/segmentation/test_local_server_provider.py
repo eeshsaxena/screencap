@@ -200,3 +200,65 @@ class TestDefaultRawCall:
         monkeypatch.setitem(sys.modules, "requests", fake)
 
         assert LocalServerProvider._default_raw_call("http://127.0.0.1:1234", "p") is None
+
+
+# ===========================================================================
+# Free-form answer path (SCR-243, U9)
+# ===========================================================================
+
+from screencap.segmentation.generation import Evidence  # noqa: E402
+
+
+def _ev(text: str = "you edited main.py", stripped: bool = True) -> Evidence:
+    return Evidence(text=text, stripped=stripped)
+
+
+class TestAnswer:
+    def test_local_endpoint_returns_sanitized_text(self):
+        p = LocalServerProvider(
+            endpoint="http://127.0.0.1:1234",
+            answer_raw_call=lambda ep, prompt: "You edited <b>main.py</b>.",
+        )
+        out = p.answer("what did I do?", _ev())
+        assert "<" not in out and ">" not in out  # markup neutralized (KTD10)
+        assert "main.py" in out
+
+    @pytest.mark.privacy
+    def test_unmarked_evidence_refused_without_call(self):
+        calls: list = []
+        p = LocalServerProvider(
+            endpoint="http://127.0.0.1:1234",
+            answer_raw_call=lambda ep, prompt: (calls.append(prompt), "x")[1],
+        )
+        assert p.answer("q", _ev(stripped=False)) is PROVIDER_UNAVAILABLE
+        assert calls == []
+
+    @pytest.mark.privacy
+    def test_remote_endpoint_never_egresses(self):
+        # A REMOTE endpoint must fail closed at send time — evidence never leaves box.
+        calls: list = []
+        p = LocalServerProvider(
+            endpoint="http://evil.example.com:1234",
+            answer_raw_call=lambda ep, prompt: (calls.append(prompt), "x")[1],
+        )
+        assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE
+        assert calls == []
+
+    def test_no_endpoint_is_unavailable(self, monkeypatch):
+        from screencap import config
+
+        monkeypatch.setattr(config, "get_local_server_endpoint", lambda: None)
+        p = LocalServerProvider(endpoint=None, answer_raw_call=lambda ep, prompt: "x")
+        assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_none_from_raw_call_is_unavailable(self):
+        p = LocalServerProvider(
+            endpoint="http://127.0.0.1:1234", answer_raw_call=lambda ep, prompt: None
+        )
+        assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE
+
+    def test_empty_answer_is_unavailable(self):
+        p = LocalServerProvider(
+            endpoint="http://127.0.0.1:1234", answer_raw_call=lambda ep, prompt: "   "
+        )
+        assert p.answer("q", _ev()) is PROVIDER_UNAVAILABLE

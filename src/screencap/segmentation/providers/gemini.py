@@ -18,6 +18,12 @@ import logging
 import os
 from typing import Callable
 
+from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.schema import _RESPONSE_SCHEMA
 from screencap.segmentation.validate import validate_llm_tasks
@@ -91,11 +97,11 @@ class GeminiProvider:
     def __init__(
         self,
         raw_call: Callable[[str], dict | None] | None = None,
-        raw_answer: Callable[[str], str | None] | None = None,
+        answer_raw_call: Callable[[str], str | None] | None = None,
     ) -> None:
         self._raw_call = raw_call if raw_call is not None else self._call_gemini
-        self._raw_answer = (
-            raw_answer if raw_answer is not None else self._answer_gemini
+        self._answer_raw_call = (
+            answer_raw_call if answer_raw_call is not None else self._answer_gemini
         )
 
     def segment(self, activity_summary: dict) -> dict | None:
@@ -124,44 +130,6 @@ class GeminiProvider:
         except Exception:
             log.warning("Gemini output failed validation", exc_info=True)
             return None
-
-    def answer(self, prompt: str, evidence: dict) -> str | ProviderUnavailable:
-        """Generate a recall answer from ``prompt`` + a stripped ``evidence`` bundle.
-
-        Net-new generation seam (SCR-243). Unlike :meth:`segment`, this is a
-        plain text-generation call — the guardrail ``prompt`` (built upstream in
-        U4, with the ``evidence`` delimited as untrusted data) goes in, prose
-        comes out, with **no** task response-schema. Returns the model's text on
-        success, or :data:`~screencap.segmentation.provider.PROVIDER_UNAVAILABLE`
-        when the backend could not run (no key, SDK missing, API failure). Never
-        raises for an ordinary model/API error — the cloud contract mirrors
-        ``segment``'s "a cloud failure is not an exception".
-
-        ``evidence`` is accepted for interface parity (U4 folds it into the
-        prompt) and to keep the seam uniform across backends; this backend does
-        not re-read it for content, but it DOES enforce the fail-closed
-        ``stripped=True`` gate below.
-        """
-        # Fail-closed privacy gate (defense-in-depth): this is the ONLY real
-        # cloud-egressing backend, so an evidence bundle not marked stripped=True
-        # (i.e. not run through U3's ALLOW-only terminal strip) must never reach
-        # the cloud model. Refuse WITHOUT calling out — the same posture
-        # downloaded/ondevice/local_server all carry.
-        if evidence.get("stripped") is not True:
-            log.warning(
-                "GeminiProvider.answer refused evidence not marked "
-                "stripped=True (fail-closed); returning unavailable."
-            )
-            return PROVIDER_UNAVAILABLE
-        try:
-            text = self._raw_answer(prompt)
-        except Exception:
-            # An ordinary model/API error must never escape as an exception.
-            log.warning("Gemini answer call raised; unavailable", exc_info=True)
-            return PROVIDER_UNAVAILABLE
-        if text is None:
-            return PROVIDER_UNAVAILABLE
-        return text
 
     def _call_gemini(self, prompt: str) -> dict | None:
         """Call Gemini Flash via the Google AI API. Returns parsed JSON or None.
@@ -200,16 +168,39 @@ class GeminiProvider:
             log.warning("Gemini call failed", exc_info=True)
             return None
 
-    def _answer_gemini(self, prompt: str) -> str | None:
-        """Live text-generation call for recall-answering. Returns text or None.
+    # -- Free-form generation path (SCR-243, U5) ---------------------------
 
-        Mirrors :meth:`_call_gemini` (lazy ``google.genai`` import → cloud-free
-        at import time; every failure collapses to ``None`` so the caller maps it
-        to the unavailable sentinel), but WITHOUT a ``response_schema`` — a recall
-        answer is free prose, not the task JSON ``segment`` emits.
+    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+        """Answer ``prompt`` grounded in ``evidence`` via a free-form Gemini call.
+
+        Unlike :meth:`segment`, this uses NO structured response schema. Returns
+        the sanitized answer string, or :data:`PROVIDER_UNAVAILABLE` when the
+        model is unavailable/fails or produces empty output. Never raises.
+        """
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10). The cloud path is the only off-box
+        # egress, so it self-caps here rather than trusting the dispatcher.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("GeminiProvider.answer refused the request (gate); unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        raw = self._answer_raw_call(build_answer_prompt(prompt, evidence))
+        if raw is None:
+            return PROVIDER_UNAVAILABLE
+        cleaned = sanitize_answer(raw)
+        if not cleaned.strip():
+            return PROVIDER_UNAVAILABLE
+        return cleaned
+
+    def _answer_gemini(self, prompt: str) -> str | None:
+        """Free-form Gemini call (no response schema). Returns text or None.
+
+        ``google.genai`` is imported lazily here so this module stays cloud-free
+        at import time.
         """
         try:
             from google import genai
+            from google.genai import types
 
             api_key = os.environ.get("GOOGLE_GENAI_API_KEY")
             if not api_key:
@@ -220,9 +211,9 @@ class GeminiProvider:
             response = client.models.generate_content(
                 model=_MODEL,
                 contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2),
             )
             return response.text
-
         except ImportError:
             log.info("google-genai not installed, skipping Gemini answer")
             return None

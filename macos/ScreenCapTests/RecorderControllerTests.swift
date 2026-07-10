@@ -497,6 +497,31 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(fake.restoreMainWindowCount, 0, "a clean in-app Stop must not pull ScreenCap to the foreground")
     }
 
+    /// An in-app Stop whose background finalization outlasts the 60s wait
+    /// (`.timedOut`) — routine for a long recording whose chunk scrub + upload
+    /// drain takes a while — must NOT leave a stale terminal error banner.
+    /// Finalization is a non-terminal, self-resolving condition; the daemon's
+    /// later `recording_finalized` refreshes the Library so the per-recording
+    /// status chip reflects it, but nothing clears `lastError`. So the pre-fix
+    /// `.timedOut` branch's "Stop is still finalizing in the background." write
+    /// sat stale on the red error surface until the next recording start.
+    func testInAppStopTimeoutDoesNotSurfaceStaleFinalizingBanner() async {
+        let recorder = RecorderController(
+            stopPolicy: StubbedStopPolicyCoordinator(outcome: .timedOut)
+        )
+        recorder._testSetTransport(.cliFallback)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+
+        recorder.stop()
+
+        await waitUntil { recorder.state == .idle }
+
+        XCTAssertNil(
+            recorder.lastError,
+            "an in-app Stop that finalizes in the background must not leave a stale terminal error banner"
+        )
+    }
+
     /// If the in-app Stop signal never dispatches, the recording is still live,
     /// so the rollback must undo the synchronous pill hide: roll back to
     /// `.recording` AND re-float the pill (`.showHUD`). Guards the

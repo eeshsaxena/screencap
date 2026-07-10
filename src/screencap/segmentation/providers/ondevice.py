@@ -59,6 +59,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation_finish import evidence_gate_ok, sanitize_answer
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.validate import validate_llm_tasks
 
@@ -71,6 +73,11 @@ _HELPER_BASENAME = "IntelligenceHelper"
 # bounded; a hang past this maps to unavailable so terminal_stage never blocks
 # on segmentation. Overridable via env for the (fast) fake-helper tests.
 _DEFAULT_TIMEOUT_S = 120.0
+
+# Response size cap for the free-form answer path (KTD10 / security review).
+# The request-side caps + fail-closed gate are shared via
+# ``generation_finish.evidence_gate_ok``; this bounds the helper's stdout result.
+_MAX_ANSWER_STDOUT_BYTES = 1 * 1024 * 1024
 
 
 def _helper_timeout_s() -> float:
@@ -226,37 +233,6 @@ class OnDeviceProvider:
             log.warning("On-device helper output failed validation", exc_info=True)
             return None
 
-    def answer(self, prompt: str, evidence: dict) -> str | ProviderUnavailable:
-        """Recall-answer via the on-device model — unavailable until SCR-243 lands.
-
-        The Apple Foundation Models Swift-helper exposes only the segmentation
-        (task-JSON) path today; the ``prompt→answer`` generation path does NOT
-        exist yet. Until it lands, this reports unavailable so U1's degradation
-        ladder degrades to a downloaded/consented-cloud backend rather than
-        raising — the same tri-state posture ``segment`` uses.
-
-        The fail-closed ``stripped`` gate is kept consistent with ``segment``:
-        an evidence bundle not marked ``stripped=True`` is refused first, so the
-        posture is already correct when SCR-243 wires in a real helper call here.
-
-        # TODO(SCR-243): on-device generation path — replace the unconditional
-        # unavailable return with a Swift-helper generation call (write the
-        # guardrail prompt + delimited evidence to the helper, read the answer
-        # envelope back), reusing the discovery/timeout/scrubbed-env machinery
-        # ``segment`` already has above.
-        """
-        if evidence.get("stripped") is not True:
-            log.warning(
-                "OnDeviceProvider.answer refused evidence not marked "
-                "stripped=True (fail-closed); returning unavailable."
-            )
-            return PROVIDER_UNAVAILABLE
-        log.info(
-            "On-device generation path not available (SCR-243 not landed); "
-            "answer reports unavailable."
-        )
-        return PROVIDER_UNAVAILABLE
-
     @staticmethod
     def _parse_envelope(stdout: str) -> dict | None | ProviderUnavailable:
         """Decode the helper's stdout envelope.
@@ -300,4 +276,97 @@ class OnDeviceProvider:
             return PROVIDER_UNAVAILABLE
 
         log.warning("On-device helper envelope had unknown status %r", status)
+        return PROVIDER_UNAVAILABLE
+
+    # -- Free-form generation path (SCR-243, U4) ---------------------------
+
+    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+        """Answer ``prompt`` grounded in ``evidence`` on-device via the Swift helper.
+
+        See :mod:`screencap.segmentation.generation` for the two-state
+        (``str`` | :data:`PROVIDER_UNAVAILABLE`) return. Never raises for an
+        ordinary error. The grounding instructions live in the helper (KTD3);
+        this side passes the raw prompt + stripped evidence text.
+        """
+        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
+        # within the size caps (KTD10). No helper spawn on refusal.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("OnDeviceProvider.answer refused the request (gate); unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        helper = _resolve_helper()
+        if helper is None:
+            log.info("On-device helper not found (CLI-only install?); unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        payload = json.dumps(
+            {"task": "answer", "prompt": prompt, "evidence": evidence.text}
+        )
+
+        try:
+            proc = subprocess.run(
+                [str(helper)],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=_helper_timeout_s(),
+                env=_scrubbed_env(),
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("On-device answer helper timed out; unavailable")
+            return PROVIDER_UNAVAILABLE
+        except OSError:
+            log.warning("On-device answer helper could not be spawned; unavailable",
+                        exc_info=True)
+            return PROVIDER_UNAVAILABLE
+
+        if proc.returncode != 0:
+            log.warning(
+                "On-device answer helper exited %d; unavailable. stderr: %s",
+                proc.returncode, (proc.stderr or "").strip()[:500],
+            )
+            return PROVIDER_UNAVAILABLE
+
+        if len(proc.stdout or "") > _MAX_ANSWER_STDOUT_BYTES:
+            log.warning("On-device answer stdout exceeds the size cap; unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        text = self._parse_text_envelope(proc.stdout)
+        if text is PROVIDER_UNAVAILABLE:
+            return PROVIDER_UNAVAILABLE
+
+        cleaned = sanitize_answer(text)  # type: ignore[arg-type]
+        if not cleaned.strip():
+            # Empty/whitespace answer is indistinguishable from "no answer" —
+            # treat it as unavailable rather than returning a blank string (KTD9).
+            return PROVIDER_UNAVAILABLE
+        return cleaned
+
+    @staticmethod
+    def _parse_text_envelope(stdout: str) -> str | ProviderUnavailable:
+        """Decode the helper's stdout envelope for the answer path.
+
+        ``{"status":"ok","result":"<text>"}`` → the raw ``result`` string.
+        ``{"status":"unavailable",...}`` or a non-string ``result`` or any
+        unparseable output → :data:`PROVIDER_UNAVAILABLE`.
+        """
+        raw = (stdout or "").strip()
+        if not raw:
+            log.warning("On-device answer helper produced empty stdout; unavailable")
+            return PROVIDER_UNAVAILABLE
+        try:
+            envelope = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            log.warning("On-device answer helper stdout was not JSON; unavailable")
+            return PROVIDER_UNAVAILABLE
+        if not isinstance(envelope, dict):
+            return PROVIDER_UNAVAILABLE
+        if envelope.get("status") == "ok":
+            result = envelope.get("result")
+            if isinstance(result, str):
+                return result
+            log.warning("On-device answer 'ok' envelope had no string result")
+            return PROVIDER_UNAVAILABLE
+        log.info("On-device answer helper reported unavailable: %s",
+                 envelope.get("reason", ""))
         return PROVIDER_UNAVAILABLE

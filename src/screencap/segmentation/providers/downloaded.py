@@ -38,6 +38,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation_finish import (
+    build_answer_prompt,
+    evidence_gate_ok,
+    sanitize_answer,
+)
 from screencap.segmentation.local_finish import build_local_prompt, finalize_local_result
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
@@ -177,41 +183,6 @@ class DownloadedProvider:
         # (KTD12) → confidence-gate (KTD9), shared with the BYO backend.
         return finalize_local_result(raw_result, activity_summary)
 
-    def answer(self, prompt: str, evidence: dict) -> str | ProviderUnavailable:
-        """Recall-answer via the hardened downloaded-model worker (SCR-243 path).
-
-        Net-new generation seam. Mirrors :meth:`segment`'s posture — the same
-        fail-closed ``stripped`` gate (no worker spawn on unmarked input), the
-        same model-resolution / stdin-cap / single-flight + RAM guard — but the
-        worker runs in an ``answer`` mode (prompt in → prose out) and the
-        envelope carries ``answer`` text, not tasks. Returns the model's text on
-        success, or :data:`~screencap.segmentation.provider.PROVIDER_UNAVAILABLE`
-        when the backend could not run. Never raises for an ordinary failure.
-        """
-        if evidence.get("stripped") is not True:
-            log.warning(
-                "DownloadedProvider.answer refused evidence not marked "
-                "stripped=True (fail-closed); returning unavailable."
-            )
-            return PROVIDER_UNAVAILABLE
-
-        model_path = _resolve_model_path()
-        if model_path is None:
-            log.info("No downloaded model installed; answer unavailable")
-            return PROVIDER_UNAVAILABLE
-
-        payload = json.dumps(
-            {"mode": "answer", "prompt": prompt, "model_path": model_path}
-        )
-        if len(payload.encode("utf-8")) > _MAX_STDIN_BYTES:
-            log.warning("Downloaded-model answer request exceeds the stdin cap; unavailable")
-            return PROVIDER_UNAVAILABLE
-
-        stdout = self._run_worker_raw(payload)
-        if stdout is PROVIDER_UNAVAILABLE:
-            return PROVIDER_UNAVAILABLE
-        return self._parse_answer_envelope(stdout)
-
     def _run_worker(self, payload: str) -> dict | None | ProviderUnavailable:
         """Spawn the worker and return its raw ``result`` dict, ``None``, or the sentinel.
 
@@ -230,39 +201,9 @@ class DownloadedProvider:
                 return PROVIDER_UNAVAILABLE
             if not has_ram_headroom(_installed_model_size()):
                 return PROVIDER_UNAVAILABLE
-            stdout = self._spawn_worker_raw(payload)
-            if stdout is PROVIDER_UNAVAILABLE:
-                return PROVIDER_UNAVAILABLE
-            return self._parse_envelope(stdout)
+            return self._spawn_worker(payload)
 
-    def _run_worker_raw(self, payload: str) -> str | ProviderUnavailable:
-        """Guarded raw worker spawn for the answer path — returns stdout or sentinel.
-
-        Same single-flight + RAM-headroom guard as :meth:`_run_worker`, but hands
-        back the worker's raw stdout so the answer path parses its own
-        (``{status, answer}``) envelope rather than the tasks (``{status, result}``)
-        one — the guard/spawn machinery is shared, only the envelope shape differs.
-        """
-        from screencap.segmentation.inference_guard import (
-            has_ram_headroom,
-            inference_slot,
-        )
-
-        with inference_slot() as acquired:
-            if not acquired:
-                log.info("Another inference worker is in flight; skipping (unavailable)")
-                return PROVIDER_UNAVAILABLE
-            if not has_ram_headroom(_installed_model_size()):
-                return PROVIDER_UNAVAILABLE
-            return self._spawn_worker_raw(payload)
-
-    def _spawn_worker_raw(self, payload: str) -> str | ProviderUnavailable:
-        """Spawn the worker and return its raw stdout, or the unavailable sentinel.
-
-        The shared subprocess spawn (nice, allowlist env, timeout, size caps,
-        stderr-not-logged) for BOTH the segment and answer paths — each parses
-        the returned stdout into its own envelope shape.
-        """
+    def _spawn_worker(self, payload: str) -> dict | None | ProviderUnavailable:
         cmd = _worker_command()
 
         def _preexec() -> None:  # pragma: no cover - child-side, POSIX only
@@ -297,37 +238,7 @@ class DownloadedProvider:
             log.warning("Downloaded-model worker output exceeds the stdout cap; unavailable")
             return PROVIDER_UNAVAILABLE
 
-        return proc.stdout
-
-    @staticmethod
-    def _parse_answer_envelope(stdout: str) -> str | ProviderUnavailable:
-        """Decode the worker's ``{status, answer}`` envelope into the answer text.
-
-        Returns the ``answer`` string on ``status == "ok"`` (a recall answer is
-        free prose, not tasks), or :data:`PROVIDER_UNAVAILABLE` on
-        ``status == "unavailable"`` or any unparseable/garbage output.
-        """
-        text = (stdout or "").strip()
-        if not text:
-            log.warning("Downloaded-model answer worker produced empty stdout; unavailable")
-            return PROVIDER_UNAVAILABLE
-        try:
-            envelope = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            log.warning("Downloaded-model answer worker stdout was not JSON; unavailable")
-            return PROVIDER_UNAVAILABLE
-        if not isinstance(envelope, dict):
-            return PROVIDER_UNAVAILABLE
-
-        status = envelope.get("status")
-        if status == "ok":
-            answer = envelope.get("answer")
-            return answer if isinstance(answer, str) else PROVIDER_UNAVAILABLE
-        if status == "unavailable":
-            log.info("Downloaded-model answer worker unavailable: %s",
-                     envelope.get("reason", ""))
-            return PROVIDER_UNAVAILABLE
-        return PROVIDER_UNAVAILABLE
+        return self._parse_envelope(proc.stdout)
 
     @staticmethod
     def _parse_envelope(stdout: str) -> dict | None | ProviderUnavailable:
@@ -356,4 +267,118 @@ class DownloadedProvider:
         if status == "unavailable":
             log.info("Downloaded-model worker unavailable: %s", envelope.get("reason", ""))
             return PROVIDER_UNAVAILABLE
+        return PROVIDER_UNAVAILABLE
+
+    # -- Free-form generation path (SCR-243, U10) --------------------------
+
+    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+        """Answer ``prompt`` grounded in ``evidence`` via the downloaded model's
+        free-form text mode.
+
+        Reuses the hardened subprocess machinery (allowlist env, single-flight,
+        RAM precheck, ``nice``, size caps) but a **grammar-free** worker mode
+        (``mode="generate_text"``, KTD8) that returns raw text — not the JSON
+        tasks envelope. Returns the sanitized answer or
+        :data:`PROVIDER_UNAVAILABLE`. Never raises.
+        """
+        # Single fail-closed gate: stripped marker (R10/R11), str text/prompt
+        # (R12), within the size caps (KTD10). No worker spawn on refusal.
+        if not evidence_gate_ok(prompt, evidence):
+            log.warning("DownloadedProvider.answer refused the request (gate); unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        model_path = _resolve_model_path()
+        if model_path is None:
+            log.info("No downloaded model installed; answer unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        payload = json.dumps(
+            {
+                "mode": "generate_text",
+                "prompt": build_answer_prompt(prompt, evidence),
+                "model_path": model_path,
+            }
+        )
+        if len(payload.encode("utf-8")) > _MAX_STDIN_BYTES:
+            log.warning("Downloaded-model answer request exceeds the stdin cap; unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        raw = self._run_answer_worker(payload)
+        if raw is PROVIDER_UNAVAILABLE:
+            return PROVIDER_UNAVAILABLE
+        cleaned = sanitize_answer(raw)  # type: ignore[arg-type]
+        if not cleaned.strip():
+            return PROVIDER_UNAVAILABLE
+        return cleaned
+
+    def _run_answer_worker(self, payload: str) -> str | ProviderUnavailable:
+        """Single-flight + RAM-headroom guarded spawn for the answer path."""
+        from screencap.segmentation.inference_guard import (
+            has_ram_headroom,
+            inference_slot,
+        )
+
+        with inference_slot() as acquired:
+            if not acquired:
+                log.info("Another inference worker is in flight; skipping (unavailable)")
+                return PROVIDER_UNAVAILABLE
+            if not has_ram_headroom(_installed_model_size()):
+                return PROVIDER_UNAVAILABLE
+            return self._spawn_answer_worker(payload)
+
+    def _spawn_answer_worker(self, payload: str) -> str | ProviderUnavailable:
+        cmd = _worker_command()
+
+        def _preexec() -> None:  # pragma: no cover - child-side, POSIX only
+            try:
+                os.nice(_NICE_INCREMENT)
+            except OSError:
+                pass
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=_worker_timeout_s(),
+                env=_allowlist_env(),
+                preexec_fn=_preexec if os.name == "posix" else None,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Downloaded-model answer worker timed out; unavailable")
+            return PROVIDER_UNAVAILABLE
+        except OSError:
+            log.warning("Downloaded-model answer worker could not be spawned; unavailable")
+            return PROVIDER_UNAVAILABLE
+
+        if proc.returncode != 0:
+            log.warning("Downloaded-model answer worker exited %d; unavailable",
+                        proc.returncode)
+            return PROVIDER_UNAVAILABLE
+        if len(proc.stdout or "") > _MAX_STDOUT_BYTES:
+            log.warning("Downloaded-model answer output exceeds the stdout cap; unavailable")
+            return PROVIDER_UNAVAILABLE
+        return self._parse_text_envelope(proc.stdout)
+
+    @staticmethod
+    def _parse_text_envelope(stdout: str) -> str | ProviderUnavailable:
+        """Decode the worker's ``{status, result}`` envelope into the raw answer string.
+
+        Returns the ``result`` **string** on ``status == "ok"``, or
+        :data:`PROVIDER_UNAVAILABLE` on ``unavailable`` / non-string result /
+        any unparseable output.
+        """
+        text = (stdout or "").strip()
+        if not text:
+            return PROVIDER_UNAVAILABLE
+        try:
+            envelope = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return PROVIDER_UNAVAILABLE
+        if not isinstance(envelope, dict):
+            return PROVIDER_UNAVAILABLE
+        if envelope.get("status") == "ok":
+            result = envelope.get("result")
+            return result if isinstance(result, str) else PROVIDER_UNAVAILABLE
         return PROVIDER_UNAVAILABLE

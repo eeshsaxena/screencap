@@ -118,9 +118,18 @@ def _extract_json(text: str | None) -> dict | None:
 
 @runtime_checkable
 class RuntimeAdapter(Protocol):
-    """One local-inference backend. ``generate`` never raises for a backend error."""
+    """One local-inference backend. Neither method raises for a backend error.
+
+    ``generate`` is JSON-bound (segmentation): it returns the parsed tasks dict
+    or ``None``. ``generate_text`` is the free-form recall-answer path (SCR-243,
+    KTD8): it returns raw model text or ``None`` — no JSON grammar, no parse,
+    no retry.
+    """
 
     def generate(self, model_path: str, prompt: str) -> dict | None:
+        ...
+
+    def generate_text(self, model_path: str, prompt: str) -> str | None:
         ...
 
 
@@ -186,6 +195,19 @@ class MlxRuntime:
             log.info("mlx output did not parse as JSON (attempt %d)", attempt + 1)
         return None
 
+    def generate_text(self, model_path: str, prompt: str) -> str | None:
+        """Free-form generation (SCR-243, KTD8): raw model text, no JSON parse/retry.
+
+        Reuses the same load/gen seams as :meth:`generate`, but returns the raw
+        string (or ``None`` on load/generation failure or empty output) — the
+        JSON grammar/parse/retry loop is segmentation-only.
+        """
+        handle = self._load(model_path)
+        if handle is None:
+            return None
+        text = self._gen(handle, prompt)
+        return text if isinstance(text, str) and text.strip() else None
+
     @staticmethod
     def _load_default(model_path: str) -> object | None:
         """Load the model once. Not exercised in CI (needs the lib + a model)."""
@@ -224,15 +246,31 @@ class LlamaCppRuntime:
     """
 
     def __init__(
-        self, raw_generate: Callable[[str, str], str | None] | None = None
+        self,
+        raw_generate: Callable[[str, str], str | None] | None = None,
+        raw_text_generate: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._raw = raw_generate if raw_generate is not None else self._raw_default
+        self._raw_text = (
+            raw_text_generate if raw_text_generate is not None
+            else self._raw_text_default
+        )
 
     def generate(self, model_path: str, prompt: str) -> dict | None:
         text = self._raw(model_path, prompt)
         if text is None:
             return None
         return _extract_json(text)
+
+    def generate_text(self, model_path: str, prompt: str) -> str | None:
+        """Free-form generation (SCR-243, KTD8): a grammar-free completion.
+
+        Distinct from :meth:`generate`, which forces the ``_RESPONSE_SCHEMA``
+        JSON grammar — free-form answers must not be schema-constrained. Returns
+        raw text or ``None``.
+        """
+        text = self._raw_text(model_path, prompt)
+        return text if isinstance(text, str) and text.strip() else None
 
     @staticmethod
     def _raw_default(model_path: str, prompt: str) -> str | None:
@@ -253,4 +291,29 @@ class LlamaCppRuntime:
             return resp["choices"][0]["message"]["content"]
         except Exception:
             log.warning("llama-cpp-python generation failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _raw_text_default(model_path: str, prompt: str) -> str | None:
+        """Live grammar-free ``llama-cpp-python`` completion (no JSON schema).
+
+        The free-form recall-answer analogue of :meth:`_raw_default` — same load,
+        but no ``response_format`` grammar. Not exercised in CI (needs the lib +
+        a model).
+        """
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            log.info("llama-cpp-python not installed; runtime unavailable")
+            return None
+        try:
+            llm = Llama(model_path=model_path, n_ctx=_LLAMACPP_N_CTX, verbose=False)
+            resp = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=_MAX_OUTPUT_TOKENS,
+            )
+            return resp["choices"][0]["message"]["content"]
+        except Exception:
+            log.warning("llama-cpp-python text generation failed", exc_info=True)
             return None
