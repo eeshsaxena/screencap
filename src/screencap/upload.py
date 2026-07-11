@@ -98,18 +98,24 @@ def _get_portal_url() -> str:
     return os.environ.get("SCREENCAP_PORTAL_URL", DEFAULT_PORTAL_URL)
 
 
-class PortalError(RuntimeError):
-    """Portal-session request failure carrying a machine-readable ``code``.
+class BillingError(RuntimeError):
+    """Billing request failure (checkout or portal) carrying a machine-readable
+    ``code``.
 
     ``code`` is the cross-boundary contract the CLI's error envelope emits and
     the Swift error mapper keys on (never message text, which drifts silently
     past fakes): ``no_subscription`` (backend's fail-closed nothing-to-manage
-    4xx), ``not_signed_in``, ``network``, or ``unknown``.
+    4xx), ``not_signed_in``, ``network`` (retryable), or ``unknown``.
     """
 
     def __init__(self, message: str, code: str):
         super().__init__(message)
         self.code = code
+
+
+#: Backward-compat alias — the portal chain (and its tests) predate the shared
+#: name; ``except PortalError`` and isinstance checks keep working unchanged.
+PortalError = BillingError
 
 
 def request_checkout_url(tier: str) -> str:
@@ -120,8 +126,11 @@ def request_checkout_url(tier: str) -> str:
     webhook remains the sole entitlement authority, re-deriving tier from the
     paid price (U2/U3). Mirrors :func:`request_signed_urls`'s auth/error handling:
     ``NotSignedIn`` -> a clear "sign in" message, a transient ``AuthError`` ->
-    retryable message. The uid is derived server-side from the token, never sent
-    by the client.
+    retryable message. Every failure is a :class:`BillingError` carrying the
+    same machine-readable ``code`` contract as :func:`request_portal_url`
+    (``not_signed_in`` / ``network`` / ``unknown``) — message strings are
+    unchanged (they are CLI-facing copy pinned by macOS tests). The uid is
+    derived server-side from the token, never sent by the client.
     """
     from screencap import auth
 
@@ -129,13 +138,17 @@ def request_checkout_url(tier: str) -> str:
     try:
         resp = auth.authed_post(requests.post, url, json={"tier": tier}, timeout=30)
     except auth.NotSignedIn:
-        raise RuntimeError("Sign in to upgrade: run `screencap login`.")
+        raise BillingError("Sign in to upgrade: run `screencap login`.", "not_signed_in")
     except auth.AuthError as e:
-        raise RuntimeError(f"Cloud auth temporarily unavailable; try again: {e}")
+        raise BillingError(
+            f"Cloud auth temporarily unavailable; try again: {e}", "network"
+        )
     except requests.ConnectionError:
-        raise RuntimeError("Checkout service unavailable. Check your internet connection.")
+        raise BillingError(
+            "Checkout service unavailable. Check your internet connection.", "network"
+        )
     except requests.Timeout:
-        raise RuntimeError("Checkout service timed out. Try again later.")
+        raise BillingError("Checkout service timed out. Try again later.", "network")
 
     if resp.status_code != 200:
         detail = ""
@@ -143,11 +156,11 @@ def request_checkout_url(tier: str) -> str:
             detail = resp.json().get("error", resp.text)
         except Exception:
             detail = resp.text
-        raise RuntimeError(f"Checkout service error: {detail}")
+        raise BillingError(f"Checkout service error: {detail}", "unknown")
 
     checkout_url = resp.json().get("url")
     if not checkout_url:
-        raise RuntimeError("Checkout service returned no URL.")
+        raise BillingError("Checkout service returned no URL.", "unknown")
     return checkout_url
 
 
@@ -200,6 +213,14 @@ def request_portal_url() -> str:
                 "no_subscription",
             )
         detail = body.get("error") or resp.text
+        # A 5xx (the CF's portal_unavailable 502 included) is a transient
+        # server-side failure -> retryable "network" so the app renders retry
+        # copy. 4xx rejections (e.g. invalid_uid) stay non-retryable "unknown".
+        if resp.status_code >= 500 or "portal_unavailable" in (
+            body.get("code"),
+            body.get("error"),
+        ):
+            raise PortalError(f"Subscription service error: {detail}", "network")
         raise PortalError(f"Subscription service error: {detail}", "unknown")
 
     portal_url = resp.json().get("url")

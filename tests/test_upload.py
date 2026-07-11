@@ -457,9 +457,146 @@ def test_checkout_url_cmd_requires_and_forwards_tier():
 
 
 # ---------------------------------------------------------------------------
+# Checkout coded errors — the checkout chain carries the same machine-readable
+# `code` contract as portal, so Swift's error mapper never falls back to the
+# generic unknown copy. Marked privacy (KTD-8): CI runs only the privacy lane.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_request_checkout_url_not_signed_in_coded_same_message(monkeypatch):
+    """NotSignedIn -> BillingError code "not_signed_in" with the EXACT
+    pre-existing CLI-facing message (pinned equality — proves no copy drift)."""
+    from screencap import auth
+    from screencap.upload import BillingError, request_checkout_url
+
+    def _raise(*args, **kwargs):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.authed_post", _raise)
+
+    with pytest.raises(BillingError) as exc_info:
+        request_checkout_url("cloud")
+    assert exc_info.value.code == "not_signed_in"
+    assert str(exc_info.value) == "Sign in to upgrade: run `screencap login`."
+
+
+@pytest.mark.privacy
+def test_request_checkout_url_connection_error_and_timeout_network_code():
+    """ConnectionError / Timeout -> BillingError code "network" (retryable)."""
+    import requests as req
+
+    from screencap.upload import BillingError, request_checkout_url
+
+    with mock.patch("screencap.upload.requests.post", side_effect=req.ConnectionError):
+        with pytest.raises(BillingError, match="unavailable") as exc_info:
+            request_checkout_url("local")
+    assert exc_info.value.code == "network"
+
+    with mock.patch("screencap.upload.requests.post", side_effect=req.Timeout):
+        with pytest.raises(BillingError, match="timed out") as exc_info:
+            request_checkout_url("local")
+    assert exc_info.value.code == "network"
+
+
+@pytest.mark.privacy
+def test_checkout_url_cmd_error_envelope_carries_not_signed_in_code(monkeypatch):
+    """CLI end-to-end: not signed in -> exit 1 envelope with code
+    "not_signed_in" — the contract Swift's AccountErrorCopy maps on."""
+    from screencap import auth
+
+    def _raise(*args, **kwargs):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.authed_post", _raise)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["checkout-url", "--tier", "cloud", "--json"])
+
+    assert result.exit_code == 1
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert "schema_version" in envelope
+    assert envelope["code"] == "not_signed_in"
+
+
+@pytest.mark.privacy
+def test_checkout_url_cmd_error_envelope_carries_network_code_on_timeout():
+    """CLI end-to-end: request timeout -> exit 1 envelope with code "network"
+    so the app renders retry copy instead of the generic unknown copy."""
+    import requests as req
+
+    runner = CliRunner()
+    with mock.patch("screencap.upload.requests.post", side_effect=req.Timeout):
+        result = runner.invoke(cli, ["checkout-url", "--tier", "local", "--json"])
+
+    assert result.exit_code == 1
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert "timed out" in envelope["error"]
+    assert envelope["code"] == "network"
+
+
+@pytest.mark.privacy
+def test_portal_error_is_billing_error_alias():
+    """Backward compat: PortalError remains importable and IS BillingError, so
+    every existing `except PortalError` / isinstance check still holds."""
+    from screencap.upload import BillingError, PortalError
+
+    assert PortalError is BillingError
+    assert issubclass(BillingError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
 # Portal (manage-subscription) chain — U2. All marked privacy (KTD-8): CI runs
 # only the privacy lane, and these are Vision-free.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_request_portal_url_5xx_portal_unavailable_maps_to_network():
+    """The CF's portal_unavailable 502 (and any 5xx) is a retryable server-side
+    failure -> code "network", so Swift renders retry copy, not unknown."""
+    from screencap.upload import PortalError, request_portal_url
+
+    # Structured portal_unavailable body on a 502.
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 502
+    mock_resp.json.return_value = {"error": "portal_unavailable", "code": "portal_unavailable"}
+    mock_resp.text = '{"error": "portal_unavailable"}'
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp):
+        with pytest.raises(PortalError) as exc_info:
+            request_portal_url()
+    assert exc_info.value.code == "network"
+
+    # Bare 5xx with an unparseable body is still retryable.
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 503
+    mock_resp.json.side_effect = ValueError("not json")
+    mock_resp.text = "Service Unavailable"
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp):
+        with pytest.raises(PortalError) as exc_info:
+            request_portal_url()
+    assert exc_info.value.code == "network"
+
+
+@pytest.mark.privacy
+def test_request_portal_url_400_invalid_uid_stays_unknown():
+    """A 4xx server-side rejection (invalid_uid) is NOT retryable -> code
+    stays "unknown" (only the nothing-to-manage 4xx gets no_subscription)."""
+    from screencap.upload import PortalError, request_portal_url
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 400
+    mock_resp.json.return_value = {"error": "invalid_uid", "code": "invalid_uid"}
+    mock_resp.text = '{"error": "invalid_uid"}'
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp):
+        with pytest.raises(PortalError) as exc_info:
+            request_portal_url()
+    assert exc_info.value.code == "unknown"
 
 
 @pytest.mark.privacy
