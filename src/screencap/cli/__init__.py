@@ -55,7 +55,9 @@ _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
 # the SwiftUI first-run banner can read `mode`, `setup_skipped`, and
 # `has_privacy_section` in a single round-trip without touching config.toml.
 # Additive: every v1 field is unchanged.
-_SETTINGS_SCHEMA_VERSION = 2
+# v3: drops the `auto_name` field (legacy LLM auto-naming removed; the
+# feature was dead — its flags never reached the daemon).
+_SETTINGS_SCHEMA_VERSION = 3
 # `settings intelligence --json` envelope (ok + schema_version + the current
 # provider / cloud provider / per-task consent rows), read by the Swift
 # Intelligence pane (U9) to reconcile its optimistic toggles. SCR local-first
@@ -390,7 +392,7 @@ from screencap._stderr_events import (
 
 
 @cli.command()
-@click.option("--name", "-n", default=None, help="Recording name (skips auto-naming).")
+@click.option("--name", "-n", default=None, help="Recording name.")
 @click.option("--description", "-d", default=None, help="Task description.")
 @click.option("--no-audio", is_flag=True, default=False, help="Disable audio capture.")
 @click.option("--no-video", is_flag=True, default=False, help="Disable video capture.")
@@ -399,8 +401,6 @@ from screencap._stderr_events import (
 @click.option("--output", "-o", type=click.Path(), default=None, help="Custom output directory.")
 @click.option("--no-wifi-metrics", is_flag=True, default=False, help="Disable WiFi metrics collection.")
 @click.option("--no-app-versions", is_flag=True, default=False, help="Disable running app version capture.")
-@click.option("--no-auto-name", is_flag=True, default=False, help="Skip LLM auto-naming after recording.")
-@click.option("--local-only", is_flag=True, default=False, help="Restrict LLM naming to local providers (Ollama).")
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Show all info/debug output during recording.")
 @click.option("--chunk-duration", type=float, default=None,
               help="Auto-cut recording at this interval (seconds). Default: 900 (15 min). Set 0 to disable chunking.")
@@ -433,7 +433,7 @@ from screencap._stderr_events import (
 def start(
     name, description, no_audio, no_video, no_images, no_window_data,
     output, no_wifi_metrics, no_app_versions,
-    no_auto_name, local_only, verbose, chunk_duration, no_live_upload,
+    verbose, chunk_duration, no_live_upload,
     destination, segmentation_mode, no_scrub, network, unlisted,
 ):
     """Record a screen capture session. Ctrl+C to stop.
@@ -466,19 +466,9 @@ def start(
     # Resolve segmentation mode: CLI flag > config.toml > default
     seg_mode = segmentation_mode or get_segmentation_mode()
 
-    user_provided_name = name is not None
-
     if not name:
-        if no_auto_name:
-            # Restore old interactive prompt behavior
-            if not sys.stdin.isatty():
-                console.print("[red]Error: --name is required with --no-auto-name in non-interactive mode.[/red]")
-                raise SystemExit(1)
-            name = click.prompt("Recording name")
-            description = description or click.prompt("Description (optional)", default="", show_default=False)
-        else:
-            # Generate timestamp-based temp name
-            name = f"rec-{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+        # Generate timestamp-based temp name
+        name = f"rec-{datetime.now().strftime('%Y%m%dT%H%M%S')}"
 
     # --no-audio wins; otherwise fall back to the persisted default so the
     # menu-bar "Audio (next recording)" toggle actually reaches new sessions.
@@ -2937,7 +2927,6 @@ def settings(ctx, set_pair, as_json):
     Changeable keys:
       show_on_website    Show recordings on the website (true/false)
       audio_default      Record audio by default (true/false)
-      auto_name          LLM auto-naming after recording (true/false)
       upload_default     Default destination (local/cloud/both/ask)
       content_index_enabled  Index on-screen text for local search (true/false)
     """
@@ -2948,7 +2937,6 @@ def settings(ctx, set_pair, as_json):
         _CONFIG_PATH,
         get_audio_default,
         get_auto_delete_after_upload,
-        get_auto_name,
         get_chunk_duration,
         get_cloud_e2ee_enabled,
         get_content_index_backfill_declined,
@@ -2972,7 +2960,7 @@ def settings(ctx, set_pair, as_json):
         raw_value = raw_value.strip()
 
         # Validate key and parse value
-        _BOOL_KEYS = {"show_on_website", "audio_default", "auto_name", "auto_name_local_only",
+        _BOOL_KEYS = {"show_on_website", "audio_default",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
                        "content_index_enabled", "content_index_consent_declined",
                        "content_index_backfill_declined", "cloud_e2ee_enabled"}
@@ -3029,7 +3017,6 @@ def settings(ctx, set_pair, as_json):
         "show_on_website": bool(show),
         "upload_default": str(get_upload_default()),
         "audio_default": bool(get_audio_default()),
-        "auto_name": bool(get_auto_name()),
         "chunk_duration": float(chunk),
         "auto_delete_after_upload": bool(get_auto_delete_after_upload()),
         "rest_threshold_seconds": float(rest),
@@ -3064,7 +3051,6 @@ def settings(ctx, set_pair, as_json):
     console.print(f"  Show on website:          {'yes' if show else 'no'}")
     console.print(f"  Upload default:           {get_upload_default()}")
     console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
-    console.print(f"  Auto-name:                {'enabled' if get_auto_name() else 'disabled'}")
     console.print(f"  Chunk duration:           {chunk_str}")
     console.print(f"  Auto-delete after upload: {'enabled' if get_auto_delete_after_upload() else 'disabled'}")
     console.print(f"  Rest threshold:           {rest:.0f}s ({rest / 60:.0f} min)")

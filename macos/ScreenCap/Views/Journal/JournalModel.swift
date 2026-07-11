@@ -76,8 +76,8 @@ enum JournalModel {
         return formatter.string(from: day)
     }
 
-    /// The card's summary line — U2's `summary` (the namer's task description),
-    /// hidden entirely when the namer hasn't produced one (design 409 renders it
+    /// The card's summary line — U2's `summary` (the recording's task description),
+    /// hidden entirely when the recording has none (design 409 renders it
     /// only in the prototype's always-populated mock).
     static func summaryLine(_ rec: RecordingSummary) -> String? {
         guard let summary = rec.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -85,12 +85,12 @@ enum JournalModel {
         return summary
     }
 
-    /// The card's display title, preferring the namer's `title` and falling back
-    /// to a locally-derived named task (U10). When the namer produced no title —
+    /// The card's display title, preferring the recording's `title` and falling back
+    /// to a locally-derived named task (U10). When the recording has no distinct title —
     /// the raw directory `name` is the placeholder `RecordingSummary` supplies —
     /// but on-device segmentation named at least one task, the first task's name
     /// reads far better than the directory slug. Uploaded/cloud-named recordings
-    /// keep the namer title unchanged; only the un-named local case borrows a task
+    /// keep the recording title unchanged; only the un-named local case borrows a task
     /// name. Returns `rec.title` (never empty) in every other case, so the card
     /// title is always populated.
     static func displayTitle(_ rec: RecordingSummary, tasks: [RecordingTask]) -> String {
@@ -102,10 +102,10 @@ enum JournalModel {
         return rec.title
     }
 
-    /// The card's summary line, preferring the namer's `summary` and falling back
+    /// The card's summary line, preferring the recording's `summary` and falling back
     /// to a compact "N tasks" line derived from the locally-named tasks (U10) when
-    /// the namer produced no summary. Nil (line hidden) only when there is neither
-    /// a namer summary nor any local task — so a recording with no tasks store
+    /// the recording has no summary. Nil (line hidden) only when there is neither
+    /// a recording summary nor any local task — so a recording with no tasks store
     /// renders exactly as before (no crash, no fabricated line).
     static func summaryLine(_ rec: RecordingSummary, tasks: [RecordingTask]) -> String? {
         if let summary = summaryLine(rec) { return summary }

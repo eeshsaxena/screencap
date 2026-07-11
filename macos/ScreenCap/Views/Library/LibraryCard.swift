@@ -37,7 +37,7 @@ struct LibraryCard: View {
     let thumbnailLoader: ThumbnailLoader
     /// The recording's locally-named task segments (U10) — empty while unresolved,
     /// on a daemon miss, or when the recording has no tasks store. Used only for
-    /// the title fallback when the namer produced no title.
+    /// the title fallback when the recording has no distinct title.
     var tasks: [RecordingTask] = []
     /// Primary tap — opens the recording on the Day timeline (U9).
     var onOpen: () -> Void
@@ -50,7 +50,7 @@ struct LibraryCard: View {
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
 
-    /// Title prefers the namer's, falling back to the first local task name when
+    /// Title prefers the recording's own, falling back to the first local task name when
     /// the recording is otherwise un-named (U10). Shared rule with the Journal
     /// card so both surfaces read identically for a locally-named recording.
     private var title: String { JournalModel.displayTitle(recording, tasks: tasks) }

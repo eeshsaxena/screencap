@@ -96,7 +96,7 @@ final class JournalGroupingTests: XCTestCase {
 
     // MARK: - Summary line
 
-    /// The card summary renders only when the namer produced one — nil and
+    /// The card summary renders only when the recording has one — nil and
     /// blank both hide the line (U8 test scenario "summary hidden when null").
     func testSummaryLineHiddenWhenNullOrBlank() {
         XCTAssertNil(JournalModel.summaryLine(rec(name: "a", startedAt: nil, summary: nil)))
