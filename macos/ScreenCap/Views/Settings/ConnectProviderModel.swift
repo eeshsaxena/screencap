@@ -57,9 +57,9 @@ enum BYOVendor: String, CaseIterable, Identifiable {
     var cliFixGuidance: String {
         switch self {
         case .openai:
-            return "Install the Codex CLI and run `codex login` (sign in with ChatGPT) — ScreenCap invokes your signed-in `codex`, it never stores a token."
+            return "Install the Codex CLI and sign in with ChatGPT — ScreenCap invokes your signed-in `codex`, it never stores a token."
         case .anthropic:
-            return "Install Claude Code and run `claude` once to sign in — ScreenCap invokes your signed-in `claude`, it never stores a token."
+            return "Install Claude Code and sign in — ScreenCap invokes your signed-in `claude`, it never stores a token."
         case .gemini:
             return "Install the Gemini CLI and sign in — ScreenCap invokes your signed-in `gemini`, it never stores a token."
         }

@@ -198,7 +198,7 @@ final class RecordingStateMachineTests: XCTestCase {
 
         XCTAssertEqual(effects, [
             .resolveAwaiting(.finalized, success: true),
-            .surfaceError("Recording stopped, but some data may not have uploaded. Run `screencap upload` to retry."),
+            .surfaceError("Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."),
             .refreshIndex,
         ])
     }

@@ -116,7 +116,12 @@ final class SearchViewModelTests: XCTestCase {
         fake.perRecordingTimestamps = ["rec": [1000]]  // chunk 0 -> snaps to 1000
 
         let vm = makeVM(fake)
-        await vm.search("refund", contentIndexEnabled: true)
+        // SCR-176 — the app token ("slack") gives the query an app filter so the
+        // timeline stream is legitimately fetched and can join the merge; a pure
+        // free-text query no longer fans out to timeline (see
+        // testPureFreeTextExcludesTimelineFlood). No time window, so content/audio
+        // are not client-side time-filtered.
+        await vm.search("slack refund", contentIndexEnabled: true)
 
         let results = loaded(vm)
         XCTAssertEqual(results?.items.map(\.anchorMs), [2000, 1000, 3000])
@@ -137,7 +142,9 @@ final class SearchViewModelTests: XCTestCase {
             indexState: .ok
         )
         let vm = makeVM(fake)
-        await vm.search("refund", contentIndexEnabled: true)
+        // SCR-176 — an app token keeps the timeline stream (the unrelated newer
+        // activity row) in the fan-out; pure free-text no longer merges timeline.
+        await vm.search("slack refund", contentIndexEnabled: true)
 
         let items = loaded(vm)?.items ?? []
         XCTAssertEqual(items.first?.stream, .screen, "the relevant text hit must lead despite being older")
@@ -271,20 +278,68 @@ final class SearchViewModelTests: XCTestCase {
 
     // U12 — the gate returns 402 before any results assemble, so a lapsed search
     // publishes no `.loaded` results (no partial leak of a gated recall surface).
+    // SCR-176 — a pure free-text query skips timeline, so the 402 arrives on the
+    // content verb; the paywall gates all five recall verbs together. A sibling
+    // stream returning a row must still not leak into a published result.
     func testSubscriptionRequiredDoesNotPublishResults() async {
         let fake = FakeSearchService()
-        fake.timelineError = DaemonClientError.envelopeError(
+        fake.contentError = DaemonClientError.envelopeError(
             code: "subscription_required", rawBody: Data()
         )
-        fake.contentResponse = ContentSearchResponse(
-            hits: [ContentHit(recording: "rec", timestampMs: 1000, snippet: "x", score: -1)],
-            indexState: .ok
+        fake.transcriptResponse = TranscriptSearchResponse(
+            hits: [TranscriptHit(recording: "rec", chunkIndex: 0, snippet: "x")],
+            coverage: .bestEffort
         )
         let vm = makeVM(fake)
         await vm.search("refund", contentIndexEnabled: true)
 
         XCTAssertNil(loaded(vm), "a gated search must not publish .loaded results")
         XCTAssertEqual(vm.phase, .subscriptionRequired)
+    }
+
+    // SCR-176 — a pure free-text query (no time window, no app filter) must NOT
+    // fan out to timeline.query. That verb is time/app-filtered only (no text
+    // term) and truncates earliest-first, so an unbounded fetch would flood the
+    // results with up to `streamFetchLimit` of the OLDEST activity rows, unrelated
+    // to the query. Only the relevant content hit should surface.
+    func testPureFreeTextExcludesTimelineFlood() async {
+        let fake = FakeSearchService()
+        // If timeline were (wrongly) attempted, these oldest rows would flood in.
+        fake.timelineResponse = TimelineQueryResponse(
+            rows: (0..<SearchViewModel.streamFetchLimit).map {
+                TimelineRow(recording: "rec", timestampMs: 1000 + $0, app: "Slack", title: nil)
+            },
+            coverage: .authoritative
+        )
+        fake.contentResponse = ContentSearchResponse(
+            hits: [ContentHit(recording: "rec", timestampMs: 5000, snippet: "refund", score: -1)],
+            indexState: .ok
+        )
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+
+        let results = loaded(vm)
+        XCTAssertEqual(results?.items.filter { $0.stream == .activity }.count, 0,
+                       "pure free-text must not merge timeline activity rows")
+        XCTAssertEqual(results?.coverage.activity, .notRun,
+                       "the timeline stream is skipped for pure free-text")
+        XCTAssertEqual(results?.items.map(\.stream), [.screen],
+                       "only the relevant content hit should surface")
+        XCTAssertEqual(results?.truncated, false,
+                       "a skipped timeline fetch must not flag truncation")
+    }
+
+    // SCR-176 — daemon-down is still detected for a pure free-text query even
+    // though timeline is skipped: it is derived from the content/transcript
+    // streams, which share the same socket.
+    func testDaemonDownOnPureFreeTextWhenSocketFails() async {
+        let fake = FakeSearchService()
+        fake.contentError = DaemonClientError.socketUnavailable(path: "/tmp/x.sock")
+        let vm = makeVM(fake)
+        await vm.search("refund", contentIndexEnabled: true)
+
+        XCTAssertEqual(vm.phase, .daemonDown)
+        XCTAssertFalse(vm.isSearching, "isSearching must clear on the daemon-down exit")
     }
 
     func testPartialContentErrorStillReturnsTimeline() async {
@@ -399,6 +454,8 @@ final class SearchViewModelTests: XCTestCase {
     // must not publish its result over the newer search. The fake cancels the
     // surrounding task on the main timeline fetch; the model's pre-publish
     // `Task.isCancelled` guard should then bail, leaving phase at `.searching`.
+    // SCR-176 — the query carries a time term so the main timeline stream is
+    // fetched (a pure free-text query skips it, and with it the cancel hook).
     func testCancelledSearchDoesNotPublishResults() async {
         let fake = FakeSearchService()
         fake.timelineResponse = TimelineQueryResponse(
@@ -410,7 +467,7 @@ final class SearchViewModelTests: XCTestCase {
         fake.onTimelineQuery = { holder.task?.cancel() }
 
         holder.task = Task { @MainActor in
-            await vm.search("refund", contentIndexEnabled: true)
+            await vm.search("today refund", contentIndexEnabled: true)
         }
         await holder.task?.value
 
@@ -437,10 +494,13 @@ final class SearchViewModelTests: XCTestCase {
         let holder = TaskHolder()
         // Cancel on the main timeline fetch — correlation runs strictly after,
         // so a cancellation-aware fan-out should issue zero per-recording calls.
+        // SCR-176 — the query carries a time term so the main timeline stream is
+        // fetched (pure free-text skips it, moving the cancel point into
+        // correlation and defeating this assertion).
         fake.onTimelineQuery = { holder.task?.cancel() }
 
         holder.task = Task { @MainActor in
-            await vm.search("refund", contentIndexEnabled: true)
+            await vm.search("today refund", contentIndexEnabled: true)
         }
         await holder.task?.value
 
