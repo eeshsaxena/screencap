@@ -31,11 +31,11 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     // them (nullable-timing contract): readiness is never gated on their presence.
     /// Numeric byte total behind `sizeMB` — the sidebar footer sums this.
     let sizeBytes: Int
-    /// The namer's `task_description` — a 2–3 sentence summary, or nil when the
-    /// namer hasn't run / the DB was locked at scan time.
+    /// The recording's `task_description` — a short summary set via the CLI
+    /// `--description` flag, or nil when absent / the DB was locked at scan time.
     let summary: String?
-    /// Humanized display title (the namer's slug). Falls back to the raw
-    /// directory `name` when an older daemon omits it.
+    /// Humanized display title derived from the directory name. Falls back to
+    /// the raw directory `name` when an older daemon omits it.
     let title: String
     /// Derived lifecycle: `recording` | `processing` | `ready` (KTD-7). Defaults
     /// to `ready` so a missing value never traps a card in a spinner.

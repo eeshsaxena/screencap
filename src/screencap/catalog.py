@@ -205,12 +205,13 @@ class RecordingInfo(NamedTuple):
     # parsing. Mirrored EXACTLY onto daemon.schema.RecordingSummary — recording.list
     # asserts the two field sets match, so any field added here must be added there.
     # `size_bytes` is the numeric total behind the formatted `size_mb` (sidebar
-    # footer sums it). `summary` is the namer's `recording.task_description` (null
-    # when absent or the DB is locked). `title` is the humanized directory name (the
-    # namer's slug) shown on cards/HUD — a *title*, distinct from the `summary`
-    # description. `state` is the derived lifecycle (`recording`|`processing`|`ready`,
-    # KTD-7). `recording_id` is the stable id pinned at start (survives the post-stop
-    # auto-name rename) so clients hold identity across it.
+    # footer sums it). `summary` is `recording.task_description` (set via the CLI
+    # `--description` flag; null when absent or the DB is locked). `title` is the
+    # humanized directory name shown on cards/HUD — a *title*, distinct from the
+    # `summary` description. `state` is the derived lifecycle
+    # (`recording`|`processing`|`ready`, KTD-7). `recording_id` is the stable id
+    # pinned at start (survives a post-stop directory rename) so clients hold
+    # identity across it.
     size_bytes: int = 0
     summary: str | None = None
     title: str = ""
@@ -283,14 +284,14 @@ def _dir_size_mb(p: Path) -> str:
 
 
 def _humanize_name(name: str) -> str:
-    """Humanize the namer's slug/directory name into a display title (U2).
+    """Humanize a kebab-case directory name into a display title (U2).
 
-    The auto-named recording directory is a kebab-case slug
-    (``namer.validate_slug``); turn it into Title Case for the card/HUD title
+    Some legacy on-disk recording directories carry kebab-case slug names; turn
+    them into Title Case for the card/HUD title
     (``"stripe-webhook-debugging"`` → ``"Stripe Webhook Debugging"``). Internal
-    capitals are preserved (``.capitalize`` would lowercase them). A legacy
+    capitals are preserved (``.capitalize`` would lowercase them). A
     timestamp-named recording passes its stamp through with separators spaced —
-    an acceptable fallback for a recording the namer never renamed.
+    an acceptable fallback.
     """
     words = name.replace("_", " ").replace("-", " ").split()
     if not words:
@@ -315,7 +316,7 @@ def read_recording_id(directory: Path) -> str | None:
 
 
 def _read_task_description(db_path: Path) -> str | None:
-    """Best-effort read of ``recording.task_description`` — the namer's summary.
+    """Best-effort read of ``recording.task_description`` — the recording summary.
 
     Lock-tolerant like :func:`_read_recording_meta`: returns ``None`` (never
     raises) when the DB is absent, locked by an active recording, corrupt, or the
@@ -734,9 +735,9 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
             intent=intent,
             probe=ledger,
         )
-        # The namer writes `task_description` only AFTER stop, and the active
-        # recording holds a write lock — so reading it here can't yield a summary
-        # and would just block up to the 500ms busy_timeout on every scan. Skip it.
+        # The active recording holds a write lock on the DB, so reading
+        # `task_description` here would just block up to the 500ms busy_timeout
+        # on every scan without yielding a summary. Skip it.
         summary = None if is_active else _read_task_description(db)
 
         results.append(

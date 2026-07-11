@@ -49,11 +49,11 @@ final class RecordingTasksTests: XCTestCase {
     func testDisplayTitleKeepsNamerTitleWhenPresent() {
         let rec = recording(name: "2026-07-06_10-00-00", title: "Payroll Reconciliation")
         let title = JournalModel.displayTitle(rec, tasks: [task(0, "Some task")])
-        XCTAssertEqual(title, "Payroll Reconciliation", "a namer title is never overridden by a task")
+        XCTAssertEqual(title, "Payroll Reconciliation", "a distinct recording title is never overridden by a task")
     }
 
     func testDisplayTitleFallsBackToFirstTaskWhenUnnamed() {
-        // title == name means the namer produced no title (RecordingSummary
+        // title == name means the recording has no distinct title (RecordingSummary
         // defaults title to the directory name).
         let rec = recording(name: "2026-07-06_10-00-00", title: nil)
         let title = JournalModel.displayTitle(rec, tasks: [task(0, "Payroll run in Gusto")])
@@ -63,7 +63,7 @@ final class RecordingTasksTests: XCTestCase {
     func testDisplayTitleKeepsDirectoryNameWhenNoTasks() {
         let rec = recording(name: "2026-07-06_10-00-00", title: nil)
         let title = JournalModel.displayTitle(rec, tasks: [])
-        XCTAssertEqual(title, "2026-07-06_10-00-00", "no tasks + no namer title → directory name, no crash")
+        XCTAssertEqual(title, "2026-07-06_10-00-00", "no tasks + no distinct title → directory name, no crash")
     }
 
     // MARK: - summaryLine (task-aware overload)

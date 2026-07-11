@@ -867,7 +867,7 @@ def test_recording_id_stable_across_directory_rename(recordings_dir):
     info = list_recordings(recordings_dir)[0]
     assert info.recording_id == "temp-capture-name"
 
-    d.rename(recordings_dir / "final-slug")  # the namer's rename
+    d.rename(recordings_dir / "final-slug")  # legacy post-stop directory rename
     info2 = list_recordings(recordings_dir)[0]
     assert info2.name == "final-slug"
     assert info2.recording_id == "temp-capture-name"

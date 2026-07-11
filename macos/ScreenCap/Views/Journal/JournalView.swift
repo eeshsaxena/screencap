@@ -206,7 +206,7 @@ struct JournalView: View {
 }
 
 /// A Journal card (design 403–416): 290pt wide, 16/9 thumbnail with duration
-/// chip, title, summary (hidden when the namer hasn't produced one), and the
+/// chip, title, summary (hidden when the recording has none), and the
 /// badge + app chip row. The thumbnail/badge pieces are shared with U5's
 /// Library card; the summary line and app chip are Journal-only.
 struct JournalCard: View {
@@ -226,7 +226,7 @@ struct JournalCard: View {
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
 
-    /// Title prefers the namer's, falling back to the first local task name when
+    /// Title prefers the recording's own, falling back to the first local task name when
     /// the recording is otherwise un-named (U10).
     private var title: String { JournalModel.displayTitle(recording, tasks: tasks) }
 
