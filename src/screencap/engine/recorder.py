@@ -732,6 +732,33 @@ def write_action_event(
     # perf_q.put((event.type, event.timestamp, utils.get_timestamp()))
 
 
+# Per-process cache of the corpus key for encrypted capture (search U2). Loaded
+# once, lazily, from the daemon-supplied ``SCREENCAP_CORPUS_KEY_FILE`` (never argv —
+# the bytes must not be ``ps``-visible). Spawn-safe: a re-imported child resets this
+# to (False, None) and re-reads the inherited env file on its first still.
+_CORPUS_KEY_LOADED = False
+_CORPUS_KEY_CACHE: bytes | None = None
+
+
+def _corpus_key() -> bytes | None:
+    """Return the corpus key for encrypted capture, or ``None`` if unavailable.
+
+    Read-only + cached: the writer never mints a key (the daemon does, before it
+    enables encryption). A ``None`` here makes the write path fail closed rather
+    than emit plaintext."""
+    global _CORPUS_KEY_LOADED, _CORPUS_KEY_CACHE
+    if not _CORPUS_KEY_LOADED:
+        try:
+            from screencap import corpus_crypto
+
+            _CORPUS_KEY_CACHE = corpus_crypto.load_corpus_key()
+        except Exception:  # noqa: BLE001 — any key-load failure = "no key" → fail closed
+            logger.error("Failed to load the corpus key for encrypted capture", exc_info=True)
+            _CORPUS_KEY_CACHE = None
+        _CORPUS_KEY_LOADED = True
+    return _CORPUS_KEY_CACHE
+
+
 def write_screen_event(
     db: crud.SaSession,
     recording: Recording,
@@ -756,25 +783,63 @@ def write_screen_event(
     image = event.data
     event_data: dict[str, Any] = {}
     if config.RECORD_IMAGES:
-        if screenshots_dir:
+        # Corpus encryption (search R3): when the U8 gate flips RECORD_IMAGES_ENCRYPTED
+        # on, stills persist as AES-256-GCM ``.jpg.enc`` (and blobs are encrypted)
+        # instead of plaintext. Fail closed — never write plaintext when encryption
+        # is required but the key is missing (the gate should have forced stills off;
+        # this is the defense-in-depth guard that upholds the never-write-plaintext
+        # invariant). Default OFF preserves today's plaintext behavior byte-for-byte.
+        encrypt = config.RECORD_IMAGES_ENCRYPTED
+        key = _corpus_key() if encrypt else None
+        if encrypt and key is None:
+            logger.error(
+                "Corpus encryption is enabled but the corpus key is unavailable; "
+                "skipping this still (no plaintext written)"
+            )
+        elif screenshots_dir:
             import math
 
             ts = event.timestamp
             if math.isfinite(ts) and ts > 0:
                 filename = f"{ts:.6f}.jpg"
-                file_path = os.path.join(screenshots_dir, filename)
-                try:
-                    image.save(file_path, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY)
-                    os.chmod(file_path, 0o600)
-                    event_data["image_path"] = f"screenshots/{filename}"
-                except OSError:
-                    logger.warning(
-                        f"Failed to save screenshot to {file_path}, skipping"
-                    )
+                if encrypt:
+                    from screencap import still_io
+
+                    enc_path = os.path.join(screenshots_dir, filename + still_io.ENC_SUFFIX)
+                    try:
+                        with io.BytesIO() as output:
+                            image.save(
+                                output, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY
+                            )
+                            jpeg_bytes = output.getvalue()
+                        still_io.write_encrypted_still(enc_path, jpeg_bytes, key)
+                        event_data["image_path"] = f"screenshots/{filename}{still_io.ENC_SUFFIX}"
+                    except OSError:
+                        logger.warning(
+                            f"Failed to save encrypted screenshot to {enc_path}, skipping"
+                        )
+                else:
+                    file_path = os.path.join(screenshots_dir, filename)
+                    try:
+                        image.save(
+                            file_path, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY
+                        )
+                        os.chmod(file_path, 0o600)
+                        event_data["image_path"] = f"screenshots/{filename}"
+                    except OSError:
+                        logger.warning(
+                            f"Failed to save screenshot to {file_path}, skipping"
+                        )
         else:
             with io.BytesIO() as output:
                 image.save(output, format="JPEG", quality=config.SCREENSHOT_JPEG_QUALITY)
                 png_data = output.getvalue()
+            if encrypt:
+                from screencap import corpus_crypto, still_io
+
+                png_data = corpus_crypto.encrypt(
+                    png_data, key, still_io.png_blob_aad(recording.timestamp, event.timestamp)
+                )
             event_data["png_data"] = png_data
     crud.insert_screenshot(db, recording, event.timestamp, event_data)
 

@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # if false, only write video events corresponding to screenshots
     RECORD_FULL_VIDEO: bool = False
     RECORD_IMAGES: bool = False
+    # Encrypt persisted stills at rest (search guardrails R3). When True the screen
+    # writer emits ``screenshots/<ts>.jpg.enc`` (AES-256-GCM via the corpus key) and
+    # encrypts inline ``png_data`` blobs, instead of plaintext JPEG. Default False:
+    # the encrypted format stays dark until the U8 readiness gate flips it (a bare
+    # constant flip would bypass R8 / the never-write-plaintext invariant), and
+    # U7's migration converts pre-flip plaintext corpora in one step at flip time.
+    RECORD_IMAGES_ENCRYPTED: bool = False
     # useful for debugging but expensive computationally
     LOG_MEMORY: bool = False
     VIDEO_ENCODING: str = "libx264"
@@ -142,6 +149,7 @@ _FIELD_TO_CONFIG_ATTR = {
     "capture_video": "RECORD_VIDEO",
     "capture_audio": "RECORD_AUDIO",
     "capture_images": "RECORD_IMAGES",
+    "capture_images_encrypted": "RECORD_IMAGES_ENCRYPTED",
     "capture_window_data": "RECORD_WINDOW_DATA",
     "capture_full_video": "RECORD_FULL_VIDEO",
     "video_encoding": "VIDEO_ENCODING",
@@ -181,6 +189,7 @@ class RecordingConfig:
     capture_video: bool | None = None
     capture_audio: bool | None = None
     capture_images: bool | None = None
+    capture_images_encrypted: bool | None = None
     capture_window_data: bool | None = None
     capture_full_video: bool | None = None
     video_encoding: str | None = None
