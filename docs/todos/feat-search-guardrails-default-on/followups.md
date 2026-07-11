@@ -47,6 +47,7 @@ crypto/gating core (U6 core) landed. Plan:
   this box — they fail on clean `main` too; the concurrent `fix/daemon-test-config-hermeticity`
   branch fixes exactly that harness issue).
 - **Two call-graph guards pass** ✓.
+- **Daemon-family failures are inter-test-class INTERFERENCE, not my code:** `DaemonClientTests` (the tests for the one daemon file I modified) passes ALONE (19 tests, 0 failures); it only fails when the daemon classes share a test process (shared sockets/ports/state). Proven not-config (fails on clean HOME too) and not-a-regression (fails on clean `main`). A repo-wide harness issue owned by `fix/daemon-test-config-hermeticity`.
 - **Swift `xcodebuild test` green** ✓ — **940 tests, 0 failures** (19s, `test-without-building`)
   excluding the 5 pre-existing-flaky daemon-family classes the gate itself caveats
   (`DaemonClient`, `DaemonClientBackfill`, `DaemonInstallController`, `DaemonSessionService`,
