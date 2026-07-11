@@ -12,6 +12,7 @@ from screencap.engine.db.models import (
     ActionEvent,
     AudioInfo,
     MemoryStat,
+    MutedInterval,
     NETWORK_HEALTH_EVENTS,
     NetworkEvent,
     NetworkEventMeta,
@@ -205,6 +206,48 @@ def insert_window_geometry_capture_failure(
     )
     session.add(row)
     session.commit()
+
+
+def open_muted_interval(
+    session: SaSession, recording: Recording, start_ts: float
+) -> int:
+    """Record the start of a muted span (SCR-218 U3) and return its row id.
+
+    Unbuffered + immediate commit so the span is durable before any crash.
+    Called at the mute *command* (not the confirmed stop) so the interval
+    over-covers the ~100 ms stop latency; any audio captured in that window is
+    dropped at transcribe time (U6). Local-only (``recording.db``, R8).
+    """
+    row = MutedInterval(
+        recording_id=recording.id,
+        start_ts=start_ts,
+        end_ts=None,
+    )
+    session.add(row)
+    session.commit()
+    return int(row.id)
+
+
+def close_muted_interval(
+    session: SaSession, recording: Recording, end_ts: float
+) -> int:
+    """Close every open muted span for ``recording`` by setting ``end_ts``
+    (SCR-218 U3). Returns the number of intervals closed — 0 is a safe no-op.
+
+    Idempotent, and closes all open rows (there should be at most one) so a
+    stray open interval from a prior crash can never wedge the state. An
+    interval left open (never closed) is treated by U6 as muted to chunk end.
+    """
+    open_rows = (
+        session.query(MutedInterval)
+        .filter(MutedInterval.recording_id == recording.id)
+        .filter(MutedInterval.end_ts.is_(None))
+        .all()
+    )
+    for row in open_rows:
+        row.end_ts = end_ts
+    session.commit()
+    return len(open_rows)
 
 
 def insert_window_event(
