@@ -40,6 +40,65 @@ enum PrivacySettingsPolicy {
         on ? "local" : "ask"
     }
 
+    // MARK: - E2EE row (SCR-220 U4)
+
+    /// What a tap on the E2EE toggle does, keyed on the runtime flag state.
+    /// `locked`: nil flag (older CLI without the `e2ee` verb, KTD-8) — the
+    /// row is non-interactive. `showDisclosure`: the off→on tap presents the
+    /// R4 limits sheet INSTEAD of flipping — the switch stays OFF and no CLI
+    /// call fires until the user confirms (cancel = dismiss, nothing else).
+    /// `disable`: the on→off tap needs no disclosure — plain optimistic flip.
+    enum E2EETapOutcome: Equatable {
+        case locked
+        case showDisclosure
+        case disable
+    }
+
+    static func e2eeTapOutcome(cloudE2EEEnabled: Bool?) -> E2EETapOutcome {
+        switch cloudE2EEEnabled {
+        case .none: return .locked
+        case .some(true): return .disable
+        case .some(false): return .showDisclosure
+        }
+    }
+
+    /// The E2EE toggle renders ON iff the CLI reports the flag true. nil
+    /// (unknown) renders OFF — never guess an encryption claim (KD7).
+    static func e2eeToggleOn(cloudE2EEEnabled: Bool?) -> Bool {
+        cloudE2EEEnabled == true
+    }
+
+    /// Chip label: "beta" in both live states (R1 — the opt-in is labeled
+    /// beta; no bare capability claim); the stub "planned" chip only when the
+    /// flag is unreadable (older CLI, KTD-8).
+    static func e2eeChip(cloudE2EEEnabled: Bool?) -> String {
+        cloudE2EEEnabled == nil
+            ? PrivacySettingsCopy.e2eeChipStub
+            : PrivacySettingsCopy.e2eeChipBeta
+    }
+
+    /// The caption under the E2EE row, honesty-gated per state (KTD-9/KD7):
+    /// nil → the stub copy (no capability claim at all); false → opt-in copy
+    /// that makes no claim about current uploads being encrypted; true → the
+    /// truthful scoped beta claim (per-Mac encryption active, no recovery).
+    /// Never "always on" or "shared · encrypted" — those unlock in later
+    /// stages, and PrivacySettingsPolicyTests string-asserts their absence.
+    static func e2eeCaption(cloudE2EEEnabled: Bool?) -> String {
+        switch cloudE2EEEnabled {
+        case .none: return PrivacySettingsCopy.e2eeSubStub
+        case .some(false): return PrivacySettingsCopy.e2eeSubOff
+        case .some(true): return PrivacySettingsCopy.e2eeSubOn
+        }
+    }
+
+    /// Hover help for the E2EE row — conditioned ("when on") so it stays
+    /// honest while the toggle is off.
+    static func e2eeHelp(cloudE2EEEnabled: Bool?) -> String {
+        cloudE2EEEnabled == nil
+            ? PrivacySettingsCopy.e2eeHelpStub
+            : PrivacySettingsCopy.e2eeHelpLive
+    }
+
     /// SCR-228: map a storage-migration refusal `reason` code to honest copy.
     /// The daemon's own `message` is preferred when present; this is the
     /// fallback (older daemon that omits `message`) so the pane never shows a
@@ -79,23 +138,46 @@ enum PrivacySettingsPolicy {
     }
 }
 
-/// The pane's honesty-gated copy (KTD-9): the E2EE row is informational with
-/// no active claim (SCR-220), the private-window row states the capability
-/// does not exist yet (SCR-224), and the mask row's "always on" describes the
-/// capture-time policy engine, which genuinely always runs.
-/// PrivacySettingsPolicyTests string-asserts these.
+/// The pane's honesty-gated copy (KTD-9/KD7): the E2EE row's copy is keyed on
+/// the runtime `cloud_e2ee_enabled` signal (SCR-220 U4 — beta opt-in), the
+/// private-window row states the capability does not exist yet (SCR-224),
+/// and the mask row's "always on" describes the capture-time policy engine,
+/// which genuinely always runs. PrivacySettingsPolicyTests string-asserts
+/// these.
 enum PrivacySettingsCopy {
     static let paneTitle = "Privacy"
     static let paneSub = "Where your recordings live and what leaves this Mac."
 
     static let keepLocalTitle = "Keep recordings local by default"
 
-    // Stub: SCR-220 end-to-end encryption for shared copies — informational
-    // row, no active toggle, no "always on" claim (KTD-9).
+    // SCR-220 U4: E2EE for cloud copies is now a live opt-in beta toggle. All
+    // row copy is state-keyed through PrivacySettingsPolicy.e2eeChip/
+    // e2eeCaption/e2eeHelp (KD7 — every claim bound to the runtime
+    // `cloud_e2ee_enabled` signal): nil (older CLI) keeps the stub
+    // presentation below; off makes no claim that current uploads are
+    // encrypted; on claims exactly the per-Mac beta capability and names the
+    // no-recovery limit. Still no "always on" (Stage 3), no "shared ·
+    // encrypted" (SCR-221), no "keys stay with your team" (KD3).
     static let e2eeTitle = "End-to-end encryption for shared copies"
-    static let e2eeChip = "planned"
-    static let e2eeSub = "Not available yet. Sharing today uses per-recording upload approval instead."
-    static let e2eeHelp = "Coming soon — SCR-220"
+    static let e2eeChipStub = "planned"
+    static let e2eeChipBeta = "beta"
+    static let e2eeSubStub = "Not available yet. Sharing today uses per-recording upload approval instead."
+    static let e2eeSubOff = "Off — cloud copies upload without end-to-end encryption. Turn on to encrypt future uploads from this Mac."
+    static let e2eeSubOn = "On — new cloud copies from this Mac are encrypted so only this Mac can decrypt them. No recovery: losing this Mac loses access to them."
+    static let e2eeHelpStub = "Coming soon — SCR-220"
+    static let e2eeHelpLive = "Beta — when on, new cloud copies are encrypted so only this Mac can decrypt them."
+
+    // R4: the limits disclosure that gates the off→on flip. The body must
+    // name all three limits plainly BEFORE the user commits: only this Mac
+    // can decrypt, no recovery exists, losing this Mac loses access to the
+    // encrypted cloud copies.
+    static let e2eeConfirmTitle = "Turn on end-to-end encryption for cloud copies?"
+    static let e2eeConfirmBody =
+        "This Mac creates the encryption key, and only this Mac can decrypt "
+        + "the cloud copies it uploads. There is no recovery: if you lose "
+        + "this Mac, you lose access to those encrypted cloud copies. Beta — "
+        + "recordings already uploaded are not re-encrypted."
+    static let e2eeConfirmAction = "Turn On Encryption"
 
     // The always-on capture-time policy engine (true today); per-app
     // overrides are SCR-225.
@@ -127,12 +209,18 @@ enum PrivacySettingsCopy {
             + "on the same disk."
     }
 
-    /// Every row string, for the KTD-9 gate: no active-encryption claims while
-    /// SCR-220 is open, no auto-pause claims while SCR-224 is open.
-    static var allRowStrings: [String] {
+    /// Every row string for a given E2EE state, for the KTD-9/KD7 gate: the
+    /// E2EE strings are state-keyed, so the gate sweeps all three states —
+    /// no auto-pause claims while SCR-224 is open, and no later-stage E2EE
+    /// claims in any state.
+    static func allRowStrings(cloudE2EEEnabled: Bool?) -> [String] {
         [
             keepLocalTitle,
-            e2eeTitle, e2eeChip, e2eeSub,
+            e2eeTitle,
+            PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: cloudE2EEEnabled),
+            PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: cloudE2EEEnabled),
+            PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: cloudE2EEEnabled),
+            e2eeConfirmTitle, e2eeConfirmBody, e2eeConfirmAction,
             maskTitle, maskChip, maskSub, maskLink,
             pauseTitle, pauseSub,
             storageTitle, storageChangeLabel,
