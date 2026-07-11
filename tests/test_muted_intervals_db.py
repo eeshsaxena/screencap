@@ -75,6 +75,27 @@ def test_muted_intervals_stay_local_only(recording_db):
     assert upload._is_raw_artifact("some/nested/recording.db") is True
 
 
+def test_span_reader_returns_overlapping_intervals(recording_db):
+    from screencap.redaction.geometry import list_muted_intervals_in_span
+
+    crud.open_muted_interval(recording_db.session, recording_db.recording, 1010.0)
+    crud.close_muted_interval(recording_db.session, recording_db.recording, 1020.0)
+    crud.open_muted_interval(recording_db.session, recording_db.recording, 1030.0)  # open
+
+    got = list_muted_intervals_in_span(recording_db.db_path, 1005.0, 1035.0)
+    assert (1010.0, 1020.0) in got
+    assert (1030.0, None) in got  # open interval surfaced with end=None
+
+
+def test_span_reader_excludes_non_overlapping(recording_db):
+    from screencap.redaction.geometry import list_muted_intervals_in_span
+
+    crud.open_muted_interval(recording_db.session, recording_db.recording, 1010.0)
+    crud.close_muted_interval(recording_db.session, recording_db.recording, 1020.0)
+
+    assert list_muted_intervals_in_span(recording_db.db_path, 1050.0, 1060.0) == []
+
+
 def session_all(recording_db):
     return (
         recording_db.session.query(MutedInterval)

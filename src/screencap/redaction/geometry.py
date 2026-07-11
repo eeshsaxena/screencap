@@ -342,6 +342,51 @@ def geometry_capture_failures_in_span(
         return []
 
 
+def list_muted_intervals_in_span(
+    db_path: Path,
+    start_ts: float,
+    end_ts: float,
+    conn: Connection | None = None,
+) -> list[tuple[float, float | None]]:
+    """List muted spans (SCR-218 U3) overlapping the chunk span ``[start_ts,
+    end_ts]``, as ``(start, end)`` recording-relative tuples sorted ascending.
+
+    An open interval (still muted at read time — ``end_ts`` NULL) is returned
+    with ``end`` as ``None``; U6 treats it as muted to chunk end. A row overlaps
+    the span when its start is at/before ``end_ts`` and it has no end or its end
+    is at/after ``start_ts``. Returns ``[]`` (without raising) for recordings
+    predating the ``muted_intervals`` table or on any read error — a recording
+    with no mutes simply has no rows.
+
+    Args:
+        db_path: Path to the recording database.
+        start_ts: Inclusive start of the chunk frame span.
+        end_ts: Inclusive end of the chunk frame span.
+        conn: Optional open connection to reuse across many chunk spans.
+    """
+
+    def _query(c: Connection) -> list[tuple[float, float | None]]:
+        if not has_table(c, "muted_intervals"):
+            return []
+        rows = c.execute(
+            "SELECT start_ts, end_ts FROM muted_intervals "
+            "WHERE start_ts <= ? AND (end_ts IS NULL OR end_ts >= ?) "
+            "ORDER BY start_ts",
+            (end_ts, start_ts),
+        ).fetchall()
+        return [
+            (float(r[0]), None if r[1] is None else float(r[1])) for r in rows
+        ]
+
+    if conn is not None:
+        return _query(conn)
+    try:
+        with open_recording_db(db_path) as own_conn:
+            return _query(own_conn)
+    except Exception:
+        return []
+
+
 def load_window_events(db_path: Path) -> list[WindowContext]:
     """Load window_event rows sorted by timestamp."""
     with open_recording_db(db_path) as conn:

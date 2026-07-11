@@ -626,7 +626,10 @@ class ChunkProcessor:
 
         def _transcribe_step(i):
             self._set_status("Transcribing audio...")
-            result = self._transcribe(i)
+            # start_ts/end_ts are closed over from _run_agnostic_stages — the
+            # pipeline TranscribeStep signature stays (idx,) while U6 still gets
+            # the chunk span it needs for the muted-span marker.
+            result = self._transcribe(i, start_ts, end_ts)
             _abort_if_stopping()
             return result
 
@@ -857,8 +860,13 @@ class ChunkProcessor:
         logger.warning(f"Audio ack for chunk {idx} not received in 60s, proceeding")
         self._set_status("Audio ack timeout — proceeding")
 
-    def _transcribe(self, idx: int) -> Path | None:
-        """Transcribe audio chunk quietly (no print output). Returns transcript path or None."""
+    def _transcribe(self, idx: int, start_ts: float, end_ts: float) -> Path | None:
+        """Transcribe audio chunk quietly (no print output). Returns transcript path or None.
+
+        ``start_ts``/``end_ts`` are the chunk's recording-relative span, used to
+        drop muted-span speech and place the ``[microphone muted]`` marker
+        (SCR-218 U6) before the transcript is saved.
+        """
         audio_path = self._capture_dir / f"audio_{idx:04d}.flac"
         if not audio_path.exists():
             logger.info(f"No audio file for chunk {idx}, skipping transcription")
@@ -900,6 +908,9 @@ class ChunkProcessor:
                 full_text_parts.append(segment.text)
 
             transcript = "".join(full_text_parts).strip()
+            transcript, segments = self._apply_muted_marker(
+                start_ts, end_ts, transcript, segments,
+            )
             _save_transcript_quiet(
                 transcript, segments, transcript_path, transcript_json_path,
             )
@@ -930,6 +941,9 @@ class ChunkProcessor:
                     "end": seg["end"],
                     "text": seg["text"].strip(),
                 })
+            transcript, segments = self._apply_muted_marker(
+                start_ts, end_ts, transcript, segments,
+            )
             _save_transcript_quiet(
                 transcript, segments, transcript_path, transcript_json_path,
             )
@@ -973,6 +987,34 @@ class ChunkProcessor:
             )
         transcript_path.write_text(resp.text)
         transcript_json_path.write_text(json.dumps(resp.model_dump(), indent=2))
+
+    def _apply_muted_marker(self, start_ts, end_ts, transcript, segments):
+        """Drop muted-span speech and insert the ``[microphone muted]`` marker
+        for this chunk (SCR-218 U6).
+
+        Reads the local-only ``muted_intervals`` overlapping the chunk span and
+        rewrites the whisper segments so no speech captured while muted (or in
+        the stop-latency window) reaches the transcript — and, for cloud
+        recordings, the cloud. A no-op when the chunk had no mutes. Strictly
+        fail-open: any error leaves the original transcript untouched.
+        """
+        try:
+            from screencap.redaction.geometry import list_muted_intervals_in_span
+            from screencap.redaction.muted_marker import (
+                apply_muted_intervals_to_segments,
+            )
+
+            db_path = self._capture_dir / "recording.db"
+            intervals = list_muted_intervals_in_span(db_path, start_ts, end_ts)
+            if not intervals:
+                return transcript, segments
+            new_segments, new_text = apply_muted_intervals_to_segments(
+                segments, intervals, start_ts, end_ts,
+            )
+            return new_text, new_segments
+        except Exception as e:  # noqa: BLE001 — never fail a transcript on this
+            logger.warning(f"muted-marker post-process failed (non-fatal): {e}")
+            return transcript, segments
 
     def _export_events(self, idx: int, start_ts: float, end_ts: float) -> Path:
         """Export events from recording.db as JSONL for this chunk's time range.
