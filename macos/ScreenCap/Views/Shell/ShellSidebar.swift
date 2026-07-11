@@ -89,16 +89,24 @@ enum ShellSidebarModel {
         return StorageFooter(byteText: formatStorage(bytes), allLocal: !anyUploaded)
     }
 
-    /// SCR-239 (U11) — whether the standing "enable local intelligence" sidebar
-    /// hint should show: only when the active provider is on-device, no
-    /// downloadable model is installed yet, and the user hasn't dismissed it.
-    /// A cloud provider (which already names tasks) or an installed model hides it.
+    /// SCR-239 (U11) / R13 (U6) — whether the standing "enable local intelligence"
+    /// sidebar hint should show: only when the active provider is on-device, no
+    /// consented cloud fallback (`cloud_provider`) is set, no downloadable model
+    /// is installed yet, and the user hasn't dismissed it. A cloud provider or an
+    /// installed model hides it. The cloud slot is checked explicitly because
+    /// under the two-slot semantics a BYO pick sets only `cloud_provider` and
+    /// leaves `provider == "on-device"`; nil, empty/whitespace, and the CLI's
+    /// clear-literal "none" all mean unset — read through
+    /// `IntelligenceSelectionModel.normalizedCloudProvider` so the two sites
+    /// share one normalization rule.
     static func shouldShowLocalModelHint(
         provider: String?,
+        cloudProvider: String?,
         downloadedInstalled: Bool,
         dismissed: Bool
     ) -> Bool {
-        provider == "on-device" && !downloadedInstalled && !dismissed
+        let cloudUnset = IntelligenceSelectionModel.normalizedCloudProvider(cloudProvider) == nil
+        return provider == "on-device" && cloudUnset && !downloadedInstalled && !dismissed
     }
 
     /// Format a byte total the design's way ("4.2 GB"), stepping down to MB/KB for
@@ -186,12 +194,14 @@ struct ShellSidebarView: View {
     }
 
     /// The standing, dismissible "enable local intelligence" hint (SCR-239 U11).
-    /// Shown only when on-device is active and no model is installed; tapping it
-    /// opens the Intelligence pane, the [x] dismisses it for good (R7).
+    /// Shown only when on-device is active with no cloud fallback selected and
+    /// no model is installed; tapping it opens the Intelligence pane, the [x]
+    /// dismisses it for good (R7).
     @ViewBuilder
     private var localModelHint: some View {
         let show = ShellSidebarModel.shouldShowLocalModelHint(
             provider: intelligence.settings?.provider,
+            cloudProvider: intelligence.settings?.cloudProvider,
             downloadedInstalled: intelligence.settings?.downloadedModelInstalled ?? false,
             dismissed: hintDismissed
         )
