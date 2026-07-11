@@ -4480,6 +4480,138 @@ def search_status_cmd(as_json: bool) -> None:
         console.print(f"{key}: {value}")
 
 
+@cli.group("e2ee")
+def e2ee_group() -> None:
+    """End-to-end encryption for cloud copies (beta, SCR-220).
+
+    ``enable`` creates the device-held encryption key first and only then
+    flips ``cloud_e2ee_enabled`` on — a key failure leaves the flag untouched
+    so the account is never half-configured (flag on, no key, every upload
+    failing closed). ``disable`` writes an explicit ``false`` and keeps the
+    key so re-enabling never mints a second key (prior ciphertext stays
+    readable). ``status`` is read-only. Headless companion to the macOS
+    Privacy-settings toggle, which shells out to these verbs.
+    """
+
+
+def _set_cloud_e2ee_flag(value: bool) -> None:
+    """Persist ``cloud_e2ee_enabled`` through the same write machinery as
+    ``settings --set`` (atomic tomlkit write + in-process cache invalidation).
+
+    Always writes the literal value — ``disable`` must land an explicit
+    ``false`` in config.toml, never unset the key: an unset value would be
+    silently re-enrolled by a future default flip (Stage 3, U9).
+    """
+    from screencap.config import _CONFIG_PATH, invalidate_config_cache
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    doc["cloud_e2ee_enabled"] = value
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
+def _read_cloud_kek_id() -> str | None:
+    """Hex key id of the stored cloud KEK, or ``None`` (absent or unreadable).
+
+    Read-only — must never create a key (``status``/``disable`` paths)."""
+    from screencap import cloud_crypto
+
+    try:
+        key = cloud_crypto.get_cloud_kek()
+    except Exception:  # noqa: BLE001 — KeyringError etc.: report as absent
+        return None
+    if key is None:
+        return None
+    return cloud_crypto.cloud_key_id(key).hex()
+
+
+@e2ee_group.command("enable")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON. Auto-detected when stdout "
+                   "is not a TTY.")
+def e2ee_enable_cmd(as_json: bool) -> None:
+    """Create the encryption key (if needed) and turn on E2EE for cloud copies.
+
+    Key first, flag second: the one-time Keychain prompt may appear here (this
+    is a foreground process; the daemon can only read the key, never create
+    it). If key creation fails the flag is left untouched and the command
+    exits non-zero.
+    """
+    from screencap import cloud_crypto
+
+    try:
+        key = cloud_crypto.get_or_create_cloud_kek()
+    except Exception as exc:  # noqa: BLE001 — KeyringError etc.
+        if as_json:
+            click.echo(json.dumps({
+                "error": f"{type(exc).__name__}: {exc}",
+                "enabled": False,
+                "key_present": False,
+            }))
+        else:
+            console.print(
+                f"[red]Could not create the encryption key:[/red] {escape(str(exc))}"
+            )
+            console.print("[dim]E2EE was NOT enabled; settings are unchanged.[/dim]")
+        raise SystemExit(1)
+
+    _set_cloud_e2ee_flag(True)
+    key_id = cloud_crypto.cloud_key_id(key).hex()
+    if as_json:
+        click.echo(json.dumps(
+            {"enabled": True, "key_present": True, "key_id": key_id}
+        ))
+        return
+    console.print("[green]E2EE enabled[/green] for cloud copies (beta).")
+    console.print(f"  Key id: [bold]{key_id}[/bold] (held only in this Mac's Keychain)")
+
+
+@e2ee_group.command("disable")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON. Auto-detected when stdout "
+                   "is not a TTY.")
+def e2ee_disable_cmd(as_json: bool) -> None:
+    """Turn off E2EE for new cloud copies. The key is kept.
+
+    Writes an explicit ``cloud_e2ee_enabled = false`` (never unsets it) and
+    leaves the Keychain key in place so existing encrypted recordings stay
+    readable and re-enabling reuses the same key.
+    """
+    _set_cloud_e2ee_flag(False)
+    key_id = _read_cloud_kek_id()
+    if as_json:
+        click.echo(json.dumps(
+            {"enabled": False, "key_present": key_id is not None, "key_id": key_id}
+        ))
+        return
+    console.print("[yellow]E2EE disabled[/yellow] for new cloud copies.")
+    if key_id is not None:
+        console.print(f"  Key kept (id [bold]{key_id}[/bold]) — re-enabling reuses it.")
+
+
+@e2ee_group.command("status")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON. Auto-detected when stdout "
+                   "is not a TTY.")
+def e2ee_status_cmd(as_json: bool) -> None:
+    """Show the E2EE flag, key presence, and key id. Never creates a key."""
+    from screencap.config import get_cloud_e2ee_enabled
+
+    enabled = bool(get_cloud_e2ee_enabled())
+    key_id = _read_cloud_kek_id()
+    if as_json:
+        click.echo(json.dumps(
+            {"enabled": enabled, "key_present": key_id is not None, "key_id": key_id}
+        ))
+        return
+    console.print(f"  E2EE for cloud copies: {'enabled' if enabled else 'disabled'}")
+    console.print(f"  Encryption key:        {'present (id ' + key_id + ')' if key_id else 'none'}")
+
+
 @cli.group("storage")
 def storage_group() -> None:
     """Manage where recordings are stored (SCR-228).
