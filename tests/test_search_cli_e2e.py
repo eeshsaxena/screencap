@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,11 @@ def test_search_enable_flip_migrates_and_flips_gate(tmp_path):
     jpeg = io.BytesIO()
     Image.new("RGB", (64, 32), "white").save(jpeg, format="JPEG")
     (ss / "100.000000.jpg").write_bytes(jpeg.getvalue())
+    # Age it past the flip's active-writer grace (corpus_migrate._ACTIVE_WRITE_GRACE_S,
+    # 2s) so this pre-existing still migrates now instead of being deferred as a
+    # recorder's in-flight write — otherwise the test races that window on fast hosts.
+    old = time.time() - 10
+    os.utime(ss / "100.000000.jpg", (old, old))
     seed = _py(
         home,
         "from screencap.content_index import ContentIndex, IndexFrame, default_index_path;"
