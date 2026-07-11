@@ -9,6 +9,10 @@ import SwiftUI
 enum ShellRoute: Hashable {
     case library
     case journal
+    /// The Account & Plan pane (account-sheet U5, KTD-4): the Settings entry
+    /// renders the shared `AccountSheetView` as an embedded pane — sheet
+    /// presentation is reserved for the gate and upload entries.
+    case account
     /// The conversational-recall Chat destination — the FIRST search-like sidebar
     /// route (KTD7). Distinct from Search, which is the `RecallPaletteView` overlay
     /// palette (NOT a sidebar destination). Chat and Search share the retrieval
@@ -70,6 +74,10 @@ enum ShellSidebarModel {
     ]
 
     static let settingsNav: [ShellNavItem] = [
+        // Account is pinned FIRST (KTD-4): it is the paid-only gate's home
+        // surface, and burying it slows a lapsed user's path back to a
+        // resolvable state.
+        ShellNavItem(id: "account", label: "Account", route: .account, availability: .enabled),
         ShellNavItem(id: "privacy", label: "Privacy", route: .privacy, availability: .enabled),
         ShellNavItem(id: "appRules", label: "App rules", route: .appRules, availability: .enabled),
         ShellNavItem(id: "intelligence", label: "Intelligence", route: .intelligence, availability: .enabled),

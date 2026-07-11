@@ -224,7 +224,7 @@ struct NewRecordingSheet: View {
         // permission gate so the subscription requirement is the leading message.
         if auth.isGatedForLapse {
             close()
-            NotificationCenter.default.post(name: .screenCapOpenUpgradePrompt, object: nil)
+            NotificationCenter.default.post(name: .screenCapOpenAccountGate, object: nil)
             return
         }
         // Pre-spawn permission gate renders inline (KTD-8) rather than popping a

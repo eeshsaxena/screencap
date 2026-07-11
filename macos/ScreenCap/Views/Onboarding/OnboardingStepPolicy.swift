@@ -340,14 +340,6 @@ enum OnboardingCopy {
     static let cloudUpgradeCardMeta = "Upgrade — add cloud"
     static let cloudUpgradeBadge = "Upgrade"
 
-    /// Gated re-subscribe surface copy for a lapsed / never-entitled re-entry
-    /// (KTD-4 / R7): not a fresh trial chooser, but a "resume your subscription"
-    /// framing. The reassurance line states data is retained (R8).
-    static let lapsedHeadline = "Your subscription has lapsed."
-    static let lapsedSub =
-        "Recording and search are paused. Your recordings are safe on this Mac — "
-        + "browse and export them anytime. Resubscribe to record and search again."
-
     /// The on-screen trial banner text for each lifecycle state (U11). Pure copy
     /// (string-assertable in `OnboardingStepPolicyTests` without a render tree);
     /// the escalation (calm → urgent) is expressed by the words, and the color is
@@ -376,27 +368,11 @@ enum OnboardingCopy {
         "Team libraries and invites are on the way",
     ]
 
-    // Step 4 — account (design 238–262). The design's "keys and billing" copy
-    // and the "never readable by us" footer are SCR-221/SCR-229/SCR-220 scope
-    // (KTD-9) — the interim copy claims nothing about keys, billing, or
-    // encryption.
-    static let accountHeadline = "Create your Screencap account."
-    static let accountSub =
-        "Sign-in opens in your browser. Uploads still happen only when you "
-        + "approve them, recording by recording."
-
-    // Billing U9 — the post-sign-in upgrade panel for Personal cloud. Unlike the
-    // pre-billing gate, these DO carry the price ($5/mo is true and billable
-    // now), but carry NO end-to-end-encryption / "we can't watch" claim (R2 —
-    // the paid tier is server-readable). Team stays price-free (coming soon).
-    static let upgradeSub =
-        "Personal cloud keeps the recordings you approve backed up and shareable. "
-        + "Local recording stays free either way."
-    static let upgradePriceLine = "$5 / month · cancel anytime"
-    static let upgradeBullets = [
-        "Upload the recordings you approve",
-        "Share single recordings by link",
-    ]
+    // Step 4 — account: the body is the shared `AccountSheetView` since
+    // account-sheet U5, so its headline/plan/upgrade copy lives in
+    // `AccountSheetCopy` (pinned by `AccountSheetPolicyTests`). The step-local
+    // account/upgrade/lapsed strings that used to live here were retired with
+    // the bespoke panel.
 
     // Step 5 — team setup (design 264–288). The design's "one shared,
     // encrypted library" is SCR-221/SCR-220; the fields render per the design
@@ -419,22 +395,23 @@ enum OnboardingCopy {
         + "in Settings → Intelligence."
     static let downloadModelSkip = "Not now"
 
-    /// Every string the storage + account steps render, for the KTD-9 / R12
+    /// Every string the storage step renders, for the KTD-9 / R12
     /// string-level gate (no E2EE / "we can't watch" claims). Includes the
-    /// paid-launch two-tier cards, the trial disclosure, and the lapsed surface
-    /// so the honesty assertion covers the new copy too.
+    /// paid-launch two-tier cards and the trial disclosure so the honesty
+    /// assertion covers the new copy too. (The account step's copy lives in
+    /// `AccountSheetCopy` since account-sheet U5, audited by
+    /// `AccountSheetPolicyTests`.)
     static var storageAndAccountStrings: [String] {
         [
             storageHeadline, storageSub, storageFootnote,
             localCardTitle, localCardMeta,
             personalCardTitle, personalCardMeta, personalCardMetaFree,
             teamCardTitle, teamCardMeta,
-            accountHeadline, accountSub,
-            // Paid-only launch (U11): the two priced cards + trial + lapsed copy.
+            // Paid-only launch (U11): the two priced cards + trial copy.
             localProCardTitle, localProCardMeta,
             cloudCardTitle, cloudCardMeta,
             cloudUpgradeCardMeta, cloudUpgradeBadge,
-            trialDisclosure, lapsedHeadline, lapsedSub,
+            trialDisclosure,
             OnboardingStepPolicy.storageCTATitle(tier: .local),
             OnboardingStepPolicy.storageCTATitle(tier: .personalCloud),
             OnboardingStepPolicy.storageCTATitle(tier: .teamCloud),

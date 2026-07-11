@@ -7,6 +7,15 @@ import OSLog
 /// Tail with: `log stream --predicate 'subsystem == "com.screencap.macos"'`.
 private let recorderLogger = Logger(subsystem: "com.screencap.macos", category: "recorder")
 let SUPPORTED_API_SCHEMA_VERSION = 1
+/// The auth CLI envelopes (`whoami` / `checkout-url` / `portal-url` /
+/// `reconcile-entitlement`) version independently of the daemon `/v0/*` API
+/// above: Python's `_AUTH_SCHEMA_VERSION` was bumped 1 → 2 when the two-tier
+/// `tier` + `trial_end` claims joined the envelope (U6), while the daemon
+/// envelopes stayed at 1. `CloudAuthController`'s drift check compares against
+/// this constant so an auth-side bump warns exactly once per real drift —
+/// not spuriously on every envelope because it was measured against the
+/// daemon's version.
+let SUPPORTED_AUTH_SCHEMA_VERSION = 2
 
 /// Status payload from `screencap status --json` (Unit 4 schema v1).
 struct CLIStatus: Decodable {

@@ -35,9 +35,11 @@ struct ReviewWindow: View {
     @State private var riskyIntervals: [TimelineInterval] = []
     @State private var currentTime: Double = 0
     @State private var timelineLoaded = false
-    /// Drives the "Sign in to upload" sheet (plan U6). Shown when Upload is
-    /// tapped while signed out, instead of letting the CLI refuse opaquely.
-    @State private var showSignInSheet = false
+    /// Drives the Account & Plan sheet in `.upload` context (plan U6,
+    /// account-sheet U5/R14). Shown when Upload is tapped while signed out
+    /// (sign-in framing) or while signed in on Local Pro (upgrade-to-Cloud
+    /// framing), instead of letting the CLI refuse opaquely.
+    @State private var showAccountSheet = false
     /// Tracks whether this window has incremented the upload coordinator's
     /// active-upload count, so Sign Out stays disabled for exactly the span of
     /// this window's upload and the count is balanced on close.
@@ -122,34 +124,43 @@ struct ReviewWindow: View {
             }
             syncUploadCount(for: newState)
         }
-        .sheet(isPresented: $showSignInSheet, onDismiss: {
-            // Esc / system / external (menu) dismissal bypasses the Cancel
+        .sheet(isPresented: $showAccountSheet, onDismiss: {
+            // Esc / system / external (menu) dismissal bypasses the Close
             // button's onDismiss closure, so run the same ownership-aware
             // teardown here. Converges every dismissal route on one place.
             teardownSignInIfOwned()
         }) {
-            SignInPromptView(
+            AccountSheetView(
                 auth: auth,
-                onSignedIn: {
-                    showSignInSheet = false
+                context: .upload,
+                onStartSignIn: {
+                    // Ownership latch (R14): fired precisely when THIS sheet's
+                    // own Sign In / retry buttons launch a login (the retired
+                    // SignInPromptView.onStartSignIn pattern), so closing this
+                    // window cancels only flows it actually started — never a
+                    // sign-in another surface began while this sheet happened
+                    // to be up.
+                    startedSignIn = true
+                },
+                onSettled: {
+                    // Fires exactly once, on the signed-out → signed-in
+                    // transition only (the sheet's one-shot latch) — dismiss
+                    // and auto-start the gated upload (R14). The signed-in
+                    // Local Pro presentation never settles (no transition), so
+                    // it can never auto-fire an upload the signer would refuse.
+                    showAccountSheet = false
                     model.startUpload()
                 },
                 onDismiss: {
-                    // Closing the sheet via its own Cancel sets isPresented
+                    // Closing the sheet via its own Close sets isPresented
                     // false, which fires the .sheet(onDismiss:) teardown above —
                     // so this only needs to dismiss; cancel happens there.
-                    showSignInSheet = false
-                },
-                onStartSignIn: {
-                    // This window launched the login, so it owns the in-flight
-                    // flow and is the one allowed to cancel it on close/dismiss.
-                    startedSignIn = true
+                    showAccountSheet = false
                 }
             )
-            // Block interactive dismissal while the browser round-trip is live
-            // so a stray Esc/drag can't silently strand the login subprocess;
-            // the in-progress sheet still offers an explicit Cancel.
-            .interactiveDismissDisabled(isSignInInProgress)
+            // Interactive-dismissal blocking while the browser round-trip is
+            // live is owned by AccountSheetView itself (it applies
+            // `.interactiveDismissDisabled` while signInFlow is in progress).
         }
         .onDisappear {
             model.windowDidClose()
@@ -186,9 +197,13 @@ struct ReviewWindow: View {
         }
     }
 
-    /// Upload tapped (the `.ready` and `.failed`-with-retry action). Signed in
-    /// → start the upload; signed out → present the sign-in prompt rather than
-    /// letting `screencap upload` refuse opaquely (plan U6).
+    /// Upload tapped (the `.ready` and `.failed`-with-retry action). Cloud-
+    /// entitled and signed in → start the upload; signed out, signed in on
+    /// Local Pro, or definitively lapsed with the paywall on (R14 — today's
+    /// raw signer-refusal paths) → present the Account & Plan sheet in
+    /// `.upload` context rather than letting `screencap upload` refuse
+    /// opaquely (plan U6 / account-sheet U5).
+    /// The pure decision lives in `AccountSheetPolicy.uploadEntryAction`.
     ///
     /// `refreshIfNeeded` first, because sign-in state is now resolved lazily
     /// rather than at app launch (SCR-241): if the user opens a review window
@@ -200,10 +215,16 @@ struct ReviewWindow: View {
     private func attemptUpload() {
         Task {
             await auth.refreshIfNeeded()
-            if auth.isSignedIn {
+            switch AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: auth.isSignedIn,
+                tier: auth.tier,
+                trialState: auth.trialState,
+                paywallEnabled: auth.paywallEnabled
+            ) {
+            case .proceed:
                 model.startUpload()
-            } else {
-                showSignInSheet = true
+            case .presentAccountSheet:
+                showAccountSheet = true
             }
         }
     }

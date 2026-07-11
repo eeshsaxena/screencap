@@ -213,7 +213,7 @@ struct RecallPaletteView: View {
     /// presenting under the scrim.
     private func upgrade() {
         dismiss()
-        NotificationCenter.default.post(name: .screenCapOpenUpgradePrompt, object: nil)
+        NotificationCenter.default.post(name: .screenCapOpenAccountGate, object: nil)
     }
 
     // MARK: - Settings + consent (inherited from the retired SearchView, palette-scoped)

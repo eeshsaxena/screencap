@@ -179,8 +179,12 @@ struct OnboardingStorageStep: View {
     }
 }
 
-/// Step 4 — account (design 238–262). All three actions route to the existing
-/// browser sign-in (`CloudAuthController` → `screencap login`); sign-in leaves
+/// Step 4 — account. The account/plans body is the shared `AccountSheetView`
+/// in `.onboarding` context (account-sheet U5): sign-in, plan state, checkout,
+/// and the checkout-pending/reconcile machinery are all controller-owned
+/// (KTD-6), so this step keeps no bespoke duplicate. The wizard retains its
+/// chrome — the skip link and the footer progress dots stay wizard-owned; the
+/// sheet's own header serves as the step title. Sign-in leaves
 /// `upload_default` untouched (`ask`), so the Review window stays the upload
 /// gate. A functional skip keeps the wizard completable without an account.
 struct OnboardingAccountStep: View {
@@ -189,17 +193,10 @@ struct OnboardingAccountStep: View {
     let onSignedIn: () -> Void
     let onSkip: () -> Void
 
-    /// Short reason surfaced when minting the checkout URL fails (U9).
-    @State private var upgradeError: String?
-    /// Post-checkout pending: set true when the user opens Stripe Checkout, so
-    /// the return path shows "unlocks automatically" (a spinner + reconcile),
-    /// never a fresh "start trial" that reads like a failed payment (U11).
-    @State private var checkoutPending = false
-
-    /// The paid tier this step checks out — the storage selection mapped to the
-    /// entitlement/price tier (U11). Local Pro on the `.local` storage tier,
-    /// Cloud on `.personalCloud`. Passed to `startCheckout` for PRICE selection
-    /// only; the webhook is the entitlement authority (KTD-2).
+    /// The paid tier this step's storage selection maps to (U11): Local Pro on
+    /// the `.local` storage tier, Cloud on `.personalCloud`. Used only for the
+    /// wizard-advance gate — checkout itself runs inside the shared sheet, and
+    /// the webhook is the entitlement authority (KTD-2).
     private var checkoutTier: EntitlementTier {
         switch tier {
         case .local: return .localPro
@@ -208,16 +205,14 @@ struct OnboardingAccountStep: View {
         }
     }
 
-    /// After sign-in, a paid cloud tier stays on this step until the trial /
-    /// subscription is active — the upgrade panel drives checkout (U8/U9/U11).
-    /// Only when the client paywall is on (KTD-6); off → no soft gate.
+    /// Whether the wizard must hold on this step after sign-in: with the
+    /// paywall on, a paid tier stays until the trial / subscription is active
+    /// (the sheet's plan buttons drive checkout). Off → no soft gate.
     ///
-    /// Grace/stale (KTD-4): while `whoami` is stale the daemon grace-allows via
-    /// the lease, so we must NOT show the upgrade/"expired" surface then — an
-    /// offline payer would see a spurious paywall. `trialState == .indeterminate`
-    /// captures the stale case (and the pre-resolution case), so gating on
-    /// "not indeterminate" keeps the offline payer out of the upgrade panel.
-    private var showUpgrade: Bool {
+    /// Grace/stale (KTD-4): `trialState == .indeterminate` captures the stale
+    /// case (and pre-resolution), so an offline payer is never held on a
+    /// spurious paywall.
+    private var mustStayForEntitlement: Bool {
         auth.paywallEnabled
             && auth.isSignedIn
             && checkoutTier != .none
@@ -226,316 +221,65 @@ struct OnboardingAccountStep: View {
             && auth.trialState != .subscribed
     }
 
-    /// The lapsed / never-entitled re-entry renders a gated RE-subscribe surface
-    /// (not a fresh chooser) per U11.
-    private var isLapsed: Bool {
-        showUpgrade && auth.trialState == .lapsed
+    /// Whether the wizard may leave this step: signed in, and either no
+    /// entitlement hold remains (paywall off, Team, offline-stale grace) or a
+    /// paid entitlement has actually resolved. Deliberately keyed on ANY
+    /// resolved entitlement — `isSubscribed` or any held `tier` (a trial
+    /// carries the tier it converts into) — NOT only the storage-mapped
+    /// `checkoutTier`: a user who picked Local storage but bought Cloud in the
+    /// sheet must advance too, not be stranded with only Skip.
+    private var canAdvance: Bool {
+        auth.isSignedIn
+            && (!mustStayForEntitlement || auth.isSubscribed || auth.tier != .none)
+    }
+
+    /// One-shot latch: the settle callback, the entitlement observers, and the
+    /// on-appear short-circuit can all conclude "advance" for the same resolve
+    /// — the wizard must move exactly once.
+    @State private var didAdvance = false
+
+    private func advanceIfSettled() {
+        guard !didAdvance, canAdvance else { return }
+        didAdvance = true
+        onSignedIn()
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(upgradeHeadline)
-                .font(SCTypography.serifHeading)
-                .foregroundStyle(Color.scInk)
-                .multilineTextAlignment(.center)
-                .padding(.bottom, 10)
-            Text(upgradeSubcopy)
-                .font(SCTypography.sans(size: 14))
-                .foregroundStyle(Color.scInkSecondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 440)
-                .padding(.bottom, 30)
-
-            if auth.signInFlow == .inProgress {
-                signInWaiting
-            } else if showUpgrade {
-                upgradePanel
-            } else {
-                signInActions
-            }
+            AccountSheetView(
+                auth: auth,
+                context: .onboarding,
+                onSettled: {
+                    // Sign-in just completed on this step. Paywall-off, Team,
+                    // already-entitled, and offline-stale accounts advance
+                    // immediately; a paid tier holds for entitlement — the
+                    // onChange wiring below advances once it resolves.
+                    advanceIfSettled()
+                }
+                // No onDismiss: embedded in the wizard chrome, the skip link
+                // below is the way past this step.
+            )
 
             OnboardingLinkButton(title: "Skip for now", action: onSkip)
                 .padding(.top, 24)
         }
         .padding(.horizontal, 100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Resolve sign-in state lazily when this account step appears (sign-in
-        // is no longer probed at app launch — SCR-241). Without this, a user who
-        // replays onboarding while already signed in would see `status ==
-        // .unknown` (→ `isSignedIn == false`) and be offered a redundant sign-in
-        // instead of the upgrade panel. The account step is an explicit cloud
-        // surface, so decrypting the Keychain (and any prompt) here is expected.
-        .task { await auth.refreshIfNeeded() }
-        // Trial/subscription just became active (webhook granted it) → finish.
-        // Cloud maps to `isSubscribed`; Local Pro converts once the tier resolves
-        // (not `isSubscribed`, which is cloud-only), so also finish when the
-        // resolved entitlement tier now matches what this step checked out.
-        .onChange(of: auth.isSubscribed) { subscribed in
-            if subscribed, checkoutTier == .cloud { onSignedIn() }
-        }
-        .onChange(of: auth.tier) { newTier in
-            if newTier == checkoutTier, checkoutTier != .none { onSignedIn() }
-        }
-        // Returning from the browser checkout → re-check entitlement (both
-        // tiers). The pending flag survives the app-switch so the return shows
-        // the pending panel, not "start trial".
-        .onReceive(NotificationCenter.default.publisher(
-            for: NSApplication.didBecomeActiveNotification)) { _ in
-            if showUpgrade || checkoutPending { Task { await auth.refreshEntitlement() } }
-        }
-    }
-
-    /// Headline reflects the entitlement state: lapsed re-subscribe, the paid
-    /// upgrade, or the pre-billing account creation.
-    private var upgradeHeadline: String {
-        if isLapsed { return OnboardingCopy.lapsedHeadline }
-        if showUpgrade { return "One more step to unlock \(checkoutTier == .cloud ? "cloud" : "Local Pro")." }
-        return OnboardingCopy.accountHeadline
-    }
-
-    private var upgradeSubcopy: String {
-        if isLapsed { return OnboardingCopy.lapsedSub }
-        if showUpgrade { return OnboardingCopy.upgradeSub }
-        return OnboardingCopy.accountSub
-    }
-
-    /// The tier's price line, sourced from `PricingCatalog` (single source,
-    /// KTD-7). Cloud gets the Cloud price; Local Pro the Local Pro price.
-    private var upgradePriceLine: String {
-        checkoutTier == .cloud
-            ? "\(PricingCatalog.cloudPriceLine) · cancel anytime"
-            : "\(PricingCatalog.localProPriceLine) · cancel anytime"
-    }
-
-    /// The tier's selling bullets — Cloud vs Local Pro card bullets (KTD-7).
-    private var upgradeBullets: [String] {
-        checkoutTier == .cloud ? OnboardingCopy.cloudCardBullets : OnboardingCopy.localProCardBullets
-    }
-
-    /// The checkout CTA label — "Resubscribe" on a lapsed re-entry, a trial
-    /// "Start free trial" otherwise (R5). Both carry the tier's price.
-    private var checkoutButtonTitle: String {
-        let price = checkoutTier == .cloud ? PricingCatalog.cloudMonthly : PricingCatalog.localProMonthly
-        return isLapsed
-            ? "Resubscribe — \(price)/month"
-            : "Start free trial — then \(price)/month"
-    }
-
-    private var upgradePanel: some View {
-        VStack(spacing: 12) {
-            Text(upgradePriceLine)
-                .font(SCTypography.metaMono)
-                .foregroundStyle(Color.scTeal)
-
-            // Trial lifecycle banner (U11): calm "N days left" → escalated
-            // near-expiry → urgent last-day. Color escalates with urgency; the
-            // copy discloses auto-conversion (R12). No banner on lapsed (that is
-            // the whole-panel re-subscribe framing) or subscribed.
-            if let banner = OnboardingCopy.trialBanner(for: auth.trialState) {
-                Text(banner)
-                    .font(SCTypography.sans(size: 12.5, weight: .semibold))
-                    .foregroundStyle(trialBannerColor)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityAddTraits(.updatesFrequently)
-            }
-
-            ForEach(upgradeBullets, id: \.self) { bullet in
-                HStack(alignment: .top, spacing: 8) {
-                    Text("—").foregroundStyle(Color.scInkMuted)
-                    Text(bullet).foregroundStyle(Color.scInkSecondary)
-                }
-                .font(SCTypography.sans(size: 12.5))
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            // R12 — auto-conversion + cancellation disclosed before any charge.
-            Text(OnboardingCopy.trialDisclosure)
-                .font(SCTypography.sans(size: 11.5))
-                .foregroundStyle(Color.scInkMuted)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if let upgradeError {
-                Text(upgradeError)
-                    .font(SCTypography.sans(size: 12.5))
-                    .foregroundStyle(Color.scRust)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 2)
-            }
-
-            OnboardingPrimaryButton(title: checkoutButtonTitle) {
-                upgradeError = nil
-                checkoutPending = true
-                // Pass the chosen tier so Checkout selects the right price; the
-                // webhook re-derives the entitlement (KTD-2). Failure clears the
-                // pending flag so the user can retry, not sit on a false spinner.
-                auth.startCheckout(tier: checkoutTier) { reason in
-                    upgradeError = reason
-                    checkoutPending = false
-                }
-            }
-            .padding(.top, 4)
-            .accessibilityLabel(checkoutButtonTitle)
-            .accessibilityHint("Requires a paid subscription. \(OnboardingCopy.trialDisclosure)")
-
-            // Post-checkout pending (U11): once Checkout is opened, show the
-            // "unlocks automatically" reassurance so the return from Stripe never
-            // reads as a failed payment. Shown for BOTH tiers.
-            if checkoutPending {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Unlocks automatically once payment completes.")
-                        .font(SCTypography.sans(size: 12))
-                        .foregroundStyle(Color.scInkMuted)
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Waiting for payment to complete. Your subscription unlocks automatically.")
-            }
-
-            OnboardingLinkButton(title: "I've paid — check now") {
-                // Reconcile first (grant-only self-heal for a dropped checkout
-                // webhook), then force-refresh — so a paid customer is never
-                // stuck if the webhook never landed (U14).
-                Task { await auth.reconcileEntitlement() }
-            }
-        }
-        .frame(width: 360)
-    }
-
-    /// The trial banner color escalates with urgency — teal (calm) → amber
-    /// (near-expiry) → rust (last day). Neutral for the non-banner states.
-    private var trialBannerColor: Color {
-        switch auth.trialState {
-        case .active: return .scTeal
-        case .nearExpiry: return .scAmber
-        case .lastDay: return .scRust
-        case .indeterminate, .subscribed, .lapsed: return .scInkMuted
-        }
-    }
-
-    private var signInWaiting: some View {
-        VStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.small)
-            Text("Waiting for sign-in in your browser…")
-                .font(SCTypography.sans(size: 13))
-                .foregroundStyle(Color.scInkSecondary)
-            Button("Cancel") { auth.cancelSignIn() }
-                .buttonStyle(.plain)
-                .font(SCTypography.sans(size: 12.5))
-                .underline()
-                .foregroundStyle(Color.scInkMuted)
-        }
-        .frame(width: 340)
-    }
-
-    private var signInActions: some View {
-        VStack(spacing: 10) {
-            if case .failed(let reason) = auth.signInFlow {
-                Text(reason)
-                    .font(SCTypography.sans(size: 12.5))
-                    .foregroundStyle(Color.scRust)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 4)
-            }
-            providerButton(label: "Continue with Google", monogram: "G")
-            appleButton
-            HStack(spacing: 12) {
-                Rectangle().fill(Color.scBorderWarm).frame(height: 1)
-                Text("or")
-                    .font(SCTypography.metaMonoSmall)
-                    .foregroundStyle(Color.scInkMuted)
-                Rectangle().fill(Color.scBorderWarm).frame(height: 1)
-            }
-            .padding(.vertical, 6)
-            workEmailRow
-        }
-        .frame(width: 340)
-    }
-
-    /// Every provider action invokes the same browser flow — the sign-in page
-    /// is where the provider choice actually happens until SCR-221/SCR-229
-    /// bring native per-provider flows.
-    private func startSignIn() {
-        auth.startSignIn { success in
-            if success { proceedAfterSignIn() }
-        }
-    }
-
-    /// With the paywall on, a paid cloud tier requires an active trial /
-    /// subscription before finishing — the upgrade panel (shown reactively when
-    /// `showUpgrade`) drives it. Paywall-off, Team, already-entitled, and
-    /// offline-stale accounts proceed immediately (U9 / KTD-6 / KTD-4). Uses the
-    /// same `showUpgrade` gate as the panel so the "stay on this step" decision
-    /// can't drift from what is actually rendered.
-    private func proceedAfterSignIn() {
-        if showUpgrade { return }
-        onSignedIn()
-    }
-
-    private func providerButton(label: String, monogram: String) -> some View {
-        Button(action: startSignIn) {
-            HStack(spacing: 10) {
-                Text(monogram)
-                    .font(SCTypography.grotesk(size: 15, weight: .bold))
-                    .foregroundStyle(Color.scTeal)
-                Text(label)
-                    .font(SCTypography.sans(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.scInk)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .background(Color.scPaper, in: Capsule())
-            .overlay(Capsule().strokeBorder(Color.scBorderWarm, lineWidth: 1))
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var appleButton: some View {
-        Button(action: startSignIn) {
-            HStack(spacing: 10) {
-                Image(systemName: "apple.logo")
-                    .font(.system(size: 13))
-                Text("Continue with Apple")
-                    .font(SCTypography.sans(size: 14, weight: .semibold))
-            }
-            .foregroundStyle(Color.scCanvas)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .background(Color.scInk, in: Capsule())
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var workEmailRow: some View {
-        HStack(spacing: 8) {
-            // Decorative field per the design; email entry happens on the
-            // browser sign-in page, so typing here would be silently ignored —
-            // disabled keeps the row honest.
-            Text("work email…")
-                .font(SCTypography.sans(size: 13.5))
-                .foregroundStyle(Color.scInkMuted)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 11)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.scPaper, in: Capsule())
-                .overlay(Capsule().strokeBorder(Color.scBorderWarm, lineWidth: 1))
-                .help("Email sign-in continues in your browser")
-            Button(action: startSignIn) {
-                Text("Continue")
-                    .font(SCTypography.sans(size: 13.5, weight: .semibold))
-                    .foregroundStyle(Color.scCanvas)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 11)
-                    .background(Color.scTeal, in: Capsule())
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
+        // A paid entitlement just resolved (webhook granted it) → finish.
+        // Cloud surfaces as `isSubscribed`; either trial/paid tier surfaces as
+        // `tier`/`trialState` — watch all three so the advance keys on the
+        // entitlement actually granted, whichever tier it is (cross-tier fix).
+        .onChange(of: auth.isSubscribed) { _ in advanceIfSettled() }
+        .onChange(of: auth.tier) { _ in advanceIfSettled() }
+        .onChange(of: auth.trialState) { _ in advanceIfSettled() }
+        // Replay / already-signed-in fix: `onSettled` fires only on the
+        // signed-out → signed-in TRANSITION, so a user re-running onboarding
+        // while signed in and entitled would otherwise get no advance at all.
+        // Resolve lazily, then short-circuit (mirrors the retired
+        // `proceedAfterSignIn` behavior). No-ops when a hold remains.
+        .task {
+            await auth.refreshIfNeeded()
+            advanceIfSettled()
         }
     }
 }
