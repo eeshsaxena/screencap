@@ -47,10 +47,12 @@ crypto/gating core (U6 core) landed. Plan:
   this box — they fail on clean `main` too; the concurrent `fix/daemon-test-config-hermeticity`
   branch fixes exactly that harness issue).
 - **Two call-graph guards pass** ✓.
-- **Swift `xcodebuild test` green** ✓ *for this change* — the whole app + test target
-  compile and every new/regression class passes; the only full-suite failures are the
-  flaky daemon-session integration tests, which fail **identically on clean `main`**
-  (verified in a control worktree) and are being fixed on a separate branch.
+- **Swift `xcodebuild test` green** ✓ — **940 tests, 0 failures** (19s, `test-without-building`)
+  excluding the 5 pre-existing-flaky daemon-family classes the gate itself caveats
+  (`DaemonClient`, `DaemonClientBackfill`, `DaemonInstallController`, `DaemonSessionService`,
+  `RecorderControllerDaemon`) — they fail **identically on clean `main`** (verified in a
+  control worktree) and are being fixed on a separate `fix/daemon-test-config-hermeticity`
+  branch. My change contributes zero failures.
 - **End-to-end** — automated in two layers:
   - Data plane (`tests/test_search_guardrails_e2e.py`): gate default-on → encrypted
     capture (only `.jpg.enc`) → secrets scrubbed at index (planted secret not findable,
