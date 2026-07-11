@@ -293,12 +293,12 @@ final class CloudAuthController: ObservableObject {
     /// additive until U5 switches onboarding over). Set when `startCheckout`
     /// runs; drives the "unlocks automatically" pending rendering and gates the
     /// app-activation entitlement refresh. Cleared when the entitlement resolves
-    /// to `checkoutTargetTier` with no live trial, on mint failure, and on
-    /// sign-out/account switch.
+    /// to `checkoutTargetTier` in a live entitled state (trialing or converted),
+    /// on mint failure, and on sign-out/account switch.
     @Published private(set) var checkoutPending = false
     /// The paid tier the pending checkout targets (KTD-6). Remembered so the
     /// webhook-lag window can be told apart from "resolved": only an envelope
-    /// that reports THIS tier (and no live `trial_end`) settles the flag.
+    /// that reports THIS tier in a live entitled trial state settles the flag.
     /// Re-tapping a tier replaces it — an abandoned Stripe tab stays
     /// recoverable in place. Nil whenever `checkoutPending` is false.
     @Published private(set) var checkoutTargetTier: EntitlementTier?
@@ -338,6 +338,15 @@ final class CloudAuthController: ObservableObject {
     /// ignored rather than corrupting the live attempt (e.g. clobbering the new
     /// `loginHandle` or flipping the new flow to `.failed`).
     private var loginGeneration = 0
+    /// Monotonic per-attempt token for `startCheckout`, mirroring
+    /// `loginGeneration`. Re-tapping a tier replaces the target and mints a
+    /// fresh URL (a supported flow), so a superseded attempt's late mint
+    /// failure — or late success — must not clear the CURRENT attempt's
+    /// pending state or open a stale URL. Each `startCheckout` bumps it and
+    /// the mint Task captures the value; a mismatch on resume means the
+    /// attempt was superseded (or sign-out tore the machinery down) and the
+    /// Task returns without mutating anything.
+    private var checkoutGeneration = 0
     /// Completion for the in-flight attempt (the Upload gate's "proceed once
     /// signed in"). Fired exactly once per attempt — on success, failure, or
     /// cancel — then cleared.
@@ -478,15 +487,22 @@ final class CloudAuthController: ObservableObject {
 
     /// Clear checkout-pending once the entitlement has actually converged on
     /// the remembered target (account-sheet KTD-6): the tier matches AND the
-    /// account is no longer trialing (`trial_end` absent → `.subscribed`).
-    /// Tier-match alone is NOT enough — during a same-tier trial the tier
-    /// matches before any payment lands, and clearing then would drop the
-    /// "unlocks automatically" reassurance mid-checkout. Runs on every
-    /// entitlement recompute (refresh, force-refresh, post-login) so the
-    /// webhook's grant settles the flag no matter which read path observes it.
+    /// trial state reads as live-entitled. Every checkout goes through the
+    /// mandatory card-required trial (billing.py always mints `trialing`
+    /// subscriptions with a future `trial_end`), so a just-completed purchase
+    /// resolves to the target tier in `.active`/`.nearExpiry`/`.lastDay` —
+    /// requiring `.subscribed` here would leave the flag stuck for the whole
+    /// trial. Any live entitled state settles; only `.indeterminate` (stale /
+    /// unresolved — the webhook-lag window) and `.lapsed` keep it armed.
+    /// Runs on every entitlement recompute (refresh, force-refresh,
+    /// post-login) so the webhook's grant settles the flag no matter which
+    /// read path observes it.
     private func settleCheckoutPendingIfResolved() {
-        guard checkoutPending, let target = checkoutTargetTier else { return }
-        if tier == target, trialState == .subscribed {
+        guard checkoutPending, let target = checkoutTargetTier, tier == target else { return }
+        switch trialState {
+        case .indeterminate, .lapsed:
+            return
+        case .subscribed, .active, .nearExpiry, .lastDay:
             checkoutPending = false
             checkoutTargetTier = nil
         }
@@ -613,16 +629,23 @@ final class CloudAuthController: ObservableObject {
         accountError = nil
         checkoutPending = true
         checkoutTargetTier = tier
+        checkoutGeneration &+= 1
+        let generation = checkoutGeneration
         Task { [weak self] in
             guard let self else { return }
             do {
                 let data = try await self.service.fetchCheckoutURL(tier: checkoutTier)
+                // Superseded by a re-tap (or torn down by sign-out) while the
+                // mint was in flight: this attempt owns no state anymore —
+                // don't open its stale URL or touch the live attempt's pending.
+                guard generation == self.checkoutGeneration else { return }
                 let env = CheckoutURLEnvelope.parse(data)
                 if env?.ok != false, self.openBillingURL(env?.url) {
                     return // Opened; pending settles when the entitlement resolves.
                 }
                 self.failCheckout(with: AccountErrorCopy.from(code: env?.code), onFailure: onFailure)
             } catch {
+                guard generation == self.checkoutGeneration else { return }
                 self.failCheckout(with: AccountErrorCopy.from(error: error), onFailure: onFailure)
             }
         }
@@ -909,9 +932,12 @@ final class CloudAuthController: ObservableObject {
 
     /// Version-keyed variant shared with the portal envelope (which is not an
     /// `AuthWhoAmIEnvelope`) so every auth-adjacent envelope drifts loudly.
+    /// Compares against `SUPPORTED_AUTH_SCHEMA_VERSION` (the auth CLI's
+    /// `_AUTH_SCHEMA_VERSION`), NOT `SUPPORTED_API_SCHEMA_VERSION` — the
+    /// daemon `/v0/*` API versions independently of the auth envelopes.
     private func warnOnSchemaDrift(version: Int?) {
-        if let version, version != SUPPORTED_API_SCHEMA_VERSION {
-            authLogger.warning("Auth envelope schema_version=\(version, privacy: .public) does not match SwiftUI side (\(SUPPORTED_API_SCHEMA_VERSION, privacy: .public)). Processing anyway.")
+        if let version, version != SUPPORTED_AUTH_SCHEMA_VERSION {
+            authLogger.warning("Auth envelope schema_version=\(version, privacy: .public) does not match SwiftUI side (\(SUPPORTED_AUTH_SCHEMA_VERSION, privacy: .public)). Processing anyway.")
         }
     }
 
@@ -936,7 +962,9 @@ final class CloudAuthController: ObservableObject {
         // (account-sheet KTD-6): the remembered target and both pending flags
         // belong to the account that started them — a different account later
         // resolving the same tier must not settle the old attempt. Stale error
-        // copy goes with them.
+        // copy goes with them, and the generation bump keeps an in-flight
+        // mint's late callbacks from repopulating what was just cleared.
+        checkoutGeneration &+= 1
         checkoutPending = false
         checkoutTargetTier = nil
         portalReturnPending = false
