@@ -83,10 +83,26 @@ final class FakeCloudAuthService: CloudAuthService {
     /// The tier the last `fetchCheckoutURL(tier:)` was called with (U11) — lets
     /// a test assert Local Pro passes `"local"` and Cloud passes `"cloud"`.
     private(set) var lastCheckoutTier: String?
+    /// When true, each `fetchCheckoutURL` suspends until the test resumes it
+    /// via `releaseNextHeldCheckout()` (FIFO) — lets a test interleave a
+    /// superseded attempt's LATE failure with a live attempt, pinning the
+    /// checkout generation guard.
+    var holdCheckoutCalls = false
+    private var heldCheckouts: [CheckedContinuation<Void, Never>] = []
+    /// How many `fetchCheckoutURL` calls are currently suspended.
+    var suspendedCheckoutCount: Int { heldCheckouts.count }
+
+    func releaseNextHeldCheckout() {
+        guard !heldCheckouts.isEmpty else { return }
+        heldCheckouts.removeFirst().resume()
+    }
 
     func fetchCheckoutURL(tier: String) async throws -> Data {
         checkoutURLCallCount += 1
         lastCheckoutTier = tier
+        if holdCheckoutCalls {
+            await withCheckedContinuation { heldCheckouts.append($0) }
+        }
         if let checkoutURLError { throw checkoutURLError }
         return checkoutURLData
     }
@@ -133,10 +149,10 @@ enum FakeCloudAuthError: Error, LocalizedError {
     }
 }
 
-private let signedInEnvelope = #"{"ok": true, "schema_version": 1, "signed_in": true, "uid": "abc123", "email": "user@example.com"}"#
-private let signedOutEnvelope = #"{"ok": true, "schema_version": 1, "signed_in": false}"#
-private let staleEnvelope = #"{"ok": true, "schema_version": 1, "signed_in": true, "uid": null, "email": null, "stale": true}"#
-private let loginErrorEnvelope = #"{"ok": false, "schema_version": 1, "error": "state mismatch"}"#
+private let signedInEnvelope = #"{"ok": true, "schema_version": 2, "signed_in": true, "uid": "abc123", "email": "user@example.com"}"#
+private let signedOutEnvelope = #"{"ok": true, "schema_version": 2, "signed_in": false}"#
+private let staleEnvelope = #"{"ok": true, "schema_version": 2, "signed_in": true, "uid": null, "email": null, "stale": true}"#
+private let loginErrorEnvelope = #"{"ok": false, "schema_version": 2, "error": "state mismatch"}"#
 
 @MainActor
 final class CloudAuthControllerTests: XCTestCase {
@@ -229,7 +245,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// uid (email is preferred when present, uid otherwise).
     func testRefreshUidOnlyAccountLabelFallsBackToUid() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"abc123","email":null}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"abc123","email":null}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -620,7 +636,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// app's soft gate. Present → on; absent → off (pre-billing behavior).
     func testRefreshReadsPaywallEnabledFlag() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":false,"paywall_enabled":true}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":false,"paywall_enabled":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -637,8 +653,8 @@ final class CloudAuthControllerTests: XCTestCase {
     /// claim is observed locally without a re-login (U14).
     func testReconcileEntitlementReconcilesThenRefreshes() async {
         let service = FakeCloudAuthService()
-        service.reconcileData = Data(#"{"ok":true,"schema_version":1,"subscribed":true}"#.utf8)
-        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"paywall_enabled":true}"#.utf8)
+        service.reconcileData = Data(#"{"ok":true,"schema_version":2,"subscribed":true}"#.utf8)
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"paywall_enabled":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.reconcileEntitlement()
@@ -655,7 +671,7 @@ final class CloudAuthControllerTests: XCTestCase {
     func testReconcileEntitlementStillRefreshesWhenReconcileFails() async {
         let service = FakeCloudAuthService()
         service.reconcileError = FakeCloudAuthError.offline
-        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true}"#.utf8)
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.reconcileEntitlement()
@@ -671,14 +687,14 @@ final class CloudAuthControllerTests: XCTestCase {
     /// false (Local Pro has no cloud upload — R3/KTD-1).
     func testRefreshReadsTwoTierEntitlement() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
         XCTAssertEqual(controller.tier, .cloud)
         XCTAssertTrue(controller.isSubscribed)
 
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local"}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local"}"#.utf8)
         await controller.refresh()
         XCTAssertEqual(controller.tier, .localPro)
         XCTAssertFalse(controller.isSubscribed, "Local Pro is not the cloud entitlement")
@@ -688,7 +704,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// lapsed, disambiguated from offline by `stale`).
     func testRefreshNoTierIsNone() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -701,7 +717,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// spurious paywall surfaces for an offline payer.
     func testStaleEntitlementIsIndeterminateNotLapsed() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":null,"email":null,"stale":true}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":null,"email":null,"stale":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -714,7 +730,7 @@ final class CloudAuthControllerTests: XCTestCase {
     func testTrialEndDrivesTrialState() async {
         let service = FakeCloudAuthService()
         let farFuture = Int(Date().timeIntervalSince1970) + 10 * 86_400
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","trial_end":\#(farFuture)}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","trial_end":\#(farFuture)}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -725,7 +741,7 @@ final class CloudAuthControllerTests: XCTestCase {
         }
 
         // Converted: tier present, no trial_end → subscribed (no trial banner).
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
         await controller.refresh()
         XCTAssertEqual(controller.trialState, .subscribed)
     }
@@ -733,7 +749,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// Sign out clears the two-tier entitlement too (not just `status`).
     func testSignOutClearsTierAndTrialState() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud"}"#.utf8)
         let controller = CloudAuthController(service: service)
         await controller.refresh()
         XCTAssertEqual(controller.tier, .cloud)
@@ -749,7 +765,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// paywall enabled gates the record + recall affordances.
     func testIsGatedForLapseWhenLapsedAndPaywallOn() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","paywall_enabled":true}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","paywall_enabled":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -761,7 +777,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// (pre-billing / dark) is never gated.
     func testNotGatedWhenPaywallOff() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -774,7 +790,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// even with the paywall on.
     func testNotGatedWhenStaleEvenWithPaywallOn() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":null,"email":null,"stale":true,"paywall_enabled":true}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":null,"email":null,"stale":true,"paywall_enabled":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
@@ -786,14 +802,14 @@ final class CloudAuthControllerTests: XCTestCase {
     /// paywall on or off.
     func testNotGatedWhenEntitled() async {
         let service = FakeCloudAuthService()
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local","paywall_enabled":true}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local","paywall_enabled":true}"#.utf8)
         let controller = CloudAuthController(service: service)
 
         await controller.refresh()
         XCTAssertEqual(controller.tier, .localPro)
         XCTAssertFalse(controller.isGatedForLapse, "an entitled Local Pro user must not be gated")
 
-        service.whoamiData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","paywall_enabled":true}"#.utf8)
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","paywall_enabled":true}"#.utf8)
         await controller.refresh()
         XCTAssertFalse(controller.isGatedForLapse, "an entitled Cloud user must not be gated")
     }
@@ -871,7 +887,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// portal link grants access to the user's billing page).
     func testStartManageSubscriptionOpensPortalURL() async {
         let service = FakeCloudAuthService()
-        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"https://billing.stripe.com/p/session_abc"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":true,"schema_version":2,"url":"https://billing.stripe.com/p/session_abc"}"#.utf8)
         let recorder = URLOpenRecorder()
         let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
 
@@ -888,7 +904,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// keyed on the envelope's `code`, never its dynamic `error` text.
     func testStartManageSubscriptionFailureSurfacesMappedCopyNotRawText() async {
         let service = FakeCloudAuthService()
-        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"Subscription service error: upstream 502 gobbledygook","code":"network"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":false,"schema_version":2,"error":"Subscription service error: upstream 502 gobbledygook","code":"network"}"#.utf8)
         let recorder = URLOpenRecorder()
         let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
 
@@ -910,7 +926,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// user must not be told to buy again).
     func testPortalNoSubscriptionMapsToNothingToManageCopy() async {
         let service = FakeCloudAuthService()
-        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"No subscription found for this account yet. If you just subscribed, try again in a minute.","code":"no_subscription"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":false,"schema_version":2,"error":"No subscription found for this account yet. If you just subscribed, try again in a minute.","code":"no_subscription"}"#.utf8)
         let controller = CloudAuthController(service: service, openURL: { _ in })
 
         let copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
@@ -931,7 +947,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// subcommand).
     func testPortalURLEnvelopeErrorSurfacesMappedCopyEndToEnd() async throws {
         fakeCLI = try FakeCLIBinary(
-            stdout: #"{"ok": false, "schema_version": 1, "error": "No subscription found for this account yet.", "code": "no_subscription"}"#,
+            stdout: #"{"ok": false, "schema_version": 2, "error": "No subscription found for this account yet.", "code": "no_subscription"}"#,
             exitCode: 1,
             expectedSubcommand: "portal-url"
         )
@@ -953,7 +969,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// (an arbitrary scheme through `NSWorkspace` could launch a local app).
     func testPortalFileSchemeURLNeverOpened() async {
         let service = FakeCloudAuthService()
-        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"file:///etc/passwd"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":true,"schema_version":2,"url":"file:///etc/passwd"}"#.utf8)
         let recorder = URLOpenRecorder()
         let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
 
@@ -994,7 +1010,7 @@ final class CloudAuthControllerTests: XCTestCase {
         let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
 
         // No code → static fallback, envelope text discarded.
-        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"Sign in to manage your subscription: run `screencap login`."}"#.utf8)
+        service.portalURLData = Data(#"{"ok":false,"schema_version":2,"error":"Sign in to manage your subscription: run `screencap login`."}"#.utf8)
         var copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
             controller.startManageSubscription { cont.resume(returning: $0) }
         }
@@ -1002,7 +1018,7 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertFalse(copy.message.contains("screencap login"), "terminal instructions must never render (R10)")
 
         // With the real code → the static sign-in case, action `.signIn`.
-        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"Sign in to manage your subscription: run `screencap login`.","code":"not_signed_in"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":false,"schema_version":2,"error":"Sign in to manage your subscription: run `screencap login`.","code":"not_signed_in"}"#.utf8)
         copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
             controller.startManageSubscription { cont.resume(returning: $0) }
         }
@@ -1011,12 +1027,21 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertFalse(copy.message.contains("screencap login"))
     }
 
+    /// The thrown-error mapper: a `CLIError.timedOut` (shell-out hung, no
+    /// envelope ever arrived) reads as network trouble — retry is the honest
+    /// advice — while any other error takes the static fallback.
+    func testTimedOutErrorMapsToNetworkCopy() {
+        XCTAssertEqual(AccountErrorCopy.from(error: CLIError.timedOut(seconds: 30)), .network)
+        XCTAssertEqual(AccountErrorCopy.from(error: FakeCloudAuthError.offline), .unknown)
+    }
+
     // MARK: - controller-owned checkout/portal pending machinery (KTD-6 / R13)
 
     /// Checkout-pending is set (with the remembered target) the moment checkout
     /// starts, a re-tap replaces the target in place, and neither the
-    /// webhook-lag window (refresh reports no tier yet) nor a same-tier trial
-    /// (tier matches but `trial_end` is live) settles it prematurely.
+    /// webhook-lag window (refresh reports no tier yet), nor a refresh
+    /// reporting a DIFFERENT tier, nor an offline-stale (`.indeterminate`)
+    /// refresh settles it prematurely.
     func testCheckoutPendingSetAndSurvivesLagAndTrialingRefreshes() async {
         let service = FakeCloudAuthService()
         service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
@@ -1034,17 +1059,49 @@ final class CloudAuthControllerTests: XCTestCase {
         await waitUntil("checkout must open") { recorder.opened.count >= 1 }
 
         // Webhook-lag window: the post-return refresh reports no tier yet.
-        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
         await controller.refreshEntitlement()
         XCTAssertTrue(controller.checkoutPending, "an unresolved refresh must not clear pending (webhook lag)")
 
-        // Target tier present but still trialing: tier alone matches before any
-        // payment, so a live `trial_end` must keep the flag set.
+        // A refresh reporting a DIFFERENT tier (a stale claim, or an older
+        // purchase's webhook landing) must not settle this attempt.
         let farFuture = Int(Date().timeIntervalSince1970) + 5 * 86_400
-        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","trial_end":\#(farFuture)}"#.utf8)
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local","trial_end":\#(farFuture)}"#.utf8)
         await controller.refreshEntitlement()
-        XCTAssertTrue(controller.checkoutPending, "a still-trialing target tier must not settle the checkout")
+        XCTAssertTrue(controller.checkoutPending, "a non-target tier must not settle the checkout")
         XCTAssertEqual(controller.checkoutTargetTier, .cloud)
+
+        // Target tier but offline-stale → `.indeterminate`: nothing positive
+        // has resolved yet, so pending stays armed (KTD-4 grace, not a settle).
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":null,"email":null,"stale":true,"tier":"cloud"}"#.utf8)
+        await controller.refreshEntitlement()
+        XCTAssertEqual(controller.trialState, .indeterminate)
+        XCTAssertTrue(controller.checkoutPending, "an indeterminate refresh must not settle the checkout")
+        XCTAssertEqual(controller.checkoutTargetTier, .cloud)
+    }
+
+    /// The checkout success path: every purchase goes through the mandatory
+    /// card-required trial (billing.py always mints `trialing` subscriptions),
+    /// so a completed checkout resolves to the TARGET tier with a live future
+    /// `trial_end`. That must settle pending — requiring `.subscribed` would
+    /// leave the flag stuck (and Manage Subscription hidden) for the whole
+    /// 7-day trial.
+    func testCheckoutPendingSettlesOnTargetTierStillTrialing() async {
+        let service = FakeCloudAuthService()
+        service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        controller.startCheckout(tier: .cloud)
+        await waitUntil("checkout must open") { recorder.opened.count == 1 }
+        XCTAssertTrue(controller.checkoutPending)
+
+        let farFuture = Int(Date().timeIntervalSince1970) + 7 * 86_400
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","trial_end":\#(farFuture)}"#.utf8)
+        await controller.refreshEntitlement()
+
+        XCTAssertFalse(controller.checkoutPending, "target tier + live trial = the checkout's normal success — must settle")
+        XCTAssertNil(controller.checkoutTargetTier)
     }
 
     /// Checkout-pending clears when the entitlement resolves to the remembered
@@ -1058,7 +1115,7 @@ final class CloudAuthControllerTests: XCTestCase {
         controller.startCheckout(tier: .localPro)
         await waitUntil("checkout must open") { recorder.opened.count == 1 }
 
-        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local"}"#.utf8)
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local"}"#.utf8)
         await controller.refreshEntitlement()
 
         XCTAssertFalse(controller.checkoutPending, "target tier + no live trial = resolved")
@@ -1082,6 +1139,47 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertEqual(controller.accountError, .unknown)
     }
 
+    /// Generation guard on the checkout mint (mirrors `loginGeneration`):
+    /// re-tap-replaces-target is a supported flow, so attempt A's LATE mint
+    /// failure, landing after attempt B replaced it, must not clear B's armed
+    /// pending state or surface A's error. B's own (current-generation)
+    /// failure still clears normally.
+    func testSupersededCheckoutLateFailureDoesNotClobberLiveAttempt() async {
+        let service = FakeCloudAuthService()
+        service.holdCheckoutCalls = true
+        service.checkoutURLError = FakeCloudAuthError.offline
+        let controller = CloudAuthController(service: service, openURL: { _ in })
+        var failureA: String?
+        var failureB: String?
+
+        // Attempt A suspends inside the mint call.
+        controller.startCheckout(tier: .localPro) { failureA = $0 }
+        await waitUntil("attempt A must reach the mint call") { service.suspendedCheckoutCount == 1 }
+
+        // Re-tap: attempt B supersedes A and re-arms pending with the new target.
+        controller.startCheckout(tier: .cloud) { failureB = $0 }
+        await waitUntil("attempt B must reach the mint call") { service.suspendedCheckoutCount == 2 }
+        XCTAssertTrue(controller.checkoutPending)
+        XCTAssertEqual(controller.checkoutTargetTier, .cloud)
+
+        // A's late failure lands now — the stale generation must be dropped.
+        service.releaseNextHeldCheckout() // A (FIFO)
+        await waitUntil("attempt A must finish") { service.suspendedCheckoutCount == 1 }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(controller.checkoutPending, "a superseded attempt's failure must not clear the live attempt")
+        XCTAssertEqual(controller.checkoutTargetTier, .cloud)
+        XCTAssertNil(controller.accountError, "a superseded attempt must not surface its error")
+        XCTAssertNil(failureA, "a superseded attempt's onFailure must not fire")
+
+        // B's failure is current-generation: it clears pending as usual (also
+        // proves the release plumbing above exercised a real failure path).
+        service.releaseNextHeldCheckout() // B
+        await waitUntil("the live attempt's failure must clear pending") { !controller.checkoutPending }
+        XCTAssertNil(controller.checkoutTargetTier)
+        XCTAssertEqual(controller.accountError, .unknown)
+        XCTAssertEqual(failureB, AccountErrorCopy.unknown.message)
+    }
+
     /// Sign-out (and thus any account switch) clears both pending flags AND the
     /// remembered target — a different account later resolving the same tier
     /// must not settle the old account's attempt.
@@ -1089,7 +1187,7 @@ final class CloudAuthControllerTests: XCTestCase {
         let service = FakeCloudAuthService()
         service.whoamiData = Data(signedInEnvelope.utf8)
         service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
-        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"https://billing.stripe.com/p/s"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":true,"schema_version":2,"url":"https://billing.stripe.com/p/s"}"#.utf8)
         let recorder = URLOpenRecorder()
         let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
         await controller.refresh()
@@ -1114,7 +1212,7 @@ final class CloudAuthControllerTests: XCTestCase {
     /// the recourse if that refresh lost the race with the webhook.
     func testPortalReturnActivationTriggersRefreshThenClears() async {
         let service = FakeCloudAuthService()
-        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"https://billing.stripe.com/p/s"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":true,"schema_version":2,"url":"https://billing.stripe.com/p/s"}"#.utf8)
         service.forceRefreshData = Data(signedInEnvelope.utf8)
         let center = NotificationCenter()
         let recorder = URLOpenRecorder()
