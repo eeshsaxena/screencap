@@ -51,12 +51,20 @@ crypto/gating core (U6 core) landed. Plan:
   compile and every new/regression class passes; the only full-suite failures are the
   flaky daemon-session integration tests, which fail **identically on clean `main`**
   (verified in a control worktree) and are being fixed on a separate branch.
-- **End-to-end** — the *data plane* is now automated (`tests/test_search_guardrails_e2e.py`):
-  gate default-on → encrypted capture (only `.jpg.enc`) → secrets scrubbed at index
-  (planted secret not findable, region painted) → SQLCipher search → `frame.read`
-  serves the scrubbed still → key-pull → video-only. The **manual** residual (Touch ID
-  *prompt* observation, disclosure-sheet visual, new-install run on a signed app) needs
-  a human + a signed build.
+- **End-to-end** — automated in two layers:
+  - Data plane (`tests/test_search_guardrails_e2e.py`): gate default-on → encrypted
+    capture (only `.jpg.enc`) → secrets scrubbed at index (planted secret not findable,
+    region painted) → SQLCipher search → `frame.read` serves the scrubbed still →
+    key-pull → video-only.
+  - **Real `screencap` CLI in an isolated HOME** (`tests/test_search_cli_e2e.py`): the
+    DoD flip/decline behaviors against the actual binary — `search enable` migrates an
+    existing plaintext corpus with **zero plaintext stills remaining**, rekeys the index,
+    flips the gate ON (only after acknowledgment), preserves the data; declining durably
+    holds the gate OFF.
+  - **Remaining manual residual** (needs a signed build + human): the disclosure *sheet
+    rendering*, the Touch ID *prompt* on opening encrypted search stills, and a
+    new-install run — the *decisions/data* behind all three are automated above; only the
+    on-screen visuals are unverified until the app is signable.
 
 ## Remaining — run the migration on the REAL dev install (mutates real data)
 - `screencap search enable` executes the plaintext→encrypted migration on the user's
