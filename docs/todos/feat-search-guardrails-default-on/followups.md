@@ -41,6 +41,29 @@ crypto/gating core (U6 core) landed. Plan:
   session on opening encrypted search stills; disclosure presents once, not over a
   takeover; decline holds.
 
+## Verification Contract status
+- **Python full suite green + privacy-marked + Vision-free** ✓ (the pre-existing
+  `test_config`/daemon-`read_only_verbs` failures are real-`config.toml` pollution on
+  this box — they fail on clean `main` too; the concurrent `fix/daemon-test-config-hermeticity`
+  branch fixes exactly that harness issue).
+- **Two call-graph guards pass** ✓.
+- **Swift `xcodebuild test` green** ✓ *for this change* — the whole app + test target
+  compile and every new/regression class passes; the only full-suite failures are the
+  flaky daemon-session integration tests, which fail **identically on clean `main`**
+  (verified in a control worktree) and are being fixed on a separate branch.
+- **End-to-end** — the *data plane* is now automated (`tests/test_search_guardrails_e2e.py`):
+  gate default-on → encrypted capture (only `.jpg.enc`) → secrets scrubbed at index
+  (planted secret not findable, region painted) → SQLCipher search → `frame.read`
+  serves the scrubbed still → key-pull → video-only. The **manual** residual (Touch ID
+  *prompt* observation, disclosure-sheet visual, new-install run on a signed app) needs
+  a human + a signed build.
+
+## Remaining — run the migration on the REAL dev install (mutates real data)
+- `screencap search enable` executes the plaintext→encrypted migration on the user's
+  actual `~/.screencap` (encrypts every existing still, rekeys `content_index.db`).
+  It's headless-runnable, but it is a **hard-to-reverse mutation of real recordings**,
+  so run it only with the user's explicit go-ahead. Machinery is unit + E2E tested.
+
 ## Remaining — U6 app provisioning (Swift) — the release blocker
 - **EMPIRICALLY CONFIRMED:** adding `keychain-access-groups` to `ScreenCap.entitlements`
   **breaks the ad-hoc-signed dev/test build** — `xcodebuild` fails with *"ScreenCap has
