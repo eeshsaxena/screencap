@@ -2,8 +2,15 @@
 
 The legacy auto-namer sent raw recording content to cloud LLM APIs with no
 consent gate. It is gone; this guard makes sure the same bypass cannot be
-silently reintroduced anywhere under ``src/screencap/``. The sanctioned
-naming/summary path is ``screencap.segmentation`` with its ``ConsentPolicy``.
+silently reintroduced under ``src/screencap/`` in either of the two shapes it
+detects (SDK imports and hostname literals). The sanctioned naming/summary
+path is ``screencap.segmentation`` with its ``ConsentPolicy``.
+
+This guard is a tripwire against those two shapes, not an egress sandbox:
+subprocess delegation to vendor CLI binaries (the removed namer's former top
+providers; sanctioned home ``segmentation/providers/cli_delegate.py``),
+string-composed URLs, and non-listed vendors are outside its detection
+surface and rely on code review.
 
 Two detection axes, both pure-AST (stdlib only — no Vision/pyobjc/NLP, so the
 guard runs on the Vision-free CI privacy lane):

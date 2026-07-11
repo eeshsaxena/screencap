@@ -145,6 +145,16 @@ def test_auto_name_removed_and_schema_bumped():
     assert payload["schema_version"] >= 3
 
 
+@pytest.mark.parametrize("pair", ["auto_name=true", "auto_name_local_only=false"])
+def test_auto_name_set_rejected_as_unknown_key(pair):
+    """The removed keys are no longer writable: `settings --set auto_name=...`
+    errors as an unknown setting instead of silently persisting dead config."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["settings", "--set", pair], catch_exceptions=False)
+    assert result.exit_code != 0, result.output
+    assert "Unknown setting" in result.output
+
+
 def _invoke_set(pair: str) -> None:
     runner = CliRunner()
     result = runner.invoke(cli, ["settings", "--set", pair], catch_exceptions=False)

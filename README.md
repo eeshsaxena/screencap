@@ -6,7 +6,7 @@ ScreenCap is designed for teams who need more than video clips: reproducible rec
 
 ## What We Offer
 
-- **One-command capture workflow**: Start recording immediately with `screencap start`, then auto-transcribe and auto-name on stop.
+- **One-command capture workflow**: Start recording immediately with `screencap start`, then auto-transcribe on stop.
 - **ML-ready outputs**: Export processed interaction events to JSONL with `screencap export` for downstream training pipelines.
 - **Local-first by default**: Run from a standalone binary, keep recordings on disk, and use optional cloud sync only when needed.
 - **Structured recording data**: Recording artifacts and schema are designed for ML training pipelines.
@@ -53,17 +53,17 @@ pip install -e ".[dev]"
 # start recording immediately — no prompts needed
 screencap start
 
-# screencap stop (or Ctrl+C) to stop → auto-transcribes audio → LLM names the recording
-# e.g. rec-20260222T143000/ → stripe-webhook-debugging/
+# screencap stop (or Ctrl+C) to stop → auto-transcribes audio
+# recording directory: rec-20260222T143000/
 
-# explicit name (skips auto-naming)
+# explicit name
 screencap start -n my-session -d "testing login flow"
 
 # list recordings
 screencap list
 
 # view in browser
-screencap view stripe-webhook-debugging
+screencap view rec-20260222T143000
 
 # transcribe audio (interactive — offers API or local Whisper)
 screencap transcribe my-session
@@ -90,14 +90,12 @@ Record screen, mouse, keyboard, and optionally audio. Starts immediately with no
 
 | Flag | Description |
 |------|-------------|
-| `-n, --name TEXT` | Recording name (skips auto-naming when provided) |
+| `-n, --name TEXT` | Recording name |
 | `-d, --description TEXT` | Task description |
 | `--no-audio` | Disable audio capture |
 | `--no-video` | Disable video capture |
 | `--no-images` | Disable screenshot capture |
 | `--no-window-data` | Disable window/accessibility data capture |
-| `--no-auto-name` | Skip LLM naming (prompts for name interactively) |
-| `--local-only` | Restrict LLM naming to local providers (Ollama) |
 | `-o, --output PATH` | Custom output directory (skips directory rename) |
 | `--no-wifi-metrics` | Disable WiFi metrics collection |
 | `--no-app-versions` | Disable running app version capture |
@@ -122,27 +120,11 @@ SCREENCAP_DISK_WARN_MB=500 screencap start
 SCREENCAP_DISK_WARN_MB=0 SCREENCAP_DISK_STOP_MB=0 screencap start
 ```
 
-#### Auto-naming
+#### Auto-transcription
 
-After stopping, the post-recording pipeline runs:
+After stopping, if audio was captured it is transcribed using the fastest available backend (faster-whisper → openai-whisper → OpenAI API → skip). Uses the `base` model for local backends.
 
-1. **Auto-transcribe** — If audio was captured, transcribes using the fastest available backend (faster-whisper → openai-whisper → OpenAI API → skip). Uses the `base` model for local backends.
-2. **LLM naming** — Assembles context (screenshots from DB, action events, window titles, transcript, running apps) and queries an LLM to generate a kebab-case directory name and description.
-
-The LLM provider chain tries each in order, falling through on any failure:
-
-| Priority | Provider | How it's detected |
-|----------|----------|-------------------|
-| 1 | `claude` CLI | `claude` on PATH |
-| 2 | `chatgpt` CLI | `chatgpt` on PATH |
-| 3 | Anthropic API | `ANTHROPIC_API_KEY` env var |
-| 4 | OpenAI API | `OPENAI_API_KEY` env var |
-| 5 | Ollama (local) | HTTP check on `localhost:11434` |
-| 6 | Skip | Keeps timestamp name |
-
-If no provider is available, the recording keeps its timestamp name (`rec-YYYYMMDDTHHMMSS`). This is not an error.
-
-To use Ollama for fully local naming: `ollama pull qwen3-vl:4b` then `screencap start --local-only`.
+Recordings keep their timestamp name (`rec-YYYYMMDDTHHMMSS`) unless `--name` is provided.
 
 ### `screencap list`
 
@@ -426,8 +408,6 @@ Config file: `~/.screencap/config.toml`
 recordings_dir = "/custom/path/to/recordings"
 downloads_dir = "/custom/path/to/downloads"
 audio_default = false
-auto_name = true              # LLM auto-naming after recording
-auto_name_local_only = false  # restrict to Ollama only
 disk_warn_mb = 2000           # free MB to start / warn (0 = disable)
 disk_stop_mb = 500            # free MB to auto-stop (0 = disable)
 ```
@@ -439,8 +419,6 @@ disk_stop_mb = 500            # free MB to auto-stop (0 = disable)
 | `SCREENCAP_RECORDINGS_DIR` | `~/.screencap/recordings` | Override recordings directory |
 | `SCREENCAP_DOWNLOADS_DIR` | `~/.screencap/downloads` | Override downloads directory |
 | `SCREENCAP_AUDIO_DEFAULT` | `true` | Default audio capture on/off |
-| `SCREENCAP_AUTO_NAME` | `true` | Enable/disable LLM auto-naming |
-| `SCREENCAP_AUTO_NAME_LOCAL_ONLY` | `false` | Restrict auto-naming to local providers (Ollama) |
 | `SCREENCAP_DISK_WARN_MB` | `2000` | Free MB required to start recording / trigger warning (0 = disable) |
 | `SCREENCAP_DISK_STOP_MB` | `500` | Free MB threshold to auto-stop recording (0 = disable) |
 | `SCREENCAP_PRIVACY_MODE` | — | Override privacy mode (can only tighten, never loosen) |
@@ -454,7 +432,7 @@ Environment variables take precedence over `config.toml`.
 
 ```
 ~/.screencap/recordings/
-└── stripe-webhook-debugging/   # auto-named by LLM (or rec-20260222T143000/ if no LLM)
+└── rec-20260222T143000/         # recording directory (timestamp-named)
     ├── recording.db            # SQLite: events, screenshots & metadata
     ├── video.mp4               # Screen recording
     ├── audio.flac              # Audio (if enabled)

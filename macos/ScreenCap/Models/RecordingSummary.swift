@@ -40,14 +40,14 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     /// Derived lifecycle: `recording` | `processing` | `ready` (KTD-7). Defaults
     /// to `ready` so a missing value never traps a card in a spinner.
     let state: String
-    /// Stable identity pinned at recording start — survives the post-stop
-    /// auto-name directory rename (unlike `name`). nil for legacy recordings.
+    /// Stable identity pinned at recording start — survives any post-stop
+    /// directory rename (unlike `name`). nil for legacy recordings.
     let recordingId: String?
 
     var id: String { name }
 
-    /// Identity that survives the post-stop auto-name rename. Consumers that must
-    /// hold a card in place across the rename (U5's grid diffing, the draft card)
+    /// Identity that survives a post-stop directory rename. Consumers that must
+    /// hold a card in place across a rename (U5's grid diffing, the draft card)
     /// key on this rather than `name`. Falls back to `name` for legacy recordings.
     var stableID: String { recordingId ?? name }
 
