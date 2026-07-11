@@ -10,8 +10,11 @@ final class FakeCLIBinary {
     private let dir: URL
 
     /// Creates and installs the fake. `stdout` is emitted verbatim; `exitCode`
-    /// becomes the process exit status.
-    init(stdout: String, exitCode: Int) throws {
+    /// becomes the process exit status. When `expectedSubcommand` is given, the
+    /// fake only plays the payload for that first argument and exits 64 with an
+    /// unexpected-command envelope otherwise — pinning WHICH CLI command the
+    /// code under test actually invoked (e.g. `portal-url`, not `checkout-url`).
+    init(stdout: String, exitCode: Int, expectedSubcommand: String? = nil) throws {
         dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("fake-cli-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -19,7 +22,17 @@ final class FakeCLIBinary {
         // Single-quote the payload so JSON metacharacters stay inert; `printf
         // '%s'` prints its argument literally (no format expansion).
         let quoted = stdout.replacingOccurrences(of: "'", with: "'\\''")
-        let script = "#!/bin/sh\nprintf '%s' '\(quoted)'\nexit \(exitCode)\n"
+        var script = "#!/bin/sh\n"
+        if let expectedSubcommand {
+            script += """
+            if [ "$1" != "\(expectedSubcommand)" ]; then
+              printf '%s' '{"ok": false, "error": "unexpected command"}'
+              exit 64
+            fi
+
+            """
+        }
+        script += "printf '%s' '\(quoted)'\nexit \(exitCode)\n"
         try script.write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755], ofItemAtPath: url.path

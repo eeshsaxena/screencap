@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import ScreenCap
 
@@ -99,6 +100,26 @@ final class FakeCloudAuthService: CloudAuthService {
         if let reconcileError { throw reconcileError }
         return reconcileData
     }
+
+    // portal (account sheet U3) — the hosted customer-portal URL mint.
+    var portalURLData = Data()
+    var portalURLError: Error?
+    private(set) var portalURLCallCount = 0
+
+    func fetchPortalURL() async throws -> Data {
+        portalURLCallCount += 1
+        if let portalURLError { throw portalURLError }
+        return portalURLData
+    }
+}
+
+/// Records what the controller's browser-open seam would launch, so tests can
+/// assert on the exact URL (and that nothing opens on the guarded paths)
+/// without `NSWorkspace` actually spawning a browser.
+@MainActor
+final class URLOpenRecorder {
+    private(set) var opened: [URL] = []
+    func open(_ url: URL) { opened.append(url) }
 }
 
 enum FakeCloudAuthError: Error, LocalizedError {
@@ -782,18 +803,14 @@ final class CloudAuthControllerTests: XCTestCase {
     func testStartCheckoutPassesTier() async {
         let service = FakeCloudAuthService()
         service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
-        let controller = CloudAuthController(service: service)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
 
         controller.startCheckout(tier: .localPro)
-        // Let the detached checkout Task run.
-        await Task.yield()
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(service.lastCheckoutTier, "local")
+        await waitUntil("local checkout must run") { service.lastCheckoutTier == "local" }
 
         controller.startCheckout(tier: .cloud)
-        await Task.yield()
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(service.lastCheckoutTier, "cloud")
+        await waitUntil("cloud checkout must run") { service.lastCheckoutTier == "cloud" }
     }
 
     /// A `.none` checkout tier (no plan chosen) never opens a checkout and
@@ -810,29 +827,368 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertNotNil(failure)
     }
 
-    /// End-to-end regression for the swallowed-checkout-error bug: `checkout-url`
-    /// reports failure as a `{ok:false, error}` envelope on **stdout** and exits
-    /// 1 with *empty* stderr. This drives the real `LiveCloudAuthService` →
-    /// `CLIClient` path (which the `FakeCloudAuthService` seam bypasses) against a
-    /// fake `screencap`, and asserts `startCheckout` surfaces that real reason —
-    /// not the bare "screencap exited with code 1:" the user saw before
-    /// `fetchCheckoutURL` opted into `allowNonZeroExit`.
+    /// End-to-end regression for the checkout error path: `checkout-url` reports
+    /// failure as a `{ok:false, error}` envelope on **stdout** and exits 1 with
+    /// *empty* stderr. This drives the real `LiveCloudAuthService` → `CLIClient`
+    /// path (which the `FakeCloudAuthService` seam bypasses) against a fake
+    /// `screencap`, and asserts `startCheckout` surfaces the error seam's static
+    /// copy — never the bare "screencap exited with code 1:" (the pre-
+    /// `allowNonZeroExit` bug) and never the envelope's dynamic `error` text,
+    /// which here carries a terminal instruction the app must not render (R10;
+    /// the raw-reason passthrough this test used to pin was the KTD-5 leak).
     func testStartCheckoutSurfacesEnvelopeErrorNotBareExitCode() async throws {
         fakeCLI = try FakeCLIBinary(
             stdout: #"{"ok": false, "error": "Sign in to upgrade: run `screencap login`."}"#,
             exitCode: 1
         )
-        let controller = CloudAuthController(service: LiveCloudAuthService())
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(
+            service: LiveCloudAuthService(), openURL: { recorder.open($0) }
+        )
 
         let failure = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
             controller.startCheckout(tier: .localPro) { cont.resume(returning: $0) }
         }
 
-        XCTAssertEqual(failure, "Sign in to upgrade: run `screencap login`.")
+        XCTAssertEqual(failure, AccountErrorCopy.unknown.message)
         XCTAssertFalse(
             failure.contains("exited with code"),
-            "the real reason must surface, never a bare CLI exit code"
+            "mapped copy must surface, never a bare CLI exit code"
         )
+        XCTAssertFalse(
+            failure.contains("screencap login"),
+            "envelope text with terminal instructions must never render (R10)"
+        )
+        XCTAssertTrue(recorder.opened.isEmpty)
+    }
+
+    // MARK: - portal / Manage Subscription (account sheet U3)
+
+    /// Plan scenario: `startManageSubscription` happy path — the portal URL is
+    /// minted and handed to the browser-open seam exactly once, the return
+    /// refresh is armed, and no error surfaces. The URL value itself lives only
+    /// in the envelope → open call (it is never written to os_log/print — a
+    /// portal link grants access to the user's billing page).
+    func testStartManageSubscriptionOpensPortalURL() async {
+        let service = FakeCloudAuthService()
+        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"https://billing.stripe.com/p/session_abc"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        controller.startManageSubscription()
+        await waitUntil("portal URL must reach the open seam") { recorder.opened.count == 1 }
+
+        XCTAssertEqual(recorder.opened.first?.absoluteString, "https://billing.stripe.com/p/session_abc")
+        XCTAssertEqual(service.portalURLCallCount, 1)
+        XCTAssertNil(controller.accountError)
+        XCTAssertTrue(controller.portalReturnPending, "a successful open must arm the browser-return refresh (R7)")
+    }
+
+    /// Plan scenario (AE4): a portal mint failure surfaces the MAPPED copy —
+    /// keyed on the envelope's `code`, never its dynamic `error` text.
+    func testStartManageSubscriptionFailureSurfacesMappedCopyNotRawText() async {
+        let service = FakeCloudAuthService()
+        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"Subscription service error: upstream 502 gobbledygook","code":"network"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        let copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
+            controller.startManageSubscription { cont.resume(returning: $0) }
+        }
+
+        XCTAssertEqual(copy, .network)
+        XCTAssertEqual(copy.action, .retry)
+        XCTAssertFalse(copy.message.contains("502"), "raw envelope text must never surface")
+        XCTAssertEqual(controller.accountError, .network, "the seam's published output must carry the same mapped copy")
+        XCTAssertTrue(recorder.opened.isEmpty)
+        XCTAssertFalse(controller.portalReturnPending, "a failed mint must not arm the return refresh")
+    }
+
+    /// Plan scenario (AE8): the backend's fail-closed `no_subscription` 4xx maps
+    /// to the eventual-consistency copy — it offers a retry and never asserts no
+    /// subscription exists (Stripe search lags checkout by ~1 min; a just-paid
+    /// user must not be told to buy again).
+    func testPortalNoSubscriptionMapsToNothingToManageCopy() async {
+        let service = FakeCloudAuthService()
+        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"No subscription found for this account yet. If you just subscribed, try again in a minute.","code":"no_subscription"}"#.utf8)
+        let controller = CloudAuthController(service: service, openURL: { _ in })
+
+        let copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
+            controller.startManageSubscription { cont.resume(returning: $0) }
+        }
+
+        XCTAssertEqual(copy, .noSubscription)
+        XCTAssertEqual(copy.action, .retry)
+        XCTAssertTrue(copy.message.contains("try again in a minute"), "the copy must leave the just-subscribed door open")
+    }
+
+    /// End-to-end via `FakeCLIBinary`: `portal-url` exits 1 with an `{ok:false,
+    /// code}` envelope on stdout (empty stderr). Drives the real
+    /// `LiveCloudAuthService` → `CLIClient` path and pins `allowNonZeroExit` —
+    /// without it the non-zero exit throws and the machine-readable `code` is
+    /// lost, so this would map to `.unknown` instead of `.noSubscription`. The
+    /// fake also pins that the controller invoked `portal-url` (not another
+    /// subcommand).
+    func testPortalURLEnvelopeErrorSurfacesMappedCopyEndToEnd() async throws {
+        fakeCLI = try FakeCLIBinary(
+            stdout: #"{"ok": false, "schema_version": 1, "error": "No subscription found for this account yet.", "code": "no_subscription"}"#,
+            exitCode: 1,
+            expectedSubcommand: "portal-url"
+        )
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(
+            service: LiveCloudAuthService(), openURL: { recorder.open($0) }
+        )
+
+        let copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
+            controller.startManageSubscription { cont.resume(returning: $0) }
+        }
+
+        XCTAssertEqual(copy, .noSubscription, "the envelope's code must survive the non-zero exit (allowNonZeroExit)")
+        XCTAssertTrue(recorder.opened.isEmpty)
+    }
+
+    /// The https open-guard, portal side: a `file://` URL in an `ok:true`
+    /// envelope is never handed to the opener — it routes to the error seam
+    /// (an arbitrary scheme through `NSWorkspace` could launch a local app).
+    func testPortalFileSchemeURLNeverOpened() async {
+        let service = FakeCloudAuthService()
+        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"file:///etc/passwd"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        let copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
+            controller.startManageSubscription { cont.resume(returning: $0) }
+        }
+
+        XCTAssertTrue(recorder.opened.isEmpty, "non-https URLs must never open")
+        XCTAssertEqual(copy, .unknown)
+        XCTAssertFalse(controller.portalReturnPending)
+    }
+
+    /// The https open-guard, checkout side: a custom-scheme URL never opens and
+    /// the mint fails through the seam, clearing the pending machinery.
+    func testCheckoutCustomSchemeURLNeverOpened() async {
+        let service = FakeCloudAuthService()
+        service.checkoutURLData = Data(#"{"ok":true,"url":"screencap://not-a-checkout"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        let failure = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            controller.startCheckout(tier: .cloud) { cont.resume(returning: $0) }
+        }
+
+        XCTAssertTrue(recorder.opened.isEmpty, "non-https URLs must never open")
+        XCTAssertEqual(failure, AccountErrorCopy.unknown.message)
+        XCTAssertFalse(controller.checkoutPending, "a rejected URL is a mint failure — pending must clear")
+        XCTAssertNil(controller.checkoutTargetTier)
+    }
+
+    /// The literal upload.py sign-in error string (it embeds a terminal
+    /// instruction) fed through the mapper surfaces ONLY static copy — with no
+    /// `code` it takes the fallback, and with its real `code` it takes the
+    /// static sign-in case; the dynamic text never rides along either way.
+    func testUploadPySignInStringSurfacesOnlyStaticFallback() async {
+        let service = FakeCloudAuthService()
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        // No code → static fallback, envelope text discarded.
+        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"Sign in to manage your subscription: run `screencap login`."}"#.utf8)
+        var copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
+            controller.startManageSubscription { cont.resume(returning: $0) }
+        }
+        XCTAssertEqual(copy, .unknown)
+        XCTAssertFalse(copy.message.contains("screencap login"), "terminal instructions must never render (R10)")
+
+        // With the real code → the static sign-in case, action `.signIn`.
+        service.portalURLData = Data(#"{"ok":false,"schema_version":1,"error":"Sign in to manage your subscription: run `screencap login`.","code":"not_signed_in"}"#.utf8)
+        copy = await withCheckedContinuation { (cont: CheckedContinuation<AccountErrorCopy, Never>) in
+            controller.startManageSubscription { cont.resume(returning: $0) }
+        }
+        XCTAssertEqual(copy, .notSignedIn)
+        XCTAssertEqual(copy.action, .signIn)
+        XCTAssertFalse(copy.message.contains("screencap login"))
+    }
+
+    // MARK: - controller-owned checkout/portal pending machinery (KTD-6 / R13)
+
+    /// Checkout-pending is set (with the remembered target) the moment checkout
+    /// starts, a re-tap replaces the target in place, and neither the
+    /// webhook-lag window (refresh reports no tier yet) nor a same-tier trial
+    /// (tier matches but `trial_end` is live) settles it prematurely.
+    func testCheckoutPendingSetAndSurvivesLagAndTrialingRefreshes() async {
+        let service = FakeCloudAuthService()
+        service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        controller.startCheckout(tier: .localPro)
+        XCTAssertTrue(controller.checkoutPending, "pending is set up front, before the mint round-trip")
+        XCTAssertEqual(controller.checkoutTargetTier, .localPro)
+
+        // Re-tap replaces the remembered target (an abandoned Stripe tab stays
+        // recoverable in place — tier buttons remain active while pending).
+        controller.startCheckout(tier: .cloud)
+        XCTAssertEqual(controller.checkoutTargetTier, .cloud)
+        await waitUntil("checkout must open") { recorder.opened.count >= 1 }
+
+        // Webhook-lag window: the post-return refresh reports no tier yet.
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io"}"#.utf8)
+        await controller.refreshEntitlement()
+        XCTAssertTrue(controller.checkoutPending, "an unresolved refresh must not clear pending (webhook lag)")
+
+        // Target tier present but still trialing: tier alone matches before any
+        // payment, so a live `trial_end` must keep the flag set.
+        let farFuture = Int(Date().timeIntervalSince1970) + 5 * 86_400
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"cloud","trial_end":\#(farFuture)}"#.utf8)
+        await controller.refreshEntitlement()
+        XCTAssertTrue(controller.checkoutPending, "a still-trialing target tier must not settle the checkout")
+        XCTAssertEqual(controller.checkoutTargetTier, .cloud)
+    }
+
+    /// Checkout-pending clears when the entitlement resolves to the remembered
+    /// target tier with `trial_end` absent (converted/paid — `.subscribed`).
+    func testCheckoutPendingClearsOnTargetTierResolvedWithTrialEndAbsent() async {
+        let service = FakeCloudAuthService()
+        service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+
+        controller.startCheckout(tier: .localPro)
+        await waitUntil("checkout must open") { recorder.opened.count == 1 }
+
+        service.forceRefreshData = Data(#"{"ok":true,"schema_version":1,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":false,"tier":"local"}"#.utf8)
+        await controller.refreshEntitlement()
+
+        XCTAssertFalse(controller.checkoutPending, "target tier + no live trial = resolved")
+        XCTAssertNil(controller.checkoutTargetTier)
+    }
+
+    /// Checkout-pending clears on mint failure — the browser never opened, so
+    /// there is no return to wait on and the user must be able to retry.
+    func testCheckoutPendingClearsOnMintFailure() async {
+        let service = FakeCloudAuthService()
+        service.checkoutURLError = FakeCloudAuthError.offline
+        let controller = CloudAuthController(service: service, openURL: { _ in })
+
+        let failure = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            controller.startCheckout(tier: .cloud) { cont.resume(returning: $0) }
+        }
+
+        XCTAssertEqual(failure, AccountErrorCopy.unknown.message)
+        XCTAssertFalse(controller.checkoutPending)
+        XCTAssertNil(controller.checkoutTargetTier)
+        XCTAssertEqual(controller.accountError, .unknown)
+    }
+
+    /// Sign-out (and thus any account switch) clears both pending flags AND the
+    /// remembered target — a different account later resolving the same tier
+    /// must not settle the old account's attempt.
+    func testSignOutClearsPendingFlagsAndRememberedTier() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        service.checkoutURLData = Data(#"{"ok":true,"url":"https://example.com/checkout"}"#.utf8)
+        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"https://billing.stripe.com/p/s"}"#.utf8)
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(service: service, openURL: { recorder.open($0) })
+        await controller.refresh()
+
+        controller.startCheckout(tier: .localPro)
+        controller.startManageSubscription()
+        await waitUntil("both flows must open") { recorder.opened.count == 2 }
+        XCTAssertTrue(controller.checkoutPending)
+        XCTAssertTrue(controller.portalReturnPending)
+
+        await controller.signOut()
+
+        XCTAssertFalse(controller.checkoutPending)
+        XCTAssertNil(controller.checkoutTargetTier)
+        XCTAssertFalse(controller.portalReturnPending)
+        XCTAssertNil(controller.accountError)
+    }
+
+    /// `startManageSubscription` arms the browser-return flag, and the next app
+    /// activation triggers exactly one entitlement refresh (the R7 return path),
+    /// after which portal-pending clears — the manual reconcile affordance is
+    /// the recourse if that refresh lost the race with the webhook.
+    func testPortalReturnActivationTriggersRefreshThenClears() async {
+        let service = FakeCloudAuthService()
+        service.portalURLData = Data(#"{"ok":true,"schema_version":1,"url":"https://billing.stripe.com/p/s"}"#.utf8)
+        service.forceRefreshData = Data(signedInEnvelope.utf8)
+        let center = NotificationCenter()
+        let recorder = URLOpenRecorder()
+        let controller = CloudAuthController(
+            service: service, notificationCenter: center, openURL: { recorder.open($0) }
+        )
+
+        controller.startManageSubscription()
+        await waitUntil("portal must open") { controller.portalReturnPending }
+
+        center.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        await waitUntil("activation must refresh entitlement") { service.forceRefreshCallCount == 1 }
+        await waitUntil("portal-pending must clear after the post-return refresh") {
+            controller.portalReturnPending == false
+        }
+    }
+
+    /// The launch-path invariant, extended to app switches: an activation with
+    /// NOTHING pending does zero auth work — no `whoami`, no force-refresh, no
+    /// Keychain decrypt. (An "always" gate would shell out on every app switch.)
+    func testActivationWithNothingPendingDoesNoAuthWork() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(signedInEnvelope.utf8)
+        let center = NotificationCenter()
+        let controller = CloudAuthController(service: service, notificationCenter: center)
+
+        center.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        // Give the (gated) activation task a beat to run — it must no-op.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        await Task.yield()
+
+        XCTAssertEqual(service.whoamiCallCount, 0, "idle activation must not decrypt the Keychain")
+        XCTAssertEqual(service.forceRefreshCallCount, 0)
+        XCTAssertEqual(controller.status, .unknown)
+    }
+
+    /// The reconcile round-trip publishes an in-flight signal the sheet renders
+    /// (U3) and lowers it when done, success or failure.
+    func testReconcilePublishesInFlightSignal() async {
+        let service = FakeCloudAuthService()
+        service.reconcileError = FakeCloudAuthError.offline
+        service.forceRefreshData = Data(signedInEnvelope.utf8)
+        let controller = CloudAuthController(service: service)
+        XCTAssertFalse(controller.isReconciling)
+
+        async let reconcile: Void = controller.reconcileEntitlement()
+        await waitUntil("reconcile must publish in-flight") {
+            controller.isReconciling || service.forceRefreshCallCount == 1
+        }
+        await reconcile
+
+        XCTAssertFalse(controller.isReconciling, "the signal must lower once the round-trip settles")
+        XCTAssertEqual(service.forceRefreshCallCount, 1)
+    }
+
+    // MARK: - helpers
+
+    /// Poll until `condition` holds (or the timeout passes) — the detached
+    /// checkout / portal / activation Tasks have no completion to await
+    /// directly. Mirrors `RecorderControllerTests.waitUntil`.
+    private func waitUntil(
+        _ message: String,
+        timeout: TimeInterval = 3,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @escaping @MainActor () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail(message, file: file, line: line)
     }
 
     // MARK: - fake CLI injection (for LiveCloudAuthService integration)
