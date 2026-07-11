@@ -17,6 +17,11 @@ KTD-3):
   caller has a live Stripe subscription but no claim (dropped webhook), grant it
   so a paying customer is never permanently stuck (U14 / AE7). It deploys like
   ``create-checkout-session`` (Firebase-gated, needs ``STRIPE_SECRET_KEY``).
+- ``create_portal_session`` — Firebase-token-gated. Resolves the caller's Stripe
+  customer per request via subscription search on ``metadata.uid`` (no customer
+  id is persisted anywhere) and returns a hosted customer-portal URL so the app
+  can offer Manage Subscription (account-sheet plan U1 / R12). No subscription
+  -> structured ``no_subscription`` 4xx; the portal URL is never logged.
 
 Firebase Admin is initialized HERE (KTD-8): a separately-deployed entry point
 never imports main.py, so it cannot rely on main.py's module-scope init side
@@ -67,6 +72,19 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
         --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...
 
+    # stripe-portal-session — Firebase-token-gated customer-portal URL minting.
+    # Needs the price->tier map (highest-tier subscription selection) plus the
+    # portal return URL and the saved portal configuration id (account-sheet U7:
+    # live mode fails Session.create until a configuration exists).
+    gcloud functions deploy stripe-portal-session \
+        --project proteus-photos --gen2 --runtime python312 \
+        --trigger-http --allow-unauthenticated \
+        --region southamerica-east1 --source scripts/cloud-function/ \
+        --entry-point create_portal_session \
+        --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py \
+        --service-account screencap-billing@proteus-photos.iam.gserviceaccount.com \
+        --set-env-vars SCREENCAP_PROJECT_ID=proteus-photos,STRIPE_SECRET_KEY=sk_...,STRIPE_PRICE_ID_LOCAL=price_...,STRIPE_PRICE_ID_CLOUD=price_...,STRIPE_PRICE_ID=price_...,STRIPE_PORTAL_RETURN_URL=https://screencap.sh/account,STRIPE_PORTAL_CONFIGURATION_ID=bpc_...
+
     # NEVER commit sk_live_... / whsec_...; keep test-mode and live-mode keys per
     # environment and rotate via the console + redeploy (billing plan U11).
 """
@@ -75,6 +93,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import firebase_admin
 import functions_framework
@@ -132,6 +151,18 @@ def _cors(response, status=200):
 
 def _stripe_key() -> str:
     return os.environ.get("STRIPE_SECRET_KEY", "")
+
+
+# Firebase uids are opaque [A-Za-z0-9_-] strings (<=128 chars). Anything else is
+# rejected BEFORE interpolation into a Stripe search query — the search syntax
+# accepts quotes and operators, and an injected uid would match (and, on the
+# portal path, open) another customer's records.
+_UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _valid_uid(uid) -> bool:
+    """True iff ``uid`` is safe to interpolate into a Stripe search query."""
+    return isinstance(uid, str) and _UID_RE.fullmatch(uid) is not None
 
 
 def _webhook_secret() -> str:
@@ -452,6 +483,26 @@ def stripe_webhook(request):
             obj.get("status"),
         )
 
+    # Multi-subscription convergence (account-sheet plan U1): each checkout
+    # mints a NEW Stripe customer, so one uid can hold several subscriptions.
+    # Before a revoke event (deleted, or the tier-revoking `updated` that fell
+    # through above) clears the claim, re-derive it across ALL of the uid's
+    # subscriptions — canceling one must converge onto the sub still paying,
+    # never wipe a paying user's entitlement. A search failure keeps tier=None
+    # (fail-closed clear, matching the pre-existing single-sub behavior).
+    if tier is None and event_type in (
+        "customer.subscription.deleted",
+        "customer.subscription.updated",
+    ):
+        tier = _active_subscription_tier(uid)
+        if tier is not None:
+            logger.info(
+                "stripe webhook %s: another active subscription remains; "
+                "converging to tier %s instead of clearing",
+                event_type,
+                tier,
+            )
+
     _apply_entitlement(uid, tier, trial_end)
     return (jsonify({"received": True}), 200)
 
@@ -470,6 +521,11 @@ def _active_subscription_tier(uid) -> str | None:
     active subs exist, the highest tier wins (``local`` < ``cloud``). Any lookup
     failure returns ``None`` — never hand out access on an error.
     """
+    if not _valid_uid(uid):
+        # Never interpolate an unvetted uid into the search query (fail-closed;
+        # the uid itself is not logged — it is attacker-shaped by definition).
+        logger.warning("subscription search skipped: uid failed validation")
+        return None
     try:
         result = stripe.Subscription.search(query=f"metadata['uid']:'{uid}'")
     except Exception as exc:  # transient / search error — do not grant on failure.
@@ -517,3 +573,120 @@ def reconcile_entitlement(request):
     if tier is not None:
         _apply_entitlement(uid, tier)
     return _cors(jsonify({"tier": tier, "subscribed": tier == "cloud"}))
+
+
+# --------------------------------------------------------------------------
+# Account-sheet U1 — create-portal-session (Firebase-token-gated)
+# --------------------------------------------------------------------------
+
+
+def _portal_customer(uid) -> str | None:
+    """Stripe customer id whose billing portal the caller should manage, or None.
+
+    No customer id is persisted anywhere; it is resolved per request from the
+    uid stamped into subscription metadata (KTD-9) — and because each checkout
+    mints a NEW Stripe customer, one uid can map to several. Selection is
+    deterministic and mirrors ``_active_subscription_tier``: filter to
+    currently-active statuses, prefer the highest tier, then the newest
+    ``created``. Returns ``None`` when no active/trialing subscription exists
+    (the "nothing to manage" path). Search errors propagate to the caller's
+    Stripe-exception handling (502) — a transient failure must not read as
+    "no subscription".
+    """
+    result = stripe.Subscription.search(query=f"metadata['uid']:'{uid}'")
+    best_key: tuple | None = None
+    best_customer: str | None = None
+    for sub in result.get("data", []):
+        if sub.get("status") not in _ACTIVE_STATUSES:
+            continue
+        tier = _tier_from_subscription(sub)
+        if tier is None:
+            continue
+        key = (TIERS_BY_RANK.index(tier), sub.get("created") or 0)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_customer = sub.get("customer")
+    return best_customer
+
+
+@functions_framework.http
+def create_portal_session(request):
+    """Create a hosted customer-portal session for the caller's subscription.
+
+    The uid is derived server-side from the verified Firebase bearer and is
+    NEVER read from the request body (KTD-4), then validated before it is
+    interpolated into the Stripe search query — an injected uid here would open
+    ANOTHER customer's portal. A caller with no active/trialing subscription
+    gets the structured ``no_subscription`` 4xx (nothing to manage, R12), never
+    a Stripe pass-through. The portal ``session.url`` is a capability link into
+    the customer's billing account and is NEVER written to logs.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204, CORS_HEADERS)
+
+    _ensure_firebase_app()
+
+    try:
+        uid = verify_bearer(request, PROJECT_ID)
+    except AuthUnavailable:
+        return _cors(
+            (jsonify({"error": "Auth verification temporarily unavailable"}), 503)
+        )
+    except AuthInvalid:
+        return _cors((jsonify({"error": "Authentication required"}), 401))
+
+    if not _valid_uid(uid):
+        # Reject before ANY Stripe call — never interpolate an unvetted uid.
+        return _cors(
+            (jsonify({"error": "Invalid account id", "code": "invalid_uid"}), 400)
+        )
+
+    stripe.api_key = _stripe_key()
+    try:
+        customer = _portal_customer(uid)
+    except Exception as exc:  # Stripe/network error — do not leak internals.
+        logger.warning("portal subscription search failed for uid %s: %s", uid, exc)
+        return _cors(
+            (
+                jsonify(
+                    {
+                        "error": "Billing portal temporarily unavailable",
+                        "code": "portal_unavailable",
+                    }
+                ),
+                502,
+            )
+        )
+    if customer is None:
+        return _cors(
+            (jsonify({"error": "no_subscription", "code": "no_subscription"}), 404)
+        )
+
+    kwargs = {
+        "customer": customer,
+        "return_url": os.environ.get(
+            "STRIPE_PORTAL_RETURN_URL", "https://screencap.sh/account"
+        ),
+    }
+    # Pin the U7 two-product allowlist in code, not dashboard default state.
+    configuration = os.environ.get("STRIPE_PORTAL_CONFIGURATION_ID", "")
+    if configuration:
+        kwargs["configuration"] = configuration
+
+    try:
+        session = stripe.billing_portal.Session.create(**kwargs)
+    except Exception as exc:  # e.g. no live portal configuration saved (U7).
+        logger.warning("portal session create failed: %s", exc)
+        return _cors(
+            (
+                jsonify(
+                    {
+                        "error": "Billing portal temporarily unavailable",
+                        "code": "portal_unavailable",
+                    }
+                ),
+                502,
+            )
+        )
+
+    return _cors(jsonify({"url": session.url}))
