@@ -43,6 +43,11 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     /// Stable identity pinned at recording start — survives any post-stop
     /// directory rename (unlike `name`). nil for legacy recordings.
     let recordingId: String?
+    /// Frozen per-recording E2EE intent (KTD-4): true only when the recording
+    /// was started with cloud E2EE on, so its uploads are ciphertext. Older
+    /// daemons/CLIs omit it → nil, treated as not-encrypted — never an error
+    /// state (nullable-timing contract).
+    let cloudE2EE: Bool?
 
     var id: String { name }
 
@@ -99,6 +104,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         case title
         case state
         case recordingId = "recording_id"
+        case cloudE2EE = "cloud_e2ee"
     }
 
     init(from decoder: Decoder) throws {
@@ -122,6 +128,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? name
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? "ready"
         recordingId = try c.decodeIfPresent(String.self, forKey: .recordingId)
+        cloudE2EE = try c.decodeIfPresent(Bool.self, forKey: .cloudE2EE)
     }
 
     /// Newest-first comparator. Recordings without a `startedAt` sort to the

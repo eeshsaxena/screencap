@@ -60,13 +60,56 @@ final class LibraryFilterTests: XCTestCase {
         XCTAssertEqual(LibraryBadge.forRecording(rec).tone, .uploaded)
     }
 
-    /// R7 / KTD-9: the badge vocabulary never claims sharing or encryption.
-    func testBadgeNeverEmitsSharedOrEncrypted() {
+    // MARK: - Encrypted badge (R3 / KTD-4)
+
+    /// AE1 (badge half): a frozen-on uploaded recording badges its encryption.
+    func testFrozenOnUploadedBadgesEncrypted() {
+        let rec = makeSummary(uploaded: true, state: "ready", cloudE2EE: true)
+        XCTAssertEqual(LibraryBadge.forRecording(rec), LibraryBadge(text: "uploaded · encrypted", tone: .uploaded))
+    }
+
+    /// AE3: frozen-off and absent (old daemon) recordings never claim
+    /// encryption — absent decodes to nil and yields today's badge unchanged.
+    func testFrozenOffOrAbsentNeverClaimsEncryption() {
+        let frozenOff = makeSummary(uploaded: true, state: "ready", cloudE2EE: false)
+        XCTAssertEqual(LibraryBadge.forRecording(frozenOff), LibraryBadge(text: "uploaded", tone: .uploaded))
+        let absent = makeSummary(uploaded: true, state: "ready", cloudE2EE: nil)
+        XCTAssertNil(absent.cloudE2EE)
+        XCTAssertEqual(LibraryBadge.forRecording(absent), LibraryBadge(text: "uploaded", tone: .uploaded))
+    }
+
+    /// The badge is about uploaded copies: a local recording never badges
+    /// encryption, even if the frozen bit is (anomalously) true.
+    func testLocalRecordingIgnoresFrozenBit() {
+        for state in ["ready", "processing", "recording"] {
+            let rec = makeSummary(uploaded: false, state: state, cloudE2EE: true)
+            XCTAssertFalse(
+                LibraryBadge.forRecording(rec).text.lowercased().contains("encrypted"),
+                "local \(state) row must not claim encryption"
+            )
+        }
+    }
+
+    /// AE3 (mixed library): each row renders its own frozen truth.
+    func testMixedLibraryRendersPerRecordingTruth() {
+        let encrypted = makeSummary(name: "enc", uploaded: true, cloudE2EE: true)
+        let plaintext = makeSummary(name: "plain", uploaded: true, cloudE2EE: false)
+        XCTAssertEqual(LibraryBadge.forRecording(encrypted).text, "uploaded · encrypted")
+        XCTAssertEqual(LibraryBadge.forRecording(plaintext).text, "uploaded")
+    }
+
+    /// KTD-9: "shared" stays forbidden until team semantics exist (SCR-221),
+    /// and "encrypted" appears only from the frozen intent bit (KTD-4).
+    func testBadgeNeverEmitsSharedAndEncryptedOnlyFromFrozenIntent() {
         for rec in [uploadedReady, localReady, localProcessing, activeRecording,
-                    makeSummary(uploaded: true, state: "processing")] {
+                    makeSummary(uploaded: true, state: "processing"),
+                    makeSummary(uploaded: true, cloudE2EE: true),
+                    makeSummary(uploaded: false, cloudE2EE: true)] {
             let text = LibraryBadge.forRecording(rec).text.lowercased()
             XCTAssertFalse(text.contains("shared"), "badge '\(text)' must not say 'shared'")
-            XCTAssertFalse(text.contains("encrypted"), "badge '\(text)' must not say 'encrypted'")
+            if !(rec.uploaded && rec.cloudE2EE == true) {
+                XCTAssertFalse(text.contains("encrypted"), "badge '\(text)' must not say 'encrypted'")
+            }
         }
     }
 
@@ -103,14 +146,18 @@ final class LibraryFilterTests: XCTestCase {
     private lazy var localProcessing = makeSummary(name: "proc", uploaded: false, state: "processing")
     private lazy var activeRecording = makeSummary(name: "rec", uploaded: false, state: "recording")
 
+    /// `cloudE2EE: nil` omits the `cloud_e2ee` key entirely — the old-daemon
+    /// wire shape — so the nil cases genuinely exercise the absent-key decode.
     private func makeSummary(
         name: String = "rec-test",
         uploaded: Bool = false,
         state: String = "ready",
         startedAt: Double = 1_748_390_400.0,
-        recordingId: String? = nil
+        recordingId: String? = nil,
+        cloudE2EE: Bool? = nil
     ) -> RecordingSummary {
         let recIDJSON = recordingId.map { "\"\($0)\"" } ?? "null"
+        let cloudE2EELine = cloudE2EE.map { ",\n          \"cloud_e2ee\": \($0)" } ?? ""
         let json = """
         {
           "name": "\(name)",
@@ -131,7 +178,7 @@ final class LibraryFilterTests: XCTestCase {
           "summary": null,
           "title": "\(name)",
           "state": "\(state)",
-          "recording_id": \(recIDJSON)
+          "recording_id": \(recIDJSON)\(cloudE2EELine)
         }
         """
         return try! JSONDecoder().decode(RecordingSummary.self, from: Data(json.utf8))

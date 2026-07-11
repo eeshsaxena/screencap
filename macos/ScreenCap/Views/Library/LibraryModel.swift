@@ -39,9 +39,13 @@ enum LibraryChip: String, CaseIterable, Identifiable, Hashable {
 
 /// A Library card's status badge (design 370, logic 702–710). The copy is the
 /// honesty-substituted vocabulary (KTD-9): the prototype's "shared · encrypted"
-/// becomes "uploaded" — this type never emits "shared" or "encrypted". Pure; the
-/// view maps `tone` to the design's border/foreground colors so the mapping is
-/// testable without SwiftUI `Color`.
+/// becomes "uploaded" — this type never emits "shared" (forbidden until team
+/// semantics exist, SCR-221). "encrypted" is emitted only from the recording's
+/// frozen per-recording E2EE intent (`cloudE2EE`, KTD-4) — never from live flag
+/// or ledger state — so the badge claims encryption exactly when that
+/// recording's uploads are ciphertext (R3). Pure and synchronous (no Keychain
+/// reads, no I/O); the view maps `tone` to the design's border/foreground
+/// colors so the mapping is testable without SwiftUI `Color`.
 struct LibraryBadge: Equatable {
     enum Tone: Equatable {
         /// Teal outline — uploaded to the user's own cloud.
@@ -55,12 +59,18 @@ struct LibraryBadge: Equatable {
     let text: String
     let tone: Tone
 
-    /// uploaded → teal "uploaded"; not-yet-`ready` (processing / recording) →
-    /// amber "draft · local"; else muted "local" (U5 approach). Uploaded wins
-    /// over draft so a cloud recording still finishing reads as "uploaded",
-    /// matching the sidebar's `allLocal` gate.
+    /// uploaded → teal "uploaded" ("uploaded · encrypted" when the frozen
+    /// intent bit is true); not-yet-`ready` (processing / recording) → amber
+    /// "draft · local"; else muted "local" (U5 approach). Uploaded wins over
+    /// draft so a cloud recording still finishing reads as "uploaded",
+    /// matching the sidebar's `allLocal` gate. `cloudE2EE` nil/false (older
+    /// daemons, pre-arc recordings) leaves today's copy unchanged; the bit is
+    /// about uploaded copies, so local rows ignore it entirely.
     static func forRecording(_ rec: RecordingSummary) -> LibraryBadge {
-        if rec.uploaded { return LibraryBadge(text: "uploaded", tone: .uploaded) }
+        if rec.uploaded {
+            let text = rec.cloudE2EE == true ? "uploaded · encrypted" : "uploaded"
+            return LibraryBadge(text: text, tone: .uploaded)
+        }
         if !rec.isReady { return LibraryBadge(text: "draft · local", tone: .draft) }
         return LibraryBadge(text: "local", tone: .local)
     }
