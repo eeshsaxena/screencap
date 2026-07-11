@@ -109,7 +109,10 @@ class _PopenEngineProcess:
     def __init__(self, argv: list[str], *, extra_env: dict[str, str] | None = None) -> None:
         self._popen = subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,
+            # SCR-218 U1: stdin is the daemon->engine control channel (was
+            # DEVNULL). The daemon writes NDJSON command lines here via
+            # ``send_line``; the engine reads them in ``engine.control_channel``.
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
@@ -144,6 +147,16 @@ class _PopenEngineProcess:
 
     def kill(self) -> None:
         self._popen.kill()
+
+    def send_line(self, line: str) -> None:
+        """Write one already-newline-terminated command line to the engine's
+        stdin control channel (SCR-218 U1). Raises on a closed/broken pipe; the
+        caller (``Supervisor.send_command``) degrades that to a False result."""
+        stdin = self._popen.stdin
+        if stdin is None:
+            raise BrokenPipeError("engine stdin is not a pipe")
+        stdin.write(line.encode("utf-8"))
+        stdin.flush()
 
     async def wait(self, timeout: float | None = None) -> int:
         try:
@@ -330,6 +343,28 @@ class Supervisor:
         elif self._engine_pid is not None:
             snapshot["engine_pid"] = self._engine_pid
         return snapshot
+
+    async def send_command(self, command: dict[str, Any]) -> bool:
+        """Write one NDJSON command line to the running engine's stdin control
+        channel (SCR-218 U1).
+
+        Returns ``True`` if the line was written, ``False`` if there is no live
+        engine or the pipe is broken. Serialized under ``_operation_lock`` so it
+        cannot race a spawn/stop that swaps or tears down ``_proc``; a mute that
+        loses that race simply finds no live engine and returns ``False`` rather
+        than raising. Broken-pipe/OS errors on the write are likewise swallowed
+        into a ``False`` result — the engine is on its way out.
+        """
+        line = json.dumps(command) + "\n"
+        async with self._operation_lock:
+            proc = self._proc
+            if proc is None or not proc.is_alive():
+                return False
+            try:
+                await asyncio.to_thread(proc.send_line, line)
+                return True
+            except (BrokenPipeError, ValueError, OSError):
+                return False
 
     async def acquire_migration(self, *, schema_version: int) -> None:
         """Reserve the daemon for a storage-location migration (SCR-228 U3/U4).
