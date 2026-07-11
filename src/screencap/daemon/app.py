@@ -730,6 +730,60 @@ async def recording_stop(request: Request) -> JSONResponse:
         )
 
 
+async def recording_mute(request: Request) -> JSONResponse:
+    """Set the mic mute state on the running recording (SCR-218 U4).
+
+    Forwards the request to the engine over the stdin control channel (U1) and
+    returns the pre-forward bus cursor. It does NOT set mute state itself — the
+    engine's confirmed ``audio_muted`` / ``audio_unmuted`` event does (KTD4/U5),
+    so the response echoes only the *requested* state and the app must not treat
+    it as confirmation. A mutating verb on the same trust boundary as
+    ``recording.start`` / ``recording.stop``: the peer descriptor is derived and
+    every exit path (ok, typed error, unhandled) is audited.
+    """
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "recording.mute",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        parsed = schema.RecordingMuteRequest.model_validate(await request.json())
+        # Capture the cursor BEFORE forwarding so a client can subscribe to
+        # /v0/events?since=<cursor> and never miss the confirming event.
+        cursor = request.app.state.event_bus.current_cursor()
+        forwarded = await request.app.state.supervisor.set_muted(parsed.muted)
+        if not forwarded:
+            raise errors.NotRecordingError(
+                schema_version=schema._RECORDING_MUTE_API_VERSION
+            )
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._RECORDING_MUTE_API_VERSION,
+                muted=parsed.muted,
+                cursor=cursor,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_MUTE_API_VERSION,
+            request=request,
+        )
+
+
 async def permission_request(request: Request) -> JSONResponse:
     """On-demand daemon-driven TCC registration (U8).
 
@@ -2496,6 +2550,7 @@ def build_app() -> Starlette:
             Route("/v0/events", events_stream, methods=["GET"]),
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
+            Route("/v0/recording.mute", recording_mute, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
             Route("/v0/content.search", content_search, methods=["POST"]),

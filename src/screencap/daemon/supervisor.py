@@ -366,6 +366,17 @@ class Supervisor:
             except (BrokenPipeError, ValueError, OSError):
                 return False
 
+    async def set_muted(self, muted: bool) -> bool:
+        """Forward a mute/unmute request to the running engine (SCR-218 U4).
+
+        Returns ``True`` if forwarded, ``False`` if there is no live engine. It
+        deliberately does NOT write mute state into ``_session_state`` — the
+        engine's confirmed ``audio_muted`` / ``audio_unmuted`` event is the sole
+        writer (KTD4/U5), so the snapshot never reports a request that may have
+        failed at the actual ``stream.stop()``.
+        """
+        return await self.send_command({"type": "set_muted", "muted": bool(muted)})
+
     async def acquire_migration(self, *, schema_version: int) -> None:
         """Reserve the daemon for a storage-location migration (SCR-228 U3/U4).
 

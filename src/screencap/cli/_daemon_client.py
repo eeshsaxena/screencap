@@ -257,6 +257,16 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/recording.stop", json_body=body, timeout=timeout)
         )
 
+    def mute(self, *, muted: bool) -> dict[str, Any]:
+        """Set the mic mute state on the running recording (SCR-218 U4).
+
+        Returns the ``{muted, cursor}`` envelope. ``muted`` is the *requested*
+        state; confirmed state arrives on ``/v0/events`` (KTD4).
+        """
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/recording.mute", json_body={"muted": muted})
+        )
+
     def content_search(
         self,
         query: str,
