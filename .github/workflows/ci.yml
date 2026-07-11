@@ -46,10 +46,25 @@ jobs:
         # is the fix release (pypa/pip#13870, GHSA-58qw-9mgm-455v).
         run: pip install --upgrade "pip>=26.1"
 
+      - name: Install SQLCipher toolchain
+        # The corpus-encryption invariant guards (test_content_index_encryption,
+        # test_corpus_migration, test_search_cli_e2e, test_search_guardrails_e2e)
+        # importorskip("pysqlcipher3"); without a SQLCipher toolchain they SKIP
+        # silently on CI, so the R3/R5/wrong-key-fails-closed invariants ship
+        # unverified. pysqlcipher3 has no wheel for these targets and builds from
+        # source against a system libsqlcipher (keg-only in brew).
+        run: brew install sqlcipher
+
       - name: Install dependencies
         # .[dev] pulls .[record] (incl. pyobjc-framework-Vision on darwin) plus the
-        # pytest tooling, so both the Vision-backed and Vision-free guards run here.
-        run: pip install -e ".[dev]"
+        # pytest tooling; the sqlcipher extra builds pysqlcipher3 against the brew
+        # libsqlcipher above so the encrypted-corpus guards actually RUN here (the
+        # Linux lane keeps skipping them — pysqlcipher3 is darwin-only).
+        env:
+          LDFLAGS: -L/opt/homebrew/opt/sqlcipher/lib
+          CPPFLAGS: -I/opt/homebrew/opt/sqlcipher/include
+          C_INCLUDE_PATH: /opt/homebrew/opt/sqlcipher/include
+        run: pip install -e ".[dev,sqlcipher]"
 
       - name: Download spaCy model (presidio NER backbone)
         # The privacy suite exercises the real DetectionPipeline (presidio); its
