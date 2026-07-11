@@ -128,13 +128,21 @@ def test_existing_settings_fields_unchanged():
         "show_on_website",
         "upload_default",
         "audio_default",
-        "auto_name",
         "chunk_duration",
         "auto_delete_after_upload",
         "rest_threshold_seconds",
         "recordings_dir",
     ):
         assert key in settings, f"missing {key} in settings payload"
+
+
+def test_auto_name_removed_and_schema_bumped():
+    """Legacy LLM auto-naming was removed (2026-07-11 plan): the `auto_name`
+    key is gone from the payload and the field removal is signalled by a
+    schema_version bump to v3."""
+    payload = _invoke_settings_json()
+    assert "auto_name" not in payload["settings"]
+    assert payload["schema_version"] >= 3
 
 
 def _invoke_set(pair: str) -> None:

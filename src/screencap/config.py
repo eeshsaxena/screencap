@@ -184,21 +184,9 @@ def get_app_versions() -> bool:
     return _parse_bool_env("SCREENCAP_APP_VERSIONS", "app_versions", True)
 
 
-def get_auto_name() -> bool:
-    """Return whether LLM auto-naming is enabled after recording (True = on)."""
-    return _parse_bool_env("SCREENCAP_AUTO_NAME", "auto_name", True)
-
-
 def get_auto_update() -> bool:
     """Return whether auto-update checking is enabled (True = on)."""
     return _parse_bool_env("SCREENCAP_AUTO_UPDATE", "auto_update", True)
-
-
-def get_auto_name_local_only() -> bool:
-    """Return whether LLM auto-naming is restricted to local providers only."""
-    return _parse_bool_env(
-        "SCREENCAP_AUTO_NAME_LOCAL_ONLY", "auto_name_local_only", False,
-    )
 
 
 def get_content_index_enabled() -> bool:
