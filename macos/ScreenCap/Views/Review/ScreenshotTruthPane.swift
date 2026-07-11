@@ -91,6 +91,12 @@ struct ScreenshotTruthPane: View {
     /// `image == nil` records a load that was attempted and failed.
     @State private var loaded: LoadedFrame?
 
+    /// The corpus key, loaded from the Keychain ONCE when the pane appears, so the
+    /// per-frame `.task` decrypt reuses it instead of re-reading the Keychain on
+    /// every frame boundary (search U6 hot-path fix). nil in a dev build / when no
+    /// key is available — plaintext stills still read fine via the static fallback.
+    @State private var corpus: CorpusCrypto? = try? CorpusCrypto()
+
     private struct LoadedFrame {
         let url: URL
         let image: NSImage?
@@ -120,8 +126,13 @@ struct ScreenshotTruthPane: View {
             guard let url = currentFrameURL, loaded?.url != url else { return }
             // Search U6: decrypt a `*.jpg.enc` corpus still transparently (plaintext
             // `*.jpg` reads unchanged). Runs off the main actor; `Data` is Sendable.
+            // Reuse the once-loaded key (`corpus`) so no Keychain read happens here.
+            let cached = corpus
             let data = await Task.detached(priority: .userInitiated) {
-                CorpusCrypto.readStillData(at: url)
+                if let cached {
+                    return cached.readStillData(at: url)
+                }
+                return CorpusCrypto.readStillData(at: url)
             }.value
             if !Task.isCancelled {
                 loaded = LoadedFrame(url: url, image: data.flatMap { NSImage(data: $0) })

@@ -28,7 +28,10 @@ struct RecallPaletteView: View {
 
     @State private var query = ""
     @State private var contentIndexEnabled = false
-    @State private var corpusEncrypted = false
+    // nil = not yet loaded. Treated as "gated" until loadSettings() positively
+    // resolves it, so recall results never render un-gated during the async load
+    // window (fail-closed on the presence gate).
+    @State private var corpusEncrypted: Bool? = nil
     @State private var consentDeclined = false
     @State private var backfillDeclined = false
     @State private var selectedResultID: SearchResultItem.ID?
@@ -74,7 +77,9 @@ struct RecallPaletteView: View {
                 selectedResultID: selectedResultID,
                 frameIndex: frameIndex,
                 thumbnailLoader: thumbnailLoader,
-                presenceGate: corpusEncrypted ? presenceGate : nil,
+                // Unknown (nil, pre-load) -> gated: default to requiring presence
+                // until settings confirm the corpus is NOT encrypted.
+                presenceGate: (corpusEncrypted ?? true) ? presenceGate : nil,
                 onEnableConsent: enableConsent,
                 onDeclineConsent: declineConsent,
                 onAcceptBackfill: model.acceptBackfill,

@@ -20,7 +20,7 @@ enum CorpusCryptoError: Error {
     case decryptFailed
 }
 
-struct CorpusCrypto {
+struct CorpusCrypto: Sendable {
     static let magic = Data("SCE1".utf8)
     static let nonceLength = 12
     static let tagLength = 16
@@ -132,16 +132,26 @@ struct CorpusCrypto {
         return try decrypt(token, recording: recording, name: name)
     }
 
+    /// Read a still's JPEG bytes, decrypting a `*.jpg.enc` transparently, reusing
+    /// THIS instance's already-loaded key — no Keychain round-trip. Callers that
+    /// decode many frames (e.g. the truth pane's per-frame `.task`) should hold one
+    /// `CorpusCrypto` and call this, instead of the static form which loads a fresh
+    /// key every call. Returns nil for a missing file or a failed decrypt.
+    func readStillData(at url: URL) -> Data? {
+        if CorpusCrypto.isEncryptedStill(url) {
+            return try? decryptStill(at: url)
+        }
+        return try? Data(contentsOf: url)
+    }
+
     /// Read a still's JPEG bytes, decrypting a `*.jpg.enc` transparently (loading the
-    /// corpus key on demand). The single still-bytes read seam for the app's
-    /// full-size views. Returns nil for a missing file or a failed decrypt (e.g. the
-    /// key isn't available in a dev build) → the caller shows a placeholder.
+    /// corpus key on demand). Convenience for one-off reads; a caller decoding many
+    /// frames should hold a `CorpusCrypto` and use the instance method above. Returns
+    /// nil for a missing file or a failed decrypt (e.g. no key in a dev build).
     static func readStillData(at url: URL) -> Data? {
         if isEncryptedStill(url) {
-            guard let corpus = try? CorpusCrypto(), let data = try? corpus.decryptStill(at: url) else {
-                return nil
-            }
-            return data
+            guard let corpus = try? CorpusCrypto() else { return nil }
+            return corpus.readStillData(at: url)
         }
         return try? Data(contentsOf: url)
     }
