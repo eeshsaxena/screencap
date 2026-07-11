@@ -115,6 +115,42 @@ def test_search_enable_flip_migrates_and_flips_gate(tmp_path):
     assert verify.stdout.strip() == "True"
 
 
+def test_new_install_disclosure_then_search_on_and_gate_healthy(tmp_path):
+    """A fresh install: the disclosure would be shown (not acknowledged, not declined),
+    the gate is OFF until acknowledgment, and after ``search enable`` search is ON and
+    the readiness gate resolves default-on (DoD: 'new install lands with search ON')."""
+    home = tmp_path / "home"
+    (home / ".screencap").mkdir(parents=True)  # empty install — no recordings, no config
+    key_file = tmp_path / "corpus.key"
+
+    # Before acknowledgment: gate OFF, and the disclosure WOULD present.
+    before = _status(home, key_file)
+    assert before["corpus_encrypted"] is False
+    assert before["content_index_enabled"] is False  # gate off until the disclosure is acknowledged
+    # The disclosure WOULD present (Swift SearchDisclosurePolicy.shouldPresent mirror):
+    # unacknowledged + not-declined ⇒ show.
+    assert before["disclosure_acknowledged"] is False and before["consent_declined"] is False
+
+    # Acknowledge via `search enable` (a no-op migration on an empty install) → search ON.
+    r = _cli(home, "search", "enable", key_file=key_file)
+    assert r.returncode == 0, r.stderr
+    after = _status(home, key_file)
+    assert after["corpus_encrypted"] is True
+    assert after["disclosure_acknowledged"] is True
+    assert after["content_index_enabled"] is True  # search ON
+
+    # Gate healthy: the readiness gate resolves default-on for the enabled install.
+    healthy = _py(
+        home,
+        "from screencap import capture_gate;"
+        "g=capture_gate.gather_and_resolve(explicit_capture_images=None, scrub_enabled=True);"
+        "print(g.capture_images and g.capture_images_encrypted and g.reason=='default_on')",
+        key_file=key_file,
+    )
+    assert healthy.returncode == 0, healthy.stderr
+    assert healthy.stdout.strip() == "True"
+
+
 def test_decline_durably_holds_gate_off(tmp_path):
     home = tmp_path / "home"
     (home / ".screencap").mkdir(parents=True)
