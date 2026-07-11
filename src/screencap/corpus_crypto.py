@@ -219,6 +219,16 @@ def _read_key_file(path: str) -> bytes | None:
     return _decode_key(text) if text else None
 
 
+def write_key_file(path: str, key: bytes) -> None:
+    """Public: stage the base64 corpus key to ``path`` at ``0600`` (create-or-truncate).
+
+    The daemon writes the key to a 0600 file for the engine subprocess (which has a
+    different Keychain ACL identity and cannot read the shared group). This is the
+    supported cross-module entry point; ``_write_key_file`` stays the internal name
+    key persistence uses so callers do not reach into a private symbol."""
+    _write_key_file(path, key)
+
+
 def _write_key_file(path: str, key: bytes) -> None:
     """Write the base64 key to ``path`` with ``0600`` perms (create-or-truncate)."""
     p = Path(path)
@@ -386,4 +396,5 @@ __all__ = [
     "is_encrypted",
     "load_corpus_key",
     "get_or_create_corpus_key",
+    "write_key_file",
 ]
