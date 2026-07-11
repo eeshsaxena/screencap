@@ -185,6 +185,35 @@ enum AccountSheetPolicy {
         }
     }
 
+    // MARK: - Upload entry decision (R14, U5)
+
+    /// What the review window's Upload tap does.
+    enum UploadEntryAction: Equatable {
+        /// Start the upload — signed in and not on a tier the signer would
+        /// refuse.
+        case proceed
+        /// Present the Account & Plan sheet in `.upload` context: sign-in
+        /// framing when signed out, upgrade-to-Cloud framing for a signed-in
+        /// Local Pro holder (today's raw signer-refusal path).
+        case presentAccountSheet
+    }
+
+    /// The review window's Upload branch (R14). Signed out → the sheet
+    /// (sign-in framing). Signed in on Local Pro with the paywall on → the
+    /// sheet (upgrade-to-Cloud framing) instead of a raw signer error.
+    /// Everything else proceeds — including paywall-off (pre-billing behavior:
+    /// no upgrade surface exists to show, R9) and the stale/offline case
+    /// (`tier` resolves `.none` when stale; grace must never gate, KTD-4).
+    static func uploadEntryAction(
+        isSignedIn: Bool,
+        tier: EntitlementTier,
+        paywallEnabled: Bool
+    ) -> UploadEntryAction {
+        guard isSignedIn else { return .presentAccountSheet }
+        if paywallEnabled, tier == .localPro { return .presentAccountSheet }
+        return .proceed
+    }
+
     // MARK: - Framing (context selects copy only, KTD-3)
 
     /// The sheet headline. The neutral state suppresses gate/upload framing

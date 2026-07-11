@@ -205,6 +205,51 @@ final class AccountSheetPolicyTests: XCTestCase {
         )
     }
 
+    // MARK: - Upload entry decision (R14, U5)
+
+    /// The review window's Upload tap: signed out → the sheet (sign-in
+    /// framing); signed in on Local Pro with the paywall on → the sheet
+    /// (upgrade-to-Cloud framing) instead of the raw signer refusal; a
+    /// cloud-entitled account proceeds straight to the upload.
+    func testUploadEntryActionBranches() {
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: false, tier: .none, paywallEnabled: true
+            ),
+            .presentAccountSheet
+        )
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: true, tier: .localPro, paywallEnabled: true
+            ),
+            .presentAccountSheet
+        )
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: true, tier: .cloud, paywallEnabled: true
+            ),
+            .proceed
+        )
+    }
+
+    /// Paywall off is pre-billing behavior (R9 — there is no upgrade surface
+    /// to show), and the stale/offline case resolves `tier == .none` (KTD-4 —
+    /// grace never gates): both proceed for a signed-in account.
+    func testUploadEntryActionPaywallOffAndGraceProceed() {
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: true, tier: .localPro, paywallEnabled: false
+            ),
+            .proceed
+        )
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: true, tier: .none, paywallEnabled: true
+            ),
+            .proceed
+        )
+    }
+
     /// R3: the gate keeps an explicit dismiss affordance ("Not now") — the
     /// sheet frames, it does not trap.
     func testGateDismissTitleIsNotNow() {
