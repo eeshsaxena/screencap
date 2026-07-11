@@ -238,15 +238,36 @@ def test_checkout_completed_no_subscription_id_fail_closed():
 
 def test_deleted_event_clears_claim_via_subscription_metadata():
     # No client_reference_id on a delete event; uid resolves from subscription
-    # metadata, and the re-fetched status confirms it is no longer active.
+    # metadata, and the re-fetched status confirms it is no longer active. The
+    # pre-clear re-derive (search) finds no other active sub -> genuine clear.
     ev = _event("customer.subscription.deleted", {"id": "sub_1", "metadata": {"uid": "userA"}})
     fetched = _sub(CLOUD_PRICE, status="canceled", uid="userA")
     with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch(
         "stripe.Subscription.retrieve", return_value=fetched
+    ), mock.patch(
+        "stripe.Subscription.search", return_value={"data": []}
     ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
         status, _ = _invoke(_req())
     assert status == 200
     setc.assert_called_once_with("userA", {"tier": "none", "subscribed": False})
+
+
+@pytest.mark.privacy
+def test_deleted_event_with_other_active_sub_rederives_instead_of_clearing():
+    # Multi-subscription convergence (account-sheet plan U1): each checkout
+    # mints a NEW Stripe customer, so one uid can hold several subscriptions.
+    # Canceling ONE of them must converge the claim onto the sub still paying —
+    # never wipe a paying user's entitlement.
+    ev = _event("customer.subscription.deleted", {"id": "sub_1", "metadata": {"uid": "userA"}})
+    fetched = _sub(CLOUD_PRICE, status="canceled", uid="userA")
+    with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch(
+        "stripe.Subscription.retrieve", return_value=fetched
+    ), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [_sub(LOCAL_PRICE)]}
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, _ = _invoke(_req())
+    assert status == 200
+    setc.assert_called_once_with("userA", {"tier": "local", "subscribed": False})
 
 
 def test_stale_delete_for_active_subscription_does_not_clear():
@@ -269,9 +290,9 @@ def test_updated_to_inactive_status_clears_claim():
     # unresolvable-price case the no-op guard is for (test_unmapped_price_no_grant).
     for bad_status in ("canceled", "unpaid", "paused", "incomplete_expired"):
         ev = _event("customer.subscription.updated", _sub(CLOUD_PRICE, status=bad_status))
-        with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch.object(
-            billing.fb_auth, "set_custom_user_claims"
-        ) as setc:
+        with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch(
+            "stripe.Subscription.search", return_value={"data": []}
+        ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
             status, _ = _invoke(_req())
         assert status == 200
         setc.assert_called_once_with("userA", {"tier": "none", "subscribed": False})
