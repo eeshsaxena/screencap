@@ -1723,7 +1723,9 @@ def checkout_url_cmd(tier, as_json):
     macOS app opens the printed URL in the browser; on return it force-refreshes
     the entitlement (`whoami --force-refresh`) to pick up the granted plan. The
     tier selects the price only — the webhook re-derives entitlement from the
-    paid price.
+    paid price. The error envelope carries a machine-readable `code`
+    (`not_signed_in`, `network`) alongside `error`, so the app's error mapper
+    keys on code, never message text (KTD-5) — same contract as `portal-url`.
     """
     from screencap import upload
 
@@ -1731,9 +1733,12 @@ def checkout_url_cmd(tier, as_json):
         url = upload.request_checkout_url(tier)
     except Exception as e:
         if as_json:
-            click.echo(json.dumps(
-                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
-            ))
+            click.echo(json.dumps({
+                "ok": False,
+                "schema_version": _AUTH_SCHEMA_VERSION,
+                "error": str(e),
+                "code": getattr(e, "code", "unknown"),
+            }))
             sys.exit(1)
         console.print(f"[red]Couldn't start checkout:[/red] {escape(str(e))}")
         sys.exit(1)
