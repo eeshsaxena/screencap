@@ -235,6 +235,78 @@ def get_content_index_enabled() -> bool:
     return _parse_bool_env("SCREENCAP_CONTENT_INDEX", "content_index_enabled", False)
 
 
+def _retention_section_int(cfg_key: str) -> int | None:
+    """Read a non-negative int from the ``[retention]`` config section, or None."""
+    section = _load_toml().get("retention", {})
+    if not isinstance(section, dict) or cfg_key not in section:
+        return None
+    val = section.get(cfg_key)
+    if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+        raise SystemExit(
+            f"Error: [retention].{cfg_key} must be a non-negative integer, got: {val!r}"
+        )
+    return val
+
+
+def _require_nonneg_int(env_val: str, env_name: str) -> int:
+    env_val = env_val.strip()
+    try:
+        val = int(env_val)
+    except ValueError:
+        raise SystemExit(f"Error: {env_name} must be an integer, got: {env_val!r}")
+    if val < 0:
+        raise SystemExit(f"Error: {env_name} cannot be negative, got: {val}")
+    return val
+
+
+def get_screenshot_retention_days() -> int:
+    """Age bound (days) for the ``screenshots/`` dir; ``0`` = unbounded (search R2).
+
+    Precedence: ``SCREENCAP_SCREENSHOT_RETENTION_DAYS`` env > ``[retention]
+    screenshot_days`` config > default. The default is **30 days when the corpus is
+    encrypted** (i.e. guardrails-on / search default-on) and **0 (unbounded)
+    otherwise**, so today's explicit opt-in users keep their stills until they set a
+    cap, while a default-on install gets a bound automatically.
+    """
+    env = os.environ.get("SCREENCAP_SCREENSHOT_RETENTION_DAYS")
+    if env is not None:
+        return _require_nonneg_int(env, "SCREENCAP_SCREENSHOT_RETENTION_DAYS")
+    configured = _retention_section_int("screenshot_days")
+    if configured is not None:
+        return configured
+    return 30 if get_corpus_encrypted() else 0
+
+
+def get_screenshot_size_cap_mb() -> int:
+    """Total-size bound (MB) for a recording's ``screenshots/`` dir; ``0`` = unbounded.
+
+    Precedence: ``SCREENCAP_SCREENSHOT_SIZE_CAP_MB`` env > ``[retention]
+    screenshot_size_cap_mb`` config > ``0``. Default unbounded (opt-in) — the age
+    bound is the primary default; a size cap is set only when explicitly configured.
+    """
+    env = os.environ.get("SCREENCAP_SCREENSHOT_SIZE_CAP_MB")
+    if env is not None:
+        return _require_nonneg_int(env, "SCREENCAP_SCREENSHOT_SIZE_CAP_MB")
+    configured = _retention_section_int("screenshot_size_cap_mb")
+    return configured if configured is not None else 0
+
+
+def get_corpus_encrypted() -> bool:
+    """Return whether the local recall corpus is stored encrypted at rest (search R3).
+
+    Governs the storage FORMAT of the corpus (``content_index.db`` via SQLCipher;
+    ``screenshots/*.jpg.enc`` via the corpus key) so every reader/writer — the
+    engine capture path, the chunk-processor index pass, the daemon search verbs,
+    the backfill job, and the scrub-worker purge — opens the corpus in one
+    consistent mode. Default False (plaintext, today's behavior); it is flipped to
+    True once and durably by U7's migration at the U8 default-on flip, never toggled
+    back (an encrypted corpus stays encrypted). Distinct from the per-recording
+    readiness gate (U8), which decides whether *new* capture is stills-on — this is
+    the stable at-rest format marker the whole corpus shares.
+    """
+    return _parse_bool_env("SCREENCAP_CORPUS_ENCRYPTED", "corpus_encrypted", False)
+
+
 def get_cloud_e2ee_enabled() -> bool:
     """Return whether cloud uploads are end-to-end encrypted on-device (E2EE slice).
 

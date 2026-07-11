@@ -73,6 +73,19 @@ record = [
     "pyobjc-framework-Vision>=9.0; sys_platform == 'darwin'",
 ]
 privacy = []  # Moved to base dependencies as of v0.11.0
+sqlcipher = [
+    # Corpus content-index at-rest encryption (search guardrails U4 / R3). The
+    # plan pinned ``sqlcipher3-binary``, but no wheel is published for the
+    # project's macOS/arm64 + x86_64 / Python 3.12 targets, so we use
+    # ``pysqlcipher3`` built from source against a system libsqlcipher
+    # (``brew install sqlcipher``). Kept an OPTIONAL extra, not a base dep:
+    # ``content_index.py`` imports it lazily and only when the corpus is
+    # encrypted (OFF until the U8 flip), so a plain ``pip install`` without a
+    # SQLCipher toolchain still works and simply keeps encrypted search
+    # unavailable (fail-closed, R8). Bundling libsqlcipher into the signed app
+    # for both arches is a release-packaging follow-up (see plan Risks).
+    "pysqlcipher3>=1.2.0; sys_platform == 'darwin'",
+]
 local-model = [
     # SCR-239 opt-in downloadable local model (never bundled by default).
     # These runtimes ship in the per-arch embedded daemon build; the model

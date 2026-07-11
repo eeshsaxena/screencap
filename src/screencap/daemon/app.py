@@ -84,12 +84,26 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     # warm finishing first; it only makes the common case fast. Fail-open inside
     # _warm_grant_cache: a probe error must never break the daemon.
     app.state._grant_warm_task = asyncio.create_task(_warm_grant_cache(app))
+    # Periodic screenshot-retention sweep (search U5): applies the age/size bound to
+    # converged recordings that no recording-lifecycle event revisits. Not
+    # auth-gated (runs signed-out); a no-op until a bound is configured. Fail-open —
+    # starting it must never break daemon boot.
+    try:
+        from screencap.daemon.retention_sweep import RetentionSweep
+
+        app.state.retention_sweep = RetentionSweep()
+        app.state.retention_sweep.start()
+    except Exception:  # noqa: BLE001 - the sweep is best-effort maintenance
+        logger.warning("retention sweep failed to start", exc_info=True)
     try:
         yield
     finally:
         warm_task = getattr(app.state, "_grant_warm_task", None)
         if warm_task is not None and not warm_task.done():
             warm_task.cancel()
+        retention_sweep = getattr(app.state, "retention_sweep", None)
+        if retention_sweep is not None:
+            await retention_sweep.shutdown()
         # Stop an in-flight backfill BEFORE closing the bus/loop: its OCR worker
         # runs on a to_thread worker that the loop cannot cancel, so without an
         # explicit stop it would keep writing content_index.db past loop close.
