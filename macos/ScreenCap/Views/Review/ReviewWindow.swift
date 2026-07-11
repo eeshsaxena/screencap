@@ -133,6 +133,15 @@ struct ReviewWindow: View {
             AccountSheetView(
                 auth: auth,
                 context: .upload,
+                onStartSignIn: {
+                    // Ownership latch (R14): fired precisely when THIS sheet's
+                    // own Sign In / retry buttons launch a login (the retired
+                    // SignInPromptView.onStartSignIn pattern), so closing this
+                    // window cancels only flows it actually started — never a
+                    // sign-in another surface began while this sheet happened
+                    // to be up.
+                    startedSignIn = true
+                },
                 onSettled: {
                     // Fires exactly once, on the signed-out → signed-in
                     // transition only (the sheet's one-shot latch) — dismiss
@@ -152,18 +161,6 @@ struct ReviewWindow: View {
             // Interactive-dismissal blocking while the browser round-trip is
             // live is owned by AccountSheetView itself (it applies
             // `.interactiveDismissDisabled` while signInFlow is in progress).
-        }
-        .onChange(of: auth.signInFlow) { flow in
-            // Ownership latch (R14): the retired SignInPromptView reported
-            // "I launched a login" via a callback; AccountSheetView's surface
-            // has no such hook, so attribute an in-progress transition to this
-            // window while ITS sheet is up. Sign-in can only start from an
-            // account surface, and while this window's sheet is presented that
-            // surface is this sheet — so this window owns the flow and is the
-            // one allowed to cancel it on close/dismiss.
-            if case .inProgress = flow, showAccountSheet {
-                startedSignIn = true
-            }
         }
         .onDisappear {
             model.windowDidClose()
@@ -201,10 +198,11 @@ struct ReviewWindow: View {
     }
 
     /// Upload tapped (the `.ready` and `.failed`-with-retry action). Cloud-
-    /// entitled and signed in → start the upload; signed out, or signed in on
-    /// Local Pro with the paywall on (R14 — today's raw signer-refusal path)
-    /// → present the Account & Plan sheet in `.upload` context rather than
-    /// letting `screencap upload` refuse opaquely (plan U6 / account-sheet U5).
+    /// entitled and signed in → start the upload; signed out, signed in on
+    /// Local Pro, or definitively lapsed with the paywall on (R14 — today's
+    /// raw signer-refusal paths) → present the Account & Plan sheet in
+    /// `.upload` context rather than letting `screencap upload` refuse
+    /// opaquely (plan U6 / account-sheet U5).
     /// The pure decision lives in `AccountSheetPolicy.uploadEntryAction`.
     ///
     /// `refreshIfNeeded` first, because sign-in state is now resolved lazily
@@ -220,6 +218,7 @@ struct ReviewWindow: View {
             switch AccountSheetPolicy.uploadEntryAction(
                 isSignedIn: auth.isSignedIn,
                 tier: auth.tier,
+                trialState: auth.trialState,
                 paywallEnabled: auth.paywallEnabled
             ) {
             case .proceed:

@@ -19,6 +19,15 @@ struct AccountSheetView: View {
     @ObservedObject var auth: CloudAuthController
     /// Which entry point presented this instance — framing copy only (KTD-3).
     let context: AccountSheetContext
+    /// Fired when one of THIS instance's own sign-in buttons is tapped (Sign
+    /// In, its failure retry, or the error seam's sign-in recovery), just
+    /// before `auth.startSignIn()`. Mirrors the retired
+    /// `SignInPromptView.onStartSignIn`: the auth controller is app-wide, so a
+    /// presenting window that must cancel-on-close only the flows it started
+    /// needs an explicit "I launched this login" signal — inferring ownership
+    /// from `signInFlow` transitions would claim sign-ins other surfaces
+    /// started.
+    var onStartSignIn: (() -> Void)? = nil
     /// Fired exactly once when sign-in settles while this instance is up
     /// (one-shot latch, mirroring `SignInPromptView`'s `didSignIn`). The upload
     /// entry uses it to dismiss and auto-start the gated upload (R14).
@@ -33,6 +42,13 @@ struct AccountSheetView: View {
     /// it and render no dismiss affordance. The presenting window owns
     /// cancellation of an in-flight sign-in on dismissal (R14).
     var onDismiss: (() -> Void)? = nil
+
+    /// App-wide upload bookkeeping (R8). Observed — not read through the
+    /// non-published `auth.canSignOut` closure alone — so the Sign Out row
+    /// re-renders when an upload starts or finishes; every host scene injects
+    /// the coordinator (`ScreenCapApp`). `auth.canSignOut` stays the
+    /// action-time guard.
+    @EnvironmentObject private var uploads: UploadCoordinator
 
     /// One-shot latch so the sign-in settle calls `onSettled` exactly once
     /// even if `isSignedIn` republishes — prevents a double upload.
@@ -82,6 +98,9 @@ struct AccountSheetView: View {
             titleVisibility: .visible
         ) {
             Button(AccountSheetCopy.signOutConfirmAction, role: .destructive) {
+                // Action-time guard (R8): an upload may have entered flight
+                // between the tap and this confirmation.
+                guard auth.canSignOut else { return }
                 Task { await auth.signOut() }
             }
             Button("Cancel", role: .cancel) {}
@@ -234,9 +253,34 @@ struct AccountSheetView: View {
             .accessibilityLabel("\(AccountSheetCopy.planName(tier)). \(AccountSheetCopy.currentPlanBadge).")
         case .buy:
             tierBuyButton(tier, enabled: true)
+        case .switchViaPortal:
+            tierSwitchButton(tier)
         case .disabledPreview:
             // R4: plans preview while signed out — visible, priced, inactive.
             tierBuyButton(tier, enabled: false)
+        }
+    }
+
+    /// The cross-tier affordance for an account that already holds a
+    /// subscription: a secondary button routing through the Stripe portal
+    /// (`startManageSubscription`) — a checkout here would mint a SECOND
+    /// subscription (U4: tier switching for existing subscribers goes through
+    /// Manage Subscription).
+    @ViewBuilder
+    private func tierSwitchButton(_ tier: EntitlementTier) -> some View {
+        VStack(spacing: 2) {
+            Button {
+                beginManage()
+            } label: {
+                Text(AccountSheetCopy.switchPlanButtonTitle(tier) ?? "")
+                    .frame(maxWidth: .infinity)
+            }
+            .accessibilityHint(
+                "Opens your subscription management page in your browser to switch plans."
+            )
+            Text(AccountSheetCopy.switchPlanDetail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -284,15 +328,23 @@ struct AccountSheetView: View {
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 360)
-                Button("Try Again") { auth.startSignIn() }
+                Button("Try Again") { startOwnSignIn() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
             }
         case .idle:
-            Button(AccountSheetCopy.signInButton) { auth.startSignIn() }
+            Button(AccountSheetCopy.signInButton) { startOwnSignIn() }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
         }
+    }
+
+    /// Every sign-in this instance launches goes through here so the
+    /// presenting window's ownership signal (`onStartSignIn`) can never drift
+    /// from the actual `startSignIn()` calls.
+    private func startOwnSignIn() {
+        onStartSignIn?()
+        auth.startSignIn()
     }
 
     // MARK: - Checkout pending + reconcile (KTD-6 / AE3)
@@ -353,9 +405,13 @@ struct AccountSheetView: View {
                     .accessibilityHint("Opens your subscription management page in your browser.")
             }
             if AccountSheetPolicy.showsSignOut(state: sheetState) {
+                // Derived from the OBSERVED coordinator, not the non-published
+                // `auth.canSignOut` closure — reading only the closure meant
+                // nothing re-rendered when an upload started or finished, so
+                // the button's enabled state went stale (R8).
                 Button("Sign Out") { showingSignOutConfirm = true }
-                    .disabled(!auth.canSignOut)
-                if auth.isSignedIn && !auth.canSignOut {
+                    .disabled(!auth.isSignedIn || uploads.isUploadInFlight)
+                if auth.isSignedIn && uploads.isUploadInFlight {
                     // R8: disabled-with-reason while an upload is in flight.
                     Text(AccountSheetCopy.signOutDisabledUploadInFlight)
                         .font(.caption)
@@ -371,9 +427,18 @@ struct AccountSheetView: View {
     /// mapped static copy, never an envelope string — with its recovery
     /// action: retry re-runs the billing action that failed, sign-in starts
     /// the browser flow.
+    ///
+    /// Suppressed entirely while the sheet renders signed-out
+    /// (`AccountSheetPolicy.showsErrorSection`): there `signInSection` owns
+    /// the failure display with a working retry, and a sign-in failure also
+    /// publishes `accountError` — rendering both stacked two copies of the
+    /// message plus a dead "Try Again" (`retryLastAction` is only set by the
+    /// billing actions). Belt-and-braces, a `.retry` with no recorded action
+    /// renders the message without the button rather than a no-op button.
     @ViewBuilder
     private var errorSection: some View {
-        if let error = auth.accountError {
+        if AccountSheetPolicy.showsErrorSection(state: sheetState),
+           let error = auth.accountError {
             VStack(spacing: 8) {
                 Text(error.message)
                     .font(.caption)
@@ -382,14 +447,16 @@ struct AccountSheetView: View {
                     .frame(maxWidth: 380)
                 switch error.action {
                 case .retry:
-                    Button("Try Again") {
-                        auth.clearAccountError()
-                        retryLastAction?()
+                    if let retry = retryLastAction {
+                        Button("Try Again") {
+                            auth.clearAccountError()
+                            retry()
+                        }
                     }
                 case .signIn:
                     Button(AccountSheetCopy.signInButton) {
                         auth.clearAccountError()
-                        auth.startSignIn()
+                        startOwnSignIn()
                     }
                 }
             }
