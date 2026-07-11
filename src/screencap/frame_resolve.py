@@ -77,24 +77,33 @@ def _round_half_away(x: float) -> int:
 
 
 def load_frames(screenshots_dir: Path) -> list[Frame]:
-    """List ``screenshots_dir``'s ``*.jpg`` frames, parsed and sorted ascending.
+    """List ``screenshots_dir``'s frames, parsed and sorted ascending.
 
-    Globs ``*.jpg`` only (``.jpeg``/``.png`` excluded), parses each ``{epoch}.jpg``
-    stem to a timestamp (skipping non-numeric stems), and sorts ascending by
-    millisecond. Returns ``[]`` when the directory is missing — never raises.
+    Globs both the plaintext ``*.jpg`` and the encrypted ``*.jpg.enc`` forms (search
+    U7 compat) — ``.jpeg``/``.png`` excluded — parses each ``{epoch}`` stem to a
+    timestamp (skipping non-numeric stems), dedups a frame that exists in both forms
+    during the migration window, and sorts ascending by millisecond. The ``stem`` is
+    always the logical ``{epoch}`` (no ``.enc``) so the ``frame.read`` verb resolves
+    it to whichever on-disk form exists. Returns ``[]`` when the directory is
+    missing — never raises.
     """
+    from screencap import still_io
+
     screenshots_dir = Path(screenshots_dir)
     if not screenshots_dir.is_dir():
         return []
-    frames: list[Frame] = []
-    for img_path in screenshots_dir.glob("*.jpg"):
-        ts = parse_screenshot_timestamp(img_path.name)
-        if ts is None:
-            continue
-        stem = img_path.name[: -len(".jpg")]
-        frames.append(Frame(ts=ts, ms=_round_half_away(ts * 1000.0), stem=stem))
-    frames.sort(key=lambda f: f.ms)
-    return frames
+    by_ms: dict[int, Frame] = {}
+    for pattern in ("*.jpg", "*.jpg.enc"):
+        for img_path in screenshots_dir.glob(pattern):
+            logical = still_io.logical_still_name(img_path)  # '<ts>.jpg'
+            ts = parse_screenshot_timestamp(logical)
+            if ts is None:
+                continue
+            ms = _round_half_away(ts * 1000.0)
+            # First form wins; a frame present as both .jpg and .jpg.enc mid-migration
+            # is listed once (same logical stem either way).
+            by_ms.setdefault(ms, Frame(ts=ts, ms=ms, stem=logical[: -len(".jpg")]))
+    return sorted(by_ms.values(), key=lambda f: f.ms)
 
 
 def nearest_frame(

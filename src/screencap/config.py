@@ -307,6 +307,38 @@ def get_corpus_encrypted() -> bool:
     return _parse_bool_env("SCREENCAP_CORPUS_ENCRYPTED", "corpus_encrypted", False)
 
 
+def get_corpus_encryption_requested() -> bool:
+    """Return whether a corpus-encryption flip has been *requested* (search U7).
+
+    Set by the U8 flip before the migration runs, so a daemon that crashes
+    mid-migration knows on the next start to RESUME converting the corpus rather
+    than leave it half-plaintext. ``corpus_encrypted`` is the *done* marker;
+    this is the *intent* marker. Default False (no flip requested)."""
+    return _parse_bool_env(
+        "SCREENCAP_CORPUS_ENCRYPTION_REQUESTED", "corpus_encryption_requested", False
+    )
+
+
+def set_corpus_encryption_requested(value: bool) -> None:
+    """Persist the corpus-encryption *intent* marker (search U7). Advisory-locked +
+    atomic; invalidates the in-process cache."""
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        doc["corpus_encryption_requested"] = bool(value)
+
+
+def set_corpus_encrypted(value: bool) -> None:
+    """Persist the corpus-encryption *done* marker (search U7). Set True only AFTER
+    the migration has converted every still + rekeyed the index, so readers never
+    switch to the encrypted paths before the bytes exist. Advisory-locked + atomic;
+    invalidates the in-process cache."""
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        doc["corpus_encrypted"] = bool(value)
+
+
 def get_cloud_e2ee_enabled() -> bool:
     """Return whether cloud uploads are end-to-end encrypted on-device (E2EE slice).
 

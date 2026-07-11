@@ -88,6 +88,19 @@ def _chunks(seq: list[Any], size: int) -> list[list[Any]]:
     return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
+def _both_still_forms(rel: str) -> tuple[str, ...]:
+    """Both on-disk forms of a recorded still path (search U7 compat).
+
+    A DB ``image_path`` may be ``screenshots/<ts>.jpg`` while the migrated file on
+    disk is ``screenshots/<ts>.jpg.enc`` (or vice versa), so a purge must try both.
+    """
+    if rel.endswith(".jpg.enc"):
+        return (rel, rel[: -len(".enc")])
+    if rel.endswith(".jpg"):
+        return (rel, rel + ".enc")
+    return (rel,)
+
+
 def _delete_in_batches(
     cur: sqlite3.Cursor, table: str, column: str, values: list[Any],
 ) -> int:
@@ -401,20 +414,28 @@ class ScrubWorker:
     def _unlink_screenshot_files(self, image_paths: list[str]) -> int:
         """Delete on-disk screenshot files for paths gathered pre-delete.
 
+        Tries BOTH the plaintext ``.jpg`` and the encrypted ``.jpg.enc`` form of each
+        recorded ``image_path`` (search U7 compat): a pre-flip DB row still records
+        ``.jpg`` after the migration converted the file to ``.jpg.enc``, so a
+        single-extension unlink would leave the just-disabled frame's pixels on disk.
         Returns the number of files actually unlinked.
         """
         deleted = 0
+        cap_resolved = self._capture_dir.resolve()
         for rel in image_paths:
-            try:
-                p = (self._capture_dir / rel).resolve()
-                # Defensive: never escape capture_dir.
-                cap_resolved = self._capture_dir.resolve()
-                if cap_resolved not in p.parents and p != cap_resolved:
+            unlinked_any = False
+            for candidate in _both_still_forms(rel):
+                try:
+                    p = (self._capture_dir / candidate).resolve()
+                    # Defensive: never escape capture_dir.
+                    if cap_resolved not in p.parents and p != cap_resolved:
+                        continue
+                    p.unlink(missing_ok=True)
+                    unlinked_any = True
+                except OSError:
                     continue
-                p.unlink(missing_ok=True)
+            if unlinked_any:
                 deleted += 1
-            except OSError:
-                continue
         return deleted
 
     def _delete_orphan_action_events(

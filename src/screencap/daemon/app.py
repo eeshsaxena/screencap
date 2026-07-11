@@ -68,6 +68,15 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         )
     except Exception:  # noqa: BLE001 - reconcile must never break startup
         logger.warning("storage-migration reconcile failed", exc_info=True)
+    # Search U7: resume/finish a corpus plaintext→encrypted flip that a prior daemon
+    # requested but didn't complete (crash-safe). A no-op before any flip is
+    # requested; strictly fail-open so a migration hiccup never blocks daemon start.
+    try:
+        from screencap import corpus_migrate
+
+        await asyncio.to_thread(corpus_migrate.resume_at_daemon_start)
+    except Exception:  # noqa: BLE001 - migration must never break startup
+        logger.warning("corpus-migration resume failed", exc_info=True)
     # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
     # daemon start (the stale-daemon-after-app-update lesson — a request-path
     # module must be imported before the first request, never lazily inside the
