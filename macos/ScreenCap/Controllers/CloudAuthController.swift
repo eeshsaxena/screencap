@@ -54,7 +54,7 @@ private struct PortalURLEnvelope: Decodable {
 /// literal with no dynamic interpolation, so a runtime envelope string (or
 /// `CLIError.nonZeroExit.localizedDescription`, which embeds raw stderr) can
 /// never carry raw backend text or terminal instructions into rendered copy.
-enum AccountErrorCopy: Equatable {
+enum AccountErrorCopy: Equatable, CaseIterable {
     /// The backend's fail-closed "no active/trialing subscription" 4xx (AE8).
     /// Stripe's subscription search is eventually consistent (~1 min after
     /// checkout), so the copy never asserts that no subscription exists — a
