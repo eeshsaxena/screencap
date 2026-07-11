@@ -30,7 +30,6 @@ import pytest
 
 from screencap import pipeline_state as ps
 
-
 # ---------------------------------------------------------------------------
 # Fixtures — an OLD-PATH chunked recording dir as it exists before the new
 # code first runs over it: chunk media on disk, legacy per-chunk status files,

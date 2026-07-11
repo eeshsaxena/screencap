@@ -1039,8 +1039,8 @@ class TestUnifiedEventExport:
         at runtime, so wiring network rows into the chunk_processor
         would silently leak metadata to the cloud bucket.
         """
-        from screencap.engine.db import crud
         from screencap.chunk_processor import ChunkProcessor
+        from screencap.engine.db import crud
 
         crud.insert_network_event(
             recording_db.session,

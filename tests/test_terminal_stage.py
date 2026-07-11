@@ -409,8 +409,8 @@ class TestFailClosed:
             ts.CloudCopyProducer, "produce",
             lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed, failed_chunks=[1]),
         )
-        from screencap.upload import UploadResult
         import screencap.upload as up
+        from screencap.upload import UploadResult
         monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
 
         sentinel_called = []
@@ -452,8 +452,8 @@ class TestForceStopGate:
             ts.CloudCopyProducer, "produce",
             lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
         )
-        from screencap.upload import UploadResult
         import screencap.upload as up
+        from screencap.upload import UploadResult
         monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
         monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
 
@@ -493,8 +493,8 @@ class TestStaleSentinel:
             ts.CloudCopyProducer, "produce",
             lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
         )
-        from screencap.upload import UploadResult
         import screencap.upload as up
+        from screencap.upload import UploadResult
         monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
 
         captured = {}
@@ -611,8 +611,8 @@ def _stub_cloud_seam(monkeypatch, scrubbed):
         ts.CloudCopyProducer, "produce",
         lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
     )
-    from screencap.upload import UploadResult
     import screencap.upload as up
+    from screencap.upload import UploadResult
     monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
     monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
 
@@ -718,8 +718,8 @@ class TestAlreadyConvergedFastPath:
             ts.CloudCopyProducer, "produce",
             lambda self, **kw: produced.append(True) or CloudCopyOutcome(scrubbed_dir=scrubbed),
         )
-        from screencap.upload import UploadResult
         import screencap.upload as up
+        from screencap.upload import UploadResult
         monkeypatch.setattr(up, "upload_recording", lambda d, **kw: UploadResult(recording=d.name))
         monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
 
