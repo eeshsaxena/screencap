@@ -130,10 +130,11 @@ struct MainWindow: View {
     /// from the Library header. Kept here (not in LibraryView) so it layers over
     /// the whole shell like the prototype's z-41 overlay.
     @State private var showingNewRecording = false
-    /// U12: the upgrade prompt — an in-window overlay presented when a lapsed
-    /// user taps a gated record/search affordance (mirrors the New-recording
-    /// overlay layering). Kept here so it layers over the whole shell.
-    @State private var showingUpgradePrompt = false
+    /// U12 / account-sheet U5: the shared Account & Plan sheet, presented via
+    /// `.sheet(item:)` so the presentation carries its context (KTD-3). Gated
+    /// record/search affordances set `.gate`; nil means no sheet. The Settings
+    /// entry is NOT this — it is the embedded `.account` route (KTD-4).
+    @State private var presentedAccountContext: AccountSheetContext?
     /// U10: the Recall palette — an in-window overlay (KTD-4) opened by the
     /// window-scoped ⌘⇧F (KTD-13), the Library/Journal search pills, and the
     /// menu-bar "Search…" item (via notification).
@@ -291,11 +292,15 @@ struct MainWindow: View {
                 NewRecordingSheet(isPresented: $showingNewRecording)
             }
         }
-        .sheet(isPresented: $showingUpgradePrompt) {
-            // U12: the lapse upgrade prompt. A native sheet (mirroring
-            // SignInPromptView's presentation) shared by every gated
-            // record/search affordance across the shell.
-            UpgradePromptView(auth: auth, onDismiss: { showingUpgradePrompt = false })
+        .sheet(item: $presentedAccountContext) { context in
+            // U12 / account-sheet U5: the unified Account & Plan sheet shared
+            // by every gated record/search affordance across the shell
+            // (replaces the retired UpgradePromptView).
+            AccountSheetView(
+                auth: auth,
+                context: context,
+                onDismiss: { presentedAccountContext = nil }
+            )
         }
         .overlay {
             // U10: the Recall palette overlay (the prototype's z-40/41 scrim +
@@ -319,10 +324,16 @@ struct MainWindow: View {
         .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenRecallPalette)) { _ in
             showingPalette = true
         }
-        .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenUpgradePrompt)) { _ in
-            // U12: the menu-bar gated Start item routed here after focusing the
-            // window — open the shared upgrade prompt.
-            showingUpgradePrompt = true
+        .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenAccountGate)) { _ in
+            // U12 / account-sheet U5: a gated affordance (menu-bar Start,
+            // New-recording sheet, Recall palette) routed here after focusing
+            // the window — present the shared sheet in gate context.
+            presentedAccountContext = .gate
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenAccountPane)) { _ in
+            // Account-sheet U5 (KTD-4): the menu-bar "Account…" item — select
+            // the embedded Account & Plan pane route.
+            route = .account
         }
     }
 
@@ -479,6 +490,12 @@ struct MainWindow: View {
         switch route {
         // Index-independent routes are reachable even while the recordings index
         // is loading or errored — handle them before the index gate.
+        case .account:
+            // Account-sheet U5 (KTD-4): the Settings "Account" entry renders
+            // the shared account content as an embedded pane — `account`
+            // context, no onDismiss (embedded panes have no dismiss
+            // affordance; the sidebar is the way out).
+            AccountSheetView(auth: auth, context: .account)
         case .privacy:
             // U12: the prototype Privacy settings pane. The mask row's
             // disclosure deep-links to App rules — the per-app view of what
@@ -518,7 +535,7 @@ struct MainWindow: View {
             // on the Day timeline seeked to the recording (U9).
             LibraryView(
                 onNewRecording: presentNewRecording,
-                onUpgradePrompt: { showingUpgradePrompt = true },
+                onUpgradePrompt: { presentedAccountContext = .gate },
                 onOpenSearch: { showingPalette = true },
                 onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
             )

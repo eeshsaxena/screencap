@@ -15,4 +15,36 @@ enum MenuBarMenuPolicy {
         if case .recording = state { return true }
         return false
     }
+
+    // MARK: - Collapsed account section (account-sheet U5)
+
+    /// The "Account…" menu item title — always present; it opens the main
+    /// window's Account & Plan pane (KTD-4).
+    static let accountItemTitle = "Account…"
+
+    /// The single account status line above the "Account…" item. An in-flight
+    /// or failed sign-in takes priority over the persistent status so the user
+    /// always sees what the browser round-trip is doing; the failed line is
+    /// deliberately static copy (no raw reason string — R10) since the pane is
+    /// where retry + details live now.
+    static func accountStatusLine(
+        status: AuthStatus,
+        signInFlow: SignInFlowState
+    ) -> String {
+        switch signInFlow {
+        case .inProgress:
+            return "Signing in… check your browser"
+        case .failed:
+            return "Sign-in failed — open Account to retry"
+        case .idle:
+            switch status {
+            case .signedIn:
+                return status.accountLabel.map { "Signed in: \($0)" } ?? "Signed in (offline)"
+            case .signedOut:
+                return "Not signed in"
+            case .unknown:
+                return "Checking sign-in…"
+            }
+        }
+    }
 }

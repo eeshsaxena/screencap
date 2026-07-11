@@ -19,6 +19,16 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertNil(library.helpText, "an enabled row has no coming-soon tooltip")
     }
 
+    /// KTD-4 (account-sheet U5): Account is pinned FIRST in the SETTINGS group
+    /// — it is the paid-only gate's home surface, and burying it slows a
+    /// lapsed user's path back to a resolvable state.
+    func testAccountIsFirstInSettingsGroup() {
+        let first = ShellSidebarModel.settingsNav.first
+        XCTAssertEqual(first?.id, "account")
+        XCTAssertEqual(first?.route, .account)
+        XCTAssertEqual(first?.isEnabled, true)
+    }
+
     func testPrivacyRoutesAndIsEnabled() {
         let privacy = item(ShellSidebarModel.settingsNav, "privacy")
         XCTAssertEqual(privacy.route, .privacy)

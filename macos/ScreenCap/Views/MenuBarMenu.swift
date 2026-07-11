@@ -7,11 +7,20 @@ extension Notification.Name {
     /// (KTD-13: the ⌘⇧F shortcut itself stays window-scoped, no global tap).
     static let screenCapOpenRecallPalette = Notification.Name("com.screencap.recallPalette.open")
 
-    /// U12 — posted by the menu-bar gated "Start Recording" item (lapsed user)
-    /// after focusing/opening the main window; MainWindow observes it and opens
-    /// the upgrade prompt. Same pattern as the Search item, so the menu-bar
-    /// affordance surfaces the same upgrade sheet as the in-window controls.
-    static let screenCapOpenUpgradePrompt = Notification.Name("com.screencap.upgradePrompt.open")
+    /// U12 / account-sheet U5 — posted by the gated record/search affordances
+    /// (menu-bar gated Start, New-recording sheet, Recall palette) after
+    /// focusing/opening the main window; MainWindow observes it and presents
+    /// the shared Account & Plan sheet in `.gate` context. Same pattern as the
+    /// Search item, so every gated affordance surfaces the same sheet.
+    /// (Replaces the retired `.screenCapOpenUpgradePrompt` /
+    /// `UpgradePromptView` round-trip.)
+    static let screenCapOpenAccountGate = Notification.Name("com.screencap.accountSheet.gate")
+
+    /// Account-sheet U5 (KTD-4) — posted by the menu-bar "Account…" item after
+    /// focusing/opening the main window; MainWindow observes it and selects the
+    /// `.account` sidebar route (the embedded Account & Plan pane — no
+    /// menu-bar sheet).
+    static let screenCapOpenAccountPane = Notification.Name("com.screencap.accountPane.open")
 }
 
 /// Menu bar dropdown — Start Recording, Stop, account, Open ScreenCap,
@@ -22,7 +31,6 @@ extension Notification.Name {
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var auth: CloudAuthController
-    @EnvironmentObject private var uploads: UploadCoordinator
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -51,7 +59,7 @@ struct MenuBarMenu: View {
             // state the subscription requirement (VoiceOver reads the title).
             Button {
                 openMainWindow()
-                NotificationCenter.default.post(name: .screenCapOpenUpgradePrompt, object: nil)
+                NotificationCenter.default.post(name: .screenCapOpenAccountGate, object: nil)
             } label: {
                 Label("Start Recording — Subscription Required", systemImage: "lock.fill")
             }
@@ -77,8 +85,9 @@ struct MenuBarMenu: View {
 
         Divider()
 
-        // Cloud account (plan U6). The one consistent place to see sign-in
-        // state and sign in / out. Local recording is never gated on this.
+        // Cloud account (plan U6, collapsed by account-sheet U5): a status
+        // line plus the "Account…" entry into the shared Account & Plan pane.
+        // Local recording is never gated on this.
         //
         // Sign-in state is resolved lazily on first menu open (not at app
         // launch): `refreshIfNeeded` decrypts the Keychain only when this
@@ -106,40 +115,21 @@ struct MenuBarMenu: View {
             .keyboardShortcut("q")
     }
 
-    /// Account status + Sign In / Sign Out. The in-progress and failed sign-in
-    /// flow states take priority over the persistent status so the user always
-    /// sees what the browser round-trip is doing (design-review states a/b).
-    ///
-    /// This switch over `SignInFlowState` parallels `SignInPromptView.actions`,
-    /// but renders genuinely different controls (menu items vs. a sheet with a
-    /// ProgressView and keyboard-shortcut buttons), so the two intentionally
-    /// stay separate rather than sharing a forced `@ViewBuilder`. Keep the case
-    /// coverage here and there in sync when `SignInFlowState` changes.
+    /// Collapsed account section (account-sheet U5): one status line + the
+    /// "Account…" item that opens the main window's Account & Plan pane
+    /// (KTD-4 — the `.account` route, no menu-bar sheet). Sign In / Sign Out
+    /// live in the shared sheet/pane now, so the menu never runs auth flows
+    /// itself; the status line still surfaces an in-flight browser round-trip
+    /// so the user sees what's happening. The line copy is policy-derived
+    /// (`MenuBarMenuPolicy.accountStatusLine`) so it stays unit-testable.
     @ViewBuilder
     private var accountSection: some View {
-        switch auth.signInFlow {
-        case .inProgress:
-            Text("Signing in… check your browser")
-            Button("Cancel Sign-In") { auth.cancelSignIn() }
-        case .failed(let reason):
-            Text("Sign-in failed: \(reason)")
-            Button("Sign In…") { auth.startSignIn() }
-        case .idle:
-            switch auth.status {
-            case .signedIn:
-                Text(auth.status.accountLabel.map { "Signed in: \($0)" } ?? "Signed in (offline)")
-                Button("Sign Out") { Task { await auth.signOut() } }
-                    // Disabled mid-upload so an in-flight signed-URL request
-                    // can't hit NotSignedIn (design-review state c). Gates on
-                    // both the persistent status and the app-wide upload count
-                    // (owned by `UploadCoordinator`); observing `uploads` here
-                    // is what re-renders the menu when an upload starts/finishes.
-                    .disabled(!(auth.isSignedIn && !uploads.isUploadInFlight))
-            case .signedOut:
-                Button("Sign In…") { auth.startSignIn() }
-            case .unknown:
-                Text("Checking sign-in…")
-            }
+        Text(MenuBarMenuPolicy.accountStatusLine(
+            status: auth.status, signInFlow: auth.signInFlow
+        ))
+        Button(MenuBarMenuPolicy.accountItemTitle) {
+            openMainWindow()
+            NotificationCenter.default.post(name: .screenCapOpenAccountPane, object: nil)
         }
     }
 

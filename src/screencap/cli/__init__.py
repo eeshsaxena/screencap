@@ -1723,7 +1723,9 @@ def checkout_url_cmd(tier, as_json):
     macOS app opens the printed URL in the browser; on return it force-refreshes
     the entitlement (`whoami --force-refresh`) to pick up the granted plan. The
     tier selects the price only — the webhook re-derives entitlement from the
-    paid price.
+    paid price. The error envelope carries a machine-readable `code`
+    (`not_signed_in`, `network`) alongside `error`, so the app's error mapper
+    keys on code, never message text (KTD-5) — same contract as `portal-url`.
     """
     from screencap import upload
 
@@ -1731,11 +1733,53 @@ def checkout_url_cmd(tier, as_json):
         url = upload.request_checkout_url(tier)
     except Exception as e:
         if as_json:
-            click.echo(json.dumps(
-                {"ok": False, "schema_version": _AUTH_SCHEMA_VERSION, "error": str(e)}
-            ))
+            click.echo(json.dumps({
+                "ok": False,
+                "schema_version": _AUTH_SCHEMA_VERSION,
+                "error": str(e),
+                "code": getattr(e, "code", "unknown"),
+            }))
             sys.exit(1)
         console.print(f"[red]Couldn't start checkout:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if as_json:
+        click.echo(json.dumps(
+            {"ok": True, "schema_version": _AUTH_SCHEMA_VERSION, "url": url}
+        ))
+        return
+    console.print(url)
+
+
+@cli.command("portal-url")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def portal_url_cmd(as_json):
+    """Print a hosted Stripe customer-portal URL for managing the subscription.
+
+    Requires sign-in (the uid is derived server-side from the bearer token) and
+    an active or trialing subscription. The macOS app opens the printed URL in
+    the browser; on return it force-refreshes the entitlement to pick up any plan
+    change. The error envelope carries a machine-readable `code`
+    (`no_subscription`, `not_signed_in`, `network`) alongside `error`, so the
+    app's error mapper keys on code, never message text (KTD-5).
+    """
+    from screencap import upload
+
+    try:
+        url = upload.request_portal_url()
+    except Exception as e:
+        if as_json:
+            click.echo(json.dumps({
+                "ok": False,
+                "schema_version": _AUTH_SCHEMA_VERSION,
+                "error": str(e),
+                "code": getattr(e, "code", "unknown"),
+            }))
+            sys.exit(1)
+        console.print(
+            f"[red]Couldn't open subscription management:[/red] {escape(str(e))}"
+        )
         sys.exit(1)
     if as_json:
         click.echo(json.dumps(
@@ -3695,7 +3739,7 @@ def _handle_byo_key(set_vendor, clear_vendor, validate, as_json, err_console) ->
         except Exception as exc:  # noqa: BLE001 — surface a clean error, never the key
             err_console.print(
                 f"[red]Error:[/red] couldn't clear the {escape(vendor)} key "
-                f"({type(exc).__name__})."
+                f"({escape(type(exc).__name__)})."
             )
             _emit(False, vendor=vendor, error="key_clear_failed")
             return
@@ -3732,7 +3776,7 @@ def _handle_byo_key(set_vendor, clear_vendor, validate, as_json, err_console) ->
     except Exception as exc:  # noqa: BLE001 — surface a clean error, never the key
         err_console.print(
             f"[red]Error:[/red] couldn't store the {escape(vendor)} key "
-            f"({type(exc).__name__})."
+            f"({escape(type(exc).__name__)})."
         )
         _emit(False, vendor=vendor, validation=validation, error="key_store_failed")
         return
@@ -4446,7 +4490,7 @@ def search_enable_cmd() -> None:
     try:
         report = corpus_migrate.flip_corpus_to_encrypted()
     except Exception as exc:  # noqa: BLE001 — surface the failure with a clean exit
-        console.print(f"[red]Could not enable search: {exc}[/red]")
+        console.print(f"[red]Could not enable search: {escape(str(exc))}[/red]")
         raise SystemExit(1)
     console.print(
         f"[green]Search enabled.[/green] Encrypted {report.stills_encrypted} still(s) "

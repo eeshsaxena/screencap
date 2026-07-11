@@ -7,14 +7,114 @@ private let authLogger = Logger(subsystem: "com.screencap.macos", category: "clo
 
 /// Decoded `screencap checkout-url --json` envelope (billing U9): `{ok, url}` on
 /// success or `{ok:false, error}`. Tolerant parse like `AuthWhoAmIEnvelope`.
+/// `code` is additive (the CLI doesn't emit it for checkout today); absent, the
+/// error mapper resolves to its static fallback — never to the `error` text.
 private struct CheckoutURLEnvelope: Decodable {
     let ok: Bool?
     let url: String?
     let error: String?
+    let code: String?
 
     static func parse(_ data: Data) -> CheckoutURLEnvelope? {
         guard !data.isEmpty else { return nil }
         return try? JSONDecoder().decode(CheckoutURLEnvelope.self, from: data)
+    }
+}
+
+/// Decoded `screencap portal-url --json` envelope (account sheet U2/U3):
+/// `{ok, schema_version, url}` on success, or exit 1 with `{ok:false,
+/// schema_version, error, code}` where `code` ∈ no_subscription |
+/// not_signed_in | network | unknown. Tolerant parse like
+/// `CheckoutURLEnvelope`; every field is nullable per state and consumers gate
+/// only on what their state needs — success needs `url`, the failure path needs
+/// only `code` (`AccountErrorCopy` keys on it; `error` text is NEVER rendered).
+private struct PortalURLEnvelope: Decodable {
+    let ok: Bool?
+    let schemaVersion: Int?
+    let url: String?
+    let error: String?
+    let code: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, url, error, code
+        case schemaVersion = "schema_version"
+    }
+
+    static func parse(_ data: Data) -> PortalURLEnvelope? {
+        guard !data.isEmpty else { return nil }
+        return try? JSONDecoder().decode(PortalURLEnvelope.self, from: data)
+    }
+}
+
+/// The single error-mapping seam for account/billing failures (KTD-5 / R10).
+///
+/// Keyed on the CLI envelope's machine-readable `code` — never on message
+/// text, which drifts silently past fakes — and on the Swift-side `CLIError`
+/// for failures where no envelope ever arrived. Every `message` is a STATIC
+/// literal with no dynamic interpolation, so a runtime envelope string (or
+/// `CLIError.nonZeroExit.localizedDescription`, which embeds raw stderr) can
+/// never carry raw backend text or terminal instructions into rendered copy.
+enum AccountErrorCopy: Equatable, CaseIterable {
+    /// The backend's fail-closed "no active/trialing subscription" 4xx (AE8).
+    /// Stripe's subscription search is eventually consistent (~1 min after
+    /// checkout), so the copy never asserts that no subscription exists — a
+    /// just-paid user must not read "no subscription" and buy again.
+    case noSubscription
+    /// No stored credential — the fix is signing in, not retrying.
+    case notSignedIn
+    /// Transient network/auth-refresh trouble — retry is the honest advice.
+    case network
+    /// Anything unrecognized (absent/future `code`, unexpected Swift error).
+    /// Static fallback by construction: no field of the failure is embedded.
+    case unknown
+
+    /// The recovery affordance the sheet renders next to the message.
+    enum Action: Equatable {
+        case retry
+        case signIn
+    }
+
+    var message: String {
+        switch self {
+        case .noSubscription:
+            return "No subscription found yet — if you just subscribed, try again in a minute."
+        case .notSignedIn:
+            return "Sign in to manage your subscription."
+        case .network:
+            return "Couldn't reach the subscription service. Check your connection and try again."
+        case .unknown:
+            return "Something went wrong. Try again."
+        }
+    }
+
+    var action: Action {
+        switch self {
+        case .noSubscription, .network, .unknown:
+            return .retry
+        case .notSignedIn:
+            return .signIn
+        }
+    }
+
+    /// Map an envelope's `code` field. Absent or unrecognized → the static
+    /// fallback (never a peek at the `error` message text).
+    static func from(code: String?) -> AccountErrorCopy {
+        switch code {
+        case "no_subscription": return .noSubscription
+        case "not_signed_in": return .notSignedIn
+        case "network": return .network
+        default: return .unknown
+        }
+    }
+
+    /// Map a thrown Swift-side error — the shell-out failed before any envelope
+    /// existed. A timeout reads as network trouble; everything else takes the
+    /// static fallback. Deliberately never surfaces `localizedDescription`:
+    /// `CLIError.nonZeroExit`'s description embeds raw stderr (the R10 leak
+    /// this seam exists to close).
+    static func from(error: Error) -> AccountErrorCopy {
+        if case CLIError.timedOut = error { return .network }
+        return .unknown
     }
 }
 
@@ -75,6 +175,13 @@ protocol CloudAuthService {
     /// customer is never permanently stuck. The caller re-mints the token
     /// (force-refresh whoami) afterward to observe the grant locally.
     func fetchReconcileEntitlement() async throws -> Data
+
+    /// Raw stdout of `screencap portal-url --json` — a hosted Stripe
+    /// customer-portal URL for managing the subscription (account sheet U3).
+    /// Requires sign-in and an active/trialing subscription; the failure
+    /// envelope carries a machine-readable `code` the error seam keys on
+    /// (KTD-5). Token handling stays in Python.
+    func fetchPortalURL() async throws -> Data
 }
 
 @MainActor
@@ -132,6 +239,17 @@ final class LiveCloudAuthService: CloudAuthService {
     func fetchReconcileEntitlement() async throws -> Data {
         try await CLIClient.runJSONRaw(["reconcile-entitlement", "--json"], timeout: 30)
     }
+
+    func fetchPortalURL() async throws -> Data {
+        // `allowNonZeroExit`: like `checkout-url`, on failure the CLI writes the
+        // `{ok:false, error, code}` envelope to stdout and exits 1 with *empty*
+        // stderr. Without this, the non-zero exit throws `nonZeroExit(stderr:
+        // "")`, discarding the envelope — and with it the machine-readable
+        // `code` the error seam maps, leaving only the static fallback.
+        try await CLIClient.runJSONRaw(
+            ["portal-url", "--json"], timeout: 30, allowNonZeroExit: true
+        )
+    }
 }
 
 /// Owns cloud sign-in state for the app shell (plan U6). Surfaces:
@@ -170,6 +288,36 @@ final class CloudAuthController: ObservableObject {
     /// soft gate / checkout — cloud onboarding behaves exactly as before billing.
     /// Read from the `whoami` envelope's `paywall_enabled`; false when absent.
     @Published private(set) var paywallEnabled: Bool = false
+    /// Browser-return flag for an in-flight Stripe Checkout (account-sheet
+    /// KTD-6, relocated from `OnboardingAccountStep`'s view-local copy —
+    /// additive until U5 switches onboarding over). Set when `startCheckout`
+    /// runs; drives the "unlocks automatically" pending rendering and gates the
+    /// app-activation entitlement refresh. Cleared when the entitlement resolves
+    /// to `checkoutTargetTier` in a live entitled state (trialing or converted),
+    /// on mint failure, and on sign-out/account switch.
+    @Published private(set) var checkoutPending = false
+    /// The paid tier the pending checkout targets (KTD-6). Remembered so the
+    /// webhook-lag window can be told apart from "resolved": only an envelope
+    /// that reports THIS tier in a live entitled trial state settles the flag.
+    /// Re-tapping a tier replaces it — an abandoned Stripe tab stays
+    /// recoverable in place. Nil whenever `checkoutPending` is false.
+    @Published private(set) var checkoutTargetTier: EntitlementTier?
+    /// Browser-return flag for an opened customer portal (KTD-6 / R7). Unlike
+    /// checkout there is no target state to converge on (the user may have
+    /// cancelled, downgraded, or done nothing), so this clears after the single
+    /// post-return refresh; the manual reconcile affordance remains the recourse
+    /// if that refresh lost the race with the webhook.
+    @Published private(set) var portalReturnPending = false
+    /// In-flight signal for the "I've paid — check now" reconcile round-trip so
+    /// the sheet (U4) can render a spinner instead of a dead-feeling button.
+    @Published private(set) var isReconciling = false
+    /// The error seam's rendered output (KTD-5 / R10): the last account/billing
+    /// failure, already mapped to app-native static copy + a recovery action.
+    /// Views render THIS — never `env.error` and never a raw
+    /// `localizedDescription`. Set by portal/checkout mint failures, the
+    /// https open-guard, and sign-in failures; cleared when a new attempt
+    /// starts, on `clearAccountError()`, and on sign-out.
+    @Published private(set) var accountError: AccountErrorCopy?
 
     private let service: CloudAuthService
     /// Read-only window onto the upload count that gates Sign Out. Owned by the
@@ -190,6 +338,15 @@ final class CloudAuthController: ObservableObject {
     /// ignored rather than corrupting the live attempt (e.g. clobbering the new
     /// `loginHandle` or flipping the new flow to `.failed`).
     private var loginGeneration = 0
+    /// Monotonic per-attempt token for `startCheckout`, mirroring
+    /// `loginGeneration`. Re-tapping a tier replaces the target and mints a
+    /// fresh URL (a supported flow), so a superseded attempt's late mint
+    /// failure — or late success — must not clear the CURRENT attempt's
+    /// pending state or open a stale URL. Each `startCheckout` bumps it and
+    /// the mint Task captures the value; a mismatch on resume means the
+    /// attempt was superseded (or sign-out tore the machinery down) and the
+    /// Task returns without mutating anything.
+    private var checkoutGeneration = 0
     /// Completion for the in-flight attempt (the Upload gate's "proceed once
     /// signed in"). Fired exactly once per attempt — on success, failure, or
     /// cancel — then cleared.
@@ -207,16 +364,54 @@ final class CloudAuthController: ObservableObject {
     /// its own timer (rather than racing it).
     private static let loginWatchdogSeconds: TimeInterval = 210
 
+    /// Browser-open seam for the billing URLs (checkout + portal). Injected so
+    /// tests can observe what would open without launching a real browser; the
+    /// default routes to `NSWorkspace`. Only ever invoked through
+    /// `openBillingURL`, which enforces the https guard first.
+    private let openURL: @MainActor (URL) -> Void
+    /// Injected so tests can post `didBecomeActiveNotification` on a private
+    /// center without touching the process-global one (other observers in the
+    /// test host must not react to a synthetic activation).
+    private let notificationCenter: NotificationCenter
+    /// Token for the app-activation subscription; removed in `deinit`.
+    private var activationObserver: NSObjectProtocol?
+
     /// - Parameter isUploadInFlight: reads the app-wide `UploadCoordinator`'s
     ///   in-flight flag so `canSignOut` can gate on uploads without this
     ///   controller owning the count. Defaults to "no upload" for tests /
     ///   surfaces that don't wire a coordinator.
     init(
         service: CloudAuthService = LiveCloudAuthService(),
-        isUploadInFlight: @escaping () -> Bool = { false }
+        isUploadInFlight: @escaping () -> Bool = { false },
+        notificationCenter: NotificationCenter = .default,
+        openURL: @escaping @MainActor (URL) -> Void = { _ = NSWorkspace.shared.open($0) }
     ) {
         self.service = service
         self.isUploadInFlight = isUploadInFlight
+        self.notificationCenter = notificationCenter
+        self.openURL = openURL
+        // Browser-return hook (account-sheet KTD-6): re-check entitlement when
+        // the app comes back to the front after a Stripe Checkout / portal
+        // visit. Subscribing is free — `refreshAfterBrowserReturnIfPending` is
+        // gated pending-only, so an activation with nothing pending does ZERO
+        // auth work (no `whoami` shell-out, no Keychain decrypt). That keeps
+        // the `testInitialStateDoesNoAuthWork` launch-path invariant intact and
+        // avoids shelling out `whoami --force-refresh` on every app switch.
+        activationObserver = notificationCenter.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refreshAfterBrowserReturnIfPending()
+            }
+        }
+    }
+
+    deinit {
+        if let activationObserver {
+            notificationCenter.removeObserver(activationObserver)
+        }
     }
 
     var isSignedIn: Bool { status.isSignedIn }
@@ -287,6 +482,30 @@ final class CloudAuthController: ObservableObject {
             stale: isStale
         )
         announceTrialTransitionIfNeeded(from: previous, to: trialState)
+        settleCheckoutPendingIfResolved()
+    }
+
+    /// Clear checkout-pending once the entitlement has actually converged on
+    /// the remembered target (account-sheet KTD-6): the tier matches AND the
+    /// trial state reads as live-entitled. Every checkout goes through the
+    /// mandatory card-required trial (billing.py always mints `trialing`
+    /// subscriptions with a future `trial_end`), so a just-completed purchase
+    /// resolves to the target tier in `.active`/`.nearExpiry`/`.lastDay` —
+    /// requiring `.subscribed` here would leave the flag stuck for the whole
+    /// trial. Any live entitled state settles; only `.indeterminate` (stale /
+    /// unresolved — the webhook-lag window) and `.lapsed` keep it armed.
+    /// Runs on every entitlement recompute (refresh, force-refresh,
+    /// post-login) so the webhook's grant settles the flag no matter which
+    /// read path observes it.
+    private func settleCheckoutPendingIfResolved() {
+        guard checkoutPending, let target = checkoutTargetTier, tier == target else { return }
+        switch trialState {
+        case .indeterminate, .lapsed:
+            return
+        case .subscribed, .active, .nearExpiry, .lastDay:
+            checkoutPending = false
+            checkoutTargetTier = nil
+        }
     }
 
     /// Reset entitlement state to the signed-out / unresolved baseline.
@@ -356,6 +575,10 @@ final class CloudAuthController: ObservableObject {
     /// failure is non-fatal — we still force-refresh in case the webhook already
     /// landed.
     func reconcileEntitlement() async {
+        // Published in-flight signal (U3): the sheet's "check now" affordance
+        // renders a spinner off this instead of feeling dead for two shell-outs.
+        isReconciling = true
+        defer { isReconciling = false }
         do {
             _ = try await service.fetchReconcileEntitlement()
         } catch {
@@ -364,34 +587,144 @@ final class CloudAuthController: ObservableObject {
         await refreshEntitlement()
     }
 
+    /// The `didBecomeActiveNotification` hook body (account-sheet KTD-6 / R7):
+    /// returning from the Stripe Checkout / portal browser tab re-checks the
+    /// entitlement so a plan change lands without a manual action. Gated
+    /// pending-only — an activation with nothing pending does zero auth work
+    /// (an "always" gate would shell out `whoami --force-refresh` on every app
+    /// switch). Checkout-pending is NOT cleared here; it settles only when the
+    /// entitlement converges on the target (`settleCheckoutPendingIfResolved`).
+    private func refreshAfterBrowserReturnIfPending() async {
+        guard checkoutPending || portalReturnPending else { return }
+        await refreshEntitlement()
+        // Portal-pending clears after this one post-return refresh: there is no
+        // target state to converge on, and the reconcile affordance remains the
+        // user's recourse if this refresh lost the race with the webhook.
+        portalReturnPending = false
+    }
+
     /// Opens hosted Stripe Checkout for the chosen paid `tier` in the browser
     /// (U9 / paid-only U11). The tier selects the Stripe PRICE only — the webhook
     /// re-derives the entitlement from the paid price and is the sole authority
     /// (KTD-2), so this never over-grants. The URL is minted by `checkout-url`
-    /// (token stays in Python); `onFailure` carries a short reason on mint failure.
+    /// (token stays in Python).
+    ///
+    /// Sets the browser-return pending state up front (KTD-6): `checkoutPending`
+    /// + the remembered `checkoutTargetTier`. A re-tap simply replaces the
+    /// target and re-runs checkout, so an abandoned Stripe tab is recoverable in
+    /// place. Mint failure clears both and routes through the error seam —
+    /// `onFailure` receives the MAPPED static copy (never `env.error`, never
+    /// `localizedDescription`; R10) and `accountError` publishes the full
+    /// `AccountErrorCopy` for seam consumers.
     func startCheckout(
         tier: EntitlementTier,
         onFailure: @escaping @MainActor (String) -> Void = { _ in }
     ) {
         guard let checkoutTier = tier.checkoutTier else {
+            // App-native static copy (no plan chosen) — not an envelope error,
+            // so it doesn't ride the seam or touch the pending machinery.
             onFailure("Pick a plan to continue.")
             return
         }
+        accountError = nil
+        checkoutPending = true
+        checkoutTargetTier = tier
+        checkoutGeneration &+= 1
+        let generation = checkoutGeneration
         Task { [weak self] in
             guard let self else { return }
             do {
                 let data = try await self.service.fetchCheckoutURL(tier: checkoutTier)
+                // Superseded by a re-tap (or torn down by sign-out) while the
+                // mint was in flight: this attempt owns no state anymore —
+                // don't open its stale URL or touch the live attempt's pending.
+                guard generation == self.checkoutGeneration else { return }
                 let env = CheckoutURLEnvelope.parse(data)
-                guard env?.ok != false, let urlString = env?.url,
-                      let url = URL(string: urlString) else {
-                    onFailure(env?.error ?? "Couldn't start checkout.")
-                    return
+                if env?.ok != false, self.openBillingURL(env?.url) {
+                    return // Opened; pending settles when the entitlement resolves.
                 }
-                NSWorkspace.shared.open(url)
+                self.failCheckout(with: AccountErrorCopy.from(code: env?.code), onFailure: onFailure)
             } catch {
-                onFailure(error.localizedDescription)
+                guard generation == self.checkoutGeneration else { return }
+                self.failCheckout(with: AccountErrorCopy.from(error: error), onFailure: onFailure)
             }
         }
+    }
+
+    /// Mint-failure path for `startCheckout`: clear the pending machinery (the
+    /// browser never opened, so there is no return to wait on) and surface the
+    /// mapped copy through both seam outputs.
+    private func failCheckout(
+        with copy: AccountErrorCopy,
+        onFailure: @MainActor (String) -> Void
+    ) {
+        checkoutPending = false
+        checkoutTargetTier = nil
+        accountError = copy
+        onFailure(copy.message)
+    }
+
+    /// Opens the hosted Stripe customer portal in the browser (account sheet
+    /// U3 / R7) — `startCheckout(tier:)` minus the tier. The URL is minted by
+    /// `portal-url` (token stays in Python), treated as short-lived and
+    /// single-use: fetched on tap, opened immediately, never cached — and never
+    /// written to os_log/print (it grants access to the user's billing page).
+    /// On a successful open, `portalReturnPending` arms the app-activation
+    /// refresh (KTD-6 — without it the portal return never re-checks the
+    /// entitlement and R7 silently fails). Failures land on the error seam:
+    /// `accountError` + `onFailure` carry the mapped static copy, keyed on the
+    /// envelope's `code`.
+    func startManageSubscription(
+        onFailure: @escaping @MainActor (AccountErrorCopy) -> Void = { _ in }
+    ) {
+        accountError = nil
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let data = try await self.service.fetchPortalURL()
+                let env = PortalURLEnvelope.parse(data)
+                self.warnOnSchemaDrift(version: env?.schemaVersion)
+                if env?.ok != false, self.openBillingURL(env?.url) {
+                    self.portalReturnPending = true
+                    return
+                }
+                self.failPortal(with: AccountErrorCopy.from(code: env?.code), onFailure: onFailure)
+            } catch {
+                self.failPortal(with: AccountErrorCopy.from(error: error), onFailure: onFailure)
+            }
+        }
+    }
+
+    /// Failure path for `startManageSubscription`: surface the mapped copy
+    /// through both seam outputs. No pending state to clear — the portal flag
+    /// is only armed after a successful open.
+    private func failPortal(
+        with copy: AccountErrorCopy,
+        onFailure: @MainActor (AccountErrorCopy) -> Void
+    ) {
+        accountError = copy
+        onFailure(copy)
+    }
+
+    /// The ONE shared browser-open path for billing URLs (checkout + portal).
+    /// Validates https before handing anything to the opener: a `file://` or
+    /// custom-scheme URL from a compromised/buggy envelope could launch an
+    /// arbitrary local app via `NSWorkspace`, so anything non-https returns
+    /// false (→ the caller routes to the error seam) and is never opened.
+    /// Returns true only when the URL was actually handed to the opener.
+    private func openBillingURL(_ urlString: String?) -> Bool {
+        guard let urlString,
+              let url = URL(string: urlString),
+              url.scheme?.lowercased() == "https" else {
+            return false
+        }
+        openURL(url)
+        return true
+    }
+
+    /// Dismiss the surfaced account error (the sheet's inline dismiss path).
+    func clearAccountError() {
+        accountError = nil
     }
 
     /// Post a VoiceOver announcement when the trial lifecycle crosses into a more
@@ -454,6 +787,7 @@ final class CloudAuthController: ObservableObject {
             return
         }
         signInFlow = .inProgress
+        accountError = nil
         loginStdout = []
         pendingResult = onResult
         loginGeneration &+= 1
@@ -466,9 +800,12 @@ final class CloudAuthController: ObservableObject {
             startLoginWatchdog(generation: generation)
         } catch {
             // Spawn failure (binary not found, launch error) — terminal failure,
-            // no process to clean up.
+            // no process to clean up. `signInFlow` keeps the short reason for
+            // the legacy surfaces (until U5); the seam output carries only the
+            // mapped static copy (KTD-5).
             loginHandle = nil
             signInFlow = .failed(error.localizedDescription)
+            accountError = AccountErrorCopy.from(error: error)
             finishResult(false)
         }
     }
@@ -504,6 +841,8 @@ final class CloudAuthController: ObservableObject {
         loginHandle?.terminate()
         loginHandle = nil
         signInFlow = .failed("Sign-in timed out.")
+        // Seam output (KTD-5): a hung login reads as network trouble — retry.
+        accountError = .network
         finishResult(false)
     }
 
@@ -523,6 +862,9 @@ final class CloudAuthController: ObservableObject {
             finishResult(false)
         case .failed:
             signInFlow = .idle
+            // Dismissing a failed flow also clears the seam's copy of it —
+            // "never mind" must not leave stale error copy on the sheet.
+            accountError = nil
             finishResult(false)
         case .idle:
             break
@@ -553,6 +895,11 @@ final class CloudAuthController: ObservableObject {
         let reason = envelope?.error.flatMap { $0.isEmpty ? nil : $0 }
             ?? "Sign-in failed or was cancelled."
         signInFlow = .failed(reason)
+        // Seam output (KTD-5): the login envelope carries no machine-readable
+        // `code`, so the mapped copy is the static fallback by construction —
+        // the dynamic `reason` text above stays on the legacy `signInFlow`
+        // surface (until U5) and never rides `accountError`.
+        accountError = .unknown
         finishResult(false)
     }
 
@@ -580,8 +927,17 @@ final class CloudAuthController: ObservableObject {
     /// match the Swift side — mirrors `UploadController` / `DaemonClient` so a
     /// Python-side bump is visible rather than silently ignored.
     private func warnOnSchemaDrift(_ envelope: AuthWhoAmIEnvelope?) {
-        if let version = envelope?.schemaVersion, version != SUPPORTED_API_SCHEMA_VERSION {
-            authLogger.warning("Auth envelope schema_version=\(version, privacy: .public) does not match SwiftUI side (\(SUPPORTED_API_SCHEMA_VERSION, privacy: .public)). Processing anyway.")
+        warnOnSchemaDrift(version: envelope?.schemaVersion)
+    }
+
+    /// Version-keyed variant shared with the portal envelope (which is not an
+    /// `AuthWhoAmIEnvelope`) so every auth-adjacent envelope drifts loudly.
+    /// Compares against `SUPPORTED_AUTH_SCHEMA_VERSION` (the auth CLI's
+    /// `_AUTH_SCHEMA_VERSION`), NOT `SUPPORTED_API_SCHEMA_VERSION` — the
+    /// daemon `/v0/*` API versions independently of the auth envelopes.
+    private func warnOnSchemaDrift(version: Int?) {
+        if let version, version != SUPPORTED_AUTH_SCHEMA_VERSION {
+            authLogger.warning("Auth envelope schema_version=\(version, privacy: .public) does not match SwiftUI side (\(SUPPORTED_AUTH_SCHEMA_VERSION, privacy: .public)). Processing anyway.")
         }
     }
 
@@ -602,5 +958,16 @@ final class CloudAuthController: ObservableObject {
         }
         status = .signedOut
         clearEntitlement()
+        // Sign-out / account switch invalidates the browser-return machinery
+        // (account-sheet KTD-6): the remembered target and both pending flags
+        // belong to the account that started them — a different account later
+        // resolving the same tier must not settle the old attempt. Stale error
+        // copy goes with them, and the generation bump keeps an in-flight
+        // mint's late callbacks from repopulating what was just cleared.
+        checkoutGeneration &+= 1
+        checkoutPending = false
+        checkoutTargetTier = nil
+        portalReturnPending = false
+        accountError = nil
     }
 }
