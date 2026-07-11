@@ -262,8 +262,10 @@ def test_reconcile_search_failure_does_not_grant():
 # Account-sheet U1 — create_portal_session (customer-portal URL)
 # --------------------------------------------------------------------------
 #
-# New portal tests carry @pytest.mark.privacy so the chain runs in the CI
-# privacy lane (account-sheet plan KTD-8); the older checkout/reconcile tests
+# New portal tests carry @pytest.mark.privacy for future CI wiring, but note
+# that pyproject.toml pins ``testpaths = ["tests"]`` — CI does NOT collect
+# scripts/cloud-function/, so today these run only via an explicit path
+# (``pytest scripts/cloud-function/``). The older checkout/reconcile tests
 # above are deliberately left unmarked.
 
 PORTAL_URL = "https://billing.stripe/portal-session-xyz"
@@ -451,6 +453,43 @@ def test_portal_configuration_env_passed_through():
         status, _ = _invoke_portal(_req())
     assert status == 200
     assert create.call_args.kwargs["configuration"] == "bpc_test_123"
+
+
+@pytest.mark.privacy
+def test_portal_config_unset_with_live_key_502_no_session_create():
+    # U7 fail-closed: with a LIVE key and no pinned portal configuration,
+    # Session.create would silently fall back to the Stripe dashboard's default
+    # configuration and drop the two-product allowlist — refuse instead.
+    env = {"STRIPE_SECRET_KEY": "sk_live_abc", "STRIPE_PORTAL_CONFIGURATION_ID": ""}
+    with mock.patch.dict(os.environ, env), mock.patch.object(
+        billing, "verify_bearer", return_value="userA"
+    ), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [_psub(CLOUD_PRICE)]}
+    ), mock.patch("stripe.billing_portal.Session.create") as create:
+        status, payload = _invoke_portal(_req())
+    assert status == 502
+    assert payload["code"] == "portal_unavailable"
+    create.assert_not_called()
+
+
+@pytest.mark.privacy
+def test_portal_config_unset_with_test_key_proceeds_with_warning(caplog):
+    # Test mode may fall back to the account-default configuration (harmless in
+    # test, and required for local dev) — but the fallback must be logged.
+    fake_session = mock.Mock(url=PORTAL_URL)
+    env = {"STRIPE_SECRET_KEY": "sk_test_abc", "STRIPE_PORTAL_CONFIGURATION_ID": ""}
+    with caplog.at_level(logging.WARNING), mock.patch.dict(
+        os.environ, env
+    ), mock.patch.object(billing, "verify_bearer", return_value="userA"), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [_psub(CLOUD_PRICE)]}
+    ), mock.patch("stripe.billing_portal.Session.create", return_value=fake_session) as create:
+        status, payload = _invoke_portal(_req())
+    assert status == 200
+    assert payload["url"] == PORTAL_URL
+    assert "configuration" not in create.call_args.kwargs
+    assert any(
+        "STRIPE_PORTAL_CONFIGURATION_ID" in r.getMessage() for r in caplog.records
+    )
 
 
 @pytest.mark.privacy

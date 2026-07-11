@@ -270,6 +270,72 @@ def test_deleted_event_with_other_active_sub_rederives_instead_of_clearing():
     setc.assert_called_once_with("userA", {"tier": "local", "subscribed": False})
 
 
+@pytest.mark.privacy
+def test_stale_search_returning_deleted_sub_itself_still_clears():
+    # The convergence search index can lag and still report the just-canceled
+    # subscription as active. The event's OWN subscription id must be excluded
+    # from candidacy — otherwise a revoke silently becomes a re-grant with a
+    # 200, so Stripe never redelivers and the claim stays wrong forever.
+    ev = _event(
+        "customer.subscription.deleted", {"id": "sub_1", "metadata": {"uid": "userA"}}
+    )
+    fetched = _sub(CLOUD_PRICE, status="canceled", uid="userA")
+    stale_self = {**_sub(CLOUD_PRICE, status="active"), "id": "sub_1"}
+    with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch(
+        "stripe.Subscription.retrieve", return_value=fetched
+    ), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [stale_self]}
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, _ = _invoke(_req())
+    assert status == 200
+    setc.assert_called_once_with("userA", {"tier": "none", "subscribed": False})
+
+
+@pytest.mark.privacy
+def test_search_failure_during_revoke_rederive_5xx_claim_untouched():
+    # A transient search outage on the revoke path must NOT clear a paying
+    # user's claim, and must NOT return 200 (Stripe would treat the event as
+    # delivered and never retry). 5xx -> Stripe redelivers -> convergence
+    # re-runs once the outage passes.
+    ev = _event(
+        "customer.subscription.deleted", {"id": "sub_1", "metadata": {"uid": "userA"}}
+    )
+    fetched = _sub(CLOUD_PRICE, status="canceled", uid="userA")
+    with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch(
+        "stripe.Subscription.retrieve", return_value=fetched
+    ), mock.patch(
+        "stripe.Subscription.search", side_effect=Exception("stripe down")
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, _ = _invoke(_req())
+    assert 500 <= status < 600
+    setc.assert_not_called()
+
+
+@pytest.mark.privacy
+def test_trialing_survivor_converges_with_trial_end():
+    # The converged claim derives BOTH tier and trial_end from the surviving
+    # subscription — a trialing survivor must stay trialing (its "days left"
+    # UI depends on trial_end), not lose trial_end to the deleted event's None.
+    ev = _event(
+        "customer.subscription.deleted", {"id": "sub_1", "metadata": {"uid": "userA"}}
+    )
+    fetched = _sub(CLOUD_PRICE, status="canceled", uid="userA")
+    survivor = {
+        **_sub(CLOUD_PRICE, status="trialing", trial_end=1893456000),
+        "id": "sub_2",
+    }
+    with mock.patch("stripe.Webhook.construct_event", return_value=ev), mock.patch(
+        "stripe.Subscription.retrieve", return_value=fetched
+    ), mock.patch(
+        "stripe.Subscription.search", return_value={"data": [survivor]}
+    ), mock.patch.object(billing.fb_auth, "set_custom_user_claims") as setc:
+        status, _ = _invoke(_req())
+    assert status == 200
+    setc.assert_called_once_with(
+        "userA", {"tier": "cloud", "subscribed": True, "trial_end": 1893456000}
+    )
+
+
 def test_stale_delete_for_active_subscription_does_not_clear():
     # Out-of-order: a delete event arrives, but the subscription is currently
     # active -> converge to the active tier, do NOT revoke a paying user.
