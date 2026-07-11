@@ -251,35 +251,6 @@ def test_migrate_db_blobs_encrypts_and_roundtrips(tmp_path):
     assert corpus_migrate.migrate_recording_db_blobs(rec, key) == 0
 
 
-def test_namer_decrypts_migrated_blob(tmp_path, monkeypatch):
-    import io as _io
-    import sqlite3
-
-    from PIL import Image
-
-    from screencap import namer
-
-    key = os.urandom(32)
-    key_file = tmp_path / "corpus.key"
-    key_file.write_text(corpus_crypto._encode_key(key))
-    monkeypatch.setenv(corpus_crypto.CORPUS_KEY_FILE_ENV, str(key_file))
-
-    buf = _io.BytesIO()
-    Image.new("RGB", (8, 8), (10, 20, 30)).save(buf, format="JPEG")
-    jpeg = buf.getvalue()
-    rec = _rec(tmp_path, "rec-1")
-    _seed_recording_db(rec, [(100.0, 150.25, jpeg)])
-    corpus_migrate.migrate_recording_db_blobs(rec, key)
-
-    conn = sqlite3.connect(str(rec / "recording.db"))
-    stored = bytes(conn.execute("SELECT png_data FROM screenshot").fetchone()[0])
-    conn.close()
-    # namer transparently decrypts the encrypted blob back to the original JPEG.
-    assert namer._decrypt_blob_if_needed(stored, 100.0, 150.25) == jpeg
-    # A plaintext blob passes through unchanged.
-    assert namer._decrypt_blob_if_needed(jpeg, 100.0, 150.25) == jpeg
-
-
 def _stub_flip_config(monkeypatch, tmp_path, recs, key):
     from screencap import config
 

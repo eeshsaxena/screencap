@@ -31,23 +31,23 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     // them (nullable-timing contract): readiness is never gated on their presence.
     /// Numeric byte total behind `sizeMB` — the sidebar footer sums this.
     let sizeBytes: Int
-    /// The namer's `task_description` — a 2–3 sentence summary, or nil when the
-    /// namer hasn't run / the DB was locked at scan time.
+    /// The recording's `task_description` — a short summary set via the CLI
+    /// `--description` flag, or nil when absent / the DB was locked at scan time.
     let summary: String?
-    /// Humanized display title (the namer's slug). Falls back to the raw
-    /// directory `name` when an older daemon omits it.
+    /// Humanized display title derived from the directory name. Falls back to
+    /// the raw directory `name` when an older daemon omits it.
     let title: String
     /// Derived lifecycle: `recording` | `processing` | `ready` (KTD-7). Defaults
     /// to `ready` so a missing value never traps a card in a spinner.
     let state: String
-    /// Stable identity pinned at recording start — survives the post-stop
-    /// auto-name directory rename (unlike `name`). nil for legacy recordings.
+    /// Stable identity pinned at recording start — survives any post-stop
+    /// directory rename (unlike `name`). nil for legacy recordings.
     let recordingId: String?
 
     var id: String { name }
 
-    /// Identity that survives the post-stop auto-name rename. Consumers that must
-    /// hold a card in place across the rename (U5's grid diffing, the draft card)
+    /// Identity that survives a post-stop directory rename. Consumers that must
+    /// hold a card in place across a rename (U5's grid diffing, the draft card)
     /// key on this rather than `name`. Falls back to `name` for legacy recordings.
     var stableID: String { recordingId ?? name }
 

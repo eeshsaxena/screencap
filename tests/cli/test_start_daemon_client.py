@@ -333,6 +333,29 @@ def test_start_force_flag_removed(stub_daemon):
     assert "no such option" in result.output.lower()
 
 
+@pytest.mark.parametrize("flag", ["--no-auto-name", "--local-only"])
+def test_start_auto_name_flags_removed(stub_daemon, flag):
+    """Legacy LLM auto-naming removed (2026-07-11 plan): its stranded
+    ``--no-auto-name``/``--local-only`` flags dead-ended in the start command
+    and never reached the daemon. Click now rejects them outright."""
+    result = stub_daemon.invoke(["start", "--name", "demo", flag, "--local"])
+    assert result.exit_code == 2, result.output
+    assert "no such option" in result.output.lower()
+
+
+def test_start_without_name_generates_rec_timestamp(stub_daemon):
+    """With no ``--name``, start unconditionally falls through to the
+    ``rec-<timestamp>`` temp name (formerly the else-branch of the removed
+    ``--no-auto-name`` prompt)."""
+    result = stub_daemon.invoke(["start", "--local"])
+    assert result.exit_code == 0, result.output
+    import re
+
+    assert re.fullmatch(
+        r"rec-\d{8}T\d{6}", stub_daemon.captured_start["name"]
+    ), stub_daemon.captured_start
+
+
 def test_start_daemon_error_returns_exit_1(stub_daemon):
     stub_daemon.start_status = 500
     stub_daemon.start_response = {

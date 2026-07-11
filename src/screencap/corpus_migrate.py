@@ -15,8 +15,7 @@ Guarantees:
   the frame by removing the leftover plaintext.
 - **Inline blobs too (R5).** Plaintext ``png_data`` blobs in ``recording.db`` are
   encrypted in place under the same ``png_blob_aad`` the capture write path uses,
-  so ``recording.db`` holds no plaintext still after the flip. ``namer`` decrypts
-  transparently via ``corpus_crypto.is_encrypted``.
+  so ``recording.db`` holds no plaintext still after the flip.
 - **Index rekey via SQLCipher ``sqlcipher_export``** into a sibling file + atomic
   rename, under the shared ``content_index_write_lock`` every other index writer
   holds, so a concurrent indexer can't race the swap.
