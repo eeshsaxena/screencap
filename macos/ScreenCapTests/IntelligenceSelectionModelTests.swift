@@ -113,6 +113,16 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(sel, RenderedModelSelection(rowID: "on-device", needsReconcile: true))
     }
 
+    /// The reconcile prompt survives a cloud selection: a legacy value stranded
+    /// in the provider slot still degrades day-splitting to the heuristic, and
+    /// the BYO row must not mask it (the next tap's write-through heals it).
+    func testLegacyProviderSlotKeepsReconcileUnderCloudSelection() {
+        let sel = IntelligenceSelectionModel.renderedSelection(
+            settings(provider: "gemini", cloudProvider: "openai", openaiKey: true)
+        )
+        XCTAssertEqual(sel, RenderedModelSelection(rowID: "openai", needsReconcile: true))
+    }
+
     /// A legacy `provider=gemini` (pre-two-slot value) is mapped render-only:
     /// on-device row + reconcile treatment, no write-through migration.
     func testLegacyGeminiProviderReconcilesToOnDevice() {
@@ -253,8 +263,7 @@ final class IntelligenceSelectionModelTests: XCTestCase {
     func testTapOnDeviceHealsLegacyGeminiPersisted() {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
-                forPick: .onDevice,
-                persistedProvider: "gemini", persistedCloudProvider: nil
+                forPick: .onDevice, settings: settings(provider: "gemini")
             ),
             [.clearCloudProvider, .setProvider("on-device")]
         )
@@ -264,8 +273,7 @@ final class IntelligenceSelectionModelTests: XCTestCase {
     func testTapOnDeviceNoOpWhenOnDevicePersisted() {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
-                forPick: .onDevice,
-                persistedProvider: "on-device", persistedCloudProvider: nil
+                forPick: .onDevice, settings: settings(provider: "on-device")
             ),
             []
         )
@@ -276,8 +284,7 @@ final class IntelligenceSelectionModelTests: XCTestCase {
     func testTapOnDeviceHealsDownloadedPersisted() {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
-                forPick: .onDevice,
-                persistedProvider: "downloaded", persistedCloudProvider: nil
+                forPick: .onDevice, settings: settings(provider: "downloaded")
             ),
             [.clearCloudProvider, .setProvider("on-device")]
         )
@@ -289,7 +296,7 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
                 forPick: .onDevice,
-                persistedProvider: "on-device", persistedCloudProvider: "openai"
+                settings: settings(provider: "on-device", cloudProvider: "openai")
             ),
             [.clearCloudProvider, .setProvider("on-device")]
         )
@@ -299,7 +306,9 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
                 forPick: .localServer,
-                persistedProvider: "local-server", persistedCloudProvider: nil
+                settings: settings(provider: "local-server",
+                                   endpoint: "http://127.0.0.1:11434",
+                                   classification: "LOCAL")
             ),
             []
         )
@@ -311,7 +320,7 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
                 forPick: .byo(providerID: "openai"),
-                persistedProvider: "local-server", persistedCloudProvider: "openai"
+                settings: settings(provider: "local-server", cloudProvider: "openai")
             ),
             []
         )
@@ -321,9 +330,34 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(
             IntelligenceSelectionModel.tapWrites(
                 forPick: .byo(providerID: "openai"),
-                persistedProvider: "on-device", persistedCloudProvider: "gemini"
+                settings: settings(provider: "on-device", cloudProvider: "gemini")
             ),
             [.setCloudProvider("openai")]
+        )
+    }
+
+    /// KTD1 heal: a BYO pick over a stranded legacy provider slot fixes the
+    /// slot first, then writes the cloud slot — a plain single-write pick
+    /// would mask the stranded value forever (day-splitting silently on the
+    /// heuristic behind a healthy-looking cloud selection).
+    func testTapBYOHealsLegacyProviderSlotFirst() {
+        XCTAssertEqual(
+            IntelligenceSelectionModel.tapWrites(
+                forPick: .byo(providerID: "openai"),
+                settings: settings(provider: "gemini")
+            ),
+            [.setProvider("on-device"), .setCloudProvider("openai")]
+        )
+    }
+
+    /// An endpoint-less `local-server` slot is equally stranded — same heal.
+    func testTapBYOHealsEndpointlessLocalServerSlotFirst() {
+        XCTAssertEqual(
+            IntelligenceSelectionModel.tapWrites(
+                forPick: .byo(providerID: "anthropic-cli"),
+                settings: settings(provider: "local-server")
+            ),
+            [.setProvider("on-device"), .setCloudProvider("anthropic-cli")]
         )
     }
 

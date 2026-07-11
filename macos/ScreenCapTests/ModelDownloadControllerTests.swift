@@ -119,4 +119,27 @@ final class ModelDownloadControllerTests: XCTestCase {
         XCTAssertNotNil(c.lastError)
         XCTAssertEqual(c.state, .idle)  // unchanged from the initial state
     }
+
+    /// The daemon-side cancel converges lazily (the transfer itself is not
+    /// interruptible), so the post-cancel status read can still say
+    /// `downloading` — it must NOT resurrect the poll loop the user just
+    /// stopped (KTD8's auto-start is for downloads observed elsewhere, not
+    /// for undoing an explicit Cancel).
+    func testCancelDoesNotResurrectPollingOnStaleDownloadingRead() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] args in
+            args == ["model", "cancel"] ? Data("ok".utf8)
+                : self?.statusJSON(state: "downloading", done: 50, total: 100)
+        }
+        let c = ModelDownloadController(invoke: fake.invoker())
+        await c.refreshStatus()
+        XCTAssertTrue(c.isPolling, "seeded mid-download: the loop runs")
+
+        await c.cancel()
+
+        XCTAssertFalse(c.isPolling,
+                       "a stale post-cancel `downloading` read must not restart the loop")
+        XCTAssertTrue(c.state.isDownloading,
+                      "the stale state itself renders honestly until the daemon converges")
+    }
 }

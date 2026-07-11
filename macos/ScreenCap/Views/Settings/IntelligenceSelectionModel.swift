@@ -232,18 +232,24 @@ enum IntelligenceSelectionModel {
     static let daySplitRowCaption =
         "Stays on this Mac — never a cloud task, even with a cloud model connected."
     static let daySplitChipLabel = "On-device"
-    /// R9 — frames/images never reach any cloud model; a fixed rule, not a toggle.
+    /// R9 — the consent-governed Intelligence tasks never send frames; a fixed
+    /// rule, not a toggle. Scoped to the named tasks: the legacy auto-namer
+    /// (`src/screencap/namer.py`, tracked as a follow-up) has vendor-API paths
+    /// that attach screenshots, so an unscoped "never sent to any cloud model"
+    /// claim would be false.
     static let framesRowTitle = "Screen frames or images"
     static let framesRowCaption =
-        "Never sent to any cloud model. A fixed rule, not a toggle."
+        "Summaries, answers, and day-splitting never send screen images — a fixed rule, not a toggle."
     static let framesChipLabel = "Always off"
-    /// R12 — the trust footer under the consent card. Scoped to what models
-    /// *see*: the segmentation privacy strip (the single chokepoint in
-    /// `activity_summary.py` / the recall evidence bundle, fail-closed) removes
-    /// masked and blocked apps' content before any provider — local on-device
-    /// or cloud — is invoked. It deliberately claims nothing about uploads.
+    /// R12 — the trust footer under the consent card. Scoped to the
+    /// consent-governed tasks: the segmentation privacy strip (the single
+    /// chokepoint in `activity_summary.py` / the recall evidence bundle,
+    /// fail-closed) removes masked and blocked apps' content before those
+    /// providers run. It deliberately claims nothing about uploads, and not
+    /// "any model" — the legacy auto-namer path (follow-up) sits outside the
+    /// strip.
     static let consentTrustFooter =
-        "Masked and blocked apps are stripped before any model sees a word — local or cloud."
+        "Masked and blocked apps are stripped before summaries, answers, and day-splitting run — local or cloud."
 
     // MARK: Honest-copy audit corpus (KTD7)
 
@@ -354,17 +360,40 @@ enum IntelligenceSelectionModel {
     /// treatment. Render-only — no write-through migration happens here.
     static func renderedSelection(_ settings: IntelligenceSettings) -> RenderedModelSelection {
         if let cloud = normalizedCloudProvider(settings.cloudProvider) {
-            return RenderedModelSelection(rowID: cloud, needsReconcile: false)
+            // The reconcile prompt must survive a cloud selection: a legacy
+            // value stranded in the provider slot still degrades day-splitting,
+            // and the BYO row would otherwise mask it forever.
+            return RenderedModelSelection(
+                rowID: cloud, needsReconcile: !providerSlotMappable(settings)
+            )
         }
-        switch settings.provider {
-        case "on-device", "downloaded":
+        if providerSlotMappable(settings) {
             // `downloaded` is a valid engine but no longer a row of its own —
             // the on-device row covers it (KTD2).
-            return RenderedModelSelection(rowID: onDeviceRowID, needsReconcile: false)
-        case "local-server" where hasLocalEndpoint(settings):
-            return RenderedModelSelection(rowID: localServerRowID, needsReconcile: false)
+            return RenderedModelSelection(
+                rowID: settings.provider == localServerRowID && hasLocalEndpoint(settings)
+                    ? localServerRowID
+                    : onDeviceRowID,
+                needsReconcile: false
+            )
+        }
+        return RenderedModelSelection(rowID: onDeviceRowID, needsReconcile: true)
+    }
+
+    /// Whether the persisted `provider` slot maps to a renderable local row:
+    /// `on-device`/`downloaded` always; `local-server` only with a LOCAL
+    /// endpoint. Legacy values (`gemini`) and endpoint-less/REMOTE
+    /// `local-server` are unmappable — the daemon routes them to the idle-gap
+    /// heuristic, so they render with the reconcile treatment and are healed
+    /// by the next tap's write-through.
+    static func providerSlotMappable(_ settings: IntelligenceSettings) -> Bool {
+        switch settings.provider {
+        case "on-device", "downloaded":
+            return true
+        case "local-server":
+            return hasLocalEndpoint(settings)
         default:
-            return RenderedModelSelection(rowID: onDeviceRowID, needsReconcile: true)
+            return false
         }
     }
 
@@ -400,18 +429,24 @@ enum IntelligenceSelectionModel {
     /// is a no-op (empty write list).
     static func tapWrites(
         forPick kind: IntelligenceModelRow.Kind,
-        persistedProvider: String,
-        persistedCloudProvider: String?
+        settings: IntelligenceSettings
     ) -> [ProviderWriteInstruction] {
-        let cloud = normalizedCloudProvider(persistedCloudProvider)
+        let cloud = normalizedCloudProvider(settings.cloudProvider)
         switch kind {
         case .onDevice:
-            if cloud == nil && persistedProvider == onDeviceRowID { return [] }
+            if cloud == nil && settings.provider == onDeviceRowID { return [] }
         case .localServer:
-            if cloud == nil && persistedProvider == localServerRowID { return [] }
+            if cloud == nil && settings.provider == localServerRowID { return [] }
         case .byo(let providerID):
             // A BYO pick writes only the cloud slot, so only that slot is compared.
             if cloud == providerID { return [] }
+            // KTD1 heal: unless the provider slot holds a value no row can
+            // render (legacy `gemini`, endpoint-less/REMOTE `local-server`) —
+            // a cloud selection would mask that stranded slot forever, so the
+            // pick heals it to `on-device` first, then writes the cloud slot.
+            if !providerSlotMappable(settings) {
+                return [.setProvider(onDeviceRowID), .setCloudProvider(providerID)]
+            }
         }
         return writes(forPick: kind)
     }

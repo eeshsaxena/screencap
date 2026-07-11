@@ -119,6 +119,10 @@ struct IntelligenceSettingsView: View {
         .task { onDeviceStatus = OnDeviceModelStatus.probe() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             onDeviceStatus = OnDeviceModelStatus.probe()
+            // KTD3 — reachability recovers on focus, like the Apple probe: a
+            // transient status-read failure at pane-open must not leave the
+            // download affordance disabled for the whole visit.
+            Task { await download.refreshStatus() }
         }
         // R8 — the highlight's clearing edges live in the pure predicate: a
         // selection change to another row clears it (the flow's own auto-select
@@ -360,12 +364,18 @@ struct IntelligenceSettingsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // KTD6 — flow-opening accessories share the radios' in-flight
+        // discipline: a flow terminal action racing a pane provider write
+        // would bounce off the controller's quiet guard and surface a stale
+        // error for an operation that never ran.
+        .disabled(providerWriteInFlight)
     }
 
     /// The trailing chip/button per BYO row: a "needs attention" chip for an
     /// unavailable CLI (R5/R13), a Manage button for a connected key, or a
     /// Connect button otherwise — each opening the flow at the vendor's
-    /// configure step (U4).
+    /// configure step (U4). Disabled while a provider write is in flight
+    /// (same rationale as the Add row).
     @ViewBuilder
     private func byoRowAccessory(_ option: BYOProviderOption) -> some View {
         switch (option.mechanism, option.state) {
@@ -378,6 +388,7 @@ struct IntelligenceSettingsView: View {
                 .buttonStyle(.plain)
                 .font(SCTypography.sans(size: 12, weight: .semibold))
                 .foregroundStyle(Color.scTeal)
+                .disabled(providerWriteInFlight)
             }
         case (.apiKey, .connected):
             Button(IntelligenceSelectionModel.manageAccessoryTitle) {
@@ -386,6 +397,7 @@ struct IntelligenceSettingsView: View {
             .buttonStyle(.plain)
             .font(SCTypography.sans(size: 12, weight: .semibold))
             .foregroundStyle(Color.scTeal)
+            .disabled(providerWriteInFlight)
         case (.apiKey, _):
             Button(IntelligenceSelectionModel.connectAccessoryTitle) {
                 connectFlow = .manage(.vendor(option.vendor))
@@ -393,6 +405,7 @@ struct IntelligenceSettingsView: View {
             .buttonStyle(.plain)
             .font(SCTypography.sans(size: 12, weight: .semibold))
             .foregroundStyle(Color.scTeal)
+            .disabled(providerWriteInFlight)
         default:
             EmptyView()
         }
@@ -422,23 +435,31 @@ struct IntelligenceSettingsView: View {
     private func tapRow(_ row: IntelligenceModelRow, settings: IntelligenceSettings) {
         guard !providerWriteInFlight, row.selectable else { return }
         let writes = IntelligenceSelectionModel.tapWrites(
-            forPick: row.kind,
-            persistedProvider: settings.provider,
-            persistedCloudProvider: settings.cloudProvider
+            forPick: row.kind, settings: settings
         )
         guard let terminal = writes.last else { return }
         writeError = nil
         providerWriteInFlight = true
         Task {
             let ok: Bool
-            switch terminal {
-            case .setProvider(let value):
-                ok = await intelligence.selectLocalProvider(value)
-            case .setCloudProvider(let id):
-                ok = await intelligence.selectCloudProvider(id)
-            case .clearCloudProvider:
-                // Never terminal in the model's write plans; nothing to do.
-                ok = true
+            // KTD1 heal shape: a BYO pick over a stranded legacy provider slot
+            // fixes the slot first, then selects the cloud row — abort the
+            // cloud write when the heal fails (same policy as the local seam).
+            if writes.count == 2,
+               case .setProvider(let heal) = writes[0],
+               case .setCloudProvider(let id) = writes[1] {
+                let healed = await intelligence.selectLocalProvider(heal)
+                ok = healed ? await intelligence.selectCloudProvider(id) : false
+            } else {
+                switch terminal {
+                case .setProvider(let value):
+                    ok = await intelligence.selectLocalProvider(value)
+                case .setCloudProvider(let id):
+                    ok = await intelligence.selectCloudProvider(id)
+                case .clearCloudProvider:
+                    // Never terminal in the model's write plans; nothing to do.
+                    ok = true
+                }
             }
             providerWriteInFlight = false
             if !ok { writeError = intelligence.lastError ?? "the provider change." }
@@ -574,6 +595,11 @@ struct IntelligenceSettingsView: View {
                     .font(SCTypography.sans(size: 12))
                     .foregroundStyle(Color.scInkMuted)
                     .fixedSize(horizontal: false, vertical: true)
+                // KTD3 — the in-pane recovery path: without it, one transient
+                // status-read failure pins this disabled state for the visit.
+                Button("Retry") { Task { await download.refreshStatus() } }
+                    .buttonStyle(.plain).font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scTeal)
                 Spacer(minLength: 0)
             }
         }
@@ -770,7 +796,19 @@ struct IntelligenceSettingsView: View {
             .buttonStyle(.plain)
             .disabled(providerWriteInFlight)
         } else {
-            radio(selected: isSelected, muted: true)
+            // A disabled control, not a bare shape (the pane's existing
+            // idiom), so VoiceOver exposes the not-selectable state; the
+            // radio glyph itself stays accessibility-hidden.
+            Button {} label: {
+                radio(selected: isSelected, muted: true)
+            }
+            .buttonStyle(.plain)
+            .disabled(true)
+            .accessibilityLabel(
+                row.kind == .localServer
+                    ? IntelligenceSelectionModel.remoteEndpointNotSelectableCopy
+                    : "Not selectable"
+            )
         }
     }
 

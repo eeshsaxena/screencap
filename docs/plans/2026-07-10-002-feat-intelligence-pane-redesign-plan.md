@@ -19,7 +19,7 @@ execution: code
 - **Stop conditions:** Surface a blocker only if implementation contradicts the Product Contract or requires backend (Python) changes beyond the two named Swift controllers.
 - **Open blockers:** None.
 
-**Product Contract preservation:** changed R2/Key Decisions (selection semantics corrected to fallback-honest — the daemon dispatches local-first and `cloud_provider` is the consented fallback answerer; the earlier "who answers when you ask" claim was unimplementable without Python changes the scope boundary forbids), R7 (verification narrowed to existing seams; local-server model discovery deferred — no app-reachable seam exists), R8 (auto-select qualified to selectable rows only), AE3 (REMOTE-endpoint behavior corrected — the daemon has no consent-gated-cloud path for `local-server`, so REMOTE rows are not selectable), R4 (insufficient-disk surfaces as a failed-with-reason state, not a pre-emptive disabled state), R13 (the sidebar hint condition is redefined rather than preserved), F3 (remedies keyed to the actual availability-probe states). Each change resolves a conflict with the confirmed no-backend-changes scope boundary or corrects copy describing behavior that does not exist.
+**Product Contract preservation:** changed R2/Key Decisions (selection semantics corrected to fallback-honest — the daemon dispatches local-first and `cloud_provider` is the consented fallback answerer; the earlier "who answers when you ask" claim was unimplementable without Python changes the scope boundary forbids), R7 (verification narrowed to existing seams; local-server model discovery deferred — no app-reachable seam exists), R8 (auto-select qualified to selectable rows only), AE3 (REMOTE-endpoint behavior corrected — the daemon has no consent-gated-cloud path for `local-server`, so REMOTE rows are not selectable), R4 (insufficient-disk surfaces as a failed-with-reason state, not a pre-emptive disabled state), R13 (the sidebar hint condition is redefined rather than preserved), F3 (remedies keyed to the actual availability-probe states). Each change resolves a conflict with the confirmed no-backend-changes scope boundary or corrects copy describing behavior that does not exist. Post-review amendments: R8 narrowed again (an unavailable CLI cannot be added — the needs-attention-add path was unreachable by design), and R12's footer claim rescoped from "any model" to the consent-governed tasks (the legacy auto-namer egress path, now a named follow-up, falsifies the broader claim).
 
 ---
 
@@ -61,14 +61,14 @@ The pane is also gaining traffic: Chat deep-links into it for consent, onboardin
 
 - R6. Connection mechanics move off the pane into a sequential sub-flow: choose a provider, configure it, confirm. OpenAI, Anthropic, Gemini (key or CLI delegation) and Local server are the choices.
 - R7. The sub-flow confirms each mechanism honestly before finishing: API keys via the existing validate probe, CLI delegation via the availability check (copy states no test call is made), and local server via LOCAL/REMOTE classification feedback. No network probe or model discovery is performed for local servers.
-- R8. A newly added provider row appears with a just-added highlight and a prompt to enable the tasks it may handle in the consent section; flow completion auto-selects the new provider only when its row is selectable (a REMOTE-classified local server or a needs-attention CLI add finishes highlighted but unselected).
+- R8. A newly added provider row appears with a just-added highlight and a prompt to enable the tasks it may handle in the consent section; flow completion auto-selects the new provider only when its row is selectable (a REMOTE-classified local server finishes highlighted but unselected; an unavailable CLI cannot be added — its configure surface shows fix guidance instead).
 - R9. A local server added via the sub-flow keeps its LOCAL/REMOTE classification, with copy stating the consequence of each; a REMOTE-classified server is shown but not selectable, with copy stating that answers and day-splitting require a local endpoint.
 
 **Consent section**
 
 - R10. The consent section keeps four rows — Summaries & titles (toggle), Answers about your recordings (toggle), Splitting & labeling the day (fixed on-device), Screen frames or images (fixed always-off) — each captioned in plain language stating what is sent and what never leaves.
 - R11. Consent semantics are unchanged: no new toggles, the two fixed rows remain impossible to enable, and the consent-row CLI argv contracts are untouched.
-- R12. All copy passes the honest-copy constraints (no E2EE, "we can't see it", or "free unlimited" claims), and a trust footer states that masked and blocked apps are stripped before any model sees content. The current footer line "Cloud tasks only run when the active model above is a cloud provider" is removed — it is false under the new semantics.
+- R12. All copy passes the honest-copy constraints (no E2EE, "we can't see it", or "free unlimited" claims), and a trust footer states that masked and blocked apps are stripped before summaries, answers, and day-splitting run — scoped to the consent-governed tasks, because the legacy auto-namer egress path falsifies an unscoped "any model" claim. The current footer line "Cloud tasks only run when the active model above is a cloud provider" is removed — it is false under the new semantics.
 
 **Entry points**
 
@@ -137,6 +137,8 @@ flowchart TB
   - Local-server model discovery ("found Ollama · 3 models"): requires a new CLI/daemon seam; only a legacy CLI-side Ollama probe exists (`src/screencap/namer.py`).
   - A scroll-to-consent anchor for Chat's deep link (the `.intelligence` route case carries no payload today; `timeline(day:seekMs:)` is the existing payload pattern to follow).
   - Feeding the Apple Intelligence availability probe into the sidebar hint condition (the sidebar has no FoundationModels plumbing).
+  - Bringing the legacy auto-namer (`src/screencap/namer.py`) under the consent policy and privacy strip: it sends unstripped titles/transcript — and screenshots via its vendor-API paths — to cloud models on a default-on path, bypassing the Intelligence consent matrix entirely (surfaced by this redesign's review; needs its own ticket).
+  - Documenting (or providing an atomic CLI/daemon verb for) the two-write selection ordering contract, so scripts and agents can replicate the pane's clear-cloud-first invariant.
 
 ### Dependencies / Assumptions
 

@@ -191,35 +191,6 @@ final class IntelligenceController: ObservableObject {
 
     // MARK: - Writes
 
-    /// Select the active provider (`on-device` or a cloud provider id). Optimistic
-    /// flip + revert-on-failure: the published provider flips immediately so the
-    /// picker tracks the tap; a CLI failure restores the previous value and
-    /// surfaces the error, so the picker never rests contradicting disk. Returns
-    /// success so the pane can show an inline error.
-    @discardableResult
-    func setProvider(_ value: String) async -> Bool {
-        guard !providerWriteInFlight else { return false }
-        providerWriteInFlight = true
-        defer { providerWriteInFlight = false }
-
-        let previous = settings
-        if let current = settings {
-            settings = current.with(provider: value)
-        }
-        do {
-            _ = try await invoke(["settings", "intelligence", "provider", "set", value, "--json"])
-            lastError = nil
-            // Reconcile against disk — provider selection may materialize a
-            // cloud_provider the picker should reflect.
-            await refresh()
-            return true
-        } catch {
-            settings = previous
-            lastError = error.localizedDescription
-            return false
-        }
-    }
-
     /// Set (or clear with an empty string) the bring-your-own endpoint URL
     /// (SCR-239). Writes `local_server_endpoint set <url>` then reconciles against
     /// disk so the pane reflects the resolved LOCAL/REMOTE classification. Returns
@@ -236,8 +207,11 @@ final class IntelligenceController: ObservableObject {
             await refresh()
             return true
         } catch {
-            lastError = error.localizedDescription
+            // Reconcile FIRST — a successful refresh clears `lastError`, so the
+            // write error must be assigned after it or the flow's feedback row
+            // reads nil (the ordering the select seams already document).
             await refresh()
+            lastError = error.localizedDescription
             return false
         }
     }
@@ -413,15 +387,18 @@ final class IntelligenceController: ObservableObject {
             }
             let result = (try? JSONDecoder().decode(BYOKeyResult.self, from: data))
                 ?? BYOKeyResult(ok: false, keyPresent: false, validation: nil, error: "decode_failed")
-            lastError = result.ok ? nil : (result.error ?? "the key couldn't be stored.")
+            // Reconcile FIRST — refresh's success path clears `lastError`, so
+            // the write error must be assigned after it (the select seams'
+            // documented ordering).
             await refresh()
+            lastError = result.ok ? nil : (result.error ?? "the key couldn't be stored.")
             return result
         } catch {
             // A non-zero exit (e.g. an invalid key the daemon rejected) surfaces
             // as a thrown CLIError whose stderr the CLI already redacted of the
             // key; try to recover the JSON envelope the CLI still emits on stdout.
-            lastError = error.localizedDescription
             await refresh()
+            lastError = error.localizedDescription
             return BYOKeyResult(
                 ok: false, keyPresent: false, validation: nil,
                 error: error.localizedDescription
@@ -442,8 +419,10 @@ final class IntelligenceController: ObservableObject {
             await refresh()
             return true
         } catch {
-            lastError = error.localizedDescription
+            // Reconcile FIRST — see setEndpoint; a successful refresh would
+            // otherwise wipe the error the flow is about to read.
             await refresh()
+            lastError = error.localizedDescription
             return false
         }
     }

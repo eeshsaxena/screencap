@@ -108,49 +108,9 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertNil(controller.settings)
     }
 
-    // MARK: - setProvider (R2)
-
-    /// Selecting a provider ships exactly the CLI vector Python expects, then
-    /// reconciles against disk.
-    func testSetProviderIssuesExpectedArgvAndRefreshes() async {
-        let fake = FakeInvoker()
-        let controller = IntelligenceController(invoke: fake.invoker())
-        await controller.refresh()  // seed settings so the optimistic flip has a base
-
-        let ok = await controller.setProvider("gemini")
-
-        XCTAssertTrue(ok)
-        // The write, then a read-back reconcile.
-        XCTAssertEqual(
-            fake.calls.suffix(2).map { $0 },
-            [
-                ["settings", "intelligence", "provider", "set", "gemini", "--json"],
-                ["settings", "intelligence", "--json"],
-            ]
-        )
-    }
-
-    /// Optimistic flip + revert-on-failure: a nonzero exit restores the previous
-    /// provider and surfaces the error so the picker never contradicts disk.
-    func testSetProviderRevertsOnFailure() async {
-        let fake = FakeInvoker()
-        fake.respond = { [weak self] args in
-            if args.contains("provider"), args.contains("set") {
-                throw NSError(domain: "t", code: 1, userInfo: [NSLocalizedDescriptionKey: "boom"])
-            }
-            return self?.envelope(provider: "on-device")
-        }
-        let controller = IntelligenceController(invoke: fake.invoker())
-        await controller.refresh()
-        XCTAssertEqual(controller.settings?.provider, "on-device")
-
-        let ok = await controller.setProvider("gemini")
-
-        XCTAssertFalse(ok)
-        XCTAssertEqual(controller.settings?.provider, "on-device",
-                       "failed write must revert the optimistic picker flip")
-        XCTAssertEqual(controller.lastError, "boom")
-    }
+    // (The old `setProvider` seam was retired post-review — no production
+    // caller remained after the pane moved to `selectLocalProvider`, whose
+    // ordering/revert/argv contracts are pinned in the U2 section below.)
 
     // MARK: - setConsent (R8/R10 optimistic toggle)
 
@@ -209,13 +169,13 @@ final class IntelligenceSettingsTests: XCTestCase {
 
     /// A hostile provider value stays a single argv element (no shell splitting)
     /// — the argv-array contract, same canary as PrivacyController's.
-    func testSetProviderPreservesValueAsSingleArgvElement() async {
+    func testSelectLocalProviderPreservesValueAsSingleArgvElement() async {
         let fake = FakeInvoker()
         let controller = IntelligenceController(invoke: fake.invoker())
         await controller.refresh()
-        let hostile = "gemini; rm -rf $HOME `id`"
+        let hostile = "on-device; rm -rf $HOME `id`"
 
-        _ = await controller.setProvider(hostile)
+        _ = await controller.selectLocalProvider(hostile)
 
         XCTAssertTrue(fake.calls.contains(
             ["settings", "intelligence", "provider", "set", hostile, "--json"]
@@ -556,19 +516,26 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertTrue(M.recallConsentRowCaption.hasPrefix("Sends"))
         XCTAssertTrue(M.recallConsentRowCaption.contains("Never screen images"))
         XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("never a cloud task"))
-        XCTAssertTrue(M.framesRowCaption.lowercased().contains("never sent to any cloud model"))
+        // Scoped to the consent-governed tasks — an unscoped "any cloud model"
+        // claim is falsified by the legacy auto-namer path (follow-up).
+        XCTAssertTrue(M.framesRowCaption.lowercased().contains("never send screen images"))
+        XCTAssertFalse(M.framesRowCaption.lowercased().contains("any cloud model"))
     }
 
-    /// R12 — the trust footer states the strip scope honestly: masked and
-    /// blocked apps are stripped before any model — local or cloud — sees
-    /// content (the segmentation privacy strip, fail-closed at the helper
-    /// boundary). It claims nothing about uploads.
-    func testTrustFooterStatesStripBeforeAnyModel() {
+    /// R12 — the trust footer states the strip scope honestly, scoped to the
+    /// consent-governed tasks (summaries, answers, day-splitting). It must NOT
+    /// claim "any model": the legacy auto-namer path sits outside the strip
+    /// (tracked as a follow-up), so the broader claim would be false. It
+    /// claims nothing about uploads.
+    func testTrustFooterScopesStripToConsentGovernedTasks() {
         let footer = IntelligenceSelectionModel.consentTrustFooter.lowercased()
         XCTAssertTrue(footer.contains("masked"))
         XCTAssertTrue(footer.contains("blocked"))
-        XCTAssertTrue(footer.contains("before any model"))
+        XCTAssertTrue(footer.contains("summaries"))
+        XCTAssertTrue(footer.contains("day-splitting"))
         XCTAssertTrue(footer.contains("local or cloud"))
+        XCTAssertFalse(footer.contains("any model"),
+                       "unscoped claim — falsified by the legacy auto-namer path")
         XCTAssertFalse(footer.contains("upload"),
                        "the footer is scoped to models seeing content, not uploads")
     }

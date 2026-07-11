@@ -185,6 +185,13 @@ final class ModelDownloadController: ObservableObject {
             lastError = error.localizedDescription
         }
         await refreshStatus()
+        // The daemon-side cancel converges lazily (the underlying snapshot
+        // download is not interruptible mid-transfer), so the post-cancel
+        // status read can still say `downloading` — and refreshStatus's KTD8
+        // auto-start would resurrect the loop the user just stopped. A later
+        // refresh (pane focus/reopen, retry) restarts polling if the download
+        // genuinely continues.
+        stopPolling()
     }
 
     /// Test seam (U2) — whether the status-poll loop is active. Internal so
