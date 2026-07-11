@@ -242,6 +242,12 @@ class ChunkProcessor:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
+        # Secrets-only local scrubber for the content-index pass (search U3), built
+        # lazily + cached once (the detector pipeline loads plugins once). ``None``
+        # after a failed build → fail closed (index nothing) for the session.
+        self._local_scrubber = None
+        self._local_scrubber_built = False
+
         # U5 ledger handle for the destination-agnostic stage runner, built
         # lazily on first use. ``None`` (no recording.db / no recording row,
         # e.g. test fixtures) disables ledger bookkeeping — the agnostic
@@ -1106,8 +1112,30 @@ class ChunkProcessor:
         # inside the write lock, and only when there is something to write — so an
         # empty / fully-blocked range never creates an empty PII store). We just
         # hand it the path.
+        from screencap import config
         from screencap.content_index import default_index_path
         from screencap.index_core import index_range
+
+        # Secrets-only local scrub (search U3 / R1): once the corpus is encrypted
+        # (guardrails-on), redact secrets/PII from each still BEFORE its text is
+        # indexed, and re-encrypt the painted still. Fail CLOSED — if the detection
+        # pipeline can't be built we index NOTHING (never raw, unredacted text),
+        # leaving the chunk for a later processing pass to retry (KTD2 / R8). Before
+        # the flip (``corpus_encrypted`` False) the pass indexes raw OCR text exactly
+        # as today (opt-in plaintext users are unchanged until migration).
+        scrubber = None
+        corpus_key = None
+        if config.get_corpus_encrypted():
+            scrubber = self._get_local_scrubber()
+            if scrubber is None:
+                logger.warning(
+                    f"Chunk {idx}: local scrub pipeline unavailable; skipping content "
+                    "index (fail closed — left for retry on the next processing pass)"
+                )
+                return
+            from screencap import corpus_crypto
+
+            corpus_key = corpus_crypto.load_corpus_key()
 
         # Key on the recording DIRECTORY name (globally unique, and what the daemon
         # query side resolves a recording filter to) so the scrub_worker purge and
@@ -1123,7 +1151,28 @@ class ChunkProcessor:
             ocr=ocr,
             store_path=default_index_path(),
             stop_event=self._stop_event,
+            scrub=scrubber,
+            corpus_key=corpus_key,
         )
+
+    def _get_local_scrubber(self):
+        """Lazily build + cache the secrets-only local scrubber (search U3).
+
+        Cached across chunks (the pipeline loads detector plugins once). A build
+        failure caches ``None`` so we don't re-import every chunk; a later
+        processing pass (a fresh ``ChunkProcessor``) retries — the fail-closed
+        retry model (KTD2)."""
+        if self._local_scrubber_built:
+            return self._local_scrubber
+        self._local_scrubber_built = True
+        try:
+            from screencap.redaction.local_scrub import LocalScrubber
+
+            self._local_scrubber = LocalScrubber()
+        except Exception:
+            logger.warning("local scrub pipeline failed to initialize", exc_info=True)
+            self._local_scrubber = None
+        return self._local_scrubber
 
     def _collect_chunk_files(self, idx: int, transcript_path: Path | None) -> list[dict]:
         """Collect files belonging to this chunk for upload.
