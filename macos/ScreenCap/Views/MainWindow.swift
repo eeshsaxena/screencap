@@ -135,6 +135,14 @@ struct MainWindow: View {
     /// record/search affordances set `.gate`; nil means no sheet. The Settings
     /// entry is NOT this — it is the embedded `.account` route (KTD-4).
     @State private var presentedAccountContext: AccountSheetContext?
+    /// Tracks whether the gate sheet initiated the in-flight sign-in flow
+    /// (mirrors `ReviewWindow.startedSignIn`). The auth controller is
+    /// app-wide, so only the surface that started the flow may cancel it on
+    /// dismissal — otherwise dismissing the gate sheet would abort a login
+    /// another window started. Without this teardown, "Sign In" then "Not
+    /// now" would orphan the `screencap login` subprocess + browser flow
+    /// until its watchdog timeout.
+    @State private var startedSignIn = false
     /// U10: the Recall palette — an in-window overlay (KTD-4) opened by the
     /// window-scoped ⌘⇧F (KTD-13), the Library/Journal search pills, and the
     /// menu-bar "Search…" item (via notification).
@@ -292,13 +300,27 @@ struct MainWindow: View {
                 NewRecordingSheet(isPresented: $showingNewRecording)
             }
         }
-        .sheet(item: $presentedAccountContext) { context in
+        .sheet(item: $presentedAccountContext, onDismiss: {
+            // Every dismissal route — "Not now", Esc, and the system's
+            // item → nil transition — converges here, mirroring
+            // ReviewWindow's `.sheet(onDismiss:)` teardown: cancel the
+            // in-flight sign-in only if this sheet started it.
+            teardownSignInIfOwned()
+        }) { context in
             // U12 / account-sheet U5: the unified Account & Plan sheet shared
             // by every gated record/search affordance across the shell
             // (replaces the retired UpgradePromptView).
             AccountSheetView(
                 auth: auth,
                 context: context,
+                onStartSignIn: {
+                    // Ownership latch (R14): fired precisely when THIS
+                    // sheet's own Sign In / retry buttons launch a login, so
+                    // dismissing it cancels only flows it actually started —
+                    // never a sign-in another surface began while the gate
+                    // sheet happened to be up.
+                    startedSignIn = true
+                },
                 onDismiss: { presentedAccountContext = nil }
             )
         }
@@ -539,6 +561,19 @@ struct MainWindow: View {
                 onOpenSearch: { showingPalette = true },
                 onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
             )
+        }
+    }
+
+    /// Cancels the in-flight sign-in only if the gate sheet started it and a
+    /// flow is still in progress (mirrors `ReviewWindow.teardownSignInIfOwned`).
+    /// Safe on any dismissal route; clears the ownership flag so it's a no-op
+    /// on a second call. The embedded `.account` pane needs no counterpart —
+    /// it isn't dismissible, so a login it starts is never orphaned.
+    private func teardownSignInIfOwned() {
+        guard startedSignIn else { return }
+        startedSignIn = false
+        if case .inProgress = auth.signInFlow {
+            auth.cancelSignIn()
         }
     }
 
