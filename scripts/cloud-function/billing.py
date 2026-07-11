@@ -87,6 +87,28 @@ Deploy (project: proteus-photos, region: southamerica-east1):
 
     # NEVER commit sk_live_... / whsec_...; keep test-mode and live-mode keys per
     # environment and rotate via the console + redeploy (billing plan U11).
+
+Pre-launch checklist (U7 — portal, LIVE mode only):
+    Stripe's hosted customer portal refuses ``billing_portal.Session.create()``
+    in live mode until a Configuration is saved. Test mode silently falls back
+    to an account default, which MASKS this failure until the first live user
+    hits "Manage Subscription" and gets a 502 — so this must be done before
+    launch, not discovered after:
+
+    1. Run ``scripts/cloud-function/setup_portal_config.py`` with LIVE-mode
+       price ids (or save the equivalent portal settings by hand in the Stripe
+       Dashboard, live mode: Settings -> Billing -> Customer portal). The
+       script scopes ``subscription_update`` to exactly the Local Pro + Cloud
+       products so a customer can only plan-switch between the two paid tiers.
+    2. Set the printed configuration id as ``STRIPE_PORTAL_CONFIGURATION_ID``
+       on the deployed ``stripe-portal-session`` function (see the deploy
+       block above) and redeploy — ``create_portal_session`` passes it
+       explicitly to ``Session.create``, never relying on dashboard default
+       state.
+    3. If ``STRIPE_PORTAL_RETURN_URL`` is left unset on the function, Stripe
+       falls back to the portal configuration's own default return URL rather
+       than failing — set it explicitly if the app needs a specific
+       post-portal destination.
 """
 
 from __future__ import annotations
