@@ -1883,7 +1883,7 @@ class TestUnlistedMarker:
 
         # Server returns a URL for the media file but silently drops _unlisted
         # (legacy behaviour — mirrors what the old filename regex did).
-        def fake_request_signed_urls(recording_name, file_infos):
+        def fake_request_signed_urls(recording_name, file_infos, **kw):
             return ({"chunk_0000.mp4": "https://example.com/signed"}, "gs://bucket/test/")
 
         with mock.patch(

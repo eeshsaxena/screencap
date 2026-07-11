@@ -532,7 +532,7 @@ def test_promotion_guard_production_shaped_no_prefreeze_no_injected_remote(
 
     # Nothing is in GCS: request_signed_urls returns a (non-None) signed URL for
     # every requested file -> "needs upload", i.e. NOT already present.
-    def _none_present(name, infos):
+    def _none_present(name, infos, **kw):
         return ({fi.name: f"https://signed/{fi.name}" for fi in infos}, "prefix")
 
     monkeypatch.setattr("screencap.upload.request_signed_urls", _none_present)
@@ -598,7 +598,7 @@ def test_promotion_allows_uploaded_then_evicted_chunk(tmp_path, monkeypatch):
     # A fresh GCS probe would say "not present" (a signed URL is returned for
     # every requested file), proving the pass comes from the ledger UPLOADED
     # state and NOT from a remote confirm.
-    def _none_present(name, infos):
+    def _none_present(name, infos, **kw):
         return ({fi.name: f"https://signed/{fi.name}" for fi in infos}, "prefix")
 
     monkeypatch.setattr("screencap.upload.request_signed_urls", _none_present)

@@ -437,7 +437,7 @@ class SubscriptionRequired(RuntimeError):
 
 
 def request_signed_urls(
-    recording_name: str, files: list[FileInfo],
+    recording_name: str, files: list[FileInfo], *, e2ee: bool = False,
 ) -> tuple[dict[str, str | None], str]:
     """POST to Cloud Function, return (urls_dict, gcs_prefix).
 
@@ -455,16 +455,19 @@ def request_signed_urls(
     The bearer/refresh/retry policy lives in :func:`screencap.auth.authed_post`;
     the ``requests.post`` reference is passed in so it stays this module's own call
     (test mocks at ``screencap.upload.requests.post`` keep working).
+
+    ``e2ee`` is the recording's FROZEN cloud-E2EE decision (SCR-220 KTD-4),
+    resolved by the PUT caller from ``.recording_intent`` — never the live flag.
+    Probe-only callers (reconcile / remote-confirm) leave the default: they
+    discard the URLs, so the advertised content type is inert for them.
     """
     from screencap import auth
-    from screencap.config import get_cloud_e2ee_enabled
 
     url = _get_upload_url()
     # KTD-5: when E2EE is on, objects are ciphertext PUT as octet-stream. The
     # signed URL binds Content-Type into the V4 signature, so the signed-URL
     # request must advertise the same octet-stream the encrypted PUT will send —
-    # otherwise the PUT is a 403. Flag on ⇒ every cloud upload is encrypted.
-    e2ee = get_cloud_e2ee_enabled()
+    # otherwise the PUT is a 403. Frozen-on ⇒ every cloud upload is encrypted.
     payload = {
         "recording": recording_name,
         "files": [
@@ -538,6 +541,7 @@ def upload_recording(
     force: bool = False,
     jobs: int = 4,
     masked_video_upload: bool = False,
+    cloud_e2ee: bool | None = None,
 ) -> UploadResult:
     """Upload all files in a recording directory.
 
@@ -552,10 +556,22 @@ def upload_recording(
 
     Installs a SIGTERM handler so the SwiftUI shell can cancel an
     in-progress upload via subprocess.terminate(); restored on exit.
+
+    ``cloud_e2ee`` is the recording's FROZEN E2EE decision (SCR-220 KTD-4).
+    ``None`` resolves it from ``recording_dir``'s own ``.recording_intent``;
+    callers uploading a derived directory (the terminal stage's scrubbed copy)
+    must resolve it from the SOURCE recording dir and pass it explicitly, like
+    ``masked_video_upload``. Frozen-on encrypts or fails closed regardless of
+    the live flag; frozen-off/absent uploads plaintext per today's path.
     """
     # Read immutable recording_id if available, fallback to dir name
     _id_file = recording_dir / ".recording_id"
     recording_name = _id_file.read_text().strip() if _id_file.exists() else recording_dir.name
+
+    if cloud_e2ee is None:
+        from screencap.pipeline_chunk_ops import get_frozen_cloud_e2ee
+
+        cloud_e2ee = get_frozen_cloud_e2ee(recording_dir)
 
     if not dry_run and not force and is_uploaded(recording_dir):
         console.print(
@@ -624,8 +640,8 @@ def upload_recording(
             total_bytes=total_size,
         )
 
-        # Request signed URLs
-        urls, gcs_prefix = request_signed_urls(recording_name, files)
+        # Request signed URLs (advertising the frozen decision's content types)
+        urls, gcs_prefix = request_signed_urls(recording_name, files, e2ee=cloud_e2ee)
 
         result = UploadResult(recording=recording_name, gcs_prefix=gcs_prefix)
         to_upload = []
@@ -715,8 +731,9 @@ def upload_recording(
 
             # 2. Submit all uploads. Resolve the cloud key once for the whole
             #    batch — a per-file Keychain read would be N round-trips — and a
-            #    flag-on-but-no-key state fails the whole upload closed right here.
-            cloud_key = _cloud_upload_key()
+            #    frozen-on-but-no-key state fails the whole upload closed right
+            #    here (KTD-4: the frozen bit decides, never the live flag).
+            cloud_key = _cloud_upload_key(cloud_e2ee)
             with ThreadPoolExecutor(max_workers=jobs) as executor:
                 futures = {}
                 for f, signed_url in to_upload:
@@ -862,25 +879,27 @@ class CloudEncryptionUnavailable(RuntimeError):
     """
 
 
-def _cloud_upload_key() -> bytes | None:
-    """Return the cloud encryption key when E2EE is on, else ``None``.
+def _cloud_upload_key(e2ee: bool) -> bytes | None:
+    """Return the cloud encryption key when ``e2ee`` is on, else ``None``.
 
+    ``e2ee`` is the recording's FROZEN decision from ``.recording_intent``
+    (SCR-220 KTD-4), resolved once by the caller — never the live flag, so a
+    mid-life flag flip cannot downgrade a frozen-on recording to plaintext.
     Resolves the key for the current context (engine → delivered file; batch /
-    CLI → Keychain). When the flag is on but no key is available, raises
+    CLI → Keychain). When ``e2ee`` is on but no key is available, raises
     :class:`CloudEncryptionUnavailable` — callers must fail closed rather than
     fall back to a plaintext upload.
     """
-    from screencap.config import get_cloud_e2ee_enabled
-
-    if not get_cloud_e2ee_enabled():
+    if not e2ee:
         return None
     from screencap import cloud_crypto
 
     key = cloud_crypto.resolve_cloud_key()
     if key is None:
         raise CloudEncryptionUnavailable(
-            "cloud E2EE is enabled but no encryption key is available; refusing "
-            "to upload plaintext (sign in to create the cloud key)"
+            "this recording was made under cloud E2EE but no encryption key is "
+            "available; refusing to upload plaintext (sign in to create the "
+            "cloud key)"
         )
     return key
 
@@ -921,17 +940,21 @@ def _upload_with_progress(
     recording_name: str,
     max_retries: int,
     cloud_key=_RESOLVE_KEY,
+    *,
+    e2ee: bool = False,
 ) -> None:
     """Upload a single file with streaming progress and retry on URL expiry.
 
-    When cloud E2EE is enabled the file is encrypted on-device before the PUT
-    (KTD-4): the object store only ever holds ciphertext. The body then streams
-    as ``application/octet-stream`` with the computed ciphertext ``Content-Length``.
-    ``cloud_key`` is resolved once by the batch caller; a standalone call
-    resolves it itself.
+    When the recording's FROZEN cloud-E2EE decision (``e2ee``, KTD-4) is on the
+    file is encrypted on-device before the PUT: the object store only ever holds
+    ciphertext. The body then streams as ``application/octet-stream`` with the
+    computed ciphertext ``Content-Length``. ``cloud_key`` is resolved once by
+    the batch caller; a standalone call resolves it itself from ``e2ee``. The
+    key's presence IS the single decision downstream: the 403-retry re-sign
+    advertises octet-stream exactly when a key is set.
     """
     if cloud_key is _RESOLVE_KEY:
-        cloud_key = _cloud_upload_key()
+        cloud_key = _cloud_upload_key(e2ee)
     for attempt in range(1 + max_retries):
         with open(f.path, "rb") as fh:
             progress.reset(task_id)
@@ -951,7 +974,9 @@ def _upload_with_progress(
 
         if resp.status_code == 403 and attempt < max_retries:
             console.print(f"  [yellow]URL expired for {f.name}, retrying...[/yellow]")
-            urls, _ = request_signed_urls(recording_name, [f])
+            urls, _ = request_signed_urls(
+                recording_name, [f], e2ee=cloud_key is not None,
+            )
             new_url = urls.get(f.name)
             if new_url:
                 signed_url = new_url

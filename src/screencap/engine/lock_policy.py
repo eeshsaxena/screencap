@@ -68,6 +68,8 @@ def _write_identity_files(
 
         masked_video_upload = get_masked_video_upload_enabled()
 
+    from screencap.config import get_cloud_e2ee_enabled
+
     intent = {
         # Bumped 1 -> 2: adds the frozen resolved-policy fields
         # (retention_policy, retention_params). Readers tolerate v1 (absent
@@ -80,6 +82,12 @@ def _write_identity_files(
         # mid-recording global flip cannot ship unmasked rich video (the live
         # upload + terminal stage read this, never the mutable global).
         "masked_video_upload": bool(masked_video_upload),
+        # SCR-220 (KTD-4): freeze the cloud-E2EE decision per recording so a
+        # mid-life flag flip cannot downgrade an "encrypted" recording to a
+        # plaintext upload. Every upload seam reads THIS frozen bit — the
+        # live flag's only role is seeding it here at recording start.
+        # Schema-additive: older intents lack the field → treated as False.
+        "cloud_e2ee": bool(get_cloud_e2ee_enabled()),
         "privacy_mode": privacy_mode,
         "show_on_website": request.show_on_website,
         "created_at": datetime.now(timezone.utc).isoformat(),

@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MaskClassification",
+    "get_frozen_cloud_e2ee",
     "get_frozen_masked_video_upload",
     "mask_chunk_for_cloud",
 ]
@@ -65,6 +66,25 @@ def get_frozen_masked_video_upload(recording_dir: Path) -> bool:
     from screencap.config import get_masked_video_upload_enabled
 
     return get_masked_video_upload_enabled()
+
+
+def get_frozen_cloud_e2ee(recording_dir: Path) -> bool:
+    """Resolve the FROZEN cloud-E2EE decision for a recording (SCR-220 KTD-4).
+
+    Reads the value frozen into ``.recording_intent`` at recording start
+    (``engine/lock_policy._write_identity_files``). Every upload seam derives
+    its encrypt decision from this bit, never the live flag — frozen-on
+    encrypts (failing closed without a key) regardless of the current flag
+    state; the flag's only role is seeding the intent at start.
+
+    Unlike :func:`get_frozen_masked_video_upload` there is NO global fallback:
+    a missing/old-schema intent (pre-SCR-220) is frozen-off — plaintext per
+    today's path, never an error — because those recordings genuinely ran
+    without E2EE and must not report (or require) an encrypted upload.
+    """
+    from screencap.catalog import read_cloud_e2ee
+
+    return bool(read_cloud_e2ee(Path(recording_dir)))
 
 
 @dataclass

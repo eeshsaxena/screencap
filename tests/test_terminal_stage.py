@@ -869,14 +869,14 @@ class TestSCR129SourceMediaUpload:
             uploaded.add(f"chunk_{i:04d}_manifest.json")
         put: list[tuple[str, str]] = []
 
-        def _fake_request_signed_urls(recording_name, files):
+        def _fake_request_signed_urls(recording_name, files, **kw):
             return (
                 {f.name: (None if f.name in uploaded else f"https://x/{f.name}")
                  for f in files},
                 "prefix/",
             )
 
-        def _fake_upload_single(fi, signed_url):
+        def _fake_upload_single(fi, signed_url, **kw):
             put.append((fi.name, str(fi.path)))
             uploaded.add(fi.name)
 

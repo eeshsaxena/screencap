@@ -114,6 +114,32 @@ def read_masked_video_upload(directory: Path) -> bool | None:
     return bool(val) if isinstance(val, bool) else None
 
 
+def read_cloud_e2ee(directory: Path) -> bool | None:
+    """Read the FROZEN ``cloud_e2ee`` decision from ``.recording_intent``.
+
+    The cloud-E2EE flag is resolved ONCE at recording start and frozen into
+    ``.recording_intent`` (``engine/lock_policy._write_identity_files``), so a
+    mid-life flag flip can never downgrade an "encrypted" recording to a
+    plaintext upload (SCR-220 KTD-4). Every upload seam derives its encrypt
+    decision from THIS value, never the mutable global.
+
+    Returns the frozen bool, or ``None`` when the file is missing/corrupt or the
+    field is absent (an intent written before SCR-220). Unlike
+    ``read_masked_video_upload`` there is NO global fallback for that ``None``:
+    callers treat it as frozen-off (plaintext per today's path, never an error)
+    — see ``pipeline_chunk_ops.get_frozen_cloud_e2ee``.
+    """
+    intent_path = directory / INTENT_FILE
+    if not intent_path.exists():
+        return None
+    try:
+        data = json.loads(intent_path.read_text())
+    except Exception:
+        return None
+    val = data.get("cloud_e2ee")
+    return bool(val) if isinstance(val, bool) else None
+
+
 def read_intent_privacy_mode(directory: Path) -> str | None:
     """Read the FROZEN capture-time ``privacy_mode`` from ``.recording_intent``.
 
@@ -217,6 +243,11 @@ class RecordingInfo(NamedTuple):
     title: str = ""
     state: Literal["recording", "processing", "ready"] = "ready"
     recording_id: str | None = None
+    # SCR-220 (KTD-4): the FROZEN per-recording E2EE bit from .recording_intent
+    # (read_cloud_e2ee) — badge truth, immutable after start. False for pre-arc
+    # recordings (field absent) — never an error. Mirrored EXACTLY onto
+    # daemon.schema.RecordingSummary (recording.list asserts field parity).
+    cloud_e2ee: bool = False
 
 
 def _fmt_duration(seconds: float | None) -> str:
@@ -764,6 +795,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 title=_humanize_name(d.name),
                 state=state,
                 recording_id=read_recording_id(d),
+                cloud_e2ee=bool(read_cloud_e2ee(d)),
             )
         )
 

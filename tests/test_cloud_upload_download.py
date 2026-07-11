@@ -27,18 +27,15 @@ pytestmark = pytest.mark.privacy
 KEY = b"K" * 32
 
 
+# KTD-4 (SCR-220 U3): the seams take the recording's FROZEN E2EE decision as a
+# parameter — the live flag only seeds the intent at start — so the fixtures
+# here control key availability, not the flag.
 @pytest.fixture
-def e2ee_on(monkeypatch):
-    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "true")
+def cloud_key_available(monkeypatch):
     monkeypatch.delenv(cc.ENGINE_CLOUD_KEY_FILE_ENV, raising=False)
     monkeypatch.setattr(
         keyring, "get_password", lambda s, a: base64.b64encode(KEY).decode()
     )
-
-
-@pytest.fixture
-def e2ee_off(monkeypatch):
-    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "false")
 
 
 class _PutResp:
@@ -93,10 +90,12 @@ def _capture_put(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_batch_upload_ciphertext_and_download_round_trip(tmp_path, monkeypatch, e2ee_on):
+def test_batch_upload_ciphertext_and_download_round_trip(
+    tmp_path, monkeypatch, cloud_key_available
+):
     fi, content = _make_file(tmp_path)
     box = _capture_put(monkeypatch)
-    _upload_with_progress(fi, "https://put", _progress(), 1, "rec", 0)
+    _upload_with_progress(fi, "https://put", _progress(), 1, "rec", 0, e2ee=True)
 
     body = box["body"]
     assert cc.is_encrypted_prefix(body)  # Covers AE3: server object is ciphertext
@@ -109,10 +108,10 @@ def test_batch_upload_ciphertext_and_download_round_trip(tmp_path, monkeypatch, 
     assert dest.read_bytes() == content  # Covers AE4: decrypts to the original
 
 
-def test_batch_upload_plaintext_when_flag_off(tmp_path, monkeypatch, e2ee_off):
+def test_batch_upload_plaintext_when_frozen_off(tmp_path, monkeypatch):
     fi, content = _make_file(tmp_path)
     box = _capture_put(monkeypatch)
-    _upload_with_progress(fi, "https://put", _progress(), 1, "rec", 0)
+    _upload_with_progress(fi, "https://put", _progress(), 1, "rec", 0, e2ee=False)
     assert box["body"] == content  # byte-identical to today
     assert box["headers"]["Content-Type"] == "video/mp4"
 
@@ -122,10 +121,10 @@ def test_batch_upload_plaintext_when_flag_off(tmp_path, monkeypatch, e2ee_off):
 # --------------------------------------------------------------------------
 
 
-def test_live_upload_is_ciphertext(tmp_path, monkeypatch, e2ee_on):
+def test_live_upload_is_ciphertext(tmp_path, monkeypatch, cloud_key_available):
     fi, content = _make_file(tmp_path)
     box = _capture_put(monkeypatch)
-    _upload_single(fi, "https://put")
+    _upload_single(fi, "https://put", e2ee=True)
     assert cc.is_encrypted_prefix(box["body"])
     assert box["headers"]["Content-Type"] == "application/octet-stream"
     # and it round-trips
@@ -135,45 +134,44 @@ def test_live_upload_is_ciphertext(tmp_path, monkeypatch, e2ee_on):
     assert dest.read_bytes() == content
 
 
-def test_live_upload_plaintext_when_flag_off(tmp_path, monkeypatch, e2ee_off):
+def test_live_upload_plaintext_when_frozen_off(tmp_path, monkeypatch):
     fi, content = _make_file(tmp_path)
     box = _capture_put(monkeypatch)
-    _upload_single(fi, "https://put")
+    _upload_single(fi, "https://put", e2ee=False)
     assert box["body"] == content
 
 
 # --------------------------------------------------------------------------
-# Fail closed: flag on but no key -> never upload plaintext
+# Fail closed: frozen-on but no key -> never upload plaintext
 # --------------------------------------------------------------------------
 
 
 @pytest.fixture
-def e2ee_on_no_key(monkeypatch):
-    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "true")
+def no_cloud_key(monkeypatch):
     monkeypatch.delenv(cc.ENGINE_CLOUD_KEY_FILE_ENV, raising=False)
     monkeypatch.setattr(keyring, "get_password", lambda s, a: None)
 
 
-def test_batch_fails_closed_without_key(tmp_path, monkeypatch, e2ee_on_no_key):
+def test_batch_fails_closed_without_key(tmp_path, monkeypatch, no_cloud_key):
     fi, _ = _make_file(tmp_path)
     monkeypatch.setattr(requests, "put", lambda *a, **k: pytest.fail("uploaded without a key"))
     with pytest.raises(upload.CloudEncryptionUnavailable):
-        _upload_with_progress(fi, "https://put", _progress(), 1, "rec", 0)
+        _upload_with_progress(fi, "https://put", _progress(), 1, "rec", 0, e2ee=True)
 
 
-def test_live_fails_closed_without_key(tmp_path, monkeypatch, e2ee_on_no_key):
+def test_live_fails_closed_without_key(tmp_path, monkeypatch, no_cloud_key):
     fi, _ = _make_file(tmp_path)
     monkeypatch.setattr(requests, "put", lambda *a, **k: pytest.fail("uploaded without a key"))
     with pytest.raises(upload.CloudEncryptionUnavailable):
-        _upload_single(fi, "https://put")
+        _upload_single(fi, "https://put", e2ee=True)
 
 
 # --------------------------------------------------------------------------
-# Signed-URL request advertises octet-stream when the flag is on (KTD-5)
+# Signed-URL request advertises octet-stream when the frozen bit is on (KTD-5)
 # --------------------------------------------------------------------------
 
 
-def test_signed_url_request_uses_octet_stream_when_flag_on(monkeypatch, e2ee_on):
+def test_signed_url_request_uses_octet_stream_when_e2ee_on(monkeypatch):
     box: dict = {}
 
     def fake_authed_post(post, url, json=None, timeout=None):
@@ -183,11 +181,11 @@ def test_signed_url_request_uses_octet_stream_when_flag_on(monkeypatch, e2ee_on)
     monkeypatch.setattr("screencap.auth.authed_post", fake_authed_post)
     monkeypatch.setattr(upload, "_get_upload_url", lambda: "http://fn")
     fi = FileInfo(name="chunk_0.mp4", path=Path("/x"), content_type="video/mp4", size=1)
-    request_signed_urls("rec", [fi])
+    request_signed_urls("rec", [fi], e2ee=True)
     assert box["payload"]["files"][0]["content_type"] == "application/octet-stream"
 
 
-def test_signed_url_request_uses_real_type_when_flag_off(monkeypatch, e2ee_off):
+def test_signed_url_request_uses_real_type_when_e2ee_off(monkeypatch):
     box: dict = {}
 
     def fake_authed_post(post, url, json=None, timeout=None):
@@ -199,6 +197,151 @@ def test_signed_url_request_uses_real_type_when_flag_off(monkeypatch, e2ee_off):
     fi = FileInfo(name="chunk_0.mp4", path=Path("/x"), content_type="video/mp4", size=1)
     request_signed_urls("rec", [fi])
     assert box["payload"]["files"][0]["content_type"] == "video/mp4"
+
+
+# --------------------------------------------------------------------------
+# KTD-4 (SCR-220 U3): the frozen per-recording intent bit — not the live flag —
+# decides encryption at every upload seam.
+# --------------------------------------------------------------------------
+
+
+def _write_intent(capture_dir: Path, *, cloud_e2ee: bool | None) -> None:
+    """Write a minimal frozen ``.recording_intent``; ``None`` omits the field
+    (a pre-arc recording whose intent predates SCR-220)."""
+    import json
+
+    intent = {
+        "version": 2,
+        "destination": "cloud",
+        "masked_video_upload": False,
+        "privacy_mode": "public",
+    }
+    if cloud_e2ee is not None:
+        intent["cloud_e2ee"] = cloud_e2ee
+    (capture_dir / ".recording_intent").write_text(json.dumps(intent))
+
+
+def _run_live_chunk_upload(tmp_path, monkeypatch) -> tuple[dict, bytes]:
+    """Drive the live seam (``upload_chunk_files``) end-to-end with the network
+    mocked, returning the captured PUT box and the plaintext content."""
+    from screencap import chunk_processor
+
+    content = b"live-chunk-payload" * 16
+    chunk = tmp_path / "chunk_0000.mp4"
+    chunk.write_bytes(content)
+    box = _capture_put(monkeypatch)
+    monkeypatch.setattr(
+        "screencap.upload.request_signed_urls",
+        lambda name, infos, **kw: ({"chunk_0000.mp4": "https://put"}, "gs://p/"),
+    )
+    ok = chunk_processor.upload_chunk_files(
+        "rec", [{"name": "chunk_0000.mp4", "path": chunk}], tmp_path,
+    )
+    box["ok"] = ok
+    return box, content
+
+
+def test_downgrade_pin_frozen_on_flag_off_live_still_ciphertext(
+    tmp_path, monkeypatch, cloud_key_available
+):
+    """The KTD-4 downgrade pin (AE1/AE3): a recording frozen ``cloud_e2ee: true``
+    keeps encrypting after the live flag is flipped off mid-life — the flag's
+    only role is seeding the intent at recording start."""
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "false")  # mid-life downgrade
+    _write_intent(tmp_path, cloud_e2ee=True)
+    box, _ = _run_live_chunk_upload(tmp_path, monkeypatch)
+    assert box["ok"] is True
+    assert cc.is_encrypted_prefix(box["body"])  # NEVER plaintext
+    assert box["headers"]["Content-Type"] == "application/octet-stream"
+
+
+def test_downgrade_pin_frozen_on_no_key_fails_closed_not_plaintext(
+    tmp_path, monkeypatch, no_cloud_key
+):
+    """Frozen-on with no key available fails the chunk closed — the PUT never
+    happens, regardless of the live flag being off."""
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "false")
+    _write_intent(tmp_path, cloud_e2ee=True)
+    box, _ = _run_live_chunk_upload(tmp_path, monkeypatch)
+    assert box["ok"] is False  # chunk FAILED, nothing deleted
+    assert "body" not in box  # no PUT was attempted
+
+
+def test_frozen_off_flag_flipped_on_stays_plaintext(
+    tmp_path, monkeypatch, cloud_key_available
+):
+    """A recording frozen ``cloud_e2ee: false`` uploads plaintext even after the
+    live flag is flipped on mid-life (per today's path)."""
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "true")  # mid-life upgrade attempt
+    _write_intent(tmp_path, cloud_e2ee=False)
+    box, content = _run_live_chunk_upload(tmp_path, monkeypatch)
+    assert box["ok"] is True
+    assert box["body"] == content
+    assert box["headers"]["Content-Type"] == "video/mp4"
+
+
+def test_pre_arc_recording_uploads_plaintext_never_errors(
+    tmp_path, monkeypatch, no_cloud_key
+):
+    """No frozen field (intent predates SCR-220) → treated as frozen-off:
+    plaintext per today's path, never an error — even with the flag on and no
+    key anywhere."""
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "true")
+    _write_intent(tmp_path, cloud_e2ee=None)
+    box, content = _run_live_chunk_upload(tmp_path, monkeypatch)
+    assert box["ok"] is True
+    assert box["body"] == content
+
+
+def test_batch_seam_reads_frozen_intent_not_live_flag(
+    tmp_path, monkeypatch, cloud_key_available
+):
+    """The batch seam (``upload_recording``) resolves the same frozen bit: a
+    frozen-on recording ships ciphertext with the live flag off."""
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "false")
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    _write_intent(rec, cloud_e2ee=True)
+    content = b"batch-payload" * 16
+    (rec / "chunk_0000.mp4").write_bytes(content)
+    box = _capture_put(monkeypatch)
+    signed: dict = {}
+
+    def fake_signed(name, infos, **kw):
+        signed.update(kw)
+        return ({fi.name: "https://put" for fi in infos}, "gs://p/")
+
+    monkeypatch.setattr(upload, "request_signed_urls", fake_signed)
+    result = upload.upload_recording(rec, jobs=1)
+    assert not result.failed
+    assert signed == {"e2ee": True}  # the sign request advertised the frozen bit
+    assert cc.is_encrypted_prefix(box["body"])
+    assert box["headers"]["Content-Type"] == "application/octet-stream"
+
+
+def test_intent_frozen_at_start_flag_flip_does_not_change_it(tmp_path, monkeypatch):
+    """The bit is seeded from the live flag ONCE at recording start; flipping the
+    flag mid-recording does not change the frozen value on disk."""
+    import json
+
+    from screencap.engine.config import RecordingConfig
+    from screencap.engine.lock_policy import _write_identity_files
+    from screencap.engine.screen_recorder import RecordingRequest
+
+    request = RecordingRequest(
+        name="frozen-rec", config=RecordingConfig(), cloud_intent=True,
+        keep_local=False,
+    )
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "true")
+    _write_identity_files(tmp_path, request=request, privacy_mode="public")
+
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "false")  # mid-recording flip
+    intent = json.loads((tmp_path / ".recording_intent").read_text())
+    assert intent["cloud_e2ee"] is True
+
+    from screencap.pipeline_chunk_ops import get_frozen_cloud_e2ee
+
+    assert get_frozen_cloud_e2ee(tmp_path) is True
 
 
 # --------------------------------------------------------------------------
@@ -251,7 +394,9 @@ def test_assert_uploadable_still_rejects_recording_db(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_batch_403_retry_reencrypts_with_fresh_nonce(tmp_path, monkeypatch, e2ee_on):
+def test_batch_403_retry_reencrypts_with_fresh_nonce(
+    tmp_path, monkeypatch, cloud_key_available
+):
     fi, content = _make_file(tmp_path)
     bodies: list[bytes] = []
     calls = {"n": 0}
@@ -265,11 +410,19 @@ def test_batch_403_retry_reencrypts_with_fresh_nonce(tmp_path, monkeypatch, e2ee
         return _403() if calls["n"] == 1 else _PutResp()
 
     monkeypatch.setattr(requests, "put", fake_put)
-    # The 403 branch re-requests a signed URL before retrying.
-    monkeypatch.setattr(
-        upload, "request_signed_urls", lambda rec, files: ({fi.name: "https://put2"}, "p")
-    )
-    _upload_with_progress(fi, "https://put1", _progress(), 1, "rec", 1)  # max_retries=1
+    # The 403 branch re-requests a signed URL before retrying — advertising
+    # octet-stream because a cloud key is set (the single decision).
+    resign: dict = {}
+
+    def fake_signed(rec, files, **kw):
+        resign.update(kw)
+        return ({fi.name: "https://put2"}, "p")
+
+    monkeypatch.setattr(upload, "request_signed_urls", fake_signed)
+    _upload_with_progress(
+        fi, "https://put1", _progress(), 1, "rec", 1, e2ee=True,
+    )  # max_retries=1
+    assert resign == {"e2ee": True}
 
     assert len(bodies) == 2  # first attempt 403'd, second succeeded
     assert all(cc.is_encrypted_prefix(b) for b in bodies)

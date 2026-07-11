@@ -111,6 +111,31 @@ async def test_recording_list_matches_cli_json_shape(
     assert set(payload["recordings"][0]) == set(expected_recordings[0])
 
 
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_recording_list_exposes_frozen_cloud_e2ee(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SCR-220 (KTD-4): ``/v0/recording.list`` surfaces the frozen per-recording
+    E2EE bit — True for a frozen-on recording, False for a pre-arc one whose
+    intent lacks the field (never an error)."""
+    recordings_dir = tmp_path / "recordings"
+    frozen_on = _make_recording(recordings_dir, "e2ee-rec")
+    (frozen_on / ".recording_intent").write_text(
+        json.dumps({"version": 2, "destination": "cloud", "cloud_e2ee": True})
+    )
+    _make_recording(recordings_dir, "pre-arc-rec")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(recordings_dir))
+
+    response = await _asgi_get("/v0/recording.list")
+
+    assert response.status_code == 200
+    rows = {r["name"]: r for r in response.json()["recordings"]}
+    assert rows["e2ee-rec"]["cloud_e2ee"] is True
+    assert rows["pre-arc-rec"]["cloud_e2ee"] is False
+
+
 @pytest.mark.asyncio
 async def test_session_snapshot_no_recording_keeps_all_keys(isolated_lock) -> None:
     response = await _asgi_get("/v0/session.snapshot")

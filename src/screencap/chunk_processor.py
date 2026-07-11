@@ -1414,7 +1414,10 @@ def upload_chunk_files(
     Returns True if all core files uploaded. Transcript failures are
     logged but treated as non-fatal.
     """
-    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+    from screencap.pipeline_chunk_ops import (
+        get_frozen_cloud_e2ee,
+        get_frozen_masked_video_upload,
+    )
     from screencap.upload import (
         FileInfo,
         _content_type,
@@ -1427,6 +1430,9 @@ def upload_chunk_files(
     # recording dir (capture_dir) and gate every chunk video at the enqueue
     # boundary, so a masked-path-switch regression in any caller fails loud here.
     masked_on = get_frozen_masked_video_upload(capture_dir)
+    # SCR-220 (KTD-4): resolve the FROZEN E2EE decision once per call — the
+    # sign + PUT below both derive from it, never the live flag.
+    e2ee = get_frozen_cloud_e2ee(capture_dir)
 
     file_infos = []
     for f in files:
@@ -1449,7 +1455,7 @@ def upload_chunk_files(
         return True
 
     try:
-        urls, gcs_prefix = request_signed_urls(recording_name, file_infos)
+        urls, gcs_prefix = request_signed_urls(recording_name, file_infos, e2ee=e2ee)
     except Exception as e:
         logger.error(f"Failed to get signed URLs: {e}")
         return False
@@ -1472,7 +1478,7 @@ def upload_chunk_files(
         if url is None:
             continue  # server confirms already uploaded
         try:
-            _upload_single(fi, url)
+            _upload_single(fi, url, e2ee=e2ee)
         except Exception as e:
             if not is_core:
                 logger.warning(f"Non-fatal: failed to upload {fi.name}: {e}")
@@ -1494,20 +1500,22 @@ def upload_chunk_files(
     return core_ok
 
 
-def _upload_single(fi, signed_url: str) -> None:
+def _upload_single(fi, signed_url: str, *, e2ee: bool) -> None:
     """Upload a single file without progress tracking.
 
     This is the live/during-recording PUT site, reached from the engine
-    subprocess. When cloud E2EE is enabled it encrypts on-device before the PUT
-    (KTD-4) using the daemon-delivered key, so a live cloud recording never
-    ships plaintext chunks. A missing key raises (fail closed) — the caller
-    marks the chunk FAILED and deletes nothing.
+    subprocess. ``e2ee`` is the recording's FROZEN cloud-E2EE decision
+    (SCR-220 KTD-4), resolved by the caller from ``.recording_intent`` — never
+    the live flag. Frozen-on encrypts on-device before the PUT using the
+    daemon-delivered key, so a live cloud recording never ships plaintext
+    chunks. A missing key raises (fail closed) — the caller marks the chunk
+    FAILED and deletes nothing.
     """
     import requests
 
     from screencap.upload import _cloud_upload_key, _put_body_and_headers
 
-    key = _cloud_upload_key()
+    key = _cloud_upload_key(e2ee)
     with open(fi.path, "rb") as fh:
         # Plaintext body is the raw handle (no progress bar on the live path).
         body, headers = _put_body_and_headers(fh, fi.size, fi.content_type, key, fh)
@@ -1625,7 +1633,11 @@ def upload_sentinel(
         except Exception:
             return False
 
-    # Upload
+    # Upload. SCR-220 (KTD-4): the sentinel PUT derives its encrypt decision
+    # from the recording's frozen intent, same as every chunk PUT.
+    from screencap.pipeline_chunk_ops import get_frozen_cloud_e2ee
+
+    e2ee = get_frozen_cloud_e2ee(capture_dir)
     fi = FileInfo(
         name="recording_complete.json",
         path=sentinel_path,
@@ -1633,13 +1645,13 @@ def upload_sentinel(
         size=sentinel_path.stat().st_size,
     )
     try:
-        urls, _ = request_signed_urls(recording_name, [fi])
+        urls, _ = request_signed_urls(recording_name, [fi], e2ee=e2ee)
         if "recording_complete.json" not in urls:
             logger.error("Server returned no URL for recording_complete.json")
             return False
         url = urls["recording_complete.json"]
         if url:
-            _upload_single(fi, url)
+            _upload_single(fi, url, e2ee=e2ee)
         return True
     except Exception as e:
         logger.error(f"Failed to upload sentinel: {e}")
