@@ -73,19 +73,29 @@ def read_upload_warning(directory: Path) -> str | None:
     return warning if isinstance(warning, str) and warning else None
 
 
-def read_intent(directory: Path) -> str | None:
-    """Read the recording intent from a .recording_intent file.
+def _read_intent_data(directory: Path) -> dict | None:
+    """Load ``.recording_intent`` once, or ``None`` when missing/corrupt/non-dict.
 
-    Returns 'cloud', 'local', 'both', or None if the file is missing/corrupt.
+    Shared by the field readers below so a caller that needs several frozen
+    fields (the ``list_recordings`` row loop) parses the file exactly once.
     """
     intent_path = directory / INTENT_FILE
     if not intent_path.exists():
         return None
     try:
         data = json.loads(intent_path.read_text())
-        return data.get("destination")
     except Exception:
         return None
+    return data if isinstance(data, dict) else None
+
+
+def read_intent(directory: Path) -> str | None:
+    """Read the recording intent from a .recording_intent file.
+
+    Returns 'cloud', 'local', 'both', or None if the file is missing/corrupt.
+    """
+    data = _read_intent_data(directory)
+    return data.get("destination") if data is not None else None
 
 
 def read_masked_video_upload(directory: Path) -> bool | None:
@@ -103,14 +113,8 @@ def read_masked_video_upload(directory: Path) -> bool | None:
     back to the mutable global only for those legacy recordings — see
     ``pipeline_chunk_ops.get_frozen_masked_video_upload``.
     """
-    intent_path = directory / INTENT_FILE
-    if not intent_path.exists():
-        return None
-    try:
-        data = json.loads(intent_path.read_text())
-    except Exception:
-        return None
-    val = data.get("masked_video_upload")
+    data = _read_intent_data(directory)
+    val = data.get("masked_video_upload") if data is not None else None
     return bool(val) if isinstance(val, bool) else None
 
 
@@ -129,14 +133,8 @@ def read_cloud_e2ee(directory: Path) -> bool | None:
     callers treat it as frozen-off (plaintext per today's path, never an error)
     — see ``pipeline_chunk_ops.get_frozen_cloud_e2ee``.
     """
-    intent_path = directory / INTENT_FILE
-    if not intent_path.exists():
-        return None
-    try:
-        data = json.loads(intent_path.read_text())
-    except Exception:
-        return None
-    val = data.get("cloud_e2ee")
+    data = _read_intent_data(directory)
+    val = data.get("cloud_e2ee") if data is not None else None
     return bool(val) if isinstance(val, bool) else None
 
 
@@ -156,14 +154,8 @@ def read_intent_privacy_mode(directory: Path) -> str | None:
     ``PrivacyMode.PUBLIC`` for that ``None`` case rather than trusting the
     mutable global.
     """
-    intent_path = directory / INTENT_FILE
-    if not intent_path.exists():
-        return None
-    try:
-        data = json.loads(intent_path.read_text())
-    except Exception:
-        return None
-    val = data.get("privacy_mode")
+    data = _read_intent_data(directory)
+    val = data.get("privacy_mode") if data is not None else None
     return val if isinstance(val, str) and val else None
 
 
@@ -747,7 +739,10 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         is_stub = uploaded and not has_media and db is not None
 
         drops = read_drops(d)
-        intent = read_intent(d)
+        # One .recording_intent parse per row: destination and the frozen
+        # cloud_e2ee bit both come from this single read.
+        intent_data = _read_intent_data(d)
+        intent = intent_data.get("destination") if intent_data is not None else None
         # SCR-148: both are pure local reads (no auth / Keychain access), so
         # list_recordings stays a cheap local scan usable without sign-in.
         owner_uid = read_owner_uid(d)
@@ -795,7 +790,7 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 title=_humanize_name(d.name),
                 state=state,
                 recording_id=read_recording_id(d),
-                cloud_e2ee=bool(read_cloud_e2ee(d)),
+                cloud_e2ee=(intent_data or {}).get("cloud_e2ee") is True,
             )
         )
 
