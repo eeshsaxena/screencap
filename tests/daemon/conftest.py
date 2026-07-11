@@ -47,6 +47,18 @@ def _isolate_recordings_and_run_dir(tmp_path, monkeypatch):
     base = tmp_path / "base-isolated"
     base.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(cfg, "_DEFAULT_BASE", base)
+    # ``_CONFIG_PATH`` is bound at import time from the ORIGINAL ``_DEFAULT_BASE``,
+    # so patching ``_DEFAULT_BASE`` above does NOT redirect ``config.toml`` reads:
+    # ``_load_toml()`` still resolves the developer's real ``~/.screencap/config.toml``
+    # and caches it. A developer testing the paywall (``local_paywall_enforce = true``)
+    # would leak that flag into the daemon app, 402-ing the read-only recall/search
+    # verb tests (dogfood 2026-07-11). Redirect the path at the isolated (empty) base
+    # and reset the module-level cache on both sides so neither the leak-in nor the
+    # isolated ``{}`` persists across tests.
+    monkeypatch.setattr(cfg, "_CONFIG_PATH", base / "config.toml")
+    cfg.invalidate_config_cache()
+    yield
+    cfg.invalidate_config_cache()
 
 
 @pytest.fixture(autouse=True)
