@@ -210,6 +210,20 @@ def build_engine_worker_args(
     args["name"] = name
     args["output_dir"] = str(capture_dir)
     args["capture_dir_hint"] = str(capture_dir)
+    # Search U8 / KTD5: resolve the stills-capture gate here (the defaults-resolution
+    # seam). An unset ``capture_images`` follows the default-on readiness gate; an
+    # explicit true is clamped OFF when encryption is required but not ready; an
+    # explicit false always wins. The encryption flag itself rides the engine env
+    # (see ``Supervisor._stage_corpus_key``), so only the on/off decision lands here.
+    from screencap.capture_gate import gather_and_resolve
+
+    gate = gather_and_resolve(
+        explicit_capture_images=request.capture_images,
+        scrub_enabled=request.scrub_enabled,
+    )
+    if gate.reason != "explicit_true":
+        logger.info("capture gate: images=%s (%s)", gate.capture_images, gate.reason)
+    args["capture_images"] = gate.capture_images
     return args
 
 
@@ -409,6 +423,11 @@ class Supervisor:
                 key_env = await self._stage_engine_cloud_key(request, capture_dir)
                 if key_env:
                     extra_env = {**(extra_env or {}), **key_env}
+                # Search U8: deliver the corpus key (via file) + RECORD_IMAGES_ENCRYPTED
+                # to the engine when the gate resolved encrypted stills ON.
+                corpus_env = await self._stage_corpus_key(request, capture_dir)
+                if corpus_env:
+                    extra_env = {**(extra_env or {}), **corpus_env}
                 command = self._engine_command_factory(encoded_args)
                 proc = _PopenEngineProcess(command, extra_env=extra_env)
                 self._proc = proc
@@ -1344,6 +1363,48 @@ class Supervisor:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         self._poll_task = None
+
+    async def _stage_corpus_key(
+        self, request: "RecordingStartRequest", capture_dir: Path
+    ) -> dict[str, str] | None:
+        """Stage the corpus key for an ENCRYPTED-stills recording's engine (search U8).
+
+        Re-resolves the capture gate (a pure config read, so it agrees with
+        ``build_engine_worker_args``); when stills are on AND encrypted, writes the
+        corpus key to a 0600 file and returns the env overlay pointing the engine at
+        it (``corpus_crypto.CORPUS_KEY_FILE_ENV``) plus ``RECORD_IMAGES_ENCRYPTED=1``.
+        The key bytes go via the FILE, never argv/config (``ps``-visible), mirroring
+        the ID-token channel. Returns ``None`` when stills are off or plaintext.
+        Fail-closed: if the key can't be staged, returns ``None`` so the engine gets
+        no key — the writer then never half-writes plaintext (U2 guard)."""
+        from screencap.capture_gate import gather_and_resolve
+
+        gate = gather_and_resolve(
+            explicit_capture_images=request.capture_images,
+            scrub_enabled=request.scrub_enabled,
+        )
+        if not gate.capture_images_encrypted:
+            return None
+        from screencap import corpus_crypto
+
+        try:
+            key = await asyncio.to_thread(corpus_crypto.load_corpus_key)
+        except Exception as exc:  # noqa: BLE001 — fail closed on any key error
+            logger.warning("daemon: could not load corpus key at recording start (%s)", type(exc).__name__)
+            return None
+        if key is None:
+            logger.warning("daemon: corpus key absent at recording start; stills will be off")
+            return None
+        from screencap import config
+
+        path = config.get_base_dir() / "run" / "corpus.key"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(corpus_crypto._write_key_file, str(path), key)
+        except OSError as exc:
+            logger.warning("daemon: could not stage corpus key file: %s", exc)
+            return None
+        return {corpus_crypto.CORPUS_KEY_FILE_ENV: str(path), "RECORD_IMAGES_ENCRYPTED": "1"}
 
     async def _stage_engine_token(
         self, request: "RecordingStartRequest", capture_dir: Path

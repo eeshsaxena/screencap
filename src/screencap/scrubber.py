@@ -2494,7 +2494,7 @@ def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
 
 
 # Files to skip during copytree and delete as safety fallback.
-_SKIP_FILES = {".upload_status.json", "viewer.html"}
+_SKIP_FILES = {".upload_status.json", "viewer.html", ".scrub_state.json"}
 _SKIP_EXTENSIONS = {".mp4", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
 
 

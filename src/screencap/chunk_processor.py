@@ -1143,7 +1143,7 @@ class ChunkProcessor:
         # budget_s / max_frames / dhash_threshold are omitted: ``index_range``
         # defaults them to the canonical ``index_core`` tuning constants, so the
         # call tracks those defaults automatically (no cross-module private import).
-        index_range(
+        result = index_range(
             self._capture_dir,
             start_ts,
             end_ts,
@@ -1154,6 +1154,21 @@ class ChunkProcessor:
             scrub=scrubber,
             corpus_key=corpus_key,
         )
+
+        # Search U8 / KTD2: once this chunk's stills have actually been
+        # secrets-scrubbed (scrub applied + the whole range processed), record the
+        # range so ``frame.read`` may serve its frames. A partial (stop/budget) bail
+        # leaves the range unmarked → frames stay refused until a later pass.
+        if scrubber is not None and result.completed_range:
+            import math
+
+            from screencap import scrub_state
+
+            scrub_state.mark_chunk_scrubbed(
+                self._capture_dir,
+                math.floor(start_ts * 1000),
+                math.ceil(end_ts * 1000),
+            )
 
     def _get_local_scrubber(self):
         """Lazily build + cache the secrets-only local scrubber (search U3).

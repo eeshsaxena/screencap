@@ -26,6 +26,7 @@ _TIMELINE_DAY_API_VERSION = 1
 # gains nullable timing fields without an API bump (mirrors the additive
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
 _FRAME_NEAREST_API_VERSION = 1
+_FRAME_READ_API_VERSION = 1
 # SCR-179 query-parser vocabulary verb. Additive (new verb) — no global
 # API_SCHEMA_VERSION bump (mirrors the `permissions`/SCR-148 additive precedent).
 _APPS_LIST_API_VERSION = 1
@@ -100,6 +101,8 @@ _MODEL_NAMES = {
     "TimelineDayResponse",
     "FrameNearestRequest",
     "FrameNearestResponse",
+    "FrameReadRequest",
+    "FrameReadResponse",
     "AppsListResponse",
     "WhoAmIResponse",
     "BackfillStartRequest",
@@ -483,6 +486,36 @@ def _load_models() -> dict[str, Any]:
 
         stem: str | None
         delta_ms: int | None
+        # Search U8 / KTD6: True when the corpus is encrypted, so an MCP client knows
+        # to call ``frame.read`` (decrypt-and-serve) instead of reading the ``.jpg``
+        # path directly. Additive/non-breaking — a stale daemon omits it (defaults
+        # False → the agent reads the path as before).
+        encrypted: bool = False
+
+    # Search U8 frame.read: size-capped so a single decrypt-and-serve cannot return
+    # an unbounded payload over the UDS.
+    _FRAME_READ_MAX_BYTES = 8_000_000  # ~8 MB — comfortably above a full-screen JPEG
+
+    class FrameReadRequest(_DaemonModel):
+        """Search U8 / KTD6 decrypt-and-serve input.
+
+        Resolves ``(recording, stem)`` — the stem an agent got from
+        ``frame.nearest`` — to the decrypted still bytes, gated ALLOW-only +
+        scrubbed-chunk-only + size-capped. ``recording`` is validated by the
+        canonical name validator in the handler (traversal-safe)."""
+
+        recording: str
+        stem: str
+
+    class FrameReadResponse(EnvelopeResponse):
+        """Decrypted still bytes for an ALLOW, scrubbed frame — base64, size-capped.
+
+        ``image_base64`` is null on any legitimate refusal (frame missing, blocked,
+        or in an unscrubbed chunk) so the verb answers a miss rather than a 500.
+        ``content_type`` is ``image/jpeg`` when bytes are present."""
+
+        image_base64: str | None
+        content_type: str | None
 
     class AppsListResponse(EnvelopeResponse):
         """SCR-179 vocabulary source for the in-app query parser.
@@ -788,6 +821,8 @@ def _load_models() -> dict[str, Any]:
         "TimelineDayResponse": TimelineDayResponse,
         "FrameNearestRequest": FrameNearestRequest,
         "FrameNearestResponse": FrameNearestResponse,
+        "FrameReadRequest": FrameReadRequest,
+        "FrameReadResponse": FrameReadResponse,
         "AppsListResponse": AppsListResponse,
         "WhoAmIResponse": WhoAmIResponse,
         "BackfillStartRequest": BackfillStartRequest,

@@ -282,7 +282,8 @@ def _wal_checkpoint(recording_dir: Path) -> None:
 # Review-only artifacts (`.video_review.mp4`) are dot-prefixed, so the dotfile
 # filter in `list_recording_files` already skips them — no entry needed here.
 _RAW_DB_NAMES = frozenset(
-    {"recording.db", "recording.db-wal", "recording.db-shm", "tasks.json"}
+    {"recording.db", "recording.db-wal", "recording.db-shm", "tasks.json",
+     ".scrub_state.json"}
 )
 _RAW_SUFFIXES = (".scrub_failed",)
 

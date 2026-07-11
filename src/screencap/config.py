@@ -232,7 +232,47 @@ def get_content_index_enabled() -> bool:
     local-only (never uploaded) and purged on retroactive disable. Requires
     scrubbing to be enabled — the secure-field skip depends on the scrub context.
     """
-    return _parse_bool_env("SCREENCAP_CONTENT_INDEX", "content_index_enabled", False)
+    env = os.environ.get("SCREENCAP_CONTENT_INDEX")
+    if env is not None:
+        return env.lower() in _BOOL_TRUE
+    cfg = _load_toml()
+    if "content_index_enabled" in cfg:
+        return bool(cfg["content_index_enabled"])
+    # Unset → the search-by-default gate (U8 / R6): ON once the corpus is encrypted
+    # (guardrails active), the disclosure was acknowledged, and consent wasn't
+    # declined. Pre-flip this is False, preserving today's opt-in behavior.
+    return search_default_on()
+
+
+def get_search_disclosure_acknowledged() -> bool:
+    """Return whether the search-by-default disclosure has been acknowledged (R6).
+
+    Written by the onboarding disclosure step (new installs) or the one-time
+    post-update disclosure (existing installs). The default-on gate never flips for
+    a user who has not seen the disclosure, so this is a hard precondition. Default
+    False."""
+    return _parse_bool_env(
+        "SCREENCAP_SEARCH_DISCLOSURE_ACKNOWLEDGED", "search_disclosure_acknowledged", False
+    )
+
+
+def set_search_disclosure_acknowledged(value: bool) -> None:
+    """Persist the search-disclosure-acknowledged marker (R6). Advisory-locked +
+    atomic; invalidates the in-process cache."""
+    from screencap.privacy_settings import _privacy_config_writer
+
+    with _privacy_config_writer() as doc:
+        doc["search_disclosure_acknowledged"] = bool(value)
+
+
+def search_default_on() -> bool:
+    """Whether search (stills + indexing) should default ON: the corpus is encrypted,
+    the disclosure was acknowledged, and consent wasn't declined (U8 / R6)."""
+    return (
+        get_corpus_encrypted()
+        and get_search_disclosure_acknowledged()
+        and not get_content_index_consent_declined()
+    )
 
 
 def _retention_section_int(cfg_key: str) -> int | None:
