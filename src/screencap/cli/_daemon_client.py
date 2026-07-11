@@ -349,6 +349,20 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/backfill.cancel", json_body={})
         )
 
+    def storage_migrate(self, target: str) -> dict[str, Any]:
+        """``POST /v0/storage.migrate`` — relocate the recordings library (SCR-228).
+
+        Synchronous same-volume move on the daemon side. On a refusal the daemon
+        returns ``ok:false`` with ``error=storage_migration_failed`` plus a
+        specific ``reason`` and human ``message`` (carried on the raised
+        ``DaemonClientError.envelope``).
+        """
+        return self._parse_ok_envelope(
+            self._request(
+                "POST", "/v0/storage.migrate", json_body={"target": target}
+            )
+        )
+
     def model_download_start(self, model_id: str | None = None) -> dict[str, Any]:
         """``POST /v0/model.download.start`` — start (or return) the model download."""
         body = {"model_id": model_id} if model_id else {}

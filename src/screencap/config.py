@@ -121,6 +121,28 @@ def get_recordings_dir() -> Path:
     return p
 
 
+def set_recordings_dir(path: Path) -> None:
+    """Persist the recordings directory to ``config.toml`` (SCR-228).
+
+    Writes the top-level ``recordings_dir`` key through the advisory-locked
+    config writer (``privacy_settings._privacy_config_writer``), so the write
+    is atomic, lost-update-safe against concurrent config mutations, and
+    invalidates the in-process cache on exit — a daemon performing a storage
+    migration observes the new path immediately without a separate
+    invalidation step. Stores the resolved absolute path as a string.
+
+    Note: ``SCREENCAP_RECORDINGS_DIR`` still takes precedence in
+    ``get_recordings_dir``; a caller that needs the config change to take
+    effect must reject an active env override first (see
+    ``screencap.storage_migration.validate_target``).
+    """
+    from screencap.privacy_settings import _privacy_config_writer
+
+    resolved = str(Path(path).resolve())
+    with _privacy_config_writer() as doc:
+        doc["recordings_dir"] = resolved
+
+
 def get_audio_default() -> bool:
     """Return default audio setting (True = on)."""
     return _parse_bool_env("SCREENCAP_AUDIO_DEFAULT", "audio_default", True)

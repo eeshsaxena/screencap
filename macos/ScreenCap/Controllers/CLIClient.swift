@@ -223,6 +223,20 @@ enum CLIClient {
         return stdoutBytes
     }
 
+    /// Like `runJSONRaw` but tolerates a non-zero exit and still returns the
+    /// stdout envelope. For commands that exit non-zero on a *handled* refusal
+    /// while still emitting a JSON `{"ok":false,"reason":…,"message":…}` body
+    /// the caller must decode to distinguish a refusal (e.g. SCR-228
+    /// `storage migrate` rejecting a cross-volume/cloud-synced target) from a
+    /// launch/crash. Mirrors `runJSONRawStdin`'s `allowNonZeroExit` rationale.
+    static func runJSONRawTolerant(_ args: [String], timeout: TimeInterval = 60) async throws -> Data {
+        assert(args.contains("--json"), "runJSONRawTolerant requires the caller to pass --json explicitly. args=\(args)")
+        let (stdoutBytes, _) = try await runOneShot(
+            args, timeout: timeout, allowNonZeroExit: true
+        )
+        return stdoutBytes
+    }
+
     /// Spawn + drain + race timeout. Returns (stdout, stderr); throws on
     /// launch failure, timeout, or non-zero exit. Shared backbone for
     /// `runJSON` and `runAwaitingExit` so the timeout / pipe-drain logic

@@ -138,6 +138,16 @@ Two **opt-in** local segmentation backends run named-task inference on-device. B
 
 - **Model-download progress events are recording-name-free.** The daemon's `model.download.*` events carry only bytes/percent + state — no path, no URL, no recording context — matching the `backfill.*` bar.
 
+## Storage-location migration (SCR-228)
+
+The user can relocate the recordings library to another folder **on the same volume** via `/v0/storage.migrate` (an atomic `os.rename`). Three properties define its boundary:
+
+- **`recording.db` stays local-only across the move.** The migration is a pure `os.rename` of the tree — no upload/GCS seam is on the path (a `@pytest.mark.privacy` test asserts the engine imports none), so the R8 local-only guarantee holds unchanged; the DB simply lives at the new local path.
+
+- **The target is rejected if it would exfiltrate the library.** Preflight rejects a **cloud-synced** target — iCloud Drive (`check_icloud_sync`, covering `~/Library/Mobile Documents` + Desktop/Documents sync) and the `~/Library/CloudStorage` File-Provider root plus classic `~/Dropbox`/`~/OneDrive`/`~/Google Drive` — resolving the path with `realpath` first so a symlink into a synced folder is still caught. It also rejects a cross-volume target, a nested target, and a move while `SCREENCAP_RECORDINGS_DIR` pins the location. (Third-party sync tools outside those vendors are a known gap — see the plan's Open Questions.)
+
+- **The new root is hardened, and the move is transactional.** The new recordings root is `chmod`'d `0o700` (the load-bearing cross-user gate — it blocks directory traversal regardless of per-file mode, so a library moved outside `~` to a world-traversable parent is not exposed) and the result is **verified**; a hardening or config-flip failure rolls the `rename` back rather than leaving a half-moved, world-readable, or split-brain state. Same-EUID callers can already move the tree directly, so the verb adds no authz surface beyond the documented boundary.
+
 ## Recording toolbar hide controls: global input + capture exclusion
 
 The recording HUD can be dismissed and restored during a recording via a global **⌘⇧H** hotkey and a bottom-edge cursor "peek," alongside the pill's Hide button and the menu-bar item. These touch two surfaces the rest of the app deliberately avoids; both are held to a narrow footprint:

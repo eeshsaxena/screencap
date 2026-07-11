@@ -142,6 +142,12 @@ def _daemon_is_busy(app: Starlette) -> bool:
     # auto-spawned daemon could idle-exit mid-upload.
     if supervisor is not None and _has_inflight_resume(supervisor):
         return True
+    # SCR-228: a storage-location migration holds the daemon. /v0/storage.migrate
+    # is deliberately NOT in _ACTIVITY_PATHS, and its handler yields the loop
+    # across an asyncio.to_thread move, so this busy check is what stops an
+    # auto-spawned daemon idle-exiting mid-migration.
+    if supervisor is not None and _is_migrating(supervisor):
+        return True
     # SCR-178 U5: a content-index backfill run is in flight. ``backfill.*`` is
     # deliberately NOT in ``_ACTIVITY_PATHS`` (status-polling must not reset the
     # idle timer), so the only thing keeping the daemon alive across a long
@@ -170,6 +176,16 @@ def _backfill_running(job: object) -> bool:
 
 def _has_inflight_resume(supervisor: object) -> bool:
     getter = getattr(supervisor, "has_inflight_resume", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 — watchdog stays robust against test doubles
+        return False
+
+
+def _is_migrating(supervisor: object) -> bool:
+    getter = getattr(supervisor, "is_migrating", None)
     if getter is None:
         return False
     try:

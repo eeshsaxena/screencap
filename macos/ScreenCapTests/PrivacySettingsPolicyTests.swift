@@ -62,4 +62,52 @@ final class PrivacySettingsPolicyTests: XCTestCase {
         )
         XCTAssertEqual(PrivacySettingsView.abbreviateHome("/Volumes/ext/recs"), "/Volumes/ext/recs")
     }
+
+    // MARK: - Storage row (SCR-228)
+
+    /// The storage row is live now — its copy must not claim the feature is
+    /// unavailable / coming soon (the old SCR-228 stub honesty gate, inverted).
+    func testStorageRowMakesNoComingSoonClaim() {
+        let copy = [
+            PrivacySettingsCopy.storageChangeHelp,
+            PrivacySettingsCopy.storageConfirmTitle,
+            PrivacySettingsCopy.storageMigratingLabel,
+            PrivacySettingsCopy.storageConfirmBody(target: "~/x"),
+        ].joined(separator: " ").lowercased()
+        XCTAssertFalse(copy.contains("coming soon"))
+        XCTAssertFalse(copy.contains("not available"))
+        XCTAssertFalse(copy.contains("scr-228"))
+    }
+
+    /// The confirmation body names the destructive/blocking implications so the
+    /// user isn't surprised: whole-library move, recording paused, same disk.
+    func testStorageConfirmBodyNamesImplications() {
+        let body = PrivacySettingsCopy.storageConfirmBody(target: "~/Movies/recs").lowercased()
+        XCTAssertTrue(body.contains("~/movies/recs"))
+        XCTAssertTrue(body.contains("paused"))
+        XCTAssertTrue(body.contains("same disk"))
+    }
+
+    /// Each machine reason code maps to a distinct, non-empty, code-free message
+    /// (the fallback used when the daemon envelope omits `message`).
+    func testMigrationFailureFallbackPerReason() {
+        let reasons = [
+            "cross_volume", "cloud_synced", "target_not_empty",
+            "not_writable", "nested", "recording_active",
+            "migration_in_progress", "env_override",
+            "same_as_source", "source_missing",
+        ]
+        var seen = Set<String>()
+        for reason in reasons {
+            let msg = PrivacySettingsPolicy.migrationFailureFallback(reason: reason)
+            XCTAssertFalse(msg.isEmpty, "empty message for \(reason)")
+            XCTAssertFalse(msg.contains("_"), "\(reason) fallback leaked a code: \(msg)")
+            seen.insert(msg)
+        }
+        XCTAssertEqual(seen.count, reasons.count, "reasons must map to distinct copy")
+        // An unknown code still yields a safe generic message.
+        XCTAssertFalse(
+            PrivacySettingsPolicy.migrationFailureFallback(reason: "bogus").isEmpty
+        )
+    }
 }

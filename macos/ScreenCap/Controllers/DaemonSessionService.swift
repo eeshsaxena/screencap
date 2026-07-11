@@ -9,6 +9,8 @@ enum DaemonErrorCode {
     static let lockContended = "lock_contended"
     static let notOwnedByDaemon = "not_owned_by_daemon"
     static let permissionRequired = "permission_required"
+    // SCR-228: recording.start refused because a storage migration holds the daemon.
+    static let migrationInProgress = "migration_in_progress"
 }
 
 /// Decodes the `missing` list off a `permission_required` error envelope (U6).
@@ -199,6 +201,12 @@ final class LiveDaemonSessionService: DaemonSessionService {
             let missing = (try? JSONDecoder().decode(PermissionRequiredPayload.self, from: rawBody))?
                 .missing ?? []
             return .permissionRequired(missing: missing)
+        case DaemonClientError.envelopeError(let code, _)
+            where code == DaemonErrorCode.migrationInProgress:
+            // SCR-228: reuse `.other` with the honest copy so no render-site
+            // change is needed — a recording can't start mid-migration.
+            return .other(localizedDescription:
+                PrivacySettingsPolicy.migrationFailureFallback(reason: "migration_in_progress"))
         default:
             return .other(localizedDescription: error.localizedDescription)
         }
