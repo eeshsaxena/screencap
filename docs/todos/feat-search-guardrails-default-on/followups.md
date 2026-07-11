@@ -25,17 +25,21 @@ crypto/gating core (U6 core) landed. Plan:
   gains the `capture_images` passthrough. Tested by `OnboardingSearchDisclosureTests`
   (copy honesty + enable/decline CLI args + presentation decision).
 
-## Remaining — needs runtime UI verification (manual QA)
-- Adopt `PresenceGatedContent(gate:)` on the actual display surfaces (search-result
-  still grid + `ScreenshotTruthPane` + any full-size still), with ONE shared
-  `PresenceGate` owned as an `@StateObject` by the shell so the grace window is shared.
-  The wrapper + gate logic are done + tested; only the view-tree threading +
-  interaction verification remain.
-- Present `SearchDisclosureView` in the onboarding wizard flow (new installs) and as a
-  one-time post-update sheet (existing installs), driven by
-  `SearchDisclosurePolicy.shouldPresent`. The model/copy/actions are done + tested;
-  inserting the step into `OnboardingStepPolicy`'s derivation + the post-update
-  presentation trigger remain.
+## Done — U6/U8 UI wiring (compiles; needs runtime QA on a signed build)
+- `PresenceGatedContent(gate:)` adopted on `ScreenshotTruthPane` (optional gate) and
+  the Recall palette results list (`RecallPaletteView` owns one shared `@StateObject`
+  `PresenceGate`, handed to the content only when `corpus_encrypted`). `settings --json`
+  + `PrivacyStatus` gained `corpus_encrypted` so the app knows when to gate.
+- `SearchDisclosureView` presented by `MainWindow` as a one-time sheet after any
+  onboarding/permission takeover clears, gated on `SearchDisclosurePolicy.shouldPresent`
+  (covers new installs post-onboarding AND existing installs — avoids touching the
+  test-pinned `OnboardingStepPolicy` derivation). Enable → `search enable`; Decline →
+  `content_index_consent_declined=true`.
+- **Remaining runtime QA (needs a signed build):** the visual/interaction behavior of
+  the gate prompt + disclosure sheet timing is unverified until the app is signable
+  (the decrypt path is dark in dev). Confirm on a signed build: gate prompts once per
+  session on opening encrypted search stills; disclosure presents once, not over a
+  takeover; decline holds.
 
 ## Remaining — U6 app provisioning (Swift) — the release blocker
 - **EMPIRICALLY CONFIRMED:** adding `keychain-access-groups` to `ScreenCap.entitlements`
