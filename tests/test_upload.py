@@ -456,6 +456,162 @@ def test_checkout_url_cmd_requires_and_forwards_tier():
     req.assert_called_once_with("cloud")
 
 
+# ---------------------------------------------------------------------------
+# Portal (manage-subscription) chain — U2. All marked privacy (KTD-8): CI runs
+# only the privacy lane, and these are Vision-free.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_request_portal_url_posts_bearer_to_default_url():
+    """request_portal_url POSTs bearer-authed to DEFAULT_PORTAL_URL, returns url."""
+    from screencap.upload import DEFAULT_PORTAL_URL, request_portal_url
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"url": "https://billing.stripe/portal_abc"}
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp) as mp:
+        url = request_portal_url()
+
+    assert url == "https://billing.stripe/portal_abc"
+    # authed_post forwards the url positionally and attaches the bearer header.
+    assert mp.call_args.args[0] == DEFAULT_PORTAL_URL
+    assert mp.call_args.kwargs["headers"]["Authorization"] == "Bearer test-id-token"
+
+
+@pytest.mark.privacy
+def test_request_portal_url_env_override(monkeypatch):
+    """SCREENCAP_PORTAL_URL overrides the endpoint (dev/test against U1 stub)."""
+    from screencap.upload import request_portal_url
+
+    monkeypatch.setenv("SCREENCAP_PORTAL_URL", "https://portal.test/session")
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"url": "https://billing.stripe/portal_env"}
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp) as mp:
+        url = request_portal_url()
+
+    assert url == "https://billing.stripe/portal_env"
+    assert mp.call_args.args[0] == "https://portal.test/session"
+
+
+@pytest.mark.privacy
+def test_request_portal_url_no_subscription_distinct_code():
+    """The backend's nothing-to-manage 4xx maps to a distinct PortalError carrying
+    code "no_subscription" and friendly copy — never the raw body (KTD-5 feed)."""
+    from screencap.upload import PortalError, request_portal_url
+
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.json.return_value = {"error": "no_subscription", "code": "no_subscription"}
+    mock_resp.text = '{"error": "no_subscription"}'
+
+    with mock.patch("screencap.upload.requests.post", return_value=mock_resp):
+        with pytest.raises(PortalError) as exc_info:
+            request_portal_url()
+
+    assert exc_info.value.code == "no_subscription"
+    # Friendly message, not the backend body echoed back.
+    assert "no_subscription" not in str(exc_info.value)
+
+
+@pytest.mark.privacy
+def test_request_portal_url_not_signed_in(monkeypatch):
+    """NotSignedIn -> sign-in-needed error with code "not_signed_in"."""
+    from screencap import auth
+    from screencap.upload import PortalError, request_portal_url
+
+    def _raise(*args, **kwargs):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.authed_post", _raise)
+
+    with pytest.raises(PortalError, match="[Ss]ign in") as exc_info:
+        request_portal_url()
+    assert exc_info.value.code == "not_signed_in"
+
+
+@pytest.mark.privacy
+def test_request_portal_url_connection_error_and_timeout():
+    """ConnectionError / Timeout -> friendly retryable errors, code "network"."""
+    import requests as req
+
+    from screencap.upload import PortalError, request_portal_url
+
+    with mock.patch("screencap.upload.requests.post", side_effect=req.ConnectionError):
+        with pytest.raises(PortalError, match="unavailable") as exc_info:
+            request_portal_url()
+    assert exc_info.value.code == "network"
+
+    with mock.patch("screencap.upload.requests.post", side_effect=req.Timeout):
+        with pytest.raises(PortalError, match="timed out") as exc_info:
+            request_portal_url()
+    assert exc_info.value.code == "network"
+
+
+@pytest.mark.privacy
+def test_portal_url_cmd_happy_path_json():
+    """CLI happy path: exit 0, envelope has ok:true, schema_version, url."""
+    runner = CliRunner()
+
+    with mock.patch(
+        "screencap.upload.request_portal_url", return_value="https://billing.stripe/p1"
+    ) as req:
+        result = runner.invoke(cli, ["portal-url", "--json"])
+
+    assert result.exit_code == 0
+    req.assert_called_once_with()
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is True
+    assert envelope["schema_version"] >= 2
+    assert envelope["url"] == "https://billing.stripe/p1"
+
+
+@pytest.mark.privacy
+def test_portal_url_cmd_error_envelope_on_stdout():
+    """CLI error path: exit 1 with ok:false + error + code on stdout — the
+    envelope the app decodes under allowNonZeroExit (KTD-2)."""
+    from screencap.upload import PortalError
+
+    runner = CliRunner()
+
+    with mock.patch(
+        "screencap.upload.request_portal_url",
+        side_effect=PortalError("Subscription service timed out. Try again later.", "network"),
+    ):
+        result = runner.invoke(cli, ["portal-url", "--json"])
+
+    assert result.exit_code == 1
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert "schema_version" in envelope
+    assert "timed out" in envelope["error"]
+    assert envelope["code"] == "network"
+
+
+@pytest.mark.privacy
+def test_portal_url_cmd_envelope_carries_no_subscription_code():
+    """The envelope's machine-readable code survives to stdout for the backend's
+    nothing-to-manage 4xx — pins the cross-boundary contract Swift maps on (KTD-5)."""
+    from screencap.upload import PortalError
+
+    runner = CliRunner()
+
+    with mock.patch(
+        "screencap.upload.request_portal_url",
+        side_effect=PortalError("No subscription found for this account yet.", "no_subscription"),
+    ):
+        result = runner.invoke(cli, ["portal-url", "--json"])
+
+    assert result.exit_code == 1
+    envelope = json.loads(result.output)
+    assert envelope["ok"] is False
+    assert envelope["code"] == "no_subscription"
+
+
 def test_request_signed_urls_connection_error():
     from screencap.upload import request_signed_urls
     import pytest
