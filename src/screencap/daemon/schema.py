@@ -238,6 +238,10 @@ def _load_models() -> dict[str, Any]:
         # Phase 2 U2: server-derived provenance classification.
         # Populated for daemon-owned sessions; None otherwise.
         started_by: str | None = None
+        # SCR-218 U5: confirmed mic mute state. Absent until the first confirmed
+        # mute event (additive, back-compat) — a missing value means unmuted, so
+        # a stale daemon and a pre-first-mute recording both read as audio-on.
+        muted: bool = False
         cursor: int
 
     class RecordingStartRequest(_DaemonModel):

@@ -72,6 +72,13 @@ EVENT_LOCK_CONTENDED = "lock_contended"
 EVENT_CHUNK_FINALIZED = "chunk_finalized"
 EVENT_RECORDING_FINALIZED = "recording_finalized"
 EVENT_DISK_FULL = "disk_full"
+# SCR-218 mid-recording mic mute. Emitted by the audio subsystem AFTER the mic
+# stream actually stops/starts (KTD4 confirmed-state), so the daemon's session
+# state / snapshot and the app reflect capture that genuinely changed — never a
+# request that might have failed. Carry ``muted`` for symmetry, though the event
+# type already implies it.
+EVENT_AUDIO_MUTED = "audio_muted"
+EVENT_AUDIO_UNMUTED = "audio_unmuted"
 EVENT_PERMISSION_LOST = "permission_lost"
 # Start-time permission block (SCR-142). Re-emitted by the ``screencap start``
 # daemon client when the daemon's pre-spawn permission gate rejects the start
@@ -211,6 +218,8 @@ __all__ = [
     "EVENT_CHUNK_FINALIZED",
     "EVENT_RECORDING_FINALIZED",
     "EVENT_DISK_FULL",
+    "EVENT_AUDIO_MUTED",
+    "EVENT_AUDIO_UNMUTED",
     "EVENT_PERMISSION_LOST",
     "EVENT_PERMISSION_REQUIRED",
     "EVENT_CAPTURE_UNHEALTHY",

@@ -515,7 +515,11 @@ async def session_snapshot(request: Request) -> JSONResponse:
     if daemon_owned and supervisor is not None:
         current = supervisor.current_session()
         if current:
-            for key in ("engine_pid", "frames_written", "started_by"):
+            # SCR-218 U5: ``muted`` rides the same overlay. It's absent until the
+            # first confirmed mute event, so an unmuted (or pre-first-mute)
+            # recording omits it and the app defaults to unmuted — the additive,
+            # back-compatible contract mirrored on the app decoder side.
+            for key in ("engine_pid", "frames_written", "started_by", "muted"):
                 if current.get(key) is not None:
                     payload[key] = current[key]
     elif not daemon_owned:

@@ -1190,6 +1190,13 @@ class Supervisor:
             frames = event.get("frames_written", event.get("frame_count"))
             if isinstance(frames, int):
                 self._session_state["frames_written"] = frames
+        # SCR-218 U5: the pump is the SOLE writer of mute state. The engine emits
+        # these only after the mic stream actually toggles (KTD4), so the
+        # snapshot / events reflect confirmed capture, never the mute request.
+        elif event_type == _stderr_events.EVENT_AUDIO_MUTED:
+            self._session_state["muted"] = True
+        elif event_type == _stderr_events.EVENT_AUDIO_UNMUTED:
+            self._session_state["muted"] = False
 
     async def _wait_on_subscription(
         self,
