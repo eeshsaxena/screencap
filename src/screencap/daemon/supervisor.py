@@ -26,6 +26,7 @@ from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus, _Subscri
 from screencap.pidfile import CLAIMANT_DAEMON
 
 if TYPE_CHECKING:
+    from screencap.capture_gate import CaptureGateResult
     from screencap.daemon.schema import RecordingStartRequest
     from screencap.terminal_stage import TerminalResult
 
@@ -197,6 +198,7 @@ def build_engine_worker_args(
     *,
     name: str,
     capture_dir: Path,
+    gate: "CaptureGateResult | None" = None,
 ) -> dict[str, Any]:
     """Build the arg dict the engine worker is dispatched with.
 
@@ -205,11 +207,32 @@ def build_engine_worker_args(
     created downstream by the engine worker command itself, so they are
     intentionally absent here. Shared with the dispatch integration test so the
     arg shape stays in lockstep with production.
+
+    ``gate`` is the ONE capture-gate resolution for this spawn: ``Supervisor.spawn``
+    resolves it once and threads the SAME result into both this function (the
+    on/off decision) and ``_stage_corpus_key`` (the key/encryption decision), so the
+    two can never diverge and leave stills on with encryption off (plaintext). When
+    called without a gate (direct test / non-spawn callers) it resolves its own.
     """
     args = request.model_dump()
     args["name"] = name
     args["output_dir"] = str(capture_dir)
     args["capture_dir_hint"] = str(capture_dir)
+    # Search U8 / KTD5: resolve the stills-capture gate (the defaults-resolution
+    # seam). An unset ``capture_images`` follows the default-on readiness gate; an
+    # explicit true is clamped OFF when encryption is required but not ready; an
+    # explicit false always wins. The encryption flag itself rides the engine env
+    # (see ``Supervisor._stage_corpus_key``), so only the on/off decision lands here.
+    if gate is None:
+        from screencap.capture_gate import gather_and_resolve
+
+        gate = gather_and_resolve(
+            explicit_capture_images=request.capture_images,
+            scrub_enabled=request.scrub_enabled,
+        )
+    if gate.reason != "explicit_true":
+        logger.info("capture gate: images=%s (%s)", gate.capture_images, gate.reason)
+    args["capture_images"] = gate.capture_images
     return args
 
 
@@ -264,6 +287,7 @@ class Supervisor:
         # engine can't read the Keychain). Static — no refresh loop — and unlinked
         # in _reset_state so the master key never outlives the recording.
         self._engine_cloud_key_file: Path | None = None
+        self._corpus_key_file: Path | None = None
         # SCR-116: the uid the staged token belonged to. The re-mint loop refuses
         # to restage a token whose uid differs (a mid-recording account switch),
         # so every chunk of this recording stays in the original namespace.
@@ -395,7 +419,17 @@ class Supervisor:
                 started_by=started_by,
             )
 
-            args = self._worker_args(request, name=name, capture_dir=capture_dir)
+            # Search U8 / KTD5: resolve the capture gate ONCE and thread the same
+            # result into the args (on/off) and _stage_corpus_key (key/encryption),
+            # so the two decisions can never diverge (a between-reads key flip must
+            # not yield stills-on + encryption-off = plaintext).
+            from screencap.capture_gate import gather_and_resolve
+
+            gate = gather_and_resolve(
+                explicit_capture_images=request.capture_images,
+                scrub_enabled=request.scrub_enabled,
+            )
+            args = self._worker_args(request, name=name, capture_dir=capture_dir, gate=gate)
             encoded_args = base64.b64encode(
                 json.dumps(args, separators=(",", ":")).encode("utf-8")
             ).decode("ascii")
@@ -409,6 +443,25 @@ class Supervisor:
                 key_env = await self._stage_engine_cloud_key(request, capture_dir)
                 if key_env:
                     extra_env = {**(extra_env or {}), **key_env}
+                # Search U8: deliver the corpus key (via file) + RECORD_IMAGES_ENCRYPTED
+                # to the engine when the gate resolved encrypted stills ON.
+                corpus_env = await self._stage_corpus_key(request, capture_dir, gate=gate)
+                if corpus_env:
+                    extra_env = {**(extra_env or {}), **corpus_env}
+                elif gate.capture_images_encrypted:
+                    # Encryption was REQUIRED but the key could not be staged. The
+                    # engine's U2 guard only blocks plaintext when RECORD_IMAGES_ENCRYPTED
+                    # is set; without it, stills-on would write PLAINTEXT. Clamp stills
+                    # off and re-encode before the spawn so a staging failure can never
+                    # fall through to plaintext capture (never-plaintext invariant).
+                    logger.warning(
+                        "daemon: corpus key staging failed while encryption required; "
+                        "clamping stills OFF for this recording (never plaintext)"
+                    )
+                    args["capture_images"] = False
+                    encoded_args = base64.b64encode(
+                        json.dumps(args, separators=(",", ":")).encode("utf-8")
+                    ).decode("ascii")
                 command = self._engine_command_factory(encoded_args)
                 proc = _PopenEngineProcess(command, extra_env=extra_env)
                 self._proc = proc
@@ -905,6 +958,7 @@ class Supervisor:
         finally:
             self._prune_stale_engine_token_files()
             self._prune_stale_engine_cloud_key_files()
+            self._prune_stale_corpus_key_files()
             self._recovering = False
             # SCR-125 U6 F3 startup sweep — resume cloud recordings left
             # incomplete by a prior daemon/engine crash. Detached (tracked) so it
@@ -964,6 +1018,32 @@ class Supervisor:
             except OSError as exc:
                 logger.warning(
                     "daemon: could not remove stale cloud-key file %s: %s", path, exc
+                )
+
+    @staticmethod
+    def _prune_stale_corpus_key_files() -> None:
+        """Delete any leftover ``corpus-key-*`` files at daemon startup.
+
+        A hard crash / SIGKILL runs no Python teardown, so a 0600 file holding the
+        corpus key can survive in the run dir. At daemon startup no live recording
+        can legitimately own one (the engine that read it is gone), so unlink every
+        survivor — the corpus key is Keychain-entitlement protected and a lingering
+        plaintext copy would let any same-EUID process decrypt the corpus. Best-effort.
+        """
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        try:
+            stale = list(run_dir.glob("corpus-key-*"))
+        except OSError as exc:
+            logger.warning("daemon: could not scan for stale corpus key files: %s", exc)
+            return
+        for path in stale:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "daemon: could not remove stale corpus key file %s: %s", path, exc
                 )
 
     async def _stderr_pump(self, proc: _PopenEngineProcess) -> None:
@@ -1162,8 +1242,11 @@ class Supervisor:
         *,
         name: str,
         capture_dir: Path,
+        gate: "CaptureGateResult | None" = None,
     ) -> dict[str, Any]:
-        return build_engine_worker_args(request, name=name, capture_dir=capture_dir)
+        return build_engine_worker_args(
+            request, name=name, capture_dir=capture_dir, gate=gate
+        )
 
     def _owner_payload(self) -> dict[str, Any]:
         from screencap import pidfile
@@ -1344,6 +1427,72 @@ class Supervisor:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         self._poll_task = None
+
+    async def _stage_corpus_key(
+        self,
+        request: "RecordingStartRequest",
+        capture_dir: Path,
+        *,
+        gate: "CaptureGateResult",
+    ) -> dict[str, str] | None:
+        """Stage the corpus key for an ENCRYPTED-stills recording's engine (search U8).
+
+        Consumes the SAME ``gate`` ``spawn`` resolved for ``build_engine_worker_args``
+        (single-resolution invariant — the on/off and encryption decisions can't
+        diverge). When stills are on AND encrypted, writes the corpus key to a
+        per-recording 0600 file and returns the env overlay pointing the engine at it
+        (``corpus_crypto.CORPUS_KEY_FILE_ENV``) plus ``RECORD_IMAGES_ENCRYPTED=1``.
+        The key bytes go via the FILE, never argv/config (``ps``-visible), mirroring
+        the ID-token and cloud-key channels.
+
+        The staged file is tracked (``self._corpus_key_file``), unlinked on teardown
+        (``_cleanup_corpus_key_file``) and pruned at daemon startup
+        (``_prune_stale_corpus_key_files``) — the corpus key is Keychain-entitlement
+        protected, so a persistent plaintext 0600 copy must not outlive the recording
+        (it would let any same-EUID process decrypt the corpus, undoing that bar).
+
+        Returns ``None`` when stills are off or plaintext. When encryption was
+        required but the key can't be staged this returns ``None`` too; ``spawn`` then
+        clamps stills OFF so the engine never captures plaintext."""
+        if not gate.capture_images_encrypted:
+            return None
+        from screencap import corpus_crypto
+
+        try:
+            key = await asyncio.to_thread(corpus_crypto.load_corpus_key)
+        except Exception as exc:  # noqa: BLE001 — fail closed on any key error
+            logger.warning("daemon: could not load corpus key at recording start (%s)", type(exc).__name__)
+            return None
+        if key is None:
+            logger.warning("daemon: corpus key absent at recording start; stills will be off")
+            return None
+
+        path = self._corpus_key_path(capture_dir)
+        try:
+            await asyncio.to_thread(corpus_crypto.write_key_file, str(path), key)
+        except OSError as exc:
+            logger.warning("daemon: could not stage corpus key file: %s", exc)
+            return None
+        self._corpus_key_file = path
+        return {corpus_crypto.CORPUS_KEY_FILE_ENV: str(path), "RECORD_IMAGES_ENCRYPTED": "1"}
+
+    @staticmethod
+    def _corpus_key_path(capture_dir: Path) -> Path:
+        from screencap.config import get_base_dir
+
+        run_dir = get_base_dir() / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir / f"corpus-key-{capture_dir.name}.key"
+
+    def _cleanup_corpus_key_file(self) -> None:
+        path = self._corpus_key_file
+        self._corpus_key_file = None
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("daemon: could not remove corpus key file %s: %s", path, exc)
 
     async def _stage_engine_token(
         self, request: "RecordingStartRequest", capture_dir: Path
@@ -1608,6 +1757,7 @@ class Supervisor:
         self._token_refresh_task = None
         self._cleanup_engine_token_file()
         self._cleanup_engine_cloud_key_file()
+        self._cleanup_corpus_key_file()
         self._engine_token_uid = None
         self._finalized_seen = False
         self._stopping = False

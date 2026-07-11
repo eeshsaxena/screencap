@@ -138,6 +138,15 @@ struct MainWindow: View {
     /// window-scoped ⌘⇧F (KTD-13), the Library/Journal search pills, and the
     /// menu-bar "Search…" item (via notification).
     @State private var showingPalette = false
+    /// Search U8 (R6): the one-time search-by-default disclosure. Presented as a
+    /// sheet on the shell (after any onboarding/permission takeover clears) when the
+    /// corpus is not yet encrypted and consent wasn't declined — covering both new
+    /// installs (post-onboarding) and existing installs (which never re-run
+    /// onboarding). Evaluated at most once per window session.
+    @State private var showingSearchDisclosure = false
+    @State private var didEvaluateSearchDisclosure = false
+    @State private var searchRetentionDays = 30
+    @StateObject private var searchDisclosure = SearchDisclosureController()
 
     var body: some View {
         Group {
@@ -150,6 +159,9 @@ struct MainWindow: View {
                     onboarding = nil
                     route = destination == .appRules ? .appRules : .library
                     updatePermissionSetupPresentation()
+                    // Search U8: new installs see the disclosure right after
+                    // onboarding completes (existing installs get it on plain launch).
+                    Task { await maybePresentSearchDisclosure() }
                 }
             } else if showingPermissionSetup {
                 // U14: permission repair reuses the onboarding permissions
@@ -166,9 +178,17 @@ struct MainWindow: View {
                     .environmentObject(recorder)
             }
         }
+        .sheet(isPresented: $showingSearchDisclosure) {
+            SearchDisclosureView(
+                controller: searchDisclosure,
+                retentionDays: searchRetentionDays,
+                onResolved: { showingSearchDisclosure = false }
+            )
+        }
         .onAppear {
             decideOnboardingTakeover()
             updatePermissionSetupPresentation()
+            Task { await maybePresentSearchDisclosure() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .screenCapRecordingDidEnd)) { _ in
             // U7: a recording ended and the main window was restored — land on
@@ -329,6 +349,31 @@ struct MainWindow: View {
             try? markers.markCompleted()
         case .none:
             break
+        }
+    }
+
+    /// Search U8 (R6): present the one-time search-by-default disclosure when the
+    /// shell owns the window and the corpus is not yet encrypted / not declined.
+    /// Evaluated at most once per window session; heavily gated so it never fights
+    /// the onboarding / permission takeover or another sheet, and fails safe (no
+    /// present) when the daemon settings are unavailable.
+    private func maybePresentSearchDisclosure() async {
+        guard !didEvaluateSearchDisclosure,
+              onboarding == nil,
+              !showingPermissionSetup,
+              recorder.matrixDisclosure == nil else { return }
+        didEvaluateSearchDisclosure = true
+        do {
+            let data = try await CLIClient.runJSONRaw(["settings", "--json"])
+            let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
+            let acknowledged = env.settings.corpusEncrypted ?? false
+            let declined = env.settings.contentIndexConsentDeclined ?? false
+            if SearchDisclosurePolicy.shouldPresent(acknowledged: acknowledged, declined: declined) {
+                showingSearchDisclosure = true
+            }
+        } catch {
+            // Daemon/settings unavailable → don't present; allow a retry next launch.
+            didEvaluateSearchDisclosure = false
         }
     }
 

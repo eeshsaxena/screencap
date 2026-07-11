@@ -478,7 +478,12 @@ def start(
 
     # Capture flags: default to True for images and window data (opt-out)
     capture_video = False if no_video else None  # None = use upstream default (True)
-    capture_images = False if no_images else True  # Default ON (overrides upstream False)
+    # Search U8: route the CLI's stills default through the daemon's readiness gate
+    # instead of forcing True — ``None`` (unset) lets ``build_engine_worker_args``
+    # resolve default-on iff the guardrails are ready (encrypted + disclosure +
+    # retention), so a headless CLI no longer accumulates plaintext, never-evicted
+    # stills. ``--no-images`` stays an explicit opt-out.
+    capture_images = False if no_images else None
     capture_window_data = False if no_window_data else None  # None = upstream default (True)
     # First-run privacy setup detection
     from screencap.privacy_settings import (
@@ -2942,6 +2947,7 @@ def settings(ctx, set_pair, as_json):
         get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
+        get_corpus_encrypted,
         get_recordings_dir,
         get_rest_threshold,
         get_show_on_website,
@@ -3025,6 +3031,9 @@ def settings(ctx, set_pair, as_json):
         "content_index_consent_declined": bool(get_content_index_consent_declined()),
         "content_index_backfill_declined": bool(get_content_index_backfill_declined()),
         "cloud_e2ee_enabled": bool(get_cloud_e2ee_enabled()),
+        # Search U8: whether the recall corpus is encrypted (guardrails on) — the app
+        # gates present-user auth on corpus-still display only when this is true.
+        "corpus_encrypted": bool(get_corpus_encrypted()),
         "privacy": _build_privacy_settings_block(),
     }
 
@@ -4410,6 +4419,65 @@ def backfill_cancel_cmd() -> None:
     else:
         console.print(f"[#22d3ee]Backfill {escape(state)}.[/#22d3ee]")
     console.print(f"  {_backfill_snapshot_line(snapshot)}")
+
+
+@cli.group("search")
+def search_group() -> None:
+    """On-device recording search (search-by-default guardrails).
+
+    ``enable`` acknowledges the disclosure and turns search on safely: it encrypts
+    the existing recall corpus (stills + content index) and flips the default so new
+    recordings are captured, secrets-scrubbed, retention-bounded, and searchable.
+    ``status`` prints the current gate state. Headless companion to the macOS app's
+    onboarding disclosure step.
+    """
+
+
+@search_group.command("enable")
+def search_enable_cmd() -> None:
+    """Acknowledge the disclosure and enable encrypted on-device search."""
+    from rich.console import Console
+
+    from screencap import config, corpus_migrate
+
+    console = Console()
+    console.print("Enabling on-device search — encrypting your existing recordings...")
+    config.set_search_disclosure_acknowledged(True)
+    try:
+        report = corpus_migrate.flip_corpus_to_encrypted()
+    except Exception as exc:  # noqa: BLE001 — surface the failure with a clean exit
+        console.print(f"[red]Could not enable search: {exc}[/red]")
+        raise SystemExit(1)
+    console.print(
+        f"[green]Search enabled.[/green] Encrypted {report.stills_encrypted} still(s) "
+        f"across {report.recordings_scanned} recording(s); index rekeyed: "
+        f"{report.index_rekeyed}. New recordings are searchable and secrets-scrubbed."
+    )
+
+
+@search_group.command("status")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def search_status_cmd(as_json: bool) -> None:
+    """Show the search-by-default gate state."""
+    import json as _json
+
+    from rich.console import Console
+
+    from screencap import config
+
+    state = {
+        "corpus_encrypted": config.get_corpus_encrypted(),
+        "disclosure_acknowledged": config.get_search_disclosure_acknowledged(),
+        "consent_declined": config.get_content_index_consent_declined(),
+        "content_index_enabled": config.get_content_index_enabled(),
+        "screenshot_retention_days": config.get_screenshot_retention_days(),
+    }
+    console = Console()
+    if as_json:
+        console.print_json(_json.dumps(state))
+        return
+    for key, value in state.items():
+        console.print(f"{key}: {value}")
 
 
 @cli.group("storage")

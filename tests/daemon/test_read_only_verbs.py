@@ -1374,11 +1374,14 @@ async def test_frame_nearest_response_is_pointer_only(
     assert ".jpg" not in response.text
     assert "screenshots" not in response.text
     assert "/" not in payload["stem"]
-    # Structural lock: exactly the envelope keys + {stem, delta_ms}, nothing else.
+    # Structural lock: exactly the envelope keys + {stem, delta_ms, encrypted}.
+    # `encrypted` (KTD6) is a bool storage hint, not a path/bytes, so it stays
+    # inside the pointer-only contract; here the corpus is unencrypted -> False.
     assert set(payload) == {
         "ok", "schema_version", "daemon_version", "api_schema_version",
-        "stem", "delta_ms",
+        "stem", "delta_ms", "encrypted",
     }
+    assert payload["encrypted"] is False
 
 
 @pytest.mark.asyncio

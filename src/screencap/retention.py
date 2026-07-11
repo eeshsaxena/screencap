@@ -85,7 +85,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "EvictionReport",
+    "ScreenshotEvictionReport",
     "evict_recording",
+    "evict_screenshots",
 ]
 
 
@@ -108,6 +110,25 @@ class EvictionReport:
     masked_copies_evicted: list[int] = field(default_factory=list)
     refused: list[int] = field(default_factory=list)
     bytes_freed: int = 0
+    # Screenshot retention (search U5): the count + bytes of stills trimmed from
+    # the ``screenshots/`` dir by the age/size bound this pass. Independent of the
+    # chunk eviction above; ``screenshot_bytes_freed`` is also folded into
+    # ``bytes_freed``.
+    screenshots_evicted: int = 0
+    screenshot_bytes_freed: int = 0
+
+
+@dataclass
+class ScreenshotEvictionReport:
+    """Outcome of one :func:`evict_screenshots` pass.
+
+    ``evicted`` — the still filenames unlinked. ``bytes_freed`` — total bytes.
+    ``index_rows_purged`` — content-index rows removed for the evicted frames.
+    """
+
+    evicted: list[str] = field(default_factory=list)
+    bytes_freed: int = 0
+    index_rows_purged: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +177,211 @@ def _unlink_chunk(recording_dir: Path, idx: int) -> int:
         except OSError as exc:  # noqa: PERF203
             logger.warning("retention: failed to unlink %s: %s", p.name, exc)
     return freed
+
+
+# ---------------------------------------------------------------------------
+# Screenshot retention (search U5 / R2) — an age/size bound on the screenshots
+# dir, independent of chunk eviction and of the chunk retention policy.
+# ---------------------------------------------------------------------------
+
+
+def _still_timestamp(path: Path) -> float | None:
+    """Parse the epoch-seconds capture time from a still filename ``<ts>.jpg[.enc]``.
+
+    Stills are named ``f"{event.timestamp:.6f}.jpg"`` (plus ``.enc`` when
+    encrypted). Returns None for any name that does not parse (skipped, never
+    evicted)."""
+    from screencap import still_io
+
+    name = still_io.logical_still_name(path)  # strips a trailing '.enc'
+    if not name.endswith(".jpg"):
+        return None
+    try:
+        return float(name[:-4])
+    except ValueError:
+        return None
+
+
+def _last_indexed_ts(recording: str, store: "object | None" = None) -> float | None:
+    """The newest indexed frame time (epoch seconds) for ``recording``, or None.
+
+    The "don't race the indexer" high-water mark for the fast path; None when the
+    index is absent/empty (no indexer constraint). ``store`` is an already-open
+    ``ContentIndex`` to reuse across a batch (the daemon sweep opens ONE for the
+    whole run instead of one per recording); when None, opens+closes its own."""
+    try:
+        from screencap.content_index import ContentIndex, default_index_path
+
+        if store is not None:
+            ms = store.max_indexed_timestamp_ms(recording)
+            return ms / 1000.0 if ms is not None else None
+        path = default_index_path()
+        if not path.exists():
+            return None
+        with ContentIndex(path) as own:
+            ms = own.max_indexed_timestamp_ms(recording)
+        return ms / 1000.0 if ms is not None else None
+    except Exception:  # noqa: BLE001 — the guard is best-effort; fall back to no constraint
+        return None
+
+
+def evict_screenshots(
+    recording_dir: Path,
+    *,
+    now: float | None = None,
+    days: int | None = None,
+    size_cap_mb: int | None = None,
+    last_indexed_ts: float | None = None,
+    purge_index: bool = True,
+) -> ScreenshotEvictionReport:
+    """Evict old stills from ``recording_dir/screenshots`` by age and/or size cap.
+
+    Independent of chunk eviction and of the chunk retention policy (a
+    ``keep_forever`` recording still trims stills once a bound is set — search R2).
+    ``days`` / ``size_cap_mb`` default to the configured bounds; ``0`` on an axis =
+    unbounded there. ``last_indexed_ts`` (epoch seconds) is the "don't race the
+    indexer" high-water mark — a still newer than it is never evicted (it may still
+    be OCR'd); ``None`` applies no such constraint (converged recordings). Evicted
+    frames' content-index rows are purged too (same sensitivity class — retention
+    forgets the frame entirely). Fail-open: an unlink/purge hiccup is logged, never
+    raised."""
+    import time
+
+    from screencap import config
+
+    report = ScreenshotEvictionReport()
+    recording_dir = Path(recording_dir)
+    screenshots_dir = recording_dir / "screenshots"
+    if not screenshots_dir.is_dir():
+        return report
+
+    now = time.time() if now is None else now
+    days = config.get_screenshot_retention_days() if days is None else days
+    size_cap_mb = config.get_screenshot_size_cap_mb() if size_cap_mb is None else size_cap_mb
+    if days <= 0 and size_cap_mb <= 0:
+        return report  # unbounded on both axes → today's behavior (nothing evicted)
+
+    try:
+        entries = list(screenshots_dir.iterdir())
+    except OSError:
+        return report
+
+    stills: list[tuple[float, Path, int]] = []
+    for p in entries:
+        if not (p.name.endswith(".jpg") or p.name.endswith(".jpg.enc")):
+            continue
+        ts = _still_timestamp(p)
+        if ts is None:
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        stills.append((ts, p, size))
+    if not stills:
+        return report
+    stills.sort(key=lambda s: s[0])  # oldest first
+
+    def _protected(ts: float) -> bool:
+        return last_indexed_ts is not None and ts > last_indexed_ts
+
+    selected: list[tuple[float, Path, int]] = []
+    selected_paths: set[Path] = set()
+
+    if days > 0:
+        cutoff = now - days * 86400
+        for ts, p, size in stills:
+            if ts < cutoff and not _protected(ts):
+                selected.append((ts, p, size))
+                selected_paths.add(p)
+
+    if size_cap_mb > 0:
+        cap_bytes = size_cap_mb * 1024 * 1024
+        remaining = sum(s[2] for s in stills) - sum(s[2] for s in selected)
+        for ts, p, size in stills:
+            if remaining <= cap_bytes:
+                break
+            if p in selected_paths or _protected(ts):
+                continue
+            selected.append((ts, p, size))
+            selected_paths.add(p)
+            remaining -= size
+
+    if not selected:
+        return report
+
+    evicted_ts: list[float] = []
+    for ts, p, size in selected:
+        try:
+            p.unlink()
+        except OSError as exc:
+            logger.warning("retention: failed to unlink still %s: %s", p.name, exc)
+            continue
+        report.evicted.append(p.name)
+        report.bytes_freed += size
+        evicted_ts.append(ts)
+
+    if evicted_ts and purge_index:
+        try:
+            _purge_screenshot_index_rows(
+                recording_dir.name, min(evicted_ts), max(evicted_ts), report
+            )
+        except Exception:  # noqa: BLE001 — purge is best-effort; eviction already happened
+            logger.warning(
+                "retention: content-index purge after screenshot eviction failed",
+                exc_info=True,
+            )
+    return report
+
+
+def _purge_screenshot_index_rows(
+    recording: str, min_ts: float, max_ts: float, report: ScreenshotEvictionReport
+) -> None:
+    """Purge the evicted frames' content-index rows over ``[min_ts, max_ts]`` (secs).
+
+    Mirrors ``scrub_worker._purge_content_index_intervals``: never creates the store
+    if indexing was never used, takes the shared write lock so it can't interleave
+    with a concurrent inline index write, and widens the ms window to catch a frame
+    whose ``round(ts*1000)`` landed on a boundary."""
+    import math
+
+    from screencap.content_index import default_index_path
+
+    path = default_index_path()
+    if not path.exists():
+        return
+    from screencap.content_index import ContentIndex, content_index_write_lock
+
+    start_ms = math.floor(min_ts * 1000)
+    end_ms = math.ceil(max_ts * 1000) + 1  # inclusive of the newest evicted frame
+    with content_index_write_lock(), ContentIndex(path) as store:
+        if not store.available:
+            return
+        report.index_rows_purged += store.delete_recording_interval(recording, start_ms, end_ms)
+
+
+def _evict_screenshots_in_pass(recording_dir: Path, report: EvictionReport, *, now: float) -> None:
+    """Fold a screenshot-retention pass into an in-progress :func:`evict_recording`.
+
+    Resolves the configured bound; a still-unbounded config is a no-op. Uses the
+    live content-index high-water mark so the during-recording fast path never
+    evicts a frame the indexer has not reached yet."""
+    from screencap import config
+
+    days = config.get_screenshot_retention_days()
+    size_cap_mb = config.get_screenshot_size_cap_mb()
+    if days <= 0 and size_cap_mb <= 0:
+        return
+    sub = evict_screenshots(
+        recording_dir,
+        now=now,
+        days=days,
+        size_cap_mb=size_cap_mb,
+        last_indexed_ts=_last_indexed_ts(recording_dir.name),
+    )
+    report.screenshots_evicted += len(sub.evicted)
+    report.screenshot_bytes_freed += sub.bytes_freed
+    report.bytes_freed += sub.bytes_freed
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +619,11 @@ def evict_recording(
     _evict_masked_cloud_copies(
         recording_dir, ledger, report, policy=policy, confirm=confirm,
     )
+
+    # --- 2.5. Screenshot retention (search U5 / R2): an independent age/size bound
+    #          on the screenshots dir, run under EVERY chunk policy (incl.
+    #          keep_forever — a kept-forever recording still trims old stills). ---
+    _evict_screenshots_in_pass(recording_dir, report, now=now)
 
     # --- 3. Select & evict per the configured policy for the LOCAL rich copy. ---
     if policy.retention_policy == RetentionPolicy.KEEP_FOREVER:

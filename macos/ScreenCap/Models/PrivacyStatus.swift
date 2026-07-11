@@ -38,6 +38,10 @@ struct SettingsEnvelope: Decodable {
         /// `contentIndexConsentDeclined`: the user may consent to forward-only
         /// indexing yet skip the historical backfill.
         let contentIndexBackfillDeclined: Bool?
+        /// Search U8: whether the recall corpus is encrypted (guardrails on). The
+        /// app gates present-user auth on corpus-still display only when true.
+        /// Optional/tolerant — older daemons omit it (→ ungated).
+        let corpusEncrypted: Bool?
         /// SCR-174: recording chunk length (seconds) — used to estimate a
         /// transcript chunk's wall-clock position before snapping to a real
         /// timeline event.
@@ -59,6 +63,7 @@ struct SettingsEnvelope: Decodable {
             case contentIndexEnabled = "content_index_enabled"
             case contentIndexConsentDeclined = "content_index_consent_declined"
             case contentIndexBackfillDeclined = "content_index_backfill_declined"
+            case corpusEncrypted = "corpus_encrypted"
             case chunkDuration = "chunk_duration"
             case audioDefault = "audio_default"
             case uploadDefault = "upload_default"

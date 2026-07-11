@@ -24,6 +24,7 @@ _RECALL_POST = [
     ("/v0/transcript.search", {"query": "x"}),
     ("/v0/timeline.query", {}),
     ("/v0/frame.nearest", {"recording": "rec", "timestamp_ms": 0}),
+    ("/v0/frame.read", {"recording": "rec", "stem": "0"}),
 ]
 _RECALL_GET = ["/v0/apps.list"]
 

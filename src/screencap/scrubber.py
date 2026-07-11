@@ -1681,6 +1681,58 @@ def _active_window_roi(
     return (x1, roi_y, roi_w, roi_h)
 
 
+def _source_recording_name(screenshots_dir: Path) -> str:
+    """The SOURCE recording name for a stills dir's corpus AAD (search U7).
+
+    The stills may live under ``<name>-scrubbed/screenshots`` (the cloud copy) or
+    ``<name>/chunk_N/screenshots`` (the live chunk copy) or ``<name>/screenshots``.
+    In every case the ciphertext AAD was bound to the ORIGINAL recording ``<name>``,
+    so climb to the recording root and strip any ``-scrubbed`` suffix."""
+    parent = Path(screenshots_dir).parent
+    if parent.name.startswith("chunk_"):
+        parent = parent.parent
+    name = parent.name
+    if name.endswith("-scrubbed"):
+        name = name[: -len("-scrubbed")]
+    return name
+
+
+def _decrypt_encrypted_stills_for_masking(screenshots_dir: Path) -> None:
+    """Decrypt every ``*.jpg.enc`` in ``screenshots_dir`` to plaintext ``*.jpg`` for
+    the cloud copy (search U7 / R7). Fail closed: drop a still that cannot be
+    decrypted rather than upload an unmaskable frame."""
+    enc_files = sorted(screenshots_dir.glob("*.jpg.enc"))
+    if not enc_files:
+        return
+    from screencap import corpus_crypto, still_io
+
+    try:
+        key = corpus_crypto.load_corpus_key()
+    except Exception:  # noqa: BLE001 — treat any key error as "no key" → fail closed
+        key = None
+    recording = _source_recording_name(screenshots_dir)
+    for enc in enc_files:
+        plain_path = Path(str(enc)[: -len(".enc")])  # <ts>.jpg
+        try:
+            if key is None:
+                raise corpus_crypto.CorpusDecryptError("corpus key unavailable")
+            aad = corpus_crypto.corpus_aad(recording, still_io.logical_still_name(enc))
+            data = corpus_crypto.decrypt(enc.read_bytes(), key, aad)
+            plain_path.write_bytes(data)
+            os.chmod(plain_path, 0o600)
+            enc.unlink()
+        except Exception:
+            logger.warning(
+                "scrub: dropping un-decryptable encrypted still %s from the cloud copy",
+                enc.name,
+            )
+            for stray in (enc, plain_path):
+                try:
+                    stray.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def mask_screenshots(
     screenshots_dir: Path,
     ctx: ScrubContext,
@@ -1704,6 +1756,13 @@ def mask_screenshots(
         return
     if ctx.evaluator is None or ctx.classifier is None:
         return
+
+    # Search U7 / R7: the cloud copy must upload plaintext masked JPEGs, but a copied
+    # recording may hold encrypted ``*.jpg.enc`` stills. Decrypt them to plaintext
+    # ``*.jpg`` HERE (before the mask loop, which globs ``*.jpg``) so the uploaded
+    # artifact set stays byte-shape-identical to today's; an un-decryptable still is
+    # dropped (fail closed — never upload an unmaskable frame).
+    _decrypt_encrypted_stills_for_masking(screenshots_dir)
 
     _result = result if result is not None else ScrubResult()
     evaluator = ctx.evaluator
@@ -2435,7 +2494,7 @@ def _build_app_allowlist(metrics_path: Path) -> frozenset[str]:
 
 
 # Files to skip during copytree and delete as safety fallback.
-_SKIP_FILES = {".upload_status.json", "viewer.html"}
+_SKIP_FILES = {".upload_status.json", "viewer.html", ".scrub_state.json"}
 _SKIP_EXTENSIONS = {".mp4", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
 
 

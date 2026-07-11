@@ -42,6 +42,13 @@ class ScreenshotOcr(Protocol):
         roi: tuple[float, float, float, float] | None = None,
     ) -> OcrResult: ...
 
+    def recognize_bytes(
+        self,
+        data: bytes,
+        *,
+        roi: tuple[float, float, float, float] | None = None,
+    ) -> OcrResult: ...
+
 
 class VisionOcr:
     """Apple Vision VNRecognizeTextRequest wrapper.
@@ -62,13 +69,45 @@ class VisionOcr:
         *,
         roi: tuple[float, float, float, float] | None = None,
     ) -> OcrResult:
-        import objc
         from Foundation import NSData
 
+        img_data = NSData.dataWithContentsOfFile_(str(image_path))
+        if img_data is None:
+            raise OSError(f"Failed to load image data: {image_path}")
+        im_w, im_h = _image_dimensions(image_path)
+        return self._recognize_nsdata(img_data, im_w, im_h, roi)
+
+    def recognize_bytes(
+        self,
+        data: bytes,
+        *,
+        roi: tuple[float, float, float, float] | None = None,
+    ) -> OcrResult:
+        """OCR an in-memory image (search U3): the seam that lets the encrypted
+        index pass decrypt a still to RAM and OCR it without ever writing the
+        decrypted plaintext to disk (KTD2 — no decrypt-to-temp)."""
+        import io
+
+        from Foundation import NSData
+        from PIL import Image
+
+        img_data = NSData.dataWithBytes_length_(data, len(data))
+        if img_data is None:
+            raise OSError("Failed to build NSData from in-memory image bytes")
+        with Image.open(io.BytesIO(data)) as im:
+            im_w, im_h = im.size
+        return self._recognize_nsdata(img_data, im_w, im_h, roi)
+
+    def _recognize_nsdata(
+        self,
+        img_data: object,
+        im_w: int,
+        im_h: int,
+        roi: tuple[float, float, float, float] | None,
+    ) -> OcrResult:
+        import objc
+
         with objc.autorelease_pool():
-            img_data = NSData.dataWithContentsOfFile_(str(image_path))
-            if img_data is None:
-                raise OSError(f"Failed to load image data: {image_path}")
             handler = (
                 self._Vision.VNImageRequestHandler.alloc().initWithData_options_(
                     img_data, None
@@ -85,10 +124,7 @@ class VisionOcr:
 
             success, error = handler.performRequests_error_([req], None)
             if not success:
-                return OcrResult([], 0, 0)
-
-            # Get image dimensions from the loaded image
-            im_w, im_h = _image_dimensions(image_path)
+                return OcrResult([], im_w, im_h)
 
             blocks: list[OcrTextBlock] = []
             for obs in req.results() or []:

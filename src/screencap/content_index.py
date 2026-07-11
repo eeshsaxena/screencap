@@ -81,6 +81,39 @@ _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 200
 _BUSY_TIMEOUT_MS = 10000
 
+# Backend-agnostic DB error tuples. ``content_index.db`` is plain ``sqlite3`` by
+# default, but SQLCipher-encrypted (via ``pysqlcipher3``) once the corpus is
+# migrated (search U4 / R3). pysqlcipher3's exception classes are DISJOINT from
+# sqlite3's, so every ``except`` that must also catch an encrypted-backend failure
+# references these tuples; :func:`_load_sqlcipher` widens them to include the
+# SQLCipher classes the first time an encrypted connection is opened.
+_sqlcipher = None  # lazily imported ``pysqlcipher3.dbapi2`` module (None until used)
+_DATABASE_ERRORS: tuple[type[BaseException], ...] = (sqlite3.DatabaseError,)
+_OPERATIONAL_ERRORS: tuple[type[BaseException], ...] = (sqlite3.OperationalError,)
+
+
+def _load_sqlcipher():
+    """Import ``pysqlcipher3`` once, widening the backend-error tuples to include
+    its (sqlite3-disjoint) exception classes.
+
+    Raises :class:`_StoreUnavailable` when the binding is not installed, so an
+    encrypted store degrades to ``STORE_UNAVAILABLE`` (fail-closed, R8) on a host
+    without the SQLCipher toolchain rather than crashing.
+    """
+    global _sqlcipher, _DATABASE_ERRORS, _OPERATIONAL_ERRORS
+    if _sqlcipher is None:
+        try:
+            from pysqlcipher3 import dbapi2 as sc
+        except ImportError as exc:
+            raise _StoreUnavailable(
+                "content index is encrypted but the SQLCipher binding "
+                "(pysqlcipher3) is unavailable"
+            ) from exc
+        _sqlcipher = sc
+        _DATABASE_ERRORS = (sqlite3.DatabaseError, sc.DatabaseError)
+        _OPERATIONAL_ERRORS = (sqlite3.OperationalError, sc.OperationalError)
+    return _sqlcipher
+
 
 class IndexState(str, Enum):
     """Why a search returned what it did — keeps "empty" from being ambiguous.
@@ -284,8 +317,33 @@ class ContentIndex:
     callers (the fail-open U2 pass, the daemon delete sites) wrap them.
     """
 
-    def __init__(self, db_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        encrypted: bool | None = None,
+        key: bytes | None = None,
+    ) -> None:
         self._db_path = Path(db_path) if db_path is not None else default_index_path()
+        # Resolve the at-rest format once, consistently across every callsite: when
+        # ``encrypted`` is not given, take the shared corpus marker (search U4). An
+        # encrypted store needs the corpus key; load it here (read-only) if the
+        # caller did not supply one. A missing key on an encrypted store makes
+        # ``_open`` fail closed (STORE_UNAVAILABLE) — it never opens plaintext.
+        if encrypted is None:
+            from screencap import config
+
+            encrypted = config.get_corpus_encrypted()
+        self._encrypted = encrypted
+        if encrypted and key is None:
+            from screencap import corpus_crypto
+
+            try:
+                key = corpus_crypto.load_corpus_key()
+            except Exception:  # noqa: BLE001 — any key-load failure = "no key" → fail closed
+                logger.warning("content index: failed to load the corpus key", exc_info=True)
+                key = None
+        self._key = key
         self._conn: sqlite3.Connection | None = None
         self._fts_available = False
         self._available = False
@@ -294,7 +352,7 @@ class ContentIndex:
             self._available = True
         except _StoreUnavailable as exc:
             logger.warning("content index unavailable: %s", exc)
-        except sqlite3.DatabaseError as exc:
+        except _DATABASE_ERRORS as exc:
             logger.warning("content index could not be opened: %s", type(exc).__name__)
 
     # -- lifecycle -------------------------------------------------------
@@ -341,7 +399,7 @@ class ContentIndex:
             raise _StoreUnavailable("content-index db path is a symlink")
 
         existed = path.exists()
-        conn = sqlite3.connect(str(path))
+        conn = self._connect(path)
         # Close the create-to-chmod window before any second reader can open it.
         if not existed:
             try:
@@ -364,6 +422,29 @@ class ContentIndex:
         self._fts_available = self._probe_fts5(conn)
         self._create_schema(conn)
 
+    def _connect(self, path: Path):
+        """Open the backend connection.
+
+        Plain ``sqlite3`` by default (today's behavior). When the corpus is
+        encrypted (search U4 / R3), open via SQLCipher and set the raw 256-bit
+        corpus key with ``PRAGMA key`` — an ``x'<hex>'`` full-length key makes
+        SQLCipher skip PBKDF2 (the corpus key is already high-entropy). An
+        immediate ``sqlite_master`` read forces key verification at open, so a
+        wrong/absent key or a plaintext file opened as encrypted fails here (→
+        ``_StoreUnavailable`` / a widened DB error) instead of silently later.
+        """
+        if not self._encrypted:
+            return sqlite3.connect(str(path))
+        if self._key is None:
+            raise _StoreUnavailable(
+                "content index is encrypted but the corpus key is unavailable"
+            )
+        sc = _load_sqlcipher()
+        conn = sc.connect(str(path))
+        conn.execute(f"PRAGMA key = \"x'{self._key.hex()}'\"")
+        conn.execute("SELECT count(*) FROM sqlite_master")  # force key verification now
+        return conn
+
     @staticmethod
     def _probe_fts5(conn: sqlite3.Connection) -> bool:
         """Return whether FTS5 is compiled in (probe a temp virtual table).
@@ -377,7 +458,7 @@ class ContentIndex:
             )
             conn.execute("DROP TABLE temp._fts5_probe")
             return True
-        except sqlite3.OperationalError:
+        except _OPERATIONAL_ERRORS:
             return False
 
     def _create_schema(self, conn: sqlite3.Connection) -> None:
@@ -506,7 +587,7 @@ class ContentIndex:
             return
         try:
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        except sqlite3.OperationalError:
+        except _OPERATIONAL_ERRORS:
             pass
 
     # -- search ----------------------------------------------------------
@@ -538,7 +619,7 @@ class ContentIndex:
             else:
                 hits = self._search_like(query, recording, limit)
                 degraded = True
-        except sqlite3.DatabaseError as exc:
+        except _DATABASE_ERRORS as exc:
             logger.warning("content search failed: %s", type(exc).__name__)
             return SearchResult([], IndexState.STORE_UNAVAILABLE)
 
@@ -631,6 +712,29 @@ class ContentIndex:
             "WHERE recording = ? AND timestamp_ms >= ? AND timestamp_ms < ?",
             (recording, int(start_ms), int(end_ms)),
         )
+
+    def max_indexed_timestamp_ms(self, recording: str) -> int | None:
+        """Return the newest indexed ``timestamp_ms`` for ``recording``, or None.
+
+        The screenshot-retention pass (search U5) uses this as the "don't race the
+        indexer" high-water mark: a still newer than the last indexed frame is not
+        yet safe to evict. Returns None when the store is unavailable or the
+        recording has no indexed frames (caller then applies no indexer constraint).
+        """
+        if not self._available or self._conn is None:
+            return None
+        newest: int | None = None
+        try:
+            for table in self._present_tables(self._conn):
+                row = self._conn.execute(
+                    f"SELECT max(timestamp_ms) FROM {table} WHERE recording = ?",
+                    (recording,),
+                ).fetchone()
+                if row and row[0] is not None:
+                    newest = int(row[0]) if newest is None else max(newest, int(row[0]))
+        except _DATABASE_ERRORS:
+            return None
+        return newest
 
     def _present_tables(self, conn: sqlite3.Connection) -> list[str]:
         """Which of the two content tables actually exist in this store."""

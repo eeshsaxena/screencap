@@ -82,10 +82,25 @@ class TranscriptSearchResult(BaseModel):
 
 class FrameNearest(BaseModel):
     """A resolved nearest-frame pointer (SCR-186). POINTER-ONLY — a bare on-disk
-    stem, never a path or image bytes; both fields null on a miss."""
+    stem, never a path or image bytes; both fields null on a miss.
+
+    ``encrypted`` (search U8) is True when the corpus is stored encrypted — read the
+    frame's bytes via ``read_frame`` (the daemon decrypts) instead of the ``.jpg``
+    path, which won't exist / won't be readable plaintext."""
 
     stem: str | None
     delta_ms: int | None
+    encrypted: bool = False
+
+
+class FrameBytes(BaseModel):
+    """Decrypted still bytes for an ALLOW, scrubbed frame (search U8 / frame.read).
+
+    ``image_base64`` is null when the frame is missing, blocked, or in a not-yet-
+    scrubbed chunk (fail-closed refusal)."""
+
+    image_base64: str | None
+    content_type: str | None
 
 
 class TimelineRow(BaseModel):
@@ -317,7 +332,29 @@ async def resolve_frame(
     env = await (await _client()).frame_nearest(
         recording, timestamp_ms, staleness_cap_ms=staleness_cap_ms,
     )
-    return FrameNearest(stem=env.get("stem"), delta_ms=env.get("delta_ms"))
+    return FrameNearest(
+        stem=env.get("stem"),
+        delta_ms=env.get("delta_ms"),
+        encrypted=bool(env.get("encrypted", False)),
+    )
+
+
+async def read_frame(recording: str, stem: str) -> FrameBytes:
+    """Fetch the decrypted bytes of a screenshot the corpus stores encrypted (U8).
+
+    When ``resolve_frame`` returns ``encrypted: true`` the ``.jpg`` on disk is
+    ``.jpg.enc`` (AES-256-GCM) and you cannot read it directly — call this with the
+    resolved ``stem`` and the daemon decrypts + serves the JPEG bytes as base64.
+
+    Fail-closed: ``image_base64`` is null when the frame is missing, was
+    masked/excluded (ALLOW-only), or is in a chunk not yet secrets-scrubbed. Every
+    call is audit-logged by the daemon. Size-capped; a decoded JPEG is returned as
+    ``image/jpeg``."""
+    env = await (await _client()).frame_read(recording, stem)
+    return FrameBytes(
+        image_base64=env.get("image_base64"),
+        content_type=env.get("content_type"),
+    )
 
 
 async def list_recordings() -> RecordingsResult:
@@ -458,7 +495,7 @@ def build_server() -> FastMCP:
     )
     for fn in (
         search_screen_content, search_transcript, query_timeline,
-        resolve_frame, list_recordings, whoami, chat_answer,
+        resolve_frame, read_frame, list_recordings, whoami, chat_answer,
     ):
         mcp.tool()(fn)
     return mcp

@@ -80,6 +80,8 @@ class _OcrEngine(Protocol):
 
     def recognize(self, image_path: Path, **kwargs: object) -> object: ...
 
+    def recognize_bytes(self, data: bytes, **kwargs: object) -> object: ...
+
 
 @dataclass(frozen=True)
 class IndexRangeResult:
@@ -104,11 +106,21 @@ class IndexRangeResult:
     ``completed_range`` (SCR-192): a present-but-unavailable store must leave the
     unit PENDING so a store repair + resume re-OCRs, rather than latching DONE with
     zero rows.
+
+    ``scrub_complete`` is ``True`` only when a scrub pass ran and EVERY ALLOW still
+    in the range was OCR'd + scrubbed + (if it carried a secret) painted-and-
+    persisted successfully. Any per-frame decrypt/OCR/scrub failure or a failed
+    paint persist flips it ``False``. The live path gates ``scrub_state``'s
+    "chunk scrubbed" marker on this ALONGSIDE ``completed_range`` (KTD2), so
+    ``frame.read`` never serves a still that was skipped and therefore still holds
+    its secret. Defaults ``True`` (an empty range / a non-scrub pass is trivially
+    complete).
     """
 
     rows_written: int
     completed_range: bool
     store_available: bool = True
+    scrub_complete: bool = True
 
 
 def index_range(
@@ -124,6 +136,8 @@ def index_range(
     max_frames: int = _INDEX_MAX_OCR_FRAMES,
     dhash_threshold: int = _INDEX_DHASH_THRESHOLD,
     require_cross_process_lock: bool = False,
+    scrub: "object | None" = None,
+    corpus_key: bytes | None = None,
 ) -> IndexRangeResult:
     """OCR the screenshots in ``[start_ts, end_ts)`` into the store at ``store_path``.
 
@@ -150,11 +164,26 @@ def index_range(
     protection. The live recorder path leaves this False (its same-process racers
     are served by the in-process lock) and so never sees that exception.
 
+    ``scrub`` (search U3): an optional secrets-only scrubber (duck-typed
+    :class:`~screencap.redaction.local_scrub.LocalScrubber`). When provided, each
+    frame is decrypted to RAM (encrypted stills are also globbed), OCR'd in-memory
+    (never writing decrypted plaintext to disk — KTD2), and its secret/PII spans are
+    painted out of the persisted still (re-encrypted with ``corpus_key`` when the
+    still is ``*.jpg.enc``) while ONLY the redacted text is indexed (R1). The
+    still-persist happens under the write lock with the same re-stat barrier as the
+    index rows, so a concurrent purge is never resurrected. When ``scrub`` is None
+    the loop indexes the raw OCR text exactly as before (pre-U3 behavior).
+
     Returns an :class:`IndexRangeResult`. The caller owns the policy decisions:
-    whether to index at all and where ``skip_intervals`` come from.
+    whether to index at all, whether to require a scrub (fail closed when its
+    pipeline is unavailable rather than index unredacted text), and where
+    ``skip_intervals`` come from.
     """
+    import io
+
     from PIL import Image
 
+    from screencap import still_io
     from screencap.content_index import (
         ContentIndex,
         IndexFrame,
@@ -184,11 +213,17 @@ def index_range(
     # monotonic when the integer part has a fixed width), then bisect to the
     # window: take only [start_ts, end_ts) and stop at the upper bound rather than
     # scanning every later screenshot in the recording.
+    # Encrypted stills (``*.jpg.enc``) are only readable when a scrubber (and thus a
+    # corpus key path) is in play, so glob them only on the scrub path; the plaintext
+    # path stays byte-for-byte the pre-U3 ``*.jpg`` glob. Parse the timestamp from the
+    # logical name (``.enc`` stripped) so both forms sort into one timeline.
+    globs = ("*.jpg", "*.jpg.enc") if scrub is not None else ("*.jpg",)
     parsed: list[tuple[float, Path]] = []
-    for img_path in screenshots_dir.glob("*.jpg"):
-        ts = parse_screenshot_timestamp(img_path.name)
-        if ts is not None:
-            parsed.append((ts, img_path))
+    for pattern in globs:
+        for img_path in screenshots_dir.glob(pattern):
+            ts = parse_screenshot_timestamp(still_io.logical_still_name(img_path))
+            if ts is not None:
+                parsed.append((ts, img_path))
     parsed.sort(key=lambda p: p[0])
 
     ts_keys = [ts for ts, _ in parsed]
@@ -230,7 +265,17 @@ def index_range(
         started = time.perf_counter()
         prev_hash: int | None = None
         frames: list[IndexFrame] = []
+        # Redacted stills to persist for surviving frames (search U3): ms -> (path,
+        # painted JPEG bytes). Applied under the write lock after the re-stat barrier.
+        painted_by_path: dict[Path, bytes] = {}
         bailed = False
+        # Search U8 / KTD2: True only while EVERY ALLOW still in this range has been
+        # OCR'd + scrubbed + (if it carried a secret) painted. Any per-frame skip
+        # (undecryptable / OCR / scrub failure) or a failed paint persist flips it
+        # False so chunk_processor does NOT mark the chunk scrubbed — otherwise
+        # frame.read would serve an unpainted still with its secret intact. Only
+        # meaningful when ``scrub is not None``.
+        scrub_complete = True
         for ts, img_path in candidates:
             # This pass may run synchronously before a chunk's upload, so a
             # force-stop or a slow/wedged OCR engine must not pin the
@@ -242,6 +287,60 @@ def index_range(
                 logger.info("content-index OCR budget hit; stopping early")
                 bailed = True
                 break
+
+            # Scrub path (search U3): decrypt-to-RAM, OCR in-memory (no plaintext to
+            # disk), redact secrets, and stage the painted still for persist.
+            if scrub is not None:
+                try:
+                    img_bytes = still_io.open_still(img_path, corpus_key)
+                except Exception:
+                    # An unreadable still stays unscrubbed on disk → the chunk is
+                    # NOT fully scrubbed; leave it unmarked so frame.read refuses it.
+                    scrub_complete = False
+                    continue
+                cur_hash = None
+                try:
+                    with Image.open(io.BytesIO(img_bytes)) as im:
+                        cur_hash = dhash(im)
+                except Exception:
+                    cur_hash = None
+                # NOTE: no dedup skip on the scrub path — every ALLOW still must be
+                # individually OCR'd + scrubbed + painted. A near-duplicate almost
+                # always carries the SAME secret in the same place, so skipping its
+                # paint (as an earlier version did) served that secret unredacted via
+                # frame.read. Dedup applies only to the INDEX rows below.
+                is_dup = (
+                    cur_hash is not None
+                    and prev_hash is not None
+                    and hamming_distance(cur_hash, prev_hash) <= dhash_threshold
+                )
+                try:
+                    ocr_result = ocr.recognize_bytes(img_bytes)
+                except Exception:
+                    scrub_complete = False
+                    continue
+                try:
+                    scrub_res = scrub.scrub(img_bytes, ocr_result)
+                except Exception:
+                    # A scrub failure must NOT fall through to indexing raw text
+                    # (that would leak secrets into the index) — skip the frame, and
+                    # mark the range incomplete so its still stays unserved.
+                    logger.warning(
+                        "content-index: scrub failed for a frame; skipping it", exc_info=True
+                    )
+                    scrub_complete = False
+                    continue
+                if scrub_res.painted_bytes is not None:
+                    painted_by_path[img_path] = scrub_res.painted_bytes
+                # Keep prev_hash on a dup so we compare against the last distinct frame.
+                if not is_dup and cur_hash is not None:
+                    prev_hash = cur_hash
+                if not is_dup:
+                    text = scrub_res.redacted_text
+                    if text:
+                        frames.append(IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text))
+                continue
+
             # Dedup near-identical consecutive frames (same primitive + tight
             # threshold mask_screenshots uses); keep prev_hash on a dup so we
             # compare against the last distinct frame.
@@ -298,6 +397,28 @@ def index_range(
                 surviving.append(fr)
             frames = surviving
 
+        # Persist the redacted stills (search U3) under the SAME write lock + re-stat
+        # barrier: a still is re-written (re-encrypted for ``*.jpg.enc``, atomically
+        # replaced for plaintext) only if its file still exists NOW, so a purge that
+        # unlinked a just-disabled frame mid-pass is never resurrected. Runs even for
+        # frames whose redacted text was empty (still had a secret to paint out).
+        if painted_by_path:
+            for img_path, painted in painted_by_path.items():
+                if not img_path.exists():
+                    continue  # purge race: unlinked during OCR — do not resurrect
+                try:
+                    _persist_scrubbed_still(img_path, painted, corpus_key)
+                except Exception:
+                    # The still stays unpainted on disk (secret intact); mark the
+                    # range incomplete so the chunk is not recorded as scrubbed and
+                    # frame.read keeps refusing it until a later pass repaints it.
+                    logger.warning(
+                        "content-index: failed to persist redacted still %s",
+                        img_path.name,
+                        exc_info=True,
+                    )
+                    scrub_complete = False
+
         # Replace the WHOLE chunk time-range (not just the surviving frames) so a
         # re-process where a frame is now skipped (policy/dedup) drops its stale,
         # less-redacted row instead of leaving it behind. Range is [start, end) in
@@ -332,4 +453,27 @@ def index_range(
         rows_written=rows_written,
         completed_range=completed_range,
         store_available=store_available,
+        scrub_complete=scrub_complete,
     )
+
+
+def _persist_scrubbed_still(img_path: Path, painted_bytes: bytes, corpus_key: bytes | None) -> None:
+    """Write a redacted still back over ``img_path`` (search U3).
+
+    Encrypted stills (``*.jpg.enc``) are re-encrypted with the corpus key; plaintext
+    stills are atomically replaced. Both write via a temp file + ``os.replace`` so a
+    crash never leaves a partial (or, for the encrypted form, a plaintext) still."""
+    from screencap import still_io
+
+    if still_io.is_encrypted_path(img_path):
+        if corpus_key is None:
+            raise ValueError("cannot re-encrypt a redacted still without the corpus key")
+        still_io.write_encrypted_still(img_path, painted_bytes, corpus_key)
+        return
+    _atomic_replace(img_path, painted_bytes)
+
+
+def _atomic_replace(dest: Path, data: bytes) -> None:
+    from screencap.atomic_io import atomic_write_0600
+
+    atomic_write_0600(dest, data, fsync=True, suffix=".jpg.part")

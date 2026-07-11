@@ -68,6 +68,15 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         )
     except Exception:  # noqa: BLE001 - reconcile must never break startup
         logger.warning("storage-migration reconcile failed", exc_info=True)
+    # Search U7: resume/finish a corpus plaintext→encrypted flip that a prior daemon
+    # requested but didn't complete (crash-safe). A no-op before any flip is
+    # requested; strictly fail-open so a migration hiccup never blocks daemon start.
+    try:
+        from screencap import corpus_migrate
+
+        await asyncio.to_thread(corpus_migrate.resume_at_daemon_start)
+    except Exception:  # noqa: BLE001 - migration must never break startup
+        logger.warning("corpus-migration resume failed", exc_info=True)
     # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
     # daemon start (the stale-daemon-after-app-update lesson — a request-path
     # module must be imported before the first request, never lazily inside the
@@ -84,12 +93,26 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     # warm finishing first; it only makes the common case fast. Fail-open inside
     # _warm_grant_cache: a probe error must never break the daemon.
     app.state._grant_warm_task = asyncio.create_task(_warm_grant_cache(app))
+    # Periodic screenshot-retention sweep (search U5): applies the age/size bound to
+    # converged recordings that no recording-lifecycle event revisits. Not
+    # auth-gated (runs signed-out); a no-op until a bound is configured. Fail-open —
+    # starting it must never break daemon boot.
+    try:
+        from screencap.daemon.retention_sweep import RetentionSweep
+
+        app.state.retention_sweep = RetentionSweep()
+        app.state.retention_sweep.start()
+    except Exception:  # noqa: BLE001 - the sweep is best-effort maintenance
+        logger.warning("retention sweep failed to start", exc_info=True)
     try:
         yield
     finally:
         warm_task = getattr(app.state, "_grant_warm_task", None)
         if warm_task is not None and not warm_task.done():
             warm_task.cancel()
+        retention_sweep = getattr(app.state, "retention_sweep", None)
+        if retention_sweep is not None:
+            await retention_sweep.shutdown()
         # Stop an in-flight backfill BEFORE closing the bus/loop: its OCR worker
         # runs on a to_thread worker that the loop cannot cancel, so without an
         # explicit stop it would keep writing content_index.db past loop close.
@@ -1590,11 +1613,16 @@ async def frame_nearest(request: Request) -> JSONResponse:
             parsed.recording, parsed.timestamp_ms, parsed.staleness_cap_ms,
         )
         stem, delta_ms = result if result is not None else (None, None)
+        from screencap.config import get_corpus_encrypted
+
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._FRAME_NEAREST_API_VERSION,
                 stem=stem,
                 delta_ms=delta_ms,
+                # KTD6: signal encrypted storage so the agent calls frame.read
+                # instead of reading the .jpg path directly.
+                encrypted=get_corpus_encrypted(),
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1604,6 +1632,143 @@ async def frame_nearest(request: Request) -> JSONResponse:
             exc,
             schema_version=schema._FRAME_NEAREST_API_VERSION,
             request=request,
+        )
+
+
+def _run_frame_read(
+    recording: str, stem: str, max_bytes: int,
+) -> tuple[bytes, str] | None:
+    """Resolve + decrypt an ALLOW, scrubbed still for ``frame.read`` (search U8).
+
+    Fail-closed refusals (return ``None``): a non-numeric ``stem``, missing
+    recording/still, a blocked (masked/excluded/secure-field/indeterminate) frame, a
+    frame whose chunk has NOT yet been secrets-scrubbed (KTD2 — enforced for the
+    encrypted form always, and for a plaintext still once the corpus is encrypted),
+    a missing corpus key, or a payload over ``max_bytes``. On success returns
+    ``(jpeg_bytes, content_type)``."""
+    from screencap import corpus_crypto, frame_blocked, scrub_state, still_io
+    from screencap.config import get_corpus_encrypted, resolve_recording_dir
+
+    # Validate the stem is a bare numeric timestamp BEFORE any filesystem access, so
+    # a traversal-shaped or non-numeric stem is rejected without stat'ing a raw path.
+    try:
+        ts = float(stem)
+    except ValueError:
+        return None
+
+    rec_dir = resolve_recording_dir(recording)
+    if not rec_dir.is_dir():
+        return None
+    screenshots = rec_dir / "screenshots"
+    enc_path = screenshots / f"{stem}.jpg.enc"
+    plain_path = screenshots / f"{stem}.jpg"
+    path = enc_path if enc_path.exists() else (plain_path if plain_path.exists() else None)
+    if path is None:
+        return None
+
+    # ALLOW-only (R8): never serve a masked/excluded frame; indeterminate → refuse.
+    is_blocked = frame_blocked.build_is_blocked(rec_dir, [ts])
+    if is_blocked(ts):
+        return None
+
+    if still_io.is_encrypted_path(path):
+        # KTD2: refuse a frame whose chunk hasn't been secrets-scrubbed yet.
+        if not scrub_state.is_frame_scrubbed(rec_dir, round(ts * 1000)):
+            return None
+        try:
+            key = corpus_crypto.load_corpus_key()
+            data = still_io.open_still(path, key)
+        except Exception:
+            return None
+    else:
+        # A PLAINTEXT still. Once the corpus is meant to be encrypted (post-flip), a
+        # surviving plaintext still is a leftover/anomaly (e.g. a not-yet-migrated or
+        # in-flight frame) and must be held to the SAME scrub gate — otherwise an
+        # unscrubbed secret frame could be served through this branch. Pre-flip
+        # (plaintext corpus, agent reads the .jpg path directly) keeps today's behavior.
+        if get_corpus_encrypted() and not scrub_state.is_frame_scrubbed(
+            rec_dir, round(ts * 1000)
+        ):
+            return None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+
+    if len(data) > max_bytes:
+        return None
+    return data, "image/jpeg"
+
+
+async def frame_read(request: Request) -> JSONResponse:
+    """``POST /v0/frame.read`` — decrypt-and-serve an ALLOW, scrubbed still (search U8).
+
+    A capability-bearing verb (KTD6): every invocation is audit-logged
+    (peer + ok/blocked/error). Returns base64 JPEG bytes for an ALLOW frame from a
+    scrubbed chunk, size-capped; refuses blocked frames and unscrubbed chunks
+    (fail-closed, ``image_base64: null``). Same-EUID + ALLOW + scrubbed-chunk is the
+    trust bar for agents (no present-user check — resolved OQ3); the app's own
+    display gates on Touch ID separately (U6). NOT in ``_ACTIVITY_PATHS``."""
+    import base64
+
+    from pydantic import ValidationError
+
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon._name_validation import validate_recording_name
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+    recording_name: str | None = None
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "frame.read",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            recording_name=recording_name,
+        )
+
+    try:
+        _check_subscription_for_recall(schema_version=schema._FRAME_READ_API_VERSION)
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.FrameReadRequest.model_validate(body)
+        except ValidationError:
+            _audit("error")
+            return _validation_error_response(schema_version=schema._FRAME_READ_API_VERSION)
+        recording_name = parsed.recording
+        validate_recording_name(parsed.recording)
+        result = await asyncio.to_thread(
+            _run_frame_read, parsed.recording, parsed.stem, schema._FRAME_READ_MAX_BYTES,
+        )
+        if result is None:
+            _audit("blocked")
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._FRAME_READ_API_VERSION,
+                    image_base64=None,
+                    content_type=None,
+                )
+            )
+        data, content_type = result
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._FRAME_READ_API_VERSION,
+                image_base64=base64.b64encode(data).decode("ascii"),
+                content_type=content_type,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit("error")
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit("error")
+        return _internal_error_response(
+            exc, schema_version=schema._FRAME_READ_API_VERSION, request=request,
         )
 
 
@@ -2338,6 +2503,7 @@ def build_app() -> Starlette:
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
             Route("/v0/timeline.day", timeline_day, methods=["POST"]),
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
+            Route("/v0/frame.read", frame_read, methods=["POST"]),
             Route("/v0/tasks.list", tasks_list, methods=["POST"]),
             Route("/v0/chat.answer", chat_answer, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),

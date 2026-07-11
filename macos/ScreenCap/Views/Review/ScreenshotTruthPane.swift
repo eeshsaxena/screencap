@@ -78,6 +78,11 @@ enum ScreenshotTruth {
 struct ScreenshotTruthPane: View {
     let screenshots: [ReviewScreenshot]
     let currentTime: Double
+    /// Search U6 (R4): when a shared `PresenceGate` is supplied, the frame area is
+    /// wrapped in `PresenceGatedContent` so full-size stills reveal only after
+    /// present-user auth (with the session grace window). `nil` (default) keeps the
+    /// pane ungated — existing call sites are unchanged.
+    var presenceGate: PresenceGate? = nil
 
     /// Decoded-frame cache. The selected frame changes only when playback
     /// crosses a screenshot boundary (capture is sparse), so loading it lazily
@@ -85,6 +90,12 @@ struct ScreenshotTruthPane: View {
     /// every ~10Hz playback tick — and moves the decode off the main thread.
     /// `image == nil` records a load that was attempted and failed.
     @State private var loaded: LoadedFrame?
+
+    /// The corpus key, loaded from the Keychain ONCE when the pane appears, so the
+    /// per-frame `.task` decrypt reuses it instead of re-reading the Keychain on
+    /// every frame boundary (search U6 hot-path fix). nil in a dev build / when no
+    /// key is available — plaintext stills still read fine via the static fallback.
+    @State private var corpus: CorpusCrypto? = try? CorpusCrypto()
 
     private struct LoadedFrame {
         let url: URL
@@ -104,7 +115,7 @@ struct ScreenshotTruthPane: View {
         VStack(spacing: 0) {
             header
             Divider()
-            frameArea
+            gatedFrameArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         // Runs once per distinct frame URL (not per render), so the frame is
@@ -113,8 +124,15 @@ struct ScreenshotTruthPane: View {
         // builds on return and decodes lazily at draw time.
         .task(id: currentFrameURL) {
             guard let url = currentFrameURL, loaded?.url != url else { return }
+            // Search U6: decrypt a `*.jpg.enc` corpus still transparently (plaintext
+            // `*.jpg` reads unchanged). Runs off the main actor; `Data` is Sendable.
+            // Reuse the once-loaded key (`corpus`) so no Keychain read happens here.
+            let cached = corpus
             let data = await Task.detached(priority: .userInitiated) {
-                try? Data(contentsOf: url)
+                if let cached {
+                    return cached.readStillData(at: url)
+                }
+                return CorpusCrypto.readStillData(at: url)
             }.value
             if !Task.isCancelled {
                 loaded = LoadedFrame(url: url, image: data.flatMap { NSImage(data: $0) })
@@ -133,6 +151,15 @@ struct ScreenshotTruthPane: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.green.opacity(0.08))
+    }
+
+    @ViewBuilder
+    private var gatedFrameArea: some View {
+        if let gate = presenceGate {
+            PresenceGatedContent(gate: gate) { frameArea }
+        } else {
+            frameArea
+        }
     }
 
     @ViewBuilder

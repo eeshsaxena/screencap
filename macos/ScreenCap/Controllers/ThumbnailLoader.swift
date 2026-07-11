@@ -55,10 +55,16 @@ actor ThumbnailLoader {
     init(
         maxPixelSize: Int = 160,
         maxConcurrentDecodes: Int = 4,
-        decode: @escaping Decode = ThumbnailLoader.decodeDownsampled
+        decode: Decode? = nil
     ) {
         self.maxPixelSize = maxPixelSize
-        self.decode = decode
+        // Search U6: default to the decrypting decode so an encrypted `*.jpg.enc`
+        // still is decrypted in-memory (CryptoKit) before downsampling. The corpus
+        // key is read once from the shared Keychain group; when it is unavailable
+        // (dev builds without the entitlement, or the guardrails aren't on) encrypted
+        // frames decode to `nil` → the row shows the placeholder (R5). Tests inject
+        // an explicit `decode` to bypass real crypto.
+        self.decode = decode ?? ThumbnailLoader.makeDecryptingDecode(corpus: try? CorpusCrypto())
         self.gate = DecodeGate(permits: maxConcurrentDecodes)
         cache.countLimit = 512
     }
@@ -96,6 +102,17 @@ actor ThumbnailLoader {
     static func decodeDownsampled(url: URL, maxPixelSize: Int) -> ThumbnailImage? {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
+        return downsample(source: source, maxPixelSize: maxPixelSize)
+    }
+
+    /// Downsample from in-memory bytes — the decrypted-still path (search U6).
+    static func decodeDownsampled(data: Data, maxPixelSize: Int) -> ThumbnailImage? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else { return nil }
+        return downsample(source: source, maxPixelSize: maxPixelSize)
+    }
+
+    private static func downsample(source: CGImageSource, maxPixelSize: Int) -> ThumbnailImage? {
         let thumbOptions: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -105,5 +122,20 @@ actor ThumbnailLoader {
             return nil
         }
         return ThumbnailImage(cgImage: cgImage)
+    }
+
+    /// A decode that decrypts `*.jpg.enc` via `corpus` (CryptoKit) before
+    /// downsampling, and reads `*.jpg` from the URL directly (search U6). Returns
+    /// `nil` for an encrypted still when `corpus` is absent or decryption fails
+    /// (e.g. dev builds where the Keychain group entitlement is stripped) → the row
+    /// shows the placeholder rather than leaking or crashing.
+    static func makeDecryptingDecode(corpus: CorpusCrypto?) -> Decode {
+        return { url, maxPixelSize in
+            if CorpusCrypto.isEncryptedStill(url) {
+                guard let corpus, let data = try? corpus.decryptStill(at: url) else { return nil }
+                return decodeDownsampled(data: data, maxPixelSize: maxPixelSize)
+            }
+            return decodeDownsampled(url: url, maxPixelSize: maxPixelSize)
+        }
     }
 }

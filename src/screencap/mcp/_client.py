@@ -152,6 +152,11 @@ class AsyncDaemonClient:
             body["staleness_cap_ms"] = staleness_cap_ms
         return await self._post("/v0/frame.nearest", body)
 
+    async def frame_read(self, recording: str, stem: str) -> dict[str, Any]:
+        return await self._post(
+            "/v0/frame.read", {"recording": recording, "stem": stem}
+        )
+
     async def chat_answer(
         self,
         question: str,

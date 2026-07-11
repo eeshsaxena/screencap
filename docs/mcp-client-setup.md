@@ -60,7 +60,8 @@ works the same way.
 | `search_screen_content` | On-screen text snippets + `(recording, timestamp_ms)` | **Best-effort** |
 | `search_transcript` | Audio-transcript snippets + `(recording, chunk_index)` + chunk timing | **Best-effort** |
 | `query_timeline` | Structured app / window / time rows | **Authoritative** |
-| `resolve_frame` | The nearest screenshot **stem** for a `(recording, timestamp_ms)` pointer | — |
+| `resolve_frame` | The nearest screenshot **stem** for a `(recording, timestamp_ms)` pointer (+ `encrypted` flag) | — |
+| `read_frame` | Decrypted JPEG **bytes** (base64) for an ALLOW, scrubbed frame, when the corpus is encrypted | — |
 | `list_recordings` | Recording names + metadata, incl. cloud `owner_uid` + `upload_warning` | — |
 | `whoami` | The cloud account signed in on this machine (`uid` / `email`) | **Authoritative** |
 
@@ -76,6 +77,15 @@ works the same way.
   the nearest unmasked frame, or to a `null` miss. If the recording's privacy
   state can't be determined, it fails closed to a miss. This preserves the same
   ALLOW-only guarantee the content index gives (see `SECURITY.md`).
+- **Encrypted corpora: read bytes via `read_frame`, not the path.** When search runs
+  with the on-by-default guardrails, screenshots are stored encrypted
+  (`<stem>.jpg.enc`) and `resolve_frame` returns `encrypted: true`. In that case the
+  `.jpg` path won't be readable — call `read_frame(recording, stem)` and the daemon
+  decrypts and serves the JPEG bytes (base64). `read_frame` applies the same
+  ALLOW-only filter, additionally refuses a frame whose chunk hasn't been
+  secrets-scrubbed yet (fail-closed), is size-capped, and is **audit-logged** per
+  call. Same-user access, no biometric prompt for the agent (the app's own display
+  gates on Touch ID separately) — see `SECURITY.md`.
 - **Resolving a transcript hit is chunk-granular.** A transcript hit carries
   `timestamp_ms` (the chunk's start), `timestamp_granularity: "chunk"`, and
   `chunk_duration_ms`. Chunks default to 15 minutes and have no per-word timing,
