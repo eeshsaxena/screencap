@@ -38,6 +38,12 @@ crypto/gating core (U6 core) landed. Plan:
   presentation trigger remain.
 
 ## Remaining — U6 app provisioning (Swift) — the release blocker
+- **EMPIRICALLY CONFIRMED:** adding `keychain-access-groups` to `ScreenCap.entitlements`
+  **breaks the ad-hoc-signed dev/test build** — `xcodebuild` fails with *"ScreenCap has
+  entitlements that require signing with a development certificate."* So it cannot be
+  committed until the app is signed with a Developer-ID cert + a provisioning profile
+  that authorizes the group; it was reverted to keep the build green. `CorpusCrypto`
+  is written to read the group; enabling it is purely the signing/provisioning step.
 - **App `keychain-access-groups` provisioning (SCR-242 sibling — the blocker).**
   OQ4 was resolved to option (a): the app reads the corpus key from the shared group
   `2A8S6MV8DZ.com.screencap.shared`. `keychain-access-groups` is a **restricted**

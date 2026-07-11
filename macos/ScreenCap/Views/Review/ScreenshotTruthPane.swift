@@ -78,6 +78,11 @@ enum ScreenshotTruth {
 struct ScreenshotTruthPane: View {
     let screenshots: [ReviewScreenshot]
     let currentTime: Double
+    /// Search U6 (R4): when a shared `PresenceGate` is supplied, the frame area is
+    /// wrapped in `PresenceGatedContent` so full-size stills reveal only after
+    /// present-user auth (with the session grace window). `nil` (default) keeps the
+    /// pane ungated — existing call sites are unchanged.
+    var presenceGate: PresenceGate? = nil
 
     /// Decoded-frame cache. The selected frame changes only when playback
     /// crosses a screenshot boundary (capture is sparse), so loading it lazily
@@ -104,7 +109,7 @@ struct ScreenshotTruthPane: View {
         VStack(spacing: 0) {
             header
             Divider()
-            frameArea
+            gatedFrameArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         // Runs once per distinct frame URL (not per render), so the frame is
@@ -135,6 +140,15 @@ struct ScreenshotTruthPane: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.green.opacity(0.08))
+    }
+
+    @ViewBuilder
+    private var gatedFrameArea: some View {
+        if let gate = presenceGate {
+            PresenceGatedContent(gate: gate) { frameArea }
+        } else {
+            frameArea
+        }
     }
 
     @ViewBuilder
