@@ -3,20 +3,25 @@
 This module is the SINGLE SOURCE OF TRUTH for the crypto that makes a
 cloud upload unreadable by the server. It is the sibling of
 ``network/crypto.py`` (which protects captured network bodies): both hold a
-long-lived KEK in the login Keychain and both use ``AESGCM``, but this one
+long-lived KEK in the Keychain and both use ``AESGCM``, but this one
 protects *whole recording artifacts in transit and at rest in the object
 store*, so the server can only ever hold ciphertext.
 
 Two pieces:
 
 * **Cloud KEK** (:func:`get_cloud_kek` / :func:`get_or_create_cloud_kek`) —
-  a 256-bit device-held key in the Keychain under a service distinct from the
-  network KEK and the SCR-236 at-rest container key (its lifecycle diverges:
-  future escrow + team-key wrapping). A lost KEK means every cloud recording
-  encrypted under it is permanently undecryptable — documented, not recovered.
-  Creation is **foreground-only** (the one-time Keychain ACL prompt needs a
-  foreground process identity); the engine subprocess reads a delivered key,
-  never calling :func:`get_or_create_cloud_kek`.
+  a 256-bit device-held key under a service distinct from the network KEK and
+  the SCR-236 at-rest container key (its lifecycle diverges: future escrow +
+  team-key wrapping). Its home is the shared-access-group data-protection
+  keychain (SCR-220 KTD-1, ``synchronizable=false`` until Stage 2 flips it),
+  with the legacy ``keyring`` fallback for un-entitled binaries and a one-time
+  write-verify-then-delete migration of pre-Stage-1 keyring KEKs (KTD-2) —
+  mirroring ``corpus_crypto``'s dual-path pattern. A lost KEK means every
+  cloud recording encrypted under it is permanently undecryptable —
+  documented, not recovered. Creation is **foreground-only** (the one-time
+  Keychain ACL prompt needs a foreground process identity); the engine
+  subprocess reads a delivered key, never calling
+  :func:`get_or_create_cloud_kek`.
 
 * **Framed AEAD** (:func:`encrypt_stream` / :func:`decrypt_to` /
   :class:`EncryptingReader`) — a per-file streaming scheme that seals the
@@ -61,13 +66,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import math
 import os
 import secrets
 import struct
+import sys
 from typing import BinaryIO, Callable, Iterable, Iterator
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Keychain constants — distinct from network/crypto.py and the SCR-236 key
@@ -79,6 +88,13 @@ it orphans every cloud recording encrypted under the old key."""
 
 CLOUD_KEK_ACCOUNT = "kek"
 """Keychain ``account`` for the cloud KEK."""
+
+# Shared Keychain access group (SCR-241) — same value + env override as
+# ``screencap.auth.KEYCHAIN_ACCESS_GROUP``, re-declared here to avoid importing
+# the heavier ``auth`` module (which pulls ``requests``).
+KEYCHAIN_ACCESS_GROUP = os.environ.get(
+    "SCREENCAP_KEYCHAIN_ACCESS_GROUP", "2A8S6MV8DZ.com.screencap.shared"
+)
 
 # ---------------------------------------------------------------------------
 # Framing constants
@@ -142,22 +158,130 @@ def cloud_key_id(key: bytes) -> bytes:
     return hashlib.sha256(key).digest()[:_KEY_ID_LEN]
 
 
-def get_cloud_kek() -> bytes | None:
-    """Read-only cloud-KEK lookup. Returns ``None`` if none is stored.
+def _encode_kek(kek: bytes) -> str:
+    return base64.b64encode(kek).decode("ascii")
 
-    Use from every path that must not create a key: the engine/daemon read
-    path and download. Never silently re-creates — a missing key means cloud
-    recordings are undecryptable and the user must be told.
 
-    Raises:
-        keyring.errors.KeyringError: on Keychain access failure.
-    """
+def _decode_kek(stored: str) -> bytes:
+    return base64.b64decode(stored.encode("ascii"))
+
+
+def _load_legacy_kek() -> bytes | None:
+    """Legacy ``keyring`` home — primary store for un-entitled binaries (the
+    pip/pyenv CLI, Debug builds), which own the ACL they wrote and read it
+    silently."""
     import keyring  # lazy: Darwin backend can block; keep ``--help`` fast
 
     stored = keyring.get_password(CLOUD_SERVICE, CLOUD_KEK_ACCOUNT)
     if stored is None:
         return None
-    return base64.b64decode(stored.encode("ascii"))
+    return _decode_kek(stored)
+
+
+def _group_store_prefer_existing(encoded: str) -> str | None:
+    """Write ``encoded`` to the shared group unless an item already exists.
+
+    ``keychain_group.store()`` is add-then-update-on-duplicate, so calling it
+    unconditionally would overwrite a concurrently created KEK — forking the
+    user's ciphertext across two keys (KTD-2). So: re-read first and keep
+    whatever is there; after a write, return the verified readback (``None``
+    when the write cannot be confirmed, so the migration never deletes the
+    legacy item on an unverified copy).
+
+    Raises :class:`~screencap.keychain_group.MissingEntitlement` /
+    :class:`~screencap.keychain_group.KeychainError` as ``keychain_group``.
+    """
+    from screencap import keychain_group
+
+    existing = keychain_group.load(
+        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+    )
+    if existing is not None:
+        return existing
+    keychain_group.store(
+        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, encoded, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+    )
+    return keychain_group.load(
+        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+    )
+
+
+def _migrate_legacy_kek_if_needed() -> bytes | None:
+    """One-time silent migration of a pre-Stage-1 legacy-``keyring`` KEK into
+    the shared access group. Runs only on the entitled path when the group is
+    empty (KTD-2, on the ``auth._migrate_legacy_token_if_needed`` template).
+
+    Strictly non-interactive (read *and* delete) and fail-open, with two
+    hardenings the re-mintable auth token didn't need: the legacy item is
+    deleted only after a **verified readback** of the new group item, and an
+    existing group item always wins over the legacy one (never overwritten) —
+    a lost or forked KEK is permanently undecryptable ciphertext.
+    """
+    from screencap import keychain_group
+
+    try:
+        stored = keychain_group.load_legacy_noninteractive(CLOUD_SERVICE, CLOUD_KEK_ACCOUNT)
+    except Exception:  # noqa: BLE001 — migration must never raise
+        return None
+    if stored is None:
+        return None  # no legacy key / not silently readable → genuinely absent
+    try:
+        winner = _group_store_prefer_existing(stored)
+    except Exception:  # noqa: BLE001 — fail-open: keep decrypting on the legacy key
+        logger.debug(
+            "cloud kek: legacy→group migration write failed; using legacy key", exc_info=True
+        )
+        return _decode_kek(stored)
+    if winner is None:
+        # Write not confirmed by readback — abort: the legacy item stays the
+        # key's home until a later attempt verifiably lands.
+        logger.warning("cloud kek: group write not confirmed by readback; keeping legacy key")
+        return _decode_kek(stored)
+    if winner != stored:
+        # A concurrent writer landed a group KEK first — it wins (KTD-2). The
+        # legacy item stays; its ciphertext may still need it.
+        logger.warning("cloud kek: group already holds a different key; legacy key left in place")
+        return _decode_kek(winner)
+    # Verified readback matches → the group is now the home; drop the legacy copy.
+    if keychain_group.delete_legacy_noninteractive(CLOUD_SERVICE, CLOUD_KEK_ACCOUNT):
+        logger.info("cloud kek: migrated legacy keyring key into the access group")
+    else:
+        logger.warning(
+            "cloud kek: migrated key to access group but the legacy item persists; "
+            "key duplicated across homes until removed"
+        )
+    return _decode_kek(stored)
+
+
+def get_cloud_kek() -> bytes | None:
+    """Read-only cloud-KEK lookup. Returns ``None`` if none is stored.
+
+    Group-first (KTD-1): the shared access group is the KEK's home for entitled
+    binaries; un-entitled ones (``MissingEntitlement``) fall back to the legacy
+    ``keyring`` path. An entitled binary whose group is empty attempts the
+    one-time legacy migration (KTD-2). Use from every path that must not create
+    a key: the engine/daemon read path and download. Never silently re-creates —
+    a missing key means cloud recordings are undecryptable and the user must be
+    told.
+
+    Raises:
+        keyring.errors.KeyringError: on legacy Keychain access failure.
+        keychain_group.KeychainError: on a non-entitlement group failure —
+            never masked as "absent", which could cascade into a re-mint.
+    """
+    if sys.platform != "darwin":
+        return _load_legacy_kek()
+    from screencap import keychain_group  # lazy, mirrors corpus_crypto
+
+    try:
+        stored = keychain_group.load(
+            CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+        )
+    except keychain_group.MissingEntitlement:
+        return _load_legacy_kek()
+    if stored is not None:
+        return _decode_kek(stored)
+    return _migrate_legacy_kek_if_needed()
 
 
 def get_or_create_cloud_kek() -> bytes:
@@ -174,17 +298,28 @@ def get_or_create_cloud_kek() -> bytes:
     warning; this helper just returns bytes.
 
     Raises:
-        keyring.errors.KeyringError: on Keychain access failure.
+        keyring.errors.KeyringError: on legacy Keychain access failure.
+        keychain_group.KeychainError: on a non-entitlement group failure.
     """
-    import keyring
-
     existing = get_cloud_kek()
     if existing is not None:
         return existing
     kek = secrets.token_bytes(_KEK_LEN)
-    keyring.set_password(
-        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, base64.b64encode(kek).decode("ascii")
-    )
+    encoded = _encode_kek(kek)
+    if sys.platform == "darwin":
+        from screencap import keychain_group
+
+        try:
+            winner = _group_store_prefer_existing(encoded)
+        except keychain_group.MissingEntitlement:
+            pass  # un-entitled binary → legacy keyring home below
+        else:
+            # A concurrent writer's key wins (KTD-2) — never fork ciphertext
+            # across two keys by overwriting.
+            return _decode_kek(winner) if winner is not None else kek
+    import keyring
+
+    keyring.set_password(CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, encoded)
     return kek
 
 
@@ -470,6 +605,7 @@ def decrypt_stream_from_chunks(
 __all__ = [
     "CLOUD_SERVICE",
     "CLOUD_KEK_ACCOUNT",
+    "KEYCHAIN_ACCESS_GROUP",
     "MAGIC",
     "VERSION",
     "HEADER_LEN",

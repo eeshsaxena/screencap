@@ -165,12 +165,23 @@ def test_plaintext_artifact_prefixes_not_detected_as_encrypted(prefix):
 
 
 # --------------------------------------------------------------------------
-# Cloud KEK lifecycle (mocked Keychain)
+# Cloud KEK lifecycle — un-entitled legacy fork (mocked Keychain)
+#
+# The shared-group home + migration are covered in tests/test_cloud_kek_group.py;
+# these pin the legacy-`keyring` fallback, so the group is forced un-entitled
+# (never the real Keychain).
 # --------------------------------------------------------------------------
 
 
 @pytest.fixture
 def fake_keyring(monkeypatch):
+    from screencap import keychain_group as kg
+
+    def _unentitled(*_a, **_k):
+        raise kg.MissingEntitlement(kg.errSecMissingEntitlement, "test")
+
+    monkeypatch.setattr(kg, "load", _unentitled)
+    monkeypatch.setattr(kg, "store", _unentitled)
     store: dict[tuple[str, str], str] = {}
     monkeypatch.setattr(keyring, "get_password", lambda s, a: store.get((s, a)))
     monkeypatch.setattr(
@@ -190,7 +201,7 @@ def test_get_or_create_creates_then_reads_same(fake_keyring):
     assert cc.get_cloud_kek() == created
 
 
-def test_keyring_error_surfaces(monkeypatch):
+def test_keyring_error_surfaces(fake_keyring, monkeypatch):
     def boom(_s, _a):
         raise keyring.errors.KeyringError("locked")
 

@@ -15,39 +15,53 @@ import pytest
 
 from screencap import keychain_group as kg
 
+pytestmark = pytest.mark.privacy
+
 GROUP = "2A8S6MV8DZ.com.screencap.shared"
 SERVICE = "screencap-auth"
 ACCOUNT = "default"
 
 
 class _FakeGroupKeychain:
-    """In-memory stand-in for the data-protection-keychain access-group store."""
+    """In-memory stand-in for the data-protection-keychain access-group store.
+
+    Items are keyed by ``synchronizable`` too, mirroring macOS: the synced and
+    non-synced items are distinct, and a query only matches its own flavor.
+    """
 
     def __init__(self) -> None:
-        self.items: dict[tuple[str, str, str], bytes] = {}
+        self.items: dict[tuple[str, str, str, bool], bytes] = {}
 
-    def add(self, service: str, account: str, secret: bytes, access_group: str) -> int:
-        key = (service, account, access_group)
+    def add(
+        self, service: str, account: str, secret: bytes, access_group: str, *, synchronizable: bool = False
+    ) -> int:
+        key = (service, account, access_group, synchronizable)
         if key in self.items:
             return kg.errSecDuplicateItem
         self.items[key] = secret
         return kg.errSecSuccess
 
-    def update(self, service: str, account: str, secret: bytes, access_group: str) -> int:
-        key = (service, account, access_group)
+    def update(
+        self, service: str, account: str, secret: bytes, access_group: str, *, synchronizable: bool = False
+    ) -> int:
+        key = (service, account, access_group, synchronizable)
         if key not in self.items:
             return kg.errSecItemNotFound
         self.items[key] = secret
         return kg.errSecSuccess
 
-    def copy(self, service: str, account: str, access_group: str) -> tuple[int, bytes | None]:
-        key = (service, account, access_group)
+    def copy(
+        self, service: str, account: str, access_group: str, *, synchronizable: bool = False
+    ) -> tuple[int, bytes | None]:
+        key = (service, account, access_group, synchronizable)
         if key in self.items:
             return kg.errSecSuccess, self.items[key]
         return kg.errSecItemNotFound, None
 
-    def delete(self, service: str, account: str, access_group: str) -> int:
-        key = (service, account, access_group)
+    def delete(
+        self, service: str, account: str, access_group: str, *, synchronizable: bool = False
+    ) -> int:
+        key = (service, account, access_group, synchronizable)
         if key in self.items:
             del self.items[key]
             return kg.errSecSuccess
@@ -82,16 +96,16 @@ def test_store_existing_updates_not_errors(fake_group: _FakeGroupKeychain) -> No
 def test_store_duplicate_then_update_fails_surfaces_update_status(monkeypatch: pytest.MonkeyPatch) -> None:
     # add → errSecDuplicateItem → update fails: the UPDATE's status must surface,
     # not the swallowed duplicate.
-    monkeypatch.setattr(kg, "_sec_item_add", lambda *a: kg.errSecDuplicateItem)
-    monkeypatch.setattr(kg, "_sec_item_update", lambda *a: -25291)  # errSecNotAvailable
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a, **k: kg.errSecDuplicateItem)
+    monkeypatch.setattr(kg, "_sec_item_update", lambda *a, **k: -25291)  # errSecNotAvailable
     with pytest.raises(kg.KeychainError) as exc:
         kg.store(SERVICE, ACCOUNT, "x", GROUP)
     assert exc.value.status == -25291
 
 
 def test_store_duplicate_then_update_missing_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kg, "_sec_item_add", lambda *a: kg.errSecDuplicateItem)
-    monkeypatch.setattr(kg, "_sec_item_update", lambda *a: kg.errSecMissingEntitlement)
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a, **k: kg.errSecDuplicateItem)
+    monkeypatch.setattr(kg, "_sec_item_update", lambda *a, **k: kg.errSecMissingEntitlement)
     with pytest.raises(kg.MissingEntitlement):
         kg.store(SERVICE, ACCOUNT, "x", GROUP)
 
@@ -123,14 +137,14 @@ def test_delete_removes_item(fake_group: _FakeGroupKeychain) -> None:
 
 
 def test_missing_entitlement_raises_typed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kg, "_sec_item_add", lambda *a: kg.errSecMissingEntitlement)
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a, **k: kg.errSecMissingEntitlement)
     with pytest.raises(kg.MissingEntitlement) as exc:
         kg.store(SERVICE, ACCOUNT, "x", GROUP)
     assert exc.value.status == kg.errSecMissingEntitlement
 
 
 def test_missing_entitlement_on_load_raises_typed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kg, "_sec_item_copy_matching", lambda *a: (kg.errSecMissingEntitlement, None))
+    monkeypatch.setattr(kg, "_sec_item_copy_matching", lambda *a, **k: (kg.errSecMissingEntitlement, None))
     with pytest.raises(kg.MissingEntitlement):
         kg.load(SERVICE, ACCOUNT, GROUP)
 
@@ -140,7 +154,7 @@ def test_unexpected_status_raises_keychainerror_not_missing_entitlement(
 ) -> None:
     # -25291 errSecNotAvailable is NOT the un-entitled trigger → must surface as a
     # real error, never be masked as un-entitled (KTD-4).
-    monkeypatch.setattr(kg, "_sec_item_add", lambda *a: -25291)
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a, **k: -25291)
     with pytest.raises(kg.KeychainError) as exc:
         kg.store(SERVICE, ACCOUNT, "x", GROUP)
     assert exc.value.status == -25291
@@ -198,6 +212,54 @@ def test_delete_legacy_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(kg, "_sec_item_delete_legacy_noninteractive", _boom)
     assert kg.delete_legacy_noninteractive(SERVICE, ACCOUNT) is False
+
+
+# --- synchronizable threading (SCR-220 U1) ---------------------------------
+
+
+def test_synchronizable_reaches_all_four_primitives(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The flag must ride the add *attributes* AND every query — macOS queries
+    # default to matching only non-synchronizable items, so a primitive that
+    # drops it makes a synced item invisible to that operation.
+    seen: dict[str, bool] = {}
+
+    def add(service, account, secret, access_group, *, synchronizable=False):
+        seen["add"] = synchronizable
+        return kg.errSecDuplicateItem  # force the update leg too
+
+    def update(service, account, secret, access_group, *, synchronizable=False):
+        seen["update"] = synchronizable
+        return kg.errSecSuccess
+
+    def copy(service, account, access_group, *, synchronizable=False):
+        seen["copy"] = synchronizable
+        return kg.errSecItemNotFound, None
+
+    def delete(service, account, access_group, *, synchronizable=False):
+        seen["delete"] = synchronizable
+        return kg.errSecSuccess
+
+    monkeypatch.setattr(kg, "_sec_item_add", add)
+    monkeypatch.setattr(kg, "_sec_item_update", update)
+    monkeypatch.setattr(kg, "_sec_item_copy_matching", copy)
+    monkeypatch.setattr(kg, "_sec_item_delete", delete)
+
+    kg.store(SERVICE, ACCOUNT, "x", GROUP, synchronizable=True)
+    kg.load(SERVICE, ACCOUNT, GROUP, synchronizable=True)
+    kg.delete(SERVICE, ACCOUNT, GROUP, synchronizable=True)
+    assert seen == {"add": True, "update": True, "copy": True, "delete": True}
+
+    seen.clear()
+    kg.store(SERVICE, ACCOUNT, "x", GROUP)  # default stays device-local
+    kg.load(SERVICE, ACCOUNT, GROUP)
+    kg.delete(SERVICE, ACCOUNT, GROUP)
+    assert seen == {"add": False, "update": False, "copy": False, "delete": False}
+
+
+def test_synced_and_unsynced_items_are_distinct(fake_group: _FakeGroupKeychain) -> None:
+    kg.store(SERVICE, ACCOUNT, "synced", GROUP, synchronizable=True)
+    assert kg.load(SERVICE, ACCOUNT, GROUP) is None  # default query can't see it
+    assert kg.load(SERVICE, ACCOUNT, GROUP, synchronizable=True) == "synced"
 
 
 # --- macOS-gated real-keychain integration --------------------------------
