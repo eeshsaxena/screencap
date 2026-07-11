@@ -204,3 +204,127 @@ def test_cloud_copy_drops_undecryptable_still_fail_closed(tmp_path, monkeypatch)
 
     # No key → the un-maskable still is dropped, not left for upload.
     assert list(scrubbed_ss.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Inline png_data blob conversion (R5) + done-marker gating + active-write defer
+# ---------------------------------------------------------------------------
+
+
+def _seed_recording_db(rec_dir, rows):
+    """rows: list of (recording_ts, screenshot_ts, png_bytes). Raw sqlite3 (local-only)."""
+    import sqlite3
+
+    db = rec_dir / "recording.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE screenshot (id INTEGER PRIMARY KEY, recording_timestamp REAL, "
+        "timestamp REAL, png_data BLOB)"
+    )
+    for rec_ts, shot_ts, blob in rows:
+        conn.execute(
+            "INSERT INTO screenshot (recording_timestamp, timestamp, png_data) VALUES (?,?,?)",
+            (rec_ts, shot_ts, sqlite3.Binary(blob)),
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_migrate_db_blobs_encrypts_and_roundtrips(tmp_path):
+    import sqlite3
+
+    key = os.urandom(32)
+    rec = _rec(tmp_path, "rec-1")
+    blob = os.urandom(500)
+    _seed_recording_db(rec, [(100.0, 150.25, blob)])
+
+    assert corpus_migrate.migrate_recording_db_blobs(rec, key) == 1
+
+    conn = sqlite3.connect(str(rec / "recording.db"))
+    stored = bytes(conn.execute("SELECT png_data FROM screenshot").fetchone()[0])
+    conn.close()
+    assert corpus_crypto.is_encrypted(stored)  # no plaintext blob left in recording.db
+    # Round-trips under the SAME AAD the capture write path binds.
+    assert corpus_crypto.decrypt(stored, key, still_io.png_blob_aad(100.0, 150.25)) == blob
+    # Idempotent — an already-encrypted blob is not re-encrypted.
+    assert corpus_migrate.migrate_recording_db_blobs(rec, key) == 0
+
+
+def test_namer_decrypts_migrated_blob(tmp_path, monkeypatch):
+    import io as _io
+    import sqlite3
+
+    from PIL import Image
+
+    from screencap import namer
+
+    key = os.urandom(32)
+    key_file = tmp_path / "corpus.key"
+    key_file.write_text(corpus_crypto._encode_key(key))
+    monkeypatch.setenv(corpus_crypto.CORPUS_KEY_FILE_ENV, str(key_file))
+
+    buf = _io.BytesIO()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(buf, format="JPEG")
+    jpeg = buf.getvalue()
+    rec = _rec(tmp_path, "rec-1")
+    _seed_recording_db(rec, [(100.0, 150.25, jpeg)])
+    corpus_migrate.migrate_recording_db_blobs(rec, key)
+
+    conn = sqlite3.connect(str(rec / "recording.db"))
+    stored = bytes(conn.execute("SELECT png_data FROM screenshot").fetchone()[0])
+    conn.close()
+    # namer transparently decrypts the encrypted blob back to the original JPEG.
+    assert namer._decrypt_blob_if_needed(stored, 100.0, 150.25) == jpeg
+    # A plaintext blob passes through unchanged.
+    assert namer._decrypt_blob_if_needed(jpeg, 100.0, 150.25) == jpeg
+
+
+def _stub_flip_config(monkeypatch, tmp_path, recs, key):
+    from screencap import config
+
+    key_file = tmp_path / "corpus.key"
+    key_file.write_text(corpus_crypto._encode_key(key))
+    monkeypatch.setenv(corpus_crypto.CORPUS_KEY_FILE_ENV, str(key_file))
+    state = {"requested": False, "encrypted": False}
+    monkeypatch.setattr(config, "get_recordings_dir", lambda: recs)
+    monkeypatch.setattr(
+        config, "set_corpus_encryption_requested", lambda v: state.__setitem__("requested", v)
+    )
+    monkeypatch.setattr(config, "set_corpus_encrypted", lambda v: state.__setitem__("encrypted", v))
+    monkeypatch.setattr(
+        "screencap.content_index.default_index_path", lambda: tmp_path / "content_index.db"
+    )
+    return state
+
+
+def test_flip_defers_active_writes_and_gates_marker(tmp_path, monkeypatch):
+    # A freshly-written still (mtime within the active-write grace) is deferred, so
+    # plaintext remains, so the corpus_encrypted done marker must NOT flip.
+    key = os.urandom(32)
+    recs = tmp_path / "recordings"
+    rec = _rec(tmp_path, "rec-1")
+    (rec / "screenshots" / "100.000000.jpg").write_bytes(b"just-written")  # mtime == now
+    state = _stub_flip_config(monkeypatch, tmp_path, recs, key)
+
+    corpus_migrate.flip_corpus_to_encrypted()
+
+    assert state["requested"] is True  # intent recorded
+    assert state["encrypted"] is False  # #5: not flipped — plaintext remained
+    assert (rec / "screenshots" / "100.000000.jpg").exists()  # #9: fresh still deferred
+
+
+def test_flip_sets_marker_when_pass_is_clean(tmp_path, monkeypatch):
+    key = os.urandom(32)
+    recs = tmp_path / "recordings"
+    rec = _rec(tmp_path, "rec-1")
+    jpg = rec / "screenshots" / "100.000000.jpg"
+    jpg.write_bytes(b"idle-still")
+    os.utime(jpg, (1_000.0, 1_000.0))  # backdate well past the active-write grace
+    state = _stub_flip_config(monkeypatch, tmp_path, recs, key)
+
+    corpus_migrate.flip_corpus_to_encrypted()
+
+    assert state["encrypted"] is True  # clean pass → done marker set
+    assert not jpg.exists()
+    assert (rec / "screenshots" / "100.000000.jpg.enc").exists()

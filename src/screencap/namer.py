@@ -117,7 +117,7 @@ def _sample_screenshots_from_blobs(
     cur: Cursor,
     max_count: int,
 ) -> list[str]:
-    """Sample screenshots from png_data blobs in DB."""
+    """Sample screenshots from png_data blobs in DB (decrypting corpus-encrypted ones)."""
     cur.execute("SELECT COUNT(*) FROM screenshot WHERE png_data IS NOT NULL")
     total = cur.fetchone()[0]
     if total == 0:
@@ -128,19 +128,49 @@ def _sample_screenshots_from_blobs(
     screenshots_b64 = []
     for idx in indices:
         cur.execute(
-            "SELECT png_data FROM screenshot WHERE png_data IS NOT NULL "
-            "ORDER BY timestamp LIMIT 1 OFFSET ?",
+            "SELECT png_data, recording_timestamp, timestamp FROM screenshot "
+            "WHERE png_data IS NOT NULL ORDER BY timestamp LIMIT 1 OFFSET ?",
             (idx,),
         )
         row = cur.fetchone()
         if not row or not row[0]:
             continue
 
-        b64 = _image_bytes_to_b64(row[0])
+        blob = _decrypt_blob_if_needed(bytes(row[0]), row[1], row[2])
+        if blob is None:
+            continue
+        b64 = _image_bytes_to_b64(blob)
         if b64:
             screenshots_b64.append(b64)
 
     return screenshots_b64
+
+
+def _decrypt_blob_if_needed(
+    blob: bytes, recording_ts: float | None, screenshot_ts: float | None
+) -> bytes | None:
+    """Return plaintext image bytes for a ``png_data`` blob.
+
+    A corpus-encrypted blob (search R3 — written by the capture path once the U8
+    flip is on, or by ``corpus_migrate``) is decrypted via its ``png_blob_aad``
+    identity. Returns None (skip this sample) when the blob is encrypted but the
+    corpus key or its AAD identity is unavailable — the auto-namer is best-effort
+    and must never raise on a locked/absent key."""
+    from screencap import corpus_crypto, still_io
+
+    if not corpus_crypto.is_encrypted(blob):
+        return blob
+    if recording_ts is None or screenshot_ts is None:
+        return None
+    try:
+        key = corpus_crypto.load_corpus_key()
+        if key is None:
+            return None
+        return corpus_crypto.decrypt(
+            blob, key, still_io.png_blob_aad(float(recording_ts), float(screenshot_ts))
+        )
+    except Exception:
+        return None
 
 
 def _pick_sample_indices(total: int, max_count: int) -> list[int]:
