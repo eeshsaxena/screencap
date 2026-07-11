@@ -163,8 +163,16 @@ final class SearchViewModel: ObservableObject {
         if case .loaded = phase {} else { phase = .searching }
 
         let hasFreeText = !parsed.freeText.isEmpty
+        // SCR-176 — `timeline.query` is filtered by time/app only (it carries no
+        // free-text term) and truncates earliest-first, so an unbounded fetch for a
+        // pure free-text query would flood results with up to `streamFetchLimit` of
+        // the OLDEST, unrelated activity rows. Only fan out to timeline when there
+        // is a time window or app filter to bound it; a pure free-text query leaves
+        // the timeline stream `.notRun`.
+        let hasTimelineQuery = parsed.timeWindow != nil || parsed.appFilter != nil
 
-        async let timelineFetch = fetchTimeline(parsed)
+        async let timelineFetch: Fetched<[TimelineRow]> =
+            hasTimelineQuery ? fetchTimeline(parsed) : .notRun
         async let contentFetch: Fetched<ContentPayload> =
             hasFreeText ? fetchContent(parsed.freeText) : .notRun
         async let transcriptFetch: Fetched<[TranscriptHit]> =
@@ -178,18 +186,23 @@ final class SearchViewModel: ObservableObject {
         // one's result; bail at every publish point once this task is cancelled.
         if Task.isCancelled { return }
 
-        // All three share one socket: a socket-level failure on the
-        // always-attempted timeline call means the daemon is unreachable.
-        if case .down = timeline {
+        // All streams share one socket. A socket-level failure on ANY attempted
+        // stream means the daemon is unreachable — derive daemon-down from
+        // whichever streams ran, since a pure free-text query no longer attempts
+        // timeline (SCR-176). `.notRun` is neither down nor gated, and the
+        // `!parsed.isEmpty` guard above guarantees at least one stream ran, so this
+        // stays a reliable daemon-down signal for every query shape.
+        if timeline.isDown || content.isDown || transcript.isDown {
             phase = .daemonDown
             return
         }
-        // U12: the local paywall gates all five recall verbs together, so the
-        // always-attempted timeline verb returning 402 `subscription_required` is
-        // authoritative for the whole search — the user is lapsed. Surface the
-        // dedicated upgrade phase, distinct from `.daemonDown` and any per-stream
-        // `.unavailable`, before assembling partial results.
-        if case .subscriptionRequired = timeline {
+        // U12: the local paywall gates all five recall verbs together, so a 402
+        // `subscription_required` on any attempted stream is authoritative for the
+        // whole search — the user is lapsed. Surface the dedicated upgrade phase,
+        // distinct from `.daemonDown` and any per-stream `.unavailable`, before
+        // assembling partial results.
+        if timeline.isSubscriptionRequired || content.isSubscriptionRequired
+            || transcript.isSubscriptionRequired {
             phase = .subscriptionRequired
             return
         }
@@ -474,6 +487,21 @@ final class SearchViewModel: ObservableObject {
         case subscriptionRequired
         case errored
         case ok(Payload)
+
+        /// A socket-level transport failure (daemon unreachable). Checked across
+        /// every attempted stream (SCR-176) so daemon-down is still detected when a
+        /// pure free-text query skips the timeline verb.
+        var isDown: Bool {
+            if case .down = self { return true }
+            return false
+        }
+
+        /// The local-paywall 402 gate. Any attempted stream carrying it is
+        /// authoritative — the five recall verbs gate together.
+        var isSubscriptionRequired: Bool {
+            if case .subscriptionRequired = self { return true }
+            return false
+        }
     }
 
     /// The daemon envelope code for the local-paywall gate (mirrors
