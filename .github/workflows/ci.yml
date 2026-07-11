@@ -168,3 +168,37 @@ jobs:
 
       - name: Run SCR-66 lock-policy contract guard
         run: pytest tests/test_recorder.py::TestLockPolicyContract -v --timeout=300
+
+  cloud-function-billing-linux:
+    # The scripts/cloud-function/ suite (incl. the billing security guards: uid-
+    # injection, webhook convergence, portal fail-closed) is a separate test tree
+    # from the main `tests/` package — pyproject.toml pins `testpaths = ["tests"]`
+    # on purpose, since scripts/cloud-function/ imports stripe and
+    # functions-framework, which the main dev env does not install and which
+    # could destabilize collection for the privacy lanes above if merged in. This
+    # job installs that tree's own requirements.txt in isolation and runs it as
+    # a standalone step instead. scripts/cloud-function/conftest.py patches out
+    # GCP/Firebase at collection time, so this needs no cloud credentials.
+    name: Cloud-function billing tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-${{ hashFiles('scripts/cloud-function/requirements.txt') }}
+
+      - name: Upgrade pip past CVE-2026-3219
+        run: pip install --upgrade "pip>=26.1"
+
+      - name: Install dependencies
+        run: pip install -r scripts/cloud-function/requirements.txt pytest
+
+      - name: Run cloud-function billing test suite
+        run: python -m pytest scripts/cloud-function/ -q

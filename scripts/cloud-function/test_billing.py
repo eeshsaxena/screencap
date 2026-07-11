@@ -264,9 +264,11 @@ def test_reconcile_search_failure_does_not_grant():
 #
 # New portal tests carry @pytest.mark.privacy for future CI wiring, but note
 # that pyproject.toml pins ``testpaths = ["tests"]`` — CI does NOT collect
-# scripts/cloud-function/, so today these run only via an explicit path
-# (``pytest scripts/cloud-function/``). The older checkout/reconcile tests
-# above are deliberately left unmarked.
+# scripts/cloud-function/ as part of the main pytest lane. It runs in CI via
+# the dedicated `cloud-function-billing-linux` step in .github/workflows/ci.yml
+# (``python -m pytest scripts/cloud-function/ -q``), kept separate because this
+# tree's imports (stripe, functions-framework) aren't installed in the main dev
+# env. The older checkout/reconcile tests above are deliberately left unmarked.
 
 PORTAL_URL = "https://billing.stripe/portal-session-xyz"
 
