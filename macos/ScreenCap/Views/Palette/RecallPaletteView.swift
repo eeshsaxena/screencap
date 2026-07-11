@@ -21,8 +21,14 @@ struct RecallPaletteView: View {
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
 
+    /// Search U6 (R4): one shared present-user gate for every gated corpus surface
+    /// in this palette session, so the grace window is shared (not re-prompted per
+    /// result). Only handed to the content when the corpus is encrypted.
+    @StateObject private var presenceGate = PresenceGate()
+
     @State private var query = ""
     @State private var contentIndexEnabled = false
+    @State private var corpusEncrypted = false
     @State private var consentDeclined = false
     @State private var backfillDeclined = false
     @State private var selectedResultID: SearchResultItem.ID?
@@ -68,6 +74,7 @@ struct RecallPaletteView: View {
                 selectedResultID: selectedResultID,
                 frameIndex: frameIndex,
                 thumbnailLoader: thumbnailLoader,
+                presenceGate: corpusEncrypted ? presenceGate : nil,
                 onEnableConsent: enableConsent,
                 onDeclineConsent: declineConsent,
                 onAcceptBackfill: model.acceptBackfill,
@@ -211,6 +218,7 @@ struct RecallPaletteView: View {
             let data = try await CLIClient.runJSONRaw(["settings", "--json"])
             let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
             contentIndexEnabled = env.settings.contentIndexEnabled ?? false
+            corpusEncrypted = env.settings.corpusEncrypted ?? false
             consentDeclined = env.settings.contentIndexConsentDeclined ?? false
             backfillDeclined = env.settings.contentIndexBackfillDeclined ?? false
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
@@ -270,6 +278,10 @@ struct RecallPaletteContent: View {
     let selectedResultID: SearchResultItem.ID?
     let frameIndex: RecordingFrameIndex?
     let thumbnailLoader: ThumbnailLoader?
+    /// Search U6 (R4): when set (corpus encrypted / guardrails on), the results list
+    /// — which carries still previews — reveals only after present-user auth. `nil`
+    /// (default / pre-flip) leaves results ungated, unchanged.
+    var presenceGate: PresenceGate? = nil
     var onEnableConsent: () -> Void = {}
     var onDeclineConsent: () -> Void = {}
     var onAcceptBackfill: () -> Void = {}
@@ -348,29 +360,42 @@ struct RecallPaletteContent: View {
     @ViewBuilder
     private var resultsList: some View {
         if case .loaded(let results) = phase {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(RecallPalette.groups(results), id: \.label) { group in
-                        Text(group.label)
-                            .font(SCTypography.mono(size: 10))
-                            .tracking(1.0)
-                            .foregroundStyle(Color.scInkMuted)
-                            .accessibilityAddTraits(.isHeader)
-                        ForEach(group.items, id: \.id) { item in
-                            RecallPaletteRow(
-                                item: item,
-                                queryTerms: queryTerms,
-                                isSelected: item.id == effectiveSelectedID(results),
-                                frameIndex: frameIndex,
-                                thumbnailLoader: thumbnailLoader,
-                                onOpen: { onOpen(item) }
-                            )
-                        }
+            if let gate = presenceGate {
+                // Search U6 (R4): one unlock reveals the whole results set (still
+                // previews + text) and opens the session grace window.
+                PresenceGatedContent(gate: gate, reason: "View your search results") {
+                    resultsScroll(results)
+                }
+                .frame(maxHeight: 420)
+            } else {
+                resultsScroll(results)
+                    .frame(maxHeight: 420)
+            }
+        }
+    }
+
+    private func resultsScroll(_ results: SearchResults) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(RecallPalette.groups(results), id: \.label) { group in
+                    Text(group.label)
+                        .font(SCTypography.mono(size: 10))
+                        .tracking(1.0)
+                        .foregroundStyle(Color.scInkMuted)
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(group.items, id: \.id) { item in
+                        RecallPaletteRow(
+                            item: item,
+                            queryTerms: queryTerms,
+                            isSelected: item.id == effectiveSelectedID(results),
+                            frameIndex: frameIndex,
+                            thumbnailLoader: thumbnailLoader,
+                            onOpen: { onOpen(item) }
+                        )
                     }
                 }
-                .padding(14)
             }
-            .frame(maxHeight: 420)
+            .padding(14)
         }
     }
 

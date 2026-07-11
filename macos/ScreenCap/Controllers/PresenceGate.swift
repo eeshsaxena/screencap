@@ -35,7 +35,7 @@ struct LocalAuthPresence: PresenceEvaluating {
 }
 
 @MainActor
-final class PresenceGate {
+final class PresenceGate: ObservableObject {
     static let defaultGraceWindow: TimeInterval = 15 * 60  // 15 minutes (OQ1 proposed)
 
     private let evaluator: PresenceEvaluating

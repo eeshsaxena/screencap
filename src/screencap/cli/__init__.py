@@ -2959,6 +2959,7 @@ def settings(ctx, set_pair, as_json):
         get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
+        get_corpus_encrypted,
         get_recordings_dir,
         get_rest_threshold,
         get_show_on_website,
@@ -3043,6 +3044,9 @@ def settings(ctx, set_pair, as_json):
         "content_index_consent_declined": bool(get_content_index_consent_declined()),
         "content_index_backfill_declined": bool(get_content_index_backfill_declined()),
         "cloud_e2ee_enabled": bool(get_cloud_e2ee_enabled()),
+        # Search U8: whether the recall corpus is encrypted (guardrails on) — the app
+        # gates present-user auth on corpus-still display only when this is true.
+        "corpus_encrypted": bool(get_corpus_encrypted()),
         "privacy": _build_privacy_settings_block(),
     }
 
