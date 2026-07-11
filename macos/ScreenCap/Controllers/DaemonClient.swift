@@ -240,17 +240,24 @@ struct RecordingStartRequest: Encodable {
     /// stale daemon ignores the unknown field and its response omits the echo —
     /// the app then treats the effective state as audio-on.
     let audio: Bool?
+    /// Search U8: explicit stills override. `nil` omits the field so the daemon's
+    /// readiness gate decides (default-on when the guardrails are ready);
+    /// `true`/`false` force stills on/off for this recording (the pause/resume
+    /// affordance). A stale daemon ignores the unknown field.
+    let captureImages: Bool?
 
-    init(name: String? = nil, startedBy: String? = nil, audio: Bool? = nil) {
+    init(name: String? = nil, startedBy: String? = nil, audio: Bool? = nil, captureImages: Bool? = nil) {
         self.name = name
         self.startedBy = startedBy
         self.audio = audio
+        self.captureImages = captureImages
     }
 
     enum CodingKeys: String, CodingKey {
         case name
         case startedBy = "started_by"
         case audio
+        case captureImages = "capture_images"
     }
 }
 

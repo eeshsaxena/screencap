@@ -113,8 +113,10 @@ struct ScreenshotTruthPane: View {
         // builds on return and decodes lazily at draw time.
         .task(id: currentFrameURL) {
             guard let url = currentFrameURL, loaded?.url != url else { return }
+            // Search U6: decrypt a `*.jpg.enc` corpus still transparently (plaintext
+            // `*.jpg` reads unchanged). Runs off the main actor; `Data` is Sendable.
             let data = await Task.detached(priority: .userInitiated) {
-                try? Data(contentsOf: url)
+                CorpusCrypto.readStillData(at: url)
             }.value
             if !Task.isCancelled {
                 loaded = LoadedFrame(url: url, image: data.flatMap { NSImage(data: $0) })

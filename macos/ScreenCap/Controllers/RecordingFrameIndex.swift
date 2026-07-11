@@ -158,20 +158,29 @@ actor RecordingFrameIndex {
     }
 
     /// Static loader so it is testable with an explicit root. Applies the
-    /// path-containment guard, then parses `{epoch}.jpg` stems → ms (skipping
+    /// path-containment guard, then parses `{epoch}.jpg[.enc]` stems → ms (skipping
     /// non-numeric stems, drift-resilient), sorted ascending by time.
+    ///
+    /// Search U6: enumerate both the plaintext `*.jpg` and the encrypted `*.jpg.enc`
+    /// forms (the `ThumbnailLoader` decode seam decrypts the latter). A frame present
+    /// as BOTH during the migration window is listed once (dedup by ms); the poster
+    /// fallback for video-only recordings is unchanged.
     static func loadFrames(root: URL, recording: String) -> [FrameRef] {
         guard let dir = screenshotsDir(root: root, recording: recording) else { return [] }
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
         ) else { return [] }
-        return entries
-            .filter { $0.pathExtension.lowercased() == "jpg" }
-            .compactMap { url -> FrameRef? in
-                guard let ts = Double(url.deletingPathExtension().lastPathComponent) else { return nil }
-                return FrameRef(url: url, ms: Int((ts * 1000).rounded()))
-            }
-            .sorted { $0.ms < $1.ms }
+        var byMs: [Int: FrameRef] = [:]
+        for url in entries {
+            let name = url.lastPathComponent
+            guard name.hasSuffix(".jpg") || name.hasSuffix(".jpg.enc") else { continue }
+            let logical = CorpusCrypto.logicalStillName(url)  // "<ts>.jpg"
+            guard logical.hasSuffix(".jpg"),
+                  let ts = Double(logical.dropLast(4)) else { continue }
+            let ms = Int((ts * 1000).rounded())
+            if byMs[ms] == nil { byMs[ms] = FrameRef(url: url, ms: ms) }
+        }
+        return byMs.values.sorted { $0.ms < $1.ms }
     }
 
     /// The recording's `screenshots/` dir, or `nil` when `recording` is not a

@@ -13,7 +13,31 @@ crypto/gating core (U6 core) landed. Plan:
   and `PresenceGate.swift` (LAContext + grace window + fail-closed), `PresenceGateTests`.
   Both test classes pass under `xcodebuild test`.
 
-## Remaining — U6 app integration (Swift)
+## Done — U6/U8 Swift (compiles under `xcodebuild build-for-testing`; 19 tests pass)
+- U6 read path: `ThumbnailLoader` decrypting decode seam (`makeDecryptingDecode`,
+  `decodeDownsampled(data:)`), `RecordingFrameIndex.loadFrames` enumerates `*.jpg.enc`
+  (deduped), `CorpusCrypto.readStillData` + `ScreenshotTruthPane` decrypt. Tested by
+  `EncryptedFrameDecodeTests` (enc enumeration + decrypt-decode + no-key placeholder).
+- U6 present-user gate: `PresenceGate` (+ tests) and the reusable
+  `PresenceGatedContent` SwiftUI wrapper (the per-surface adoption primitive).
+- U8 disclosure: `SearchDisclosureController` + `SearchDisclosureCopy` +
+  `SearchDisclosurePolicy` + `SearchDisclosureView`; `DaemonClient.RecordingStartRequest`
+  gains the `capture_images` passthrough. Tested by `OnboardingSearchDisclosureTests`
+  (copy honesty + enable/decline CLI args + presentation decision).
+
+## Remaining — needs runtime UI verification (manual QA)
+- Adopt `PresenceGatedContent(gate:)` on the actual display surfaces (search-result
+  still grid + `ScreenshotTruthPane` + any full-size still), with ONE shared
+  `PresenceGate` owned as an `@StateObject` by the shell so the grace window is shared.
+  The wrapper + gate logic are done + tested; only the view-tree threading +
+  interaction verification remain.
+- Present `SearchDisclosureView` in the onboarding wizard flow (new installs) and as a
+  one-time post-update sheet (existing installs), driven by
+  `SearchDisclosurePolicy.shouldPresent`. The model/copy/actions are done + tested;
+  inserting the step into `OnboardingStepPolicy`'s derivation + the post-update
+  presentation trigger remain.
+
+## Remaining — U6 app provisioning (Swift) — the release blocker
 - **App `keychain-access-groups` provisioning (SCR-242 sibling — the blocker).**
   OQ4 was resolved to option (a): the app reads the corpus key from the shared group
   `2A8S6MV8DZ.com.screencap.shared`. `keychain-access-groups` is a **restricted**

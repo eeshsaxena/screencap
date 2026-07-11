@@ -132,6 +132,20 @@ struct CorpusCrypto {
         return try decrypt(token, recording: recording, name: name)
     }
 
+    /// Read a still's JPEG bytes, decrypting a `*.jpg.enc` transparently (loading the
+    /// corpus key on demand). The single still-bytes read seam for the app's
+    /// full-size views. Returns nil for a missing file or a failed decrypt (e.g. the
+    /// key isn't available in a dev build) → the caller shows a placeholder.
+    static func readStillData(at url: URL) -> Data? {
+        if isEncryptedStill(url) {
+            guard let corpus = try? CorpusCrypto(), let data = try? corpus.decryptStill(at: url) else {
+                return nil
+            }
+            return data
+        }
+        return try? Data(contentsOf: url)
+    }
+
     /// The logical (plaintext) basename of a still — `<ts>.jpg`, `.enc` stripped.
     static func logicalStillName(_ url: URL) -> String {
         let name = url.lastPathComponent
