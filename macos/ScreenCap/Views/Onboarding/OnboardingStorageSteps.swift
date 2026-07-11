@@ -221,6 +221,29 @@ struct OnboardingAccountStep: View {
             && auth.trialState != .subscribed
     }
 
+    /// Whether the wizard may leave this step: signed in, and either no
+    /// entitlement hold remains (paywall off, Team, offline-stale grace) or a
+    /// paid entitlement has actually resolved. Deliberately keyed on ANY
+    /// resolved entitlement — `isSubscribed` or any held `tier` (a trial
+    /// carries the tier it converts into) — NOT only the storage-mapped
+    /// `checkoutTier`: a user who picked Local storage but bought Cloud in the
+    /// sheet must advance too, not be stranded with only Skip.
+    private var canAdvance: Bool {
+        auth.isSignedIn
+            && (!mustStayForEntitlement || auth.isSubscribed || auth.tier != .none)
+    }
+
+    /// One-shot latch: the settle callback, the entitlement observers, and the
+    /// on-appear short-circuit can all conclude "advance" for the same resolve
+    /// — the wizard must move exactly once.
+    @State private var didAdvance = false
+
+    private func advanceIfSettled() {
+        guard !didAdvance, canAdvance else { return }
+        didAdvance = true
+        onSignedIn()
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             AccountSheetView(
@@ -231,7 +254,7 @@ struct OnboardingAccountStep: View {
                     // already-entitled, and offline-stale accounts advance
                     // immediately; a paid tier holds for entitlement — the
                     // onChange wiring below advances once it resolves.
-                    if !mustStayForEntitlement { onSignedIn() }
+                    advanceIfSettled()
                 }
                 // No onDismiss: embedded in the wizard chrome, the skip link
                 // below is the way past this step.
@@ -242,15 +265,21 @@ struct OnboardingAccountStep: View {
         }
         .padding(.horizontal, 100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Trial/subscription just became active (webhook granted it) → finish.
-        // Cloud maps to `isSubscribed`; Local Pro converts once the tier resolves
-        // (not `isSubscribed`, which is cloud-only), so also finish when the
-        // resolved entitlement tier now matches what this step checked out.
-        .onChange(of: auth.isSubscribed) { subscribed in
-            if subscribed, checkoutTier == .cloud { onSignedIn() }
-        }
-        .onChange(of: auth.tier) { newTier in
-            if newTier == checkoutTier, checkoutTier != .none { onSignedIn() }
+        // A paid entitlement just resolved (webhook granted it) → finish.
+        // Cloud surfaces as `isSubscribed`; either trial/paid tier surfaces as
+        // `tier`/`trialState` — watch all three so the advance keys on the
+        // entitlement actually granted, whichever tier it is (cross-tier fix).
+        .onChange(of: auth.isSubscribed) { _ in advanceIfSettled() }
+        .onChange(of: auth.tier) { _ in advanceIfSettled() }
+        .onChange(of: auth.trialState) { _ in advanceIfSettled() }
+        // Replay / already-signed-in fix: `onSettled` fires only on the
+        // signed-out → signed-in TRANSITION, so a user re-running onboarding
+        // while signed in and entitled would otherwise get no advance at all.
+        // Resolve lazily, then short-circuit (mirrors the retired
+        // `proceedAfterSignIn` behavior). No-ops when a hold remains.
+        .task {
+            await auth.refreshIfNeeded()
+            advanceIfSettled()
         }
     }
 }

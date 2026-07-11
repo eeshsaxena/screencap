@@ -142,6 +142,15 @@ enum AccountSheetPolicy {
         state == .trial
     }
 
+    /// R10/AE4 seam placement: the shared `errorSection` renders `accountError`
+    /// in every state EXCEPT signed-out — there `signInSection` already owns
+    /// the sign-in failure display (message + a working Try Again), so the
+    /// error seam rendering on top would stack a second copy of the failure
+    /// with a retry wired to a billing action that never ran.
+    static func showsErrorSection(state: AccountSheetState) -> Bool {
+        state != .signedOut
+    }
+
     // MARK: - Tier buttons
 
     /// How one tier row renders in a given state.
@@ -153,6 +162,14 @@ enum AccountSheetPolicy {
         /// subscription for a tier the account already holds (U4 approach);
         /// tier switching goes through Manage Subscription.
         case currentPlan
+        /// The OTHER tier while the account already holds a subscription
+        /// (trial / subscribed / checkout-pending with a held tier): a
+        /// secondary button routing to the Stripe portal
+        /// (`startManageSubscription`), NOT a buy button — a fresh checkout
+        /// for an existing subscriber would mint a SECOND subscription (U4:
+        /// "tier switching for existing subscribers goes through Manage
+        /// Subscription").
+        case switchViaPortal
         /// Signed-out plans preview (R4): visible with pricing, not tappable.
         case disabledPreview
         /// Not rendered at all (neutral/unknown states, paywall off).
@@ -165,7 +182,9 @@ enum AccountSheetPolicy {
     ///
     /// `checkoutPending` keeps tiers tappable (KTD-6): a re-tap replaces the
     /// remembered target and re-runs checkout, so an abandoned Stripe tab is
-    /// always recoverable in place.
+    /// always recoverable in place — but only while NO tier is held; once a
+    /// subscription exists, the cross-tier affordance is portal-routed
+    /// (`switchViaPortal`), never a second checkout.
     static func tierAffordance(
         tier: EntitlementTier,
         state: AccountSheetState,
@@ -179,7 +198,8 @@ enum AccountSheetPolicy {
         case .signedOut:
             return .disabledPreview
         case .trial, .subscribed, .checkoutPending:
-            return (tier == heldTier && heldTier != .none) ? .currentPlan : .buy
+            guard heldTier != .none else { return .buy }
+            return tier == heldTier ? .currentPlan : .switchViaPortal
         case .lapsed:
             return .buy
         }
@@ -200,17 +220,23 @@ enum AccountSheetPolicy {
 
     /// The review window's Upload branch (R14). Signed out → the sheet
     /// (sign-in framing). Signed in on Local Pro with the paywall on → the
-    /// sheet (upgrade-to-Cloud framing) instead of a raw signer error.
+    /// sheet (upgrade-to-Cloud framing) instead of a raw signer error. A
+    /// definitively lapsed signed-in account (`trialState == .lapsed`) → the
+    /// sheet too — proceeding would also just hit the raw signer refusal.
     /// Everything else proceeds — including paywall-off (pre-billing behavior:
     /// no upgrade surface exists to show, R9) and the stale/offline case
-    /// (`tier` resolves `.none` when stale; grace must never gate, KTD-4).
+    /// (`tier` resolves `.none` and `trialState` resolves `.indeterminate`
+    /// when stale; grace must never gate, KTD-4).
     static func uploadEntryAction(
         isSignedIn: Bool,
         tier: EntitlementTier,
+        trialState: TrialState,
         paywallEnabled: Bool
     ) -> UploadEntryAction {
         guard isSignedIn else { return .presentAccountSheet }
-        if paywallEnabled, tier == .localPro { return .presentAccountSheet }
+        if paywallEnabled, tier == .localPro || trialState == .lapsed {
+            return .presentAccountSheet
+        }
         return .proceed
     }
 
@@ -367,6 +393,19 @@ enum AccountSheetCopy {
 
     static let currentPlanBadge = "Current plan"
     static let manageSubscription = "Manage Subscription"
+    /// The cross-tier affordance for an existing subscriber (`switchViaPortal`):
+    /// routes to Manage Subscription rather than checkout — never a second
+    /// subscription, no terminal phrasing (R10).
+    static func switchPlanButtonTitle(_ tier: EntitlementTier) -> String? {
+        switch tier {
+        case .localPro, .cloud:
+            return "Switch to \(planName(tier))…"
+        case .none:
+            return nil
+        }
+    }
+    /// Caption under the switch button: honest about where the switch happens.
+    static let switchPlanDetail = "Plan changes happen in Manage Subscription"
     /// Trial cancel affordance (R7): the app promises pre-conversion
     /// cancellation, and Manage Subscription is where it happens.
     static let trialCancelAffordance =
@@ -402,10 +441,12 @@ enum AccountSheetCopy {
             signOutConfirmBodyUngated, signOutConfirmAction,
             signOutDisabledUploadInFlight,
             currentPlanBadge, manageSubscription, trialCancelAffordance,
+            switchPlanDetail,
             checkoutPendingBanner, reconcileCheckNow, reconcileStillProcessing,
             notNow, close,
         ]
         + [EntitlementTier.localPro, .cloud].compactMap(tierButtonTitle)
+        + [EntitlementTier.localPro, .cloud].compactMap(switchPlanButtonTitle)
         + [EntitlementTier.localPro, .cloud].compactMap(tierDetail)
         + [EntitlementTier.localPro, .cloud, .none].map(planName)
     }

@@ -214,37 +214,64 @@ final class AccountSheetPolicyTests: XCTestCase {
     func testUploadEntryActionBranches() {
         XCTAssertEqual(
             AccountSheetPolicy.uploadEntryAction(
-                isSignedIn: false, tier: .none, paywallEnabled: true
+                isSignedIn: false, tier: .none, trialState: .indeterminate,
+                paywallEnabled: true
             ),
             .presentAccountSheet
         )
         XCTAssertEqual(
             AccountSheetPolicy.uploadEntryAction(
-                isSignedIn: true, tier: .localPro, paywallEnabled: true
+                isSignedIn: true, tier: .localPro, trialState: .subscribed,
+                paywallEnabled: true
             ),
             .presentAccountSheet
         )
         XCTAssertEqual(
             AccountSheetPolicy.uploadEntryAction(
-                isSignedIn: true, tier: .cloud, paywallEnabled: true
+                isSignedIn: true, tier: .cloud, trialState: .subscribed,
+                paywallEnabled: true
+            ),
+            .proceed
+        )
+    }
+
+    /// A definitively lapsed signed-in account (`tier == .none`, `trialState
+    /// == .lapsed`) presents the sheet too — proceeding would just hit the raw
+    /// signer refusal the sheet exists to replace.
+    func testUploadEntryActionLapsedPresentsSheet() {
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: true, tier: .none, trialState: .lapsed,
+                paywallEnabled: true
+            ),
+            .presentAccountSheet
+        )
+        // Paywall off: lapsed has no upgrade surface to show (R9) — proceed.
+        XCTAssertEqual(
+            AccountSheetPolicy.uploadEntryAction(
+                isSignedIn: true, tier: .none, trialState: .lapsed,
+                paywallEnabled: false
             ),
             .proceed
         )
     }
 
     /// Paywall off is pre-billing behavior (R9 — there is no upgrade surface
-    /// to show), and the stale/offline case resolves `tier == .none` (KTD-4 —
-    /// grace never gates): both proceed for a signed-in account.
+    /// to show), and the stale/offline case resolves `tier == .none` +
+    /// `trialState == .indeterminate` (KTD-4 — grace never gates): both
+    /// proceed for a signed-in account.
     func testUploadEntryActionPaywallOffAndGraceProceed() {
         XCTAssertEqual(
             AccountSheetPolicy.uploadEntryAction(
-                isSignedIn: true, tier: .localPro, paywallEnabled: false
+                isSignedIn: true, tier: .localPro, trialState: .subscribed,
+                paywallEnabled: false
             ),
             .proceed
         )
         XCTAssertEqual(
             AccountSheetPolicy.uploadEntryAction(
-                isSignedIn: true, tier: .none, paywallEnabled: true
+                isSignedIn: true, tier: .none, trialState: .indeterminate,
+                paywallEnabled: true
             ),
             .proceed
         )
@@ -295,9 +322,12 @@ final class AccountSheetPolicyTests: XCTestCase {
 
     /// The already-held tier (trialing or subscribed) renders as current-plan
     /// — checkout can never mint a second subscription for a tier the account
-    /// already holds — while the other tier stays tappable.
-    func testHeldTierRendersCurrentPlanOtherTierTappable() {
-        // Trialing Local Pro: Local Pro is current, Cloud is buyable.
+    /// already holds — while the OTHER tier is switch-routed through the
+    /// Stripe portal (`switchViaPortal`), never a buy button: a fresh checkout
+    /// for an existing subscriber would mint a second subscription (U4: tier
+    /// switching goes through Manage Subscription).
+    func testHeldTierRendersCurrentPlanOtherTierSwitchRouted() {
+        // Trialing Local Pro: Local Pro is current, Cloud is portal-routed.
         XCTAssertEqual(
             AccountSheetPolicy.tierAffordance(
                 tier: .localPro, state: .trial, heldTier: .localPro, paywallEnabled: true
@@ -308,9 +338,9 @@ final class AccountSheetPolicyTests: XCTestCase {
             AccountSheetPolicy.tierAffordance(
                 tier: .cloud, state: .trial, heldTier: .localPro, paywallEnabled: true
             ),
-            .buy
+            .switchViaPortal
         )
-        // Subscribed Cloud: Cloud is current, Local Pro tappable.
+        // Subscribed Cloud: Cloud is current, Local Pro portal-routed.
         XCTAssertEqual(
             AccountSheetPolicy.tierAffordance(
                 tier: .cloud, state: .subscribed, heldTier: .cloud, paywallEnabled: true
@@ -321,19 +351,20 @@ final class AccountSheetPolicyTests: XCTestCase {
             AccountSheetPolicy.tierAffordance(
                 tier: .localPro, state: .subscribed, heldTier: .cloud, paywallEnabled: true
             ),
-            .buy
+            .switchViaPortal
         )
     }
 
-    /// KTD-6: tier buttons stay active during checkout-pending (a re-tap
-    /// replaces the target), with the held tier still rendered current-plan;
-    /// lapsed (held tier none) renders both tiers buyable.
-    func testCheckoutPendingKeepsTiersTappableAndLapsedBuysBoth() {
+    /// KTD-6 within the no-second-subscription rule: during checkout-pending
+    /// with a held tier, the held tier stays current-plan and the other tier
+    /// is portal-routed; a pending checkout with NO held tier keeps both tiers
+    /// buyable (the re-tap-replaces-target recovery), as does lapsed.
+    func testCheckoutPendingAffordancesAndLapsedBuysBoth() {
         XCTAssertEqual(
             AccountSheetPolicy.tierAffordance(
                 tier: .cloud, state: .checkoutPending, heldTier: .localPro, paywallEnabled: true
             ),
-            .buy
+            .switchViaPortal
         )
         XCTAssertEqual(
             AccountSheetPolicy.tierAffordance(
@@ -342,12 +373,51 @@ final class AccountSheetPolicyTests: XCTestCase {
             .currentPlan
         )
         for tier in [EntitlementTier.localPro, .cloud] {
+            // No held tier (e.g. a lapsed account's pending checkout): the
+            // abandoned-Stripe-tab recovery — both tiers stay buyable.
+            XCTAssertEqual(
+                AccountSheetPolicy.tierAffordance(
+                    tier: tier, state: .checkoutPending, heldTier: .none, paywallEnabled: true
+                ),
+                .buy
+            )
             XCTAssertEqual(
                 AccountSheetPolicy.tierAffordance(
                     tier: tier, state: .lapsed, heldTier: .none, paywallEnabled: true
                 ),
                 .buy
             )
+        }
+    }
+
+    /// Signed-out stays a disabled preview and lapsed stays buy — the
+    /// portal-routing applies only where a subscription already exists.
+    func testSwitchRoutingLeavesSignedOutAndLapsedUnchanged() {
+        XCTAssertEqual(
+            AccountSheetPolicy.tierAffordance(
+                tier: .cloud, state: .signedOut, heldTier: .none, paywallEnabled: true
+            ),
+            .disabledPreview
+        )
+        XCTAssertEqual(
+            AccountSheetPolicy.tierAffordance(
+                tier: .cloud, state: .lapsed, heldTier: .none, paywallEnabled: true
+            ),
+            .buy
+        )
+    }
+
+    // MARK: - Error seam visibility (dead-retry dedup)
+
+    /// The shared error section is suppressed while the sheet renders
+    /// signed-out: there `signInSection` owns the failure display (message +
+    /// working retry), and rendering `accountError` on top stacked two copies
+    /// of the failure plus a dead "Try Again". Every other state renders it.
+    func testErrorSectionHiddenWhileSignedOut() {
+        XCTAssertFalse(AccountSheetPolicy.showsErrorSection(state: .signedOut))
+        for shown in [AccountSheetState.unknown, .neutral, .trial, .subscribed,
+                      .lapsed, .checkoutPending] {
+            XCTAssertTrue(AccountSheetPolicy.showsErrorSection(state: shown), "\(shown)")
         }
     }
 
