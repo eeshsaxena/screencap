@@ -26,7 +26,7 @@ struct FirstRunPrivacyBanner: View {
                     .font(.body)
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("For finer control (mask URLs, mask window titles), run `screencap setup` in Terminal.")
+                Text("For finer control (mask URLs, mask window titles), this requires the developer CLI.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

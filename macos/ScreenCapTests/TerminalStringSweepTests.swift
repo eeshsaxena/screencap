@@ -159,21 +159,12 @@ final class TerminalStringSweepTests: XCTestCase {
     /// upload retry, privacy banner, agent-CLI connect guidance). The sweep
     /// bans everything else; this list may only SHRINK — the test fails if an
     /// entry stops matching (delete it here) or if any account-surface file
-    /// ever appears in it. Follow-up tracked outside this plan.
-    private static let grandfathered: [(file: String, phrase: String)] = [
-        ("Controllers/RecorderController.swift",
-         "Try `screencap stop` in a terminal."),
-        ("Controllers/InspectRouting.swift",
-         "Run `screencap download "),
-        ("Controllers/RecordingStateMachine.swift",
-         "Run `screencap upload` to retry."),
-        ("Views/Privacy/FirstRunPrivacyBanner.swift",
-         "run `screencap setup` in Terminal."),
-        ("Views/Settings/ConnectProviderModel.swift",
-         "run `codex login`"),
-        ("Views/Settings/ConnectProviderModel.swift",
-         "run `claude` once"),
-    ]
+    /// ever appears in it.
+    ///
+    /// All six pre-existing sites were rewritten to app-native / informational
+    /// phrasing (no terminal instruction) — see git history for the fix; this
+    /// list is empty on purpose and should stay that way.
+    private static let grandfathered: [(file: String, phrase: String)] = []
 
     // MARK: - 1+2: literal-level sweep + vacuity guards
 

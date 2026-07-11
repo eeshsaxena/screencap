@@ -272,7 +272,7 @@ final class RecorderControllerTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.lastError,
-            "Recording stopped, but some data may not have uploaded. Run `screencap upload` to retry."
+            "Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."
         )
     }
 

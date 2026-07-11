@@ -665,7 +665,7 @@ final class RecorderController: ObservableObject {
             if isDaemon {
                 handleDaemonOperationFailure(error)
             } else {
-                lastError = "Failed to send stop signal: \(error.localizedDescription). Try `screencap stop` in a terminal."
+                lastError = "Failed to send stop signal: \(error.localizedDescription). Try stopping the recording again, or quit ScreenCap if it won't stop."
             }
             if quitting {
                 quitProgressSecondsRemaining = nil

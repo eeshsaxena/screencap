@@ -275,7 +275,7 @@ struct RecordingStateMachine {
             // Both stop policies care about this; the in-app path resolves on it.
             var effects: [Effect] = [.resolveAwaiting(.finalized, success: true)]
             if event.forceStopped == true {
-                effects.append(.surfaceError("Recording stopped, but some data may not have uploaded. Run `screencap upload` to retry."))
+                effects.append(.surfaceError("Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."))
             }
             effects.append(.refreshIndex)
             return effects
