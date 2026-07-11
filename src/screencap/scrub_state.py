@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -89,26 +87,12 @@ def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    directory = str(path.parent) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".scrub_state.tmp")
-    closed = False
-    try:
-        os.write(fd, text.encode("utf-8"))
-        os.close(fd)
-        closed = True
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, str(path))
-    except BaseException:
-        if not closed:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    from screencap.atomic_io import atomic_write_0600
+
+    # fsync=True (was silently dropped before consolidation): the scrub-state marker
+    # gates whether frame.read may serve a chunk's stills, so it must survive a crash
+    # durably rather than tearing to empty/garbage. Written per-chunk, so cheap.
+    atomic_write_0600(path, text.encode("utf-8"), fsync=True, suffix=".scrub_state.tmp")
 
 
 __all__ = [

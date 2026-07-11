@@ -19,6 +19,12 @@ import pytest
 from screencap.mcp import server
 from screencap.mcp._client import AsyncDaemonClient, DaemonError, LivenessSubscription
 
+# The MCP surface is the agent-facing recall/search contract (pointer-only hits, the
+# frame.nearest `encrypted` steer, the frame.read decrypt seam). Mark privacy so these
+# guards actually RUN on CI's privacy lanes — otherwise a response-shape/registration
+# drift (as happened for `encrypted` + `read_frame`) ships green because unrun.
+pytestmark = pytest.mark.privacy
+
 # --------------------------------------------------------------------------
 # Stub client (mapping / clamp / error / no-match)
 # --------------------------------------------------------------------------
@@ -47,6 +53,9 @@ class _StubClient:
 
     async def frame_nearest(self, recording, timestamp_ms, *, staleness_cap_ms=None):
         return await self._reply("frame", recording, timestamp_ms, staleness_cap_ms)
+
+    async def frame_read(self, recording, stem):
+        return await self._reply("frame_bytes", recording, stem)
 
     async def list_recordings(self):
         return await self._reply("recordings")
@@ -135,8 +144,10 @@ async def test_resolve_frame_maps_pointer(monkeypatch):
     assert isinstance(result, server.FrameNearest)
     assert result.stem == "1719400010.000000"
     assert result.delta_ms == -1000
-    # Pointer-only by construction: a stem + delta, no path/bytes field.
-    assert set(server.FrameNearest.model_fields) == {"stem", "delta_ms"}
+    assert result.encrypted is False  # unencrypted corpus -> read the .jpg directly
+    # Pointer-only by construction: a stem + delta + the encrypted steer, no
+    # path/bytes field.
+    assert set(server.FrameNearest.model_fields) == {"stem", "delta_ms", "encrypted"}
 
 
 @pytest.mark.asyncio
@@ -152,12 +163,40 @@ async def test_resolve_frame_miss_is_null(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_read_frame_maps_bytes(monkeypatch):
+    stub = _StubClient({
+        "frame_bytes": {
+            "ok": True, "image_base64": "ZmFrZS1qcGVn", "content_type": "image/jpeg",
+        },
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.read_frame("demo", "1719400010.000000")
+    assert isinstance(result, server.FrameBytes)
+    assert result.image_base64 == "ZmFrZS1qcGVn"
+    assert result.content_type == "image/jpeg"
+    # The stem is forwarded verbatim to the daemon verb.
+    assert stub.calls[0] == ("frame_bytes", "demo", "1719400010.000000")
+
+
+@pytest.mark.asyncio
+async def test_read_frame_refusal_is_null(monkeypatch):
+    # Fail-closed: missing / blocked / unscrubbed-chunk collapses to a null image.
+    stub = _StubClient({"frame_bytes": {"ok": True, "image_base64": None, "content_type": None}})
+    _use_client(monkeypatch, stub)
+
+    result = await server.read_frame("demo", "1719400010.000000")
+    assert result.image_base64 is None
+    assert result.content_type is None
+
+
+@pytest.mark.asyncio
 async def test_resolve_frame_is_registered():
     mcp = server.build_server()
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
         "search_screen_content", "search_transcript", "query_timeline",
-        "resolve_frame", "list_recordings", "whoami", "chat_answer",
+        "resolve_frame", "read_frame", "list_recordings", "whoami", "chat_answer",
     }
 
 

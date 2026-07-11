@@ -27,6 +27,11 @@ _TIMELINE_DAY_API_VERSION = 1
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
 _FRAME_NEAREST_API_VERSION = 1
 _FRAME_READ_API_VERSION = 1
+# Search U8 frame.read size cap — a single decrypt-and-serve cannot return an
+# unbounded payload over the UDS. Module-level so the handler reads it as
+# ``schema._FRAME_READ_MAX_BYTES`` (it is NOT resolved through the lazy model
+# dispatcher, unlike the request/response classes).
+_FRAME_READ_MAX_BYTES = 8_000_000  # ~8 MB — comfortably above a full-screen JPEG
 # SCR-179 query-parser vocabulary verb. Additive (new verb) — no global
 # API_SCHEMA_VERSION bump (mirrors the `permissions`/SCR-148 additive precedent).
 _APPS_LIST_API_VERSION = 1
@@ -492,10 +497,6 @@ def _load_models() -> dict[str, Any]:
         # False → the agent reads the path as before).
         encrypted: bool = False
 
-    # Search U8 frame.read: size-capped so a single decrypt-and-serve cannot return
-    # an unbounded payload over the UDS.
-    _FRAME_READ_MAX_BYTES = 8_000_000  # ~8 MB — comfortably above a full-screen JPEG
-
     class FrameReadRequest(_DaemonModel):
         """Search U8 / KTD6 decrypt-and-serve input.
 
@@ -505,7 +506,11 @@ def _load_models() -> dict[str, Any]:
         canonical name validator in the handler (traversal-safe)."""
 
         recording: str
-        stem: str
+        # A bare numeric screenshot stem (e.g. "1719400010.000000"). Constrained at
+        # the schema boundary so a traversal-shaped / non-numeric stem is rejected
+        # before the handler ever builds a path from it (defense in depth with the
+        # handler's own float(stem) parse).
+        stem: str = Field(pattern=r"^\d+(\.\d+)?$", max_length=32)
 
     class FrameReadResponse(EnvelopeResponse):
         """Decrypted still bytes for an ALLOW, scrubbed frame — base64, size-capped.

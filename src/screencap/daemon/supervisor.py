@@ -26,6 +26,7 @@ from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus, _Subscri
 from screencap.pidfile import CLAIMANT_DAEMON
 
 if TYPE_CHECKING:
+    from screencap.capture_gate import CaptureGateResult
     from screencap.daemon.schema import RecordingStartRequest
     from screencap.terminal_stage import TerminalResult
 

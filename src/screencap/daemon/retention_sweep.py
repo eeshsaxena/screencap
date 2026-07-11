@@ -63,22 +63,35 @@ def sweep_once(recordings_dir: Path | str | None = None, *, now: float | None = 
     except OSError:
         return report
 
-    for rec_dir in rec_dirs:
-        try:
-            sub = retention.evict_screenshots(
-                rec_dir,
-                now=now,
-                days=days,
-                size_cap_mb=size_cap_mb,
-                last_indexed_ts=retention._last_indexed_ts(rec_dir.name),
-            )
-            report.recordings_scanned += 1
-            report.stills_evicted += len(sub.evicted)
-            report.bytes_freed += sub.bytes_freed
-            report.index_rows_purged += sub.index_rows_purged
-        except Exception as exc:  # noqa: BLE001 — one bad dir must not abort the sweep
-            logger.warning("retention sweep: %s failed (%s)", rec_dir.name, type(exc).__name__)
-            report.errors.append(rec_dir.name)
+    # Open ONE read-side content index for the whole sweep (the "don't race the
+    # indexer" high-water lookups) instead of one open per recording.
+    from contextlib import nullcontext
+
+    from screencap.content_index import ContentIndex, default_index_path
+
+    idx_path = default_index_path()
+    store_ctx = ContentIndex(idx_path) if idx_path.exists() else nullcontext(None)
+    with store_ctx as index_store:
+        for rec_dir in rec_dirs:
+            try:
+                sub = retention.evict_screenshots(
+                    rec_dir,
+                    now=now,
+                    days=days,
+                    size_cap_mb=size_cap_mb,
+                    last_indexed_ts=retention._last_indexed_ts(
+                        rec_dir.name, store=index_store
+                    ),
+                )
+                report.recordings_scanned += 1
+                report.stills_evicted += len(sub.evicted)
+                report.bytes_freed += sub.bytes_freed
+                report.index_rows_purged += sub.index_rows_purged
+            except Exception as exc:  # noqa: BLE001 — one bad dir must not abort the sweep
+                logger.warning(
+                    "retention sweep: %s failed (%s)", rec_dir.name, type(exc).__name__
+                )
+                report.errors.append(rec_dir.name)
     if report.stills_evicted:
         logger.info(
             "retention sweep: evicted %d stills (%d bytes) across %d recordings",

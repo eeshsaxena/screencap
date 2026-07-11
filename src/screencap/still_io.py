@@ -21,7 +21,6 @@ on-disk path, so no side-channel is needed to decrypt.
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 
 from screencap import corpus_crypto
@@ -97,27 +96,11 @@ def open_still(path: str | os.PathLike[str], key: bytes | None = None) -> bytes:
 
 
 def _atomic_write_0600(dest: str, data: bytes) -> None:
-    directory = os.path.dirname(dest) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, suffix=ENC_SUFFIX + ".part")
-    closed = False
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-        os.close(fd)
-        closed = True
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, dest)
-    except BaseException:
-        if not closed:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    from screencap.atomic_io import atomic_write_0600
+
+    # fsync=True: an encrypted still must be durable before os.replace so a crash
+    # never exposes the pre-replace plaintext / a torn cipher.
+    atomic_write_0600(dest, data, fsync=True, suffix=ENC_SUFFIX + ".part")
 
 
 __all__ = [

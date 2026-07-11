@@ -202,19 +202,24 @@ def _still_timestamp(path: Path) -> float | None:
         return None
 
 
-def _last_indexed_ts(recording: str) -> float | None:
+def _last_indexed_ts(recording: str, store: "object | None" = None) -> float | None:
     """The newest indexed frame time (epoch seconds) for ``recording``, or None.
 
     The "don't race the indexer" high-water mark for the fast path; None when the
-    index is absent/empty (no indexer constraint)."""
+    index is absent/empty (no indexer constraint). ``store`` is an already-open
+    ``ContentIndex`` to reuse across a batch (the daemon sweep opens ONE for the
+    whole run instead of one per recording); when None, opens+closes its own."""
     try:
         from screencap.content_index import ContentIndex, default_index_path
 
+        if store is not None:
+            ms = store.max_indexed_timestamp_ms(recording)
+            return ms / 1000.0 if ms is not None else None
         path = default_index_path()
         if not path.exists():
             return None
-        with ContentIndex(path) as store:
-            ms = store.max_indexed_timestamp_ms(recording)
+        with ContentIndex(path) as own:
+            ms = own.max_indexed_timestamp_ms(recording)
         return ms / 1000.0 if ms is not None else None
     except Exception:  # noqa: BLE001 — the guard is best-effort; fall back to no constraint
         return None

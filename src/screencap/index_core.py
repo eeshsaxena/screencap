@@ -474,27 +474,6 @@ def _persist_scrubbed_still(img_path: Path, painted_bytes: bytes, corpus_key: by
 
 
 def _atomic_replace(dest: Path, data: bytes) -> None:
-    import os
-    import tempfile
+    from screencap.atomic_io import atomic_write_0600
 
-    directory = str(dest.parent) or "."
-    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".jpg.part")
-    closed = False
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-        os.close(fd)
-        closed = True
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, str(dest))
-    except BaseException:
-        if not closed:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write_0600(dest, data, fsync=True, suffix=".jpg.part")
