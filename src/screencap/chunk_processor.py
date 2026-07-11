@@ -1155,11 +1155,13 @@ class ChunkProcessor:
             corpus_key=corpus_key,
         )
 
-        # Search U8 / KTD2: once this chunk's stills have actually been
-        # secrets-scrubbed (scrub applied + the whole range processed), record the
-        # range so ``frame.read`` may serve its frames. A partial (stop/budget) bail
-        # leaves the range unmarked → frames stay refused until a later pass.
-        if scrubber is not None and result.completed_range:
+        # Search U8 / KTD2: record the range as scrubbed (so ``frame.read`` may serve
+        # its frames) ONLY when scrub actually applied to EVERY still — the whole
+        # range was processed (``completed_range``) AND no frame was skipped or left
+        # unpainted (``scrub_complete``). A partial bail or any per-frame scrub/paint
+        # failure leaves the range unmarked → those stills stay refused until a later
+        # pass repaints them, so a skipped frame's secret is never served.
+        if scrubber is not None and result.completed_range and result.scrub_complete:
             import math
 
             from screencap import scrub_state

@@ -473,3 +473,72 @@ def test_do_index_chunk_content_matches_snapshot(env, tmp_path, monkeypatch):
     assert {h.timestamp_ms for h in _search(env.store_path, "ordinary")} == {110_000, 190_000}
     assert _search(env.store_path, "balance") == []  # masked frame excluded
     assert _search(env.store_path, "gamma") == []  # out-of-range frame excluded
+
+
+# --------------------------------------------------------------------------
+# Scrub completeness (search U8 / KTD2 — review fix #4): the chunk is "scrubbed"
+# only if EVERY ALLOW still was actually OCR'd + scrubbed + painted, and a deduped
+# frame is still painted (never skip its paint — it may carry the same secret).
+# --------------------------------------------------------------------------
+
+
+class _OcrBytes:
+    """recognize_bytes variant for the scrub path."""
+
+    def recognize_bytes(self, data: bytes, **_kw: object) -> _Result:
+        return _Result([_Block("secret text")])
+
+
+class _FakeScrub:
+    """Paints every frame; optionally RAISES on the Nth scrub to simulate a failure."""
+
+    def __init__(self, fail_on_call: int | None = None) -> None:
+        self.n = 0
+        self.fail_on_call = fail_on_call
+
+    def scrub(self, image_bytes: bytes, ocr_result: object) -> SimpleNamespace:
+        self.n += 1
+        if self.fail_on_call == self.n:
+            raise RuntimeError("scrub boom")
+        return SimpleNamespace(painted_bytes=b"painted", redacted_text="clean text")
+
+
+def test_scrub_failure_leaves_range_not_scrub_complete(env, tmp_path):
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [110.0, 120.0])  # plaintext stills
+
+    res = index_range(
+        cap, 100.0, 200.0, [], ocr=_OcrBytes(), store_path=env.store_path,
+        scrub=_FakeScrub(fail_on_call=2), corpus_key=None,
+        stop_event=threading.Event(),
+    )
+
+    assert res.completed_range is True  # the loop ran to completion...
+    assert res.scrub_complete is False  # ...but a frame's scrub failed → NOT complete
+    # -> chunk_processor will NOT mark the chunk scrubbed, so frame.read refuses it.
+
+
+def test_dedup_still_paints_every_frame(tmp_path, monkeypatch):
+    import screencap.engine.dedup as dedup
+
+    # Force every frame to read as an identical near-duplicate.
+    monkeypatch.setattr(dedup, "dhash", lambda *_a, **_k: 42)
+    monkeypatch.setattr(dedup, "hamming_distance", lambda a, b: 0)
+    store_path = tmp_path / "content_index.db"
+    cap = tmp_path / "rec"
+    cap.mkdir()
+    _make_screenshots(cap, [110.0, 120.0])
+    scrub = _FakeScrub()
+
+    res = index_range(
+        cap, 100.0, 200.0, [], ocr=_OcrBytes(), store_path=store_path,
+        scrub=scrub, corpus_key=None, stop_event=threading.Event(),
+    )
+
+    assert scrub.n == 2  # #4: EVERY frame scrubbed+painted — the dup is NOT skipped
+    assert res.scrub_complete is True
+    shots = cap / "screenshots"
+    assert (shots / "110.000000.jpg").read_bytes() == b"painted"
+    assert (shots / "120.000000.jpg").read_bytes() == b"painted"  # the "duplicate" painted too
+    assert res.rows_written == 1  # index still dedups the ROW (only paint is per-frame)

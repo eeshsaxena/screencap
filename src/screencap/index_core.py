@@ -106,11 +106,21 @@ class IndexRangeResult:
     ``completed_range`` (SCR-192): a present-but-unavailable store must leave the
     unit PENDING so a store repair + resume re-OCRs, rather than latching DONE with
     zero rows.
+
+    ``scrub_complete`` is ``True`` only when a scrub pass ran and EVERY ALLOW still
+    in the range was OCR'd + scrubbed + (if it carried a secret) painted-and-
+    persisted successfully. Any per-frame decrypt/OCR/scrub failure or a failed
+    paint persist flips it ``False``. The live path gates ``scrub_state``'s
+    "chunk scrubbed" marker on this ALONGSIDE ``completed_range`` (KTD2), so
+    ``frame.read`` never serves a still that was skipped and therefore still holds
+    its secret. Defaults ``True`` (an empty range / a non-scrub pass is trivially
+    complete).
     """
 
     rows_written: int
     completed_range: bool
     store_available: bool = True
+    scrub_complete: bool = True
 
 
 def index_range(
@@ -259,6 +269,13 @@ def index_range(
         # painted JPEG bytes). Applied under the write lock after the re-stat barrier.
         painted_by_path: dict[Path, bytes] = {}
         bailed = False
+        # Search U8 / KTD2: True only while EVERY ALLOW still in this range has been
+        # OCR'd + scrubbed + (if it carried a secret) painted. Any per-frame skip
+        # (undecryptable / OCR / scrub failure) or a failed paint persist flips it
+        # False so chunk_processor does NOT mark the chunk scrubbed — otherwise
+        # frame.read would serve an unpainted still with its secret intact. Only
+        # meaningful when ``scrub is not None``.
+        scrub_complete = True
         for ts, img_path in candidates:
             # This pass may run synchronously before a chunk's upload, so a
             # force-stop or a slow/wedged OCR engine must not pin the
@@ -277,39 +294,51 @@ def index_range(
                 try:
                     img_bytes = still_io.open_still(img_path, corpus_key)
                 except Exception:
-                    continue  # undecryptable / unreadable → skip this frame
+                    # An unreadable still stays unscrubbed on disk → the chunk is
+                    # NOT fully scrubbed; leave it unmarked so frame.read refuses it.
+                    scrub_complete = False
+                    continue
                 cur_hash = None
                 try:
                     with Image.open(io.BytesIO(img_bytes)) as im:
                         cur_hash = dhash(im)
                 except Exception:
                     cur_hash = None
-                if (
+                # NOTE: no dedup skip on the scrub path — every ALLOW still must be
+                # individually OCR'd + scrubbed + painted. A near-duplicate almost
+                # always carries the SAME secret in the same place, so skipping its
+                # paint (as an earlier version did) served that secret unredacted via
+                # frame.read. Dedup applies only to the INDEX rows below.
+                is_dup = (
                     cur_hash is not None
                     and prev_hash is not None
                     and hamming_distance(cur_hash, prev_hash) <= dhash_threshold
-                ):
-                    continue
-                if cur_hash is not None:
-                    prev_hash = cur_hash
+                )
                 try:
                     ocr_result = ocr.recognize_bytes(img_bytes)
                 except Exception:
+                    scrub_complete = False
                     continue
                 try:
                     scrub_res = scrub.scrub(img_bytes, ocr_result)
                 except Exception:
                     # A scrub failure must NOT fall through to indexing raw text
-                    # (that would leak secrets into the index) — skip the frame.
+                    # (that would leak secrets into the index) — skip the frame, and
+                    # mark the range incomplete so its still stays unserved.
                     logger.warning(
                         "content-index: scrub failed for a frame; skipping it", exc_info=True
                     )
+                    scrub_complete = False
                     continue
                 if scrub_res.painted_bytes is not None:
                     painted_by_path[img_path] = scrub_res.painted_bytes
-                text = scrub_res.redacted_text
-                if text:
-                    frames.append(IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text))
+                # Keep prev_hash on a dup so we compare against the last distinct frame.
+                if not is_dup and cur_hash is not None:
+                    prev_hash = cur_hash
+                if not is_dup:
+                    text = scrub_res.redacted_text
+                    if text:
+                        frames.append(IndexFrame(timestamp_ms=int(round(ts * 1000)), text=text))
                 continue
 
             # Dedup near-identical consecutive frames (same primitive + tight
@@ -380,11 +409,15 @@ def index_range(
                 try:
                     _persist_scrubbed_still(img_path, painted, corpus_key)
                 except Exception:
+                    # The still stays unpainted on disk (secret intact); mark the
+                    # range incomplete so the chunk is not recorded as scrubbed and
+                    # frame.read keeps refusing it until a later pass repaints it.
                     logger.warning(
                         "content-index: failed to persist redacted still %s",
                         img_path.name,
                         exc_info=True,
                     )
+                    scrub_complete = False
 
         # Replace the WHOLE chunk time-range (not just the surviving frames) so a
         # re-process where a frame is now skipped (policy/dedup) drops its stale,
@@ -420,6 +453,7 @@ def index_range(
         rows_written=rows_written,
         completed_range=completed_range,
         store_available=store_available,
+        scrub_complete=scrub_complete,
     )
 
 

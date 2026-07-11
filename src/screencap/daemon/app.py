@@ -1640,12 +1640,21 @@ def _run_frame_read(
 ) -> tuple[bytes, str] | None:
     """Resolve + decrypt an ALLOW, scrubbed still for ``frame.read`` (search U8).
 
-    Fail-closed refusals (return ``None``): missing recording/still, a blocked
-    (masked/excluded/secure-field/indeterminate) frame, an encrypted frame whose
-    chunk has NOT yet been secrets-scrubbed (KTD2), a missing corpus key, or a
-    payload over ``max_bytes``. On success returns ``(jpeg_bytes, content_type)``."""
+    Fail-closed refusals (return ``None``): a non-numeric ``stem``, missing
+    recording/still, a blocked (masked/excluded/secure-field/indeterminate) frame, a
+    frame whose chunk has NOT yet been secrets-scrubbed (KTD2 — enforced for the
+    encrypted form always, and for a plaintext still once the corpus is encrypted),
+    a missing corpus key, or a payload over ``max_bytes``. On success returns
+    ``(jpeg_bytes, content_type)``."""
     from screencap import corpus_crypto, frame_blocked, scrub_state, still_io
-    from screencap.config import resolve_recording_dir
+    from screencap.config import get_corpus_encrypted, resolve_recording_dir
+
+    # Validate the stem is a bare numeric timestamp BEFORE any filesystem access, so
+    # a traversal-shaped or non-numeric stem is rejected without stat'ing a raw path.
+    try:
+        ts = float(stem)
+    except ValueError:
+        return None
 
     rec_dir = resolve_recording_dir(recording)
     if not rec_dir.is_dir():
@@ -1655,10 +1664,6 @@ def _run_frame_read(
     plain_path = screenshots / f"{stem}.jpg"
     path = enc_path if enc_path.exists() else (plain_path if plain_path.exists() else None)
     if path is None:
-        return None
-    try:
-        ts = float(stem)
-    except ValueError:
         return None
 
     # ALLOW-only (R8): never serve a masked/excluded frame; indeterminate → refuse.
@@ -1676,6 +1681,15 @@ def _run_frame_read(
         except Exception:
             return None
     else:
+        # A PLAINTEXT still. Once the corpus is meant to be encrypted (post-flip), a
+        # surviving plaintext still is a leftover/anomaly (e.g. a not-yet-migrated or
+        # in-flight frame) and must be held to the SAME scrub gate — otherwise an
+        # unscrubbed secret frame could be served through this branch. Pre-flip
+        # (plaintext corpus, agent reads the .jpg path directly) keeps today's behavior.
+        if get_corpus_encrypted() and not scrub_state.is_frame_scrubbed(
+            rec_dir, round(ts * 1000)
+        ):
+            return None
         try:
             data = path.read_bytes()
         except OSError:
