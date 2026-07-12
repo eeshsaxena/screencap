@@ -7,6 +7,7 @@ and legacy functional API (initialize/write/finalize).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import struct
 import subprocess
@@ -1472,23 +1473,153 @@ def export_clip_video(
     from screencap.terminal_stage import terminal_lock
 
     with terminal_lock(rec_dir.name, timeout=lock_timeout):
-        # Fail closed on rich source video BEFORE reading a single chunk (KTD3).
-        from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+        _export_clip_video_locked(rec_dir, start, end, out_path, on_progress)
 
-        if get_frozen_masked_video_upload(rec_dir):
-            raise MaskedVideoRequiredError(
-                f"masked_video_upload is ON for recording {rec_dir.name!r}; "
-                f"refusing to clip unmasked source video"
-            )
+    return out_path
 
-        # Re-glob the chunk set UNDER the lock — eviction cannot run while we
-        # hold it, so this snapshot is the one we read.
-        chunks = sorted(rec_dir.glob("chunk_*.mp4"))
-        if not chunks:
-            raise NoFramesInRangeError(f"no chunk_*.mp4 to clip in {rec_dir}")
 
-        offsets = _clip_chunk_offsets(rec_dir, chunks)
-        _encode_clip(chunks, offsets, start, end, out_path, on_progress)
+def _export_clip_video_locked(
+    rec_dir: Path,
+    start: float,
+    end: float,
+    out_path: Path,
+    on_progress,
+) -> None:
+    """Trim the video for ``[start, end)`` (seconds) into ``out_path``.
+
+    The lock-free inner body of :func:`export_clip_video`: the caller MUST
+    already hold ``terminal_stage.terminal_lock(rec_dir.name)`` (the
+    ``terminal_lock`` is a non-reentrant in-process lock, so re-acquiring it here
+    would deadlock). Extracted so the video-only entry point AND the composed
+    video+audio :func:`export_clip` can each drive it under a SINGLE lock
+    acquisition without duplicating the fail-closed check / chunk glob / offset
+    resolution.
+
+    Fails closed with :class:`MaskedVideoRequiredError` before reading a single
+    chunk when the frozen ``masked_video_upload`` bit is ON (KTD3). Raises
+    :class:`NoFramesInRangeError` when there are no chunks (or none in range).
+    """
+    # Fail closed on rich source video BEFORE reading a single chunk (KTD3).
+    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
+    if get_frozen_masked_video_upload(rec_dir):
+        raise MaskedVideoRequiredError(
+            f"masked_video_upload is ON for recording {rec_dir.name!r}; "
+            f"refusing to clip unmasked source video"
+        )
+
+    # Re-glob the chunk set UNDER the lock — eviction cannot run while we
+    # hold it, so this snapshot is the one we read.
+    chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+    if not chunks:
+        raise NoFramesInRangeError(f"no chunk_*.mp4 to clip in {rec_dir}")
+
+    offsets = _clip_chunk_offsets(rec_dir, chunks)
+    _encode_clip(chunks, offsets, start, end, out_path, on_progress)
+
+
+def export_clip(
+    recording_dir: str | Path,
+    start_ms: int,
+    end_ms: int,
+    out_path: str | Path,
+    *,
+    lock_timeout: float = _CLIP_LOCK_TIMEOUT,
+    on_progress=None,
+) -> Path:
+    """Export ``[start_ms, end_ms)`` as one ``.mp4`` with BOTH video AND audio.
+
+    This is the video+audio public entry the clip CLI (U3) calls. It produces
+    the exact same PTS-preserving, capture-blocked, fail-closed video as
+    :func:`export_clip_video` (U1), then muxes the recording's SEPARATE
+    ``audio_*.flac`` for the range — aligned on the audio anchor
+    (``audio_info.timestamp``, which differs from ``video_start_time``),
+    trimmed to the SAME output-timeline origin as the video (``t=0`` is the same
+    wall-clock instant for both streams), resampled to the AAC encoder's format,
+    AAC-encoded, and interleaved into the same output container — so audio stays
+    in sync with video from start through any chunk boundary to end (KTD7).
+
+    When the recording captured no audio overlapping the range, the result is a
+    video-only clip (no crash) — identical to :func:`export_clip_video`'s output.
+    A best-effort audio pass that raises is downgraded to a video-only clip
+    rather than losing the whole export.
+
+    Same ``terminal_lock`` serialization, ``masked_video_upload`` fail-closed
+    posture, atomic write (a ``.tmp`` sibling ``os.replace``\\d onto ``out_path``
+    only on a clean finalize), and structured error taxonomy as
+    :func:`export_clip_video`.
+
+    Args:
+        recording_dir: The recording directory holding the media.
+        start_ms: Clip start, milliseconds from recording start (inclusive).
+        end_ms: Clip end, milliseconds from recording start (exclusive).
+        out_path: Destination ``.mp4`` path (parent must be writable).
+        lock_timeout: Seconds to wait for the per-recording ``terminal_lock``.
+        on_progress: Optional ``callable(frames_done, frames_total)`` — driven by
+            the video pass (the audio pass is comparatively cheap).
+
+    Returns:
+        ``out_path`` as a :class:`~pathlib.Path`.
+
+    Raises:
+        NoFramesInRangeError: Empty/inverted/out-of-range window, or no chunks.
+        MaskedVideoRequiredError: Frozen ``masked_video_upload`` is ON.
+        ClipExportError: The video re-encode failed / could not be finalized.
+        terminal_stage.TerminalStageBusy: The eviction lock stayed contended.
+    """
+    rec_dir = Path(recording_dir)
+    out_path = Path(out_path)
+
+    if end_ms <= start_ms:
+        raise NoFramesInRangeError(
+            f"empty clip range: start_ms={start_ms} >= end_ms={end_ms}"
+        )
+    start = start_ms / 1000.0
+    end = end_ms / 1000.0
+
+    from screencap.terminal_stage import terminal_lock
+
+    # Acquire the per-recording flock ONCE and drive both the (lock-free) video
+    # trim and the audio pass under it — the audio_*.flac are evictable siblings
+    # of the chunks, so both reads must be inside the same critical section.
+    with terminal_lock(rec_dir.name, timeout=lock_timeout):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Video → a dot-prefixed intermediate (excluded from upload/catalog),
+        # then muxed with audio into out_path. A masked/no-frames failure raises
+        # out of the video pass before this temp materializes, so no file leaks.
+        video_tmp = (
+            out_path.parent
+            / f".{out_path.name}.clipvid.{os.getpid()}.{uuid4().hex}.tmp.mp4"
+        )
+        try:
+            _export_clip_video_locked(rec_dir, start, end, video_tmp, on_progress)
+
+            muxed = False
+            try:
+                from screencap.engine.audio_clip import mux_clip_audio
+
+                muxed = mux_clip_audio(rec_dir, start, end, video_tmp, out_path)
+            except Exception:
+                # Audio is additive: a decode/encode hiccup must never cost the
+                # user the (already-encoded) video clip. Downgrade to video-only.
+                logger.opt(exception=True).warning(
+                    "clip audio pass failed for {}; delivering a video-only clip",
+                    rec_dir.name,
+                )
+                muxed = False
+
+            if muxed:
+                # mux_clip_audio wrote the combined A/V out_path atomically; drop
+                # the now-consumed video-only intermediate.
+                video_tmp.unlink(missing_ok=True)
+            else:
+                # No audio in range (or the audio pass declined): promote the
+                # video-only clip as the deliverable.
+                os.replace(video_tmp, out_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                video_tmp.unlink(missing_ok=True)
+            raise
 
     return out_path
 
