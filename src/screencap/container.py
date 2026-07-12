@@ -81,6 +81,52 @@ _DEFAULT_TIMEOUT = 120.0
 """Default subprocess wall-clock timeout, in seconds. ``create`` on a
 large declared size and ``compact`` can be slow; callers may override."""
 
+# --- container-key identifiers (U2, split-custody per KTD-22) ---------------
+
+CONTAINER_KEYCHAIN_SERVICE = "screencap-container"
+"""Keychain ``service`` for the container passphrase. **Distinct** from the corpus
+key's ``screencap-corpus`` (:data:`screencap.corpus_crypto.CORPUS_KEYCHAIN_SERVICE`)
+so the two keys never collide. Stable across versions — changing it orphans an
+existing encrypted store (the key is a KEK, not re-derivable)."""
+
+CONTAINER_KEYCHAIN_ACCOUNT = "key"
+"""Keychain ``account`` for the container passphrase."""
+
+CONTAINER_KEY_FILE_ENV = "SCREENCAP_CONTAINER_KEY_FILE"
+"""Env var naming a ``0600`` file holding the base64 container key, mirroring
+:data:`screencap.corpus_crypto.CORPUS_KEY_FILE_ENV`. A headless / test channel;
+when set it is the SOLE key source (the Keychain is never consulted)."""
+
+KEYCHAIN_ACCESS_GROUP = os.environ.get(
+    "SCREENCAP_KEYCHAIN_ACCESS_GROUP", "2A8S6MV8DZ.com.screencap.shared"
+)
+"""Shared Keychain access group (SCR-241). Same value + env override as
+:data:`screencap.corpus_crypto.KEYCHAIN_ACCESS_GROUP`; every binary signed with
+the Team ID *and* carrying the ``keychain-access-groups`` entitlement reads the
+key without a prompt. Re-declared here to avoid importing the heavier crypto
+module."""
+
+_CONTAINER_KEY_LEN = 32
+"""Container passphrase length in bytes (AES-256 → 256-bit key)."""
+
+_ENTITLEMENT_MISMATCH_MSG = (
+    "container key unreadable: the key is present in the shared Keychain access group "
+    "but this binary is not entitled to read it (errSecMissingEntitlement). This is NOT "
+    "data loss — the encrypted store and its key are intact. Run the vault from the "
+    "entitled ScreenCap app or its bundled CLI; a pip/pyenv terminal CLI or a Debug "
+    "'python3 -m screencap.cli' build is an unsupported vault consumer (KTD-22)."
+)
+"""Message for :class:`ContainerKeyUnreachableError` — names the cause, points at the
+entitled binary, and explicitly is not a data-loss statement (KTD-22)."""
+
+_NO_KEY_ANYWHERE_MSG = (
+    "container key missing: the encrypted store exists on disk but no key was found in "
+    "any channel (shared Keychain access group or key-file). The key appears lost — the "
+    "video data is intact but the store cannot be unlocked without it. Restore the key "
+    "from backup."
+)
+"""Message for :class:`ContainerKeyMissingError` — the genuine key-loss diagnosis (KTD-22)."""
+
 # ---------------------------------------------------------------------------
 # Exception taxonomy (KTD-10)
 # ---------------------------------------------------------------------------
@@ -162,7 +208,28 @@ class ContainerKeyMissingError(ContainerOperatorError):
     """The bundle exists on disk but no key is available to unlock it (AE2).
 
     Minting a fresh key here would orphan every existing recording, so this is a
-    hard stop, not a create.
+    hard stop, not a create. This is the **genuine key-loss** case (KTD-22): no
+    key was found in *any* channel — restore it from backup or the store stays
+    unreadable.
+    """
+
+
+class ContainerKeyUnreachableError(ContainerOperatorError):
+    """The key exists in the shared access group but *this binary* can't read it.
+
+    The KTD-22 split partner of :class:`ContainerKeyMissingError`. Raised when a
+    shared-group Keychain read returns ``errSecMissingEntitlement`` (-34018): the
+    store and its key are **intact**, but the running binary is not entitled for
+    the group (a pip/pyenv terminal CLI or a Debug ``python3 -m screencap.cli``
+    build — a documented *unsupported* vault consumer). Its message names the
+    entitlement mismatch and points at the entitled app/CLI, so an operator gets
+    an accurate diagnosis instead of a false "key lost / data loss" alarm. Unlike
+    the corpus key (:mod:`screencap.corpus_crypto`, where a mismatch merely
+    degrades Search and silently falls back to a legacy ``keyring`` item), the
+    container key must NEVER fall back — a different key would render the whole
+    library unmountable — so the mismatch is surfaced, not swallowed.
+
+    Operator failure (exit 1), but semantically distinct from data loss.
     """
 
 
@@ -698,11 +765,266 @@ def harden_mount(mountpoint: str, *, timeout: float = _DEFAULT_TIMEOUT) -> None:
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# Container-key management (U2 — read-only get, never-orphan create, KTD-22)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the corpus-key channel structure (key-file env → shared-group Keychain)
+# from ``corpus_crypto.py`` and the SCR-241 shared-access-group custody, with the
+# KTD-22 divergence: on ``errSecMissingEntitlement`` the container key is NEVER
+# silently read from a separate legacy ``keyring`` item (that would hand back a
+# *different* key and leave the real store unmountable). The mismatch is surfaced
+# so the caller can render the entitlement diagnosis. Un-entitled binaries are a
+# documented *unsupported* container consumer.
+#
+# Losing the key makes the store unreadable (the video is untouched, but the KEK
+# is not re-derivable), so :func:`get_container_key` is strictly read-only and
+# never regenerates; only :func:`create_container_key` mints a key, and it refuses
+# when a bundle already exists on disk.
+
+
+def _encode_key(key: bytes) -> str:
+    import base64
+
+    return base64.b64encode(key).decode("ascii")
+
+
+def _decode_key(stored: str) -> bytes | None:
+    """Decode a base64 key string; ``None`` (with a warning) if it is not a valid
+    32-byte key — treated as "absent" so a corrupt value never masquerades as a
+    good key and the caller degrades to the not-ready / diagnosis path."""
+    import base64
+    import logging
+
+    try:
+        raw = base64.b64decode(stored.encode("ascii"))
+    except Exception:  # noqa: BLE001 — any decode failure is "not a usable key"
+        logging.getLogger(__name__).warning(
+            "container key: stored value is not valid base64; treating as absent"
+        )
+        return None
+    if len(raw) != _CONTAINER_KEY_LEN:
+        logging.getLogger(__name__).warning(
+            "container key: stored value decodes to %d bytes (expected %d); treating as absent",
+            len(raw),
+            _CONTAINER_KEY_LEN,
+        )
+        return None
+    return raw
+
+
+def _read_key_file(path: str) -> bytes | None:
+    try:
+        with open(path, encoding="ascii") as fh:
+            text = fh.read().strip()
+    except OSError:
+        return None
+    return _decode_key(text) if text else None
+
+
+def _write_key_file(path: str, key: bytes) -> None:
+    """Write the base64 key to ``path`` at ``0600`` (create-or-truncate)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, _encode_key(key).encode("ascii"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)  # tighten if the file pre-existed with looser perms
+    except OSError:
+        pass
+
+
+def _load_from_keychain() -> bytes | None:
+    """Read the container key from the shared Keychain group; ``None`` if absent.
+
+    Raises:
+        ContainerKeyUnreachableError: the group read returned
+            ``errSecMissingEntitlement`` (KTD-22 — surfaced, never fallen back).
+        KeychainLockedError: the Keychain/keyring is locked (retryable, exit 75).
+        ContainerOperatorError: any other unexpected Keychain backend failure.
+    """
+    import sys
+
+    if sys.platform != "darwin":
+        # No shared-group Keychain off-Mac; use plain keyring (test / non-mac dev).
+        import keyring
+        import keyring.errors
+
+        try:
+            stored = keyring.get_password(CONTAINER_KEYCHAIN_SERVICE, CONTAINER_KEYCHAIN_ACCOUNT)
+        except keyring.errors.KeyringLocked as exc:
+            raise KeychainLockedError(
+                "the keyring is locked; the container key could not be read"
+            ) from exc
+        return _decode_key(stored) if stored else None
+
+    from screencap import keychain_group
+
+    try:
+        stored = keychain_group.load(
+            CONTAINER_KEYCHAIN_SERVICE, CONTAINER_KEYCHAIN_ACCOUNT, KEYCHAIN_ACCESS_GROUP
+        )
+    except keychain_group.MissingEntitlement as exc:
+        # KTD-22: do NOT fall back to a separate legacy keyring item and hand back a
+        # DIFFERENT key. Surface the mismatch for the entitlement diagnosis.
+        raise ContainerKeyUnreachableError(_ENTITLEMENT_MISMATCH_MSG) from exc
+    except keychain_group.KeychainError as exc:
+        if exc.status == keychain_group.errSecInteractionNotAllowed:
+            # The device/Keychain is locked — the group-load equivalent of
+            # keyring's KeyringLocked. Retryable so launchd tries again (exit 75).
+            raise KeychainLockedError(
+                "the Keychain is locked; the container key could not be read"
+            ) from exc
+        raise ContainerOperatorError(
+            f"could not read the container key from the shared Keychain group "
+            f"(status {exc.status})"
+        ) from exc
+    return _decode_key(stored) if stored is not None else None
+
+
+def get_container_key() -> bytes | None:
+    """Read-only container-key lookup; ``None`` when genuinely absent. NEVER creates.
+
+    Channel order (mirrors :func:`screencap.corpus_crypto.load_corpus_key`): the
+    :data:`CONTAINER_KEY_FILE_ENV` file — the SOLE source when that env var is set
+    (headless / test channel) — else the shared-group Keychain. A transiently
+    missing or locked Keychain must never silently orphan the store, so this
+    function does not regenerate; use :func:`create_container_key` to mint a first
+    key.
+
+    Raises:
+        ContainerKeyUnreachableError: the shared-group read returned
+            ``errSecMissingEntitlement`` (KTD-22 — this binary is not entitled;
+            the key is intact but unreadable here). Surfaced, never swallowed.
+        KeychainLockedError: the Keychain/keyring is locked (retryable, exit 75).
+    """
+    env_path = os.environ.get(CONTAINER_KEY_FILE_ENV)
+    if env_path:
+        return _read_key_file(env_path)
+    return _load_from_keychain()
+
+
+def require_container_key() -> bytes:
+    """Resolve the key for a store **known to exist on disk**, or raise the
+    cause-distinguishing hard stop (KTD-22). NEVER creates.
+
+    This is the diagnosis helper the daemon-mount and CLI-funnel layers call at
+    the bundle-exists-but-key-unreadable stop. It converts the three failure modes
+    into the right typed error so the operator sees an accurate cause:
+
+    * key present in the shared group but unreadable here →
+      :class:`ContainerKeyUnreachableError` (entitlement mismatch, *not* data loss;
+      points at the entitled app/CLI);
+    * Keychain/keyring locked → :class:`KeychainLockedError` (retryable, exit 75);
+    * no key in any channel → :class:`ContainerKeyMissingError` (genuine loss, exit 1).
+
+    Precondition: the caller has already confirmed the bundle exists (this helper
+    never touches the bundle bytes).
+    """
+    key = get_container_key()  # raises the unreachable / locked cases
+    if key is None:
+        raise ContainerKeyMissingError(_NO_KEY_ANYWHERE_MSG)
+    return key
+
+
+def _persist_container_key(key: bytes) -> None:
+    """Store ``key`` on the first available channel, or raise a typed failure.
+
+    Same channel order as :func:`get_container_key`: the key-file env path when set,
+    else the shared Keychain group (else plain ``keyring`` off-Mac).
+    """
+    import sys
+
+    env_path = os.environ.get(CONTAINER_KEY_FILE_ENV)
+    if env_path:
+        try:
+            _write_key_file(env_path, key)
+            return
+        except OSError as exc:
+            raise ContainerOperatorError(
+                f"could not write the container key file {env_path!r}: {exc}"
+            ) from exc
+
+    encoded = _encode_key(key)
+    if sys.platform != "darwin":
+        import keyring
+        import keyring.errors
+
+        try:
+            keyring.set_password(CONTAINER_KEYCHAIN_SERVICE, CONTAINER_KEYCHAIN_ACCOUNT, encoded)
+            return
+        except keyring.errors.KeyringLocked as exc:
+            raise KeychainLockedError(
+                "the keyring is locked; the container key could not be stored"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — any backend failure = can't persist
+            raise ContainerOperatorError(
+                f"could not store the container key in keyring: {exc}"
+            ) from exc
+
+    from screencap import keychain_group
+
+    try:
+        # Device-local (synchronizable=False → never iCloud-synced) + readable
+        # after first unlock (keychain_group's fixed accessibility) so the entitled
+        # all-day daemon reads it headlessly.
+        keychain_group.store(
+            CONTAINER_KEYCHAIN_SERVICE, CONTAINER_KEYCHAIN_ACCOUNT, encoded, KEYCHAIN_ACCESS_GROUP
+        )
+    except keychain_group.MissingEntitlement as exc:
+        raise ContainerKeyUnreachableError(_ENTITLEMENT_MISMATCH_MSG) from exc
+    except keychain_group.KeychainError as exc:
+        if exc.status == keychain_group.errSecInteractionNotAllowed:
+            raise KeychainLockedError(
+                "the Keychain is locked; the container key could not be stored"
+            ) from exc
+        raise ContainerOperatorError(
+            f"could not store the container key in the shared Keychain group "
+            f"(status {exc.status})"
+        ) from exc
+
+
+def create_container_key(bundle_path: str) -> bytes:
+    """Mint + persist a fresh 256-bit container key; return the raw key bytes.
+
+    **Refuses (raises) when ``bundle_path`` already exists on disk** — minting a
+    new key for an existing store would orphan every recording inside it, so a
+    bundle-present create is a hard error, never a silent overwrite (KTD-5).
+
+    **Foreground-only (caller contract).** The first ``keychain_group.store`` from
+    the packaged daemon triggers one visible ACL prompt, so only an interactive
+    entry point may call this — the base plan's ``serve --install`` / ``storage
+    init`` do, in their foreground CLI process. The daemon-spawned engine
+    subprocess never creates (or reads) the key.
+
+    Raises:
+        ContainerError: a typed subclass — an operator error when a bundle already
+            exists, :class:`ContainerKeyUnreachableError` /
+            :class:`KeychainLockedError` / :class:`ContainerOperatorError` when the
+            fresh key cannot be persisted.
+    """
+    import secrets
+
+    if os.path.exists(bundle_path):
+        raise ContainerOperatorError(
+            f"refusing to create a new container key: {bundle_path!r} already exists "
+            "(a new key would orphan the existing encrypted store)"
+        )
+    key = secrets.token_bytes(_CONTAINER_KEY_LEN)
+    _persist_container_key(key)
+    return key
+
+
 __all__ = [
     # constants
     "BUNDLE_NAME",
     "DEFAULT_VOLUME_NAME",
     "DEFAULT_SPARSE_BAND_SIZE_SECTORS",
+    "CONTAINER_KEYCHAIN_SERVICE",
+    "CONTAINER_KEYCHAIN_ACCOUNT",
+    "CONTAINER_KEY_FILE_ENV",
+    "KEYCHAIN_ACCESS_GROUP",
     # exceptions
     "ContainerError",
     "ContainerRetryableError",
@@ -713,6 +1035,7 @@ __all__ = [
     "ContainerCorruptError",
     "RogueMountpointError",
     "ContainerKeyMissingError",
+    "ContainerKeyUnreachableError",
     # value objects
     "AttachInfo",
     "ContainerStatus",
@@ -726,6 +1049,10 @@ __all__ = [
     "status",
     # hardening
     "harden_mount",
+    # key management
+    "get_container_key",
+    "require_container_key",
+    "create_container_key",
     # parsing (exposed for tests + higher layers)
     "parse_attach_plist",
     "parse_info_plist",
