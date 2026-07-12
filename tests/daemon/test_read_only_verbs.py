@@ -713,8 +713,10 @@ async def test_content_search_returns_pointer_only_hits(
     assert payload["index_state"] == "ok"
     assert len(payload["hits"]) == 1
     hit = payload["hits"][0]
-    # Pointer-only: exactly these fields, no path / image bytes.
-    assert set(hit) == {"recording", "timestamp_ms", "snippet", "score"}
+    # Pointer-only: exactly these fields, no path / image bytes. ``match_source``
+    # (U5) is additive — a content-frame hit reports "content".
+    assert set(hit) == {"recording", "timestamp_ms", "snippet", "score", "match_source"}
+    assert hit["match_source"] == "content"
     assert hit["recording"] == "demo"
     assert hit["timestamp_ms"] == 125_000
     assert "invoice" in hit["snippet"].lower()

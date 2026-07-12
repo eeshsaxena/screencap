@@ -419,6 +419,53 @@ def _read_user_title(db_path: Path) -> str | None:
         return None
 
 
+def match_user_titles(
+    query: str,
+    recording: str | None = None,
+    limit: int = 200,
+) -> list[tuple[str, str]]:
+    """Case-insensitively substring-match ``query`` against USER-SET titles (U5).
+
+    Powers the ``content.search`` title union: a user-renamed recording is found
+    by a term in its title even when the content index is absent (the default —
+    content indexing defaults off) or holds no frame match for it, including
+    privacy-blocked / never-indexed recordings (AE3).
+
+    Only USER-SET titles are searchable. The derived date/time default
+    (:func:`_default_title`) is NOT read here — a recording with no rename yields
+    no match, so a query term that merely happens to appear in the default label
+    (e.g. "Recording") never surfaces it.
+
+    Scans the same recordings dir the catalog listing uses (:func:`list_recordings`),
+    bounded to at most ``limit`` recordings (default 200, mirroring the daemon's
+    ``_QUERY_MAX_RECORDINGS`` scan cap). When ``recording`` is given, the scan is
+    restricted to that single recording. Each match is ``(recording_dir_name, title)``.
+    Best-effort per recording: :func:`_read_user_title` returns ``None`` (never
+    raises) for an absent / locked / corrupt / pre-``title``-column DB, which is
+    simply skipped.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    recordings_dir = get_recordings_dir()
+    if not recordings_dir.exists():
+        return []
+
+    dirs = [d for d in sorted(recordings_dir.iterdir()) if d.is_dir()]
+    if recording is not None:
+        dirs = [d for d in dirs if d.name == recording]
+
+    matches: list[tuple[str, str]] = []
+    for d in dirs[:limit]:
+        db = find_db(d)
+        if db is None:
+            continue
+        title = _read_user_title(db)
+        if title and q in title.lower():
+            matches.append((d.name, title))
+    return matches
+
+
 def _active_recording_name() -> str | None:
     """Directory name of the currently-active recording, or ``None`` (U2).
 

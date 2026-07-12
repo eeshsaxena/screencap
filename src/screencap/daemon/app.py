@@ -1169,28 +1169,71 @@ def _run_content_search(
     spawn an empty PII store) — surfaces ``not_indexed`` instead. The store's
     own ``search`` is fail-soft (corrupt → ``store_unavailable``), so this never
     raises for an unreadable store.
+
+    U5 title union: user-set recording titles are searched FIRST — before the
+    index-existence early return — and unioned into the returned hits, so a
+    renamed recording is found by a term in its title even when the content
+    index is absent (the default — content indexing defaults off) or holds no
+    frame match for it, including privacy-blocked / never-indexed recordings
+    (AE3). Each title hit is pointer-only like every content hit, but carries the
+    sentinel ``timestamp_ms=0`` (NOT a frame pointer) and ``match_source="title"``
+    so a caller can tell it apart from an on-screen-text frame hit; content hits
+    carry ``match_source="content"``. Titles are deduped against content hits by
+    recording: a recording that already has a content-frame hit is NOT also listed
+    via its title (the frame hit is richer — it carries a real pointer), so a title
+    hit is emitted only for a recording with no content hit.
     """
+    from screencap import catalog
     from screencap.content_index import ContentIndex, IndexState, default_index_path
+
+    title_matches = catalog.match_user_titles(
+        query, recording=recording, limit=_QUERY_MAX_RECORDINGS
+    )
+
+    def _title_hit(rec: str, title: str) -> dict[str, Any]:
+        # Sentinel timestamp_ms=0: a title hit is not a frame pointer. match_source
+        # steers a caller away from treating it as one (e.g. via frame.nearest).
+        return {
+            "recording": rec,
+            "timestamp_ms": 0,
+            "snippet": title,
+            "score": 0.0,
+            "match_source": "title",
+        }
 
     path = default_index_path()
     if not path.exists():
-        return {"hits": [], "index_state": IndexState.NOT_INDEXED.value}
+        # No content index (the default). Title-only hits still return; the
+        # index_state honestly reports the absent content store.
+        return {
+            "hits": [_title_hit(rec, title) for rec, title in title_matches],
+            "index_state": IndexState.NOT_INDEXED.value,
+        }
 
     kwargs: dict[str, Any] = {}
     if limit is not None:
         kwargs["limit"] = limit
     with ContentIndex(path) as store:
         result = store.search(query, recording=recording, **kwargs)
+
+    content_hits = [
+        {
+            "recording": h.recording,
+            "timestamp_ms": h.timestamp_ms,
+            "snippet": h.snippet,
+            "score": h.score,
+            "match_source": h.match_source,
+        }
+        for h in result.hits
+    ]
+    seen = {h["recording"] for h in content_hits}
+    title_hits = [
+        _title_hit(rec, title)
+        for rec, title in title_matches
+        if rec not in seen
+    ]
     return {
-        "hits": [
-            {
-                "recording": h.recording,
-                "timestamp_ms": h.timestamp_ms,
-                "snippet": h.snippet,
-                "score": h.score,
-            }
-            for h in result.hits
-        ],
+        "hits": content_hits + title_hits,
         "index_state": result.index_state.value,
     }
 
