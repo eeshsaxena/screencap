@@ -84,6 +84,13 @@ _LLM_ENRICHED_FIELDS = ("name", "description", "category", "apps_used", "confide
 MAX_MERGE_GAP = 5.0  # max seconds between consecutive chunk boundaries
 SLUG_MAX = 60
 
+# E2EE object magic — kept in sync with ``screencap.cloud_crypto.MAGIC``. This
+# container vendors only ``screencap.segmentation`` (see the deploy notes at the
+# top of this file), NOT ``cloud_crypto``, so the constant is duplicated here
+# rather than imported. ``tests/test_processor_e2ee_guard.py`` cross-checks that
+# the two never drift.
+_E2EE_MAGIC = b"SCRE2E"
+
 _CATEGORY_PREFIX = {
     "development": "dev",
     "communication": "com",
@@ -299,6 +306,25 @@ def _load_manifest(blob_name: str) -> dict | None:
     except json.JSONDecodeError:
         log.warning("Invalid JSON in manifest %s", blob_name)
         return None
+
+
+def _manifests_are_encrypted(manifest_blobs: list[str]) -> bool:
+    """True if the recording's manifests are E2EE ciphertext.
+
+    Encrypted recordings upload ciphertext manifests by construction (plan
+    KD5/R13); this plaintext-only enrichment service must never try to process
+    them. We detect the cloud-crypto object magic on the first manifest rather
+    than relying on the downstream ``json.loads`` failure — that parse-failure
+    no-op is emergent, and a future lenient-parsing change (or a single
+    plaintext manifest slipping in beside ciphertext) could silently turn it
+    into empty-output enrichment of an encrypted recording.
+    """
+    if not manifest_blobs:
+        return False
+    head = _blob_bytes(manifest_blobs[0])
+    if head is None:
+        return False
+    return head[: len(_E2EE_MAGIC)] == _E2EE_MAGIC
 
 
 # ---------------------------------------------------------------------------
@@ -1709,6 +1735,31 @@ def process_recording(cloud_event):
                         "Will reprocess on recording.db upload via screencap upload.",
             })
             return
+
+    # E2EE guard (plan KD5/R13): an encrypted recording's manifests are
+    # ciphertext by construction. Make the no-op EXPLICIT here — otherwise a
+    # ciphertext manifest fails json.loads below and falls through to the
+    # "all manifests failed to load" return, an emergent no-op a future
+    # lenient-parsing change could silently break. Only the server-readable
+    # corpus lane is ever enriched by this service.
+    if _manifests_are_encrypted(manifest_blobs):
+        log.info(
+            "%s: manifests are E2EE ciphertext — skipping enrichment (KD5 no-op)",
+            recording_name,
+        )
+        _upload_json(f"{sessions_prefix}_processing_status.json", {
+            "status": "skipped_encrypted",
+            "started_at": started_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "processor_version": PROCESSOR_VERSION,
+            "trigger_id": trigger_id,
+            "trigger_file": trigger_file,
+            "chunks_found": len(manifest_blobs),
+            "note": "End-to-end encrypted recording; server-side enrichment is a "
+                    "documented no-op (plan KD5/R13). Only the server-readable "
+                    "corpus lane is processed.",
+        })
+        return
 
     manifests = []
     for blob_name in manifest_blobs:
