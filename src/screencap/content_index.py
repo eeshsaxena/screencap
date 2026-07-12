@@ -172,10 +172,16 @@ class IndexFrame:
 
 
 def default_index_path() -> Path:
-    """Return ``~/.screencap/content_index.db`` (does not create the file)."""
-    from screencap.config import get_base_dir
+    """Return the content-index DB path (does not create the DB file).
 
-    return get_base_dir() / "content_index.db"
+    Resolved through the container-aware sidecar chokepoint
+    (:func:`screencap.config.get_store_dir`, SCR-236 U3):
+    ``~/.screencap/content_index.db`` today (flag off / ``SCREENCAP_RECORDINGS_DIR``
+    override), ``<recordings mountpoint>/.store/content_index.db`` when the
+    at-rest container is active."""
+    from screencap.config import get_store_dir
+
+    return get_store_dir() / "content_index.db"
 
 
 # SCR-134: serialize content-index writers against the retroactive-disable purge.

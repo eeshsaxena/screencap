@@ -96,15 +96,19 @@ class RunState(str, Enum):
 
 
 def default_ledger_path() -> Path:
-    """Return the default sibling ledger path ``~/.screencap/backfill_state.db``.
+    """Return the default sibling ledger path ``backfill_state.db``.
 
-    Resolved via :func:`screencap.config.get_base_dir` (deferred import to keep
-    this module light). Deliberately a SIBLING of ``content_index.db``, not a
-    table inside it — see the module docstring.
+    Resolved via the container-aware sidecar chokepoint
+    (:func:`screencap.config.get_store_dir`, SCR-236 U3; deferred import to keep
+    this module light): ``~/.screencap/backfill_state.db`` today (flag off /
+    ``SCREENCAP_RECORDINGS_DIR`` override), ``<recordings
+    mountpoint>/.store/backfill_state.db`` when the at-rest container is active.
+    Deliberately a SIBLING of ``content_index.db`` (same store dir), not a table
+    inside it — see the module docstring.
     """
     from screencap import config
 
-    return config.get_base_dir() / "backfill_state.db"
+    return config.get_store_dir() / "backfill_state.db"
 
 
 def _now() -> float:

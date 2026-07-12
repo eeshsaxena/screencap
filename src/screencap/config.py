@@ -143,6 +143,63 @@ def set_recordings_dir(path: Path) -> None:
         doc["recordings_dir"] = resolved
 
 
+def get_container_enabled() -> bool:
+    """Return whether the at-rest encryption container is enabled (SCR-236, KTD-8).
+
+    Standard bool-env/config shape (mirrors :func:`get_wifi_metrics` et al.): env
+    ``SCREENCAP_CONTAINER_ENABLED`` > config.toml ``container_enabled`` > default.
+    **Default OFF for now** — U8 flips the shipped default on; do not flip it here.
+    When on (and no ``SCREENCAP_RECORDINGS_DIR`` override is active) the data-plane
+    sidecars relocate inside the recordings mountpoint's reserved ``.store/`` dir;
+    run-dir paths are unaffected.
+    """
+    return _parse_bool_env("SCREENCAP_CONTAINER_ENABLED", "container_enabled", False)
+
+
+def _container_data_root_active() -> bool:
+    """Whether container-aware data-root resolution is in effect (SCR-236 U3).
+
+    Bypassed (→ today's behavior) whenever ``SCREENCAP_RECORDINGS_DIR`` is set —
+    the documented dev/test seam (KTD-8) — regardless of the flag. Otherwise it
+    tracks :func:`get_container_enabled`.
+    """
+    if os.environ.get("SCREENCAP_RECORDINGS_DIR"):
+        return False
+    return get_container_enabled()
+
+
+def get_data_root() -> Path:
+    """Return the container-aware data-plane root (SCR-236 U3; covers KTD-2/KTD-8).
+
+    The single chokepoint every data-plane path (the recordings tree + the
+    local-only sidecar DBs) resolves through. With the container flag OFF or
+    ``SCREENCAP_RECORDINGS_DIR`` set → identical to today (the base
+    ``~/.screencap`` dir); with the flag ON → the recordings mountpoint
+    (:func:`get_recordings_dir`), inside which the reserved ``.store/`` sidecar dir
+    lives. Run-dir paths (socket, audit log, pidfile, config.toml, terminal-stage
+    lock, autospawn log) deliberately do NOT resolve through here — they stay
+    outside the container as plaintext (R3).
+    """
+    if _container_data_root_active():
+        return get_recordings_dir()
+    return get_base_dir()
+
+
+def get_store_dir() -> Path:
+    """Return the dir holding local-only sidecar DBs (content index + backfill ledger).
+
+    The container-aware chokepoint for ``content_index.db`` / ``backfill_state.db``
+    (SCR-236 U3, KTD-2). Container active → ``<recordings mountpoint>/.store/``;
+    otherwise → :func:`get_base_dir` (today's ``~/.screencap``), so the resolution
+    is byte-identical to current behavior while the flag is off. Creates the dir.
+    """
+    if _container_data_root_active():
+        d = get_data_root() / ".store"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return get_base_dir()
+
+
 def get_audio_default() -> bool:
     """Return default audio setting (True = on)."""
     return _parse_bool_env("SCREENCAP_AUDIO_DEFAULT", "audio_default", True)

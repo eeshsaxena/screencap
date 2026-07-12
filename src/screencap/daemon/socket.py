@@ -48,6 +48,9 @@ class SocketPermsDrift(DaemonSocketError):
 
 
 def default_socket_path() -> Path:
+    # RUN-DIR boundary (SCR-236 R3): the daemon socket stays OUTSIDE the at-rest
+    # container as plaintext — it must exist before any mount. Do NOT route
+    # through config.get_data_root().
     return Path.home() / ".screencap" / "run" / "api.sock"
 
 

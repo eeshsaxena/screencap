@@ -15,6 +15,9 @@ from pathlib import Path
 
 import psutil
 
+# RUN-DIR boundary (SCR-236 R3): the pidfile/lock stay OUTSIDE the at-rest
+# container as plaintext live-process state. Do NOT route through
+# config.get_data_root().
 _DEFAULT_BASE = Path.home() / ".screencap"
 PID_FILE = _DEFAULT_BASE / "recording.pid"
 

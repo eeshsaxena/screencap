@@ -98,6 +98,8 @@ __all__ = [
 # created here if needed), so it is never inside a recording dir the uploader
 # enumerates. Kernel auto-releases the flock on process death (same property
 # pidfile.py relies on) — no stale-lock cleanup needed.
+# RUN-DIR boundary (SCR-236 R3): stays OUTSIDE the at-rest container as plaintext
+# live-process state. Do NOT route through config.get_data_root().
 _RUN_DIR = Path.home() / ".screencap" / "run"
 
 # Blocking-with-timeout default: poll LOCK_NB so we can bound the wait and
