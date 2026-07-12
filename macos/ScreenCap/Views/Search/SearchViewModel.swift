@@ -367,10 +367,16 @@ final class SearchViewModel: ObservableObject {
     /// through the same seam Skip writes) so a stale flag can't suppress
     /// future offers, then starts the run.
     func startBackfillFromEmptyState() {
-        Task { [persistBackfillDeclined] in
-            try? await persistBackfillDeclined(false)
-        }
+        persistDeclined(false)
         startRun()
+    }
+
+    /// Best-effort, fire-and-forget write of the declined flag (Skip writes
+    /// `true`; the empty-state accept clears with `false`).
+    private func persistDeclined(_ declined: Bool) {
+        Task { [persistBackfillDeclined] in
+            try? await persistBackfillDeclined(declined)
+        }
     }
 
     private func startRun() {
@@ -416,9 +422,7 @@ final class SearchViewModel: ObservableObject {
     func skipBackfill() {
         backfillTask?.cancel()
         backfillState = .hidden
-        Task { [persistBackfillDeclined] in
-            try? await persistBackfillDeclined(true)
-        }
+        persistDeclined(true)
     }
 
     /// Cancel an in-flight run. Optimistic local transition to `cancelled` with

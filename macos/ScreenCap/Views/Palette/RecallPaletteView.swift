@@ -55,11 +55,11 @@ struct RecallPaletteView: View {
             }
             // SCR-261 U3 (KTD9/R9): backfill finished (including with partial
             // failures) → refresh a live query once, non-debounced, so results
-            // reflect the new index. Never for an empty/cleared query.
-            model.onBackfillCompleted = {
-                let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return }
-                runner?.search(query, debounced: false)
+            // reflect the new index. Never for an empty/cleared query. Weak
+            // runner capture only — capturing the view struct here would cycle
+            // model → closure → view copy → @StateObject box → model.
+            model.onBackfillCompleted = { [weak runner] in
+                runner?.refreshIfNonEmpty()
             }
             await loadSettings()
             fieldFocused = true
@@ -389,7 +389,7 @@ struct RecallPaletteContent: View {
                 title: "ScreenCap isn't running",
                 note: "Start ScreenCap's background helper to search your history.",
                 retry: onRetry,
-                retryHint: "Searches again now."
+                retryHint: RecallPaletteContent.retryAgainHint
             )
         case .subscriptionRequired:
             // U12: lapsed / not-entitled. An upgrade CTA — NOT the error/retry
@@ -586,6 +586,9 @@ struct RecallPaletteContent: View {
     /// when a *different* searched stream errored (`showsUnavailableNote`).
     static let unavailableNote = "Some of this Mac couldn't be searched right now."
 
+    /// The retry CTA's VoiceOver hint, shared by every retry-bearing state.
+    static let retryAgainHint = "Searches again now."
+
     static func emptySpec(for cause: RecallPalette.State.EmptyCause) -> EmptySpec {
         switch cause {
         case .noMatches:
@@ -638,7 +641,7 @@ struct RecallPaletteContent: View {
                 icon: "exclamationmark.circle",
                 title: "Couldn't search everything",
                 note: "Part of search on this Mac isn't available right now. Your recordings are safe.",
-                cta: .retry(hint: "Searches again now.")
+                cta: .retry(hint: retryAgainHint)
             )
         }
     }
@@ -708,7 +711,7 @@ struct RecallPaletteContent: View {
             if let retry {
                 Button("Retry") { retry() }
                     .padding(.top, 4)
-                    .accessibilityHint(retryHint ?? "Searches again now.")
+                    .accessibilityHint(retryHint ?? Self.retryAgainHint)
             }
             // A labeled call-to-action (e.g. "Subscribe", "Turn on",
             // "Index now") — prominent so it reads as the way forward, not an

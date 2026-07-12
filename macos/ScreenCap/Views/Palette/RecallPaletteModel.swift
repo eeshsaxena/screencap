@@ -289,6 +289,14 @@ final class RecallPaletteQueryRunner: ObservableObject {
         }
     }
 
+    /// SCR-261: the backfill finished — re-issue the last issued query so
+    /// results reflect the newly built index. No-op while nothing meaningful
+    /// has been searched.
+    func refreshIfNonEmpty() {
+        guard let last = lastIssuedQuery, !last.isEmpty else { return }
+        search(last, debounced: false)
+    }
+
     /// esc / scrim-click: cancel whatever is in flight before the palette goes
     /// away, so no stale search publishes into a dismissed panel.
     func cancel() {

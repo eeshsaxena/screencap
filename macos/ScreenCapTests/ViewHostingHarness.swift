@@ -188,14 +188,7 @@ enum SearchFixtures {
     /// Non-authoritative empty: free-text search with no matches and no time
     /// window → "No matches".
     static func noMatchesResults() -> SearchResults {
-        SearchResults(
-            items: [],
-            coverage: CoverageReport(screen: .empty, audio: .empty, activity: .empty),
-            consentNeeded: false,
-            timeWindow: nil,
-            appFilter: nil,
-            queryTerms: ["nonexistent"]
-        )
+        emptyResults(screen: .empty, activity: .empty, queryTerms: ["nonexistent"])
     }
 
     /// A zero-hit result set with explicit per-stream coverage — the SCR-261
