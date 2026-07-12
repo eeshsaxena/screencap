@@ -293,6 +293,33 @@ final class SearchViewModelBackfillTests: XCTestCase {
         XCTAssertEqual(fired, 1)
     }
 
+    /// KTD9: a duplicate `.completed` snapshot must not re-fire the hook — the
+    /// `wasDone` guard in `applyStatus` only fires on the transition INTO
+    /// `.done`. The run task's drain loop returns on the first terminal event,
+    /// so the duplicate is delivered as a completed *seed* status (`start()`
+    /// resolves `.completed` → first `applyStatus`) followed by a completed
+    /// stream event (→ second `applyStatus`) — the exact "seed status after a
+    /// terminal event" shape the guard's comment calls out.
+    func testCompletionHookNotRefiredOnDuplicateCompletedStatus() async {
+        let fake = FakeBackfillService()
+        fake.startStatus = BackfillStatus(state: .completed, done: 3, total: 3)
+        let vm = makeVM(fake)
+        var fired = 0
+        vm.onBackfillCompleted = { fired += 1 }
+
+        vm.acceptBackfill()
+        // First `.completed` (the seed snapshot) lands us on `.done` and fires.
+        await wait(for: vm) { $0 == .done(done: 3, total: 3, failed: 0) }
+        XCTAssertEqual(fired, 1)
+
+        // Second `.completed` (a stream event) reaches applyStatus with the
+        // state already `.done` — no re-fire, state stays `.done`.
+        fake.emit(progress("backfill.completed", state: .completed, done: 3, total: 3))
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fired, 1, "duplicate completed snapshot must not re-fire the hook")
+        XCTAssertEqual(vm.backfillState, .done(done: 3, total: 3, failed: 0))
+    }
+
     /// KTD9: done-with-partial-failures is still done — the hook fires (the
     /// index did change; a refresh is warranted).
     func testCompletionHookFiresOnDoneWithFailures() async {

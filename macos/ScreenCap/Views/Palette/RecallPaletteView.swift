@@ -38,6 +38,10 @@ struct RecallPaletteView: View {
     @State private var consentDeclined = false
     @State private var backfillDeclined = false
     @State private var selectedResultID: SearchResultItem.ID?
+    // nil = no `.loaded` phase observed yet this palette session — the footer's
+    // indexed badge stays quiet until a loaded result has positively reported
+    // the index built (SCR-261 R11).
+    @State private var lastKnownScreenNotIndexed: Bool? = nil
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
@@ -66,7 +70,10 @@ struct RecallPaletteView: View {
         }
         .onChange(of: query) { _ in runner?.search(query, debounced: true) }
         .onChange(of: model.phase) { phase in
-            if case .loaded = phase { selectedResultID = nil }
+            if case .loaded(let results) = phase {
+                selectedResultID = nil
+                lastKnownScreenNotIndexed = results.coverage.screen == .notIndexed
+            }
         }
     }
 
@@ -146,14 +153,12 @@ struct RecallPaletteView: View {
     // MARK: - Footer (design 591–594)
 
     /// SCR-261 U4 (R11) — the footer claims indexed coverage only when
-    /// indexing is on AND the index is built. Off, unknown settings, or a
-    /// loaded result reporting the index absent all drop the claim.
+    /// indexing is on AND the index was observed built by a loaded result.
+    /// Idle/searching inherit the last honest observation (the latch),
+    /// defaulting to no claim before any search has loaded. Off or unknown
+    /// settings drop the claim outright.
     private var showsIndexedBadge: Bool {
-        guard contentIndexEnabled == true else { return false }
-        if case .loaded(let results) = model.phase, results.coverage.screen == .notIndexed {
-            return false
-        }
-        return true
+        contentIndexEnabled == true && lastKnownScreenNotIndexed == false
     }
 
     private var footer: some View {

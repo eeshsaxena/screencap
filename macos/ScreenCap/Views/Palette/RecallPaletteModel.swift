@@ -30,8 +30,8 @@ enum RecallPalette {
             case consentDeclined
             /// Indexing is on but this history isn't indexed yet.
             /// `ctaAvailable` is false while the backfill section owns the ask
-            /// (offer / progress / resume states); start-failed's section has
-            /// no action button, so the body CTA returns.
+            /// (offer / progress / resume states); the done and start-failed
+            /// sections carry no action button, so the body CTA returns.
             case notIndexed(ctaAvailable: Bool)
             /// Content search fell back to the LIKE scan (FTS5 absent) —
             /// results may be incomplete.
@@ -93,7 +93,11 @@ enum RecallPalette {
                 body = .results
             }
         }
-        var showsBanner = consentNeeded && !consentDeclined && backfillState == .hidden
+        // KTD6 — the live settings flag is authoritative for the banner too:
+        // nil (unresolved) stays quiet per R12, and a stale wire
+        // `consentNeeded` with the flag resolved true must not show it.
+        var showsBanner = contentIndexEnabled == false && consentNeeded
+            && !consentDeclined && backfillState == .hidden
         // SCR-261 U3 (R1/KTD4) — when the empty body owns the Turn-on ask, the
         // banner must not co-render the same question. It stays for `.results`
         // with consentNeeded (rows render, the body carries no ask).
@@ -144,12 +148,16 @@ enum RecallPalette {
     }
 
     /// Whether the not-indexed empty body may carry its own Index CTA: only
-    /// while the backfill section isn't already owning the ask.
+    /// while the backfill section isn't already owning the ask. The done and
+    /// start-failed sections render no action button (done is text-only), so
+    /// the body CTA returning violates nothing — and for `.done` it prevents a
+    /// dead end when a backfill completes with nothing indexed while coverage
+    /// stays not-indexed (the state re-derives `.done` across sessions).
     private static func backfillCTAAvailable(_ state: SearchViewModel.BackfillUIState) -> Bool {
         switch state {
-        case .hidden, .startFailed:
+        case .hidden, .done, .startFailed:
             return true
-        case .offering, .starting, .indexing, .done, .paused, .cancelled:
+        case .offering, .starting, .indexing, .paused, .cancelled:
             return false
         }
     }

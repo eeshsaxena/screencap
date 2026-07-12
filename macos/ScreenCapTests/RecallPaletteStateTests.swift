@@ -186,11 +186,22 @@ final class RecallPaletteStateTests: XCTestCase {
                 "the backfill section owns the ask in \(backfill)"
             )
         }
-        // start-failed's section carries no action button — the body CTA returns.
-        XCTAssertEqual(
-            emptyBody(SearchFixtures.emptyResults(screen: .notIndexed), backfillState: .startFailed),
-            .empty(cause: .notIndexed(ctaAvailable: true), showsUnavailableNote: false)
-        )
+        // The done and start-failed sections carry no action button — the body
+        // CTA returns. The .done pin covers the zero-indexed-completion dead
+        // end: a backfill finishing while coverage stays not-indexed would
+        // otherwise strand the user across sessions (the state re-derives
+        // `.done`).
+        let ctaReturns: [SearchViewModel.BackfillUIState] = [
+            .done(done: 5, total: 5, failed: 0),
+            .startFailed,
+        ]
+        for backfill in ctaReturns {
+            XCTAssertEqual(
+                emptyBody(SearchFixtures.emptyResults(screen: .notIndexed), backfillState: backfill),
+                .empty(cause: .notIndexed(ctaAvailable: true), showsUnavailableNote: false),
+                "the section renders no action button in \(backfill) — the body CTA returns"
+            )
+        }
     }
 
     func testNotIndexedCarriesSecondaryUnavailableNote() {
@@ -223,14 +234,27 @@ final class RecallPaletteStateTests: XCTestCase {
 
     func testUnknownSettingsFlagStaysQuiet() {
         // Settings pending/failed (nil flag) → a quiet "no matches", never a
-        // consent or not-indexed nag (R12).
-        XCTAssertEqual(
-            emptyBody(
-                SearchFixtures.emptyResults(screen: .notIndexed, consentNeeded: true),
-                contentIndexEnabled: nil
-            ),
-            .empty(cause: .noMatches, showsUnavailableNote: false)
+        // consent or not-indexed nag (R12) — and no banner either (KTD6: the
+        // live flag, not the wire snapshot, keys the banner).
+        let state = RecallPalette.state(
+            phase: .loaded(SearchFixtures.emptyResults(screen: .notIndexed, consentNeeded: true)),
+            consentDeclined: false, backfillState: .hidden,
+            contentIndexEnabled: nil, recents: []
         )
+        XCTAssertEqual(state.body, .empty(cause: .noMatches, showsUnavailableNote: false))
+        XCTAssertFalse(state.showsConsentBanner)
+    }
+
+    // KTD6 — a stale wire consentNeeded with the live flag already resolved
+    // true (indexing on) must not re-ask.
+    func testStaleWireConsentNeededWithLiveFlagOnShowsNoBanner() {
+        let state = RecallPalette.state(
+            phase: .loaded(SearchFixtures.consentNeededResults()),
+            consentDeclined: false, backfillState: .hidden,
+            contentIndexEnabled: true, recents: []
+        )
+        XCTAssertFalse(state.showsConsentBanner)
+        XCTAssertEqual(state.body, .results)
     }
 
     // MARK: - Empty-state copy + CTAs (SCR-261 U2)
@@ -407,6 +431,58 @@ final class RecallPaletteStateTests: XCTestCase {
         private(set) var cancelCount = 0
         func started() { startCount += 1 }
         func cancelled() { cancelCount += 1 }
+    }
+
+    // MARK: - Backfill-completion refresh (SCR-261)
+
+    /// The refresh re-issues exactly the last committed query, non-debounced:
+    /// with a huge debounce interval, a debounced re-issue could never land
+    /// within the bounded spin.
+    func testRefreshReissuesLastCommittedQueryWithoutDebounce() async {
+        let recorder = QueryRecorder()
+        let runner = RecallPaletteQueryRunner(debounceNanos: 10_000_000_000) { query in
+            await recorder.record(query)
+        }
+        runner.search("salesforce", debounced: false)
+        await runner.searchTask?.value
+        runner.refreshIfNonEmpty()
+        var spins = 0
+        while await recorder.queries.count < 2, spins < 100_000 {
+            await Task.yield()
+            spins += 1
+        }
+        let queries = await recorder.queries
+        XCTAssertEqual(queries, ["salesforce", "salesforce"])
+        runner.cancel()
+    }
+
+    func testRefreshWithNoPriorSearchIsNoOp() async {
+        let recorder = QueryRecorder()
+        let runner = RecallPaletteQueryRunner(debounceNanos: 0) { query in
+            await recorder.record(query)
+        }
+        runner.refreshIfNonEmpty()
+        XCTAssertNil(runner.searchTask, "nothing searched — nothing to refresh")
+        let queries = await recorder.queries
+        XCTAssertEqual(queries, [])
+    }
+
+    func testRefreshAfterCommittedEmptyQueryIsNoOp() async {
+        let recorder = QueryRecorder()
+        let runner = RecallPaletteQueryRunner(debounceNanos: 0) { query in
+            await recorder.record(query)
+        }
+        runner.search("", debounced: false)
+        await runner.searchTask?.value
+        runner.refreshIfNonEmpty()
+        await runner.searchTask?.value
+        let queries = await recorder.queries
+        XCTAssertEqual(queries, [""], "an empty committed query is nothing to refresh")
+    }
+
+    private actor QueryRecorder {
+        private(set) var queries: [String] = []
+        func record(_ query: String) { queries.append(query) }
     }
 
     // MARK: - Render smoke checks (hosted)
