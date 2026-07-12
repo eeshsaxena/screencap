@@ -277,6 +277,22 @@ final class FirstRunSetupPresentationPolicyTests: XCTestCase {
         )
     }
 
+    /// The converging denial escape honors setupDismissed exactly like the
+    /// settled gate: a user who persisted "Skip for now" must not get the wall
+    /// mid-swap on a denial the non-converging path would suppress. The
+    /// interstitial (honest status) still shows.
+    func testConvergingDenialHonorsSetupDismissed() {
+        XCTAssertEqual(
+            presentation(
+                transport: .daemon,
+                daemonGrants: denied,
+                setupDismissed: true,
+                updateConverging: true
+            ),
+            .updateInterstitial
+        )
+    }
+
     /// The interstitial is status, not a permission nag — a persisted
     /// "Skip for now" does not suppress it.
     func testConvergingOverridesSetupDismissed() {

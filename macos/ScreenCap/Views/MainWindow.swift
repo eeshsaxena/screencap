@@ -69,7 +69,13 @@ enum FirstRunSetupPresentationPolicy {
         // false by then (the loop clears it), so the expired input is
         // belt-and-suspenders for the same tick.
         if updateConverging, !convergenceDeadlineExpired {
-            if transport == .daemon, daemonGrants.anyRequiredDenied { return .permissionWall }
+            // The denial escape honors setupDismissed exactly like the
+            // non-converging path below — a user who persisted "Skip for now"
+            // must not get the wall mid-swap on a (possibly dying-daemon)
+            // denial the settled gate would suppress.
+            if transport == .daemon, daemonGrants.anyRequiredDenied, !setupDismissed {
+                return .permissionWall
+            }
             return .updateInterstitial
         }
         // Phase 1c (SCR-49): the one-time upgrade migration banner shows even when
@@ -254,6 +260,11 @@ struct MainWindow: View {
             // U7: a recording ended and the main window was restored — land on
             // Library (with the fresh draft card).
             route = .library
+            // SCR-262: state changes that fired mid-recording were swallowed by
+            // the isRecording early return (e.g. convergence finishing while a
+            // recording ran would otherwise leave the interstitial latched with
+            // no remaining exit trigger) — re-evaluate now.
+            updatePermissionSetupPresentation()
         }
         .onChange(of: recorder.daemonProbeCompleted) { _ in
             updatePermissionSetupPresentation()
@@ -462,6 +473,15 @@ struct MainWindow: View {
             let acknowledged = env.settings.corpusEncrypted ?? false
             let declined = env.settings.contentIndexConsentDeclined ?? false
             if SearchDisclosurePolicy.shouldPresent(acknowledged: acknowledged, declined: declined) {
+                // Re-check the takeover guards: the interstitial or wall can
+                // appear while the settings read was in flight (the launch
+                // task's first probe completes after onAppear evaluated the
+                // guard above). Retry next evaluation instead of popping the
+                // consent sheet over a takeover.
+                guard onboarding == nil, !showingPermissionSetup, !showingUpdateInterstitial else {
+                    didEvaluateSearchDisclosure = false
+                    return
+                }
                 showingSearchDisclosure = true
             }
         } catch {

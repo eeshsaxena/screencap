@@ -154,8 +154,10 @@ final class RecorderController: ObservableObject {
     /// repair surface) presents.
     static let updateConvergenceDeadline: TimeInterval = 90.0
 
-    /// SCR-262: cadence of the convergence re-probe loop (precedent:
-    /// `DaemonInstallController.pollDaemon`'s probe cadence).
+    /// SCR-262: cadence of the convergence re-probe loop. Deliberately slower
+    /// than `pollDaemon`'s interactive 0.5s wait: the swap takes 30–60s, so a
+    /// background ~3s tick still converges within one tick of the daemon
+    /// binding while keeping the dying socket quiet.
     static let updateConvergenceProbeInterval: TimeInterval = 3.0
 
     /// SCR-262: UserDefaults key holding the restart-trigger timestamp. The swap
@@ -378,6 +380,10 @@ final class RecorderController: ObservableObject {
     /// grant-watch's activation + timer ticks. `nil` until the first restart.
     private var lastDaemonRestartAt: Date?
 
+    /// SCR-262: true once `runLaunchDaemonCheck` has run in this process — the
+    /// stale-check, provenance reset, and anchor mint are launch-once; window
+    /// re-materializations fall through to a plain probe.
+    private var launchDaemonCheckRan = false
     /// SCR-262: the running convergence re-probe loop, nil when idle. Single
     /// instance — `startConvergenceProbeLoopIfNeeded` guards on it, and a window
     /// re-materialization re-running the launch task never doubles the loop.
@@ -560,6 +566,17 @@ final class RecorderController: ObservableObject {
         defaults: UserDefaults = .standard,
         now: () -> Date = Date.init
     ) async {
+        // Launch-once: the window-content `.task` re-runs whenever the singleton
+        // Window is re-materialized (accessory-mode teardown → menu-bar/Dock
+        // reopen). A re-run must not fire a second kickstart into the old
+        // daemon's exit grace, erase the wall's update provenance, or re-anchor
+        // a deadline the running loop already captured — it just re-probes so a
+        // reopened window still reflects current daemon state.
+        guard !launchDaemonCheckRan else {
+            await probeDaemon()
+            return
+        }
+        launchDaemonCheckRan = true
         updateConvergenceFailed = false
         let triggered = await restartStaleDaemon()
         if let anchor = Self.convergenceAnchorForLaunch(
@@ -616,7 +633,15 @@ final class RecorderController: ObservableObject {
                     recorderLogger.error(
                         "Helper swap did not converge within \(Self.updateConvergenceDeadline, privacy: .public)s; falling through to the permission wall"
                     )
-                    self.finishUpdateConvergence(failed: true)
+                    // Re-read reality before falling through: the launch probe
+                    // may have adopted the DYING pre-swap daemon (transport
+                    // frozen at .daemon, grants intact), and without a fresh
+                    // probe the policy would resolve to the shell on a dead
+                    // transport instead of the repair wall. A dead daemon now
+                    // reads .cliFallback → wall; a live one means the swap
+                    // converged after all → not a failure.
+                    await self.probeDaemon()
+                    self.finishUpdateConvergence(failed: self.transport != .daemon)
                     return
                 case .keepWaiting:
                     await sleep(Self.updateConvergenceProbeInterval)

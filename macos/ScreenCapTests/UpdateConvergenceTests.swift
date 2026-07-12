@@ -10,16 +10,19 @@ final class UpdateConvergenceTests: XCTestCase {
 
     private var defaults: UserDefaults!
     private var suiteName: String!
+    private var socketPath: String!
     private var recorder: RecorderController?
 
     override func setUp() {
         super.setUp()
         suiteName = "sc-update-convergence-\(UUID().uuidString.prefix(8))"
         defaults = UserDefaults(suiteName: suiteName)
-        // Point the daemon socket at a nonexistent path so any probeDaemon()
+        // Point the daemon socket at a not-yet-bound path so any probeDaemon()
         // the machinery runs fails fast to .unavailable instead of touching a
-        // real daemon (mirrors RecorderControllerDaemonTests' isolation).
-        setenv("SCREENCAP_DAEMON_SOCKET", "/tmp/sc-uc-\(UUID().uuidString.prefix(8)).sock", 1)
+        // real daemon (mirrors RecorderControllerDaemonTests' isolation). Tests
+        // that need a reachable daemon bind a UnixHTTPTestServer here.
+        socketPath = "/tmp/sc-uc-\(UUID().uuidString.prefix(8)).sock"
+        setenv("SCREENCAP_DAEMON_SOCKET", socketPath, 1)
     }
 
     override func tearDown() async throws {
@@ -28,6 +31,9 @@ final class UpdateConvergenceTests: XCTestCase {
         recorder = nil
         if let suiteName {
             defaults.removePersistentDomain(forName: suiteName)
+        }
+        if let socketPath {
+            unlink(socketPath)
         }
         unsetenv("SCREENCAP_DAEMON_SOCKET")
         try await super.tearDown()
@@ -208,6 +214,85 @@ final class UpdateConvergenceTests: XCTestCase {
         )
         XCTAssertFalse(recorder.updateConverging)
         XCTAssertNil(defaults.object(forKey: RecorderController.updateConvergenceAnchorKey))
+    }
+
+    /// KTD-2's load-bearing ordering, asserted by sequencing rather than
+    /// outcome: the stale-restart decision resolves BEFORE the first probe, so
+    /// the probe can never adopt a daemon the kickstart is about to kill.
+    func testStaleRestartDecisionResolvesBeforeFirstProbe() async {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        let probeRanFirst = LockedCounter()
+        await recorder.runLaunchDaemonCheck(
+            restartStaleDaemon: {
+                if await MainActor.run(body: { recorder.daemonProbeCompleted }) {
+                    _ = probeRanFirst.incrementAndGet()
+                }
+                return false
+            },
+            defaults: defaults
+        )
+        XCTAssertEqual(probeRanFirst.value, 0, "probe must not run before the restart decision resolves")
+        XCTAssertTrue(recorder.daemonProbeCompleted)
+    }
+
+    /// Window re-materialization re-runs the launch task; the stale-check,
+    /// provenance reset, and anchor mint are launch-once — a re-run must not
+    /// fire a second kickstart or re-anchor the running loop's deadline.
+    func testLaunchCheckRunsOnlyOncePerProcess() async {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        let restarts = LockedCounter()
+        let now = Date()
+        await recorder.runLaunchDaemonCheck(
+            restartStaleDaemon: { _ = restarts.incrementAndGet(); return true },
+            defaults: defaults,
+            now: { now }
+        )
+        recorder._testCancelConvergenceLoop()
+        XCTAssertTrue(recorder.updateConverging)
+        await recorder.runLaunchDaemonCheck(
+            restartStaleDaemon: { _ = restarts.incrementAndGet(); return true },
+            defaults: defaults,
+            now: { now.addingTimeInterval(30) }
+        )
+        XCTAssertEqual(restarts.value, 1, "re-materialization must not fire a second kickstart")
+        XCTAssertEqual(recorder.updateConvergenceAnchor, now, "the original anchor survives the re-run")
+        XCTAssertTrue(recorder.updateConverging)
+    }
+
+    /// KTD-8/KTD-6's provenance-clearing transition: once a reachable daemon
+    /// makes the wall's rows genuine again, the update-didn't-finish provenance
+    /// clears — a later recovery wall is ordinary, not update-flavored.
+    func testReachableDaemonClearsUpdateProvenance() async throws {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        // Expire a convergence window with no daemon: provenance latches.
+        recorder._testBeginUpdateConvergence(
+            anchor: Date().addingTimeInterval(-300), defaults: defaults
+        )
+        recorder.startConvergenceProbeLoopIfNeeded(
+            freshProbe: { nil }, now: { Date() }, sleep: { _ in }
+        )
+        await waitUntil { !recorder.updateConverging }
+        XCTAssertTrue(recorder.updateConvergenceFailed)
+        // A daemon comes up afterwards (e.g. the wall's auto-install healed
+        // it): the next probe clears the provenance.
+        let server = try UnixHTTPTestServer(socketPath: socketPath) { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/session.snapshot":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":false,"daemon_owned":false,"recording_name":null,"started_at":null,"claimant":null,"recovering":false,"cursor":0}"#)
+            default:
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+        server.start()
+        defer { server.stop() }
+        await recorder.probeDaemon()
+        XCTAssertEqual(recorder.transport, .daemon)
+        XCTAssertFalse(recorder.updateConvergenceFailed)
     }
 
     func testOrdinaryLaunchDoesNotConverge() async {
