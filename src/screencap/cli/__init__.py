@@ -70,6 +70,11 @@ _SETTINGS_SCHEMA_VERSION = 3
 # each CLI option available / needs-attention (R5). Additive over v2.
 _SETTINGS_INTELLIGENCE_SCHEMA_VERSION = 3
 _STOP_SCHEMA_VERSION = 1
+# `rename --json` envelope (ok + schema_version + recording + resolved title +
+# title_is_user_set + error), read by the macOS Library-card Rename affordance
+# (editable titles U6) to reconcile its optimistic edit against the daemon's
+# resolved display title. Wraps `POST /v0/recording.rename` (U4).
+_RENAME_SCHEMA_VERSION = 1
 # `whoami --json` envelope (ok + schema_version + signed_in/uid/email/subscribed/
 # tier/trial_end), read by the SwiftUI shell to gate the Upload affordance on
 # auth + entitlement and drive the two-tier picker + trial UI (U11).
@@ -2384,6 +2389,147 @@ def stop(force, as_json):
                 f"[yellow]Daemon reported final_state={escape(repr(_stop_outcome['final_state']))}.[/yellow]"
             )
     _emit_stop_result(ok=True)
+
+
+@cli.command()
+@click.argument("recording")
+@click.argument("title", required=False, default=None)
+@click.option("--clear", is_flag=True, default=False,
+              help="Clear the custom title and revert to the default date/time name.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Emit machine-readable JSON to stdout instead of prose. "
+                   "Auto-detected when stdout is not a TTY.")
+def rename(recording, title, clear, as_json):
+    """Set or clear a recording's display title.
+
+    RECORDING is a recording_id or its directory name; TITLE is the new display
+    title. Pass an empty title ("") or --clear to revert to the default
+    date/time name.
+
+    Thin client of ``POST /v0/recording.rename``. The custom title is local-only
+    (never uploaded). Renaming the currently-active recording is refused — stop
+    it first.
+
+    JSON envelope:
+      {ok, schema_version, recording, title, title_is_user_set, error}
+    where ``title`` is the resolved display title the daemon now reports.
+    """
+    import json as _json
+
+    from screencap.cli._autospawn import (
+        DaemonAutoSpawnError,
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    err_console = Console(stderr=True)
+
+    _outcome: dict = {
+        "recording": recording,
+        "title": None,
+        "title_is_user_set": None,
+        "error": None,
+    }
+
+    def _emit(*, ok: bool, exit_code: int = 0) -> None:
+        # Honor the JSON-envelope-on-nonzero-exit learning (see docs/solutions/
+        # integration-issues/cli-json-envelope-nonzero-exit-discards-stdout):
+        # the error is ALSO surfaced to stderr above, which survives a non-zero
+        # exit, so the user never sees a silent failure.
+        if as_json:
+            payload = {
+                "ok": ok,
+                "schema_version": _RENAME_SCHEMA_VERSION,
+                **_outcome,
+            }
+            sys.stdout.write(_json.dumps(payload) + "\n")
+            sys.stdout.flush()
+        if exit_code:
+            raise SystemExit(exit_code)
+
+    # Resolve the target title. ``--clear`` and an explicit TITLE are mutually
+    # exclusive; exactly one of them (or an empty TITLE) must be present.
+    if clear:
+        if title:
+            _outcome["error"] = "clear_and_title_conflict"
+            err_console.print(
+                "[red]Error:[/red] pass either a TITLE or --clear, not both."
+            )
+            _emit(ok=False, exit_code=2)
+            return
+        target_title = ""
+    elif title is None:
+        _outcome["error"] = "missing_title"
+        err_console.print(
+            "[red]Error:[/red] provide a TITLE, or --clear to revert to the "
+            "default date/time name."
+        )
+        _emit(ok=False, exit_code=2)
+        return
+    else:
+        target_title = title
+
+    # Renaming needs the daemon; auto-spawn one on a headless install (F3),
+    # mirroring ``screencap start``.
+    try:
+        ensure_daemon_or_spawn(
+            auto_spawn=True,
+            stderr_emitter=lambda line: click.echo(line, err=True),
+        )
+    except LaunchAgentNotRunningError as exc:
+        _outcome["error"] = "launchagent_not_running"
+        err_console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        _emit(ok=False, exit_code=1)
+        return
+    except DaemonAutoSpawnError as exc:
+        _outcome["error"] = "daemon_autospawn_failed"
+        err_console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        _emit(ok=False, exit_code=1)
+        return
+
+    try:
+        with DaemonHTTPClient() as client:
+            result = client.rename(recording=recording, title=target_title)
+    except DaemonUnreachableError:
+        _outcome["error"] = "daemon_unreachable"
+        err_console.print(
+            "[red]Error:[/red] daemon not reachable — is it running?"
+        )
+        _emit(ok=False, exit_code=1)
+        return
+    except SchemaMismatchError as exc:
+        _outcome["error"] = "schema_mismatch"
+        err_console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        err_console.print(
+            "Update the daemon: [bold]launchctl kickstart -kp "
+            "gui/$UID/com.screencap.daemon[/bold]"
+        )
+        _emit(ok=False, exit_code=1)
+        return
+    except DaemonAPIError as exc:
+        code = exc.envelope.get("error", "unknown")
+        _outcome["error"] = code
+        human = exc.envelope.get("message") or code
+        err_console.print(f"[red]Rename failed:[/red] {escape(str(human))}")
+        _emit(ok=False, exit_code=1)
+        return
+
+    _outcome["title"] = result.get("title")
+    _outcome["title_is_user_set"] = bool(result.get("title_is_user_set"))
+    if not as_json:
+        display = escape(str(_outcome["title"]))
+        if _outcome["title_is_user_set"]:
+            console.print(f"[#22d3ee]Renamed[/#22d3ee] to {display}.")
+        else:
+            console.print(f"[#22d3ee]Title cleared[/#22d3ee] — now {display}.")
+    _emit(ok=True)
 
 
 @cli.command()
