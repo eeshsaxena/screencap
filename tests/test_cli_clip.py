@@ -522,6 +522,67 @@ def test_sigterm_runs_temp_cleanup_and_reports_cancelled(recordings_root, tmp_pa
     assert signal.getsignal(signal.SIGTERM) == sigterm_before
 
 
+def test_sigterm_after_successful_export_does_not_clobber_success(recordings_root, tmp_path):
+    """FIX A (P3): a SIGTERM arriving AFTER ``export_clip`` returns successfully —
+    while the custom handler is still installed during the ``finally`` that
+    restores the previous SIGTERM disposition — must NOT emit
+    ``clip_failed(cancelled)`` and must NOT clobber the success envelope. The
+    ``succeeded`` latch makes the handler a no-op (neither emits nor raises) once a
+    real clip is on disk.
+
+    Deterministic repro of that window: patch ``signal.signal`` so its SECOND
+    SIGTERM call — clip_cmd's ``finally`` RESTORE, which runs only AFTER
+    ``export_clip`` returned and ``succeeded`` was set — first fires the
+    still-referenced custom handler (the raced SIGTERM). Without the guard that
+    handler would emit a cancel and raise ``KeyboardInterrupt`` out of the
+    ``finally``, so the ``clip_done`` / ok envelope never runs and Swift sees a
+    spurious cancel over a clip that exists.
+    """
+    import signal as signal_mod
+
+    _make_clippable(recordings_root, "rec-postsuccess")
+    out = tmp_path / "clip.mp4"
+
+    real_signal = signal_mod.signal
+    state = {"sigterm_calls": 0, "handler": None, "fired": False}
+
+    def _tracking_signal(signum, handler):
+        if signum != signal_mod.SIGTERM:
+            return real_signal(signum, handler)
+        state["sigterm_calls"] += 1
+        if state["sigterm_calls"] == 1:
+            # clip_cmd installing its custom handler — remember it.
+            state["handler"] = handler
+            return real_signal(signum, handler)
+        # 2nd SIGTERM signal() == clip_cmd's finally RESTORE. export_clip has
+        # already returned (succeeded=True); fire the custom handler now to
+        # simulate a SIGTERM racing the restore. Post-fix it must be a no-op.
+        if not state["fired"] and state["handler"] is not None:
+            state["fired"] = True
+            state["handler"](signal_mod.SIGTERM, None)
+        return real_signal(signum, handler)
+
+    with mock.patch("screencap.engine.video.export_clip", _fake_export()), mock.patch(
+        "signal.signal", _tracking_signal
+    ):
+        result = _invoke(recordings_root, "rec-postsuccess", out)
+
+    # The raced post-success SIGTERM was actually delivered to the handler...
+    assert state["fired"], "the post-success SIGTERM path was never exercised"
+    # ...yet success stands: exit 0, ok envelope with the clip path, file on disk.
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["reason"] is None
+    assert payload["path"] == str(out)
+    assert out.exists(), "the finalized clip must remain on disk"
+
+    # No spurious clip_failed(cancelled) clobbered the stream — only started→done.
+    kinds = [e["type"] for e in _events(result)]
+    assert "clip_done" in kinds
+    assert "clip_failed" not in kinds, f"post-success SIGTERM emitted a cancel: {kinds}"
+
+
 # ---------------------------------------------------------------------------
 # Auth-free (KTD5)
 # ---------------------------------------------------------------------------

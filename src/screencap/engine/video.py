@@ -1627,7 +1627,24 @@ def export_clip(
         # accumulate world-readable in the user's export dir. Concurrency-safe:
         # ``_sweep_stale_temps`` skips any temp whose embedded PID is still alive
         # (a concurrent in-flight export in this or another process).
+        #
+        # TWO shapes must be reclaimed. A SIGTERM is turned into a clean
+        # ``except BaseException`` unlink, but a SIGKILL / power-loss can strike
+        # at two different points:
+        #   * after ``_encode_clip``'s ``os.replace`` promoted the inner temp onto
+        #     ``video_tmp`` → the OUTER ``.clipvid.mp4.<pid>.<uuid>.tmp`` orphans;
+        #   * DURING ``_encode_clip``'s encode, before that replace → only the
+        #     INNER temp exists on disk. ``_encode_clip`` derives its own atomic
+        #     temp from ``video_tmp.name``, so the inner shape is
+        #     ``..clipvid.mp4.<pid>.<uuid>.tmp.<pid>.<uuid>.tmp`` (a SECOND leading
+        #     dot) — which ``.clipvid.mp4.*.tmp`` does NOT match. Sweep it with an
+        #     explicit literal-``..clipvid.mp4.`` glob: the prefix is unique to
+        #     this nested derivation (no unrelated-file collision), and the PID
+        #     parser still reads the export's pid (it sits immediately after the
+        #     one ``mp4`` token in both shapes). Without this second sweep a
+        #     SIGKILL mid-encode would leave a full-size inner temp unreclaimable.
         _sweep_stale_temps(out_path.parent, ".clipvid.mp4.*.tmp")
+        _sweep_stale_temps(out_path.parent, "..clipvid.mp4.*.tmp")
         # Video → a dot-prefixed intermediate (excluded from upload/catalog),
         # then muxed with audio into out_path. A masked/no-frames failure raises
         # out of the video pass before this temp materializes, so no file leaks.

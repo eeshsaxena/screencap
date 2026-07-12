@@ -1774,9 +1774,25 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
     # sentinel + finally restore the previous handler (skipped off-main-thread,
     # where ``signal.signal`` raises ValueError).
     _interrupt_emitted = False
+    # ``export_clip`` returns BEFORE the ``finally`` restores the previous SIGTERM
+    # handler, so the custom handler is still installed during that window. A
+    # SIGTERM delivered there (Swift racing a watchdog against a just-finished
+    # export) must NOT clobber the real clip already on disk: without this guard
+    # the handler would emit a terminal ``clip_failed(cancelled)`` and raise out
+    # of the ``finally``, so the ``clip_done`` / ok-envelope below never runs and
+    # Swift sees a spurious cancel. Once ``export_clip`` has returned we flip
+    # ``succeeded`` and the handler becomes a no-op (neither emits nor raises) —
+    # the success envelope owns the outcome. Mid-export cancel (before success)
+    # is unchanged.
+    succeeded = False
 
     def _emit_interrupted_and_raise(_signum, _frame):
         nonlocal _interrupt_emitted
+        if succeeded:
+            # Post-success SIGTERM: the clip is finalized on disk and the
+            # ok-envelope is about to be written. Swallow the signal so we don't
+            # overwrite success with a cancel.
+            return
         if not _interrupt_emitted:
             _interrupt_emitted = True
             emit_event(
@@ -1799,6 +1815,9 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
         # Relative (from-video-start) ms — the caller-facing envelope/events keep
         # the absolute ``start_ms`` / ``end_ms`` above.
         export_clip(rec_dir, rel_start_ms, rel_end_ms, out_p, **export_kwargs)
+        # A real clip is now on disk. Latch success so a SIGTERM racing the
+        # handler-restore below can't re-enter the handler and emit a cancel.
+        succeeded = True
     except TerminalStageBusy as exc:
         # A contended eviction lock is retryable, not a hard failure (KTD6). It is
         # deliberately NOT a ClipExportError, so the app can retry rather than

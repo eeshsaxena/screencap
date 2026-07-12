@@ -26,6 +26,7 @@ import pytest
 import soundfile as sf
 from PIL import Image
 
+from screencap.engine import audio_clip
 from screencap.engine.video import export_clip
 
 _BASE = 1_000_000.0  # recording-start wall-clock anchor (seconds), as in U1
@@ -232,6 +233,120 @@ class TestNoAudio:
         with av.open(str(out)) as c:
             assert c.streams.video
             assert any(True for _ in c.decode(video=0))
+
+
+class TestLazyProbe:
+    """Lock in the U2 refactor's whole point: chunk durations are probed LAZILY,
+    stopping once the running cumulative offset reaches the clip's end on the
+    audio timeline. ``_flac_duration_s`` falls through to a full PyAV decode for a
+    recorder-written FLAC, so eagerly probing every chunk would decode the entire
+    (possibly hours-long) track just to clip a few seconds. These tests guard
+    against a regression back to eager probing and confirm the early-break math.
+    """
+
+    @staticmethod
+    def _spy_probe(monkeypatch) -> list[str]:
+        """Patch ``_flac_duration_s`` to record which chunks it probes (in order),
+        delegating to the real implementation so durations stay correct."""
+        probed: list[str] = []
+        real = audio_clip._flac_duration_s
+
+        def _spy(path):
+            probed.append(Path(path).name)
+            return real(path)
+
+        monkeypatch.setattr(audio_clip, "_flac_duration_s", _spy)
+        return probed
+
+    def test_short_clip_near_start_skips_trailing_chunks(self, tmp_path, monkeypatch):
+        """A short clip near the START of a MANY-chunk recording probes ONLY the
+        prefix up to the clip's end — not every chunk (the eager-probe regression
+        would probe all 10)."""
+        _write_video(tmp_path, _SPARSE_TWO_CHUNK, _BASE)
+        _write_db(tmp_path, video_start=_BASE, audio_start=_BASE)
+        # 10 FLAC chunks × 2.0s = 20s of continuous audio; a burst in chunk0 so
+        # the produced clip is real (non-vacuous) audio built from chunk0 alone.
+        _write_flac_chunks(tmp_path, [2.0] * 10, burst_p=0.3)
+
+        probed = self._spy_probe(monkeypatch)
+        out = tmp_path / "clip.mp4"
+        export_clip(tmp_path, 0, 1000, out)  # [0s, 1s): ends inside chunk0
+
+        # Only chunk0 is probed: after probing it (running 0→2.0s ≥ hi_bound 1.0s)
+        # the loop breaks, so chunks 1..9 are never opened or decoded.
+        assert probed == ["audio_0000.flac"], f"probed trailing chunks: {probed}"
+        assert _has_audio(out), "the clip must carry the chunk0 audio"
+
+    def test_tail_chunks_do_not_change_output(self, tmp_path):
+        """Equivalence: a clip ending mid-stream is the same audio the range
+        demands — the later (out-of-range) chunks perturb neither duration nor
+        first-sample alignment. Proven by clipping the SAME range from a full
+        library and from one truncated to only the in-range chunks."""
+
+        def _build(root: Path, n_chunks: int) -> Path:
+            root.mkdir(parents=True, exist_ok=True)
+            _write_video(root, _SPARSE_TWO_CHUNK, _BASE)
+            _write_db(root, video_start=_BASE, audio_start=_BASE)
+            # Burst at concatenated p=3.2s → inside chunk1, within the [1s,5s) clip.
+            _write_flac_chunks(root, [2.0] * n_chunks, burst_p=3.2)
+            out = root / "clip.mp4"
+            export_clip(root, 1000, 5000, out)  # overlaps chunks 0..2 only
+            return out
+
+        full = _build(tmp_path / "full", 6)   # 12s; chunks 3..5 are out of range
+        trunc = _build(tmp_path / "trunc", 3)  # exactly the in-range chunks (6s)
+
+        f0, f1 = _audio_span(full)
+        t0, t1 = _audio_span(trunc)
+        # The tail chunks leave the output untouched.
+        assert abs(f0 - t0) <= 0.02, f"first-sample offset drift: {f0} vs {t0}"
+        assert abs(f1 - t1) <= 0.05, f"duration drift: {f1} vs {t1}"
+        assert abs(_burst_time(full) - _burst_time(trunc)) <= 0.05, "burst drift"
+        # And both match what the range demands: 4s span, burst at out 3.2-1.0=2.2s.
+        assert abs(f1 - 4.0) <= 0.3, f"duration {f1:.3f}s off 4.0s"
+        assert abs(_burst_time(full) - 2.2) <= 0.25, "burst off 2.2s"
+
+    def test_clip_end_exactly_on_flac_boundary(self, tmp_path, monkeypatch):
+        """Clip end landing EXACTLY on a FLAC chunk boundary: the boundary chunk
+        is fully covered by the prefix, and the next chunk is not needlessly
+        probed (the early break uses ``running >= hi_bound``)."""
+        _write_video(tmp_path, _SPARSE_TWO_CHUNK, _BASE)
+        _write_db(tmp_path, video_start=_BASE, audio_start=_BASE)
+        # Boundary between chunk0 and chunk1 sits at exactly 2.0s; burst in chunk0.
+        _write_flac_chunks(tmp_path, [2.0, 2.0, 2.0], burst_p=1.0)
+
+        probed = self._spy_probe(monkeypatch)
+        out = tmp_path / "clip.mp4"
+        export_clip(tmp_path, 0, 2000, out)  # [0s, 2.0s): ends ON the boundary
+
+        # chunk0 (running 0→2.0s) already reaches hi_bound 2.0s, so chunk1 (the
+        # boundary chunk) and chunk2 are never probed.
+        assert probed == ["audio_0000.flac"], f"probed past the boundary: {probed}"
+        first_a, last_a = _audio_span(out)
+        assert abs(last_a - 2.0) <= 0.3, f"audio duration {last_a:.3f}s off 2.0s"
+        assert abs(_burst_time(out) - 1.0) <= 0.25, "burst off 1.0s"
+
+    def test_negative_anchor_delta(self, tmp_path):
+        """Audio anchor BEFORE the video anchor (negative ``anchor_delta``): the
+        early-break math still resolves the overlap correctly and the audio opens
+        at output t=0 aligned to the video."""
+        _write_video(tmp_path, _SPARSE_TWO_CHUNK, _BASE)
+        # Audio recording began 0.5s BEFORE the video anchor → anchor_delta = -0.5.
+        _write_db(tmp_path, video_start=_BASE, audio_start=_BASE - 0.5)
+        # Burst at concatenated p=1.5s → output time p + anchor_delta - start
+        # = 1.5 - 0.5 - 0 = 1.0s.
+        _write_flac_chunks(tmp_path, [2.0, 2.0], burst_p=1.5)
+
+        out = tmp_path / "clip.mp4"
+        export_clip(tmp_path, 0, 2000, out)  # [0s, 2.0s)
+
+        assert _has_audio(out), "negative anchor delta must still carry audio"
+        first_a, last_a = _audio_span(out)
+        assert first_a <= 0.1, f"audio starts late at {first_a:.3f}s (delta ignored?)"
+        assert abs(last_a - 2.0) <= 0.3, f"audio duration {last_a:.3f}s off 2.0s"
+        assert abs(_burst_time(out) - 1.0) <= 0.25, (
+            f"burst at {_burst_time(out):.3f}s, expected ~1.0s (anchor delta wrong)"
+        )
 
 
 class TestResample:
