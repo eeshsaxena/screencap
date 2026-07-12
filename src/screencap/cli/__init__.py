@@ -4622,7 +4622,10 @@ def e2ee_enable_cmd(as_json: bool) -> None:
         ))
         return
     console.print("[green]E2EE enabled[/green] for cloud copies (beta).")
-    console.print(f"  Key id: [bold]{key_id}[/bold] (held only in this Mac's Keychain)")
+    console.print(
+        f"  Key id: [bold]{key_id}[/bold] "
+        "(held in your Keychain; syncs to your Macs via iCloud Keychain)"
+    )
 
 
 @e2ee_group.command("disable")

@@ -133,6 +133,43 @@ def test_delete_removes_item(fake_group: _FakeGroupKeychain) -> None:
     assert kg.load(SERVICE, ACCOUNT, GROUP) is None
 
 
+# --- add_if_absent: add-only, never overwrite (SCR-253 cloud-KEK safe write) --
+
+
+def test_add_if_absent_adds_when_absent(fake_group: _FakeGroupKeychain) -> None:
+    assert kg.add_if_absent(SERVICE, ACCOUNT, "first", GROUP) is True
+    assert kg.load(SERVICE, ACCOUNT, GROUP) == "first"
+
+
+def test_add_if_absent_leaves_existing_untouched(fake_group: _FakeGroupKeychain) -> None:
+    kg.store(SERVICE, ACCOUNT, "original", GROUP)
+    # A duplicate is reported, NOT overwritten (unlike store()'s update path).
+    assert kg.add_if_absent(SERVICE, ACCOUNT, "different", GROUP) is False
+    assert kg.load(SERVICE, ACCOUNT, GROUP) == "original"
+
+
+def test_add_if_absent_surfaces_unexpected_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a, **k: kg.errSecMissingEntitlement)
+    with pytest.raises(kg.MissingEntitlement):
+        kg.add_if_absent(SERVICE, ACCOUNT, "x", GROUP)
+
+
+# --- SYNCHRONIZABLE_ANY is structurally query-only ------------------------
+
+
+def test_synchronizable_any_rejected_by_mutating_primitives() -> None:
+    """The query-only sentinel must be structurally rejected by add/update/delete
+    (KTD-5): reaching a *delete* with ANY would match — and destroy — a synced
+    item fleet-wide. The guard fires before any ctypes call, so this holds on any
+    host. `load` (query) accepts it."""
+    with pytest.raises(ValueError):
+        kg._sec_item_add(SERVICE, ACCOUNT, b"x", GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+    with pytest.raises(ValueError):
+        kg._sec_item_update(SERVICE, ACCOUNT, b"x", GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+    with pytest.raises(ValueError):
+        kg._sec_item_delete(SERVICE, ACCOUNT, GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+
+
 # --- error routing (the spike-verified fallback contract) -----------------
 
 
