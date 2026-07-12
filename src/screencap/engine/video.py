@@ -1265,3 +1265,385 @@ def remediate_pixfmt_for_review(rec_dir: str | Path) -> tuple[Path, bool]:
             pass
 
     return review_path, True
+
+
+# =============================================================================
+# Clip-a-Moment: cross-chunk, PTS-preserving video trim (SCR-219 U1)
+#
+# Re-encode the video for an absolute ``[start_ms, end_ms)`` window spanning one
+# or more source ``chunk_*.mp4`` into a single continuous ``.mp4``, preserving
+# the source presentation timeline so action-gated (variable-frame-rate) idle
+# gaps survive as freeze-frames and the output duration tracks the requested
+# wall-clock range. Audio is a separate sub-system (U2) muxed into the same
+# output container later; this stage is deliberately video-only.
+# =============================================================================
+
+
+# Default wait for the per-recording terminal flock (see ``terminal_lock``).
+# The clip's source-chunk read races U8 eviction, which is fast; 30s rides out a
+# normal eviction while staying interactive. The CLI (U3) overrides this via
+# ``--lock-timeout`` under the Swift watchdog.
+_CLIP_LOCK_TIMEOUT = 30.0
+
+
+class ClipExportError(Exception):
+    """A clip export failed; carries a structured ``reason`` for the CLI envelope.
+
+    ``reason`` is one of the KTD6 tokens the ``screencap clip`` verb reports
+    (``trim_failed`` is the catch-all). Subclasses pin the specific reasons the
+    engine can raise on its own; lock contention surfaces as
+    ``terminal_stage.TerminalStageBusy`` (→ ``clip_busy``) and is intentionally
+    NOT wrapped here so the CLI can distinguish a retryable busy from a hard
+    failure.
+    """
+
+    reason = "trim_failed"
+
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        if reason is not None:
+            self.reason = reason
+
+
+class MaskedVideoRequiredError(ClipExportError):
+    """The recording's frozen ``masked_video_upload`` bit is ON — fail closed.
+
+    Source chunks recorded with the flag ON contain unmasked sensitive windows
+    (capture-time blocking was disabled), so clipping them would export rich
+    video to an external-recipient file. The clip pipeline refuses and writes no
+    file rather than leak it (KD4/KTD3, AE3).
+    """
+
+    reason = "masked_video_required"
+
+
+class NoFramesInRangeError(ClipExportError):
+    """The requested range is empty, inverted, or covers no decodable frames.
+
+    Covers a zero-length / inverted ``[start, end)``, an out-of-range window
+    past the footage, and a recording with no ``chunk_*.mp4`` to read. No
+    (partial) file is written in any of these cases.
+    """
+
+    reason = "no_frames_in_range"
+
+
+def _probe_chunk_duration_s(chunk: Path) -> float:
+    """Wall-clock duration of a chunk in seconds (last frame time + one frame).
+
+    Used only by the summed-span offset fallback (missing manifests/db). Decodes
+    the chunk to read the last presentation time — correct for the fragmented,
+    duration-less MP4s the recorder writes, where container/stream duration is
+    often unset.
+    """
+    inp = av.open(str(chunk))
+    try:
+        stream = inp.streams.video[0]
+        last = 0.0
+        for frame in inp.decode(stream):
+            if frame.time is not None and frame.time > last:
+                last = float(frame.time)
+        rate = stream.average_rate
+        frame_dur = 1.0 / float(rate) if rate else 0.0
+        return last + frame_dur
+    finally:
+        inp.close()
+
+
+def _clip_chunk_offsets(rec_dir: Path, chunks: list[Path]) -> dict[int, float]:
+    """Map ``chunk_index -> seconds from recording start`` for every chunk.
+
+    Prefers ABSOLUTE placement (``recording.db`` ``video_start`` + each chunk's
+    ``chunk_NNNN_manifest.json`` ``chunk_start``) via
+    :func:`viewer._chunk_offsets_for_concat`, so the action-gated inter-chunk
+    idle gaps are preserved on the clip timeline (SCR-98 / KTD1). Falls back to
+    back-to-back summed-span placement (each chunk offset by the cumulative
+    probed duration of its predecessors) when that metadata is unavailable — the
+    clip still assembles, it just cannot reconstruct wall-clock idle gaps it has
+    no record of. Never returns ``None``: the trim needs a placement for every
+    chunk.
+    """
+    # Deferred: viewer lives in the parent package and imports back into this
+    # module (parse_chunk_index / concat_video_chunks) — a function-local import
+    # avoids the cycle, matching engine/collaborators' use of viewer helpers.
+    from screencap.viewer import _chunk_offsets_for_concat
+
+    absolute = _chunk_offsets_for_concat(rec_dir)
+    if absolute is not None:
+        return absolute
+
+    offsets: dict[int, float] = {}
+    running = 0.0
+    for chunk in chunks:
+        idx = parse_chunk_index(chunk.stem)
+        if idx is None:
+            continue
+        offsets[idx] = running
+        running += _probe_chunk_duration_s(chunk)
+    return offsets
+
+
+def _prep_out_frame(
+    frame: "av.VideoFrame", pts: int, time_base: Fraction
+) -> "av.VideoFrame":
+    """Reformat a decoded source frame for the clip encoder and re-stamp its PTS.
+
+    Reformatting to the output pixel format yields a clean frame (source chunks
+    are already ``yuv444p``, so this is near-free) and clears the decoded
+    ``pict_type`` so x264 — not the source key-frame layout — decides GOP
+    structure. The re-stamped ``pts`` re-bases the source presentation time onto
+    the clip's ``t=0`` origin; we set it on the FRAME before ``encode`` and never
+    touch ``packet.pts`` after, per the B-frame PTS-corruption learning
+    (docs/solutions/bug-fixes/video-pts-offset-bframe-corruption-20260322.md).
+    """
+    out = frame.reformat(format="yuv444p")
+    out.pts = pts
+    out.time_base = time_base
+    out.pict_type = av.video.frame.PictureType.NONE
+    return out
+
+
+def export_clip_video(
+    recording_dir: str | Path,
+    start_ms: int,
+    end_ms: int,
+    out_path: str | Path,
+    *,
+    lock_timeout: float = _CLIP_LOCK_TIMEOUT,
+    on_progress=None,
+) -> Path:
+    """Export the video for ``[start_ms, end_ms)`` into a single continuous MP4.
+
+    ``start_ms`` / ``end_ms`` are milliseconds from recording start (the same
+    anchor ``recording.db.video_start_time`` and the chunk offsets use). The
+    window may span multiple source ``chunk_*.mp4``; the output is a re-encoded
+    ``libx264`` / ``yuv444p`` clip that PRESERVES the source presentation
+    timeline: action-gated idle gaps are held as freeze-frames and the duration
+    tracks the requested wall-clock range (KTD1). Second-accurate; a mid-GOP
+    start decodes from the preceding key frame and drops down to the requested
+    instant, opening the clip with the frame on screen at ``start``.
+
+    Video-only by design — audio (U2) is muxed into this same output path later.
+
+    Privacy: fails closed with :class:`MaskedVideoRequiredError` (writing no
+    file) when the recording's frozen ``masked_video_upload`` bit is ON, because
+    those source chunks hold unmasked sensitive windows (KTD3). The source-chunk
+    read is serialized against U8 eviction by the per-recording
+    ``terminal_lock`` — mirroring ``viewer._ensure_single_video`` — so a
+    concurrent eviction can never unlink a chunk mid-read; contention surfaces as
+    ``terminal_stage.TerminalStageBusy`` (retryable → the CLI's ``clip_busy``).
+
+    The write is atomic (a dot-prefixed ``.tmp`` sibling ``os.replace``\\d onto
+    ``out_path`` only after a clean finalize), so no partial or half-written
+    clip is ever delivered — an abort/failure leaves ``out_path`` absent. The
+    output is opened with ``movflags=faststart`` (moov at the front).
+
+    Args:
+        recording_dir: The recording directory holding the ``chunk_*.mp4``.
+        start_ms: Clip start, milliseconds from recording start (inclusive).
+        end_ms: Clip end, milliseconds from recording start (exclusive).
+        out_path: Destination ``.mp4`` path (parent must be writable).
+        lock_timeout: Seconds to wait for the per-recording ``terminal_lock``.
+        on_progress: Optional ``callable(frames_done, frames_total)`` for a
+            determinate progress bar (``frames_total`` is a range/fps estimate).
+
+    Returns:
+        ``out_path`` as a :class:`~pathlib.Path`.
+
+    Raises:
+        NoFramesInRangeError: Empty/inverted/out-of-range window, or no chunks.
+        MaskedVideoRequiredError: Frozen ``masked_video_upload`` is ON.
+        ClipExportError: The re-encode failed / could not be finalized.
+        terminal_stage.TerminalStageBusy: The eviction lock stayed contended.
+    """
+    rec_dir = Path(recording_dir)
+    out_path = Path(out_path)
+
+    if end_ms <= start_ms:
+        raise NoFramesInRangeError(
+            f"empty clip range: start_ms={start_ms} >= end_ms={end_ms}"
+        )
+    start = start_ms / 1000.0
+    end = end_ms / 1000.0
+
+    # Serialize the source-chunk read against U8 eviction on the SAME
+    # per-recording flock (deferred import — terminal_stage pulls heavier
+    # modules than the `screencap --help` path tolerates).
+    from screencap.terminal_stage import terminal_lock
+
+    with terminal_lock(rec_dir.name, timeout=lock_timeout):
+        # Fail closed on rich source video BEFORE reading a single chunk (KTD3).
+        from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+
+        if get_frozen_masked_video_upload(rec_dir):
+            raise MaskedVideoRequiredError(
+                f"masked_video_upload is ON for recording {rec_dir.name!r}; "
+                f"refusing to clip unmasked source video"
+            )
+
+        # Re-glob the chunk set UNDER the lock — eviction cannot run while we
+        # hold it, so this snapshot is the one we read.
+        chunks = sorted(rec_dir.glob("chunk_*.mp4"))
+        if not chunks:
+            raise NoFramesInRangeError(f"no chunk_*.mp4 to clip in {rec_dir}")
+
+        offsets = _clip_chunk_offsets(rec_dir, chunks)
+        _encode_clip(chunks, offsets, start, end, out_path, on_progress)
+
+    return out_path
+
+
+def _encode_clip(
+    chunks: list[Path],
+    offsets: dict[int, float],
+    start: float,
+    end: float,
+    out_path: Path,
+    on_progress,
+) -> None:
+    """Decode the in-range source frames and re-encode them into ``out_path``.
+
+    Caller holds ``terminal_lock``. Writes atomically to a ``.tmp`` sibling and
+    ``os.replace``\\s onto ``out_path`` only on a clean finalize.
+    """
+    # Only chunks from the one containing (or immediately preceding) `start`
+    # onward can contribute; offsets are monotonic in index, so pick the last
+    # chunk whose offset <= start as the entry point (it holds the opening
+    # freeze-frame when start lands in an inter-chunk idle gap).
+    start_i = 0
+    for i, chunk in enumerate(chunks):
+        idx = parse_chunk_index(chunk.stem)
+        if idx is not None and offsets.get(idx, 0.0) <= start:
+            start_i = i
+        else:
+            break
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_temps(out_path.parent, f".{out_path.name}.*.tmp")
+    tmp_path = out_path.parent / f".{out_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+
+    output = av.open(
+        str(tmp_path), mode="w", format="mp4",
+        container_options={"movflags": "faststart"},
+    )
+    out_stream = None
+    out_tb: Fraction | None = None
+    frames_total = 1
+    frames_done = 0
+    last_out_pts = -1
+    last_out_frame: "av.VideoFrame" | None = None
+    pending_pre: "av.VideoFrame" | None = None  # last frame strictly before start
+    reached_end = False
+
+    def _emit(frame: "av.VideoFrame") -> None:
+        nonlocal frames_done
+        for packet in out_stream.encode(frame):
+            output.mux(packet)
+        frames_done += 1
+        if on_progress is not None:
+            on_progress(frames_done, frames_total)
+
+    try:
+        for chunk in chunks[start_i:]:
+            idx = parse_chunk_index(chunk.stem)
+            chunk_off = offsets.get(idx, 0.0) if idx is not None else 0.0
+            if chunk_off >= end:
+                break  # this chunk (and all later) start after the range
+
+            inp = av.open(str(chunk))
+            try:
+                in_stream = inp.streams.video[0]
+                if out_stream is None:
+                    out_stream = output.add_stream("libx264")
+                    out_stream.width = in_stream.width
+                    out_stream.height = in_stream.height
+                    out_stream.pix_fmt = "yuv444p"
+                    # Preserve the source timebase so re-stamped frame PTS map
+                    # straight through the encoder (mirrors remediate_pixfmt).
+                    out_tb = in_stream.time_base
+                    out_stream.codec_context.time_base = out_tb
+                    out_stream.codec_context.max_b_frames = 0
+                    out_stream.options = {
+                        "crf": str(config.VIDEO_CRF),
+                        "preset": config.VIDEO_PRESET,
+                        "g": str(config.VIDEO_GOP_SIZE),
+                        "bf": "0",  # PTS == DTS; no packet reordering (KTD2)
+                    }
+                    fps = (
+                        float(in_stream.average_rate)
+                        if in_stream.average_rate
+                        else float(config.SCREEN_CAPTURE_FPS)
+                    )
+                    frames_total = max(1, round((end - start) * fps))
+
+                # Fast-skip: land on the key frame at/before `start` within this
+                # chunk instead of decoding from its head. Only the entry chunk
+                # has a positive target; later chunks start after `start`.
+                seek_s = start - chunk_off
+                if seek_s > 0:
+                    try:
+                        inp.seek(
+                            int(seek_s / float(in_stream.time_base)),
+                            stream=in_stream, backward=True, any_frame=False,
+                        )
+                    except Exception:
+                        pass  # seek failed → decode from head (still correct)
+
+                for frame in inp.decode(in_stream):
+                    if frame.pts is None:
+                        continue
+                    abs_time = float(frame.time) + chunk_off
+                    if abs_time < start:
+                        pending_pre = frame  # candidate opening freeze-frame
+                        continue
+                    if abs_time >= end:
+                        reached_end = True
+                        break
+
+                    out_pts = round((abs_time - start) / float(out_tb))
+                    # Opening freeze: when the first in-range frame lands after
+                    # t=0, open the clip with the frame on screen AT `start`
+                    # (the last pre-start frame), re-stamped to pts 0.
+                    if last_out_pts < 0 and pending_pre is not None and out_pts > 0:
+                        opener = _prep_out_frame(pending_pre, 0, out_tb)
+                        _emit(opener)
+                        last_out_frame = opener
+                        last_out_pts = 0
+                    if out_pts <= last_out_pts:
+                        out_pts = last_out_pts + 1  # keep PTS strictly monotonic
+                    cur = _prep_out_frame(frame, out_pts, out_tb)
+                    _emit(cur)
+                    last_out_frame = cur
+                    last_out_pts = out_pts
+
+                if reached_end:
+                    break
+            finally:
+                inp.close()
+
+        if last_out_pts < 0:
+            raise NoFramesInRangeError(
+                f"no video frames in clip range [{start:.3f}s, {end:.3f}s)"
+            )
+
+        # Trailing freeze so the clip spans the full requested range even when it
+        # ends in idle — hold the last frame to `end` (KTD1).
+        end_pts = round((end - start) / float(out_tb))
+        if last_out_frame is not None and end_pts > last_out_pts:
+            _emit(_prep_out_frame(last_out_frame, end_pts, out_tb))
+
+        for packet in out_stream.encode():  # flush the encoder
+            output.mux(packet)
+
+        # A timed-out close may leave the moov atom unwritten — never promote a
+        # possibly-truncated temp. Hand off (output=None so rollback won't
+        # re-close), drop the temp, and fail loud.
+        closed = _close_container_in_thread(output)
+        output = None
+        if not closed:
+            tmp_path.unlink(missing_ok=True)
+            raise ClipExportError(f"timed out finalizing clip {out_path}")
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        _discard_failed_output(output, tmp_path)
+        raise
