@@ -364,6 +364,34 @@ def _read_task_description(db_path: Path) -> str | None:
         return None
 
 
+def _read_user_title(db_path: Path) -> str | None:
+    """Best-effort read of the mutable, local-only ``recording.title``.
+
+    The user-set display title (an editable rename), distinct from the humanized
+    directory name and from ``task_description`` (the recording summary). Returns
+    the stripped title or ``None`` when unset — and, exactly like
+    :func:`_read_task_description`, ``None`` (never raises) when the DB is absent,
+    locked by an active recording, corrupt, or predates the ``title`` column, so a
+    locked or pre-column DB yields a null title rather than an exception.
+    """
+    import sqlite3
+
+    try:
+        with open_recording_db(db_path, busy_timeout_ms=500) as conn:
+            if has_table(conn, "recording") and has_column(
+                conn, "recording", "title"
+            ):
+                row = conn.execute(
+                    "SELECT title FROM recording LIMIT 1"
+                ).fetchone()
+                if row and row[0]:
+                    val = str(row[0]).strip()
+                    return val or None
+            return None
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+
+
 def _active_recording_name() -> str | None:
     """Directory name of the currently-active recording, or ``None`` (U2).
 

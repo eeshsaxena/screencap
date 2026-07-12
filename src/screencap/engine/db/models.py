@@ -40,6 +40,13 @@ class Recording(Base):
     double_click_distance_pixels = sa.Column(sa.Numeric(asdecimal=False))
     platform = sa.Column(sa.String)
     task_description = sa.Column(sa.String)
+    # Mutable, local-only per-recording display title (editable rename). NULL
+    # means "no user-set title" — the catalog falls back to the humanized
+    # directory name. Written via ``screencap.recording_db.write_user_title``
+    # (which ``_migrate_schema``-ADDs this column on recordings whose DB predates
+    # it), read via ``screencap.catalog._read_user_title``. Never uploaded (R8 —
+    # it lives in the local-only recording.db).
+    title = sa.Column(sa.String)
     video_start_time = sa.Column(ForceFloat)
     config = sa.Column(sa.JSON)
 

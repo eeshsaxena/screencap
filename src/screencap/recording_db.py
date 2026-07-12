@@ -63,6 +63,7 @@ __all__ = [
     "open_recording_db",
     "has_table",
     "has_column",
+    "write_user_title",
     "Connection",
     "Cursor",
     "OperationalError",
@@ -132,3 +133,48 @@ def has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
         raise ValueError(f"invalid table name: {table!r}")
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(row[1] == col for row in cur.fetchall())
+
+
+def write_user_title(path: Path | str, title: str | None) -> None:
+    """Persist the mutable, local-only ``recording.title`` (an editable rename).
+
+    Read back by :func:`screencap.catalog._read_user_title`. Local-only by rule
+    (R8): it lives in ``recording.db``, which is never uploaded.
+
+    ``title`` is stored stripped; an empty / whitespace-only ``title`` (or
+    ``None``) clears the column back to ``NULL`` — i.e. reverts to the default
+    humanized directory name the catalog falls back to.
+
+    A pre-existing recording's DB can predate the ``title`` column (``recording``
+    was captured before this feature; ``open_recording_db`` never migrates). So
+    we run :func:`screencap.engine.db._migrate_schema` FIRST — it ALTER-ADDs the
+    missing column (and tolerates a concurrent adder via its internal
+    duplicate-column guard) — so the subsequent ``UPDATE`` always targets a real
+    column. This is the pre-existing-recording rename path.
+
+    One-row-per-``recording.db`` assumption: there is exactly one authoritative
+    ``recording`` row per DB, so the ``UPDATE`` deliberately has NO
+    ``WHERE id=?`` — it sets the single row. (Never bind the STRING
+    ``.recording_id`` to the INTEGER ``id`` column: that matches zero rows
+    silently. There is no such bind here.) Copy rows created via
+    ``original_recording_id`` are an out-of-scope edge tracked in the plan's Open
+    Questions.
+
+    Lock-tolerant in the same spirit as the read side: it opens through
+    ``open_recording_db`` (which sets ``busy_timeout`` so a transient writer lock
+    is waited out) and guards ``has_table`` so a DB with no ``recording`` table is
+    a no-op rather than a crash.
+    """
+    # Deferred: importing the engine db pulls SQLAlchemy; keep this module light.
+    from screencap.engine.db import _migrate_schema
+
+    # Ensure the column exists on a DB that predates it (handles the
+    # duplicate-column race internally). No-op on an already-current schema.
+    _migrate_schema(str(path))
+
+    normalized = title.strip() if title and title.strip() else None
+    with open_recording_db(path, read_only=False) as conn:
+        if not has_table(conn, "recording"):
+            return
+        conn.execute("UPDATE recording SET title=?", (normalized,))
+        conn.commit()
