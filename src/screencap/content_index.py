@@ -138,12 +138,21 @@ class SearchHit:
 
     ``score`` is the bm25 value (most-negative = best) on the FTS5 path, or
     ``0.0`` on the LIKE fallback where no ranking is available.
+
+    ``match_source`` names the stream a hit came from: ``"content"`` (the default
+    — an on-screen-text frame match whose ``timestamp_ms`` is a real frame
+    pointer) or ``"title"`` (a user-set recording-title match the daemon unions
+    into ``content.search``, whose ``timestamp_ms`` is the sentinel ``0`` — NOT a
+    frame pointer). Additive + defaulted so the store's own positional
+    construction sites (``SearchHit(rec, ts, snip, score)``) keep working
+    unchanged; only the title-union path sets it to ``"title"``.
     """
 
     recording: str
     timestamp_ms: int
     snippet: str
     score: float
+    match_source: str = "content"
 
 
 @dataclass(frozen=True)

@@ -240,7 +240,15 @@ final class SearchViewModel: ObservableObject {
         var contentState: StreamState = .notRun
         if case .ok(let payload) = content {
             if payload.hits.count >= Self.streamFetchLimit { truncated = true }
-            let filtered = payload.hits.filter { inWindow($0.timestampMs, parsed.timeWindow) }
+            // Drop title-union hits (match_source == "title"): they carry the
+            // sentinel timestampMs = 0, not a frame pointer, so mapping them into
+            // the on-screen-text stream would render a bogus t=0 result (or get
+            // dropped by the time-window filter). The daemon/CLI still surface
+            // renamed recordings by title; surfacing them in this macOS Search UI
+            // as a distinct title match is a follow-up (SCR-223).
+            let filtered = payload.hits.filter {
+                $0.matchSource != "title" && inWindow($0.timestampMs, parsed.timeWindow)
+            }
             contentState = mapContentState(payload.indexState, matched: !filtered.isEmpty)
             for hit in filtered {
                 items.append(SearchResultItem(

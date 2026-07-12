@@ -788,6 +788,126 @@ async def recording_mute(request: Request) -> JSONResponse:
         )
 
 
+def _resolve_rename_target(selector: str) -> tuple[Path, Path, float | None] | None:
+    """Resolve a ``recording.rename`` selector to ``(dir, db_path, started_at)``.
+
+    Matches by the stable ``.recording_id`` first, then falls back to the
+    directory NAME — legacy recordings predating the ``.recording_id`` sidecar
+    return ``None`` from ``read_recording_id``, so the name fallback is what keeps
+    them renameable. ``started_at`` (capture start epoch, or ``None`` for a legacy
+    row with no start row) is read here so the handler can recompute the default
+    title on a clear without a second DB open. Returns ``None`` when no recording
+    matches. Pure disk IO — the handler runs it via ``asyncio.to_thread``.
+    """
+    from screencap import catalog
+    from screencap.config import get_recordings_dir
+
+    recordings_dir = get_recordings_dir()
+    if not recordings_dir.exists():
+        return None
+    for d in sorted(recordings_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        db = catalog.find_db(d)
+        if db is None:
+            continue
+        if catalog.read_recording_id(d) == selector or d.name == selector:
+            started, _duration, _status = catalog._read_recording_meta(db)
+            return d, db, started
+    return None
+
+
+async def recording_rename(request: Request) -> JSONResponse:
+    """Set or clear a recording's editable display title (editable titles U3).
+
+    A post-hoc, additive mutating verb: it addresses a recording by stable
+    ``recording_id`` OR directory name and writes the local-only
+    ``recording.title`` (never uploaded — R8). It mirrors ``recording.mute``'s
+    trust-boundary posture — the peer descriptor is derived and every exit path
+    (ok, typed error, unhandled) is audited — but the audit line records ONLY the
+    peer + outcome: the free-text title is deliberately kept OUT of the local
+    audit log so user-authored titles never accrue there.
+
+    The title is validated as DISPLAY text (``validate_recording_title`` — unicode
+    / emoji ok, control chars rejected, <=200 chars), NOT as a path-safe name. An
+    empty title clears the rename. The currently-active recording is refused
+    (mid-recording rename is deferred to the HUD) BEFORE any write. The response
+    echoes the resolved display title (the stripped user title when set, else the
+    freshly-recomputed date/time default so a cleared rename returns the same
+    default ``recording.list`` would), ``title_is_user_set``, and the bus cursor
+    captured before the write.
+    """
+    from screencap import catalog, recording_db
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon._name_validation import validate_recording_title
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        # Peer + outcome ONLY — never the title text (free-text titles must not
+        # accrue in the local audit log).
+        audit_log.record_verb(
+            "recording.rename",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        parsed = schema.RecordingRenameRequest.model_validate(await request.json())
+        title = validate_recording_title(parsed.title)
+
+        resolved = await asyncio.to_thread(_resolve_rename_target, parsed.recording_id)
+        if resolved is None:
+            raise errors.RecordingNotFoundError(
+                schema_version=schema._RECORDING_RENAME_API_VERSION
+            )
+        directory, db_path, started_at = resolved
+
+        # Refuse a rename of the live recording (its writer holds the DB lock and
+        # mid-recording rename is a HUD concern) BEFORE capturing the cursor or
+        # writing anything.
+        active_name = await asyncio.to_thread(catalog._active_recording_name)
+        if active_name is not None and directory.name == active_name:
+            raise errors.RecordingActiveError(
+                schema_version=schema._RECORDING_RENAME_API_VERSION
+            )
+
+        # Capture the cursor BEFORE the write so a client can subscribe to
+        # /v0/events?since=<cursor> and not miss any follow-on event.
+        cursor = request.app.state.event_bus.current_cursor()
+        await asyncio.to_thread(recording_db.write_user_title, db_path, title)
+
+        title_is_user_set = bool(title.strip())
+        if title_is_user_set:
+            display_title = title.strip()
+        else:
+            # Cleared → return the freshly-resolved default, the SAME value
+            # recording.list would now report for this recording.
+            display_title = catalog._default_title(started_at, directory.name)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._RECORDING_RENAME_API_VERSION,
+                title=display_title,
+                title_is_user_set=title_is_user_set,
+                cursor=cursor,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_RENAME_API_VERSION,
+            request=request,
+        )
+
+
 async def permission_request(request: Request) -> JSONResponse:
     """On-demand daemon-driven TCC registration (U8).
 
@@ -1049,28 +1169,75 @@ def _run_content_search(
     spawn an empty PII store) — surfaces ``not_indexed`` instead. The store's
     own ``search`` is fail-soft (corrupt → ``store_unavailable``), so this never
     raises for an unreadable store.
+
+    U5 title union: user-set recording titles are searched FIRST — before the
+    index-existence early return — and unioned into the returned hits, so a
+    renamed recording is found by a term in its title even when the content
+    index is absent (the default — content indexing defaults off) or holds no
+    frame match for it, including privacy-blocked / never-indexed recordings
+    (AE3). Each title hit is pointer-only like every content hit, but carries the
+    sentinel ``timestamp_ms=0`` (NOT a frame pointer) and ``match_source="title"``
+    so a caller can tell it apart from an on-screen-text frame hit; content hits
+    carry ``match_source="content"``. Titles are deduped against content hits by
+    recording: a recording that already has a content-frame hit is NOT also listed
+    via its title (the frame hit is richer — it carries a real pointer), so a title
+    hit is emitted only for a recording with no content hit.
     """
+    from screencap import catalog
     from screencap.content_index import ContentIndex, IndexState, default_index_path
+
+    title_matches = catalog.match_user_titles(
+        query, recording=recording, limit=_QUERY_MAX_RECORDINGS
+    )
+
+    def _title_hit(rec: str, title: str) -> dict[str, Any]:
+        # Sentinel timestamp_ms=0: a title hit is not a frame pointer. match_source
+        # steers a caller away from treating it as one (e.g. via frame.nearest).
+        return {
+            "recording": rec,
+            "timestamp_ms": 0,
+            "snippet": title,
+            "score": 0.0,
+            "match_source": "title",
+        }
 
     path = default_index_path()
     if not path.exists():
-        return {"hits": [], "index_state": IndexState.NOT_INDEXED.value}
+        # No content index (the default). Title-only hits still return; the
+        # index_state honestly reports the absent content store.
+        title_only = [_title_hit(rec, title) for rec, title in title_matches]
+        return {
+            "hits": title_only if limit is None else title_only[:limit],
+            "index_state": IndexState.NOT_INDEXED.value,
+        }
 
     kwargs: dict[str, Any] = {}
     if limit is not None:
         kwargs["limit"] = limit
     with ContentIndex(path) as store:
         result = store.search(query, recording=recording, **kwargs)
+
+    content_hits = [
+        {
+            "recording": h.recording,
+            "timestamp_ms": h.timestamp_ms,
+            "snippet": h.snippet,
+            "score": h.score,
+            "match_source": h.match_source,
+        }
+        for h in result.hits
+    ]
+    seen = {h["recording"] for h in content_hits}
+    title_hits = [
+        _title_hit(rec, title)
+        for rec, title in title_matches
+        if rec not in seen
+    ]
+    # Ranked content hits first, then title hits; cap the union to the requested
+    # `limit` so appending title hits never overruns the caller's page size.
+    combined = content_hits + title_hits
     return {
-        "hits": [
-            {
-                "recording": h.recording,
-                "timestamp_ms": h.timestamp_ms,
-                "snippet": h.snippet,
-                "score": h.score,
-            }
-            for h in result.hits
-        ],
+        "hits": combined if limit is None else combined[:limit],
         "index_state": result.index_state.value,
     }
 
@@ -2555,6 +2722,7 @@ def build_app() -> Starlette:
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/recording.mute", recording_mute, methods=["POST"]),
+            Route("/v0/recording.rename", recording_rename, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
             Route("/v0/content.search", content_search, methods=["POST"]),

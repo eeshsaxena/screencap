@@ -267,6 +267,23 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/recording.mute", json_body={"muted": muted})
         )
 
+    def rename(self, *, recording: str, title: str) -> dict[str, Any]:
+        """Set or clear a recording's editable display title (editable titles U4).
+
+        Wraps ``POST /v0/recording.rename``, mirroring :meth:`mute`. ``recording``
+        may be a stable ``recording_id`` OR a directory name; an empty ``title``
+        clears the rename and reverts to the date/time default. Returns the
+        ``{title, title_is_user_set, cursor}`` envelope — ``title`` is the resolved
+        display title (the user title when set, else the recomputed default).
+        """
+        return self._parse_ok_envelope(
+            self._request(
+                "POST",
+                "/v0/recording.rename",
+                json_body={"recording_id": recording, "title": title},
+            )
+        )
+
     def content_search(
         self,
         query: str,

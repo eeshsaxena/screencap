@@ -445,6 +445,38 @@ struct TranscriptSearchRequest: Encodable {
     }
 }
 
+/// `recording.rename` input (editable titles U6). `recordingId` addresses the
+/// target by its stable `recording_id` OR, for legacy recordings predating that
+/// sidecar, by directory name (the daemon tries both). `title` is free DISPLAY
+/// text — an EMPTY string clears the rename back to the derived default.
+struct RecordingRenameRequest: Encodable {
+    let recordingId: String
+    let title: String
+
+    enum CodingKeys: String, CodingKey {
+        case recordingId = "recording_id"
+        case title
+    }
+}
+
+/// `recording.rename` output (editable titles U6). `title` is the value the
+/// client should now show — the stripped user title when set, else the
+/// freshly-recomputed date/time default (so a cleared rename returns the same
+/// default `recording.list` would). `titleIsUserSet` is true only when a
+/// non-empty title was persisted. `cursor` is the bus cursor captured BEFORE
+/// the write.
+struct RecordingRenameResponse: Decodable {
+    let title: String
+    let titleIsUserSet: Bool
+    let cursor: Int
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case titleIsUserSet = "title_is_user_set"
+        case cursor
+    }
+}
+
 /// `timeline.query` input. v1 always passes an explicit `limit` — the verb
 /// defaults to 50 and truncates earliest-first by `timestamp_ms`, so without a
 /// raised limit + bounding window the recency ranking would silently drop the
@@ -867,6 +899,18 @@ enum DaemonClient {
     static func contentSearch(_ req: ContentSearchRequest) async throws -> ContentSearchResponse {
         let body = try JSONEncoder().encode(req)
         return try await request(method: "POST", path: "/v0/content.search", body: body)
+    }
+
+    /// Set or clear a recording's editable display title (editable titles U6). A
+    /// post-hoc, additive mutating verb over the LOCAL-only `recording.title`
+    /// (never uploaded — R8). An empty `title` clears the rename back to the
+    /// derived default. The daemon refuses a rename of the currently-active
+    /// recording with a `.envelopeError(code: "recording_active", ...)` (HTTP
+    /// 409) — the caller disables the affordance mid-recording, so that path is
+    /// only a belt-and-suspenders guard.
+    static func recordingRename(recording: String, title: String) async throws -> RecordingRenameResponse {
+        let body = try JSONEncoder().encode(RecordingRenameRequest(recordingId: recording, title: title))
+        return try await request(method: "POST", path: "/v0/recording.rename", body: body)
     }
 
     /// Transcript keyword search (SCR-118). Hits are chunk-granular (no

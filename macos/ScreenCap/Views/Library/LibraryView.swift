@@ -104,7 +104,8 @@ struct LibraryView: View {
                             tasks: journalTasks.tasks(for: rec),
                             onOpen: { open(rec) },
                             onInspect: { openInspect(rec) },
-                            onReview: { openWindow(id: ReviewWindowID, value: rec.name) }
+                            onReview: { openWindow(id: ReviewWindowID, value: rec.name) },
+                            onRenamed: { Task { await index.refresh() } }
                         )
                         .task(id: rec.stableID) { await journalTasks.resolve(rec) }
                     }

@@ -45,8 +45,13 @@ struct LibraryCard: View {
     var onInspect: () -> Void
     /// Open the Review-before-upload consent window (eligible recordings only).
     var onReview: () -> Void
+    /// A successful rename landed — the host refreshes the library list so the
+    /// card re-renders with the new title (U6).
+    var onRenamed: () -> Void = {}
 
     @State private var hovering = false
+    /// Drives the Rename… sheet (U6).
+    @State private var showingRename = false
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
 
@@ -65,6 +70,9 @@ struct LibraryCard: View {
         }
         .buttonStyle(.plain)
         .contextMenu { contextMenu }
+        .sheet(isPresented: $showingRename) {
+            RenameSheet(recording: recording, onRenamed: onRenamed)
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title), \(recording.duration), \(badge.text)")
     }
@@ -121,9 +129,123 @@ struct LibraryCard: View {
     private var contextMenu: some View {
         Button("Open") { onOpen() }
         Button("Inspect…") { onInspect() }
+        // Rename… is deferred mid-recording (the daemon 409s `recording_active`
+        // anyway); a live recording renames from the HUD instead (U6).
+        Button("Rename…") { showingRename = true }
+            .disabled(recording.isActivelyRecording)
         if recording.isUploadEligible {
             Divider()
             Button("Review & upload…") { onReview() }
+        }
+    }
+}
+
+/// The Rename… modal (U6, design-native `.sheet`): a prefilled title field with
+/// a live 200-char cap, Cancel + Save, and an inline error that keeps the sheet
+/// OPEN on any failure (validation or daemon/network) rather than a silent
+/// no-op. Prefills + compares against `recording.title` — the server-resolved
+/// value the rename verb operates on — NOT the card's `displayTitle`, which may
+/// borrow a task name for an un-named local recording. Submitting an untouched
+/// derived default is a no-op (never freezes it as a user title); an empty
+/// submission clears the rename back to the default.
+private struct RenameSheet: View {
+    let recording: RecordingSummary
+    var onRenamed: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: String
+    @State private var busy = false
+    @State private var errorText: String?
+    @FocusState private var fieldFocused: Bool
+
+    init(recording: RecordingSummary, onRenamed: @escaping () -> Void) {
+        self.recording = recording
+        self.onRenamed = onRenamed
+        _draft = State(initialValue: recording.title)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename recording")
+                .font(.title2.weight(.semibold))
+
+            Text("Give this recording a title. Leave it empty to restore the default date and time.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextField("Title", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .focused($fieldFocused)
+                .disabled(busy)
+                .onChange(of: draft) { newValue in
+                    // Enforce the display-title cap live, then clear a stale
+                    // error so a fresh edit reads clean.
+                    let capped = RenameModel.cap(newValue)
+                    if capped != newValue { draft = capped }
+                    errorText = nil
+                }
+                .onSubmit { submit() }
+
+            if let errorText {
+                Text(errorText)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(busy)
+
+                Spacer()
+
+                if busy { ProgressView().controlSize(.small) }
+
+                Button("Save") { submit() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(busy)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 420)
+        .onAppear { fieldFocused = true }
+    }
+
+    private func submit() {
+        guard !busy else { return }
+        switch RenameModel.decide(
+            draft: draft,
+            currentTitle: recording.title,
+            titleIsUserSet: recording.titleIsUserSet
+        ) {
+        case .noOp:
+            // Untouched derived default — dismiss without touching the verb.
+            dismiss()
+        case .submit(let title):
+            Task { await rename(title) }
+        }
+    }
+
+    private func rename(_ title: String) async {
+        busy = true
+        errorText = nil
+        do {
+            _ = try await DaemonClient.recordingRename(recording: recording.stableID, title: title)
+            busy = false
+            onRenamed()
+            dismiss()
+        } catch DaemonClientError.envelopeError(let code, _) where code == "recording_active" {
+            // Belt-and-suspenders: the affordance is disabled mid-recording, so
+            // this only fires if a recording started between open and Save.
+            busy = false
+            errorText = "You can't rename a recording while it's still capturing. Stop it first, then rename."
+        } catch {
+            // Any other failure keeps the sheet open with the reason shown.
+            busy = false
+            errorText = error.localizedDescription
         }
     }
 }

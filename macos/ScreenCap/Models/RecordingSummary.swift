@@ -37,6 +37,13 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     /// Humanized display title derived from the directory name. Falls back to
     /// the raw directory `name` when an older daemon omits it.
     let title: String
+    /// Editable titles (U2/U6): true only when `title` is a user-set rename
+    /// (`recording.title`), false when it is the derived date/time default.
+    /// Optional so an older daemon that omits the key decodes as nil — treated
+    /// as not-user-set (the derived default), never an error (nullable-timing
+    /// contract). The Rename affordance keys its no-op-on-unchanged-default rule
+    /// on this so submitting an untouched default never freezes it as a title.
+    let titleIsUserSet: Bool?
     /// Derived lifecycle: `recording` | `processing` | `ready` (KTD-7). Defaults
     /// to `ready` so a missing value never traps a card in a spinner.
     let state: String
@@ -102,6 +109,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         case sizeBytes = "size_bytes"
         case summary
         case title
+        case titleIsUserSet = "title_is_user_set"
         case state
         case recordingId = "recording_id"
         case cloudE2EE = "cloud_e2ee"
@@ -126,6 +134,7 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
         sizeBytes = try c.decodeIfPresent(Int.self, forKey: .sizeBytes) ?? 0
         summary = try c.decodeIfPresent(String.self, forKey: .summary)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? name
+        titleIsUserSet = try c.decodeIfPresent(Bool.self, forKey: .titleIsUserSet)
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? "ready"
         recordingId = try c.decodeIfPresent(String.self, forKey: .recordingId)
         cloudE2EE = try c.decodeIfPresent(Bool.self, forKey: .cloudE2EE)

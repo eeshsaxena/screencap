@@ -43,12 +43,22 @@ struct ContentHit: Decodable, Sendable, Hashable {
     let timestampMs: Int
     let snippet: String
     let score: Double
+    /// Which stream produced the hit: `"content"` (an on-screen-text frame match
+    /// whose `timestampMs` is a real frame pointer) or `"title"` (a user-set
+    /// recording-title match the daemon unions into `content.search`, whose
+    /// `timestampMs` is the sentinel `0` — NOT a frame pointer). Optional so an
+    /// older daemon that omits it decodes to `nil` (treated as `"content"`).
+    /// Optional with no inline default: synthesized `Decodable` decodes it via
+    /// `decodeIfPresent` (absent -> nil); the memberwise initializer takes it
+    /// explicitly (test call sites pass `matchSource: nil` for content hits).
+    let matchSource: String?
 
     enum CodingKeys: String, CodingKey {
         case recording
         case timestampMs = "timestamp_ms"
         case snippet
         case score
+        case matchSource = "match_source"
     }
 }
 
