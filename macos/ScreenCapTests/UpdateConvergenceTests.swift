@@ -385,15 +385,23 @@ final class UpdateConvergenceTests: XCTestCase {
             UpdateConvergenceCopy.deadlineFallbackNotice,
             "The update didn't finish cleanly, so ScreenCap needs to check its recording helper."
         )
+        // SCR-263: the Start-blocked stand-in shown on the menu-bar Start / sheet
+        // while the swap converges, so it can't contradict the interstitial.
+        XCTAssertEqual(
+            UpdateConvergenceCopy.startBlockedDuringConvergence,
+            "ScreenCap is finishing an update — try again in a moment."
+        )
     }
 
     /// The interstitial must never imply grants were lost — that is the exact
-    /// harm it exists to remove.
+    /// harm it exists to remove. SCR-263's Start-block stand-in is held to the
+    /// same bar (it is the copy that replaces the permission-required error).
     func testInterstitialCopyMakesNoPermissionClaims() {
         for text in [
             UpdateConvergenceCopy.headline,
             UpdateConvergenceCopy.body,
             UpdateConvergenceCopy.prolongedWait,
+            UpdateConvergenceCopy.startBlockedDuringConvergence,
         ] {
             for banned in ["permission", "grant", "denied", "System Settings"] {
                 XCTAssertFalse(
