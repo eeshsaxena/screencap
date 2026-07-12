@@ -325,6 +325,18 @@ final class DaemonInstallController: ObservableObject {
         }
     }
 
+    /// SCR-262: the narrow freshness probe for the convergence re-probe loop —
+    /// just the reachable daemon's process-start time (`daemon.info`, a
+    /// non-lazy-import verb a stale daemon still answers), nil when no daemon
+    /// answers. Distinct from `liveStaleDaemonProbe`, which also fetches
+    /// `session.snapshot` for `isRecording` — the loop never reads that, and at
+    /// a 3s cadence the extra round-trip per tick is pure waste. No-ops under
+    /// XCTest (tests inject their own probe).
+    static let liveDaemonStartedAtProbe: () async -> Double? = {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return nil }
+        return try? await DaemonClient.daemonInfo().startedAt
+    }
+
     /// mtime of the daemon executable this app would run — the embedded LoginItem
     /// helper. An app update rewrites it, so a daemon that started before this
     /// timestamp is running the PREVIOUS bundle. Returns nil (→ skip the check)

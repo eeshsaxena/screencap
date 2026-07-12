@@ -80,7 +80,10 @@ struct ScreenCapApp: App {
                 // is never gated on auth (R3), so nothing at launch needs it.
                 .task {
                     if !isRunningUnderTests {
-                        await recorder.probeDaemon()
+                        // SCR-262: stale-daemon restart decision FIRST, then the
+                        // initial probe (plus the convergence loop when a helper
+                        // swap is in flight) — see runLaunchDaemonCheck.
+                        await recorder.runLaunchDaemonCheck()
                         // First-launch sequencing: write fail-closed mode →
                         // refresh status → load apps. Runs after the daemon
                         // probe so it doesn't contend with daemon socket

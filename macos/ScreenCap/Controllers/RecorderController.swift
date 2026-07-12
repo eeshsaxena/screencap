@@ -146,6 +146,26 @@ final class RecorderController: ObservableObject {
     /// double-restarting while still picking up a fresh grant within one cycle.
     static let staleDaemonRestartCooldown: TimeInterval = 8.0
 
+    /// SCR-262: wall-clock budget for a helper swap to converge, anchored at the
+    /// restart trigger. Must exceed both the 30s install convergence budget
+    /// (launchd `ExitTimeOut=30`) and the observed 30–60s boot-out/re-register
+    /// range — 60s came from a single observed update, so 90s buys headroom
+    /// against slower machines. Past the deadline the permission wall (the
+    /// repair surface) presents.
+    static let updateConvergenceDeadline: TimeInterval = 90.0
+
+    /// SCR-262: cadence of the convergence re-probe loop. Deliberately slower
+    /// than `pollDaemon`'s interactive 0.5s wait: the swap takes 30–60s, so a
+    /// background ~3s tick still converges within one tick of the daemon
+    /// binding while keeping the dying socket quiet.
+    static let updateConvergenceProbeInterval: TimeInterval = 3.0
+
+    /// SCR-262: UserDefaults key holding the restart-trigger timestamp. The swap
+    /// window outlives the app process that kickstarts it, so a quit-and-relaunch
+    /// mid-swap re-enters convergence from this persisted anchor instead of
+    /// presenting the spurious permission wall.
+    static let updateConvergenceAnchorKey = "screencap.updateConvergenceTriggeredAt"
+
     /// Non-terminal advisory when the mute/unmute VERB itself could not be
     /// delivered (SCR-254 U7). Deliberately NOT routed through
     /// `handleDaemonOperationFailure` (which idles the recording) — the recording
@@ -195,6 +215,63 @@ final class RecorderController: ObservableObject {
         return secondsSinceLastRestart >= cooldown
     }
 
+    /// SCR-262: the anchor a launch should converge from, or nil when this launch
+    /// has no swap window to wait out.
+    ///
+    /// A freshly-triggered restart anchors at `now`. Otherwise a persisted anchor
+    /// still inside its deadline re-enters convergence with the ORIGINAL anchor —
+    /// a quit-and-relaunch mid-swap must neither present the spurious wall (the
+    /// relaunch finds a dead daemon and triggers no restart of its own) nor grant
+    /// itself a fresh deadline. A future-dated persisted anchor can't be trusted
+    /// (clock skew) — treat it as no window, mirroring the bundle-mtime guard in
+    /// `DaemonInstallController.restartStaleDaemonIfNeeded`.
+    static func convergenceAnchorForLaunch(
+        restartTriggered: Bool,
+        persistedAnchor: Date?,
+        now: Date,
+        deadline: TimeInterval
+    ) -> Date? {
+        if restartTriggered { return now }
+        guard let persistedAnchor,
+              persistedAnchor <= now,
+              now.timeIntervalSince(persistedAnchor) < deadline
+        else { return nil }
+        return persistedAnchor
+    }
+
+    /// SCR-262: one step of the convergence re-probe loop.
+    enum ConvergenceStep: Equatable {
+        /// A probed daemon's process start postdates the trigger anchor — the
+        /// swapped-in helper is up. Bare reachability is NOT success: the
+        /// booted-out daemon can keep answering the socket for up to ~30s
+        /// (launchd `ExitTimeOut=30`), and adopting it would dismiss the
+        /// interstitial onto a transport about to die.
+        case finishedFresh
+        /// The deadline passed without a fresh daemon — fall through to the
+        /// permission wall (the repair surface).
+        case deadlineExpired
+        /// No daemon, or only the pre-swap daemon, answered — keep probing.
+        case keepWaiting
+    }
+
+    /// Pure termination decision for the convergence loop. Freshness wins at the
+    /// deadline edge: a fresh daemon observed on the expiring tick still counts
+    /// as convergence.
+    static func convergenceStep(
+        probeStartedAt: Double?,
+        anchor: Date,
+        now: Date,
+        deadline: TimeInterval
+    ) -> ConvergenceStep {
+        if let probeStartedAt, probeStartedAt > anchor.timeIntervalSince1970 {
+            return .finishedFresh
+        }
+        if now.timeIntervalSince(anchor) >= deadline {
+            return .deadlineExpired
+        }
+        return .keepWaiting
+    }
+
     @Published private(set) var state: RecordingState = .idle {
         didSet {
             // The capture-health advisory is scoped to an active recording.
@@ -239,6 +316,22 @@ final class RecorderController: ObservableObject {
     @Published private(set) var transport: RecorderTransport = .cliFallback
     @Published private(set) var daemonProbeCompleted = false
     @Published private(set) var schemaMismatchDetected = false
+    /// SCR-262: true while a helper swap triggered by the stale-daemon check is
+    /// converging (kickstart fired, swapped-in daemon not yet verified fresh).
+    /// The launch gate shows the "Finishing update…" interstitial instead of the
+    /// permission wall while this is up. Set/cleared only by the launch check and
+    /// the convergence loop — gate on THIS signal, never on bare unreachability,
+    /// or dead-registration users get a 90s lie before their repair wall.
+    @Published private(set) var updateConverging = false
+    /// SCR-262: true when convergence ended at the deadline without a fresh
+    /// daemon. Marks the permission wall's provenance as "update path": the wall
+    /// then carries the didn't-finish-cleanly notice, and dismissing it does not
+    /// persist `setupDismissed` (KTD-8). Cleared once a reachable daemon makes
+    /// the wall's content genuine again, and at the next launch check.
+    @Published private(set) var updateConvergenceFailed = false
+    /// SCR-262: when the in-flight swap was triggered, for the interstitial's
+    /// elapsed-time copy. Non-nil only while `updateConverging`.
+    @Published private(set) var updateConvergenceAnchor: Date?
     /// Surfaced in the menu bar dropdown during a Cmd+Q stop. Counts down
     /// from 300s while we wait for the `stopped` event.
     @Published private(set) var quitProgressSecondsRemaining: Int?
@@ -286,6 +379,19 @@ final class RecorderController: ObservableObject {
     /// `refreshDaemonGrantsDefeatingStaleness` can rate-limit itself across the
     /// grant-watch's activation + timer ticks. `nil` until the first restart.
     private var lastDaemonRestartAt: Date?
+
+    /// SCR-262: true once `runLaunchDaemonCheck` has run in this process — the
+    /// stale-check, provenance reset, and anchor mint are launch-once; window
+    /// re-materializations fall through to a plain probe.
+    private var launchDaemonCheckRan = false
+    /// SCR-262: the running convergence re-probe loop, nil when idle. Single
+    /// instance — `startConvergenceProbeLoopIfNeeded` guards on it, and a window
+    /// re-materialization re-running the launch task never doubles the loop.
+    private var convergenceLoopTask: Task<Void, Never>?
+    /// The defaults store the current convergence anchor was persisted to, so
+    /// `finishUpdateConvergence` clears the same store the launch check wrote
+    /// (tests inject a suite-scoped instance).
+    private var convergenceDefaults: UserDefaults = .standard
 
     /// True only while a staleness-defeating daemon kickstart is in flight (the
     /// `daemonService.reload()` + rebind window inside `restartDaemonToRefreshGrants`).
@@ -364,6 +470,7 @@ final class RecorderController: ObservableObject {
 
     deinit {
         daemonEventTask?.cancel()
+        convergenceLoopTask?.cancel()
         elapsedTimer?.invalidate()
         // No `stopPolicy.cancelAll()` here: `cancelAll` is `@MainActor` and
         // `deinit` is nonisolated, so the synchronous call won't compile under
@@ -442,11 +549,124 @@ final class RecorderController: ObservableObject {
         return nil
     }
 
+    /// SCR-262 (plan U1): the launch-time daemon bring-up, replacing the old
+    /// fire-and-forget `restartStaleDaemonIfNeeded` in `AppDelegate` racing the
+    /// window's `probeDaemon()`. Sequencing is the point — the stale-daemon
+    /// decision resolves BEFORE the first probe, so the probe can never adopt a
+    /// daemon the kickstart is about to kill (transport `.daemon` on a process
+    /// seconds from death, with no re-probe driver left).
+    ///
+    /// When a restart was triggered (or a persisted anchor shows a swap window
+    /// from a previous process is still open), convergence state comes up and
+    /// the re-probe loop drives it; the presentation policy shows the
+    /// "Finishing update…" interstitial off that state. One owner, one
+    /// kickstart per launch.
+    func runLaunchDaemonCheck(
+        restartStaleDaemon: () async -> Bool = { await DaemonInstallController.restartStaleDaemonIfNeeded() },
+        defaults: UserDefaults = .standard,
+        now: () -> Date = Date.init
+    ) async {
+        // Launch-once: the window-content `.task` re-runs whenever the singleton
+        // Window is re-materialized (accessory-mode teardown → menu-bar/Dock
+        // reopen). A re-run must not fire a second kickstart into the old
+        // daemon's exit grace, erase the wall's update provenance, or re-anchor
+        // a deadline the running loop already captured — it just re-probes so a
+        // reopened window still reflects current daemon state.
+        guard !launchDaemonCheckRan else {
+            await probeDaemon()
+            return
+        }
+        launchDaemonCheckRan = true
+        updateConvergenceFailed = false
+        let triggered = await restartStaleDaemon()
+        if let anchor = Self.convergenceAnchorForLaunch(
+            restartTriggered: triggered,
+            persistedAnchor: defaults.object(forKey: Self.updateConvergenceAnchorKey) as? Date,
+            now: now(),
+            deadline: Self.updateConvergenceDeadline
+        ) {
+            defaults.set(anchor, forKey: Self.updateConvergenceAnchorKey)
+            convergenceDefaults = defaults
+            updateConvergenceAnchor = anchor
+            updateConverging = true
+        } else {
+            defaults.removeObject(forKey: Self.updateConvergenceAnchorKey)
+        }
+        await probeDaemon()
+        startConvergenceProbeLoopIfNeeded()
+    }
+
+    /// SCR-262 (plan U3): while converging, re-probe until the swapped-in daemon
+    /// is verifiably up or the deadline passes. This is the convergence driver
+    /// the suppressed wall used to be (the spurious wall auto-fired `install()`,
+    /// whose success re-probed) — without it, every update launch would ride the
+    /// full deadline and land on the wall anyway.
+    ///
+    /// The freshness probe (`daemon.info.started_at` vs the trigger anchor) is
+    /// read-only; `probeDaemon()` — the single grant/transport writer — runs
+    /// once, after freshness confirms.
+    func startConvergenceProbeLoopIfNeeded(
+        freshProbe: @escaping () async -> Double? =
+            DaemonInstallController.liveDaemonStartedAtProbe,
+        now: @escaping () -> Date = Date.init,
+        sleep: @escaping (TimeInterval) async -> Void = {
+            try? await Task.sleep(nanoseconds: UInt64(max(0, $0) * 1_000_000_000))
+        }
+    ) {
+        guard updateConverging, convergenceLoopTask == nil,
+              let anchor = updateConvergenceAnchor else { return }
+        convergenceLoopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let probeStartedAt = await freshProbe()
+                guard let self, !Task.isCancelled else { return }
+                switch Self.convergenceStep(
+                    probeStartedAt: probeStartedAt,
+                    anchor: anchor,
+                    now: now(),
+                    deadline: Self.updateConvergenceDeadline
+                ) {
+                case .finishedFresh:
+                    await self.probeDaemon()
+                    self.finishUpdateConvergence(failed: false)
+                    return
+                case .deadlineExpired:
+                    recorderLogger.error(
+                        "Helper swap did not converge within \(Self.updateConvergenceDeadline, privacy: .public)s; falling through to the permission wall"
+                    )
+                    // Re-read reality before falling through: the launch probe
+                    // may have adopted the DYING pre-swap daemon (transport
+                    // frozen at .daemon, grants intact), and without a fresh
+                    // probe the policy would resolve to the shell on a dead
+                    // transport instead of the repair wall. A dead daemon now
+                    // reads .cliFallback → wall; a live one means the swap
+                    // converged after all → not a failure.
+                    await self.probeDaemon()
+                    self.finishUpdateConvergence(failed: self.transport != .daemon)
+                    return
+                case .keepWaiting:
+                    await sleep(Self.updateConvergenceProbeInterval)
+                }
+            }
+        }
+    }
+
+    private func finishUpdateConvergence(failed: Bool) {
+        updateConverging = false
+        updateConvergenceFailed = failed
+        updateConvergenceAnchor = nil
+        convergenceLoopTask = nil
+        convergenceDefaults.removeObject(forKey: Self.updateConvergenceAnchorKey)
+    }
+
     func probeDaemon() async {
         defer { daemonProbeCompleted = true }
         switch await daemonService.probe() {
         case .daemon(let grants):
             schemaMismatchDetected = false
+            // SCR-262: a reachable daemon makes the wall's content genuine again —
+            // its rows reflect real grant state, so the wall loses its
+            // "update didn't finish" provenance (KTD-8/KTD-6).
+            updateConvergenceFailed = false
             // probeDaemon is the single writer of the daemon-grant snapshot
             // (U3). The walkthrough rows, the launch gate (U4), and the
             // start-block all read it from PermissionController. Push grants
@@ -1453,6 +1673,24 @@ extension RecorderController {
         transitionToIdle()
         task?.cancel()
         try? await Task.sleep(nanoseconds: 50_000_000)
+    }
+
+    /// SCR-262: enter convergence directly so loop tests can inject their own
+    /// probe/clock/sleep via `startConvergenceProbeLoopIfNeeded` without going
+    /// through `runLaunchDaemonCheck` (which starts the live-probe loop itself).
+    func _testBeginUpdateConvergence(anchor: Date, defaults: UserDefaults) {
+        convergenceDefaults = defaults
+        defaults.set(anchor, forKey: Self.updateConvergenceAnchorKey)
+        updateConvergenceAnchor = anchor
+        updateConverging = true
+    }
+
+    /// SCR-262: tear down a convergence loop a test left running (e.g. after
+    /// exercising `runLaunchDaemonCheck`, whose live probe no-ops under XCTest
+    /// so its loop would idle-wait out the deadline).
+    func _testCancelConvergenceLoop() {
+        convergenceLoopTask?.cancel()
+        convergenceLoopTask = nil
     }
 }
 #endif
