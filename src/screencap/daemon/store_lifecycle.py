@@ -1,0 +1,327 @@
+"""Sealed-capable store-state resolution for the daemon serve model (SCR-258 U4).
+
+This module owns the **daemon-side lifecycle** that ``container.py`` deliberately
+does not (its docstring defers ``ensure_store_mounted`` and store *state* to
+"U4"). It is the KTD-14 amendment in code: instead of the base plan's
+mount-before-bind, "never serve against an unmounted store" model — which makes a
+sealed store indistinguishable from a dead daemon (launchd retry loops, R6
+data-loss look) — the daemon binds its socket FIRST (``server.serve``) and then
+calls :func:`resolve_store_state` to classify the store into a HEALTHY serving
+state:
+
+* :attr:`StoreState.MOUNTED`   — the store is available (an encrypted container
+  attached at the recordings mountpoint, OR the container is disabled and today's
+  plaintext directory is the store).
+* :attr:`StoreState.LOCKED`    — a sealed sentinel is present; the daemon serves
+  without ever attempting a mount (the whole point of bind-before-mount).
+* :attr:`StoreState.ABSENT`    — the container is enabled but no bundle exists yet
+  (the SMAppService-starts-daemon-before-onboarding window); ``storage init`` is
+  the next step.
+* :attr:`StoreState.ERROR`     — the store exists but cannot be served: the key is
+  genuinely missing, the running binary is not entitled to read the key
+  (KTD-22), the Keychain is locked (retryable), or the container was disabled on a
+  bundle-present install (KTD-19 "downgrade unsupported"). Never a plaintext
+  fallback.
+
+Only a ROGUE mountpoint or a corrupted bundle remain operator hard-stops
+(:func:`resolve_store_state` re-raises the container operator exception so
+``serve`` can exit 1); every other condition is a healthy serving state.
+
+Nothing here runs ``hdiutil`` unless the store is genuinely healthy (container
+enabled, not sealed, bundle present, key readable, mountpoint not already a live
+volume) — the sealed / absent / key-error / disabled paths short-circuit before
+any subprocess, which is what keeps the model testable without real disk images.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import logging
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Iterator
+
+logger = logging.getLogger(__name__)
+
+# Env var the daemon sets on the engine subprocess so its disk policy evaluates
+# the HOST volume backing the bundle rather than the mounted volume's virtual
+# (declared, sparse) free space (KTD-13). Consumed by
+# ``screencap.engine.disk_policy``.
+DISK_HOST_PATH_ENV = "SCREENCAP_DISK_HOST_PATH"
+
+# Run-dir sentinel written by the lock verb (U9) to seal the store. U4 only
+# READS it — a sealed sentinel present means the daemon serves ``locked`` and
+# never attempts a mount. Writing/clearing it is U9's job.
+_SEALED_SENTINEL_NAME = "store.sealed"
+_MOUNT_LOCK_NAME = "mount.lock"
+
+
+class StoreState(str, Enum):
+    """The four healthy serving states surfaced on ``daemon.info`` (KTD-14).
+
+    ``str`` mixin so ``.value`` serializes directly into the JSON envelope and an
+    equality check against the wire string works without unwrapping (mirrors
+    :class:`screencap.content_index.IndexState`).
+    """
+
+    MOUNTED = "mounted"
+    LOCKED = "locked"
+    ABSENT = "absent"
+    ERROR = "error"
+
+
+# ``store_state=error`` reason codes carried alongside the enum on ``daemon.info``
+# so an operator (and the Swift app's ``error`` case) get an accurate cause rather
+# than a bare "error". Never a plaintext fallback for any of these.
+ERROR_KEY_MISSING = "key_missing"
+ERROR_ENTITLEMENT_MISMATCH = "entitlement_mismatch"
+ERROR_KEYCHAIN_LOCKED = "keychain_locked"
+ERROR_DOWNGRADE_UNSUPPORTED = "downgrade_unsupported"
+
+
+@dataclass(frozen=True)
+class StoreResolution:
+    """The resolved store state plus a diagnostic reason and (if mounted) path.
+
+    ``reason`` is ``None`` for MOUNTED/LOCKED/ABSENT and one of the ``ERROR_*``
+    codes for ERROR. ``mountpoint`` is set only when MOUNTED (so the daemon can
+    thread the host-volume path to the engine).
+    """
+
+    state: StoreState
+    reason: str | None = None
+    mountpoint: str | None = None
+
+    @property
+    def is_mounted(self) -> bool:
+        return self.state is StoreState.MOUNTED
+
+
+# ---------------------------------------------------------------------------
+# Path helpers (pure — no subprocess, no side effects beyond mkdir of run/)
+# ---------------------------------------------------------------------------
+
+
+def store_bundle_path() -> Path:
+    """Absolute path of the encrypted sparse bundle (KTD-1).
+
+    ``~/.screencap/store.sparsebundle`` by default — it lives in the plaintext
+    run/base dir OUTSIDE the container (it *is* the container), resolved through
+    ``config.get_base_dir`` so tests isolate it.
+    """
+    from screencap import config, container
+
+    return config.get_base_dir() / container.BUNDLE_NAME
+
+
+def sealed_sentinel_path() -> Path:
+    """Run-dir sealed-sentinel path (written by U9's lock verb; read here)."""
+    from screencap import config
+
+    return config.get_base_dir() / "run" / _SEALED_SENTINEL_NAME
+
+
+def mount_lock_path() -> Path:
+    """Run-dir ``mount.lock`` path serializing store-state resolution (KTD-3)."""
+    from screencap import config
+
+    return config.get_base_dir() / "run" / _MOUNT_LOCK_NAME
+
+
+def is_sealed() -> bool:
+    """True iff the sealed sentinel is present (store locked by the user)."""
+    return sealed_sentinel_path().exists()
+
+
+def _bundle_exists() -> bool:
+    return store_bundle_path().exists()
+
+
+def host_disk_path() -> Path | None:
+    """The HOST volume path whose free space bounds recording (KTD-13).
+
+    When the container is active, recordings land inside the mounted volume whose
+    ``shutil.disk_usage`` reports the *declared* (virtual, sparse) size — so the
+    disk guards must instead watch the bundle's backing host volume. Returns the
+    bundle's parent directory (a real host path); ``None`` when the container is
+    inactive (today's behavior — the capture dir already sits on the host volume).
+    """
+    from screencap import config
+
+    if not config.get_container_enabled():
+        return None
+    return store_bundle_path().parent
+
+
+def disk_host_env() -> dict[str, str]:
+    """The engine-subprocess env fragment carrying the host-volume path (KTD-13).
+
+    Empty when the container is inactive, so the daemon->engine pass-through adds
+    nothing on a plaintext install (byte-identical to today).
+    """
+    host = host_disk_path()
+    return {DISK_HOST_PATH_ENV: str(host)} if host is not None else {}
+
+
+# ---------------------------------------------------------------------------
+# mount.lock (KTD-3): O_NOFOLLOW + realpath-parent discipline, fcntl.flock
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _mount_lock() -> Iterator[None]:
+    """Hold an exclusive ``flock`` on ``run/mount.lock`` for the resolution.
+
+    Uses the ``_autospawn._open_auto_log`` discipline (``O_NOFOLLOW`` on the lock
+    path itself) rather than the check-then-connect shape, so a pre-planted
+    symlink AT the lock path is refused, not followed (KTD-3). The run-dir itself
+    is additionally rejected if it was swapped for a symlink (the tamper vector) —
+    checked on the final component only, so a legitimately symlinked *ancestor*
+    (macOS ``/var`` -> ``/private/var``, a test's ``/tmp`` link) does not
+    false-positive the way a ``realpath == abspath`` whole-path check would.
+    """
+    lock_path = mount_lock_path()
+    parent = lock_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise RuntimeError(
+            f"mount.lock run-dir is a symlink and will not be followed: {parent}"
+        )
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# The healthy-path mount attempt (only reached when everything checks out)
+# ---------------------------------------------------------------------------
+
+
+def _attempt_mount(bundle: Path, mountpoint: Path, key: bytes) -> StoreResolution:
+    """Reuse an existing healthy mount, hard-stop on ROGUE, else attach (KTD-3).
+
+    Ordered so the common/safe branches never invoke ``hdiutil``:
+
+    1. mountpoint is already a mounted volume -> reuse it (no attach).
+    2. mountpoint exists, is a non-empty plain directory (NOT a volume) -> ROGUE
+       hard stop (mirrors ``RogueFileAtSocketPath``); never auto-cleaned.
+    3. otherwise attach the bundle and harden the mount.
+
+    Raises the container operator exceptions (``RogueMountpointError`` /
+    ``ContainerCorruptError`` / ``ContainerAuthError``) unchanged so ``serve`` can
+    map them to exit 1.
+    """
+    from screencap import container
+
+    if os.path.ismount(str(mountpoint)):
+        # A live volume is already here (a prior daemon left it mounted — the
+        # mount outlives the daemon, base KTD-4). Reuse it.
+        return StoreResolution(StoreState.MOUNTED, mountpoint=str(mountpoint))
+
+    if mountpoint.exists() and mountpoint.is_dir() and any(mountpoint.iterdir()):
+        raise container.RogueMountpointError(
+            f"{mountpoint} is a non-empty directory but not a mounted volume; "
+            "refusing to attach over it (rogue mountpoint, never auto-cleaned)"
+        )
+
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    info = container.attach(str(bundle), key, str(mountpoint))
+    resolved_mp = info.mountpoint or str(mountpoint)
+    container.harden_mount(resolved_mp)
+    return StoreResolution(StoreState.MOUNTED, mountpoint=resolved_mp)
+
+
+# ---------------------------------------------------------------------------
+# The resolver
+# ---------------------------------------------------------------------------
+
+
+def resolve_store_state(*, attempt_mount: bool = True) -> StoreResolution:
+    """Classify the store into a healthy serving state (KTD-14, KTD-19, KTD-22).
+
+    Called by ``server.serve`` AFTER the socket is bound. Only ROGUE / corrupted
+    bundle raise (the caller exits 1); every other condition returns a
+    :class:`StoreResolution`.
+
+    ``attempt_mount=False`` resolves state without ever running ``hdiutil`` (the
+    healthy path returns MOUNTED without attaching) — used where a caller only
+    needs the classification, not a live mount.
+    """
+    from screencap import config, container
+
+    # container OFF: the store is today's plaintext dir. No mount.lock, no
+    # subprocess, no exit-code change — byte-identical to today (KTD-19 regression)
+    # UNLESS a bundle already exists, in which case honoring the off-switch would
+    # be a silent plaintext downgrade (R10) — refuse instead (KTD-19).
+    if not config.get_container_enabled():
+        if _bundle_exists():
+            logger.warning(
+                "container_enabled is false but an encrypted store bundle exists; "
+                "refusing to serve plaintext (downgrade unsupported, KTD-19)"
+            )
+            return StoreResolution(
+                StoreState.ERROR, reason=ERROR_DOWNGRADE_UNSUPPORTED
+            )
+        return StoreResolution(StoreState.MOUNTED)
+
+    # container ON: resolve under mount.lock so a concurrent resolver (or the U9
+    # lock verb) never races the sealed-sentinel / attach decision.
+    with _mount_lock():
+        # Sealed sentinel wins over everything: serve locked, NEVER attempt a
+        # mount. This is the load-bearing bind-before-mount amendment.
+        if is_sealed():
+            return StoreResolution(StoreState.LOCKED)
+
+        bundle = store_bundle_path()
+        if not bundle.exists():
+            # Fresh install / pre-init (bundle absent, key may or may not exist).
+            # ``storage init`` creates/relinks the bundle.
+            return StoreResolution(StoreState.ABSENT)
+
+        # Bundle exists — resolve the key with the KTD-22 cause-distinguishing
+        # diagnosis. NONE of these touch the bundle bytes.
+        try:
+            key = container.require_container_key()
+        except container.ContainerKeyMissingError:
+            return StoreResolution(StoreState.ERROR, reason=ERROR_KEY_MISSING)
+        except container.ContainerKeyUnreachableError:
+            return StoreResolution(
+                StoreState.ERROR, reason=ERROR_ENTITLEMENT_MISMATCH
+            )
+        except container.KeychainLockedError:
+            # Retryable in-band (NOT a daemon exit): the Keychain may unlock and a
+            # later mount attempt succeed.
+            return StoreResolution(StoreState.ERROR, reason=ERROR_KEYCHAIN_LOCKED)
+
+        if not attempt_mount:
+            return StoreResolution(StoreState.MOUNTED)
+
+        mountpoint = config.get_recordings_dir()
+        return _attempt_mount(bundle, Path(mountpoint), key)
+
+
+__all__ = [
+    "StoreState",
+    "StoreResolution",
+    "DISK_HOST_PATH_ENV",
+    "ERROR_KEY_MISSING",
+    "ERROR_ENTITLEMENT_MISMATCH",
+    "ERROR_KEYCHAIN_LOCKED",
+    "ERROR_DOWNGRADE_UNSUPPORTED",
+    "store_bundle_path",
+    "sealed_sentinel_path",
+    "mount_lock_path",
+    "is_sealed",
+    "host_disk_path",
+    "disk_host_env",
+    "resolve_store_state",
+]

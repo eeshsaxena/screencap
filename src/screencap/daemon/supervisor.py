@@ -28,6 +28,7 @@ from screencap.pidfile import CLAIMANT_DAEMON
 if TYPE_CHECKING:
     from screencap.capture_gate import CaptureGateResult
     from screencap.daemon.schema import RecordingStartRequest
+    from screencap.daemon.store_lifecycle import StoreState
     from screencap.terminal_stage import TerminalResult
 
 logger = logging.getLogger(__name__)
@@ -325,6 +326,19 @@ class Supervisor:
         # SCR-228: set while a storage-location migration holds the daemon.
         # Guarded by `_operation_lock` so it serializes against spawn/stop.
         self._migration_active = False
+        # SCR-258 U4 (KTD-14): the resolved encrypted-store state. Set by
+        # ``server.serve`` -> lifespan via ``set_store_state`` after the socket is
+        # bound and the store is classified. Default MOUNTED so a lifespan-less
+        # test app (and a plaintext / container-disabled install) behaves exactly
+        # as today. ``spawn`` reads it as the refusal flag: recording.start while
+        # the store is not MOUNTED is refused with a typed error BEFORE any
+        # ``started`` signal and before any plaintext mountpoint dir is created.
+        # The idle-watchdog PIN is deliberately NOT wired here (that is the
+        # in-flight-lock-operation rule from KTD-15, landed in U9) — a locked
+        # daemon idle-exits normally and the next start re-enters sealed serving.
+        from screencap.daemon.store_lifecycle import StoreState
+
+        self._store_state: StoreState = StoreState.MOUNTED
 
         if reconcile_on_init:
             self.start_reconcile()
@@ -445,9 +459,50 @@ class Supervisor:
         """
         return self._migration_active
 
+    def set_store_state(self, state: "StoreState") -> None:
+        """Record the resolved encrypted-store state (SCR-258 U4, KTD-14).
+
+        Called by the daemon lifespan with the ``StoreResolution`` that
+        ``server.serve`` produced after binding the socket. ``spawn`` reads it as
+        the recording.start refusal flag.
+        """
+        self._store_state = state
+
+    def is_locked(self) -> bool:
+        """True iff the store is sealed (SCR-258 U4).
+
+        The ``spawn`` refusal flag, mirroring :meth:`is_migrating`. Only the
+        sealed state is ``locked``; ABSENT and ERROR are separately refused by
+        ``spawn`` with their own typed errors. Deliberately NOT consulted by the
+        idle watchdog in U4 — a sealed steady state idle-exits normally (KTD-15).
+        """
+        from screencap.daemon.store_lifecycle import StoreState
+
+        return self._store_state is StoreState.LOCKED
+
     async def spawn(self, request: "RecordingStartRequest") -> dict[str, Any]:
         """Claim the daemon lock, spawn the engine worker, and await started."""
         async with self._operation_lock:
+            # SCR-258 U4 (KTD-14): refuse a recording.start when the encrypted
+            # store is not available, BEFORE `_allocate_capture_dir` (which would
+            # `mkdir` a plaintext directory at the mountpoint via
+            # `get_recordings_dir`) and BEFORE any `started` signal — the
+            # typed-error-before-spawn convention. LOCKED -> unlock; ABSENT/ERROR
+            # -> the store was never initialized or is unmountable, so there is no
+            # store to write into (a plaintext write here would be the historic
+            # silent-fallback bug, R10).
+            from screencap.daemon.store_lifecycle import StoreState
+
+            if self._store_state is StoreState.LOCKED:
+                raise errors.StoreLockedError(
+                    schema_version=schema._RECORDING_START_API_VERSION
+                )
+            if self._store_state is not StoreState.MOUNTED:
+                # ABSENT (pre-init) or ERROR (key missing / entitlement mismatch /
+                # keychain locked / downgrade unsupported): no usable store.
+                raise errors.StoreAbsentError(
+                    schema_version=schema._RECORDING_START_API_VERSION
+                )
             if self._migration_active:
                 # SCR-228 U4: a storage migration holds the daemon; refuse to
                 # start a recording rather than let it write into a directory
@@ -510,6 +565,16 @@ class Supervisor:
                 key_env = await self._stage_engine_cloud_key(request, capture_dir)
                 if key_env:
                     extra_env = {**(extra_env or {}), **key_env}
+                # SCR-258 U4 (KTD-13): when the container is active the capture dir
+                # sits inside the mounted volume, whose free space is the DECLARED
+                # (virtual, sparse) size — so tell the engine's disk policy to watch
+                # the HOST volume backing the bundle instead. Empty (no-op) on a
+                # plaintext install, so today's disk behavior is byte-identical.
+                from screencap.daemon.store_lifecycle import disk_host_env
+
+                host_env = disk_host_env()
+                if host_env:
+                    extra_env = {**(extra_env or {}), **host_env}
                 # Search U8: deliver the corpus key (via file) + RECORD_IMAGES_ENCRYPTED
                 # to the engine when the gate resolved encrypted stills ON.
                 corpus_env = await self._stage_corpus_key(request, capture_dir, gate=gate)

@@ -21,6 +21,7 @@ from starlette.routing import Route
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
+from screencap.daemon.store_lifecycle import StoreState
 from screencap.pidfile import CLAIMANT_DAEMON
 
 # U5 (conversational recall): the ``chat.answer`` request-path modules are
@@ -56,6 +57,14 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         from screencap.daemon.supervisor import Supervisor
 
         app.state.supervisor = Supervisor(app.state.event_bus)
+    # SCR-258 U4 (KTD-14): thread the store state ``server.serve`` resolved AFTER
+    # binding the socket into the supervisor, so ``recording.start`` is refused
+    # (typed, before any ``started`` signal) while the store is locked / absent /
+    # unmountable. Absent (a lifespan-less test app or a plaintext install) leaves
+    # the supervisor's default MOUNTED — byte-identical to today.
+    resolution = getattr(app.state, "store_resolution", None)
+    if resolution is not None:
+        app.state.supervisor.set_store_state(resolution.state)
     # SCR-228: reconcile a storage migration that crashed between the tree
     # rename and the config flip, so the daemon serves the correct recordings
     # dir from the first request. Fail-open — a reconcile error must never
@@ -234,6 +243,13 @@ async def daemon_info(request: Request) -> JSONResponse:
     # start (see the lifespan). Absent (e.g. a lifespan-less test app) → "unknown",
     # which is not alarming and renders no warning. Never blocks recording.
     filevault = getattr(request.app.state, "filevault_status", "unknown")
+    # SCR-258 U4 (KTD-14): the encrypted-store state, so a locked / absent store is
+    # distinguishable from a dead daemon. Always present (the IndexState precedent);
+    # a lifespan-less test app or a plaintext install reports ``mounted``. The
+    # ``store_reason`` (an ``ERROR_*`` code) accompanies ``error`` for an accurate
+    # cause (key missing vs entitlement mismatch vs downgrade unsupported).
+    store_state = _store_state_value(request)
+    store_reason = getattr(request.app.state, "store_reason", None)
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
@@ -241,12 +257,28 @@ async def daemon_info(request: Request) -> JSONResponse:
             started_at=_STARTED_AT,
             permissions=grants,
             filevault=filevault,
+            store_state=store_state,
+            store_reason=store_reason,
         )
     )
 
 
 async def recording_list(request: Request) -> JSONResponse:
     from screencap import catalog
+
+    # SCR-258 U4 (KTD-14/KTD-20): a locked / absent / error store returns the
+    # NORMAL envelope with ``store_state`` set and an EMPTY list — never a 500 and
+    # never a silent empty payload indistinguishable from "no recordings" (the R6
+    # data-loss look the Swift Library branches on before its isEmpty check).
+    store_state = _store_state_value(request)
+    if store_state != StoreState.MOUNTED.value:
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._LIST_API_VERSION,
+                recordings=[],
+                store_state=store_state,
+            )
+        )
 
     try:
         recordings = await asyncio.to_thread(catalog.list_recordings)
@@ -285,6 +317,7 @@ async def recording_list(request: Request) -> JSONResponse:
         schema.envelope(
             schema_version=schema._LIST_API_VERSION,
             recordings=summaries,
+            store_state=store_state,
         )
     )
 
@@ -584,6 +617,23 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
         status_code=exc.http_status,
         headers=exc.response_headers() or None,
     )
+
+
+def _store_state_value(request: Request) -> str:
+    """The resolved encrypted-store state string for this daemon (SCR-258 U4).
+
+    Read off ``app.state.store_state`` (set by ``server.serve`` -> lifespan after
+    the socket is bound). Absent (a lifespan-less test app, or an old daemon) ->
+    ``mounted``, so read verbs behave exactly as today on a plaintext install.
+    """
+    state = getattr(request.app.state, "store_state", None)
+    if state is None:
+        return StoreState.MOUNTED.value
+    return state.value if isinstance(state, StoreState) else str(state)
+
+
+def _store_is_mounted(request: Request) -> bool:
+    return _store_state_value(request) == StoreState.MOUNTED.value
 
 
 def _validation_error_response(*, schema_version: int) -> JSONResponse:
@@ -1287,6 +1337,19 @@ async def content_search(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._CONTENT_SEARCH_API_VERSION
         )
+        # SCR-258 U4: a locked / absent / error store returns empty hits +
+        # ``store_state`` (never a 500). ``index_state=store_unavailable`` is the
+        # IndexState precedent — the content index lives inside the store.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._CONTENT_SEARCH_API_VERSION,
+                    hits=[],
+                    index_state="store_unavailable",
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1304,6 +1367,7 @@ async def content_search(request: Request) -> JSONResponse:
                 schema_version=schema._CONTENT_SEARCH_API_VERSION,
                 hits=result["hits"],
                 index_state=result["index_state"],
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1725,6 +1789,17 @@ async def transcript_search(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION
         )
+        # SCR-258 U4: locked / absent / error store -> empty hits + store_state.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
+                    hits=[],
+                    coverage="best_effort",
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1740,6 +1815,7 @@ async def transcript_search(request: Request) -> JSONResponse:
                 schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
                 hits=hits,
                 coverage="best_effort",
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1760,6 +1836,17 @@ async def timeline_query(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._TIMELINE_QUERY_API_VERSION
         )
+        # SCR-258 U4: locked / absent / error store -> empty rows + store_state.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._TIMELINE_QUERY_API_VERSION,
+                    rows=[],
+                    coverage="authoritative",
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1788,6 +1875,7 @@ async def timeline_query(request: Request) -> JSONResponse:
                 schema_version=schema._TIMELINE_QUERY_API_VERSION,
                 rows=rows,
                 coverage="authoritative",
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1850,6 +1938,22 @@ async def frame_nearest(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._FRAME_NEAREST_API_VERSION
         )
+        from screencap.config import get_corpus_encrypted
+
+        # SCR-258 U4: locked / absent / error store -> a miss (null stem) +
+        # store_state, never a 500. A locked volume has no on-disk frames to
+        # resolve; the agent must see the locked state, not an ambiguous miss.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._FRAME_NEAREST_API_VERSION,
+                    stem=None,
+                    delta_ms=None,
+                    encrypted=get_corpus_encrypted(),
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1865,7 +1969,6 @@ async def frame_nearest(request: Request) -> JSONResponse:
             parsed.recording, parsed.timestamp_ms, parsed.staleness_cap_ms,
         )
         stem, delta_ms = result if result is not None else (None, None)
-        from screencap.config import get_corpus_encrypted
 
         return JSONResponse(
             schema.envelope(
@@ -1875,6 +1978,7 @@ async def frame_nearest(request: Request) -> JSONResponse:
                 # KTD6: signal encrypted storage so the agent calls frame.read
                 # instead of reading the .jpg path directly.
                 encrypted=get_corpus_encrypted(),
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -2535,6 +2639,19 @@ async def chat_answer(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        # SCR-258 U4: a locked / absent / error store degrades to a graceful
+        # refusal (the KTD8 fail-safe shape) carrying ``store_state`` — a 200 with
+        # ``refusal=true`` and ``store_unavailable`` coverage, never a 500 and
+        # never an answer conjured from an unreachable store.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._CHAT_ANSWER_API_VERSION,
+                    store_state=store_state,
+                    **_chat_answer_payload(_graceful_refusal()),
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}

@@ -15,6 +15,7 @@ options.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Protocol
@@ -22,6 +23,34 @@ from typing import Protocol
 _logger = logging.getLogger(__name__)
 
 _DISK_CHECK_INTERVAL = 30  # seconds between normal-band disk checks
+
+# SCR-258 U4 (KTD-13): the daemon sets this on the engine subprocess when the
+# encrypted container is active. The capture dir then lives inside the mounted
+# volume, whose ``shutil.disk_usage`` reports the DECLARED (virtual, sparse) size
+# — so a genuinely full host would never trip the guard. When set (and it names an
+# existing path) the free-space checks below evaluate the HOST volume backing the
+# bundle instead. Unset on a plaintext install → today's capture-dir behavior.
+_DISK_HOST_PATH_ENV = "SCREENCAP_DISK_HOST_PATH"
+
+
+def _free_space_path(capture_dir: Path | None) -> Path | None:
+    """The path whose volume free space bounds recording (KTD-13).
+
+    The host-volume override when the daemon set it (container active), else the
+    capture dir (or its parent when the capture dir does not exist yet). Read at
+    check time so an env override is honored without reconstructing the policy.
+    """
+    host = os.environ.get(_DISK_HOST_PATH_ENV)
+    if host:
+        host_path = Path(host)
+        if host_path.exists():
+            return host_path
+        # A configured-but-missing host path is a fail-closed signal, not a reason
+        # to silently fall back to the (virtual-size) mounted volume.
+        return host_path
+    if capture_dir is None:
+        return None
+    return capture_dir if capture_dir.exists() else capture_dir.parent
 
 
 class DiskSpaceCritical(Exception):
@@ -94,11 +123,11 @@ class MonitorAndStop:
         if self._capture_dir is None:
             return
 
-        check_path = (
-            self._capture_dir.parent
-            if not self._capture_dir.exists()
-            else self._capture_dir
-        )
+        # KTD-13: watch the HOST volume backing the bundle when the container is
+        # active (the daemon sets the env), else the capture dir / its parent.
+        check_path = _free_space_path(self._capture_dir)
+        if check_path is None:
+            return
         try:
             free = shutil.disk_usage(check_path).free
             warn_bytes = self._warn_mb * 1_048_576
@@ -124,8 +153,13 @@ class MonitorAndStop:
         if now < self._next_poll_at or self._capture_dir is None:
             return
 
+        # KTD-13: same host-volume override as preflight — a mounted encrypted
+        # volume's virtual free space must not mask a full host.
+        poll_path = _free_space_path(self._capture_dir)
+        if poll_path is None:
+            return
         try:
-            free = shutil.disk_usage(self._capture_dir).free
+            free = shutil.disk_usage(poll_path).free
             free_mb = free / 1_048_576
 
             if self._stop_mb > 0 and free_mb < self._stop_mb:
