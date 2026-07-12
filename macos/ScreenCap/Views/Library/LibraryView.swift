@@ -369,7 +369,10 @@ struct LibraryView: View {
     /// The read-only Inspect window (context menu; KTD-4). A stub recording
     /// surfaces the friendly download message rather than an empty window.
     private func openInspect(_ rec: RecordingSummary) {
-        switch InspectRouting.decide(recording: rec.name, anchorMs: nil, isStub: rec.isStub) {
+        switch InspectRouting.decide(
+            recording: rec.name, anchorMs: nil, isStub: rec.isStub,
+            isEncrypted: rec.cloudE2EE == true
+        ) {
         case .unavailable(let message):
             rowError = message
         case .open(let recording, _):
