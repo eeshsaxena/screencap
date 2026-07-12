@@ -398,7 +398,7 @@ final class PermissionController: ObservableObject {
     func markMigrationComplete() {
         guard migrationNeeded else { return }
         // Clear the in-session flag unconditionally so the one-time banner can't
-        // re-pop within this session (`shouldPresentOnLaunch` returns true while
+        // re-pop within this session (`launchPresentation` returns the wall while
         // `migrationNeeded`). The on-disk marker governs only whether it returns
         // on a *future* launch: a successful write suppresses it for good; a failed
         // write (e.g. `~/.screencap` unwritable) leaves the marker absent, so the

@@ -138,14 +138,17 @@ final class PermissionControllerTests: XCTestCase {
     ) -> Bool {
         // These truth-table tests model the already-migrated (post-Phase-1c)
         // state by default; the migration-override cases live in
-        // FirstRunSetupPresentationPolicyTests.
-        FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+        // FirstRunSetupPresentationPolicyTests, and the SCR-262 converging
+        // dimension defaults to the non-converging state there too — every
+        // pin below maps unchanged onto the tri-state decision (wall ↔ true,
+        // shell ↔ false).
+        FirstRunSetupPresentationPolicy.launchPresentation(
             daemonProbeCompleted: daemonProbeCompleted,
             transport: transport,
             daemonGrants: daemonGrants,
             setupDismissed: setupDismissed,
             migrationNeeded: migrationNeeded
-        )
+        ) == .permissionWall
     }
 
     func testFirstRunSetupWaitsForDaemonProbeBeforePresenting() {
