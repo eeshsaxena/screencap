@@ -96,6 +96,16 @@ KEYCHAIN_ACCESS_GROUP = os.environ.get(
     "SCREENCAP_KEYCHAIN_ACCESS_GROUP", "2A8S6MV8DZ.com.screencap.shared"
 )
 
+CLOUD_KEK_SYNCHRONIZABLE = True
+"""SCR-253 (Stage 2, KTD-5): the cloud KEK is written with
+``kSecAttrSynchronizable=true`` so it syncs to the user's other Macs via iCloud
+Keychain (end-to-end encrypted; neither we nor Apple can read it). Every KEK
+*read* uses :data:`keychain_group.SYNCHRONIZABLE_ANY` so a pre-Stage-2
+device-local (``synchronizable=false``) item is still found and never mistaken
+for absent — which would mint a forking second key. The only permitted delete of
+a group KEK item targets the ``synchronizable=false`` flavor (during the one-time
+rewrite); deleting a synced item would propagate to ALL the user's Macs."""
+
 # ---------------------------------------------------------------------------
 # Framing constants
 # ---------------------------------------------------------------------------
@@ -183,8 +193,10 @@ def _group_store_prefer_existing(encoded: str) -> str | None:
 
     ``keychain_group.store()`` is add-then-update-on-duplicate, so calling it
     unconditionally would overwrite a concurrently created KEK — forking the
-    user's ciphertext across two keys (KTD-2). So: re-read first and keep
-    whatever is there; after a write, return the verified readback (``None``
+    user's ciphertext across two keys (KTD-2). So: re-read first (matching
+    *either* sync flavor, so a device-local pre-Stage-2 item or a synced copy
+    from another Mac both win) and keep whatever is there; otherwise write the
+    new key **synchronizable** (U7) and return the verified readback (``None``
     when the write cannot be confirmed, so the migration never deletes the
     legacy item on an unverified copy).
 
@@ -194,15 +206,25 @@ def _group_store_prefer_existing(encoded: str) -> str | None:
     from screencap import keychain_group
 
     existing = keychain_group.load(
-        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+        CLOUD_SERVICE,
+        CLOUD_KEK_ACCOUNT,
+        KEYCHAIN_ACCESS_GROUP,
+        synchronizable=keychain_group.SYNCHRONIZABLE_ANY,
     )
     if existing is not None:
         return existing
     keychain_group.store(
-        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, encoded, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+        CLOUD_SERVICE,
+        CLOUD_KEK_ACCOUNT,
+        encoded,
+        KEYCHAIN_ACCESS_GROUP,
+        synchronizable=CLOUD_KEK_SYNCHRONIZABLE,
     )
     return keychain_group.load(
-        CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+        CLOUD_SERVICE,
+        CLOUD_KEK_ACCOUNT,
+        KEYCHAIN_ACCESS_GROUP,
+        synchronizable=keychain_group.SYNCHRONIZABLE_ANY,
     )
 
 
@@ -253,16 +275,84 @@ def _migrate_legacy_kek_if_needed() -> bytes | None:
     return _decode_kek(stored)
 
 
+def _ensure_group_kek_synchronizable(encoded: str) -> None:
+    """One-time rewrite of a pre-Stage-2 device-local (``synchronizable=false``)
+    group KEK to ``synchronizable=true`` so it syncs to the user's other Macs via
+    iCloud Keychain (SCR-253 U7, KTD-5).
+
+    Entitled path only. Same add-verify-then-delete discipline as U1's migration:
+    write the synced flavor, verify a readback, and only then delete the OLD
+    device-local item — a delete that **never propagates** (that item never
+    synced), unlike deleting a synced item, which would wipe the key from every
+    Mac. Fail-open at every step: on any failure the device-local key still
+    decrypts locally, and the synced copy is retried on a later call.
+
+    Idempotent and safe against a fork: a no-op once a synced item exists
+    (already migrated, or a copy synced in from another Mac), and it only ever
+    writes the SAME bytes it read, so it can never overwrite a different key.
+    """
+    from screencap import keychain_group
+
+    try:
+        synced = keychain_group.load(
+            CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=True
+        )
+    except keychain_group.MissingEntitlement:
+        return  # un-entitled legacy home never syncs
+    except keychain_group.KeychainError:
+        logger.debug("cloud kek: could not read sync flavor; leaving key as-is", exc_info=True)
+        return
+    if synced is not None:
+        return  # already syncable (migrated here, or synced from another Mac)
+    # Only a device-local item exists → establish the synced flavor, verified.
+    try:
+        keychain_group.store(
+            CLOUD_SERVICE,
+            CLOUD_KEK_ACCOUNT,
+            encoded,
+            KEYCHAIN_ACCESS_GROUP,
+            synchronizable=True,
+        )
+        verify = keychain_group.load(
+            CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=True
+        )
+    except keychain_group.KeychainError:
+        logger.warning("cloud kek: sync-on rewrite failed; key stays device-local")
+        return
+    if verify != encoded:
+        logger.warning(
+            "cloud kek: sync-on rewrite not confirmed by readback; key stays device-local"
+        )
+        return
+    # Verified: the synced item is the home. Drop the device-local item — a
+    # non-synchronizable delete never reaches the user's other Macs (KTD-5).
+    try:
+        keychain_group.delete(
+            CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+        )
+    except keychain_group.KeychainError:
+        logger.warning(
+            "cloud kek: synced copy created but the device-local item persists "
+            "(harmless duplicate — same key)"
+        )
+    else:
+        logger.info("cloud kek: rewrote device-local key to sync via iCloud Keychain")
+
+
 def get_cloud_kek() -> bytes | None:
     """Read-only cloud-KEK lookup. Returns ``None`` if none is stored.
 
     Group-first (KTD-1): the shared access group is the KEK's home for entitled
     binaries; un-entitled ones (``MissingEntitlement``) fall back to the legacy
     ``keyring`` path. An entitled binary whose group is empty attempts the
-    one-time legacy migration (KTD-2). Use from every path that must not create
-    a key: the engine/daemon read path and download. Never silently re-creates —
-    a missing key means cloud recordings are undecryptable and the user must be
-    told.
+    one-time legacy migration (KTD-2). The group read matches **either sync
+    flavor** (SCR-253 U7: ``SYNCHRONIZABLE_ANY``), so a Stage-1 device-local key
+    and a Stage-2 synced key are both found — a present key is never mistaken for
+    absent (which would cascade into a forking re-mint). Use from every path that
+    must not create or mutate a key: the engine/daemon read path, download, and
+    ``e2ee status``/``disable``. Never silently re-creates and never rewrites the
+    sync flavor — the one-time sync-on rewrite is foreground-only
+    (:func:`get_or_create_cloud_kek`).
 
     Raises:
         keyring.errors.KeyringError: on legacy Keychain access failure.
@@ -275,7 +365,10 @@ def get_cloud_kek() -> bytes | None:
 
     try:
         stored = keychain_group.load(
-            CLOUD_SERVICE, CLOUD_KEK_ACCOUNT, KEYCHAIN_ACCESS_GROUP, synchronizable=False
+            CLOUD_SERVICE,
+            CLOUD_KEK_ACCOUNT,
+            KEYCHAIN_ACCESS_GROUP,
+            synchronizable=keychain_group.SYNCHRONIZABLE_ANY,
         )
     except keychain_group.MissingEntitlement:
         return _load_legacy_kek()
@@ -292,6 +385,12 @@ def get_or_create_cloud_kek() -> bytes:
     ``screencap login`` success or an explicit init command, never a daemon or
     engine tick. The engine reads a delivered key instead.
 
+    This is also the single site of the SCR-253 U7 sync-on rewrite: when the key
+    already exists as a Stage-1 device-local item, it is rewritten
+    ``synchronizable=true`` here (entitled path, fail-open) so a re-``e2ee
+    enable`` on the first Mac makes the key reach the user's other Macs. A fresh
+    mint is written synchronizable from the start.
+
     Edge case mirrors ``network/crypto.py``: if the Keychain entry went missing
     (corruption, restore-from-backup, manual delete) a fresh key is minted and
     prior cloud recordings become undecryptable. Callers that care print a
@@ -303,6 +402,8 @@ def get_or_create_cloud_kek() -> bytes:
     """
     existing = get_cloud_kek()
     if existing is not None:
+        if sys.platform == "darwin":
+            _ensure_group_kek_synchronizable(_encode_kek(existing))
         return existing
     kek = secrets.token_bytes(_KEK_LEN)
     encoded = _encode_kek(kek)

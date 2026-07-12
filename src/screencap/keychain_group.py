@@ -100,6 +100,26 @@ class MissingEntitlement(KeychainError):
     """
 
 
+class _SynchronizableAny:
+    """Sentinel type for :data:`SYNCHRONIZABLE_ANY` (kept private; use the value)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "SYNCHRONIZABLE_ANY"
+
+
+SYNCHRONIZABLE_ANY = _SynchronizableAny()
+"""Query-only ``synchronizable`` value (``kSecAttrSynchronizableAny``): match
+**both** synced and non-synced items in a read.
+
+Illegal in an *add*/*update*/*delete* — a stored item commits to one flavor, and
+matching "any" for a delete could destroy a synced item (fleet-wide propagation).
+So it is threaded only into :func:`load`. The SCR-253 (Stage 2) cloud KEK reads
+with it so a pre-Stage-2 ``synchronizable=false`` item is still found and never
+mistaken for absent — which would mint a second key and fork the ciphertext."""
+
+
 # --------------------------------------------------------------------------
 # ctypes binding (lazy, cached) — mirrors keyring/backends/macOS/api.py.
 # --------------------------------------------------------------------------
@@ -185,13 +205,20 @@ def _group_pairs(cf: ctypes.CDLL, sec: ctypes.CDLL, access_group: str) -> list:
     ]
 
 
-def _sync_pair(cf: ctypes.CDLL, sec: ctypes.CDLL, synchronizable: bool) -> list:
+def _sync_pair(
+    cf: ctypes.CDLL, sec: ctypes.CDLL, synchronizable: "bool | _SynchronizableAny"
+) -> list:
     """The ``kSecAttrSynchronizable`` selector. In add *attributes* it sets the
     item's iCloud-sync behavior; in update/copy/delete *queries* it is what lets
     a synced item match at all (queries default to non-synchronizable-only), so
-    every primitive carries it."""
+    every primitive carries it. :data:`SYNCHRONIZABLE_ANY` (query-only) selects
+    ``kSecAttrSynchronizableAny`` to match either flavor."""
+    key = _const("kSecAttrSynchronizable", sec)
+    if synchronizable is SYNCHRONIZABLE_ANY:
+        # A Security-framework CFString constant, not a CFBoolean (query-only).
+        return [(key, _const("kSecAttrSynchronizableAny", sec))]
     value = "kCFBooleanTrue" if synchronizable else "kCFBooleanFalse"
-    return [(_const("kSecAttrSynchronizable", sec), _const(value, cf))]
+    return [(key, _const(value, cf))]
 
 
 # --- primitives (real ctypes; stubbed in unit tests) ----------------------
@@ -239,7 +266,11 @@ def _sec_item_update(
 
 
 def _sec_item_copy_matching(
-    service: str, account: str, access_group: str, *, synchronizable: bool = False
+    service: str,
+    account: str,
+    access_group: str,
+    *,
+    synchronizable: "bool | _SynchronizableAny" = False,
 ) -> tuple[int, bytes | None]:
     sec, cf = _frameworks()
     query = _cfdict(
@@ -367,9 +398,17 @@ def store(
 
 
 def load(
-    service: str, account: str, access_group: str, *, synchronizable: bool = False
+    service: str,
+    account: str,
+    access_group: str,
+    *,
+    synchronizable: "bool | _SynchronizableAny" = False,
 ) -> str | None:
     """Read the secret from the access group, or ``None`` when absent.
+
+    ``synchronizable`` picks which flavor to match; pass
+    :data:`SYNCHRONIZABLE_ANY` to match either (used by the cloud KEK so a
+    pre-Stage-2 device-local item is never mistaken for absent).
 
     Raises :class:`MissingEntitlement` / :class:`KeychainError` as :func:`store`.
     """
