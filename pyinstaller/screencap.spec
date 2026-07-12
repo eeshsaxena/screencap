@@ -308,5 +308,19 @@ app = BUNDLE(
         'CFBundleDisplayName': 'ScreenCap',
         'CFBundlePackageType': 'APPL',
         'LSUIElement': True,
+        # Microphone usage description (SCR-254 / Risk R-B). The daemon is a
+        # first-class, SEPARATELY-signed TCC subject (com.screencap.daemon), so
+        # macOS keys its mic grant on THIS identity — the app's audio-input
+        # entitlement + grant do not cover it, and permission.request cannot
+        # supply a mic grant (its allowlist excludes microphone). record_audio
+        # runs inside this daemon and opens the CoreAudio input device on an
+        # audio-on recording (and now on the first mid-recording unmute of a
+        # --no-audio recording, SCR-218 R2). A process that touches the mic
+        # without this purpose string gets no meaningful prompt (and AVFoundation
+        # clients are terminated outright), so declaring it is the prerequisite
+        # for the daemon to prompt/acquire the mic under its own identity.
+        'NSMicrophoneUsageDescription':
+            'ScreenCap records microphone audio alongside your screen capture '
+            'when you enable audio or unmute during a recording.',
     },
 )
