@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import Foundation
 import OSLog
@@ -88,6 +89,39 @@ enum RecorderTransport: Equatable {
     case cliFallback
 }
 
+/// Where a mute toggle was initiated (SCR-254 U8/U9). Routes the unmute
+/// permission-denied surface: a menu-bar action means the user isn't looking at
+/// the HUD pill, so the denial must reach a surface they can see (R3).
+enum MuteToggleSource: Equatable, Sendable {
+    case hud
+    case menuBar
+}
+
+/// Microphone-authorization seam (SCR-254 U9). Wraps the two `AVCaptureDevice`
+/// audio-permission calls the unmute path needs so `RecorderController` is
+/// unit-testable across the authorized / undetermined / denied branches without a
+/// live TCC subject. The live implementation mirrors `NewRecordingSheet`'s
+/// non-prompting `authorizationStatus` + prompting `requestAccess` pair.
+@MainActor
+protocol MicAuthorizing {
+    /// The current status WITHOUT prompting (`authorizationStatus(for: .audio)`).
+    func authorizationStatus() -> AVAuthorizationStatus
+    /// The PROMPTING request (`requestAccess(for: .audio)`); returns true on grant.
+    func requestAccess() async -> Bool
+}
+
+/// Live implementation over `AVCaptureDevice`.
+@MainActor
+final class LiveMicAuthorizer: MicAuthorizing {
+    func authorizationStatus() -> AVAuthorizationStatus {
+        AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+
+    func requestAccess() async -> Bool {
+        await AVCaptureDevice.requestAccess(for: .audio)
+    }
+}
+
 struct PrivacyMatrixDisclosure: Equatable, Identifiable {
     let id = "privacy-matrix-v2026-04"
     let changes: [String]
@@ -111,6 +145,28 @@ final class RecorderController: ObservableObject {
     /// and on a ~5s timer; 8s keeps a coincident activation + timer tick from
     /// double-restarting while still picking up a fresh grant within one cycle.
     static let staleDaemonRestartCooldown: TimeInterval = 8.0
+
+    /// Non-terminal advisory when the mute/unmute VERB itself could not be
+    /// delivered (SCR-254 U7). Deliberately NOT routed through
+    /// `handleDaemonOperationFailure` (which idles the recording) — the recording
+    /// keeps running with its prior confirmed mic state; the user can retry.
+    static let muteRequestFailedAdvisory =
+        "Couldn't reach the recorder to change the microphone. The mic state is "
+        + "unchanged — try again."
+
+    /// Non-terminal advisory when the engine confirmed it could NOT acquire the
+    /// mic on unmute (`audio_unmute_failed`, KTD4/R3). The recording keeps running
+    /// MUTED; surfaced so the failure is never silent.
+    static let microphoneUnmuteFailedAdvisory =
+        "Couldn't turn the microphone on — it may be in use by another app. The "
+        + "recording is still running, muted."
+
+    /// Non-terminal advisory when the app's own mic permission is denied, so an
+    /// unmute never reached the daemon (SCR-254 U9/R3). Paired with the modal for
+    /// the menu-bar / HUD-hidden surfaces so the denial is always visible.
+    static let microphoneAccessDeniedAdvisory =
+        "Microphone access is denied, so the mic stayed off. Enable it in System "
+        + "Settings to record audio."
 
     /// Decide whether to kickstart a fresh daemon to defeat a stale grant probe.
     ///
@@ -158,6 +214,11 @@ final class RecorderController: ObservableObject {
                 // single chokepoint the advisory uses — so hidden state never
                 // survives a recording and the pill starts shown next time (R6).
                 hudHidden = false
+                // SCR-254: mute state is per-recording; clear it on every idle
+                // transition through the same chokepoint so a fresh recording
+                // starts unmuted and no stale in-flight flag survives.
+                muted = false
+                muteInFlight = false
             }
         }
     }
@@ -186,6 +247,18 @@ final class RecorderController: ObservableObject {
     /// CLI's deterministic `--no-audio` choice); a stale daemon that omits the
     /// echo is treated as audio-on. Defaults to `true` between recordings.
     @Published private(set) var audioEnabled: Bool = true
+    /// SCR-254 (U7): the CONFIRMED mic-mute state of the current recording, the
+    /// single source the HUD pill + menu-bar item both reflect (R7). Flipped ONLY
+    /// by the engine's confirmed `audio_muted` / `audio_unmuted` events (or a
+    /// reconnect snapshot), NEVER by the mute-verb response echo — so the UI never
+    /// shows "Muted" before capture actually stopped (KTD4). Reset on the return to
+    /// `.idle` via the `state.didSet` chokepoint.
+    @Published private(set) var muted: Bool = false
+    /// SCR-254 (U7): true while a mute/unmute request is dispatched and awaiting
+    /// its confirming event. Drives the HUD's transitional "Muting…"/"Unmuting…"
+    /// affordance so the control never optimistically shows the target state.
+    /// Cleared by the confirming event, by a verb failure, or on `.idle`.
+    @Published private(set) var muteInFlight: Bool = false
     /// U7: the provisional recording name shown on the HUD title (the daemon
     /// session id / CLI name — the directory slug until post-stop auto-naming
     /// renames it; user rename is SCR-223). `nil` → the HUD shows "Recording".
@@ -241,6 +314,10 @@ final class RecorderController: ObservableObject {
     private let inputMonitor: HUDInputMonitor
     /// Persistence for the one-time first-hide menu-bar hint (U5).
     private let hintStore: HUDHintStore
+    /// SCR-254 (U9): non-prompting/prompting mic-authorization seam for the unmute
+    /// permission gate. Injected so controller tests drive the authorized /
+    /// undetermined / denied branches without a live TCC subject.
+    private let micAuthorizer: MicAuthorizing
 
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
@@ -262,7 +339,8 @@ final class RecorderController: ObservableObject {
         stopPolicy: StopPolicyCoordinator = LiveStopPolicyCoordinator(),
         windowLifecycle: WindowLifecycle = WindowLifecycleFactory.makeDefault(),
         inputMonitor: HUDInputMonitor = HUDInputMonitorFactory.makeDefault(),
-        hintStore: HUDHintStore = HUDHintStore()
+        hintStore: HUDHintStore = HUDHintStore(),
+        micAuthorizer: MicAuthorizing = LiveMicAuthorizer()
     ) {
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
@@ -272,6 +350,7 @@ final class RecorderController: ObservableObject {
         self.windowLifecycle = windowLifecycle
         self.inputMonitor = inputMonitor
         self.hintStore = hintStore
+        self.micAuthorizer = micAuthorizer
         daemonInstalledObserver = NotificationCenter.default.addObserver(
             forName: .screenCapDaemonInstalledAndRunning,
             object: nil,
@@ -449,13 +528,17 @@ final class RecorderController: ObservableObject {
         switch await daemonService.snapshot() {
         case .noActiveSession, .unreachable:
             return
-        case .daemonOwnedSession(let startedAt):
+        case .daemonOwnedSession(let startedAt, let muted):
             // We are attaching to a pre-existing daemon-owned session we did not
             // start, so we have no started identity to bind. Clear any stale one
             // from a prior recording so the "nil startedSessionID means attach"
             // invariant that the cursor_unknown gate relies on is structural,
             // not just positional (SCR-68).
             machine.setStartedSessionID(nil)
+            // SCR-254 (R6/AE4): hydrate the CONFIRMED mute state from the snapshot
+            // so re-attaching to a live recording shows the correct mic state
+            // without waiting for a fresh toggle.
+            self.muted = muted
             apply(machine.observeActiveDaemonSession(startedAt: startedAt))
             attachDaemonEventStream()
             // The watchdog only re-checks TCC for the app process during
@@ -727,6 +810,39 @@ final class RecorderController: ObservableObject {
     // MARK: - Event / process callbacks
 
     private func handleRecorderEvent(_ event: RecorderEventLine) {
+        // SCR-254: mute is ORTHOGONAL to the recording lifecycle (idle/starting/
+        // recording/stopping), so the confirmed mute events are intercepted here
+        // rather than modelled as state-machine states. Each updates the mute
+        // surface directly; we STILL call through to the machine below (these types
+        // decode to the machine's `default` → no effects), so lifecycle handling is
+        // unchanged.
+        switch event.type {
+        case "audio_muted":
+            // Confirmed: capture actually STOPPED (KTD4).
+            muted = true
+            muteInFlight = false
+        case "audio_unmuted":
+            // Confirmed: capture actually STARTED/resumed (KTD4). The mic is now
+            // live for the remainder — including a recording that started audio-off
+            // (R2) — so reflect it in `audioEnabled`, which seeds the effective-mute
+            // display so the control reads "Mic on" after unmuting a --no-audio run.
+            muted = false
+            audioEnabled = true
+            muteInFlight = false
+        case "audio_unmute_failed":
+            // ADVISORY, NON-terminal (KTD4/R3): the engine could not acquire the
+            // mic on unmute, so the recording keeps running MUTED. Clear the pending
+            // flag, keep `muted = true`, and surface a non-terminal advisory so the
+            // failure is never silent. (Not emitted by the current engine build —
+            // handled defensively so the app is ready when the engine adds it.)
+            muteInFlight = false
+            muted = true
+            if case .recording = state {
+                captureAdvisory = Self.microphoneUnmuteFailedAdvisory
+            }
+        default:
+            break
+        }
         apply(machine.handle(event: event))
     }
 
@@ -853,6 +969,96 @@ final class RecorderController: ObservableObject {
         windowLifecycle.showHUD(for: self)
     }
 
+    // MARK: - Mute control (SCR-254)
+
+    /// Toggle the recording's microphone capture (R4/R5/R7). Daemon-only (the
+    /// CLI-fallback transport has no live control channel, KTD1) and only while a
+    /// recording is live; a no-op while a prior toggle is still in flight so a
+    /// double-tap can't dispatch two requests. Muting stops capture and needs no
+    /// permission; UNMUTING may start capture, so it is gated on the app's mic TCC
+    /// (U9). `muted` is NEVER flipped optimistically here — the confirming
+    /// `audio_muted` / `audio_unmuted` event does that, so the UI can't show a
+    /// state capture never reached (KTD4).
+    func toggleMute(source: MuteToggleSource = .hud) {
+        guard transport == .daemon, state.isRecording, !muteInFlight else { return }
+        if MuteControlPresentation.effectivelyMuted(muted: muted, audioEnabled: audioEnabled) {
+            beginUnmute(source: source)
+        } else {
+            dispatchMuteRequest(true)
+        }
+    }
+
+    /// Unmute path (U9): unmuting can turn the mic *on* (R2), so gate on the app's
+    /// own microphone TCC first. Authorized → send; undetermined → prompt, then
+    /// send on grant; denied/restricted → stay muted, surface a VISIBLE denial, and
+    /// do NOT send the verb (R3 — never silent).
+    private func beginUnmute(source: MuteToggleSource) {
+        switch micAuthorizer.authorizationStatus() {
+        case .authorized:
+            dispatchMuteRequest(false)
+        case .notDetermined:
+            Task { [weak self] in
+                guard let self else { return }
+                let granted = await self.micAuthorizer.requestAccess()
+                // The recording may have ended while the prompt was up.
+                guard self.state.isRecording else { return }
+                if granted {
+                    self.dispatchMuteRequest(false)
+                } else {
+                    self.surfaceMicUnmuteDenied(source: source)
+                }
+            }
+        case .denied, .restricted:
+            surfaceMicUnmuteDenied(source: source)
+        @unknown default:
+            surfaceMicUnmuteDenied(source: source)
+        }
+    }
+
+    /// Arm the in-flight flag and dispatch the mute-verb. The confirming event —
+    /// never the response echo — settles `muted` and clears `muteInFlight`.
+    private func dispatchMuteRequest(_ target: Bool) {
+        muteInFlight = true
+        Task { [weak self] in await self?.sendMuteRequest(target) }
+    }
+
+    private func sendMuteRequest(_ target: Bool) async {
+        do {
+            // The echo is a transport ack, not confirmation — deliberately ignored
+            // (KTD4). The confirming `audio_muted` / `audio_unmuted` event flips
+            // `muted` and clears `muteInFlight`.
+            _ = try await daemonService.setMuted(target)
+        } catch {
+            // A mute-verb failure must NOT end the recording (contrast
+            // handleDaemonOperationFailure, which idles). Clear the pending flag,
+            // keep the prior confirmed `muted`, and surface a non-terminal advisory
+            // so the mic state reads as unchanged and the user can retry.
+            muteInFlight = false
+            if case .recording = state {
+                captureAdvisory = Self.muteRequestFailedAdvisory
+            }
+        }
+    }
+
+    /// Surface a denied-mic unmute VISIBLY while staying muted (U9/R3). The HUD
+    /// pill renders no inline error and the main window is hidden during a
+    /// recording, so the modal is the one surface guaranteed visible — always
+    /// present it, and auto-reveal a hidden pill (or one the user isn't looking at,
+    /// having acted from the menu bar) so the denial has an on-screen anchor. The
+    /// advisory is set too as a persistent trace for the menu dropdown / restored
+    /// window after the modal is dismissed.
+    private func surfaceMicUnmuteDenied(source: MuteToggleSource) {
+        if case .recording = state {
+            captureAdvisory = Self.microphoneAccessDeniedAdvisory
+        }
+        if source == .menuBar || hudHidden {
+            showRecordingHUD()
+        }
+        alertPresenter.presentMicrophoneAccessDenied { [weak self] in
+            self?.permissions?.openSystemSettings(for: .microphone)
+        }
+    }
+
     private func attachDaemonEventStream() {
         daemonEventTask?.cancel()
         daemonEventTask = Task { [weak self] in
@@ -865,11 +1071,17 @@ final class RecorderController: ObservableObject {
                     clearPendingStartCursor: { [weak self] in self?.machine.clearPendingStartCursor() },
                     getStartedSessionID: { [weak self] in self?.machine.startedSessionID },
                     isRecording: { [weak self] in self?.state.isRecording ?? false },
-                    onSnapshotConfirmedActiveRecording: { [weak self] startedAt in
+                    onSnapshotConfirmedActiveRecording: { [weak self] startedAt, muted in
                         // `.starting`-only — mirrors syncDaemonSnapshot's
                         // recovery path; no-op past `.starting` so it can't
                         // regress `.recording` (clobbering elapsed) or `.stopping`.
                         guard let self else { return }
+                        // SCR-254 (R6/AE4): the snapshot is CONFIRMED state, so
+                        // re-hydrate `muted` on every reconnect regardless of the
+                        // lifecycle promotion below — a reconnect while already
+                        // `.recording` must still catch up to the daemon's mute
+                        // state if the confirming event aged out of replay.
+                        self.muted = muted
                         if case .starting = self.state {
                             // We started this session (`.starting`) but missed the
                             // `started` event (cursor-unknown recovery); treat it as

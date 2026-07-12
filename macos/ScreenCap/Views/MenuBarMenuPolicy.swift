@@ -16,6 +16,16 @@ enum MenuBarMenuPolicy {
         return false
     }
 
+    // MARK: - Mute mic item (SCR-254 U8)
+
+    /// Whether the menu-bar mute item should appear. Gated on `.recording` — it
+    /// sits beside Stop in the `.recording` block, and there is no live mic to
+    /// toggle in `.starting` / `.stopping` / `.idle`.
+    static func muteItemVisible(state: RecordingState) -> Bool {
+        if case .recording = state { return true }
+        return false
+    }
+
     // MARK: - Collapsed account section (account-sheet U5)
 
     /// The "Account…" menu item title — always present; it opens the main
@@ -46,5 +56,46 @@ enum MenuBarMenuPolicy {
                 return "Checking sign-in…"
             }
         }
+    }
+}
+
+/// Shared mute-control presentation (SCR-254 U8) — ONE grammar for the HUD pill
+/// and the menu-bar item so "Muted" never reads ambiguously as "tap to mute". The
+/// control shows the CURRENT mic status ("Mic on" / "Muted"), a transitional
+/// label while a toggle is in flight, plus the SF Symbol + VoiceOver label; both
+/// surfaces derive their affordance from here so they can never drift. Pure, so
+/// it is unit-testable and reused by `RecordingHUDModel`,
+/// `RecorderController.toggleMute`, and the menu-bar item.
+enum MuteControlPresentation {
+    /// The mic's effective OFF state for both display and toggling: explicitly
+    /// muted, OR a recording that started audio-off and has not been unmuted (its
+    /// mic is not capturing). Reading this everywhere keeps "Muted" meaning "tap to
+    /// turn the mic on" — so tapping the control on a `--no-audio` recording sends
+    /// an UNMUTE (R2), not a redundant mute.
+    static func effectivelyMuted(muted: Bool, audioEnabled: Bool) -> Bool {
+        muted || !audioEnabled
+    }
+
+    /// The status label. While a toggle is in flight it shows the DIRECTION derived
+    /// from the current confirmed state (since `muted` has not flipped yet —
+    /// confirmed-state, KTD4), never an optimistic target.
+    static func statusLabel(effectivelyMuted: Bool, inFlight: Bool) -> String {
+        if inFlight { return effectivelyMuted ? "Unmuting…" : "Muting…" }
+        return effectivelyMuted ? "Muted" : "Mic on"
+    }
+
+    /// The SF Symbol name — a slashed mic when off so the state reads at a glance,
+    /// not by label alone (the distinct-visual requirement, U8).
+    static func iconName(effectivelyMuted: Bool) -> String {
+        effectivelyMuted ? "mic.slash.fill" : "mic.fill"
+    }
+
+    /// VoiceOver label — spells out the action so "Muted" is never read as a bare
+    /// command. In-flight announces the direction under way.
+    static func accessibilityLabel(effectivelyMuted: Bool, inFlight: Bool) -> String {
+        if inFlight { return effectivelyMuted ? "Unmuting microphone" : "Muting microphone" }
+        return effectivelyMuted
+            ? "Microphone muted, tap to unmute"
+            : "Microphone on, tap to mute"
     }
 }

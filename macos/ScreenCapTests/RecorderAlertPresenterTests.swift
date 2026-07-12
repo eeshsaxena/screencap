@@ -71,6 +71,33 @@ final class RecorderAlertPresenterTests: XCTestCase {
             "Permission-lost title must not assert a revocation that did not happen (SCR-87)."
         )
     }
+
+    /// SCR-254 U9: the mic-access-denied modal must stay honest that the recording
+    /// keeps running (only the mic couldn't turn on) — it must NOT say a recording
+    /// "stopped", which would be false (R3).
+    func testMicrophoneAccessDeniedCopyKeepsRecordingRunning() {
+        let title = LiveRecorderAlertPresenter.microphoneAccessDeniedTitle
+        let body = LiveRecorderAlertPresenter.microphoneAccessDeniedBody()
+
+        XCTAssertEqual(title, "Microphone access needed")
+        XCTAssertTrue(body.contains("keeps running"), "must say the recording continues")
+        XCTAssertFalse(
+            body.lowercased().contains("stopped"),
+            "a denied unmute never stops the recording (R3)."
+        )
+    }
+
+    func testFakePresenterRecordsMicrophoneAccessDenied() {
+        let presenter = FakeRecorderAlertPresenter(
+            stopAndQuitReply: .terminateCancel, permissionLostOpensSettings: true
+        )
+        var opened = false
+
+        presenter.presentMicrophoneAccessDenied { opened = true }
+
+        XCTAssertEqual(presenter.microphoneAccessDeniedPresentedCount, 1)
+        XCTAssertTrue(opened)
+    }
 }
 
 /// Test-only stand-in. Returns a fixed reply for Cmd+Q and either invokes
@@ -81,6 +108,10 @@ final class FakeRecorderAlertPresenter: RecorderAlertPresenter {
     let permissionLostOpensSettings: Bool
     private(set) var lastPermissionPresented: String?
     private(set) var lastPermissionRequiredPresented: [String]?
+    /// SCR-254 U9: number of times the microphone-access-denied modal was
+    /// presented, so a test can assert the unmute-denied path routed to the modal
+    /// (not inline-only) for the menu-bar / HUD-hidden case.
+    private(set) var microphoneAccessDeniedPresentedCount = 0
 
     init(stopAndQuitReply: NSApplication.TerminateReply, permissionLostOpensSettings: Bool = false) {
         self.stopAndQuitReply = stopAndQuitReply
@@ -100,6 +131,13 @@ final class FakeRecorderAlertPresenter: RecorderAlertPresenter {
 
     func presentPermissionRequired(permissions: [String], openSettings: @MainActor () -> Void) {
         lastPermissionRequiredPresented = permissions
+        if permissionLostOpensSettings {
+            openSettings()
+        }
+    }
+
+    func presentMicrophoneAccessDenied(openSettings: @MainActor () -> Void) {
+        microphoneAccessDeniedPresentedCount += 1
         if permissionLostOpensSettings {
             openSettings()
         }

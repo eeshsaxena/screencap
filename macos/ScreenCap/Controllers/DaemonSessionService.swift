@@ -34,7 +34,11 @@ enum DaemonSession {
 
     enum SnapshotOutcome: Equatable {
         case noActiveSession
-        case daemonOwnedSession(startedAt: Date)
+        /// A daemon-owned recording is live. `muted` is the CONFIRMED mic-mute
+        /// state from the snapshot overlay (SCR-254 U7); the service maps a
+        /// missing field to `false` (unmuted) here so the controller hydrates a
+        /// concrete value on attach / reconnect.
+        case daemonOwnedSession(startedAt: Date, muted: Bool)
         case foreignClaimant
         case unreachable
     }
@@ -105,8 +109,10 @@ enum DaemonSession {
         /// recording during `cursor_unknown` recovery. The orchestrator
         /// decides what to do — today it promotes `.starting → .recording`
         /// and ignores the call past `.starting`. Safe to invoke on every
-        /// matching iteration.
-        let onSnapshotConfirmedActiveRecording: @MainActor (Date) -> Void
+        /// matching iteration. Carries the snapshot's CONFIRMED `muted` state
+        /// (SCR-254 U7) so the controller re-hydrates mute state on reconnect
+        /// (R6/AE4), independent of the lifecycle promotion.
+        let onSnapshotConfirmedActiveRecording: @MainActor (Date, Bool) -> Void
     }
 }
 
@@ -120,6 +126,10 @@ protocol DaemonSessionService {
     func snapshot() async -> DaemonSession.SnapshotOutcome
     func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording
     func stopRecording(force: Bool) async throws
+    /// Forward a mute/unmute request for the running recording (SCR-254 U7).
+    /// Returns the daemon's echo of the REQUESTED state — a transport ack, NOT
+    /// confirmation (the confirming event flips the controller's `muted`, KTD4).
+    func setMuted(_ muted: Bool) async throws -> Bool
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome
     func reload() async -> Result<Void, DaemonSession.ReloadError>
     func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome
@@ -157,7 +167,9 @@ final class LiveDaemonSessionService: DaemonSessionService {
             guard snap.isRecording == true else { return .noActiveSession }
             if snap.daemonOwned {
                 let started = snap.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
-                return .daemonOwnedSession(startedAt: started)
+                // Additive `muted` overlay (U7): absent → unmuted (back-compat
+                // with a stale daemon that omits it), mirroring the audio-echo rule.
+                return .daemonOwnedSession(startedAt: started, muted: snap.muted ?? false)
             } else {
                 return .foreignClaimant
             }
@@ -180,6 +192,11 @@ final class LiveDaemonSessionService: DaemonSessionService {
 
     func stopRecording(force: Bool) async throws {
         _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: force))
+    }
+
+    func setMuted(_ muted: Bool) async throws -> Bool {
+        let response = try await DaemonClient.recordingMute(RecordingMuteRequest(muted: muted))
+        return response.muted
     }
 
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome {
@@ -360,7 +377,9 @@ final class LiveDaemonSessionService: DaemonSessionService {
                 let recoveryBackoff: TimeInterval
                 if snapshotIsOurSession {
                     let startedAt = snapshot.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
-                    callbacks.onSnapshotConfirmedActiveRecording(startedAt)
+                    // Additive `muted` overlay (U7): absent → unmuted, so the
+                    // controller re-hydrates a concrete confirmed value on reconnect.
+                    callbacks.onSnapshotConfirmedActiveRecording(startedAt, snapshot.muted ?? false)
                     // Healthy snapshot is positive evidence the recording is
                     // alive — equivalent recovery signal to `sawProgress` at
                     // the bottom of the loop. Reset `consecutiveFailures` so

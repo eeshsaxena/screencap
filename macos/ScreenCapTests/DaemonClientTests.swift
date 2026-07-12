@@ -221,6 +221,30 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(response.cursor, 7)
     }
 
+    // MARK: - SCR-254: recording.mute verb
+
+    /// The mute verb frames the absolute `muted` state as a POST body and decodes
+    /// the echo + pre-forward cursor. The echo is a transport ack only — the app
+    /// ignores it and waits for the confirming event (asserted at the controller
+    /// level) — but the wire shape must still round-trip.
+    func testRecordingMuteFramesPOSTBodyAndDecodesResponse() async throws {
+        _ = try startServer { request in
+            XCTAssertEqual(request.method, "POST")
+            XCTAssertEqual(request.path, "/v0/recording.mute")
+            XCTAssertEqual(request.headers["content-type"], "application/json")
+            let body = String(data: request.body, encoding: .utf8) ?? ""
+            XCTAssertTrue(body.contains(#""muted":true"#), body)
+            return .json(
+                #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"muted":true,"cursor":12}"#
+            )
+        }
+
+        let response = try await DaemonClient.recordingMute(RecordingMuteRequest(muted: true))
+
+        XCTAssertTrue(response.muted)
+        XCTAssertEqual(response.cursor, 12)
+    }
+
     // MARK: - U8: permission.request registration verb
 
     func testPermissionRequestFramesPOSTBodyAndDecodesResponse() async throws {
