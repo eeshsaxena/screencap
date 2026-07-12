@@ -153,6 +153,17 @@ class CloudKeyMismatch(CloudCryptoError):
     """
 
 
+class CloudKeyUnavailable(CloudCryptoError):
+    """An object is encrypted but no cloud key is available in this context.
+
+    Distinct from :class:`CloudKeyMismatch` (a *wrong* key) and from a generic
+    error so a keyless Mac (SCR-253 U8 — signed in on a second Mac before the
+    KEK has synced) gets an actionable "sign in · turn on iCloud Keychain"
+    guidance signal, not a corruption-looking failure. Raised before any temp
+    file is created, so no partial plaintext is ever written.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Key lifecycle
 # ---------------------------------------------------------------------------
@@ -714,6 +725,7 @@ __all__ = [
     "MAX_FRAMES",
     "CloudCryptoError",
     "CloudKeyMismatch",
+    "CloudKeyUnavailable",
     "cloud_key_id",
     "get_cloud_kek",
     "get_or_create_cloud_kek",

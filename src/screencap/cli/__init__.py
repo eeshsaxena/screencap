@@ -2768,6 +2768,7 @@ def download(names, dest, dry_run, force, jobs):
     all_skipped = 0
     all_failed = 0
     all_bytes = 0
+    any_key_unavailable = False
 
     for i, rec in enumerate(remote, 1):
         if len(remote) > 1:
@@ -2783,6 +2784,7 @@ def download(names, dest, dry_run, force, jobs):
             all_skipped += len(result.skipped)
             all_failed += len(result.failed)
             all_bytes += result.total_bytes
+            any_key_unavailable = any_key_unavailable or result.key_unavailable
 
             if not dry_run and not result.failed and result.downloaded:
                 console.print(
@@ -2802,6 +2804,17 @@ def download(names, dest, dry_run, force, jobs):
             f"{all_skipped} skipped, {all_failed} failed "
             f"({_fmt_size(all_bytes)} total)"
         )
+        if any_key_unavailable:
+            # SCR-253 U8: a distinct, actionable exit for a keyless Mac —
+            # guidance (sign in · turn on iCloud Keychain), not a decode failure,
+            # and a non-zero exit so scripts branch on it.
+            console.print(
+                "\n[yellow]Some recordings are end-to-end encrypted and this Mac "
+                "doesn't have the key.[/yellow] Sign in with the same account and "
+                "turn on iCloud Keychain (System Settings ▸ your name ▸ iCloud) so "
+                "your key can sync from the Mac that recorded them."
+            )
+            sys.exit(1)
 
 
 @cli.command()

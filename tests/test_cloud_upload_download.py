@@ -456,3 +456,78 @@ def test_download_plaintext_shorter_than_magic(tmp_path, monkeypatch):
     dest = tmp_path / "tiny.json"
     download._download_file_with_progress("https://get", dest, _progress(), 1)
     assert dest.read_bytes() == body
+
+
+# --------------------------------------------------------------------------
+# U8 (SCR-253): a keyless Mac gets a DISTINCT key-unavailable signal, never a
+# corruption-looking failure — and never a partial file.
+# --------------------------------------------------------------------------
+
+
+def test_download_key_unavailable_raises_typed_and_leaves_no_file(
+    tmp_path, monkeypatch, no_cloud_key
+):
+    """An encrypted object with no key available raises the distinct
+    ``CloudKeyUnavailable`` (not a generic error, not an ``InvalidTag``) BEFORE
+    any temp file is created — so a second Mac without the key sees a guidance
+    signal and never a half-written plaintext."""
+    blob = b"".join(cc.encrypt_stream(io.BytesIO(b"z" * 100), KEY, 16))
+    monkeypatch.setattr(requests, "get", lambda url, stream=None, timeout=None: _GetResp(blob))
+    dest = tmp_path / "enc.mp4"
+    with pytest.raises(cc.CloudKeyUnavailable):
+        download._download_file_with_progress("https://get", dest, _progress(), 1)
+    assert not dest.exists()
+
+
+def test_download_recording_flags_key_unavailable_distinctly(
+    tmp_path, monkeypatch, no_cloud_key
+):
+    """``download_recording`` classifies a key-unavailable failure into a
+    distinct ``DownloadResult.key_unavailable`` marker (the machine-readable
+    signal a script / future in-app download branches on), keeps the file in
+    ``failed``, and leaves no partial file."""
+    blob = b"".join(cc.encrypt_stream(io.BytesIO(b"z" * 100), KEY, 16))
+    monkeypatch.setattr(download, "is_downloaded", lambda d: False)
+    monkeypatch.setattr(
+        download, "request_signed_urls", lambda name: ({"chunk_0.mp4": "https://get"}, "gs://p/")
+    )
+    monkeypatch.setattr(
+        requests, "get", lambda url, stream=True, timeout=None: _GetResp(blob)
+    )
+    result = download.download_recording("rec", tmp_path)
+    assert result.key_unavailable is True
+    assert result.failed == ["chunk_0.mp4"]
+    assert not result.downloaded
+    assert not (tmp_path / "rec" / "chunk_0.mp4").exists()  # no partial file
+
+
+def test_download_recording_no_key_unavailable_on_plaintext(tmp_path, monkeypatch):
+    """A plaintext object never trips the key-unavailable marker."""
+    body = b'{"schema_version": 1}'  # no magic
+    monkeypatch.setattr(download, "is_downloaded", lambda d: False)
+    monkeypatch.setattr(
+        download, "request_signed_urls", lambda name: ({"events.jsonl": "https://get"}, "gs://p/")
+    )
+    monkeypatch.setattr(
+        requests, "get", lambda url, stream=True, timeout=None: _GetResp(body)
+    )
+    result = download.download_recording("rec", tmp_path)
+    assert result.key_unavailable is False
+    assert result.downloaded == ["events.jsonl"]
+
+
+def test_cli_download_key_unavailable_exits_one_with_marker(tmp_path, monkeypatch):
+    """The `download` CLI surfaces the distinct key-unavailable guidance and
+    exits non-zero so a script can branch on it (never a silent success)."""
+    from click.testing import CliRunner
+
+    from screencap import download as dl
+    from screencap.cli import cli
+
+    def _fake_download_recording(name, dest, **kwargs):
+        return dl.DownloadResult(recording=name, failed=["chunk_0.mp4"], key_unavailable=True)
+
+    monkeypatch.setattr(dl, "download_recording", _fake_download_recording)
+    result = CliRunner().invoke(cli, ["download", "rec-x", "--dest", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "iCloud Keychain" in result.output
