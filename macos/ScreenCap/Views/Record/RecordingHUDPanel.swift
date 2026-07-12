@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 
 // U7 — the floating recording HUD (design 29–41): a bottom-center dark pill with
-// a pulsing amber elapsed clock, the provisional recording title, Draw/Mute stubs,
-// and a teal "Stop & save", plus the "recording to this Mac" sub-caption. It lives
+// a pulsing amber elapsed clock, the provisional recording title, a Draw stub, a
+// functional Mute control (SCR-254), Hide, and a teal "Stop & save", plus the
+// "recording to this Mac" sub-caption. It lives
 // in a separate non-activating floating `NSPanel` (KTD-4) so it survives the
 // main-window hide and floats over full-screen apps on every Space, and is marked
 // capture-excluded (`sharingType = .none`).
@@ -15,6 +16,11 @@ struct RecordingHUDModel: Equatable {
     let elapsed: TimeInterval
     let title: String
     let audioEnabled: Bool
+    /// SCR-254 (U8): the confirmed live mute state + pending flag driving the Mute
+    /// control's status/icon/a11y. Default so pre-mute call sites and tests that
+    /// only care about elapsed/title/footer stay terse.
+    var muted: Bool = false
+    var muteInFlight: Bool = false
 
     /// KTD-9: the design's "recording to this Mac · encrypted" drops "· encrypted"
     /// (no encryption exists until SCR-220).
@@ -43,6 +49,27 @@ struct RecordingHUDModel: Equatable {
     var titleAccessibilityLabel: String { "Recording \(title)" }
     var stopAccessibilityLabel: String { "Stop and save recording" }
     var hideAccessibilityLabel: String { "Hide recording controls" }
+
+    // MARK: - Mute control (SCR-254 U8) — derived from the shared grammar so the
+    // HUD pill and the menu-bar item can never drift.
+
+    /// The mic's effective OFF state: explicitly muted, or a recording that started
+    /// audio-off and has not been unmuted (its mic isn't capturing).
+    var micEffectivelyMuted: Bool {
+        MuteControlPresentation.effectivelyMuted(muted: muted, audioEnabled: audioEnabled)
+    }
+    /// The status label — "Mic on" / "Muted", or "Muting…" / "Unmuting…" in flight.
+    var micStatusLabel: String {
+        MuteControlPresentation.statusLabel(effectivelyMuted: micEffectivelyMuted, inFlight: muteInFlight)
+    }
+    /// The SF Symbol — a slashed mic when off.
+    var micIconName: String {
+        MuteControlPresentation.iconName(effectivelyMuted: micEffectivelyMuted)
+    }
+    /// VoiceOver label spelling out the toggle action.
+    var micAccessibilityLabel: String {
+        MuteControlPresentation.accessibilityLabel(effectivelyMuted: micEffectivelyMuted, inFlight: muteInFlight)
+    }
 }
 
 /// The SwiftUI HUD content, bound to the live recorder for elapsed / title / audio.
@@ -53,7 +80,9 @@ struct RecordingHUDView: View {
         RecordingHUDModel(
             elapsed: recorder.state.elapsed,
             title: recorder.currentRecordingName ?? "Recording",
-            audioEnabled: recorder.audioEnabled
+            audioEnabled: recorder.audioEnabled,
+            muted: recorder.muted,
+            muteInFlight: recorder.muteInFlight
         )
     }
 
@@ -77,7 +106,7 @@ struct RecordingHUDView: View {
             titleChip
             divider
             stub("Draw", ticket: "SCR-217")
-            stub(model.audioEnabled ? "Mute" : "Muted", ticket: "SCR-218")
+            muteButton
             hideButton
             divider
             stopButton
@@ -129,8 +158,8 @@ struct RecordingHUDView: View {
             .accessibilityHidden(true)
     }
 
-    /// A disabled HUD control stub (Draw SCR-217 / Mute SCR-218), rendered per the
-    /// design but non-functional (KTD-8).
+    /// A disabled HUD control stub (Draw SCR-217), rendered per the design but
+    /// non-functional (KTD-8).
     private func stub(_ label: String, ticket: String) -> some View {
         Text(label)
             .font(SCTypography.sans(size: 13))
@@ -139,6 +168,33 @@ struct RecordingHUDView: View {
             .padding(.vertical, 8)
             .help("Coming soon — \(ticket)")
             .accessibilityLabel("\(label), coming soon")
+    }
+
+    /// The functional Mute control (SCR-254 U8). The muted state gets a DISTINCT
+    /// visual — a filled rust pill + `mic.slash.fill` — so the mic being off reads
+    /// at a glance, not by label alone. While a toggle is in flight it shows a
+    /// transitional "Muting…"/"Unmuting…" and disables, so the control never shows
+    /// an optimistic target state before capture actually changed (KTD4).
+    private var muteButton: some View {
+        Button {
+            recorder.toggleMute(source: .hud)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: model.micIconName)
+                Text(model.micStatusLabel)
+            }
+            .font(SCTypography.sans(size: 13))
+            .foregroundStyle(model.micEffectivelyMuted ? Color.scPaper : Color.scHUDMuted)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(model.micEffectivelyMuted ? Color.scRust : Color.clear, in: Capsule())
+            .opacity(model.muteInFlight ? 0.6 : 1)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.muteInFlight)
+        .help(model.micEffectivelyMuted ? "Turn the microphone on" : "Mute the microphone")
+        .accessibilityLabel(model.micAccessibilityLabel)
     }
 
     private var stopButton: some View {

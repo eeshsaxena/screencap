@@ -105,9 +105,10 @@ the previous release first; completion marker absent.
 - [ ] HUD follows across Spaces and over a full-screen app.
 - [ ] The HUD does **not** appear in its own recording (capture-excluded),
       and the footer reads "recording to this Mac" with no encryption claim.
-- [ ] HUD Draw + Mute render disabled with SCR-217 / SCR-218 tooltips; Stop
-      ends the recording; the main window restores on Library with the fresh
-      card in `processing` → `ready` state.
+- [ ] HUD Draw renders disabled with the SCR-217 tooltip; the **Mute** control is
+      functional (SCR-254, see the Mute section below); Stop ends the recording;
+      the main window restores on Library with the fresh card in `processing` →
+      `ready` state.
 - [ ] Menu bar during recording: icon swaps, Stop Recording (⌘⇧S) works;
       menu-bar Start (⌘⇧R, idle) starts with the sheet's defaults (flip
       `audio_default` off via
@@ -123,8 +124,8 @@ the previous release first; completion marker absent.
 Run these with a *second app focused* (e.g. a browser) so the global paths are
 genuinely exercised — a window-scoped shortcut would pass this only by accident.
 
-- [ ] Pill shows a plain **"Hide"** button beside Draw and Mute (not a chevron
-      icon); clicking it dismisses the pill and the recording continues.
+- [ ] Pill shows a plain **"Hide"** button beside Draw and the Mute control (not a
+      chevron icon); clicking it dismisses the pill and the recording continues.
 - [ ] With focus in the recorded app, **⌘⇧H** hides the pill; **⌘⇧H** again
       restores it bottom-center. The elapsed timer keeps advancing throughout.
 - [ ] With **no** recording active, ⌘⇧H does nothing in ScreenCap and reaches
@@ -149,6 +150,45 @@ genuinely exercised — a window-scoped shortcut would pass this only by acciden
 - [ ] **⌘⇧H collision:** register ⌘⇧H in another app first, start a recording →
       ScreenCap logs the registration failure and the menu-bar "Show recording
       controls" item still restores the pill (graceful degradation, no dead hotkey).
+
+### 4b. Mid-recording mic mute (SCR-254 / SCR-218)
+
+Requires the **daemon transport** (mute is daemon-only; the CLI-fallback pill/menu
+mute control is inert). Rebuild the embedded daemon (PyInstaller) so it carries the
+`recording.mute` verb before testing.
+
+- [ ] Start an **audio-on** recording (mic granted). The HUD pill shows **"Mic on"**
+      with a `mic.fill` icon. Speak, then click Mute → briefly **"Muting…"**
+      (disabled), then a filled **rust "Muted"** pill with `mic.slash.fill` **only
+      after** capture actually stops (never optimistically before). Speak again,
+      click to unmute → **"Unmuting…"** → **"Mic on"**.
+- [ ] **No audio on disk for the muted span:** inspect the recording's audio /
+      transcript — the muted interval holds no speech and shows a `[microphone
+      muted]` marker (transcript check is U6).
+- [ ] **Menu-bar item:** the menu shows a state-reflecting mic item beside Stop
+      with the SAME grammar ("Mic on" / "Muted"); toggling from the menu bar moves
+      both surfaces in lockstep (one shared state, R7). The item is absent when not
+      recording.
+- [ ] **Unmute a `--no-audio` recording (R2):** start with mic off (flip
+      `audio_default` off or use the sheet). The control reads **"Muted"**; click it
+      → with mic permission granted the mic turns on and it reads **"Mic on"**.
+- [ ] **Unmute permission — undetermined (AE2):** on a machine where mic TCC is
+      undetermined, unmute triggers the standard macOS mic prompt; on grant, capture
+      starts and the control reads "Mic on".
+- [ ] **Unmute permission — denied (AE3, R3):** with mic access denied, unmute shows
+      a **visible** "Microphone access needed" modal (Open System Settings), the
+      recording keeps running **muted**, and it is never a silent no-op. Verify this
+      **from the menu bar with the HUD hidden** too — the modal appears (and the pill
+      is auto-revealed), not an invisible inline-only error.
+- [ ] **Verb failure is non-terminal:** if the mute request can't reach the daemon,
+      the recording keeps running and an advisory (menu dropdown) says the mic state
+      is unchanged — the recording is **not** torn down.
+- [ ] **Reconnect preserves state (AE4):** mute, then drop/restore the events
+      subscription (e.g. `launchctl kickstart` the daemon is too heavy — instead
+      briefly lose contact) → after re-attach the pill/menu still show "Muted"
+      without a re-toggle.
+- [ ] **VoiceOver:** the Mute control reads "Microphone on, tap to mute" /
+      "Microphone muted, tap to unmute" (never a bare "Muted").
 
 ## 5. TCC quit-relaunch loop (permission loss + recovery)
 

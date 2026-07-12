@@ -36,6 +36,30 @@ MUTED_MARKER_TEXT = "[microphone muted]"
 _DEFAULT_GUARD_S = 0.35
 
 
+def _merge_overlapping(
+    intervals: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Coalesce overlapping / touching muted intervals (SCR-254 polish).
+
+    Defensive: a double-open (two mutes without an intervening unmute, or a crash
+    that left a stray open interval) would otherwise emit two overlapping
+    ``[microphone muted]`` markers. Merging first guarantees one marker per
+    contiguous muted region. ``_unmuted_spans`` already tolerates overlaps, so
+    this only changes the emitted markers, never the compressed timeline.
+    """
+    if not intervals:
+        return []
+    ordered = sorted(intervals)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:  # overlapping or adjacent
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _unmuted_spans(
     intervals: list[tuple[float, float]], duration: float
 ) -> list[tuple[float, float]]:
@@ -99,6 +123,9 @@ def apply_muted_intervals_to_segments(
 
     if not rel:
         return segments, _join_text(segments)
+
+    # Coalesce overlaps so a defensive double-open yields one marker, not two.
+    rel = _merge_overlapping(rel)
 
     spans = _unmuted_spans(rel, duration)
 

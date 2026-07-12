@@ -103,6 +103,43 @@ final class RecorderControllerDaemonTests: XCTestCase {
         }
         XCTAssertGreaterThan(elapsed, 5)
         XCTAssertNil(recorder.lastError)
+        // SCR-254: this snapshot omits the additive `muted` field, so the decode
+        // defaults it to unmuted (the stale-daemon back-compat rule).
+        XCTAssertFalse(recorder.muted)
+    }
+
+    /// SCR-254 (R6/AE4): a snapshot carrying `muted:true` hydrates the controller's
+    /// confirmed mute state on attach, over the real socket (so the additive-field
+    /// decode + `?? false` mapping is exercised end-to-end).
+    func testDaemonSnapshotMutedFieldHydratesMutedOnAttach() async throws {
+        let startedAt = Date().addingTimeInterval(-8).timeIntervalSince1970
+        _ = try startServer { request in
+            switch request.path {
+            case "/v0/daemon.info":
+                return .json(#"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"build":null,"started_at":1.0}"#)
+            case "/v0/session.snapshot":
+                return .json(
+                    #"{"ok":true,"schema_version":1,"daemon_version":"test","api_schema_version":1,"is_recording":true,"daemon_owned":true,"recording_name":"muted-rec","started_at":"# +
+                    "\(startedAt)" +
+                    #","claimant":"daemon","recovering":false,"cursor":9,"muted":true}"#
+                )
+            case "/v0/events?since=9":
+                return .chunked([
+                    #"{"type":"subscribed","schema_version":1,"cursor":9,"ts":13.0}"# + "\n",
+                ], terminate: false)
+            default:
+                XCTFail("Unexpected request path \(request.path)")
+                return .json(#"{"ok":false,"schema_version":1,"daemon_version":"test","api_schema_version":1,"error":"unexpected"}"#, status: 500)
+            }
+        }
+
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.probeDaemon()
+
+        XCTAssertEqual(recorder.transport, .daemon)
+        XCTAssertTrue(recorder.state.isRecording)
+        XCTAssertTrue(recorder.muted, "snapshot muted:true must hydrate the confirmed mute state")
     }
 
     // MARK: - U4: daemon start-block (Screen Recording only)

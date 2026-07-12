@@ -40,6 +40,10 @@ struct MenuBarMenu: View {
         } else if case .recording = recorder.state {
             Button("Stop Recording") { recorder.stop() }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
+            // SCR-254 (R5): live mic toggle beside Stop — the operator is rarely
+            // looking at the bottom-center pill mid-recording, so the menu bar is
+            // the second control surface. Same shared grammar as the HUD pill.
+            muteMenuItem
             // Restore the HUD pill after the user hid it from the pill itself.
             // Gated so it only shows while the pill is actually hidden.
             if MenuBarMenuPolicy.showRecordingControlsVisible(
@@ -130,6 +134,31 @@ struct MenuBarMenu: View {
         Button(MenuBarMenuPolicy.accountItemTitle) {
             openMainWindow()
             NotificationCenter.default.post(name: .screenCapOpenAccountPane, object: nil)
+        }
+    }
+
+    /// The state-reflecting mute item (SCR-254 U8/R5). Reuses the shared
+    /// `MuteControlPresentation` grammar so it reads identically to the HUD pill
+    /// ("Mic on" / "Muted", "Muting…"/"Unmuting…" in flight), disabling while a
+    /// toggle is in flight. Sourced as `.menuBar` so a permission-denied unmute
+    /// routes to the modal / auto-reveal path (the user isn't looking at the pill).
+    @ViewBuilder
+    private var muteMenuItem: some View {
+        if MenuBarMenuPolicy.muteItemVisible(state: recorder.state) {
+            let effectivelyMuted = MuteControlPresentation.effectivelyMuted(
+                muted: recorder.muted, audioEnabled: recorder.audioEnabled
+            )
+            Button {
+                recorder.toggleMute(source: .menuBar)
+            } label: {
+                Label(
+                    MuteControlPresentation.statusLabel(
+                        effectivelyMuted: effectivelyMuted, inFlight: recorder.muteInFlight
+                    ),
+                    systemImage: MuteControlPresentation.iconName(effectivelyMuted: effectivelyMuted)
+                )
+            }
+            .disabled(recorder.muteInFlight)
         }
     }
 

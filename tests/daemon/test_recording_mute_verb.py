@@ -13,7 +13,6 @@ import json
 import signal
 import subprocess
 import sys
-import textwrap
 import time
 from pathlib import Path
 
@@ -21,68 +20,6 @@ import httpx
 import pytest
 
 from .conftest import short_socket_path, wait_for_socket
-
-
-@pytest.fixture
-def stdin_aware_engine_script(tmp_path: Path) -> Path:
-    """A fake engine that reads its stdin control channel and records every
-    set_muted command it receives to a log file, then emits the confirmed
-    audio_muted/audio_unmuted event (so the U1->U4 forward is observable)."""
-    script = tmp_path / "stdin_engine.py"
-    script.write_text(
-        textwrap.dedent(
-            """
-            from __future__ import annotations
-
-            import base64
-            import json
-            import os
-            import signal
-            import sys
-            import threading
-            import time
-
-            args = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
-            name = args.get("name") or "fake"
-            log_path = os.environ["SCREENCAP_MUTE_LOG"]
-
-
-            def emit(event_type, **payload):
-                sys.stderr.write(
-                    json.dumps({"type": event_type, "schema_version": 1,
-                                "ts": time.time(), **payload}) + "\\n")
-                sys.stderr.flush()
-
-
-            def read_stdin():
-                for line in sys.stdin:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    cmd = json.loads(line)
-                    if cmd.get("type") == "set_muted":
-                        with open(log_path, "a") as fh:
-                            fh.write(json.dumps(cmd) + "\\n")
-                        emit("audio_muted" if cmd["muted"] else "audio_unmuted",
-                             muted=cmd["muted"])
-
-
-            def handle_term(_s, _f):
-                emit("recording_finalized", name=name, duration_seconds=0.2,
-                     force_stopped=False, disk_full=False)
-                raise SystemExit(0)
-
-
-            signal.signal(signal.SIGTERM, handle_term)
-            threading.Thread(target=read_stdin, daemon=True).start()
-            emit("started", claimant="daemon")
-            while True:
-                time.sleep(0.05)
-            """
-        ),
-        encoding="utf-8",
-    )
-    return script
 
 
 def _daemon_env(tmp_path: Path, engine_script: Path, mute_log: Path) -> dict[str, str]:
@@ -135,10 +72,10 @@ def _stop(proc: subprocess.Popen) -> None:
 
 @pytest.mark.asyncio
 async def test_recording_mute_forwards_to_engine_and_echoes(
-    tmp_path: Path, stdin_aware_engine_script: Path
+    tmp_path: Path, stdin_confirming_engine_script: Path
 ) -> None:
     mute_log = tmp_path / "mute_commands.log"
-    proc, socket_path = _serve(tmp_path, stdin_aware_engine_script, mute_log)
+    proc, socket_path = _serve(tmp_path, stdin_confirming_engine_script, mute_log)
     try:
         async with _client(socket_path) as client:
             start = await client.post(
@@ -167,10 +104,10 @@ async def test_recording_mute_forwards_to_engine_and_echoes(
 
 @pytest.mark.asyncio
 async def test_recording_mute_when_not_recording_returns_not_recording(
-    tmp_path: Path, stdin_aware_engine_script: Path
+    tmp_path: Path, stdin_confirming_engine_script: Path
 ) -> None:
     mute_log = tmp_path / "mute_commands.log"
-    proc, socket_path = _serve(tmp_path, stdin_aware_engine_script, mute_log)
+    proc, socket_path = _serve(tmp_path, stdin_confirming_engine_script, mute_log)
     try:
         async with _client(socket_path) as client:
             resp = await client.post("/v0/recording.mute", json={"muted": True})
@@ -182,10 +119,10 @@ async def test_recording_mute_when_not_recording_returns_not_recording(
 
 @pytest.mark.asyncio
 async def test_recording_mute_rejects_malformed_body(
-    tmp_path: Path, stdin_aware_engine_script: Path
+    tmp_path: Path, stdin_confirming_engine_script: Path
 ) -> None:
     mute_log = tmp_path / "mute_commands.log"
-    proc, socket_path = _serve(tmp_path, stdin_aware_engine_script, mute_log)
+    proc, socket_path = _serve(tmp_path, stdin_confirming_engine_script, mute_log)
     try:
         async with _client(socket_path) as client:
             await client.post(

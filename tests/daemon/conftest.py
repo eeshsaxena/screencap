@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -187,3 +188,71 @@ def uds_client_factory(daemon_socket_path: Path) -> Callable[[], httpx.AsyncClie
         return httpx.AsyncClient(transport=transport, base_url="http://screencap")
 
     return factory
+
+
+@pytest.fixture
+def stdin_confirming_engine_script(tmp_path: Path) -> Path:
+    """A fake engine (spawned via ``SCREENCAP_DAEMON_ENGINE_COMMAND``) that reads
+    its stdin control channel and, on each ``set_muted`` command, emits the
+    CONFIRMED ``audio_muted`` / ``audio_unmuted`` event — so the U1→U4→U5 forward
+    is observable end-to-end. If ``SCREENCAP_MUTE_LOG`` is set it also appends
+    each received command to that file, so a test can assert exactly what the
+    daemon forwarded. Shared by the ``recording.mute`` verb (U4) and
+    snapshot-muted (U5) tests (SCR-254 polish: was duplicated in both)."""
+    script = tmp_path / "stdin_confirming_engine.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            import base64
+            import json
+            import os
+            import signal
+            import sys
+            import threading
+            import time
+
+            args = json.loads(base64.b64decode(sys.argv[1]).decode("utf-8"))
+            name = args.get("name") or "fake"
+            log_path = os.environ.get("SCREENCAP_MUTE_LOG")
+
+
+            def emit(event_type, **payload):
+                sys.stderr.write(
+                    json.dumps({"type": event_type, "schema_version": 1,
+                                "ts": time.time(), **payload}) + "\\n")
+                sys.stderr.flush()
+
+
+            def read_stdin():
+                for line in sys.stdin:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    cmd = json.loads(line)
+                    if cmd.get("type") == "set_muted":
+                        if log_path:
+                            with open(log_path, "a") as fh:
+                                fh.write(json.dumps(cmd) + "\\n")
+                        # Confirmed event fires only after the "real toggle".
+                        emit("audio_muted" if cmd["muted"] else "audio_unmuted",
+                             muted=cmd["muted"])
+
+
+            def handle_term(_s, _f):
+                emit("recording_finalized", name=name, duration_seconds=0.2,
+                     force_stopped=False, disk_full=False)
+                raise SystemExit(0)
+
+
+            signal.signal(signal.SIGTERM, handle_term)
+            threading.Thread(target=read_stdin, daemon=True).start()
+            emit("started", claimant="daemon")
+            while True:
+                time.sleep(0.05)
+            """
+        ),
+        encoding="utf-8",
+    )
+    return script

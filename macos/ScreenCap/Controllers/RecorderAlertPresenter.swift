@@ -24,6 +24,15 @@ protocol RecorderAlertPresenter {
     /// not say a recording "stopped". Invokes `openSettings` on **Open System
     /// Settings**. `permissions` lists the missing permission display names.
     func presentPermissionRequired(permissions: [String], openSettings: @MainActor () -> Void)
+
+    /// Shows the "microphone access denied" alert for a failed UNMUTE (SCR-254 U9).
+    /// Distinct from both alerts above: the recording keeps running (nothing
+    /// "stopped", nothing is blocked from "starting") — only the mic could not be
+    /// turned on, so it stays muted. The one surface guaranteed visible during a
+    /// recording (the HUD pill shows no inline error, the main window is hidden), so
+    /// the menu-bar / HUD-hidden denial routes here (R3, never silent). Invokes
+    /// `openSettings` on **Open System Settings**.
+    func presentMicrophoneAccessDenied(openSettings: @MainActor () -> Void)
 }
 
 /// Live implementation. Produces the same wording and button order as the
@@ -90,6 +99,29 @@ final class LiveRecorderAlertPresenter: RecorderAlertPresenter {
         alert.messageText = "Permission required"
         alert.informativeText =
             "ScreenCap can't start recording until \(names) is granted in System Settings."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Dismiss")
+        if alert.runModal() == .alertFirstButtonReturn {
+            openSettings()
+        }
+    }
+
+    /// Title for the microphone-access-denied modal (SCR-254 U9). Extracted as a
+    /// pure static so a test can pin the wording without driving `runModal()`.
+    static let microphoneAccessDeniedTitle = "Microphone access needed"
+
+    /// Body for the microphone-access-denied modal. Must stay honest that the
+    /// recording is still running (only muted) — a denied unmute never stops the
+    /// recording (R3), so the copy must not imply it did.
+    static func microphoneAccessDeniedBody() -> String {
+        "ScreenCap can't turn the microphone on because microphone access is denied. "
+            + "Enable it in System Settings; the recording keeps running, muted."
+    }
+
+    func presentMicrophoneAccessDenied(openSettings: @MainActor () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = Self.microphoneAccessDeniedTitle
+        alert.informativeText = Self.microphoneAccessDeniedBody()
         alert.addButton(withTitle: "Open System Settings")
         alert.addButton(withTitle: "Dismiss")
         if alert.runModal() == .alertFirstButtonReturn {

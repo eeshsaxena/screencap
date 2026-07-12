@@ -83,4 +83,71 @@ final class MenuBarMenuPolicyTests: XCTestCase {
     func testAccountItemTitle() {
         XCTAssertEqual(MenuBarMenuPolicy.accountItemTitle, "Account…")
     }
+
+    // MARK: - Mute mic item (SCR-254 U8)
+
+    /// The menu-bar mute item appears only while a recording is live — there is no
+    /// live mic to toggle in `.starting` / `.stopping` / `.idle`.
+    func testMuteItemVisibleOnlyWhileRecording() {
+        XCTAssertTrue(MenuBarMenuPolicy.muteItemVisible(state: .recording(elapsed: 3)))
+        let hidden: [RecordingState] = [
+            .idle, .starting, .stopping(quitting: false), .stopping(quitting: true),
+        ]
+        for state in hidden {
+            XCTAssertFalse(
+                MenuBarMenuPolicy.muteItemVisible(state: state),
+                "no live mic to toggle in \(state)"
+            )
+        }
+    }
+
+    // MARK: - Shared mute-control grammar (SCR-254 U8)
+
+    /// Effective-muted folds in the audio-off case so "Muted" always means "tap to
+    /// turn the mic on" (the toggle and both surfaces read this).
+    func testMuteControlEffectivelyMuted() {
+        XCTAssertFalse(MuteControlPresentation.effectivelyMuted(muted: false, audioEnabled: true))
+        XCTAssertTrue(MuteControlPresentation.effectivelyMuted(muted: true, audioEnabled: true))
+        // Started audio-off, never unmuted → effectively muted.
+        XCTAssertTrue(MuteControlPresentation.effectivelyMuted(muted: false, audioEnabled: false))
+    }
+
+    /// ONE grammar for both surfaces: status labels, transitional direction, and
+    /// the slashed-vs-plain glyph.
+    func testMuteControlLabelsAndIconPerState() {
+        XCTAssertEqual(
+            MuteControlPresentation.statusLabel(effectivelyMuted: false, inFlight: false), "Mic on"
+        )
+        XCTAssertEqual(
+            MuteControlPresentation.statusLabel(effectivelyMuted: true, inFlight: false), "Muted"
+        )
+        XCTAssertEqual(
+            MuteControlPresentation.statusLabel(effectivelyMuted: false, inFlight: true), "Muting…"
+        )
+        XCTAssertEqual(
+            MuteControlPresentation.statusLabel(effectivelyMuted: true, inFlight: true), "Unmuting…"
+        )
+        XCTAssertEqual(MuteControlPresentation.iconName(effectivelyMuted: false), "mic.fill")
+        XCTAssertEqual(MuteControlPresentation.iconName(effectivelyMuted: true), "mic.slash.fill")
+    }
+
+    /// VoiceOver labels spell out the action so "Muted" isn't read as a command.
+    func testMuteControlAccessibilityLabels() {
+        XCTAssertEqual(
+            MuteControlPresentation.accessibilityLabel(effectivelyMuted: false, inFlight: false),
+            "Microphone on, tap to mute"
+        )
+        XCTAssertEqual(
+            MuteControlPresentation.accessibilityLabel(effectivelyMuted: true, inFlight: false),
+            "Microphone muted, tap to unmute"
+        )
+        XCTAssertEqual(
+            MuteControlPresentation.accessibilityLabel(effectivelyMuted: false, inFlight: true),
+            "Muting microphone"
+        )
+        XCTAssertEqual(
+            MuteControlPresentation.accessibilityLabel(effectivelyMuted: true, inFlight: true),
+            "Unmuting microphone"
+        )
+    }
 }

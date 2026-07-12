@@ -211,6 +211,12 @@ struct SessionSnapshotResponse: Decodable {
     let enginePID: Int?
     let framesWritten: Int?
     let cursor: Int
+    /// SCR-254 (U7): the recording's CONFIRMED mic-mute state. Additive — absent
+    /// until the first confirmed `audio_muted` / `audio_unmuted` event, so an
+    /// unmuted (or pre-first-mute) recording and a stale daemon both omit it. The
+    /// controller maps a missing value to `false` (unmuted), mirroring the
+    /// additive `audio`-echo back-compat rule on `RecordingStartResponse`.
+    let muted: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -228,6 +234,7 @@ struct SessionSnapshotResponse: Decodable {
         case enginePID = "engine_pid"
         case framesWritten = "frames_written"
         case cursor
+        case muted
     }
 }
 
@@ -319,6 +326,46 @@ struct RecordingStopResponse: Decodable {
         case apiSchemaVersion = "api_schema_version"
         case stopped
         case finalState = "final_state"
+    }
+}
+
+/// Body for the mid-recording mic-mute verb (SCR-254 U7). `muted` is the
+/// ABSOLUTE desired state (true = muted), not a toggle, so a dropped/retried
+/// request can never desync app vs engine (mirrors the daemon's
+/// `RecordingMuteRequest`).
+struct RecordingMuteRequest: Encodable {
+    let muted: Bool
+
+    init(muted: Bool) {
+        self.muted = muted
+    }
+}
+
+struct RecordingMuteResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    /// ECHO of the REQUESTED state for transport bookkeeping only. The app must
+    /// NOT treat this as confirmation — confirmed mute state arrives on the
+    /// events stream / snapshot after the engine actually stops/starts capture
+    /// (KTD4). `RecorderController.toggleMute` deliberately ignores it.
+    let muted: Bool
+    /// Bus cursor captured BEFORE the command was forwarded, so a fresh
+    /// subscriber could `/v0/events?since=<cursor>` without missing the
+    /// confirming `audio_muted` / `audio_unmuted` event. The app already holds a
+    /// persistent `/v0/events` subscription (`consumeEventStream`) that catches
+    /// the confirming event, so it does not re-subscribe from this cursor;
+    /// decoded for completeness / diagnostics.
+    let cursor: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case muted
+        case cursor
     }
 }
 
@@ -764,6 +811,17 @@ enum DaemonClient {
             body: body,
             timeout: 35
         )
+    }
+
+    /// Set the mic-mute state on the running recording (SCR-254 U7). Forwards to
+    /// the engine over the daemon's stdin control channel; the response echoes the
+    /// REQUESTED state (not confirmation — see `RecordingMuteResponse.muted`) plus
+    /// the pre-forward bus cursor. Uses the default 10 s budget: the daemon only
+    /// forwards one control line (it does not await the engine's stop), so this is
+    /// a fast round-trip unlike `recordingStop`.
+    static func recordingMute(_ req: RecordingMuteRequest) async throws -> RecordingMuteResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/recording.mute", body: body)
     }
 
     /// On-demand daemon-driven TCC registration (U8). The daemon runs the

@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import ScreenCap
 
@@ -919,6 +920,202 @@ final class RecorderControllerTests: XCTestCase {
         await recorder._testCancelDaemonTask()
     }
 
+    // MARK: - Mid-recording mic mute (SCR-254 U7)
+
+    /// `toggleMute()` from an unmuted recording arms `muteInFlight` and dispatches
+    /// the mute verb, but `muted` stays false until the confirming event — never
+    /// flipped from the request/echo (KTD4).
+    func testToggleMuteSetsInFlightAndSendsRequestWithoutFlippingMuted() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+
+        recorder.toggleMute()
+
+        XCTAssertTrue(recorder.muteInFlight, "the mute path arms the pending flag synchronously")
+        XCTAssertFalse(recorder.muted, "muted must not flip from the request")
+        await waitUntil { daemon.setMutedCalled }
+        XCTAssertEqual(daemon.capturedMuted, true, "an unmuted recording mutes")
+        XCTAssertFalse(recorder.muted, "still not flipped after the verb returns (echo ignored)")
+        XCTAssertTrue(recorder.muteInFlight, "stays in-flight until the confirming event")
+    }
+
+    /// The confirmed `audio_muted` event flips `muted` and clears `muteInFlight`.
+    func testAudioMutedEventFlipsMutedAndClearsInFlight() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder.toggleMute()
+        await waitUntil { daemon.setMutedCalled }
+        XCTAssertTrue(recorder.muteInFlight)
+
+        recorder._testHandleStderrLine(#"{"type":"audio_muted","schema_version":1,"muted":true}"#)
+
+        XCTAssertTrue(recorder.muted, "the confirmed event flips muted")
+        XCTAssertFalse(recorder.muteInFlight, "and clears the pending flag")
+    }
+
+    /// A mute-verb failure must NOT tear down the recording (contrast
+    /// `handleDaemonOperationFailure`, which idles). It reverts to the prior
+    /// confirmed `muted`, clears the pending flag, and surfaces a non-terminal
+    /// advisory — no `lastError`, still recording.
+    func testMuteVerbFailureKeepsRecordingRevertsAndSetsAdvisory() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        daemon.setMutedError = DaemonClientError.socketUnavailable(path: "/tmp/x.sock")
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+
+        recorder.toggleMute()
+
+        await waitUntil { recorder.captureAdvisory != nil }
+        XCTAssertTrue(recorder.state.isRecording, "a mute-verb failure must not end the recording")
+        XCTAssertFalse(recorder.muted, "muted reverts to its prior confirmed value")
+        XCTAssertFalse(recorder.muteInFlight, "the pending flag is cleared on failure")
+        XCTAssertEqual(recorder.captureAdvisory, RecorderController.muteRequestFailedAdvisory)
+        XCTAssertNil(recorder.lastError, "the failure is advisory, not terminal")
+    }
+
+    /// Mute is daemon-only (KTD1): on the CLI-fallback transport `toggleMute()` is
+    /// a no-op — no verb dispatched, no in-flight state.
+    func testToggleMuteBlockedOnCLIFallbackTransport() {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.cliFallback)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+
+        recorder.toggleMute()
+
+        XCTAssertFalse(daemon.setMutedCalled, "CLI-fallback has no live control channel")
+        XCTAssertFalse(recorder.muteInFlight)
+        XCTAssertFalse(recorder.muted)
+    }
+
+    /// Attaching to a muted daemon recording hydrates `muted` from the snapshot
+    /// overlay so the surfaces show the correct state without a re-toggle (AE4).
+    func testSnapshotMutedTrueHydratesMutedOnAttach() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        daemon.snapshotResult = .daemonOwnedSession(startedAt: Date(), muted: true)
+        let recorder = RecorderController(daemonService: daemon)
+
+        await recorder.probeDaemon()
+
+        XCTAssertTrue(recorder.muted, "snapshot muted:true hydrates muted on attach")
+        await recorder._testCancelDaemonTask()
+    }
+
+    /// A snapshot without the additive `muted` field (mapped to false by the
+    /// service) leaves the recording unmuted — the stale-daemon back-compat rule.
+    func testSnapshotWithoutMutedFieldLeavesUnmuted() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        daemon.snapshotResult = .daemonOwnedSession(startedAt: Date(), muted: false)
+        let recorder = RecorderController(daemonService: daemon)
+
+        await recorder.probeDaemon()
+
+        XCTAssertFalse(recorder.muted, "a missing muted field defaults to unmuted")
+        await recorder._testCancelDaemonTask()
+    }
+
+    // MARK: - Unmute permission UX (SCR-254 U9)
+
+    /// A muted recording + a live mic-mute state; used to drive the unmute branch.
+    private func makeMutedDaemonRecording(
+        mic: MicAuthorizing,
+        alerts: RecorderAlertPresenter = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateCancel),
+        daemon: CapturingDaemonSessionService
+    ) -> RecorderController {
+        let recorder = RecorderController(
+            alertPresenter: alerts, daemonService: daemon, micAuthorizer: mic
+        )
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        // Confirmed muted, so the next toggle is an UNMUTE that hits the U9 gate.
+        recorder._testHandleStderrLine(#"{"type":"audio_muted","schema_version":1,"muted":true}"#)
+        return recorder
+    }
+
+    /// Unmute with the mic already authorized sends `setMuted(false)` (AE2 grant).
+    func testUnmuteWithAuthorizedMicSendsVerb() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let recorder = makeMutedDaemonRecording(
+            mic: FakeMicAuthorizer(status: .authorized), daemon: daemon
+        )
+
+        recorder.toggleMute()
+
+        await waitUntil { daemon.setMutedCalled }
+        XCTAssertEqual(daemon.capturedMuted, false, "authorized unmute sends setMuted(false)")
+    }
+
+    /// Undetermined mic prompts, and on grant sends the unmute (AE2).
+    func testUnmuteUndeterminedPromptsThenSendsOnGrant() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let mic = FakeMicAuthorizer(status: .notDetermined, requestAccessResult: true)
+        let recorder = makeMutedDaemonRecording(mic: mic, daemon: daemon)
+
+        recorder.toggleMute()
+
+        await waitUntil { mic.requestAccessCalled && daemon.setMutedCalled }
+        XCTAssertEqual(daemon.capturedMuted, false, "unmute is sent once the prompt is granted")
+    }
+
+    /// Undetermined mic prompt DENIED: stay muted, do not send the verb, surface a
+    /// visible denial (AE3, R3 — never silent).
+    func testUnmuteUndeterminedDeniedStaysMutedAndSurfacesDenial() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let mic = FakeMicAuthorizer(status: .notDetermined, requestAccessResult: false)
+        let alerts = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateCancel)
+        let recorder = makeMutedDaemonRecording(mic: mic, alerts: alerts, daemon: daemon)
+
+        recorder.toggleMute()
+
+        await waitUntil { alerts.microphoneAccessDeniedPresentedCount == 1 }
+        XCTAssertFalse(daemon.setMutedCalled, "a denied unmute must not send the verb")
+        XCTAssertTrue(recorder.muted, "stays muted after a denied unmute")
+        XCTAssertNotNil(recorder.captureAdvisory, "the denial is surfaced, never silent")
+    }
+
+    /// Denied status from the MENU BAR routes to the modal (the user isn't looking
+    /// at the pill), stays muted, and never dispatches the verb (AE3, R3).
+    func testUnmuteDeniedFromMenuBarUsesModalAndStaysMuted() {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let mic = FakeMicAuthorizer(status: .denied)
+        let alerts = FakeRecorderAlertPresenter(stopAndQuitReply: .terminateCancel)
+        let recorder = makeMutedDaemonRecording(mic: mic, alerts: alerts, daemon: daemon)
+
+        // `.denied` resolves synchronously (no requestAccess), so the modal path
+        // fires on the call — no await needed.
+        recorder.toggleMute(source: .menuBar)
+
+        XCTAssertEqual(alerts.microphoneAccessDeniedPresentedCount, 1, "menu-bar denial uses the modal")
+        XCTAssertFalse(daemon.setMutedCalled, "denied unmute never dispatches the verb")
+        XCTAssertTrue(recorder.muted, "stays muted")
+        XCTAssertEqual(recorder.captureAdvisory, RecorderController.microphoneAccessDeniedAdvisory)
+    }
+
     // MARK: - Stale daemon grant probe (defeat launch-time TCC pin)
 
     /// The core regression: a required grant reads denied while a permission
@@ -1169,15 +1366,23 @@ final class CapturingCLIRecorderService: CLIRecorderService {
 @MainActor
 final class CapturingDaemonSessionService: DaemonSessionService {
     var startResult: DaemonSession.StartedRecording
+    /// SCR-254 U7: the snapshot outcome `probeDaemon`'s `syncDaemonSnapshot` reads,
+    /// so a test can drive the mute-hydration-on-attach path.
+    var snapshotResult: DaemonSession.SnapshotOutcome = .noActiveSession
+    /// SCR-254 U7: when set, `setMuted` throws it, modelling a mute-verb failure.
+    var setMutedError: Error?
     private(set) var capturedAudio: Bool?
     private(set) var startRecordingCalled = false
+    private(set) var setMutedCalled = false
+    private(set) var capturedMuted: Bool?
+    private(set) var setMutedCallCount = 0
 
     init(startResult: DaemonSession.StartedRecording) {
         self.startResult = startResult
     }
 
     func probe() async -> DaemonSession.ProbeOutcome { .daemon(grants: .allIndeterminate) }
-    func snapshot() async -> DaemonSession.SnapshotOutcome { .noActiveSession }
+    func snapshot() async -> DaemonSession.SnapshotOutcome { snapshotResult }
 
     func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording {
         startRecordingCalled = true
@@ -1186,6 +1391,16 @@ final class CapturingDaemonSessionService: DaemonSessionService {
     }
 
     func stopRecording(force: Bool) async throws {}
+
+    func setMuted(_ muted: Bool) async throws -> Bool {
+        setMutedCalled = true
+        setMutedCallCount += 1
+        capturedMuted = muted
+        if let setMutedError { throw setMutedError }
+        // Echo the requested state, as the daemon does.
+        return muted
+    }
+
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome { .other(localizedDescription: "") }
     func reload() async -> Result<Void, DaemonSession.ReloadError> { .success(()) }
     func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome {
@@ -1212,6 +1427,7 @@ private final class StaleGrantDaemonSessionService: DaemonSessionService {
         DaemonSession.StartedRecording(cursor: 0, sessionID: "stale", audioEcho: nil)
     }
     func stopRecording(force: Bool) async throws {}
+    func setMuted(_ muted: Bool) async throws -> Bool { muted }
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome { .other(localizedDescription: "") }
     func reload() async -> Result<Void, DaemonSession.ReloadError> {
         reloadCount += 1
@@ -1220,6 +1436,28 @@ private final class StaleGrantDaemonSessionService: DaemonSessionService {
     }
     func consumeEventStream(callbacks: DaemonSession.EventStreamCallbacks) async -> DaemonSession.AttachOutcome {
         .shutdown
+    }
+}
+
+/// SCR-254 U9: drives the unmute permission gate across the authorized /
+/// undetermined / denied branches without a live TCC subject. `requestAccess`
+/// returns the configured grant and records that it was invoked.
+@MainActor
+final class FakeMicAuthorizer: MicAuthorizing {
+    var status: AVAuthorizationStatus
+    var requestAccessResult: Bool
+    private(set) var requestAccessCalled = false
+
+    init(status: AVAuthorizationStatus, requestAccessResult: Bool = false) {
+        self.status = status
+        self.requestAccessResult = requestAccessResult
+    }
+
+    func authorizationStatus() -> AVAuthorizationStatus { status }
+
+    func requestAccess() async -> Bool {
+        requestAccessCalled = true
+        return requestAccessResult
     }
 }
 
