@@ -76,6 +76,49 @@ struct LibraryBadge: Equatable {
     }
 }
 
+/// What submitting the Rename… sheet should do (U6). Kept pure + `Equatable` so
+/// the no-op-on-unchanged-default rule is assertable without a render.
+enum RenameDecision: Equatable {
+    /// Dismiss WITHOUT calling `recording.rename`: the field is unchanged and
+    /// the current title is the derived default, so writing it would freeze the
+    /// date/time default as a permanent user title.
+    case noOp
+    /// Call `recording.rename` with this (already length-capped) title. An empty
+    /// string is a valid submission — it clears the rename back to the default.
+    case submit(String)
+}
+
+/// Pure rules for the Library-card Rename… affordance (U6), factored out of the
+/// `RenameSheet` view so the character cap and the no-op-on-unchanged-default
+/// decision are directly unit-testable (LibraryCardRenameTests) without a render.
+enum RenameModel {
+    /// The display-title cap enforced live in the field, mirroring the daemon's
+    /// `validate_recording_title` bound (<=200 chars).
+    static let maxTitleLength = 200
+
+    /// Truncate `text` to the display-title cap. Counts Swift `Character`s
+    /// (grapheme clusters) — the field enforces this on every keystroke.
+    static func cap(_ text: String) -> String {
+        String(text.prefix(maxTitleLength))
+    }
+
+    /// Decide what submitting `draft` should do given the recording's current
+    /// resolved title and whether that title is a user-set rename.
+    ///
+    /// No-op ONLY when the (capped) draft equals the current title AND that
+    /// title is NOT user-set (`titleIsUserSet != true`, so nil/absent counts as
+    /// the derived default). This is the rule that keeps "open Rename…, hit Save
+    /// unchanged" from silently promoting the date/time default into a frozen
+    /// user title. Any real edit — or clearing to empty — submits.
+    static func decide(draft: String, currentTitle: String, titleIsUserSet: Bool?) -> RenameDecision {
+        let capped = cap(draft)
+        if capped == currentTitle, titleIsUserSet != true {
+            return .noOp
+        }
+        return .submit(capped)
+    }
+}
+
 /// Pure derivations for the grid, kept out of the view so ordering + identity are
 /// assertable.
 enum LibraryGrid {

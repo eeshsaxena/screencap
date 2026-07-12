@@ -86,11 +86,16 @@ enum JournalModel {
     }
 
     /// The card's display title, preferring the recording's `title` and falling back
-    /// to a locally-derived named task (U10). When the recording has no distinct title —
-    /// the raw directory `name` is the placeholder `RecordingSummary` supplies —
-    /// but on-device segmentation named at least one task, the first task's name
-    /// reads far better than the directory slug. Uploaded/cloud-named recordings
-    /// keep the recording title unchanged; only the un-named local case borrows a task
+    /// to a locally-derived named task (U10). `rec.title` is the SERVER-resolved
+    /// title (editable titles U2): the user's rename when set, else the catalog's
+    /// date/time default — this view never re-derives its own default, so a
+    /// user-set or cleared title from `recording.rename` (U6) shows through
+    /// verbatim once the list refreshes. The task-name borrow only kicks in when
+    /// the recording has no distinct title at all — the raw directory `name` is
+    /// the placeholder `RecordingSummary` supplies (an older daemon that omits
+    /// `title`) — and on-device segmentation named at least one task, which reads
+    /// far better than the directory slug. Uploaded/cloud-named recordings keep
+    /// the recording title unchanged; only the un-named local case borrows a task
     /// name. Returns `rec.title` (never empty) in every other case, so the card
     /// title is always populated.
     static func displayTitle(_ rec: RecordingSummary, tasks: [RecordingTask]) -> String {
