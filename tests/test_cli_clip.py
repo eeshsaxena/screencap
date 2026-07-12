@@ -36,6 +36,13 @@ from screencap.cli import cli
 # ---------------------------------------------------------------------------
 
 
+# The recording's frozen video-start anchor (epoch seconds) and its ms form. The
+# clip command subtracts this to turn the caller's ABSOLUTE epoch-ms clip range
+# into the milliseconds-from-video-start that ``export_clip`` expects.
+_ANCHOR_S = 1000.0
+_ANCHOR_MS = round(_ANCHOR_S * 1000)  # 1_000_000
+
+
 @pytest.fixture
 def recordings_root(tmp_path, monkeypatch):
     """A recordings root wired so the clip command's ``resolve_recording_dir``
@@ -46,18 +53,23 @@ def recordings_root(tmp_path, monkeypatch):
     return root
 
 
-def _make_clippable(root: Path, name: str) -> Path:
+def _make_clippable(root: Path, name: str, *, video_start_time: float = _ANCHOR_S) -> Path:
     """A local, non-stub recording with source video present (≥1 chunk_*.mp4).
 
     The chunk bytes are irrelevant here — ``export_clip`` is stubbed — so a
-    placeholder file is enough to satisfy the ``isClippable`` gate.
+    placeholder file is enough to satisfy the ``isClippable`` gate. The
+    ``recording`` row carries the ``video_start_time`` anchor the command reads to
+    convert an absolute-epoch-ms range into engine-relative ms.
     """
     rec_dir = root / name
     rec_dir.mkdir()
     (rec_dir / "chunk_0001.mp4").write_bytes(b"fake chunk video")
     conn = sqlite3.connect(rec_dir / "recording.db")
-    conn.execute("CREATE TABLE recording (timestamp REAL)")
-    conn.execute("INSERT INTO recording VALUES (1716800000.0)")
+    conn.execute("CREATE TABLE recording (video_start_time REAL, timestamp REAL)")
+    conn.execute(
+        "INSERT INTO recording (video_start_time, timestamp) VALUES (?, ?)",
+        (video_start_time, 1716800000.0),
+    )
     conn.commit()
     conn.close()
     return rec_dir
@@ -113,7 +125,7 @@ def _events(result) -> list[dict]:
     return out
 
 
-def _invoke(root, name, out_path, *, start=1000, end=5000, extra=None):
+def _invoke(root, name, out_path, *, start=_ANCHOR_MS + 1000, end=_ANCHOR_MS + 5000, extra=None):
     args = [
         "clip",
         name,
@@ -150,12 +162,17 @@ def test_happy_path_emits_clip_done_and_ok_envelope(recordings_root, tmp_path):
     assert payload["path"] == str(out)
     assert out.exists(), "the clip file must be written"
 
-    # export_clip received the range + out path (matches its real signature).
+    # export_clip received the range CONVERTED to milliseconds-from-video-start:
+    # the absolute epoch ms the caller passed minus the recording's anchor.
     assert len(calls) == 1
-    assert calls[0]["start_ms"] == 1000
-    assert calls[0]["end_ms"] == 5000
+    assert calls[0]["start_ms"] == 1000  # (_ANCHOR_MS + 1000) - _ANCHOR_MS
+    assert calls[0]["end_ms"] == 5000  # (_ANCHOR_MS + 5000) - _ANCHOR_MS
     assert calls[0]["out_path"] == str(out)
     assert calls[0]["recording_dir"].endswith("/rec-ok")
+
+    # The envelope still reports the ABSOLUTE values the Swift caller correlates on.
+    assert payload["start_ms"] == _ANCHOR_MS + 1000
+    assert payload["end_ms"] == _ANCHOR_MS + 5000
 
     # Event stream: started then done, on the stderr channel.
     kinds = [e["type"] for e in _events(result)]
@@ -198,6 +215,38 @@ def test_lock_timeout_forwarded_to_engine(recordings_root, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert calls[0]["lock_timeout"] == 5.0
+
+
+def test_absolute_ms_converted_to_relative_before_export(recordings_root, tmp_path):
+    """Cross-unit anchor conversion: the caller passes ABSOLUTE epoch ms (what
+    Swift's ``ClipRange`` and the ``review-data`` verb speak); the command reads
+    the recording's ``video_start_time`` anchor and hands ``export_clip``
+    milliseconds-from-video-start. Concretely: anchor=1000.0s (1_000_000 ms),
+    ``--start-ms 1_005_000`` → 5_000, ``--end-ms 1_010_000`` → 10_000.
+    """
+    _make_clippable(recordings_root, "rec-conv", video_start_time=1000.0)
+    out = tmp_path / "clip.mp4"
+    calls: list = []
+
+    with mock.patch("screencap.engine.video.export_clip", _fake_export(calls)):
+        result = _invoke(
+            recordings_root, "rec-conv", out, start=1_005_000, end=1_010_000
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+
+    # export_clip sees the RELATIVE range (absolute minus the 1_000_000 ms anchor).
+    assert calls[0]["start_ms"] == 5_000
+    assert calls[0]["end_ms"] == 10_000
+
+    # The envelope + events keep the ABSOLUTE values the app correlates on.
+    assert payload["start_ms"] == 1_005_000
+    assert payload["end_ms"] == 1_010_000
+    started = next(e for e in _events(result) if e["type"] == "clip_started")
+    assert started["start_ms"] == 1_005_000
+    assert started["end_ms"] == 1_010_000
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +399,28 @@ def test_stub_recording_without_video_is_not_eligible(recordings_root, tmp_path)
     payload = json.loads(result.stdout)
     assert payload["reason"] == "not_eligible"
     export_spy.assert_not_called()
+
+
+def test_missing_anchor_is_not_eligible(recordings_root, tmp_path):
+    """A recording with source video but no readable video-start anchor (no
+    recording.db) can't be range-converted — not_eligible, and the engine is
+    never reached (no clip_started precedes the failure)."""
+    rec_dir = recordings_root / "rec-noanchor"
+    rec_dir.mkdir()
+    (rec_dir / "chunk_0001.mp4").write_bytes(b"fake chunk video")
+    out = tmp_path / "clip.mp4"
+    export_spy = mock.MagicMock()
+
+    with mock.patch("screencap.engine.video.export_clip", export_spy):
+        result = _invoke(recordings_root, "rec-noanchor", out)
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["reason"] == "not_eligible"
+    export_spy.assert_not_called()
+    assert not out.exists()
+    assert "clip_started" not in [e["type"] for e in _events(result)]
 
 
 def test_traversal_name_is_not_eligible(recordings_root, tmp_path):

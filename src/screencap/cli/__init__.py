@@ -1626,9 +1626,9 @@ def inspect_data_cmd(name, as_json):
 @cli.command("clip")
 @click.argument("name")
 @click.option("--start-ms", type=int, required=True,
-              help="Clip start, milliseconds from recording start (inclusive).")
+              help="Clip start, absolute epoch milliseconds (inclusive).")
 @click.option("--end-ms", type=int, required=True,
-              help="Clip end, milliseconds from recording start (exclusive).")
+              help="Clip end, absolute epoch milliseconds (exclusive).")
 @click.option("--out", "out_path", type=click.Path(dir_okay=False), required=True,
               help="Destination .mp4 path for the exported clip.")
 @click.option("--lock-timeout", type=click.FloatRange(min=0), default=None,
@@ -1642,6 +1642,13 @@ def inspect_data_cmd(name, as_json):
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
 def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
     """Export ``[start-ms, end-ms)`` of a recording as a local .mp4 (video + audio).
+
+    ``--start-ms`` / ``--end-ms`` are **absolute epoch milliseconds** — the same
+    anchor the Swift ``ClipRange`` and the ``review-data`` verb speak. The engine
+    ``export_clip`` expects milliseconds-from-video-start, so this command reads
+    the recording's ``video_start_time`` anchor and converts before the trim; the
+    stderr events and stdout envelope keep reporting the absolute values the
+    caller passed (that is what the app correlates on).
 
     The auth-free, local clip verb the SwiftUI shell's ClipExportController spawns
     (SCR-219). It orchestrates the U1/U2 engine trim, holding the per-recording
@@ -1710,6 +1717,45 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
         )
         return
 
+    # Cross-unit anchor conversion. The caller (Swift ``ClipRange`` / the
+    # ``review-data`` verb) passes ABSOLUTE epoch milliseconds, but the engine's
+    # ``export_clip`` wants milliseconds-from-video-start (relative to
+    # ``recording.db.video_start_time``). Read the video-start anchor exactly as
+    # the rest of the codebase does — ``video_start_time or timestamp`` (epoch
+    # seconds), mirroring viewer.get_frame_at / audio_clip — and subtract it. A
+    # missing DB or unusable anchor can't be converted, so it is not_eligible
+    # (structured, exit 0, engine untouched) rather than a crash or a wrong range.
+    import sqlite3
+
+    anchor_s: float | None = None
+    db_path = rec_dir / "recording.db"
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT video_start_time, timestamp FROM recording LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is not None:
+                raw = row[0] or row[1]
+                if raw is not None:
+                    anchor_s = float(raw)
+        except (sqlite3.Error, ValueError, TypeError):
+            anchor_s = None
+    if anchor_s is None:
+        _fail(
+            "not_eligible",
+            error=f"{name!r} has no readable video-start anchor "
+                  "(missing recording.db or null video_start_time/timestamp)",
+        )
+        return
+
+    anchor_ms = round(anchor_s * 1000)
+    rel_start_ms = start_ms - anchor_ms
+    rel_end_ms = end_ms - anchor_ms
+
     from screencap.engine.video import (
         ClipExportError,
         export_clip,
@@ -1730,7 +1776,9 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
         export_kwargs["lock_timeout"] = lock_timeout
 
     try:
-        export_clip(rec_dir, start_ms, end_ms, out_p, **export_kwargs)
+        # Relative (from-video-start) ms — the caller-facing envelope/events keep
+        # the absolute ``start_ms`` / ``end_ms`` above.
+        export_clip(rec_dir, rel_start_ms, rel_end_ms, out_p, **export_kwargs)
     except TerminalStageBusy as exc:
         # A contended eviction lock is retryable, not a hard failure (KTD6). It is
         # deliberately NOT a ClipExportError, so the app can retry rather than
