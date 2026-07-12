@@ -264,7 +264,7 @@ gcloud functions logs read get-upload-urls --project proteus-photos \
 | Identity Platform enabled | ✅ done (2026-06-04) | console shows "Authentication with Identity Platform" |
 | Google provider enabled | ✅ done (2026-06-04) | the only v1 provider |
 | OAuth client id (desktop) | ✅ `screencap-cli-desktop` (Desktop type, 2026-06-04) | value in project-local `.env`; not committed; non-confidential (ships in binaries) |
-| OAuth client **secret** | ⚠️ **capture + inject** as `SCREENCAP_OAUTH_CLIENT_SECRET` | Google Desktop clients require it at the token endpoint even under PKCE; the 2026-06-04 setup omitted it → shipped sign-in broke with `invalid_request: client_secret is missing`. Non-confidential but mandatory — inject at build time via `scripts/generate_provisioned.py` |
+| OAuth client **secret** | ✅ in project-local `.env` as `SCREENCAP_OAUTH_CLIENT_SECRET`; ⚠️ also add as a GitHub Actions repo secret for CI `release.yml` | Google Desktop clients require it at the token endpoint even under PKCE. The value was captured to `.env` (so dev sign-in worked) but was never injected into release binaries until `scripts/generate_provisioned.py` learned to bundle it → shipped sign-in broke with `invalid_request: client_secret is missing`. Non-confidential but mandatory. |
 | Firebase Web API key | ✅ created (2026-06-04) | value in project-local `.env`; not committed |
 | Web API key restrictions | ✅ done (2026-06-04) | restricted to Identity Toolkit API + Token Service API (step 6) |
 | Disabled methods | ✅ email/pw, phone, anonymous left disabled | only Google was enabled |
