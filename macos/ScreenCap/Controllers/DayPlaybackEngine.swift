@@ -282,6 +282,40 @@ final class DayPlaybackEngine: ObservableObject {
     /// The recording under the playhead (for "Share from here").
     var currentRecording: String? { currentChunk?.recording }
 
+    /// SCR-219 (U5) — named task segments for the recording currently under the
+    /// playhead, the source of "Clip this moment"'s snap-to-moment bounds
+    /// (`/v0/tasks.list`, KD2). Empty on a miss / daemon hiccup, in which case
+    /// the clip falls back to a centered fixed window — never an error state,
+    /// matching `JournalTasks`. Cached per recording so re-seeking within one
+    /// recording doesn't refetch.
+    @Published private(set) var currentRecordingTasks: [RecordingTask] = []
+    private var tasksCache: [String: [RecordingTask]] = [:]
+
+    /// Ensure `currentRecordingTasks` reflects the recording under the playhead.
+    /// Cheap + idempotent: one read-only `tasks.list` per recording, cached.
+    /// Silent on failure (leaves the cache empty so a later attempt retries) —
+    /// the clip UI treats an empty result as "no labeled moment" and falls back
+    /// to the fixed window. Invoked on demand when the user enters clip mode.
+    func refreshTasksForCurrentRecording() async {
+        guard let name = currentRecording else {
+            currentRecordingTasks = []
+            return
+        }
+        if let cached = tasksCache[name] {
+            currentRecordingTasks = cached
+            return
+        }
+        guard let response = try? await DaemonClient.tasksList(TasksListRequest(recording: name)) else {
+            // Don't cache a failure — a later entry into clip mode retries.
+            if currentRecording == name { currentRecordingTasks = [] }
+            return
+        }
+        tasksCache[name] = response.tasks
+        // Guard against the playhead having moved to another recording during
+        // the await.
+        if currentRecording == name { currentRecordingTasks = response.tasks }
+    }
+
     /// How far the *initial* landing may snap forward to reach a playable
     /// frame. Covers a card click at a recording's `started_at`, which under
     /// action-gated capture precedes the first written frame — without

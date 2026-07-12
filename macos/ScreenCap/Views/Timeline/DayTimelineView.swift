@@ -31,6 +31,18 @@ struct DayTimelineView: View {
     @State private var contentIndexEnabled = false
     @State private var searchTask: Task<Void, Never>?
 
+    // SCR-219 (U5) — clip-bounds mode. `clipMode` swaps the playback pane's
+    // action buttons for the `ClipBoundsView` overlay; the rest are the working
+    // selection state. `clipCenterMs` pins the playhead the clip was started
+    // from so a span-picker change re-centers the fixed window on the SAME
+    // instant rather than the (possibly moved) live playhead.
+    @State private var clipMode = false
+    @State private var clipRange: ClipRange?
+    @State private var clipSpan: ClipSpan = .thirtySeconds
+    @State private var clipSnappedToTask = false
+    @State private var clipCenterMs = 0
+    @State private var longClipNudgeDismissed = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -132,7 +144,8 @@ struct DayTimelineView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .bottomLeading) { timestampChip }
-        .overlay(alignment: .bottomTrailing) { actionButtons }
+        .overlay(alignment: .bottomTrailing) { if !clipMode { actionButtons } }
+        .overlay(alignment: .bottom) { clipBoundsOverlay }
     }
 
     private func placeholderCaption(_ reason: DayPlaceholderReason) -> String {
@@ -178,17 +191,7 @@ struct DayTimelineView: View {
 
     private var actionButtons: some View {
         HStack(spacing: 8) {
-            // Stub: SCR-219 clip-and-share a moment — rendered per the design,
-            // disabled until the capability exists (KTD-8).
-            Button("Clip this moment") {}
-                .buttonStyle(.plain)
-                .font(SCTypography.sans(size: 12))
-                .foregroundStyle(Color.scCanvas.opacity(0.6))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(Color.scInk.opacity(0.85), in: Capsule())
-                .disabled(true)
-                .help("Coming soon — SCR-219")
+            clipButton
             if let recording = shareableRecording {
                 Button("Share from here") {
                     // Upload consent stays load-bearing: sharing routes through
@@ -207,6 +210,49 @@ struct DayTimelineView: View {
         .padding(14)
     }
 
+    /// SCR-219 (U5) — "Clip this moment", enabled for a clippable recording
+    /// (`isClippable`: local, non-stub, video present — R8), disabled otherwise
+    /// so the design's affordance stays present. Tapping enters clip-bounds
+    /// mode. Replaces the shipped disabled stub (R9).
+    @ViewBuilder
+    private var clipButton: some View {
+        let clippable = clippableRecordingName != nil
+        Button("Clip this moment") { if clippable { beginClip() } }
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: clippable ? .semibold : .regular))
+            .foregroundStyle(clippable ? Color.scCanvas : Color.scCanvas.opacity(0.6))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color.scInk.opacity(0.85), in: Capsule())
+            .disabled(!clippable)
+            .help(clippable
+                ? "Clip this moment to a local video file"
+                : "Clipping isn't available for this recording")
+    }
+
+    /// The clip-bounds selection panel, shown at the bottom of the playback
+    /// pane while `clipMode` is active. Nil-guards fall back to nothing so an
+    /// edge case (recording changed out from under clip mode) can't crash.
+    @ViewBuilder
+    private var clipBoundsOverlay: some View {
+        if clipMode,
+           let range = clipRange,
+           let footage = currentFootageBounds {
+            ClipBoundsView(
+                range: Binding(get: { clipRange ?? range }, set: { clipRange = $0 }),
+                footageStartMs: footage.start,
+                footageEndMs: footage.end,
+                snappedToTask: clipSnappedToTask,
+                span: clipSpan,
+                showNudge: ClipBoundsResolver.isLongClip(range) && !longClipNudgeDismissed,
+                onSelectSpan: { selectClipSpan($0) },
+                onDismissNudge: { longClipNudgeDismissed = true },
+                onReview: { confirmClip() },
+                onCancel: { exitClipMode() }
+            )
+        }
+    }
+
     /// The recording under the playhead, when it can still go through the
     /// Review-before-upload flow.
     private var shareableRecording: String? {
@@ -214,6 +260,90 @@ struct DayTimelineView: View {
               let summary = index.recordings.first(where: { $0.name == name }),
               summary.isUploadEligible else { return nil }
         return name
+    }
+
+    /// The recording under the playhead, when it is clippable (R8). Distinct
+    /// from `shareableRecording`: an already-uploaded (but still local)
+    /// recording is clippable even though it is not upload-eligible.
+    private var clippableRecordingName: String? {
+        guard let name = engine.currentRecording,
+              let summary = index.recordings.first(where: { $0.name == name }),
+              summary.isClippable else { return nil }
+        return name
+    }
+
+    /// Available footage bounds (absolute unix ms) for the recording under the
+    /// playhead — the clamp window for clip bounds. A recording's day spans are
+    /// unioned (a recording could surface as more than one strip segment).
+    private var currentFootageBounds: (start: Int, end: Int)? {
+        guard let name = engine.currentRecording else { return nil }
+        let recSpans = spans.filter { $0.name == name }
+        guard let start = recSpans.map(\.startMs).min(),
+              let end = recSpans.map(\.endMs).max(),
+              end > start else { return nil }
+        return (start, end)
+    }
+
+    // MARK: - Clip bounds mode
+
+    /// Enter clip-bounds mode: resolve the default range (snap to the labeled
+    /// moment under the playhead via `tasks.list`, else a centered fixed
+    /// window), then show the `ClipBoundsView` overlay (R1/R3).
+    private func beginClip() {
+        guard let playheadMs = engine.currentDayMs,
+              let footage = currentFootageBounds else { return }
+        clipCenterMs = playheadMs
+        longClipNudgeDismissed = false
+        Task {
+            await engine.refreshTasksForCurrentRecording()
+            if let task = ClipBoundsResolver.containingTask(
+                tasks: engine.currentRecordingTasks, playheadMs: playheadMs
+            ) {
+                clipSnappedToTask = true
+                clipRange = ClipBoundsResolver.momentBounds(
+                    task: task, footageStartMs: footage.start, footageEndMs: footage.end
+                )
+            } else {
+                clipSnappedToTask = false
+                clipRange = ClipBoundsResolver.fixedWindow(
+                    centerMs: playheadMs, span: clipSpan,
+                    footageStartMs: footage.start, footageEndMs: footage.end
+                )
+            }
+            clipMode = true
+        }
+    }
+
+    /// Change the fixed-window span (fallback only) — recompute the window
+    /// centered on the ORIGINAL clip center, clamped to footage (R3).
+    private func selectClipSpan(_ span: ClipSpan) {
+        clipSpan = span
+        guard !clipSnappedToTask, let footage = currentFootageBounds else { return }
+        clipRange = ClipBoundsResolver.fixedWindow(
+            centerMs: clipCenterMs, span: span,
+            footageStartMs: footage.start, footageEndMs: footage.end
+        )
+    }
+
+    /// Confirm the bounds: carry the range out-of-band via `pendingClipRange`
+    /// and open the Review window keyed on the recording name (KTD5), then exit
+    /// bounds mode. The Review window (U6) consumes the range on `.ready`.
+    private func confirmClip() {
+        guard let name = clippableRecordingName, let range = clipRange else {
+            exitClipMode()
+            return
+        }
+        ReviewWindowOpener.shared.pendingClipRange[name] = range
+        openWindow(id: ReviewWindowID, value: name)
+        exitClipMode()
+    }
+
+    /// Leave clip-bounds mode without opening Review (the named Cancel, R9).
+    private func exitClipMode() {
+        clipMode = false
+        clipRange = nil
+        clipSnappedToTask = false
+        longClipNudgeDismissed = false
     }
 
     // MARK: - Strip

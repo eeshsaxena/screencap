@@ -145,4 +145,26 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     var isUploadEligible: Bool {
         !uploaded && !isStub
     }
+
+    /// SCR-219 R8 / KTD5 eligibility predicate for "Clip this moment" (U5):
+    /// a recording is clippable when it is **local, non-stub, and has video
+    /// present**. A clip reads the recording's LOCAL source chunks and writes a
+    /// local `.mp4` (KD1), so the media must still be on this Mac (`!isStub` —
+    /// a stub is the uploaded-then-locally-deleted state) and the recording
+    /// must carry actual captured footage (`durationSeconds > 0`; a screen
+    /// recording always has a video stream when it has footage, and this proxy
+    /// covers both chunked and legacy single-`video.mp4` recordings, unlike
+    /// `chunksTotal`).
+    ///
+    /// Deliberately distinct from `isUploadEligible`: it **drops the
+    /// `!uploaded` clause**. An already-uploaded recording is still clippable
+    /// from its local chunks (the clip is a fresh local file, not a re-upload),
+    /// so reusing the upload-only predicate would wrongly disable the button on
+    /// every shared recording. Contention with a live recording (chunks
+    /// mid-write) is not gated here — the engine `screencap clip` verb (U3)
+    /// acquires the per-recording `terminal_lock` and reports `clip_busy`, so
+    /// the lock, not this UI predicate, is the write-safety boundary.
+    var isClippable: Bool {
+        !isStub && (durationSeconds ?? 0) > 0
+    }
 }
