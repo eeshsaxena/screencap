@@ -20,8 +20,25 @@ enum InspectRouting {
     /// share; everything else opens the inspect window, seeking when the tap
     /// carried a moment (search) and at the start when it did not (Recordings
     /// list, or an unanchored search hit).
-    static func decide(recording: String, anchorMs: Int?, isStub: Bool) -> InspectOpenDecision {
+    ///
+    /// `isEncrypted` is the recording's frozen `cloud_e2ee` bit (SCR-253 U8): an
+    /// encrypted stub adds the multi-device key guidance to the message, since a
+    /// second Mac that hasn't received the key via iCloud Keychain can't read it.
+    /// There is no key-presence API (KTD-5), so this is guidance, not detection —
+    /// and never a corruption-looking error.
+    static func decide(
+        recording: String, anchorMs: Int?, isStub: Bool, isEncrypted: Bool = false
+    ) -> InspectOpenDecision {
         guard !isStub else {
+            if isEncrypted {
+                return .unavailable(
+                    message: "This recording (\(recording)) is end-to-end encrypted and was "
+                        + "uploaded; the local copy was deleted. Reading it here needs the "
+                        + "developer CLI to download it, and this Mac must hold the encryption "
+                        + "key — sign in with the same account and turn on iCloud Keychain so "
+                        + "the key syncs from the Mac that recorded it."
+                )
+            }
             return .unavailable(
                 message: "This recording (\(recording)) was uploaded and the local copy was "
                     + "deleted. Retrieving it locally requires the developer CLI."

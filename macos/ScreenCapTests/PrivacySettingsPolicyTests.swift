@@ -48,7 +48,9 @@ final class PrivacySettingsPolicyTests: XCTestCase {
 
             // "always on" is scoped to the mask chip alone (the policy engine
             // genuinely always runs) — the E2EE strings must not carry it in
-            // ANY state until the Stage 3 default flip.
+            // ANY state until the Stage 3 default flip. SCR-253 U8 retires the
+            // now-false Stage-1 "only this Mac can decrypt" claim (the key syncs
+            // to the user's other Macs), so it too is forbidden in every state.
             let e2ee = [
                 PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: state),
                 PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: state),
@@ -57,6 +59,7 @@ final class PrivacySettingsPolicyTests: XCTestCase {
                 PrivacySettingsCopy.e2eeConfirmBody,
             ].joined(separator: " ").lowercased()
             XCTAssertFalse(e2ee.contains("always on"), "state \(String(describing: state))")
+            XCTAssertFalse(e2ee.contains("only this mac"), "state \(String(describing: state))")
         }
 
         let pause = PrivacySettingsCopy.pauseSub.lowercased()
@@ -99,9 +102,12 @@ final class PrivacySettingsPolicyTests: XCTestCase {
         XCTAssertTrue(caption.contains("turn on"))
     }
 
-    /// On: the beta copy claims per-Mac encryption truthfully — scoped to
-    /// this Mac's cloud copies — and names the no-recovery limit (KD7).
-    func testE2EEOnStateClaimsPerMacEncryptionAndNamesNoRecovery() {
+    /// On: the beta copy claims multi-device encryption truthfully — scoped to
+    /// the user's own Macs, in iCloud-Keychain-honest wording (SCR-253 U8,
+    /// KTD-6: "neither we nor Apple can read") — and names the no-recovery
+    /// limit (KD7). The retired Stage-1 "only this Mac can decrypt" claim, now
+    /// false because the key syncs, must be gone.
+    func testE2EEOnStateClaimsMultiDeviceEncryptionAndNamesNoRecovery() {
         XCTAssertEqual(
             PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: true), .disable
         )
@@ -110,19 +116,27 @@ final class PrivacySettingsPolicyTests: XCTestCase {
 
         let caption = PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: true).lowercased()
         XCTAssertTrue(caption.contains("encrypted"))
-        XCTAssertTrue(caption.contains("only this mac can decrypt"))
+        XCTAssertTrue(caption.contains("your macs"))
+        XCTAssertTrue(caption.contains("icloud keychain"))
+        XCTAssertTrue(caption.contains("neither we nor apple"))
         XCTAssertTrue(caption.contains("no recovery"))
+        XCTAssertFalse(caption.contains("only this mac can decrypt"))  // retired (U8)
     }
 
-    /// R4: the disclosure that gates the off→on flip names all three limits
-    /// plainly before the user commits — only this Mac can decrypt, no
-    /// recovery exists, losing this Mac loses access to the encrypted copies.
-    func testE2EEConfirmBodyNamesAllThreeLimits() {
+    /// R4: the disclosure that gates the off→on flip names the Stage-2 custody
+    /// and limits plainly before the user commits (SCR-253 U8, KTD-6): the key
+    /// syncs to the user's Macs via iCloud Keychain, neither we nor Apple can
+    /// read it, and there is no recovery — losing access to all their Macs
+    /// loses access to the encrypted copies. The false "only this Mac" claim is
+    /// gone.
+    func testE2EEConfirmBodyNamesCustodyAndLimits() {
         let body = PrivacySettingsCopy.e2eeConfirmBody.lowercased()
-        XCTAssertTrue(body.contains("only this mac can decrypt"))
+        XCTAssertTrue(body.contains("icloud keychain"))
+        XCTAssertTrue(body.contains("neither we nor apple"))
         XCTAssertTrue(body.contains("no recovery"))
-        XCTAssertTrue(body.contains("lose this mac"))
+        XCTAssertTrue(body.contains("all your macs"))
         XCTAssertTrue(body.contains("lose access"))
+        XCTAssertFalse(body.contains("only this mac can decrypt"))  // retired (U8)
     }
 
     /// The storage row abbreviates the home directory the design's way

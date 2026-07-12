@@ -59,6 +59,11 @@ class DownloadResult:
     failed: list[str] = field(default_factory=list)
     total_bytes: int = 0
     gcs_prefix: str = ""
+    # SCR-253 U8: at least one file was encrypted and no cloud key was available
+    # on this Mac — a distinct, machine-readable signal (separate from a generic
+    # download failure) that a script or a future in-app download branches on to
+    # show the "sign in · turn on iCloud Keychain" guidance.
+    key_unavailable: bool = False
 
 
 def is_downloaded(recording_dir: Path) -> bool:
@@ -260,9 +265,13 @@ def _download_file_with_progress(
 
     key = cloud_crypto.resolve_cloud_key()
     if key is None:
-        raise RuntimeError(
-            "recording is end-to-end encrypted but no cloud key is available "
-            "(sign in on the device that recorded it)"
+        # Distinct type (SCR-253 U8): a keyless Mac gets an actionable guidance
+        # signal, not a corruption-looking failure. Raised before the temp file
+        # exists, so no partial plaintext is written.
+        raise cloud_crypto.CloudKeyUnavailable(
+            "recording is end-to-end encrypted but no cloud key is available on "
+            "this Mac (sign in with the same account and turn on iCloud Keychain "
+            "so your key can sync from the Mac that recorded it)"
         )
     fd, tmp = tempfile.mkstemp(dir=str(dest_path.parent), prefix=f".{dest_path.name}.")
     os.chmod(tmp, 0o600)
@@ -364,6 +373,12 @@ def download_recording(
                         )
                         result.failed.append(filename)
                         errors.append((filename, str(e)))
+                        # A missing E2EE key is a distinct condition (U8): mark it
+                        # so the caller shows guidance, not a generic failure.
+                        from screencap.cloud_crypto import CloudKeyUnavailable
+
+                        if isinstance(e, CloudKeyUnavailable):
+                            result.key_unavailable = True
             except KeyboardInterrupt:
                 executor.shutdown(wait=False, cancel_futures=True)
                 console.print("\n[yellow]Download interrupted.[/yellow]")

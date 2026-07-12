@@ -150,32 +150,38 @@ enum PrivacySettingsCopy {
 
     static let keepLocalTitle = "Keep recordings local by default"
 
-    // SCR-220 U4: E2EE for cloud copies is now a live opt-in beta toggle. All
-    // row copy is state-keyed through PrivacySettingsPolicy.e2eeChip/
+    // SCR-220 U4 / SCR-253 U8: E2EE for cloud copies is a live opt-in beta
+    // toggle. All row copy is state-keyed through PrivacySettingsPolicy.e2eeChip/
     // e2eeCaption/e2eeHelp (KD7 — every claim bound to the runtime
-    // `cloud_e2ee_enabled` signal): nil (older CLI) keeps the stub
-    // presentation below; off makes no claim that current uploads are
-    // encrypted; on claims exactly the per-Mac beta capability and names the
-    // no-recovery limit. Still no "always on" (Stage 3), no "shared ·
-    // encrypted" (SCR-221), no "keys stay with your team" (KD3).
+    // `cloud_e2ee_enabled` signal): nil (older CLI) keeps the stub presentation
+    // below; off makes no claim that current uploads are encrypted; on claims
+    // the multi-device beta capability in iCloud-Keychain-honest wording (KTD-6:
+    // the key syncs to the user's own Macs, so "neither we nor Apple can read"
+    // your recordings — NOT the retired Stage-1 "only this Mac can decrypt")
+    // and names the no-recovery limit. Still no "always on" (Stage 3), no
+    // "shared · encrypted" (SCR-221), no "keys stay with your team" (KD3).
     static let e2eeTitle = "End-to-end encryption for shared copies"
     static let e2eeChipStub = "planned"
     static let e2eeChipBeta = "beta"
     static let e2eeSubStub = "Not available yet. Sharing today uses per-recording upload approval instead."
     static let e2eeSubOff = "Off — cloud copies upload without end-to-end encryption. Turn on to encrypt future uploads from this Mac."
-    static let e2eeSubOn = "On — new cloud copies from this Mac are encrypted so only this Mac can decrypt them. No recovery: losing this Mac loses access to them."
+    static let e2eeSubOn = "On — new cloud copies from this Mac are encrypted. Only your Macs — signed in, with iCloud Keychain on — can decrypt them; neither we nor Apple can read them. No recovery: lose access to all your Macs and you lose access to them."
     static let e2eeHelpStub = "Coming soon — SCR-220"
-    static let e2eeHelpLive = "Beta — when on, new cloud copies are encrypted so only this Mac can decrypt them."
+    static let e2eeHelpLive = "Beta — when on, new cloud copies are encrypted so only your Macs (signed in, with iCloud Keychain on) can decrypt them."
 
-    // R4: the limits disclosure that gates the off→on flip. The body must
-    // name all three limits plainly BEFORE the user commits: only this Mac
-    // can decrypt, no recovery exists, losing this Mac loses access to the
-    // encrypted cloud copies.
+    // R4: the limits disclosure that gates the off→on flip. The body must name
+    // the custody and limits plainly BEFORE the user commits (SCR-253 U8,
+    // KTD-6): the key syncs to the user's other Macs via iCloud Keychain — so
+    // any Mac they're signed into can decrypt, and neither we nor Apple can read
+    // it — and there is no recovery, so losing access to all their Macs loses
+    // access to the encrypted cloud copies.
     static let e2eeConfirmTitle = "Turn on end-to-end encryption for cloud copies?"
     static let e2eeConfirmBody =
-        "This Mac creates the encryption key, and only this Mac can decrypt "
-        + "the cloud copies it uploads. There is no recovery: if you lose "
-        + "this Mac, you lose access to those encrypted cloud copies. Beta — "
+        "This Mac creates the encryption key and syncs it to your other Macs "
+        + "through iCloud Keychain, so any Mac where you're signed in with iCloud "
+        + "Keychain on can decrypt these cloud copies — but neither we nor Apple "
+        + "can read them. There is no recovery: if you lose access to all your "
+        + "Macs, you lose access to those encrypted cloud copies. Beta — "
         + "recordings already uploaded are not re-encrypted."
     static let e2eeConfirmAction = "Turn On Encryption"
 

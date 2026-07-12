@@ -133,6 +133,43 @@ def test_delete_removes_item(fake_group: _FakeGroupKeychain) -> None:
     assert kg.load(SERVICE, ACCOUNT, GROUP) is None
 
 
+# --- add_if_absent: add-only, never overwrite (SCR-253 cloud-KEK safe write) --
+
+
+def test_add_if_absent_adds_when_absent(fake_group: _FakeGroupKeychain) -> None:
+    assert kg.add_if_absent(SERVICE, ACCOUNT, "first", GROUP) is True
+    assert kg.load(SERVICE, ACCOUNT, GROUP) == "first"
+
+
+def test_add_if_absent_leaves_existing_untouched(fake_group: _FakeGroupKeychain) -> None:
+    kg.store(SERVICE, ACCOUNT, "original", GROUP)
+    # A duplicate is reported, NOT overwritten (unlike store()'s update path).
+    assert kg.add_if_absent(SERVICE, ACCOUNT, "different", GROUP) is False
+    assert kg.load(SERVICE, ACCOUNT, GROUP) == "original"
+
+
+def test_add_if_absent_surfaces_unexpected_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kg, "_sec_item_add", lambda *a, **k: kg.errSecMissingEntitlement)
+    with pytest.raises(kg.MissingEntitlement):
+        kg.add_if_absent(SERVICE, ACCOUNT, "x", GROUP)
+
+
+# --- SYNCHRONIZABLE_ANY is structurally query-only ------------------------
+
+
+def test_synchronizable_any_rejected_by_mutating_primitives() -> None:
+    """The query-only sentinel must be structurally rejected by add/update/delete
+    (KTD-5): reaching a *delete* with ANY would match — and destroy — a synced
+    item fleet-wide. The guard fires before any ctypes call, so this holds on any
+    host. `load` (query) accepts it."""
+    with pytest.raises(ValueError):
+        kg._sec_item_add(SERVICE, ACCOUNT, b"x", GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+    with pytest.raises(ValueError):
+        kg._sec_item_update(SERVICE, ACCOUNT, b"x", GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+    with pytest.raises(ValueError):
+        kg._sec_item_delete(SERVICE, ACCOUNT, GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+
+
 # --- error routing (the spike-verified fallback contract) -----------------
 
 
@@ -279,3 +316,18 @@ def test_real_keychain_graceful_on_unentitled_host() -> None:
         assert kg.load(svc, ACCOUNT, GROUP) == "itest-secret"
     finally:
         kg.delete(svc, ACCOUNT, GROUP)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Security.framework is macOS-only")
+def test_real_synchronizable_any_constant_resolves() -> None:
+    """The one new Security constant (`kSecAttrSynchronizableAny`, SCR-253) must
+    resolve via `in_dll` — a typo would raise `ValueError` only at call time on a
+    real host (unit tests stub the primitives). An ANY read may fail with
+    `MissingEntitlement` on an un-entitled runner, but must NOT raise `ValueError`
+    from an unresolved symbol."""
+    try:
+        kg.load("screencap-auth-itest-any", ACCOUNT, GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+    except kg.MissingEntitlement:
+        pass  # un-entitled runner — the constant still resolved past _const()
+    except ValueError as exc:  # c_void_p.in_dll couldn't find the symbol
+        pytest.fail(f"kSecAttrSynchronizableAny did not resolve: {exc}")
