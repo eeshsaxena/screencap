@@ -139,6 +139,146 @@ final class PrivacySettingsPolicyTests: XCTestCase {
         XCTAssertFalse(body.contains("only this mac can decrypt"))  // retired (U8)
     }
 
+    // MARK: - E2EE cloud-capability gate (SCR-260)
+
+    /// Eligibility resolves from the four auth signals: signed-out is never
+    /// eligible; a paywall-off build treats any signed-in user as eligible
+    /// (pre-billing had no plan gating, and `tier` is `.none` for everyone
+    /// there, so without this branch every signed-in user would be gated);
+    /// with the paywall on, a cloud-capable user is eligible, an offline/stale
+    /// user is `planUnconfirmed` (never shown "upgrade"), and a signed-in-but-
+    /// not-cloud user is `noCloudPlan`.
+    func testE2EEEligibilityResolution() {
+        // Signed out — never eligible, regardless of the other signals.
+        for capable in [true, false] {
+            for stale in [true, false] {
+                for paywall in [true, false] {
+                    XCTAssertEqual(
+                        PrivacySettingsPolicy.e2eeEligibility(
+                            isSignedIn: false, cloudCapable: capable,
+                            planStale: stale, paywallEnabled: paywall
+                        ),
+                        .signedOut
+                    )
+                }
+            }
+        }
+        // Paywall off — any signed-in user is eligible (pre-billing / dev).
+        for capable in [true, false] {
+            for stale in [true, false] {
+                XCTAssertEqual(
+                    PrivacySettingsPolicy.e2eeEligibility(
+                        isSignedIn: true, cloudCapable: capable,
+                        planStale: stale, paywallEnabled: false
+                    ),
+                    .eligible
+                )
+            }
+        }
+        // Paywall on + cloud-capable (incl. a Cloud trial) — eligible.
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeEligibility(
+                isSignedIn: true, cloudCapable: true,
+                planStale: false, paywallEnabled: true
+            ),
+            .eligible
+        )
+        // Paywall on + not cloud-capable + offline/stale — planUnconfirmed,
+        // NOT noCloudPlan (an offline payer is never shown "upgrade").
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeEligibility(
+                isSignedIn: true, cloudCapable: false,
+                planStale: true, paywallEnabled: true
+            ),
+            .planUnconfirmed
+        )
+        // Paywall on + not cloud-capable + resolved — noCloudPlan.
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeEligibility(
+                isSignedIn: true, cloudCapable: false,
+                planStale: false, paywallEnabled: true
+            ),
+            .noCloudPlan
+        )
+    }
+
+    /// The gate is on the off→on path only. nil → locked and true → disable are
+    /// eligibility-independent (older-CLI precedence; a since-lapsed user can
+    /// still turn encryption OFF, R4). false → showDisclosure only when
+    /// eligible; every gated eligibility → gated (no disclosure, no KEK write).
+    func testE2EEGatedTapOutcome() {
+        let gatedStates: [PrivacySettingsPolicy.E2EECloudEligibility] =
+            [.signedOut, .noCloudPlan, .planUnconfirmed]
+
+        // nil flag → locked for every eligibility (KTD-8 precedence).
+        for e in gatedStates + [.eligible] {
+            XCTAssertEqual(
+                PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: nil, eligibility: e),
+                .locked
+            )
+        }
+        // true flag → disable for every eligibility, including gated (R4).
+        for e in gatedStates + [.eligible] {
+            XCTAssertEqual(
+                PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: true, eligibility: e),
+                .disable
+            )
+        }
+        // false flag → showDisclosure only when eligible; gated otherwise.
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: false, eligibility: .eligible),
+            .showDisclosure
+        )
+        for e in gatedStates {
+            XCTAssertEqual(
+                PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: false, eligibility: e),
+                .gated,
+                "eligibility \(e) must gate the off→on tap"
+            )
+        }
+    }
+
+    /// The gated captions name why the row is unavailable (sign-in / cloud plan
+    /// / reconnect), make no current-or-available encryption claim, and never
+    /// say "not available" (the capability exists — it is gated). The gated help
+    /// differs from the off-state live help so the tooltip can't contradict the
+    /// caption.
+    func testE2EEGatedCaptionsAreHonestAndStateSpecific() {
+        let signedOut = PrivacySettingsPolicy.e2eeCaption(
+            cloudE2EEEnabled: false, eligibility: .signedOut
+        ).lowercased()
+        let noPlan = PrivacySettingsPolicy.e2eeCaption(
+            cloudE2EEEnabled: false, eligibility: .noCloudPlan
+        ).lowercased()
+        let unconfirmed = PrivacySettingsPolicy.e2eeCaption(
+            cloudE2EEEnabled: false, eligibility: .planUnconfirmed
+        ).lowercased()
+
+        XCTAssertTrue(signedOut.contains("sign in"))
+        XCTAssertTrue(noPlan.contains("cloud plan") || noPlan.contains("cloud subscription"))
+        XCTAssertTrue(unconfirmed.contains("reconnect"))
+
+        for caption in [signedOut, noPlan, unconfirmed] {
+            XCTAssertFalse(caption.contains("is encrypted"), caption)
+            XCTAssertFalse(caption.contains("not available"), caption)
+            XCTAssertFalse(caption.contains("always on"), caption)
+            XCTAssertFalse(caption.contains("only this mac"), caption)
+        }
+
+        // The gated states route to gated help, not the off-state "turn on to
+        // encrypt" live help.
+        let gatedHelp = PrivacySettingsPolicy.e2eeHelp(
+            cloudE2EEEnabled: false, eligibility: .noCloudPlan
+        )
+        XCTAssertEqual(gatedHelp, PrivacySettingsCopy.e2eeHelpGated)
+        XCTAssertNotEqual(gatedHelp, PrivacySettingsCopy.e2eeHelpLive)
+        // The eligible off state still returns the live help (unchanged).
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: false, eligibility: .eligible),
+            PrivacySettingsCopy.e2eeHelpLive
+        )
+    }
+
     /// The storage row abbreviates the home directory the design's way
     /// ("~/…"), and leaves foreign paths untouched.
     func testAbbreviateHome() {

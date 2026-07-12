@@ -40,25 +40,74 @@ enum PrivacySettingsPolicy {
         on ? "local" : "ask"
     }
 
-    // MARK: - E2EE row (SCR-220 U4)
+    // MARK: - E2EE row (SCR-220 U4, SCR-260 cloud-capability gate)
 
-    /// What a tap on the E2EE toggle does, keyed on the runtime flag state.
-    /// `locked`: nil flag (older CLI without the `e2ee` verb, KTD-8) — the
-    /// row is non-interactive. `showDisclosure`: the off→on tap presents the
-    /// R4 limits sheet INSTEAD of flipping — the switch stays OFF and no CLI
-    /// call fires until the user confirms (cancel = dismiss, nothing else).
-    /// `disable`: the on→off tap needs no disclosure — plain optimistic flip.
+    /// Whether the user can actually use E2EE for cloud copies (SCR-260). Cloud
+    /// copies exist only for a signed-in, cloud-capable user, so the off→on
+    /// enable path — which mints a synchronizable iCloud-Keychain KEK — is gated
+    /// on this. `eligible` keeps the shipped SCR-220 flow; the other three are
+    /// gated states, each with its own honest caption.
+    enum E2EECloudEligibility: Equatable {
+        /// Signed in with cloud upload capability — a Cloud subscriber/trialist,
+        /// or any signed-in user on a paywall-off (pre-billing / dev) build.
+        case eligible
+        /// Not signed in — no account, so no cloud upload and no cloud copies.
+        case signedOut
+        /// Signed in without a cloud-capable plan (Local Pro, or lapsed).
+        case noCloudPlan
+        /// Signed in but offline/stale, so the plan can't be positively
+        /// confirmed — gated fail-closed (never mint a KEK on an unconfirmed
+        /// plan), but told apart from `noCloudPlan` so an offline Cloud payer is
+        /// never shown an "upgrade" prompt (mirrors the billing plan's grace).
+        case planUnconfirmed
+    }
+
+    /// Resolve E2EE cloud-eligibility from the auth signals the pane reads
+    /// (SCR-260). `cloudCapable` is the app's positive cloud signal
+    /// (`CloudAuthController.isSubscribed`, i.e. `tier == .cloud`, true during a
+    /// Cloud trial). The `!paywallEnabled` branch keeps pre-billing / dev builds
+    /// working: there `tier` is `.none` for everyone, so without it every
+    /// signed-in user would be gated. `planStale` (offline) is fail-closed but
+    /// kept distinct so an offline payer isn't told to upgrade.
+    static func e2eeEligibility(
+        isSignedIn: Bool,
+        cloudCapable: Bool,
+        planStale: Bool,
+        paywallEnabled: Bool
+    ) -> E2EECloudEligibility {
+        guard isSignedIn else { return .signedOut }
+        if !paywallEnabled { return .eligible }
+        if cloudCapable { return .eligible }
+        if planStale { return .planUnconfirmed }
+        return .noCloudPlan
+    }
+
+    /// What a tap on the E2EE toggle does, keyed on the runtime flag state and
+    /// (for the off→on path) cloud-eligibility.
+    /// `locked`: nil flag (older CLI without the `e2ee` verb, KTD-8) — the row
+    /// is non-interactive, regardless of eligibility. `showDisclosure`: the
+    /// off→on tap by an eligible user presents the R4 limits sheet INSTEAD of
+    /// flipping — the switch stays OFF and no CLI call fires until the user
+    /// confirms (cancel = dismiss, nothing else). `gated` (SCR-260): the off→on
+    /// tap by a non-cloud-capable user — non-interactive, no disclosure, no
+    /// KEK-creating write. `disable`: the on→off tap needs no disclosure and is
+    /// eligibility-independent (turning encryption off is always harmless, so a
+    /// since-lapsed user can still do it — R4).
     enum E2EETapOutcome: Equatable {
         case locked
         case showDisclosure
         case disable
+        case gated
     }
 
-    static func e2eeTapOutcome(cloudE2EEEnabled: Bool?) -> E2EETapOutcome {
+    static func e2eeTapOutcome(
+        cloudE2EEEnabled: Bool?,
+        eligibility: E2EECloudEligibility = .eligible
+    ) -> E2EETapOutcome {
         switch cloudE2EEEnabled {
         case .none: return .locked
         case .some(true): return .disable
-        case .some(false): return .showDisclosure
+        case .some(false): return eligibility == .eligible ? .showDisclosure : .gated
         }
     }
 
@@ -78,25 +127,46 @@ enum PrivacySettingsPolicy {
     }
 
     /// The caption under the E2EE row, honesty-gated per state (KTD-9/KD7):
-    /// nil → the stub copy (no capability claim at all); false → opt-in copy
-    /// that makes no claim about current uploads being encrypted; true → the
-    /// truthful scoped beta claim (per-Mac encryption active, no recovery).
-    /// Never "always on" or "shared · encrypted" — those unlock in later
-    /// stages, and PrivacySettingsPolicyTests string-asserts their absence.
-    static func e2eeCaption(cloudE2EEEnabled: Bool?) -> String {
+    /// nil → the stub copy (no capability claim at all); true → the truthful
+    /// scoped beta claim (multi-device encryption active, no recovery); false →
+    /// depends on eligibility (SCR-260): the eligible opt-in copy that makes no
+    /// claim about current uploads being encrypted, or the gated copy naming why
+    /// the row is unavailable (sign in / cloud plan / reconnect). No gated
+    /// caption claims current or available encryption, and none says "not
+    /// available" (the capability exists — it is gated). Never "always on" or
+    /// "shared · encrypted" in any state — those unlock later and
+    /// PrivacySettingsPolicyTests string-asserts their absence.
+    static func e2eeCaption(
+        cloudE2EEEnabled: Bool?,
+        eligibility: E2EECloudEligibility = .eligible
+    ) -> String {
         switch cloudE2EEEnabled {
         case .none: return PrivacySettingsCopy.e2eeSubStub
-        case .some(false): return PrivacySettingsCopy.e2eeSubOff
         case .some(true): return PrivacySettingsCopy.e2eeSubOn
+        case .some(false):
+            switch eligibility {
+            case .eligible: return PrivacySettingsCopy.e2eeSubOff
+            case .signedOut: return PrivacySettingsCopy.e2eeSubGatedSignedOut
+            case .noCloudPlan: return PrivacySettingsCopy.e2eeSubGatedNoPlan
+            case .planUnconfirmed: return PrivacySettingsCopy.e2eeSubGatedUnconfirmed
+            }
         }
     }
 
-    /// Hover help for the E2EE row — conditioned ("when on") so it stays
-    /// honest while the toggle is off.
-    static func e2eeHelp(cloudE2EEEnabled: Bool?) -> String {
-        cloudE2EEEnabled == nil
-            ? PrivacySettingsCopy.e2eeHelpStub
-            : PrivacySettingsCopy.e2eeHelpLive
+    /// Hover help for the E2EE row — conditioned ("when on") so it stays honest
+    /// while the toggle is off. nil → stub; a readable-flag row that is gated
+    /// (SCR-260, off + non-eligible) → gated help that names the cloud-plan
+    /// requirement instead of the "turn on to encrypt" live help, so the tooltip
+    /// never contradicts the gated caption.
+    static func e2eeHelp(
+        cloudE2EEEnabled: Bool?,
+        eligibility: E2EECloudEligibility = .eligible
+    ) -> String {
+        if cloudE2EEEnabled == nil { return PrivacySettingsCopy.e2eeHelpStub }
+        if cloudE2EEEnabled == false && eligibility != .eligible {
+            return PrivacySettingsCopy.e2eeHelpGated
+        }
+        return PrivacySettingsCopy.e2eeHelpLive
     }
 
     /// SCR-228: map a storage-migration refusal `reason` code to honest copy.
@@ -169,6 +239,15 @@ enum PrivacySettingsCopy {
     static let e2eeHelpStub = "Coming soon — SCR-220"
     static let e2eeHelpLive = "Beta — when on, new cloud copies are encrypted so only your Macs (signed in, with iCloud Keychain on) can decrypt them."
 
+    // SCR-260: the off→on enable path mints a synchronizable KEK, so it is gated
+    // on cloud-capability. The gated captions name why the row is unavailable
+    // without claiming current/available encryption and without "not available"
+    // (the capability exists — it is gated for this user, not absent).
+    static let e2eeSubGatedSignedOut = "Cloud copies need a cloud plan. Sign in with a Cloud subscription to encrypt future uploads from this Mac."
+    static let e2eeSubGatedNoPlan = "Cloud copies need a cloud plan. Encrypting future uploads is available on the Cloud subscription."
+    static let e2eeSubGatedUnconfirmed = "Couldn't confirm your plan while offline. Reconnect to turn on encryption for cloud copies."
+    static let e2eeHelpGated = "Encrypting cloud copies is available with a cloud plan."
+
     // R4: the limits disclosure that gates the off→on flip. The body must name
     // the custody and limits plainly BEFORE the user commits (SCR-253 U8,
     // KTD-6): the key syncs to the user's other Macs via iCloud Keychain — so
@@ -216,9 +295,11 @@ enum PrivacySettingsCopy {
     }
 
     /// Every row string for a given E2EE state, for the KTD-9/KD7 gate: the
-    /// E2EE strings are state-keyed, so the gate sweeps all three states —
-    /// no auto-pause claims while SCR-224 is open, and no later-stage E2EE
-    /// claims in any state.
+    /// E2EE strings are state-keyed, so the gate sweeps all three flag states —
+    /// plus the SCR-260 gated captions and gated help, which are eligibility-
+    /// keyed rather than flag-keyed and so are included unconditionally — no
+    /// auto-pause claims while SCR-224 is open, and no later-stage E2EE claims
+    /// in any state.
     static func allRowStrings(cloudE2EEEnabled: Bool?) -> [String] {
         [
             keepLocalTitle,
@@ -226,6 +307,8 @@ enum PrivacySettingsCopy {
             PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: cloudE2EEEnabled),
             PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: cloudE2EEEnabled),
             PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: cloudE2EEEnabled),
+            e2eeSubGatedSignedOut, e2eeSubGatedNoPlan, e2eeSubGatedUnconfirmed,
+            e2eeHelpGated,
             e2eeConfirmTitle, e2eeConfirmBody, e2eeConfirmAction,
             maskTitle, maskChip, maskSub, maskLink,
             pauseTitle, pauseSub,
