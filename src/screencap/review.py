@@ -38,6 +38,7 @@ failure leaves no reusable scrubbed dir.
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -425,7 +426,148 @@ def _read_inspect_blocked_intervals(
     )
 
 
-def prepare_review_data(name: str) -> dict:
+# ---------------------------------------------------------------------------
+# Clip-range scoping (SCR-219, U4)
+#
+# The Day timeline's clip range arrives as epoch **milliseconds**
+# (``currentDayMs`` / ``pendingSeekMs`` in Swift are epoch-seconds × 1000),
+# while the recording DB's action/window timestamps and the flat
+# ``screenshots/{ts}.jpg`` names are epoch **seconds**. ``_resolve_clip_range``
+# is the single conversion seam: ``None`` (whole-recording) or ``(start_s,
+# end_s)`` in the DB/screenshot space.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_clip_range(
+    clip_start_ms: int | None, clip_end_ms: int | None
+) -> tuple[float, float] | None:
+    """Normalize the optional clip bounds to ``(start_seconds, end_seconds)``.
+
+    Both bounds present → the half-open ``[start, end)`` window in epoch
+    seconds (the DB/screenshot space). Both absent → ``None`` (whole-recording,
+    today's behavior unchanged). Exactly one present is a caller contract error
+    — a partial range would silently fall back to a whole-recording review,
+    exactly the "reviews more than the user meant to clip" leak R7 forbids — so
+    it raises ``ReviewPrepareError``.
+    """
+    if clip_start_ms is None and clip_end_ms is None:
+        return None
+    if clip_start_ms is None or clip_end_ms is None:
+        raise ReviewPrepareError(
+            "clip range requires both clip_start_ms and clip_end_ms"
+        )
+    return (clip_start_ms / 1000.0, clip_end_ms / 1000.0)
+
+
+def _resolve_screenshots(
+    scrubbed_shots_dir: Path, clip_range: tuple[float, float] | None
+) -> list[str]:
+    """Resolve the masked-screenshot truth-set, filtered to the clip range.
+
+    Whole-recording (``clip_range is None``) returns every masked
+    ``screenshots/*.jpg`` — byte-for-byte today's behavior. A clip range keeps
+    only the frames whose timestamp lies in ``[start, end)`` (frames are named
+    ``{epoch_seconds}.jpg``); an unparseable name is dropped from a scoped set
+    (it cannot be proven in-range). An empty / absent dir yields ``[]``.
+    """
+    if not scrubbed_shots_dir.is_dir():
+        return []
+    paths = sorted(scrubbed_shots_dir.glob("*.jpg"))
+    if clip_range is not None:
+        from screencap.redaction.geometry import parse_screenshot_timestamp
+
+        start_s, end_s = clip_range
+        paths = [
+            p
+            for p in paths
+            if (ts := parse_screenshot_timestamp(p.name)) is not None
+            and start_s <= ts < end_s
+        ]
+    return [str(p.resolve()) for p in paths]
+
+
+def _scoped_clip_events(
+    scrubbed_dir: Path, rec_dir: Path, clip_range: tuple[float, float]
+) -> list[str]:
+    """Export the scrubbed events for ``[start, end)`` into a scoped JSONL.
+
+    Slices the SCRUBBED copy's ``recording.db`` via ``export_chunk_events``'s
+    half-open ``[start, end)`` selection (so the reviewed events are the exact
+    scrubbed set the upload path ships, just range-scoped) and writes them to a
+    dot-prefixed ``.clip_review_events.jsonl`` inside the scrubbed dir. The
+    dot-prefix keeps the scoped file out of both the ``events_*.jsonl`` glob a
+    later whole-recording review resolves and the upload dotfile filter.
+
+    Passes the sanctioned cloud window filter (``build_cloud_window_filter``,
+    ``cloud_bound=True`` → forces PUBLIC) belt-and-braces over the
+    already-scrubbed DB, satisfying the export-callsite privacy guard.
+    """
+    from screencap.enforcement.window_filter import build_cloud_window_filter
+    from screencap.export import export_chunk_events
+    from screencap.exporter import build_export_metadata, write_events_jsonl
+
+    start_s, end_s = clip_range
+    events = export_chunk_events(
+        scrubbed_dir,
+        start_s,
+        end_s,
+        window_filter=build_cloud_window_filter(
+            cloud_bound=True, capture_dir=rec_dir,
+        ),
+        materialized=True,
+    )
+    out_path = scrubbed_dir / ".clip_review_events.jsonl"
+    write_events_jsonl(out_path, events, build_export_metadata(exclude_moves=False))
+    return [str(out_path.resolve())]
+
+
+def _redaction_evidence_from_disk(scrubbed_dir: Path) -> dict:
+    """Rebuild the export-safe redaction evidence from the on-disk audit log.
+
+    Used only on the cache-reuse path, where no fresh ``ScrubResult`` is
+    produced. ``privacy_audit.json`` persists the per-decision ``entries``, the
+    ``blocked_intervals``, and the ``fail_closed`` markers in the SAME
+    export-safe shape ``_build_redaction_evidence`` emits, so the review keeps
+    its markers/intervals across a reuse. The per-entity ``summary`` (the
+    ``entity_counts`` tally) is NOT persisted in the audit log, so it degrades
+    to ``{}`` on reuse — an accepted, non-gating loss (the summary is optional
+    UI evidence; the consent set is the screenshots + in-range events). An
+    absent/unreadable audit log yields empty, matching a clean recording.
+    """
+    empty = {"summary": {}, "markers": [], "blocked_intervals": [], "fail_closed": []}
+    audit_path = scrubbed_dir / "privacy_audit.json"
+    if not audit_path.exists():
+        return empty
+    try:
+        data = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+
+    from screencap.privacy.actions import PrivacyAction
+
+    allow = PrivacyAction.ALLOW.value
+    entries = data.get("entries") or []
+    return {
+        "summary": {},
+        "markers": [
+            {"t": e.get("timestamp"), "category": e.get("reason", "")}
+            for e in entries
+            if e.get("action") != allow
+        ],
+        "blocked_intervals": data.get("blocked_intervals") or [],
+        "fail_closed": [
+            {"t": m.get("timestamp"), "surface": m.get("surface", "")}
+            for m in (data.get("fail_closed") or [])
+        ],
+    }
+
+
+def prepare_review_data(
+    name: str,
+    *,
+    clip_start_ms: int | None = None,
+    clip_end_ms: int | None = None,
+) -> dict:
     """Run the full review-data preparation pipeline for ``name``.
 
     Returns a JSON-serializable envelope. Raises ``ReviewPrepareError``
@@ -450,8 +592,30 @@ def prepare_review_data(name: str) -> dict:
     lock from corruption from an event-free recording. ``timing_error``
     (SCR-107) is kept as the back-compat boolean alias: ``True`` for both
     non-``"ok"`` states.
+
+    ``clip_start_ms`` / ``clip_end_ms`` (SCR-219, U4) optionally scope the
+    consent surface to a single clip's ``[start, end)`` range, in epoch
+    milliseconds (the Day-timeline space; the DB/screenshot timestamps are
+    epoch seconds, so they are divided by 1000). When both are present the
+    masked-screenshot truth-set and the events are filtered to the range and an
+    additive ``clip_video_capture_blocked_only: true`` honesty flag is emitted
+    (the exported clip video is capture-blocked but its in-window text is not
+    masked — the note the Swift consent surface renders). When both are absent
+    the envelope is byte-for-byte the whole-recording shape (no new key, no
+    filtering); passing exactly one is a contract error. The new field is
+    additive/optional — a Swift consumer must ignore it, never gate readiness on
+    it (see the review-data-nullable-timing learning).
+
+    Independently of the clip range, a fresh existing ``<name>-scrubbed`` (a
+    current ``.scrub_complete`` sentinel, reusable per the upload guard) is
+    REUSED — the whole-recording scrub is skipped (KTD4, blunting the cost of
+    re-scrubbing an N-hour recording per clip); its redaction evidence is then
+    rebuilt from the on-disk audit log (the per-entity ``summary`` degrades to
+    ``{}`` — it is not persisted — while markers/intervals survive).
     """
     from screencap.config import get_recordings_dir
+
+    clip_range = _resolve_clip_range(clip_start_ms, clip_end_ms)
 
     # Resolve the recording dir + prepare the local navigation video (shared
     # with inspect-data via _prepare_recording_video).
@@ -462,51 +626,69 @@ def prepare_review_data(name: str) -> dict:
     # reviewed are the bytes uploaded. All status/progress is forced to stderr
     # (the scrubber prints to its own stdout-bound console); stdout stays the
     # JSON envelope only. The ScrubResult is the redaction-evidence source.
-    from screencap.scrubber import recording_scrub_lock
+    from screencap.scrubber import is_scrubbed_copy_reusable, recording_scrub_lock
 
     recordings_root = get_recordings_dir()
+    # rec_dir is <root>/<name>; its sibling <name>-scrubbed is the cloud copy.
+    scrubbed_dir = rec_dir.parent / f"{name}-scrubbed"
 
     # Hold the per-recording scrub lock across the ENTIRE prepare critical
-    # section — export → recovery → scrub AND the scrubbed-dir read-back — so a
-    # concurrent re-scrub (a second review window, or `screencap upload`) can't
-    # mutate/delete the <name>-scrubbed dir between the scrub and the path
-    # resolution, yielding a torn read or a spurious failure (todo 005/006).
-    # _prepare_scrubbed_copy scrubs with _already_locked=True (we hold the lock;
-    # scrub_recording must not re-acquire it — a same-process flock would
-    # deadlock). The in-memory redaction evidence + the captured path lists are
-    # then assembled into the envelope after the lock is released.
+    # section — reuse-check → export → recovery → scrub AND the scrubbed-dir
+    # read-back — so a concurrent re-scrub (a second review window, or
+    # `screencap upload`) can't mutate/delete the <name>-scrubbed dir between the
+    # scrub and the path resolution, yielding a torn read or a spurious failure
+    # (todo 005/006). _prepare_scrubbed_copy scrubs with _already_locked=True (we
+    # hold the lock; scrub_recording must not re-acquire it — a same-process
+    # flock would deadlock). The in-memory redaction evidence + the captured path
+    # lists are then assembled into the envelope after the lock is released.
     with recording_scrub_lock(name):
-        scrub_result = _prepare_scrubbed_copy(name, rec_dir, _already_locked=True)
-        scrubbed_dir = scrub_result.output_dir
+        # Cache-reuse (KTD4): a fresh, current, upload-equivalent <name>-scrubbed
+        # is reused as-is — skip the whole-recording scrub (the exact reuse guard
+        # `screencap upload` and the terminal stage use). On reuse there is no
+        # fresh ScrubResult, so the redaction evidence is rebuilt from the
+        # on-disk audit log. Otherwise scrub as today.
+        if is_scrubbed_copy_reusable(rec_dir, scrubbed_dir):
+            console.print(
+                f"  Reusing fresh scrubbed copy at "
+                f"[dim]{scrubbed_dir.name}/[/dim] (skipping re-scrub)."
+            )
+            redaction = _redaction_evidence_from_disk(scrubbed_dir)
+        else:
+            scrub_result = _prepare_scrubbed_copy(name, rec_dir, _already_locked=True)
+            scrubbed_dir = scrub_result.output_dir
+            redaction = _build_redaction_evidence(scrub_result)
 
         # Defense-in-depth path containment before emitting any scrubbed path.
         _assert_within_recordings_root(scrubbed_dir, recordings_root)
 
-        # Resolve the event source to the scrubbed dir's ACTUAL file set
-        # (per-chunk when chunked — what ships). Faithfulness by construction:
-        # the review reads the same files the scrubbed dir contains.
-        event_files = _resolve_event_files(scrubbed_dir)
-        if not event_files:
-            # No event files survived (e.g. all were fail-closed deleted during
-            # scrub). Surface a clean, honest failure rather than an ok:true
-            # envelope with a null events_path — the latter would trip the Swift
-            # readiness guard into a generic "Failed to prepare recording."
-            raise ReviewPrepareError(
-                f"could not prepare review events: no reviewable events for {name}"
-            )
-        events_paths = [str(p.resolve()) for p in event_files]
+        if clip_range is not None:
+            # Clip-scoped consent (R7): the events are re-sliced from the scrubbed
+            # copy to [start, end) via export_chunk_events' half-open selection —
+            # nothing outside the clip reaches the consent set.
+            events_paths = _scoped_clip_events(scrubbed_dir, rec_dir, clip_range)
+        else:
+            # Resolve the event source to the scrubbed dir's ACTUAL file set
+            # (per-chunk when chunked — what ships). Faithfulness by construction:
+            # the review reads the same files the scrubbed dir contains.
+            event_files = _resolve_event_files(scrubbed_dir)
+            if not event_files:
+                # No event files survived (e.g. all were fail-closed deleted
+                # during scrub). Surface a clean, honest failure rather than an
+                # ok:true envelope with a null events_path — the latter would trip
+                # the Swift readiness guard into a generic "Failed to prepare
+                # recording." (A clip range is exempt: an empty in-range slice is
+                # a legitimate empty consent set, handled above.)
+                raise ReviewPrepareError(
+                    f"could not prepare review events: no reviewable events for {name}"
+                )
+            events_paths = [str(p.resolve()) for p in event_files]
 
-        # Scrubbed (masked) screenshots — the "what actually uploads" visual (R15).
-        scrubbed_shots_dir = scrubbed_dir / "screenshots"
-        screenshots = (
-            [str(p.resolve()) for p in sorted(scrubbed_shots_dir.glob("*.jpg"))]
-            if scrubbed_shots_dir.is_dir()
-            else []
-        )
+        # Scrubbed (masked) screenshots — the "what actually uploads" visual (R15),
+        # filtered to the clip range when one is present.
+        screenshots = _resolve_screenshots(scrubbed_dir / "screenshots", clip_range)
 
         # Evidence built while still holding the lock — _build_coverage globs the
-        # scrubbed dir for transcripts; _build_redaction_evidence is in-memory.
-        redaction = _build_redaction_evidence(scrub_result)
+        # scrubbed dir for transcripts.
         coverage = _build_coverage(scrubbed_dir, screenshots)
 
     # Timing metadata for the timeline pane's coordinate space, read from the
@@ -523,7 +705,7 @@ def prepare_review_data(name: str) -> dict:
     # consumers read — True for both non-"ok" states.
     started_at, duration_seconds, timing_status = _read_recording_timing(rec_dir)
 
-    return {
+    envelope = {
         "ok": True,
         "schema_version": REVIEW_SCHEMA_VERSION,
         "video_path": str(video_path.resolve()),
@@ -547,6 +729,15 @@ def prepare_review_data(name: str) -> dict:
         "timing_error": timing_status != "ok",
         "video_pixfmt_remediated": remediated,
     }
+    if clip_range is not None:
+        # Additive, clip-only honesty flag (KTD4): the exported clip video is
+        # capture-blocked (window-level) but its in-window on-screen text is NOT
+        # masked — less redacted than these preview screenshots — and it leaves
+        # to external recipients. Present (True) only for a clip; absent for a
+        # whole-recording review so that envelope stays byte-for-byte unchanged.
+        # Optional — the Swift consumer must not gate readiness on it.
+        envelope["clip_video_capture_blocked_only"] = True
+    return envelope
 
 
 def prepare_inspect_data(name: str) -> dict:

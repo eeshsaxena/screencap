@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Stable scene id for the per-recording review `WindowGroup`. Shared by the
 /// scene declaration in `ScreenCapApp` and the Library card's "Review &
@@ -24,6 +26,19 @@ struct ReviewWindow: View {
     @EnvironmentObject private var uploads: UploadCoordinator
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model: ReviewWindowViewModel
+    /// SCR-219 (U6): the local-file clip export. Owned here (not on the
+    /// viewmodel) because clip export is a distinct terminal action that bypasses
+    /// the entire upload machinery — no `AccountSheetPolicy`, no `UploadRegistry`,
+    /// no account (KTD5). Its published `state` drives a determinate progress
+    /// modal that is decoupled from the encode (never welded to an `await`).
+    @StateObject private var clipExport = ClipExportController()
+    /// Presents the clip-export progress/result modal. A plain `@State` bool the
+    /// modal binds to — the modal's CONTENT switches on `clipExport.state`, so
+    /// presentation stays decoupled from the long encode.
+    @State private var showClipExportSheet = false
+    /// The chosen output path, retained so a retry (after a retryable
+    /// `clip_busy`) re-exports to the same destination without re-prompting.
+    @State private var pendingClipOutPath: String?
 
     @State private var videoModel: VideoPlayerPaneModel?
     @State private var timelineEvents: [TimelineEvent] = []
@@ -162,7 +177,29 @@ struct ReviewWindow: View {
             // live is owned by AccountSheetView itself (it applies
             // `.interactiveDismissDisabled` while signInFlow is in progress).
         }
+        .sheet(isPresented: $showClipExportSheet) {
+            clipExportSheet
+                // Block interactive dismissal while the encode runs — Cancel is
+                // the only way out mid-export, so a stray Esc/drag can't strand
+                // an orphaned subprocess. Terminal states (succeeded / failed /
+                // cancelled) re-enable dismissal.
+                .interactiveDismissDisabled(clipExportIsRunning)
+        }
         .onDisappear {
+            // Window-close-as-cancel for an in-flight clip export: SIGTERM the
+            // child (U1's atomic write leaves no partial file). Safe-on-idle.
+            clipExport.cancel()
+            // SCR-219 (U6): drop any UN-consumed pending clip range for this
+            // recording on close. `loadReviewData` consumes+clears the entry on a
+            // FRESH open, but if this window was re-fronted by a later
+            // `openWindow(id:value:)` (same String key) the `.task` never re-ran,
+            // so a range set for that re-front lingers in the shared singleton and
+            // would silently push a LATER plain review of the same recording into
+            // clip mode. Clearing here guarantees a stranded range can't outlive
+            // the window. No-op when already consumed (entry is nil) and never
+            // races a fresh open — the Day-timeline overlay sets the entry
+            // immediately before `openWindow`, strictly AFTER this teardown.
+            ReviewWindowOpener.shared.pendingClipRange[recordingName] = nil
             model.windowDidClose()
             // Balance the active-upload count if the window closes mid-upload
             // (onChange won't fire after the view is gone).
@@ -308,6 +345,19 @@ struct ReviewWindow: View {
                 // with the distinct fail-closed callout (R14) separate beneath.
                 RedactionEvidenceView(redaction: data.redaction)
                 FailClosedCallout(redaction: data.redaction)
+                // SCR-219 (U6, KTD4): for a clip export the video LEAVES to
+                // external recipients and — unlike these masked screenshots — is
+                // only capture-blocked, not text-masked. Surface that prominently,
+                // adjacent to the preview frames. Gated on `isClipReview`
+                // (`model.clipRange != nil`) — the SAME single source of truth
+                // that gates the "Export clip" action below — so the honesty note
+                // can never desync from the Export action (e.g. an older/minimal
+                // review-data loader that omits `clip_video_capture_blocked_only`
+                // must NOT be able to offer Export without this note). The
+                // envelope flag alone is no longer sufficient nor required here.
+                if model.isClipReview {
+                    clipHonestyNote
+                }
                 Divider()
                 // The masked-screenshot truth view is the PRIMARY surface — it
                 // shows what actually uploads (R15). The local video beside it
@@ -326,7 +376,12 @@ struct ReviewWindow: View {
                         CoverageStrip(coverage: data.coverage)
                     }
                     Divider()
-                    localVideoPane(videoModel)
+                    // Same single source of truth as the honesty note + Export
+                    // action: `isClipReview` (not the envelope flag alone), so the
+                    // "not uploaded" label override can never desync — a clip
+                    // export always names the clip as the payload, even if an
+                    // older loader omits `clip_video_capture_blocked_only`.
+                    localVideoPane(videoModel, isClipExport: model.isClipReview)
                         .frame(width: 280)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -357,21 +412,25 @@ struct ReviewWindow: View {
         }
     }
 
-    /// The local navigation video with a persistent "not uploaded" label, so
-    /// the operator never mistakes it for the payload (R15).
-    private func localVideoPane(_ videoModel: VideoPlayerPaneModel) -> some View {
+    /// The local navigation video. For a whole-recording review it carries a
+    /// persistent "not uploaded" label so the operator never mistakes it for the
+    /// payload (R15). For a CLIP export (KTD4) that label is FALSE — the video is
+    /// exactly what leaves — so it is overridden to name the clip as the payload.
+    private func localVideoPane(_ videoModel: VideoPlayerPaneModel, isClipExport: Bool) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Image(systemName: "play.rectangle")
-                    .foregroundStyle(.secondary)
-                Text("Local preview — not uploaded")
+                Image(systemName: isClipExport ? "square.and.arrow.up" : "play.rectangle")
+                    .foregroundStyle(isClipExport ? Color.orange : Color.secondary)
+                Text(isClipExport
+                    ? "Clip preview — this video will be exported"
+                    : "Local preview — not uploaded")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isClipExport ? Color.orange : Color.secondary)
                 Spacer()
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(Color.secondary.opacity(0.08))
+            .background((isClipExport ? Color.orange : Color.secondary).opacity(0.12))
             Divider()
             VideoPlayerPane(model: videoModel)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -379,6 +438,160 @@ struct ReviewWindow: View {
                     currentTime = t
                 }
         }
+    }
+
+    // MARK: - Clip export (SCR-219 U6)
+
+    /// The prominent, honest note the clip consent surface shows adjacent to the
+    /// preview frames (KTD4): the exported video is capture-blocked but NOT
+    /// text-masked and carries the original, unredacted audio, and it leaves to
+    /// external recipients.
+    private var clipHonestyNote: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("The exported clip's video is not text-masked")
+                    .font(.callout.weight(.semibold))
+                Text("These preview frames are redacted, but the exported video "
+                    + "shows on-screen text that is not masked and includes the "
+                    + "original audio. Share this clip only with people you'd show "
+                    + "your screen to.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+    }
+
+    /// True while the clip export subprocess is running (drives the modal's
+    /// interactive-dismissal block).
+    private var clipExportIsRunning: Bool {
+        if case .exporting = clipExport.state { return true }
+        return false
+    }
+
+    /// The clip-export progress/result modal. Its content switches on
+    /// `clipExport.state`, so the modal is driven by published state changes and
+    /// is NOT welded to any `await` on the long encode (decoupling per the
+    /// HUD-teardown learning). Determinate progress (R10) + a Cancel that aborts
+    /// the encode; success offers reveal-in-Finder; failures are typed/retryable.
+    @ViewBuilder
+    private var clipExportSheet: some View {
+        VStack(spacing: 16) {
+            switch clipExport.state {
+            case .exporting(let progress):
+                VStack(spacing: 12) {
+                    if progress.framesTotal > 0 {
+                        ProgressView(value: progress.fraction) {
+                            Text("Exporting clip…").font(.headline)
+                        }
+                        .frame(width: 260)
+                        Text("\(progress.framesDone) of \(progress.framesTotal) frames")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView("Preparing clip…")
+                            .controlSize(.small)
+                    }
+                    Button("Cancel") {
+                        // Aborts the encode (SIGTERM). U1's atomic .tmp/os.replace
+                        // means no partial or delivered file — the modal dismisses
+                        // off the resulting `.cancelled` state below.
+                        clipExport.cancel()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                }
+            case .succeeded(let path):
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.largeTitle)
+                    Text("Clip exported").font(.headline)
+                    Text(URL(fileURLWithPath: path).lastPathComponent)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    HStack {
+                        Button("Show in Finder") { revealInFinder(path) }
+                        Button("Done") { showClipExportSheet = false }
+                            .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            case .failed(let failure):
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.octagon.fill")
+                        .foregroundStyle(.red)
+                        .font(.largeTitle)
+                    Text(failure.message)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("Close") { showClipExportSheet = false }
+                        if failure.retryable {
+                            Button("Try Again") { retryClipExport() }
+                                .keyboardShortcut(.defaultAction)
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+            case .idle, .cancelled:
+                // Transient — dismissed by the onChange below.
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 340)
+        .onChange(of: clipExport.state) { newState in
+            // A cancel aborts to `.cancelled`; dismiss the modal so the review
+            // window is usable again. Success/failure keep the modal up (they
+            // offer reveal / retry / close affordances).
+            if case .cancelled = newState { showClipExportSheet = false }
+        }
+    }
+
+    /// "Export clip" tapped: pick a destination, then spawn `screencap clip` via
+    /// `ClipExportController`. Deliberately does NOT call `attemptUpload` — no
+    /// account, no `AccountSheetPolicy`, no keychain prompt (KTD5).
+    private func beginClipExport() {
+        guard let range = model.clipRange else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.nameFieldStringValue = suggestedClipFilename()
+        panel.canCreateDirectories = true
+        panel.title = "Export clip"
+        panel.prompt = "Export"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        pendingClipOutPath = url.path
+        showClipExportSheet = true
+        clipExport.start(name: recordingName, range: range, outPath: url.path)
+    }
+
+    /// Retry a retryable failure (a transient `clip_busy`) against the same range
+    /// and destination the user already chose.
+    private func retryClipExport() {
+        guard let range = model.clipRange, let out = pendingClipOutPath else {
+            showClipExportSheet = false
+            return
+        }
+        clipExport.start(name: recordingName, range: range, outPath: out)
+    }
+
+    /// Reveal the exported clip in Finder (R5 delivery).
+    private func revealInFinder(_ path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// Default save-panel filename. A follow-up (per plan Outstanding Questions)
+    /// may enrich this with the moment label / timestamp.
+    private func suggestedClipFilename() -> String {
+        "\(recordingName)-clip.mp4"
     }
 
     /// The resolved review data for the current state, if any — drives the
@@ -403,9 +616,19 @@ struct ReviewWindow: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Upload") { attemptUpload() }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
+                if model.isClipReview {
+                    // SCR-219 (U6): clip export is a LOCAL file write — no
+                    // account, no `AccountSheetPolicy` gate (KTD5). `beginClipExport`
+                    // goes straight to the save panel + `screencap clip`, never
+                    // through `attemptUpload`, so no auth/keychain prompt fires.
+                    Button("Export clip") { beginClipExport() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Button("Upload") { attemptUpload() }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
             }
             .padding(12)
         case .uploading(let progress, _):
