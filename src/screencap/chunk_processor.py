@@ -15,7 +15,7 @@ import threading
 import time
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from screencap._flush import wait_for_writer_flush
 from screencap.pipeline_stages import StageArtifacts as _StageArtifacts
@@ -963,6 +963,7 @@ class ChunkProcessor:
             try:
                 self._transcribe_api(
                     api_key, audio_path, transcript_path, transcript_json_path,
+                    start_ts, end_ts,
                 )
                 return transcript_path
             except Exception as e:
@@ -974,8 +975,16 @@ class ChunkProcessor:
     def _transcribe_api(
         self, api_key: str, audio_path: Path,
         transcript_path: Path, transcript_json_path: Path,
+        start_ts: float, end_ts: float,
     ) -> None:
-        """Transcribe using OpenAI Whisper API."""
+        """Transcribe using OpenAI Whisper API.
+
+        Like the two local whisper backends, this drops muted-span speech and
+        inserts the ``[microphone muted]`` marker (SCR-218 U6) — without it, the
+        stop-latency audio the user muted would reach this cloud-bound backend's
+        transcript. Normalizes to the shared ``{text, segments}`` shape the other
+        backends write.
+        """
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key)
@@ -985,12 +994,35 @@ class ChunkProcessor:
                 file=f,
                 response_format="verbose_json",
             )
-        transcript_path.write_text(resp.text)
-        transcript_json_path.write_text(json.dumps(resp.model_dump(), indent=2))
+        transcript = (resp.text or "").strip()
+        segments = [
+            {
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "text": (seg.get("text") or "").strip(),
+            }
+            for seg in (resp.model_dump().get("segments") or [])
+        ]
+        transcript, segments = self._apply_muted_marker(
+            start_ts, end_ts, transcript, segments,
+        )
+        _save_transcript_quiet(
+            transcript, segments, transcript_path, transcript_json_path,
+        )
 
-    def _apply_muted_marker(self, start_ts, end_ts, transcript, segments):
+    def _apply_muted_marker(
+        self,
+        start_ts: float,
+        end_ts: float,
+        transcript: str,
+        segments: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Drop muted-span speech and insert the ``[microphone muted]`` marker
         for this chunk (SCR-218 U6).
+
+        Returns ``(transcript, segments)`` — text first, to match the caller's
+        ``transcript, segments = ...`` unpacking (note this reverses the
+        ``(segments, text)`` order of the underlying transform).
 
         Reads the local-only ``muted_intervals`` overlapping the chunk span and
         rewrites the whisper segments so no speech captured while muted (or in

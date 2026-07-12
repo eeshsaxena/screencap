@@ -24,10 +24,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from screencap._stderr_events import EVENT_AUDIO_MUTED, EVENT_AUDIO_UNMUTED
+
 StreamFactory = Callable[[], Any]
 
-EVENT_MUTED = "audio_muted"
-EVENT_UNMUTED = "audio_unmuted"
+# Single-source the event names from _stderr_events (which documents them as the
+# rename-in-one-place constants); a local literal would reintroduce the drift.
+EVENT_MUTED = EVENT_AUDIO_MUTED
+EVENT_UNMUTED = EVENT_AUDIO_UNMUTED
 
 
 class AudioStreamController:
@@ -56,21 +60,30 @@ class AudioStreamController:
         changed, or ``None`` when already in the requested state. Raises if
         acquiring the device on unmute fails (e.g. denied mic); the controller
         stays not-capturing so the recording remains muted.
+
+        ``_muted`` is updated only *after* the transition succeeds — a raised
+        device-open on unmute leaves ``_muted`` at its prior (muted) value, so
+        internal state never claims "unmuted" while the mic is actually silent.
         """
-        self._muted = bool(muted)
+        muted = bool(muted)
         if muted:
             if self._capturing:
                 self._stream.stop()
                 self._capturing = False
+                self._muted = True
                 return EVENT_MUTED
+            self._muted = True
             return None
-        # Unmute: acquire lazily on first use, then start.
+        # Unmute: acquire lazily on first use, then start. If _make_stream raises,
+        # _muted is left unchanged (still muted) — no partial "unmuted" state.
         if not self._capturing:
             if self._stream is None:
                 self._stream = self._make_stream()  # opens the device (may raise)
             self._stream.start()
             self._capturing = True
+            self._muted = False
             return EVENT_UNMUTED
+        self._muted = False
         return None
 
     def shutdown(self) -> None:

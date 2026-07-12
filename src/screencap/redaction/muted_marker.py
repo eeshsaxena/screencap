@@ -4,15 +4,24 @@ When the mic is muted mid-recording the capture stream stops, so a chunk's FLAC
 holds only the *unmuted* audio — a shorter file with the muted spans removed.
 Whisper's segment timestamps are therefore in *compressed* FLAC time. This
 module maps them back to wall-clock, drops the speech captured in the
-stop/start-latency window (so nothing the user muted reaches the transcript —
-and, for cloud recordings, the cloud), and inserts an explicit marker over each
-muted span.
+stop/start-latency window, and inserts an explicit marker over each muted span,
+so no muted speech reaches the **transcript** (and, since scrubbed transcripts
+are cloud-bound, the transcript that reaches the cloud).
+
+Scope note: this protects the *transcript* only. The raw ``audio_NNNN.flac`` is
+uploaded unscrubbed for cloud recordings, so the ~100 ms of audio captured
+between the mute command and the actual stream stop still lands in that FLAC.
+Genuinely-muted audio never reaches the cloud (the stream was stopped, so it was
+never captured), but trimming that latency sliver from the cloud-bound FLAC is a
+separate capture-side concern (see the SCR-218 follow-up).
 
 The exact FLAC-gap boundaries are not recorded (only the ``muted_intervals``
 command/confirm times are), so the drop uses a small guard margin around each
-span to conservatively remove boundary-latency audio. Precise sample-accurate
-alignment against real whisper output is validated in hardware capture QA; the
-coordinate logic here is unit-tested with controlled inputs.
+span to conservatively remove boundary-latency audio. The guard is symmetric,
+which can drop up to ~guard seconds of legitimate speech at each unmute edge —
+a deliberate privacy-first trade-off. Precise sample-accurate alignment against
+real whisper output is validated in hardware capture QA; the coordinate logic
+here is unit-tested with controlled inputs.
 """
 
 from __future__ import annotations

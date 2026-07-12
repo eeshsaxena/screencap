@@ -27,6 +27,8 @@ import pytest
         ("EVENT_SUBSCRIBED", "subscribed"),
         ("EVENT_CAPTURE_UNHEALTHY", "capture_unhealthy"),
         ("EVENT_CAPTURE_RECOVERED", "capture_recovered"),
+        ("EVENT_AUDIO_MUTED", "audio_muted"),
+        ("EVENT_AUDIO_UNMUTED", "audio_unmuted"),
     ],
 )
 def test_daemon_bus_event_type_constants_are_exported(name: str, expected: str) -> None:

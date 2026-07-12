@@ -147,6 +147,14 @@ def test_all_none_snapshot_fields_keep_symmetric_envelope_shape() -> None:
                 "final_state": "stopped",
             },
         ),
+        (
+            schema.RecordingMuteResponse,
+            {
+                "schema_version": schema._RECORDING_MUTE_API_VERSION,
+                "muted": True,
+                "cursor": 3,
+            },
+        ),
     ],
 )
 def test_response_models_serialize_with_envelope_keys(model_type: type, payload: dict) -> None:
