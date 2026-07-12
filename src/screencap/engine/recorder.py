@@ -2718,13 +2718,17 @@ def _apply_audio_mute_command(
         ts = utils.get_timestamp()
 
     if muted:
-        event = controller.apply_muted(True)
-        if event is not None:
-            # Stream genuinely stopped: open the span (start_ts = command
-            # receipt, so it over-covers the stop latency) and confirm.
+        # KTD3: open the interval BEFORE stopping the stream, so the row is
+        # durable at command receipt and over-covers the stop latency even if a
+        # later step fails — we must never stop capture leaving the over-cover
+        # audio with no interval to drop it. Only when actually capturing;
+        # otherwise this is an idempotent no-op with no interval.
+        if controller.capturing:
             crud.open_muted_interval(session, recording, ts)
+            event = controller.apply_muted(True)
             emit(EVENT_AUDIO_MUTED, muted=True)
-        return event
+            return event
+        return controller.apply_muted(True)  # already muted — no-op, no interval
 
     # Unmute may (re)acquire the device, which can fail (denied / unavailable).
     try:
@@ -3010,9 +3014,29 @@ def record_audio(
         except Exception:  # noqa: BLE001 — a bad toggle must not crash audio.
             logger.exception("record_audio: mute command failed")
 
-    # Teardown: stop/close the stream and close any span left open by a
-    # teardown-while-muted (U3). ``close_muted_interval`` is a no-op when
-    # nothing is open, so only bother when a toggle was ever processed.
+    # Teardown: a mute forwarded as we were leaving the poll loop may still be
+    # sitting in the queue (the engine-main handler can enqueue right up to the
+    # moment the daemon tears the engine down). Drain and apply it BEFORE
+    # shutting the stream, so audio between the mute press and shutdown is still
+    # recorded as muted rather than captured unmarked (the muted-spans-hold-no-
+    # audio invariant; a bare terminate check would drop the queued command).
+    if mute_control_q is not None:
+        while True:
+            try:
+                msg = mute_control_q.get_nowait()
+            except Exception:
+                break
+            _mute_used = True
+            try:
+                _apply_audio_mute_command(
+                    controller, msg, session=_mute_session(), recording=recording,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("record_audio: draining mute command on teardown failed")
+
+    # Stop/close the stream and close any span left open by a teardown-while-
+    # muted (U3). ``close_muted_interval`` is a no-op when nothing is open, so
+    # only bother when a toggle was ever processed.
     controller.shutdown()
     if _mute_used:
         try:

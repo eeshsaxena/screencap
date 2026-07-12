@@ -362,6 +362,59 @@ class TestRecordAudioIntegration:
     @patch("screencap.engine.recorder.crud")
     @patch("screencap.engine.recorder.get_session_for_path")
     @patch("screencap.engine.recorder.utils")
+    def test_queued_mute_is_drained_on_teardown(
+        self, mock_utils, mock_get_session, mock_crud, tmp_path,
+    ):
+        """A mute forwarded as the poll loop is exiting (terminate already set)
+        must still be applied on teardown (SCR-254 review finding): the queued
+        command opens a muted_interval so audio between the mute press and
+        shutdown is recorded as muted, not captured unmarked."""
+        import multiprocessing
+
+        from screencap.engine.recorder import record_audio
+        from screencap.engine.db.models import Recording
+
+        mock_utils.set_start_time = MagicMock()
+        mock_utils.get_timestamp.return_value = 1000.0
+
+        db_path = str(tmp_path / "recording.db")
+        Path(db_path).touch()
+
+        recording = MagicMock(spec=Recording)
+        recording.timestamp = 1000.0
+        recording.id = 1
+
+        terminate = multiprocessing.Event()
+        started = multiprocessing.Event()
+        mute_q = multiprocessing.Queue()
+        # A mute the engine-main handler forwarded during teardown.
+        mute_q.put({"muted": True, "ts": 1000.5})
+
+        def mock_input_stream(callback, samplerate, channels):
+            m = MagicMock()
+            m.samplerate = SAMPLERATE
+            m.start = MagicMock()
+            m.stop = MagicMock()
+            m.close = MagicMock()
+            return m
+
+        with patch("sounddevice.InputStream", side_effect=mock_input_stream):
+            # Terminate BEFORE the call: the poll loop exits immediately without
+            # consuming the queued command — only the teardown drain can apply it.
+            terminate.set()
+            record_audio(
+                recording, db_path, terminate, started,
+                mute_control_q=mute_q, initially_muted=False,
+            )
+
+        # The drained mute opened an interval at the command ts (audio recorded
+        # as muted, not leaked). Without the teardown drain this never fires.
+        assert mock_crud.open_muted_interval.called
+        assert mock_crud.open_muted_interval.call_args.args[-1] == 1000.5
+
+    @patch("screencap.engine.recorder.crud")
+    @patch("screencap.engine.recorder.get_session_for_path")
+    @patch("screencap.engine.recorder.utils")
     def test_duration_matches_expected(
         self, mock_utils, mock_get_session, mock_crud, tmp_path,
     ):

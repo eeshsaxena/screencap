@@ -833,8 +833,8 @@ final class RecorderController: ObservableObject {
             // ADVISORY, NON-terminal (KTD4/R3): the engine could not acquire the
             // mic on unmute, so the recording keeps running MUTED. Clear the pending
             // flag, keep `muted = true`, and surface a non-terminal advisory so the
-            // failure is never silent. (Not emitted by the current engine build —
-            // handled defensively so the app is ready when the engine adds it.)
+            // failure is never silent. Emitted by the engine on a denied/failed
+            // unmute (recorder.py _apply_audio_mute_command -> audio_unmute_failed).
             muteInFlight = false
             muted = true
             if case .recording = state {
@@ -997,11 +997,21 @@ final class RecorderController: ObservableObject {
         case .authorized:
             dispatchMuteRequest(false)
         case .notDetermined:
+            // Arm the in-flight guard for the whole permission-prompt window so a
+            // second tap can't re-enter beginUnmute and fire a duplicate
+            // requestAccess (toggleMute gates on !muteInFlight). Cleared on
+            // grant -> dispatch (which re-arms it), on denial
+            // (surfaceMicUnmuteDenied clears it), or if the recording ended while
+            // the prompt was up.
+            muteInFlight = true
             Task { [weak self] in
                 guard let self else { return }
                 let granted = await self.micAuthorizer.requestAccess()
                 // The recording may have ended while the prompt was up.
-                guard self.state.isRecording else { return }
+                guard self.state.isRecording else {
+                    self.muteInFlight = false
+                    return
+                }
                 if granted {
                     self.dispatchMuteRequest(false)
                 } else {
@@ -1048,6 +1058,10 @@ final class RecorderController: ObservableObject {
     /// advisory is set too as a persistent trace for the menu dropdown / restored
     /// window after the modal is dismissed.
     private func surfaceMicUnmuteDenied(source: MuteToggleSource) {
+        // A denial ends the toggle: clear any in-flight guard armed for the
+        // permission-prompt window (harmless no-op on the already-denied path,
+        // which never armed it).
+        muteInFlight = false
         if case .recording = state {
             captureAdvisory = Self.microphoneAccessDeniedAdvisory
         }
