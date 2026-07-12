@@ -212,6 +212,59 @@ final class RecallPaletteStateTests: XCTestCase {
         )
     }
 
+    // MARK: - Empty-state copy + CTAs (SCR-261 U2)
+
+    func testNoMatchesEmptyKeepsLegacyCopyVerbatim() {
+        let spec = RecallPaletteContent.emptySpec(for: .noMatches)
+        XCTAssertEqual(spec.icon, "magnifyingglass")
+        XCTAssertEqual(spec.title, "No matches on this Mac")
+        XCTAssertEqual(
+            spec.note,
+            "Try different words, an app name, or a time like \u{201C}yesterday afternoon\u{201D}."
+        )
+        XCTAssertNil(spec.cta, "the genuine no-matches state carries no CTA")
+    }
+
+    func testConsentNeededEmptyOffersTurnOn() {
+        let spec = RecallPaletteContent.emptySpec(for: .consentNeeded)
+        XCTAssertEqual(
+            spec.cta,
+            .enableConsent(title: "Turn on", hint: "Turns on on-screen text indexing.")
+        )
+        // Honest phrasing: the indexing state, never "wasn't searched" — a
+        // stale index may well have been searched.
+        XCTAssertTrue(spec.title.contains("isn't being indexed"))
+    }
+
+    func testConsentDeclinedEmptyRendersNoButton() {
+        XCTAssertNil(
+            RecallPaletteContent.emptySpec(for: .consentDeclined).cta,
+            "the user said no — no nagging CTA"
+        )
+    }
+
+    func testNotIndexedEmptyCTAFollowsAvailability() {
+        XCTAssertEqual(
+            RecallPaletteContent.emptySpec(for: .notIndexed(ctaAvailable: true)).cta,
+            .startBackfill(title: "Index now", hint: "Starts indexing your recordings.")
+        )
+        XCTAssertNil(
+            RecallPaletteContent.emptySpec(for: .notIndexed(ctaAvailable: false)).cta,
+            "the backfill section owns the ask"
+        )
+    }
+
+    func testUnavailableEmptyReusesRetryAndDegradedDoesNot() {
+        XCTAssertEqual(
+            RecallPaletteContent.emptySpec(for: .unavailable).cta,
+            .retry(hint: "Searches again now.")
+        )
+        XCTAssertNil(
+            RecallPaletteContent.emptySpec(for: .degraded).cta,
+            "degraded means a search did run"
+        )
+    }
+
     // MARK: - Grouping
 
     func testGroupsByDayNewestFirstWithUnanchoredTrailing() {
@@ -341,6 +394,7 @@ final class RecallPaletteStateTests: XCTestCase {
         _ phase: SearchViewModel.Phase,
         consentDeclined: Bool = false,
         backfillState: SearchViewModel.BackfillUIState = .hidden,
+        contentIndexEnabled: Bool? = nil,
         recents: [String] = []
     ) -> ViewHost.Hosted {
         ViewHost.host(
@@ -348,6 +402,7 @@ final class RecallPaletteStateTests: XCTestCase {
                 phase: phase,
                 consentDeclined: consentDeclined,
                 backfillState: backfillState,
+                contentIndexEnabled: contentIndexEnabled,
                 recentSearches: recents,
                 queryTerms: [],
                 selectedResultID: nil,
@@ -376,6 +431,36 @@ final class RecallPaletteStateTests: XCTestCase {
             XCTAssertTrue(
                 ViewHost.rendersVisibleContent(in: hosted),
                 "palette variant must not render blank"
+            )
+        }
+    }
+
+    // SCR-261 U2 — every empty cause renders its own honest body; none may
+    // render blank.
+    func testEachEmptyCauseRendersVisibleContent() {
+        let notIndexed = SearchFixtures.emptyResults(screen: .notIndexed)
+        for hosted in [
+            // consentNeeded: indexing off, not declined — the Turn-on ask.
+            host(.loaded(notIndexed), contentIndexEnabled: false),
+            // consentDeclined: button-free notice.
+            host(.loaded(notIndexed), consentDeclined: true, contentIndexEnabled: false),
+            // notIndexed, body CTA available (backfill section hidden).
+            host(.loaded(notIndexed), contentIndexEnabled: true),
+            // notIndexed, CTA stood down — the backfill section owns the ask.
+            host(.loaded(notIndexed), backfillState: .offering, contentIndexEnabled: true),
+            // unavailable → Retry.
+            host(.loaded(SearchFixtures.emptyResults(screen: .empty, audio: .unavailable)),
+                 contentIndexEnabled: true),
+            // degraded — softer, no CTA.
+            host(.loaded(SearchFixtures.emptyResults(screen: .degraded)),
+                 contentIndexEnabled: true),
+            // notIndexed + a different stream unavailable → the secondary note.
+            host(.loaded(SearchFixtures.emptyResults(screen: .notIndexed, audio: .unavailable)),
+                 contentIndexEnabled: true),
+        ] {
+            XCTAssertTrue(
+                ViewHost.rendersVisibleContent(in: hosted),
+                "empty-cause variant must not render blank"
             )
         }
     }
