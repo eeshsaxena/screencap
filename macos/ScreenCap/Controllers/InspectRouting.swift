@@ -23,8 +23,8 @@ enum InspectRouting {
     static func decide(recording: String, anchorMs: Int?, isStub: Bool) -> InspectOpenDecision {
         guard !isStub else {
             return .unavailable(
-                message: "This recording was uploaded and the local copy was deleted. "
-                    + "Run `screencap download \(recording)` to retrieve it."
+                message: "This recording (\(recording)) was uploaded and the local copy was "
+                    + "deleted. Retrieving it locally requires the developer CLI."
             )
         }
         return .open(recording: recording, seekMs: anchorMs)

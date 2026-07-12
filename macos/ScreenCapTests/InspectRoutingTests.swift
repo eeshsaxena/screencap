@@ -14,10 +14,10 @@ final class InspectRoutingTests: XCTestCase {
         guard case .unavailable(let message) = decision else {
             return XCTFail("a stub must not open inspect, got \(decision)")
         }
-        // The message names the recording and the recovery command (parity with
+        // The message names the recording and the recovery path (parity with
         // the Recordings-list guard), regardless of any seek the tap carried.
         XCTAssertTrue(message.contains("rec-2026-06-26-001"))
-        XCTAssertTrue(message.contains("screencap download"))
+        XCTAssertTrue(message.contains("developer CLI"))
     }
 
     func testAnchoredNonStubOpensInspectWithSeek() {
