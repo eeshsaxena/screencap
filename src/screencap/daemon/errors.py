@@ -9,6 +9,7 @@ from screencap.daemon.schema import envelope
 
 LOCK_CONTENDED = "lock_contended"
 NOT_OWNED_BY_DAEMON = "not_owned_by_daemon"
+NOT_RECORDING = "not_recording"
 SCHEMA_MISMATCH = "schema_mismatch"
 SLOW_CONSUMER = "slow_consumer"
 CURSOR_UNKNOWN = "cursor_unknown"
@@ -272,6 +273,17 @@ class NotOwnedByDaemonError(DaemonAPIError):
             schema_version=self.schema_version,
             hint=self.hint,
         )
+
+
+class NotRecordingError(DaemonAPIError):
+    """No daemon-owned recording is in progress (SCR-218).
+
+    Returned by ``recording.mute`` when there is no live engine to forward the
+    command to — a mute that raced a stop, or a spurious call while idle.
+    """
+
+    error_code = NOT_RECORDING
+    http_status = 409
 
 
 class StorageMigrationError(DaemonAPIError):
@@ -575,6 +587,7 @@ class SubscriptionRequiredError(DaemonAPIError):
 __all__ = [
     "LOCK_CONTENDED",
     "NOT_OWNED_BY_DAEMON",
+    "NOT_RECORDING",
     "SCHEMA_MISMATCH",
     "SLOW_CONSUMER",
     "CURSOR_UNKNOWN",
@@ -608,6 +621,7 @@ __all__ = [
     "DaemonAPIError",
     "LockContendedError",
     "NotOwnedByDaemonError",
+    "NotRecordingError",
     "SchemaMismatchError",
     "SlowConsumerError",
     "CursorUnknownError",

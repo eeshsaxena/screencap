@@ -13,6 +13,9 @@ _EVENTS_API_VERSION = 1
 _RECORDING_START_API_VERSION = 1
 RECORDING_START_API_VERSION = _RECORDING_START_API_VERSION  # public alias
 _RECORDING_STOP_API_VERSION = 1
+# SCR-218 mid-recording mic mute. Additive (new verb) — no global
+# API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
+_RECORDING_MUTE_API_VERSION = 1
 _PERMISSION_REQUEST_API_VERSION = 1
 # SCR-200 identity-scoped decoy/orphan TCC cleanup verb. Additive (new verb) — no
 # global API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
@@ -88,6 +91,8 @@ _MODEL_NAMES = {
     "RecordingStartRequest",
     "RecordingStartResponse",
     "RecordingStopRequest",
+    "RecordingMuteRequest",
+    "RecordingMuteResponse",
     "RecordingStopResponse",
     "PermissionRequestRequest",
     "PermissionRequestResponse",
@@ -238,6 +243,10 @@ def _load_models() -> dict[str, Any]:
         # Phase 2 U2: server-derived provenance classification.
         # Populated for daemon-owned sessions; None otherwise.
         started_by: str | None = None
+        # SCR-218 U5: confirmed mic mute state. Absent until the first confirmed
+        # mute event (additive, back-compat) — a missing value means unmuted, so
+        # a stale daemon and a pre-first-mute recording both read as audio-on.
+        muted: bool = False
         cursor: int
 
     class RecordingStartRequest(_DaemonModel):
@@ -299,6 +308,21 @@ def _load_models() -> dict[str, Any]:
     class RecordingStopResponse(EnvelopeResponse):
         stopped: bool
         final_state: str
+
+    class RecordingMuteRequest(_DaemonModel):
+        # SCR-218: absolute desired mic state (True=muted). Absolute rather than
+        # a toggle so a dropped/retried request can never desync app vs engine.
+        muted: bool
+
+    class RecordingMuteResponse(EnvelopeResponse):
+        # Echoes the REQUESTED state for transport bookkeeping only. The app must
+        # NOT treat this as confirmation — confirmed mute state arrives on the
+        # events stream / snapshot after the engine actually stops capture (KTD4).
+        muted: bool
+        # Bus cursor captured BEFORE forwarding, so the app can subscribe to
+        # /v0/events?since=<cursor> without missing the confirming audio_muted /
+        # audio_unmuted event (late-listener-replay learning).
+        cursor: int
 
     class PermissionRequestRequest(_DaemonModel):
         """On-demand daemon-driven registration request (U8).
@@ -814,6 +838,8 @@ def _load_models() -> dict[str, Any]:
         "RecordingStartResponse": RecordingStartResponse,
         "RecordingStopRequest": RecordingStopRequest,
         "RecordingStopResponse": RecordingStopResponse,
+        "RecordingMuteRequest": RecordingMuteRequest,
+        "RecordingMuteResponse": RecordingMuteResponse,
         "PermissionRequestRequest": PermissionRequestRequest,
         "PermissionRequestResponse": PermissionRequestResponse,
         "ContentSearchRequest": ContentSearchRequest,

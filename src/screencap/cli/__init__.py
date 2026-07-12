@@ -321,6 +321,14 @@ def _engine_worker_cmd(encoded_args: str) -> None:
     for q in queues:
         threading.Thread(target=drain_queue, args=(q,), daemon=True).start()
 
+    # SCR-218 U1: start the daemon->engine stdin control-channel reader. It
+    # dispatches NDJSON commands (e.g. ``set_muted``) to handlers the recording
+    # subsystem registers once it comes up; commands for an unregistered type
+    # are dropped, so starting it before run_recording_worker is safe.
+    from screencap.engine import control_channel
+
+    control_channel.start_reader_thread()
+
     emit_event(EVENT_STARTED, claimant=CLAIMANT_DAEMON)
     run_recording_worker(args)
 

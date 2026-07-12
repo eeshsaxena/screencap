@@ -436,6 +436,42 @@ class WindowGeometryCaptureFailure(Base):
     detail = sa.Column(sa.Text, nullable=True)
 
 
+class MutedInterval(Base):
+    """A span during which the microphone was muted mid-recording (SCR-218 U3).
+
+    The recording HUD's Mute control stops mic capture live; each muted span is
+    recorded here as ``[start_ts, end_ts]`` in recording-relative wall-clock
+    time. The row is OPENED at the mute command (``end_ts`` NULL) so it
+    over-covers the ~100 ms stop latency, and CLOSED at unmute. An interval left
+    open by a crash/teardown (``end_ts`` NULL) is treated downstream (U6) as
+    muted to the end of its chunk.
+
+    Consumed at transcribe time (U6) to drop the real speech captured in the
+    stop-latency window and to place the ``[microphone muted]`` marker.
+
+    Local-only by rule (R8): it lives in ``recording.db``, which is never
+    uploaded, so the record of *when* the user muted never leaves the machine.
+    Writes are unbuffered + immediate-commit (mirroring
+    ``insert_window_geometry_capture_failure``) so a muted span is durable
+    before any subsequent crash.
+    """
+
+    __tablename__ = "muted_intervals"
+    __table_args__ = (
+        sa.Index("ix_muted_intervals_recording_start", "recording_id", "start_ts"),
+    )
+
+    id = sa.Column(sa.Integer, primary_key=True)
+    recording_id = sa.Column(
+        sa.ForeignKey("recording.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Recording-relative wall-clock (``utils.get_timestamp()``) at mute / unmute.
+    start_ts = sa.Column(ForceFloat, nullable=False, index=True)
+    # NULL while muted (open interval); set on unmute or teardown-close.
+    end_ts = sa.Column(ForceFloat, nullable=True)
+
+
 class MemoryStat(Base):
     """Class representing a memory usage statistic in the database."""
 
