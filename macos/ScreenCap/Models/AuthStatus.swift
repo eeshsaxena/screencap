@@ -98,6 +98,15 @@ enum AuthStatus: Equatable {
         return false
     }
 
+    /// True when signed in but the last refresh couldn't confirm identity
+    /// (offline): the credential exists but `whoami` returned `stale: true`.
+    /// SCR-260's eligibility gate reads this to fail-closed on an unconfirmed
+    /// plan without mistaking an offline payer for signed-out.
+    var isStale: Bool {
+        if case .signedIn(_, _, let stale) = self { return stale }
+        return false
+    }
+
     /// Account identifier for the menu line — email preferred, uid as the
     /// fallback. Nil when signed out, or signed-in-but-stale with no cached
     /// identity (the view shows an "offline" label in that case).

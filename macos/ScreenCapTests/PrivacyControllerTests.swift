@@ -603,7 +603,8 @@ final class PrivacyControllerTests: XCTestCase {
         XCTAssertNil(controller.cloudE2EEEnabled)
         XCTAssertEqual(
             PrivacySettingsPolicy.e2eeTapOutcome(
-                cloudE2EEEnabled: controller.cloudE2EEEnabled
+                cloudE2EEEnabled: controller.cloudE2EEEnabled,
+                eligibility: .eligible
             ),
             .locked
         )
@@ -625,7 +626,8 @@ final class PrivacyControllerTests: XCTestCase {
         // The off→on tap is a disclosure, not a flip.
         XCTAssertEqual(
             PrivacySettingsPolicy.e2eeTapOutcome(
-                cloudE2EEEnabled: controller.cloudE2EEEnabled
+                cloudE2EEEnabled: controller.cloudE2EEEnabled,
+                eligibility: .eligible
             ),
             .showDisclosure
         )
