@@ -233,6 +233,12 @@ class RecordingInfo(NamedTuple):
     size_bytes: int = 0
     summary: str | None = None
     title: str = ""
+    # U2 (editable titles): True when `title` is a user-set rename
+    # (recording.title), False when it is the derived date/time default. Mirrored
+    # EXACTLY onto daemon.schema.RecordingSummary — recording.list asserts the two
+    # field sets match, so this must be added there too. Additive on the wire —
+    # Swift decodes it as optional and treats absent as not-user-set.
+    title_is_user_set: bool = False
     state: Literal["recording", "processing", "ready"] = "ready"
     recording_id: str | None = None
     # SCR-220 (KTD-4): the FROZEN per-recording E2EE bit from .recording_intent
@@ -320,6 +326,27 @@ def _humanize_name(name: str) -> str:
     if not words:
         return name
     return " ".join(w[:1].upper() + w[1:] for w in words)
+
+
+def _default_title(started_at: float | None, name: str) -> str:
+    """A friendly date/time default title for a recording without a user rename (U2).
+
+    When no user title is set, cards/HUD show a stable, human-readable stamp built
+    from the capture start epoch seconds — ``"Recording · Jul 12, 2:30 PM"`` (the
+    leading zero is stripped from the 12-hour clock hour so it reads naturally).
+    Dependency-light: pure ``datetime`` formatting, no locale or third-party import.
+
+    Falls back to :func:`_humanize_name` of the directory ``name`` when
+    ``started_at`` is falsy/None (a legacy dir whose DB carries no start row), so
+    those still get the humanized slug rather than an empty or bogus label.
+    """
+    if not started_at:
+        return _humanize_name(name)
+    dt = datetime.fromtimestamp(started_at)
+    # `%I` is the zero-padded 12-hour clock; strip the pad so "02:30 PM" reads
+    # "2:30 PM". `dt.day` (an int) avoids a leading zero on the day of month.
+    clock = dt.strftime("%I:%M %p").lstrip("0")
+    return f"Recording · {dt.strftime('%b')} {dt.day}, {clock}"
 
 
 def read_recording_id(directory: Path) -> str | None:
@@ -793,6 +820,18 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
         # `task_description` here would just block up to the 500ms busy_timeout
         # on every scan without yielding a summary. Skip it.
         summary = None if is_active else _read_task_description(db)
+        # U2 (editable titles): the user-set rename wins when present; skip the
+        # read while the recording is active (the writer holds the DB lock, same
+        # rationale as `summary`). Absent → a friendly date/time default derived
+        # from the capture start (falls back to the humanized dir name for a
+        # legacy row with no start timestamp).
+        user_title = None if is_active else _read_user_title(db)
+        if user_title:
+            title = user_title
+            title_is_user_set = True
+        else:
+            title = _default_title(started, d.name)
+            title_is_user_set = False
 
         results.append(
             RecordingInfo(
@@ -815,7 +854,8 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
                 upload_warning=upload_warning,
                 size_bytes=total_bytes,
                 summary=summary,
-                title=_humanize_name(d.name),
+                title=title,
+                title_is_user_set=title_is_user_set,
                 state=state,
                 recording_id=read_recording_id(d),
                 cloud_e2ee=(intent_data or {}).get("cloud_e2ee") is True,

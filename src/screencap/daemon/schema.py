@@ -218,6 +218,12 @@ def _load_models() -> dict[str, Any]:
         size_bytes: int = 0
         summary: str | None = None
         title: str = ""
+        # U2 (editable titles): True when `title` is a user-set rename, False when
+        # it is the derived date/time default. Kept in EXACT sync with
+        # catalog.RecordingInfo.title_is_user_set (recording.list asserts field
+        # parity). Additive on the wire — no _LIST_API_VERSION bump; Swift decodes
+        # it as optional and treats absent as not-user-set.
+        title_is_user_set: bool = False
         state: str = "ready"
         recording_id: str | None = None
         # SCR-220 (KTD-4): the frozen per-recording E2EE bit — badge truth.

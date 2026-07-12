@@ -911,10 +911,17 @@ def test_summary_none_when_db_locked(recordings_dir):
     assert info.summary is None
 
 
-def test_title_humanizes_slug(recordings_dir):
+def test_title_defaults_to_friendly_start_time(recordings_dir):
+    """U2: with no user-set rename, the title is the friendly start-time default.
+
+    The humanized directory name is now only the no-start-timestamp fallback
+    (see tests/test_catalog_title_resolution.py), so a recording with a real
+    start time resolves to the ``Recording · …`` default and is not user-set.
+    """
     _make_recording(recordings_dir, "stripe-webhook-debugging", duration=10)
     info = list_recordings(recordings_dir)[0]
-    assert info.title == "Stripe Webhook Debugging"
+    assert info.title.startswith("Recording · ")
+    assert info.title_is_user_set is False
 
 
 def test_recording_id_stable_across_directory_rename(recordings_dir):
