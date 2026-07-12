@@ -189,6 +189,17 @@ struct ReviewWindow: View {
             // Window-close-as-cancel for an in-flight clip export: SIGTERM the
             // child (U1's atomic write leaves no partial file). Safe-on-idle.
             clipExport.cancel()
+            // SCR-219 (U6): drop any UN-consumed pending clip range for this
+            // recording on close. `loadReviewData` consumes+clears the entry on a
+            // FRESH open, but if this window was re-fronted by a later
+            // `openWindow(id:value:)` (same String key) the `.task` never re-ran,
+            // so a range set for that re-front lingers in the shared singleton and
+            // would silently push a LATER plain review of the same recording into
+            // clip mode. Clearing here guarantees a stranded range can't outlive
+            // the window. No-op when already consumed (entry is nil) and never
+            // races a fresh open — the Day-timeline overlay sets the entry
+            // immediately before `openWindow`, strictly AFTER this teardown.
+            ReviewWindowOpener.shared.pendingClipRange[recordingName] = nil
             model.windowDidClose()
             // Balance the active-upload count if the window closes mid-upload
             // (onChange won't fire after the view is gone).
@@ -337,9 +348,14 @@ struct ReviewWindow: View {
                 // SCR-219 (U6, KTD4): for a clip export the video LEAVES to
                 // external recipients and — unlike these masked screenshots — is
                 // only capture-blocked, not text-masked. Surface that prominently,
-                // adjacent to the preview frames. Gated on the envelope's
-                // `clip_video_capture_blocked_only` honesty flag.
-                if data.clipVideoCaptureBlockedOnly {
+                // adjacent to the preview frames. Gated on `isClipReview`
+                // (`model.clipRange != nil`) — the SAME single source of truth
+                // that gates the "Export clip" action below — so the honesty note
+                // can never desync from the Export action (e.g. an older/minimal
+                // review-data loader that omits `clip_video_capture_blocked_only`
+                // must NOT be able to offer Export without this note). The
+                // envelope flag alone is no longer sufficient nor required here.
+                if model.isClipReview {
                     clipHonestyNote
                 }
                 Divider()
@@ -360,7 +376,12 @@ struct ReviewWindow: View {
                         CoverageStrip(coverage: data.coverage)
                     }
                     Divider()
-                    localVideoPane(videoModel, isClipExport: data.clipVideoCaptureBlockedOnly)
+                    // Same single source of truth as the honesty note + Export
+                    // action: `isClipReview` (not the envelope flag alone), so the
+                    // "not uploaded" label override can never desync — a clip
+                    // export always names the clip as the payload, even if an
+                    // older loader omits `clip_video_capture_blocked_only`.
+                    localVideoPane(videoModel, isClipExport: model.isClipReview)
                         .frame(width: 280)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
