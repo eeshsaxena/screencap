@@ -93,6 +93,28 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     # warm finishing first; it only makes the common case fast. Fail-open inside
     # _warm_grant_cache: a probe error must never break the daemon.
     app.state._grant_warm_task = asyncio.create_task(_warm_grant_cache(app))
+    # U7 (SCR-236/SCR-258 KTD-11): live-check FileVault ONCE at daemon start,
+    # cache it on app.state for daemon.info, and log it once. Warn-only (R11/R15):
+    # a FileVault-off or unknown result is surfaced but never blocks recording.
+    # Strictly fail-open — the probe itself never raises, and this whole block is
+    # additionally guarded so it can never break daemon boot.
+    app.state.filevault_status = "unknown"
+    try:
+        from screencap import container
+
+        fv = await asyncio.to_thread(container.filevault_status)
+        app.state.filevault_status = fv.value
+        if fv is container.FileVaultStatus.OFF:
+            logger.warning(
+                "FileVault is OFF on this machine: recordings at rest are protected by "
+                "the encrypted container and file permissions, but not by full-disk "
+                "encryption. Turn FileVault on in System Settings > Privacy & Security "
+                "for defense in depth. (Recording is not affected.)"
+            )
+        else:
+            logger.info("FileVault status at daemon start: %s", fv.value)
+    except Exception:  # noqa: BLE001 - the FileVault check must never break startup
+        logger.debug("FileVault startup check failed", exc_info=True)
     # Periodic screenshot-retention sweep (search U5): applies the age/size bound to
     # converged recordings that no recording-lifecycle event revisits. Not
     # auth-gated (runs signed-out); a no-op until a bound is configured. Fail-open —
@@ -208,12 +230,17 @@ async def daemon_info(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 - readiness probe must never 500
         logger.debug("daemon.info grant probe failed", exc_info=True)
         grants = permission_probe.indeterminate_result()
+    # U7 (KTD-11): surface the warn-only FileVault status resolved once at daemon
+    # start (see the lifespan). Absent (e.g. a lifespan-less test app) → "unknown",
+    # which is not alarming and renders no warning. Never blocks recording.
+    filevault = getattr(request.app.state, "filevault_status", "unknown")
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
             build=_build_string(),
             started_at=_STARTED_AT,
             permissions=grants,
+            filevault=filevault,
         )
     )
 

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
@@ -766,6 +767,84 @@ def harden_mount(mountpoint: str, *, timeout: float = _DEFAULT_TIMEOUT) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FileVault detection (U7 — warn-only, KTD-11, R11/R15)
+# ---------------------------------------------------------------------------
+#
+# A live, warn-only at-rest signal, checked at each daemon start (NOT cached from
+# install time): ``fdesetup status`` runs unprivileged (verified on this
+# hardware). The result is surfaced on ``daemon.info`` and rendered by
+# ``screencap status`` only when FileVault is OFF. Nothing here ever blocks or
+# refuses recording — a machine with FileVault off records exactly as before.
+#
+# **Strictly fail-open.** Any non-zero exit, timeout, unexpected/garbled output,
+# or subprocess error degrades to :data:`FileVaultStatus.UNKNOWN`; this function
+# never raises, so a broken check can never block daemon startup.
+
+_FDESETUP_TIMEOUT = 10.0
+"""Wall-clock timeout for the ``fdesetup status`` probe, in seconds. Short: this
+is a warn-only signal on the startup path, never worth stalling boot for."""
+
+
+class FileVaultStatus(str, Enum):
+    """The tri-state result of the ``fdesetup status`` FileVault probe.
+
+    ``str``-valued so the enum member serializes directly onto the ``daemon.info``
+    envelope (``FileVaultStatus.OFF.value == "off"``) with no extra mapping.
+    ``UNKNOWN`` is the fail-open sentinel — it is NOT alarming and renders no
+    warning; only ``OFF`` warrants the warn-only surface.
+    """
+
+    ON = "on"
+    OFF = "off"
+    UNKNOWN = "unknown"
+
+
+def _parse_fdesetup_status(text: str) -> FileVaultStatus:
+    """Map ``fdesetup status`` stdout to a :class:`FileVaultStatus`.
+
+    ``fdesetup status`` prints ``FileVault is On.`` or ``FileVault is Off.`` (with
+    extra ``Encryption in progress`` / ``Decryption in progress`` lines during a
+    transition — the leading ``FileVault is On./Off.`` line still resolves those).
+    Anything else (empty, garbled, an unexpected future format) is ``UNKNOWN`` so
+    the caller stays fail-open rather than guessing.
+    """
+    low = text.lower()
+    if "filevault is on" in low:
+        return FileVaultStatus.ON
+    if "filevault is off" in low:
+        return FileVaultStatus.OFF
+    return FileVaultStatus.UNKNOWN
+
+
+def filevault_status(*, timeout: float = _FDESETUP_TIMEOUT) -> FileVaultStatus:
+    """Live-check FileVault via ``fdesetup status``; fail-open to ``UNKNOWN``.
+
+    Runs the unprivileged ``fdesetup status`` command and parses its text output.
+    **Warn-only and strictly fail-open (KTD-11, R11/R15):** any non-zero exit,
+    timeout, subprocess failure, or unexpected output returns
+    :data:`FileVaultStatus.UNKNOWN`. This function **never raises** — a broken or
+    slow check must never block daemon startup or refuse recording.
+
+    Args:
+        timeout: subprocess wall-clock timeout in seconds.
+
+    Returns:
+        :data:`FileVaultStatus.ON` / ``OFF`` on a clean parse, else
+        :data:`FileVaultStatus.UNKNOWN`.
+    """
+    import logging
+
+    try:
+        result = _run_cmd(["fdesetup", "status"], timeout=timeout)
+    except Exception:  # noqa: BLE001 - warn-only probe must never raise (fail-open)
+        logging.getLogger(__name__).debug("fdesetup status probe failed", exc_info=True)
+        return FileVaultStatus.UNKNOWN
+    if result.returncode != 0:
+        return FileVaultStatus.UNKNOWN
+    return _parse_fdesetup_status(result.stdout.decode("utf-8", "replace"))
+
+
+# ---------------------------------------------------------------------------
 # Container-key management (U2 — read-only get, never-orphan create, KTD-22)
 # ---------------------------------------------------------------------------
 #
@@ -1039,6 +1118,9 @@ __all__ = [
     # value objects
     "AttachInfo",
     "ContainerStatus",
+    "FileVaultStatus",
+    # FileVault (warn-only)
+    "filevault_status",
     # sizing
     "host_volume_capacity_bytes",
     # wrappers

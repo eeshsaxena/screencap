@@ -2173,6 +2173,7 @@ def status(as_json, no_nlp_check):
         daemon_reachable: bool
         privacy_configured: bool
         nlp_models_cached: bool | None
+        filevault: str | None
 
     payload: StatusPayload = {
         "ok": True,
@@ -2186,6 +2187,10 @@ def status(as_json, no_nlp_check):
         "daemon_reachable": False,
         "privacy_configured": False,
         "nlp_models_cached": False,
+        # U7 (KTD-11): warn-only FileVault status from daemon.info; None when the
+        # daemon is unreachable or omits it (older daemon). Rendered as a warning
+        # line only when "off" — never blocks anything.
+        "filevault": None,
     }
     if no_nlp_check:
         payload["nlp_models_cached"] = None
@@ -2222,6 +2227,15 @@ def status(as_json, no_nlp_check):
         with DaemonHTTPClient() as client:
             snapshot = client.snapshot()
             payload["daemon_reachable"] = True
+            # U7 (KTD-11): fetch the warn-only FileVault status from daemon.info.
+            # Best-effort — a failure here must never turn `status` into an error,
+            # so it degrades to leaving `filevault` None (no warning rendered).
+            try:
+                fv = client.info().get("filevault")
+                if isinstance(fv, str):
+                    payload["filevault"] = fv
+            except Exception:  # noqa: BLE001 - warn-only, never fail status on it
+                pass
     except DaemonUnreachableError:
         snapshot = None
     except SchemaMismatchError as exc:
@@ -2272,6 +2286,15 @@ def status(as_json, no_nlp_check):
         console.print("[dim]Not recording. (Daemon not running.)[/dim]")
     else:
         console.print("[dim]Not recording.[/dim]")
+
+    # U7 (KTD-11): warn-only FileVault surface. Only "off" prints a line; "on"
+    # and "unknown" stay silent so the check never nags. Never blocks anything.
+    if payload["filevault"] == "off":
+        console.print(
+            "[yellow]Warning:[/yellow] FileVault is off. Recordings are encrypted at "
+            "rest in ScreenCap's container, but turning on FileVault (System Settings "
+            "> Privacy & Security) adds full-disk encryption."
+        )
 
 
 @cli.command()

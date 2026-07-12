@@ -187,6 +187,12 @@ def _load_models() -> dict[str, Any]:
         # Additive (U2): older daemons omit this; the app decodes an absent
         # block as all-indeterminate, so no API version bump is required.
         permissions: PermissionGrants | None = None
+        # Additive (U7, SCR-236/SCR-258 KTD-11): the warn-only FileVault status,
+        # one of "on"/"off"/"unknown" (see screencap.container.FileVaultStatus).
+        # Typed as ``str`` (not a Literal) so a future token decodes tolerantly;
+        # older daemons omit it, so no API version bump is required. Warn-only —
+        # a consumer renders a warning only for "off" and never blocks on it.
+        filevault: str | None = None
 
     class RecordingSummary(_DaemonModel):
         """Recording summary shape returned by ``catalog.list_recordings()``."""
