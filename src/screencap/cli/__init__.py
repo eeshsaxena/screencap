@@ -5025,44 +5025,23 @@ class _NoLocalAuthSurface(Exception):
 
 
 def _write_sealed_sentinel():
-    """Write the sealed sentinel with the ``O_NOFOLLOW`` + realpath-parent
-    discipline (mirrors ``store_lifecycle._mount_lock`` / ``_autospawn._open_auto_log``),
-    mode ``0o600``. A pre-planted symlink AT the sentinel path is refused
-    (``O_NOFOLLOW`` → ``ELOOP``), not followed; a symlinked run-dir is rejected."""
+    """Write the sealed sentinel (CLI-local seal fallback).
+
+    Delegates to :func:`store_lifecycle.write_sealed_sentinel` — the SHARED home
+    that also backs the U9 daemon lock verb — so the ``O_NOFOLLOW`` discipline
+    can never drift between the two callers."""
     from screencap.daemon import store_lifecycle as _sl
 
-    sentinel = _sl.sealed_sentinel_path()
-    parent = sentinel.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    if parent.is_symlink():
-        raise RuntimeError(
-            f"sealed-sentinel run-dir is a symlink and will not be followed: {parent}"
-        )
-    fd = os.open(
-        str(sentinel),
-        os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
-        0o600,
-    )
-    try:
-        os.write(fd, b"sealed\n")
-    finally:
-        os.close(fd)
-    try:
-        os.chmod(str(sentinel), 0o600)  # tighten if it pre-existed looser
-    except OSError:
-        pass
-    return sentinel
+    return _sl.write_sealed_sentinel()
 
 
 def _clear_sealed_sentinel() -> None:
-    """Remove the sealed sentinel (unseal). ``unlink`` removes the link itself,
-    never a symlink's target, so it is safe against a swapped-in symlink."""
+    """Remove the sealed sentinel (CLI-local unseal fallback).
+
+    Delegates to :func:`store_lifecycle.clear_sealed_sentinel`."""
     from screencap.daemon import store_lifecycle as _sl
 
-    try:
-        os.unlink(str(_sl.sealed_sentinel_path()))
-    except FileNotFoundError:
-        pass
+    _sl.clear_sealed_sentinel()
 
 
 def _evaluate_local_authentication(reason: str) -> None:
@@ -5405,21 +5384,35 @@ def _hold_mount_lock():
 
 @storage_group.command("lock")
 def storage_lock_cmd() -> None:
-    """Seal the encrypted store (headless / no-daemon fallback).
+    """Seal the encrypted store.
 
-    Live locking during a recording — the bounded stop-then-quiesce-then-detach
-    sequence — is performed by the running daemon (the app's Lock button, or the
-    ``storage.lock`` daemon verb). This CLI command is the FALLBACK for a
-    CLI-only install where no daemon is reachable: it writes the sealed sentinel
-    (which the next daemon start honors) and never force-detaches anything.
+    When a daemon is reachable it performs the live, bounded
+    stop→quiesce→detach→seal sequence via ``POST /v0/storage.lock`` (the safe path
+    that finalizes an active recording's chunk first). With NO daemon reachable
+    (a CLI-only install), this falls back to writing the sealed sentinel — which
+    the next daemon start honors — and never force-detaches anything.
     """
+    # Daemon-first: the running daemon owns the safe quiesce/detach chain (U9).
     if _daemon_is_reachable():
-        console.print(
-            "[yellow]A ScreenCap daemon is running.[/yellow] Live lock is performed "
-            "by the daemon (use the app's Lock, or the headless daemon lock verb). "
-            "This CLI fallback only runs when no daemon is reachable."
+        from screencap.cli._daemon_client import (
+            DaemonClientError,
+            DaemonHTTPClient,
+            DaemonUnreachableError,
         )
-        raise SystemExit(1)
+
+        try:
+            with DaemonHTTPClient() as client:
+                client.storage_lock()
+        except DaemonUnreachableError:
+            pass  # raced to unreachable — fall through to the local fallback
+        except DaemonClientError as exc:
+            env = exc.envelope
+            msg = env.get("message") or env.get("error", "lock failed")
+            console.print(f"[red]Couldn't lock the store:[/red] {escape(str(msg))}")
+            raise SystemExit(1) from exc
+        else:
+            console.print("[green]Store locked.[/green] Unlock it with Touch ID.")
+            return
 
     if not _guard_container_flag_for_lock():
         return
@@ -5438,28 +5431,25 @@ def storage_lock_cmd() -> None:
 
 @storage_group.command("unlock")
 def storage_unlock_cmd() -> None:
-    """Unseal the encrypted store after present-user authentication (fallback).
+    """Unseal the encrypted store after present-user authentication.
 
-    Present-user (Touch ID with password fallback) is required on every unlock.
-    Live unlock + reconcile is performed by the running daemon (app / daemon
-    verb); this CLI command is the FALLBACK for a CLI-only install with no daemon
-    reachable. Where no LocalAuthentication surface exists (SSH / headless) it
-    refuses and names the recovery route — present-user means present.
+    Present-user (Touch ID with password fallback) is required on every unlock and
+    is evaluated HERE, in the CLI, before any daemon call — the daemon verb trusts
+    its same-EUID caller (KTD-16). When a daemon is reachable it performs the live
+    remount + reconcile via ``POST /v0/storage.unlock`` (a locked Keychain is a
+    retryable error, the sentinel stays intact); with no daemon reachable this
+    falls back to clearing the sentinel for the next daemon start. Where no
+    LocalAuthentication surface exists (SSH / headless) it refuses and names the
+    recovery route — present-user means present.
     """
-    if _daemon_is_reachable():
-        console.print(
-            "[yellow]A ScreenCap daemon is running.[/yellow] Unlock is performed by "
-            "the daemon (use the app, or the headless daemon unlock verb). This CLI "
-            "fallback only runs when no daemon is reachable."
-        )
-        raise SystemExit(1)
-
     from screencap.daemon import store_lifecycle as _sl
 
     if not _sl.is_sealed():
         console.print("[dim]Store is not sealed. Nothing to unlock.[/dim]")
         return
 
+    # Present-user auth FIRST, on every surface (KTD-16). The daemon verb does no
+    # auth of its own — it trusts the same-EUID caller — so the gate lives here.
     try:
         _evaluate_local_authentication(
             "Unlock your ScreenCap encrypted recordings store"
@@ -5482,6 +5472,32 @@ def storage_unlock_cmd() -> None:
             "The store stays sealed."
         )
         raise SystemExit(1) from exc
+
+    # Daemon-first: the running daemon remounts + re-runs the start-time reconcile
+    # (terminal-stage resume, retention, backfill) so quiesced work resumes.
+    if _daemon_is_reachable():
+        from screencap.cli._daemon_client import (
+            DaemonClientError,
+            DaemonHTTPClient,
+            DaemonUnreachableError,
+        )
+
+        try:
+            with DaemonHTTPClient() as client:
+                client.storage_unlock()
+        except DaemonUnreachableError:
+            pass  # raced to unreachable — fall through to the local fallback
+        except DaemonClientError as exc:
+            env = exc.envelope
+            msg = env.get("message") or env.get("error", "unlock failed")
+            console.print(f"[red]Couldn't unlock the store:[/red] {escape(str(msg))}")
+            raise SystemExit(1) from exc
+        else:
+            console.print(
+                "[green]Store unlocked.[/green] Pending uploads and indexing resume "
+                "automatically."
+            )
+            return
 
     _clear_sealed_sentinel()
     console.print(

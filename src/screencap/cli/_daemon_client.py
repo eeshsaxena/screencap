@@ -390,6 +390,30 @@ class DaemonHTTPClient:
             )
         )
 
+    def storage_lock(self) -> dict[str, Any]:
+        """``POST /v0/storage.lock`` — seal the live store (SCR-258 U9).
+
+        The daemon runs the bounded stop→quiesce→detach→seal chain. A failed
+        detach or a plaintext install returns ``ok:false`` with
+        ``error=store_lock_failed`` + a ``reason``/``message`` (on the raised
+        ``DaemonClientError.envelope``); the store is left mounted and unlocked.
+        """
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/storage.lock", json_body={})
+        )
+
+    def storage_unlock(self) -> dict[str, Any]:
+        """``POST /v0/storage.unlock`` — remount + resume a sealed store (U9).
+
+        The CLI performs present-user auth BEFORE calling this (the verb trusts its
+        same-EUID caller). A locked Keychain returns ``ok:false`` with
+        ``error=store_lock_failed`` + ``reason=keychain_locked`` + ``retryable:true``
+        and the sentinel stays intact.
+        """
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/storage.unlock", json_body={})
+        )
+
     def model_download_start(self, model_id: str | None = None) -> dict[str, Any]:
         """``POST /v0/model.download.start`` — start (or return) the model download."""
         body = {"model_id": model_id} if model_id else {}

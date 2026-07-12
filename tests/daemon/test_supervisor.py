@@ -1333,7 +1333,7 @@ async def test_resume_terminal_stage_runs_in_thread(tmp_path, monkeypatch):
 
     sentinel = ts.TerminalResult(destination="cloud")
 
-    def _fake_run(recording_dir, *, non_blocking):
+    def _fake_run(recording_dir, *, non_blocking, stop_event=None):
         import threading
         called["non_blocking"] = non_blocking
         called["thread"] = threading.current_thread().name
@@ -1363,7 +1363,7 @@ async def test_resume_terminal_stage_skips_when_busy(tmp_path, monkeypatch):
     bus = EventBus()
     sup = Supervisor(bus, reconcile_on_init=False)
 
-    def _busy(recording_dir, *, non_blocking):
+    def _busy(recording_dir, *, non_blocking, stop_event=None):
         raise TerminalStageBusy("held by live finalize")
 
     monkeypatch.setattr(
@@ -1408,7 +1408,7 @@ async def test_resume_emits_account_mismatch_event(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage",
-        lambda recording_dir, *, non_blocking: _mismatch_result(),
+        lambda recording_dir, *, non_blocking, stop_event=None: _mismatch_result(),
     )
     whoami_thread = {}
 
@@ -1450,7 +1450,7 @@ async def test_resume_no_mismatch_emits_nothing(tmp_path, monkeypatch):
     clean = ts.TerminalResult(destination="cloud", upload_warning="upload failed: boom")
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage",
-        lambda recording_dir, *, non_blocking: clean,
+        lambda recording_dir, *, non_blocking, stop_event=None: clean,
     )
 
     await sup.resume_terminal_stage(tmp_path / "rec")
@@ -1467,7 +1467,7 @@ async def test_resume_none_result_emits_nothing(tmp_path, monkeypatch):
     sup = Supervisor(bus, reconcile_on_init=False)
     sub = await bus.subscribe()
 
-    def _busy(recording_dir, *, non_blocking):
+    def _busy(recording_dir, *, non_blocking, stop_event=None):
         raise TerminalStageBusy("held")
 
     monkeypatch.setattr("screencap.terminal_stage.run_terminal_stage", _busy)
@@ -1491,7 +1491,7 @@ async def test_resume_emit_is_fail_open_on_whoami_error(tmp_path, monkeypatch):
     result = _mismatch_result()
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage",
-        lambda recording_dir, *, non_blocking: result,
+        lambda recording_dir, *, non_blocking, stop_event=None: result,
     )
 
     def _boom():
@@ -1517,7 +1517,7 @@ async def test_resume_emit_enrichment_stale(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage",
-        lambda recording_dir, *, non_blocking: _mismatch_result(),
+        lambda recording_dir, *, non_blocking, stop_event=None: _mismatch_result(),
     )
     monkeypatch.setattr(
         auth, "whoami",
@@ -1549,7 +1549,7 @@ async def test_resume_emit_whoami_timeout_still_publishes(tmp_path, monkeypatch)
 
     monkeypatch.setattr(
         "screencap.terminal_stage.run_terminal_stage",
-        lambda recording_dir, *, non_blocking: _mismatch_result(),
+        lambda recording_dir, *, non_blocking, stop_event=None: _mismatch_result(),
     )
     # Shrink the bound so the test is fast; whoami blocks well past it.
     monkeypatch.setattr(_sup_mod, "_WHOAMI_ENRICH_TIMEOUT_S", 0.05)
@@ -1631,7 +1631,7 @@ async def test_resume_fails_closed_on_not_signed_in(tmp_path, monkeypatch):
 
     sup = Supervisor(EventBus(), reconcile_on_init=False)
 
-    def _not_signed_in(recording_dir, *, non_blocking):
+    def _not_signed_in(recording_dir, *, non_blocking, stop_event=None):
         raise auth.NotSignedIn("no creds")
 
     monkeypatch.setattr("screencap.terminal_stage.run_terminal_stage", _not_signed_in)

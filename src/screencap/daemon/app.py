@@ -48,6 +48,49 @@ logger = logging.getLogger(__name__)
 
 _STARTED_AT = time.time()
 
+# SCR-258 U9 (KTD-15): store lock/unlock lifecycle events ride ``/v0/events`` so
+# the Swift app and MCP-adjacent surfaces update without polling. ``store.locking``
+# is the PRE-DETACH signal direct readers (Swift frame reads, in-flight pipeline
+# workers) consume to release open handles BEFORE the volume goes away — since
+# direct readers have no daemon in the byte path (base KTD-12) and would otherwise
+# see raw EIO/ENOENT mid-read. ``store.lock.progress`` carries per-phase heartbeats
+# (the state machine REFUSE_SET → STOPPING → SIGNAL_READERS → QUIESCING →
+# DETACHING → SEALED) so a Swift watchdog never stares at a silent blocking wait.
+EVENT_STORE_LOCKING = "store.locking"
+EVENT_STORE_LOCKED = "store.locked"
+EVENT_STORE_UNLOCKED = "store.unlocked"
+EVENT_STORE_LOCK_PROGRESS = "store.lock.progress"
+
+# The quiescence grace budget (KTD-15 Outstanding Question). "Seconds, not
+# until-upload-completes": in-flight ledger-disciplined workers are given this long
+# to reach a ledger-safe boundary and stop; if they do not, the graceful-then-force
+# detach is the backstop (force is safe precisely because every writer is
+# ledger-disciplined and readers were signalled). Pinned in the AE7 test.
+_LOCK_QUIESCE_GRACE_S = 5.0
+
+
+async def _emit_store_event(app: Starlette, event_type: str, **fields: Any) -> None:
+    """Publish a store lock/unlock lifecycle event on ``/v0/events`` (U9).
+
+    Best-effort: a publish failure (e.g. the bus closing during teardown) must
+    never abort the lock/unlock chain. The payload is recording-name-free (R9) —
+    it carries only phase/state, never a recording identity.
+    """
+    bus = getattr(app.state, "event_bus", None)
+    if bus is None:
+        return
+    try:
+        await bus.publish(
+            {
+                "type": event_type,
+                "schema_version": _stderr_events.EVENT_SCHEMA_VERSION,
+                "ts": time.time(),
+                **fields,
+            }
+        )
+    except Exception:  # noqa: BLE001 — a lifecycle event is best-effort telemetry
+        logger.debug("store lifecycle event publish skipped (%s)", event_type)
+
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -2854,6 +2897,307 @@ async def storage_migrate(request: Request) -> JSONResponse:
         supervisor.release_migration()
 
 
+async def _signal_background_jobs_to_pause(app: Starlette) -> None:
+    """Signal backfill / encrypt workers to pause at a ledger-safe boundary (U9).
+
+    Best-effort and bounded: each job's ``shutdown`` sets its cooperative stop flag
+    and awaits the worker within its own timeout, so a store lock never blocks
+    unbounded on a long OCR/copy run. A backfill run pauses (its ledger's PAUSED
+    state auto-resumes on unlock via ``should_auto_resume``); the encrypt job is
+    the reserved U6 hook (absent until U6 lands). Terminal-stage resumes are
+    quiesced separately by :meth:`Supervisor.quiesce_for_lock`.
+    """
+    for attr in ("backfill_job", "encrypt_job"):
+        job = getattr(app.state, attr, None)
+        if job is None:
+            continue
+        shutdown = getattr(job, "shutdown", None)
+        if shutdown is None:
+            continue
+        try:
+            await shutdown()
+        except Exception:  # noqa: BLE001 — pausing a job must never abort the lock
+            logger.warning("store lock: pausing %s raised", attr, exc_info=True)
+
+
+def _resume_after_unlock(app: Starlette) -> None:
+    """Re-arm start-time maintenance that a lock quiesced (U9 unlock reconcile).
+
+    The terminal-stage resume is driven by ``supervisor.start_reconcile`` in the
+    caller. Here we ensure the periodic retention sweep is running again and
+    best-effort auto-resume a paused backfill (the encrypt job's auto-resume is the
+    reserved U6 hook). Every step is guarded so a maintenance hiccup never breaks
+    unlock. Without this, F2's "surfaces return to normal" would silently exclude
+    pending index/retention work until an unrelated restart.
+    """
+    sweep = getattr(app.state, "retention_sweep", None)
+    if sweep is not None:
+        try:
+            sweep.start()  # idempotent — a no-op if already running
+        except Exception:  # noqa: BLE001
+            logger.debug("unlock: retention sweep restart skipped", exc_info=True)
+    job = getattr(app.state, "backfill_job", None)
+    if job is not None:
+        try:
+            from screencap.daemon.backfill_job import should_auto_resume
+
+            ledger = getattr(job, "_ledger", None)
+            if ledger is not None and should_auto_resume(ledger):
+                job.start()
+        except Exception:  # noqa: BLE001
+            logger.debug("unlock: backfill auto-resume skipped", exc_info=True)
+
+
+async def storage_lock(request: Request) -> JSONResponse:
+    """``POST /v0/storage.lock`` — seal the live store in bounded time (SCR-258 U9).
+
+    KTD-15 order, each phase heartbeat-reported on ``/v0/events``:
+
+    1. set the refusal flag FIRST (``supervisor.begin_lock`` → ``recording.start``
+       refused for the whole window, so a cron/MCP start during the stop window is
+       refused, never spawned-then-killed);
+    2. stop the active recording via ``Supervisor.stop()`` (30s budget,
+       ``EVENT_RECORDING_FINALIZED``) — the chunk is finalized, no partial loss;
+    3. emit ``store.locking`` (direct readers release handles) and signal
+       terminal-stage/backfill/encrypt workers to halt at their next ledger-safe
+       boundary within a bounded grace;
+    4. graceful-then-force detach (force is the backstop when the grace expires —
+       this deliberately differs from ``storage compact``, which never forces);
+    5. write the sealed sentinel, emit ``store.locked``.
+
+    On a FAILED detach the store stays MOUNTED and unlocked, ``_store_locked`` is
+    cleared, and a typed ``store_lock_failed`` error is returned — NEVER a
+    half-sealed state. Audit-logged with peer provenance + outcome (KTD-23). The
+    in-flight lock operation pins the idle watchdog (``begin_lock``); the sealed
+    steady state does not.
+    """
+    from screencap import config, container
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon import store_lifecycle as sl
+
+    schema_version = schema._STORAGE_LOCK_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.lock",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    supervisor = request.app.state.supervisor
+
+    # Refuse on a plaintext install: sealing a store the daemon won't honor (the
+    # container-disabled resolve ignores the sentinel) would be a dead seal.
+    if not config.get_container_enabled():
+        _audit("container_disabled")
+        return _api_error_response(
+            errors.StoreLockError(
+                "container_disabled",
+                "The encrypted container is not enabled; there is no store to lock.",
+                schema_version=schema_version,
+            )
+        )
+
+    # Idempotent: an already-sealed store no-ops with a clear message (never a
+    # second detach).
+    if _store_state_value(request) == StoreState.LOCKED.value or sl.is_sealed():
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                store_state=StoreState.LOCKED.value,
+                sealed=True,
+                already_locked=True,
+            )
+        )
+
+    # KTD-15 step 1: refuse flag FIRST, before anything else.
+    supervisor.begin_lock()
+    request.app.state.store_state = StoreState.LOCKED.value
+    await _emit_store_event(
+        request.app, EVENT_STORE_LOCK_PROGRESS, phase="refuse_set"
+    )
+
+    try:
+        # step 2: stop the active recording (finalizes the chunk; 30s budget).
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="stopping"
+        )
+        await supervisor.stop(force=False)
+
+        # step 3: emit the PRE-DETACH reader signal, pause background jobs, and
+        # quiesce in-flight terminal-stage resumes within the grace budget.
+        await _emit_store_event(request.app, EVENT_STORE_LOCKING)
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="signal_readers"
+        )
+        await _signal_background_jobs_to_pause(request.app)
+        quiesced = await supervisor.quiesce_for_lock(grace=_LOCK_QUIESCE_GRACE_S)
+        await _emit_store_event(
+            request.app,
+            EVENT_STORE_LOCK_PROGRESS,
+            phase="quiescing",
+            quiesced=quiesced,
+        )
+
+        # step 4: graceful-then-force detach.
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="detaching"
+        )
+        mountpoint = str(config.get_recordings_dir())
+        try:
+            await asyncio.to_thread(container.detach, mountpoint, force=True)
+        except container.ContainerError as exc:
+            # KTD-15 step 6: a FAILED detach unwinds to MOUNTED+unlocked. The store
+            # stays usable, nothing is sealed — NEVER a half-sealed state.
+            supervisor.abort_lock()
+            request.app.state.store_state = StoreState.MOUNTED.value
+            logger.warning("store lock: detach failed for %s: %s", mountpoint, exc)
+            _audit("detach_failed")
+            return _api_error_response(
+                errors.StoreLockError(
+                    "detach_failed",
+                    "The store could not be unmounted (a reader may still hold it "
+                    "open). It stays mounted and unlocked; nothing was sealed. "
+                    "Close open recordings/finder windows and try again.",
+                    schema_version=schema_version,
+                    retryable=True,
+                )
+            )
+
+        # step 5: seal LAST (O_NOFOLLOW sentinel), finalize state, announce.
+        sl.write_sealed_sentinel()
+        supervisor.complete_lock()
+        request.app.state.store_state = StoreState.LOCKED.value
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="sealed"
+        )
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCKED, store_state=StoreState.LOCKED.value
+        )
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                store_state=StoreState.LOCKED.value,
+                sealed=True,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        # e.g. a ReconcilingError from stop(): unwind, never leave half-sealed.
+        supervisor.abort_lock()
+        request.app.state.store_state = StoreState.MOUNTED.value
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        supervisor.abort_lock()
+        request.app.state.store_state = StoreState.MOUNTED.value
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+
+async def storage_unlock(request: Request) -> JSONResponse:
+    """``POST /v0/storage.unlock`` — remount + resume a sealed store (SCR-258 U9).
+
+    The SURFACE (app PresenceGate / CLI LocalAuthentication) performs the
+    present-user (Touch ID) auth; the verb trusts its same-EUID caller (KTD-16,
+    documented in ``SECURITY.md``). It mounts FIRST (``store_lifecycle.mount_now``,
+    ignoring the sentinel) and only clears the sentinel on a successful mount, so a
+    remount that cannot read the key (a locked Keychain) returns a RETRYABLE in-band
+    error with the sentinel INTACT (never a daemon exit). On success it clears the
+    sentinel, re-runs the daemon start-time reconcile (terminal-stage resume via
+    ``start_reconcile``; retention sweep + backfill auto-resume via
+    ``_resume_after_unlock``), and emits ``store.unlocked``. Audit-logged (KTD-23).
+    Recording does NOT restart on its own.
+    """
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon import store_lifecycle as sl
+    from screencap.daemon.store_lifecycle import (
+        ERROR_KEYCHAIN_LOCKED,
+        StoreState,
+    )
+
+    schema_version = schema._STORAGE_UNLOCK_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.unlock",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    supervisor = request.app.state.supervisor
+
+    # Idempotent: nothing sealed → already unlocked.
+    if not sl.is_sealed() and _store_state_value(request) != StoreState.LOCKED.value:
+        _audit("ok")
+        current = _store_state_value(request)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                store_state=current,
+                sealed=False,
+                already_unlocked=True,
+            )
+        )
+
+    # Mount FIRST (ignoring the sentinel); the sentinel is cleared only on success.
+    try:
+        resolution = await asyncio.to_thread(sl.mount_now)
+    except Exception as exc:  # ROGUE / corrupted bundle → operator hard stop
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+    if resolution.state is StoreState.ERROR:
+        # Retryable in-band; the sentinel stays INTACT (the store is still sealed).
+        reason = resolution.reason or ERROR_KEYCHAIN_LOCKED
+        retryable = reason == ERROR_KEYCHAIN_LOCKED
+        _audit(reason)
+        message = (
+            "The Keychain is locked; unlock your Mac and try again — the store "
+            "stays sealed."
+            if retryable
+            else "The store could not be mounted (the encryption key is "
+            "unreachable). The store stays sealed."
+        )
+        return _api_error_response(
+            errors.StoreLockError(
+                reason, message, schema_version=schema_version, retryable=retryable,
+            )
+        )
+
+    # Mounted (or, degenerately, absent): clear the sentinel and reconcile.
+    sl.clear_sealed_sentinel()
+    supervisor.set_store_state(resolution.state)
+    supervisor.reset_quiesce()
+    request.app.state.store_state = resolution.state.value
+    request.app.state.store_reason = resolution.reason
+    # Re-run the start-time reconcile so quiesced terminal-stage work resumes.
+    supervisor.start_reconcile()
+    _resume_after_unlock(request.app)
+    await _emit_store_event(
+        request.app, EVENT_STORE_UNLOCKED, store_state=resolution.state.value
+    )
+    _audit("ok")
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema_version,
+            store_state=resolution.state.value,
+            sealed=False,
+        )
+    )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -2882,6 +3226,8 @@ def build_app() -> Starlette:
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
             Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),
             Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
+            Route("/v0/storage.lock", storage_lock, methods=["POST"]),
+            Route("/v0/storage.unlock", storage_unlock, methods=["POST"]),
             Route("/v0/model.download.start", model_download_start, methods=["POST"]),
             Route("/v0/model.download.status", model_download_status, methods=["GET"]),
             Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),

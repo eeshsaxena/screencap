@@ -52,6 +52,16 @@ MIGRATION_IN_PROGRESS = "migration_in_progress"
 STORE_LOCKED = "store_locked"
 STORE_ABSENT = "store_absent"
 
+# SCR-258 U9 (KTD-15): the ``storage.lock`` / ``storage.unlock`` OPERATION itself
+# failed or was refused (as opposed to a mutation refused *because* the store is
+# already sealed, which is STORE_LOCKED above). Carries a specific ``reason``
+# (``detach_failed`` on a lock whose graceful-then-force detach failed;
+# ``keychain_locked`` / ``key_missing`` / ``entitlement_mismatch`` on an unlock
+# whose remount could not read the key) + a human ``message`` + a ``retryable``
+# flag so the surface can distinguish "try again in a moment" (Keychain locked)
+# from "the store is stuck mounted, nothing was sealed" (detach failed).
+STORE_LOCK_FAILED = "store_lock_failed"
+
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
 # as named constants prevents drift between handlers and tests.
@@ -434,6 +444,47 @@ class StoreAbsentError(DaemonAPIError):
         )
 
 
+class StoreLockError(DaemonAPIError):
+    """A ``storage.lock`` / ``storage.unlock`` OPERATION failed or was refused (U9).
+
+    Distinct from :class:`StoreLockedError` (a *mutation* refused because the store
+    is already sealed): this is the lock/unlock verb's own failure. ``reason`` is a
+    code — ``detach_failed`` when a lock's graceful-then-force detach failed (the
+    store is left MOUNTED and unlocked, nothing sealed — never a half-sealed
+    state), or ``keychain_locked`` / ``key_missing`` / ``entitlement_mismatch``
+    when an unlock's remount could not read the key (the sentinel is left intact).
+    ``retryable`` tells the surface whether trying again in a moment can help (a
+    locked Keychain) versus a terminal operator condition. Mirrors
+    :class:`StorageMigrationError`'s reason/message shape. HTTP 409.
+    """
+
+    error_code = STORE_LOCK_FAILED
+    http_status = 409
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        schema_version: int,
+        retryable: bool = False,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        self.message = message
+        self.retryable = retryable
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return error_envelope(
+            schema_version=self.schema_version,
+            error=self.error_code,
+            reason=self.reason,
+            message=self.message,
+            retryable=self.retryable,
+        )
+
+
 class SchemaMismatchError(DaemonAPIError):
     error_code = SCHEMA_MISMATCH
     http_status = 400
@@ -713,6 +764,7 @@ __all__ = [
     "SUBSCRIPTION_REQUIRED",
     "STORE_LOCKED",
     "STORE_ABSENT",
+    "STORE_LOCK_FAILED",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
@@ -750,4 +802,5 @@ __all__ = [
     "SubscriptionRequiredError",
     "StoreLockedError",
     "StoreAbsentError",
+    "StoreLockError",
 ]

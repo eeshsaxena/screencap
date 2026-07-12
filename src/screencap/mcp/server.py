@@ -54,11 +54,22 @@ class ContentHit(BaseModel):
     score: float
 
 
+# SCR-258 U9 (KTD-20): every read-tool result carries the encrypted-store state
+# as DATA (``mounted`` / ``locked`` / ``absent`` / ``error``), parsed from the
+# daemon's success envelope — NOT surfaced as an opaque ``DaemonError`` tool
+# failure. A locked store returns ``ok`` + empty results + ``store_state=locked``,
+# so the agent gets a first-class "the vault is locked" signal instead of an
+# error traceback. Absent → default ``mounted`` (plaintext install / old daemon).
+_DEFAULT_STORE_STATE = "mounted"
+
+
 class ContentSearchResult(BaseModel):
     hits: list[ContentHit]
     # ok / no_match / not_indexed / index_degraded / store_unavailable — so the
     # agent never mistakes an empty/degraded index for ground truth.
     index_state: str
+    # KTD-20: mounted / locked / absent / error — a locked vault is data, not an error.
+    store_state: str = _DEFAULT_STORE_STATE
 
 
 class TranscriptHit(BaseModel):
@@ -78,6 +89,7 @@ class TranscriptHit(BaseModel):
 class TranscriptSearchResult(BaseModel):
     hits: list[TranscriptHit]
     coverage: str
+    store_state: str = _DEFAULT_STORE_STATE
 
 
 class FrameNearest(BaseModel):
@@ -113,6 +125,7 @@ class TimelineRow(BaseModel):
 class TimelineResult(BaseModel):
     rows: list[TimelineRow]
     coverage: str
+    store_state: str = _DEFAULT_STORE_STATE
 
 
 class RecordingSummary(BaseModel):
@@ -132,6 +145,7 @@ class RecordingSummary(BaseModel):
 
 class RecordingsResult(BaseModel):
     recordings: list[RecordingSummary]
+    store_state: str = _DEFAULT_STORE_STATE
 
 
 class WhoAmIResult(BaseModel):
@@ -190,6 +204,7 @@ class ChatAnswerResult(BaseModel):
     refusal: bool
     question_kind: str
     target: str
+    store_state: str = _DEFAULT_STORE_STATE
 
 
 # -- lazy daemon runtime (connect + held subscription on first tool call) ---
@@ -272,6 +287,7 @@ async def search_screen_content(
     return ContentSearchResult(
         hits=[ContentHit(**h) for h in env.get("hits", [])],
         index_state=env.get("index_state", "store_unavailable"),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
 
 
@@ -285,6 +301,7 @@ async def search_transcript(
     return TranscriptSearchResult(
         hits=[TranscriptHit(**h) for h in env.get("hits", [])],
         coverage=env.get("coverage", "best_effort"),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
 
 
@@ -303,6 +320,7 @@ async def query_timeline(
     return TimelineResult(
         rows=[TimelineRow(**r) for r in env.get("rows", [])],
         coverage=env.get("coverage", "authoritative"),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
 
 
@@ -379,6 +397,7 @@ async def list_recordings() -> RecordingsResult:
             RecordingSummary(**{k: v for k, v in rec.items() if k in keep})
             for rec in env.get("recordings", [])
         ],
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
 
 
@@ -467,6 +486,7 @@ async def chat_answer(
         refusal=bool(env.get("refusal", False)),
         question_kind=env.get("question_kind", "point"),
         target=env.get("target", "none"),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
 
 

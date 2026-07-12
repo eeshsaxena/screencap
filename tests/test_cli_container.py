@@ -198,15 +198,36 @@ def test_local_seal_rejects_preplanted_symlink(store_env, monkeypatch):
     assert sentinel.is_symlink()  # the link itself is left untouched
 
 
-def test_local_seal_refuses_when_daemon_running(store_env, monkeypatch):
-    """Fallback is used ONLY when no daemon responds; a live daemon -> refuse."""
+def test_lock_uses_daemon_verb_when_daemon_running(store_env, monkeypatch):
+    """SCR-258 U9: a live daemon runs the safe stop→quiesce→detach→seal chain via
+    ``POST /v0/storage.lock`` (the fallback local seal runs ONLY with no daemon).
+    """
     monkeypatch.setattr(cli_mod, "_daemon_is_reachable", lambda: True)
+
+    called = {"lock": 0}
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def storage_lock(self):
+            called["lock"] += 1
+            return {"ok": True, "store_state": "locked", "sealed": True}
+
+    import screencap.cli._daemon_client as dc
+
+    monkeypatch.setattr(dc, "DaemonHTTPClient", lambda *a, **k: _FakeClient())
 
     result = CliRunner().invoke(cli, ["storage", "lock"])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0, result.output
+    assert called["lock"] == 1
+    # The CLI-local fallback sentinel is NOT written — the daemon owns the seal.
     assert not _sentinel_path().exists()
-    assert "daemon is running" in result.output.lower()
+    assert "locked" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -136,6 +136,57 @@ def is_sealed() -> bool:
     return sealed_sentinel_path().exists()
 
 
+# ---------------------------------------------------------------------------
+# Sealed-sentinel write / clear (U9 lock/unlock; the SHARED home per the U5 seam
+# note — the CLI-local seal/unseal fallback imports these rather than duplicating
+# the O_NOFOLLOW discipline).
+# ---------------------------------------------------------------------------
+
+
+def write_sealed_sentinel() -> Path:
+    """Write the sealed sentinel with ``O_NOFOLLOW`` + realpath-parent discipline.
+
+    Mirrors :func:`_mount_lock` / ``_autospawn._open_auto_log``: a pre-planted
+    symlink AT the sentinel path is refused (``O_NOFOLLOW`` → ``ELOOP``), not
+    followed, and a symlinked run-dir is rejected. Mode ``0o600``. Returns the
+    sentinel path. The U9 lock verb writes this LAST (after a successful detach);
+    the CLI-local fallback (no daemon) writes it directly.
+    """
+    sentinel = sealed_sentinel_path()
+    parent = sentinel.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise RuntimeError(
+            f"sealed-sentinel run-dir is a symlink and will not be followed: {parent}"
+        )
+    fd = os.open(
+        str(sentinel),
+        os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(fd, b"sealed\n")
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(str(sentinel), 0o600)  # tighten if it pre-existed looser
+    except OSError:
+        pass
+    return sentinel
+
+
+def clear_sealed_sentinel() -> None:
+    """Remove the sealed sentinel (unseal).
+
+    ``unlink`` removes the link itself, never a symlink's target, so it is safe
+    against a swapped-in symlink. Idempotent — a missing sentinel is a no-op.
+    """
+    try:
+        os.unlink(str(sealed_sentinel_path()))
+    except FileNotFoundError:
+        pass
+
+
 def _bundle_exists() -> bool:
     return store_bundle_path().exists()
 
@@ -309,6 +360,45 @@ def resolve_store_state(*, attempt_mount: bool = True) -> StoreResolution:
         return _attempt_mount(bundle, Path(mountpoint), key)
 
 
+def mount_now() -> StoreResolution:
+    """Mount the store IGNORING the sealed sentinel — the U9 unlock remount path.
+
+    :func:`resolve_store_state` deliberately short-circuits to ``LOCKED`` when the
+    sentinel is present (bind-before-mount), so the unlock verb cannot use it to
+    remount. This is the sibling that resolves the key + attaches WITHOUT the
+    sentinel gate, under the same ``mount.lock``. The unlock verb calls this
+    BEFORE clearing the sentinel: on ``ERROR`` (e.g. a locked Keychain) it returns
+    the typed reason and the caller leaves the sentinel intact (retryable in-band,
+    KTD-14); only on ``MOUNTED`` does the caller clear the sentinel and reconcile.
+
+    Container-disabled → ``MOUNTED`` (nothing to mount; a plaintext install has no
+    sentinel to reach here). ROGUE / corrupted bundle re-raise the container
+    operator exception unchanged, matching :func:`resolve_store_state`.
+    """
+    from screencap import config, container
+
+    if not config.get_container_enabled():
+        return StoreResolution(StoreState.MOUNTED)
+
+    with _mount_lock():
+        bundle = store_bundle_path()
+        if not bundle.exists():
+            return StoreResolution(StoreState.ABSENT)
+        try:
+            key = container.require_container_key()
+        except container.ContainerKeyMissingError:
+            return StoreResolution(StoreState.ERROR, reason=ERROR_KEY_MISSING)
+        except container.ContainerKeyUnreachableError:
+            return StoreResolution(
+                StoreState.ERROR, reason=ERROR_ENTITLEMENT_MISMATCH
+            )
+        except container.KeychainLockedError:
+            return StoreResolution(StoreState.ERROR, reason=ERROR_KEYCHAIN_LOCKED)
+
+        mountpoint = config.get_recordings_dir()
+        return _attempt_mount(bundle, Path(mountpoint), key)
+
+
 __all__ = [
     "StoreState",
     "StoreResolution",
@@ -321,7 +411,10 @@ __all__ = [
     "sealed_sentinel_path",
     "mount_lock_path",
     "is_sealed",
+    "write_sealed_sentinel",
+    "clear_sealed_sentinel",
     "host_disk_path",
     "disk_host_env",
     "resolve_store_state",
+    "mount_now",
 ]
