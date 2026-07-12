@@ -617,6 +617,53 @@ def _stub_cloud_seam(monkeypatch, scrubbed):
     monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
 
 
+@pytest.mark.privacy
+def test_terminal_stage_resolves_frozen_e2ee_from_source_not_scrubbed(tmp_path, monkeypatch):
+    """SCR-220 KTD-4 downgrade guard: the terminal stage must pass the source
+    recording's FROZEN cloud_e2ee decision into upload_recording. The scrubbed
+    copy carries no .recording_intent, so resolving from it (an easy refactor
+    slip — the sibling masked_video_upload param on the same call has the
+    identical shape) would silently ship plaintext for an encrypted recording.
+    This pins upload_recording receiving cloud_e2ee=True for a frozen-on
+    recording even though the enumerated scrubbed dir has no intent.
+    """
+    from screencap import terminal_stage as ts
+    from screencap.terminal_stage import CloudCopyOutcome
+    from screencap.upload import UploadResult
+
+    rec_dir = _make_recording(tmp_path, destination="cloud", n_chunks=2)
+    intent_path = rec_dir / ".recording_intent"
+    intent = json.loads(intent_path.read_text())
+    intent["cloud_e2ee"] = True
+    intent_path.write_text(json.dumps(intent))
+
+    scrubbed = tmp_path / "scrubbed"
+    scrubbed.mkdir()
+    # The scrubbed copy deliberately carries NO .recording_intent.
+    assert not (scrubbed / ".recording_intent").exists()
+
+    monkeypatch.setattr(
+        ts.CloudCopyProducer, "produce",
+        lambda self, **kw: CloudCopyOutcome(scrubbed_dir=scrubbed),
+    )
+    monkeypatch.setattr("screencap.chunk_processor.upload_sentinel", lambda *a, **kw: True)
+
+    seen = {}
+    import screencap.upload as up
+
+    def _capture_upload(d, **kw):
+        seen["dir"] = d
+        seen["cloud_e2ee"] = kw.get("cloud_e2ee")
+        return UploadResult(recording=d.name)
+
+    monkeypatch.setattr(up, "upload_recording", _capture_upload)
+
+    ts.run_terminal_stage(rec_dir)
+
+    assert seen["dir"] == scrubbed  # uploads the scrubbed copy...
+    assert seen["cloud_e2ee"] is True  # ...but the E2EE decision came from source
+
+
 class TestDryRunReadOnly:
     """SCR-125 U5: dry-run is a read-only preview — no flock, no disk mutation."""
 

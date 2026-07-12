@@ -33,6 +33,15 @@ KEY = b"K" * 32
 @pytest.fixture
 def cloud_key_available(monkeypatch):
     monkeypatch.delenv(cc.ENGINE_CLOUD_KEY_FILE_ENV, raising=False)
+    # Force the shared group un-entitled so the key resolves to the legacy
+    # keyring home below — never the real Security framework (test_cloud_crypto).
+    from screencap import keychain_group as kg
+
+    def _unentitled(*_a, **_k):
+        raise kg.MissingEntitlement(kg.errSecMissingEntitlement, "test")
+
+    monkeypatch.setattr(kg, "load", _unentitled)
+    monkeypatch.setattr(kg, "store", _unentitled)
     monkeypatch.setattr(
         keyring, "get_password", lambda s, a: base64.b64encode(KEY).decode()
     )
@@ -149,6 +158,13 @@ def test_live_upload_plaintext_when_frozen_off(tmp_path, monkeypatch):
 @pytest.fixture
 def no_cloud_key(monkeypatch):
     monkeypatch.delenv(cc.ENGINE_CLOUD_KEY_FILE_ENV, raising=False)
+    from screencap import keychain_group as kg
+
+    def _unentitled(*_a, **_k):
+        raise kg.MissingEntitlement(kg.errSecMissingEntitlement, "test")
+
+    monkeypatch.setattr(kg, "load", _unentitled)
+    monkeypatch.setattr(kg, "store", _unentitled)
     monkeypatch.setattr(keyring, "get_password", lambda s, a: None)
 
 

@@ -48,7 +48,20 @@ def _isolate_config(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_keyring(monkeypatch):
-    """In-memory keyring; ``sets`` counts mints so no-second-mint is pinned."""
+    """In-memory keyring; ``sets`` counts mints so no-second-mint is pinned.
+
+    The shared access group is forced un-entitled so the KEK resolves to this
+    in-memory legacy home and the test never touches the real Security
+    framework on an entitled machine (mirrors tests/test_cloud_crypto.py).
+    """
+    from screencap import keychain_group as kg
+
+    def _unentitled(*_a, **_k):
+        raise kg.MissingEntitlement(kg.errSecMissingEntitlement, "test")
+
+    monkeypatch.setattr(kg, "load", _unentitled)
+    monkeypatch.setattr(kg, "store", _unentitled)
+
     store: dict[tuple[str, str], str] = {}
     sets: list[tuple[str, str]] = []
 
