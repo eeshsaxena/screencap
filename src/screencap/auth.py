@@ -18,13 +18,17 @@ Security posture (see SECURITY.md + docs/runbooks/cloud-auth-setup.md):
   honestly a *team-shared* read, NOT a code-signing-pinned secret, and does not
   cross the same-user boundary (see SECURITY.md). The E2EE/network KEKs still use the
   default per-binary ACL (deferred).
-* The OAuth client is a **public native client**: no ``client_secret`` is
-  embedded in source or binaries. PKCE is the protection (RFC 9700). An env
-  override (``SCREENCAP_OAUTH_CLIENT_SECRET``) exists only as an escape hatch for
-  a client config that insists on a secret — nothing is shipped.
+* The OAuth client is a Google **Desktop app** client. Its ``client_secret`` is
+  *non-confidential* (it ships in the binary exactly like the client id) but is
+  NOT optional: Google's token endpoint requires it even under PKCE, so it is
+  injected via ``_provisioned`` alongside the client id. PKCE (RFC 9700) is the
+  real protection; the Desktop-client secret is a Google-specific token-endpoint
+  requirement, not a confidentiality boundary. ``SCREENCAP_OAUTH_CLIENT_SECRET``
+  overrides it for dev/local.
 
 Config knobs mirror ``SCREENCAP_UPLOAD_URL`` (env-overridable, provisioned
-defaults): ``SCREENCAP_FIREBASE_API_KEY`` and ``SCREENCAP_OAUTH_CLIENT_ID``.
+defaults): ``SCREENCAP_FIREBASE_API_KEY``, ``SCREENCAP_OAUTH_CLIENT_ID`` and
+``SCREENCAP_OAUTH_CLIENT_SECRET``.
 """
 
 from __future__ import annotations
@@ -111,7 +115,7 @@ _REFRESH_BUFFER_SECONDS = 300
 LOGIN_TIMEOUT_SECONDS = 180
 
 
-def _provisioned_value(attr: str) -> str | None:
+def _provisioned_value(attr: str, *, required: bool = True) -> str | None:
     """Return a build-time-injected credential, or ``None`` if not injected.
 
     Reads ``attr`` from the gitignored ``screencap._provisioned`` module written by
@@ -119,14 +123,22 @@ def _provisioned_value(attr: str) -> str | None:
     module is ABSENT (source checkout / test suite / unconfigured build) so the
     caller falls back to the placeholder.
 
+    ``required`` controls how a PRESENT module that is MISSING ``attr`` behaves:
+
+    * ``required=True`` (default, for the mandatory api-key / client-id) — ``getattr``
+      with no default raises ``AttributeError`` loudly: a present-but-incomplete
+      ``_provisioned`` is a broken build, not a silent fall-through to the placeholder.
+    * ``required=False`` (for the OAuth client secret) — a missing constant degrades
+      to ``None`` so the caller resolves to "". A stale ``_provisioned`` generated
+      before the secret was injected, or a genuinely secret-less client config, must
+      not crash sign-in; the release-time guard is the fail-closed net instead.
+
     The ``ImportError`` catch is deliberately narrow. An absent module
     (``ModuleNotFoundError``, an ``ImportError`` subclass) is the normal
-    not-injected case → ``None`` → placeholder. The fail-loud / fail-closed cases:
+    not-injected case → ``None`` → placeholder. The other fail-loud cases:
 
     * a module that is PRESENT but syntactically invalid (``SyntaxError``, not an
       ``ImportError`` subclass, not caught here) → propagates loudly;
-    * a module that is PRESENT but missing the expected constant (``getattr`` with no
-      default → ``AttributeError``) → propagates loudly;
     * a module that is PRESENT with the constant set to a non-``str`` value → ``None``
       → placeholder, which the U2 release guard then catches (fail-closed at release).
     """
@@ -134,11 +146,11 @@ def _provisioned_value(attr: str) -> str | None:
         from screencap import _provisioned
     except ImportError:
         return None
-    # getattr WITHOUT a default: a missing constant must still raise AttributeError
-    # (loud), never degrade to the placeholder. The isinstance check applies only to
-    # a PRESENT value — a non-str constant degrades to None → placeholder → caught by
-    # the release guard, rather than flowing a bad type into a network call.
-    value = getattr(_provisioned, attr)
+    # A missing constant: AttributeError (loud) when required, else None (the caller
+    # resolves to ""). The isinstance check applies only to a PRESENT value — a non-str
+    # constant degrades to None → placeholder → caught by the release guard, rather
+    # than flowing a bad type into a network call.
+    value = getattr(_provisioned, attr) if required else getattr(_provisioned, attr, None)
     return value if isinstance(value, str) else None
 
 
@@ -173,24 +185,41 @@ def is_placeholder_credential(value: str) -> bool:
     return value in (DEFAULT_FIREBASE_API_KEY, DEFAULT_OAUTH_CLIENT_ID)
 
 
-def bundled_credentials() -> tuple[str, str]:
+def bundled_credentials() -> tuple[str, str, str]:
     """Resolve creds as the SHIPPED binary will for an end user — ``_provisioned``
     (injected at build time) then the placeholder, **ignoring env vars**.
 
     The U2 release guard uses this rather than :func:`_api_key`/:func:`_oauth_client_id`
     so a build-shell env var or a stray ``.env`` (which ``load_dotenv`` reads at
     startup) cannot mask a ``_provisioned`` bundling failure: an end user has neither,
-    so the guard must prove what is actually bundled. Returns ``(api_key, client_id)``.
+    so the guard must prove what is actually bundled. Returns
+    ``(api_key, client_id, client_secret)``.
+
+    The client secret is the (non-confidential) Google Desktop-client secret the token
+    endpoint requires; it has no placeholder sentinel — an unprovisioned build yields
+    "" here, which the release guard rejects (a secret-less binary can't sign in).
     """
     return (
         _provisioned_value("FIREBASE_API_KEY") or DEFAULT_FIREBASE_API_KEY,
         _provisioned_value("OAUTH_CLIENT_ID") or DEFAULT_OAUTH_CLIENT_ID,
+        _provisioned_value("OAUTH_CLIENT_SECRET", required=False) or "",
     )
 
 
 def _oauth_client_secret() -> str:
-    # Empty by default — public native client, no embedded secret.
-    return os.environ.get("SCREENCAP_OAUTH_CLIENT_SECRET", "")
+    # Precedence mirrors _oauth_client_id(): explicit env var > injected _provisioned
+    # value > empty. Google "Desktop app" OAuth clients REQUIRE this (non-confidential)
+    # secret at the token endpoint even under PKCE, so a release binary must ship it via
+    # _provisioned. required=False: a present-but-secret-less _provisioned (a stale
+    # module, or a future secret-less client) degrades to "" rather than crashing
+    # sign-in — the release-time bundled_credentials()/_auth-config-check guard is the
+    # fail-closed net. An empty-string env override is treated as unset (the `or`-chain
+    # falls through).
+    return (
+        os.environ.get("SCREENCAP_OAUTH_CLIENT_SECRET")
+        or _provisioned_value("OAUTH_CLIENT_SECRET", required=False)
+        or ""
+    )
 
 
 # --------------------------------------------------------------------------

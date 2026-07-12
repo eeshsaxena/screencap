@@ -163,19 +163,26 @@ The Web API key ships in every client binary, so close the methods we don't use:
 - [ ] Email enumeration protection — leave Identity Platform's default
       ("protect against account enumeration") **on**.
 
-### 4. Create a Desktop/native (public) OAuth client
+### 4. Create a Desktop app OAuth client
 
-The CLI uses system-browser loopback OAuth (RFC 8252) + PKCE — a **public** client with
-**no client secret**.
+The CLI uses system-browser loopback OAuth (RFC 8252) + PKCE. Google's **Desktop app**
+client is the correct type for a loopback (`127.0.0.1`) flow shared by the macOS app and
+the headless CLI.
 
 1. Console → **APIs & Services → Credentials → Create credentials → OAuth client ID**.
-2. Application type: **Desktop app** (native/public client).
+2. Application type: **Desktop app**.
 3. Name it e.g. `screencap-cli-desktop`.
-4. **Capture the client id.** A Desktop client may show a "client secret" in the console,
-   but for a public native client per RFC 8252 we treat it as **non-secret and do NOT
-   embed it as a secret**: PKCE (`code_challenge`) is the protection, not the secret.
-   - [ ] **Confirm no `client_secret` is committed to source or shipped in a binary.**
-         Only the client id (and the Web API key) ship in the client.
+4. **Capture BOTH the client id AND the client secret** shown in the console.
+   > ⚠️ Google's token endpoint **requires** the `client_secret` for a Desktop client
+   > **even under PKCE** — omitting it fails *every* sign-in with
+   > `invalid_request: client_secret is missing.` The secret is **non-confidential** (it
+   > ships in the binary exactly like the client id; PKCE is the real protection), but it
+   > is **not optional**. Do NOT run this client secret-less.
+   - [ ] **Capture the client secret.** Like the client id and Web API key, it is injected
+         at build time (`SCREENCAP_OAUTH_CLIENT_SECRET`, consumed by
+         `scripts/generate_provisioned.py`) and ships in the client. Source keeps no
+         placeholder for it — an unprovisioned build resolves it to "" and the U2
+         `_auth-config-check` guard rejects the release.
 
 ### 5. Capture the Firebase Web API key
 
@@ -232,7 +239,9 @@ gcloud functions logs read get-upload-urls --project proteus-photos \
 - [ ] A valid same-project ID token → `verify_bearer` returns a uid (proven by the U2
       handler tests / a manual signed call once U2 lands).
 - [ ] A token minted for any other project → 401 (aud/iss mismatch).
-- [ ] The OAuth client is **Desktop/native**; no `client_secret` is in source or binaries.
+- [ ] The OAuth client is a **Desktop app** client; its (non-confidential but **required**)
+      `client_secret` is injected at build time (`SCREENCAP_OAUTH_CLIENT_SECRET`) and NOT
+      committed to source.
 - [ ] The Web API key is restricted to Identity Toolkit + Token Service only.
 - [ ] Email/password, phone, and anonymous sign-in are disabled.
 
@@ -254,7 +263,8 @@ gcloud functions logs read get-upload-urls --project proteus-photos \
 |------|-------|-------|
 | Identity Platform enabled | ✅ done (2026-06-04) | console shows "Authentication with Identity Platform" |
 | Google provider enabled | ✅ done (2026-06-04) | the only v1 provider |
-| OAuth client id (desktop) | ✅ `screencap-cli-desktop` (Desktop type, 2026-06-04) | value in project-local `.env`; not committed; not a secret |
+| OAuth client id (desktop) | ✅ `screencap-cli-desktop` (Desktop type, 2026-06-04) | value in project-local `.env`; not committed; non-confidential (ships in binaries) |
+| OAuth client **secret** | ⚠️ **capture + inject** as `SCREENCAP_OAUTH_CLIENT_SECRET` | Google Desktop clients require it at the token endpoint even under PKCE; the 2026-06-04 setup omitted it → shipped sign-in broke with `invalid_request: client_secret is missing`. Non-confidential but mandatory — inject at build time via `scripts/generate_provisioned.py` |
 | Firebase Web API key | ✅ created (2026-06-04) | value in project-local `.env`; not committed |
 | Web API key restrictions | ✅ done (2026-06-04) | restricted to Identity Toolkit API + Token Service API (step 6) |
 | Disabled methods | ✅ email/pw, phone, anonymous left disabled | only Google was enabled |

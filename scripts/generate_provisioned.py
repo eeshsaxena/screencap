@@ -8,19 +8,21 @@ values are injected at build time into a gitignored ``_provisioned`` module that
 ``auth.py`` consults (precedence: explicit env var > ``_provisioned`` > placeholder).
 
 This script is the SINGLE writer of ``_provisioned.py``; never hand-edit that file.
-It reads ``SCREENCAP_OAUTH_CLIENT_ID`` and ``SCREENCAP_FIREBASE_API_KEY`` from the
-environment and exits non-zero WITHOUT writing anything if either is missing — so a
-release build that forgot to source the secrets fails here rather than silently
-shipping a placeholder (broken-sign-in) binary (the U2 build guard is the net that
-catches the same failure on the built binary).
+It reads ``SCREENCAP_OAUTH_CLIENT_ID``, ``SCREENCAP_OAUTH_CLIENT_SECRET`` and
+``SCREENCAP_FIREBASE_API_KEY`` from the environment and exits non-zero WITHOUT writing
+anything if any is missing — so a release build that forgot to source the values fails
+here rather than silently shipping a placeholder / secret-less (broken-sign-in) binary
+(the U2 build guard is the net that catches the same failure on the built binary).
 
 Usage (run after ``pip install -e`` and BEFORE ``pyinstaller``):
 
-    SCREENCAP_OAUTH_CLIENT_ID=... SCREENCAP_FIREBASE_API_KEY=... \
+    SCREENCAP_OAUTH_CLIENT_ID=... SCREENCAP_OAUTH_CLIENT_SECRET=... \
+        SCREENCAP_FIREBASE_API_KEY=... \
         python scripts/generate_provisioned.py
 
-The values are non-secret by design (a public RFC 8252 native OAuth client id and a
-Firebase Web API key restricted to Identity Toolkit + Token Service) — see
+The values are non-confidential by design (a Google Desktop OAuth client id + its
+non-confidential client secret — which Google's token endpoint requires even under
+PKCE — and a Firebase Web API key restricted to Identity Toolkit + Token Service); see
 ``docs/runbooks/cloud-auth-setup.md``. "Inject, don't commit" is a keep-it-out-of-git
 preference, not a security boundary: the values still ship in the release tarball.
 """
@@ -31,9 +33,10 @@ import os
 import sys
 from pathlib import Path
 
-# The two env vars the build must supply. Names mirror the client-side env
-# overrides in ``auth.py`` so an operator sets one consistent pair.
+# The three env vars the build must supply. Names mirror the client-side env
+# overrides in ``auth.py`` so an operator sets one consistent set.
 _OAUTH_CLIENT_ID_ENV = "SCREENCAP_OAUTH_CLIENT_ID"
+_OAUTH_CLIENT_SECRET_ENV = "SCREENCAP_OAUTH_CLIENT_SECRET"
 _FIREBASE_API_KEY_ENV = "SCREENCAP_FIREBASE_API_KEY"
 
 # Written relative to this script so the output lands correctly regardless of cwd.
@@ -52,11 +55,13 @@ _TEMPLATE = '''\
 
 FIREBASE_API_KEY = {api_key!r}
 OAUTH_CLIENT_ID = {client_id!r}
+OAUTH_CLIENT_SECRET = {client_secret!r}
 '''
 
 
 def main() -> int:
     client_id = os.environ.get(_OAUTH_CLIENT_ID_ENV, "").strip()
+    client_secret = os.environ.get(_OAUTH_CLIENT_SECRET_ENV, "").strip()
     api_key = os.environ.get(_FIREBASE_API_KEY_ENV, "").strip()
 
     # Remove any stale module FIRST so a fail-closed exit never leaves a prior
@@ -68,6 +73,7 @@ def main() -> int:
         name
         for name, value in (
             (_OAUTH_CLIENT_ID_ENV, client_id),
+            (_OAUTH_CLIENT_SECRET_ENV, client_secret),
             (_FIREBASE_API_KEY_ENV, api_key),
         )
         if not value
@@ -87,14 +93,17 @@ def main() -> int:
         print(
             "ERROR: refusing to generate _provisioned.py — missing required "
             f"environment variable(s): {names}.\n"
-            "Set both before building a release (see docs/runbooks/cloud-auth-setup.md).",
+            "Set all three before building a release (see docs/runbooks/cloud-auth-setup.md).",
             file=sys.stderr,
         )
         return 1
 
     _OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     _OUTPUT_PATH.write_text(
-        _TEMPLATE.format(api_key=api_key, client_id=client_id), encoding="utf-8"
+        _TEMPLATE.format(
+            api_key=api_key, client_id=client_id, client_secret=client_secret
+        ),
+        encoding="utf-8",
     )
     # Print the path only — never echo the credential values.
     print(f"Wrote {_OUTPUT_PATH}")

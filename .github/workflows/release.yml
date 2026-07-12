@@ -67,13 +67,15 @@ jobs:
         # generator fails the build — writing nothing — if a Secret is missing,
         # so a release never silently ships a placeholder (broken-sign-in) binary.
         #
-        # One-time operator setup: add these two repository Secrets (Settings →
+        # One-time operator setup: add these three repository Secrets (Settings →
         # Secrets and variables → Actions → New repository secret). Their values
         # live in the gitignored .env / docs/runbooks/cloud-auth-setup.md and are
-        # non-secret by design (public RFC 8252 client id + a Web API key
-        # restricted to Identity Toolkit + Token Service).
+        # non-confidential by design (a Google Desktop OAuth client id + its
+        # client secret — which Google's token endpoint requires even under PKCE —
+        # and a Web API key restricted to Identity Toolkit + Token Service).
         env:
           SCREENCAP_OAUTH_CLIENT_ID: ${{ secrets.SCREENCAP_OAUTH_CLIENT_ID }}
+          SCREENCAP_OAUTH_CLIENT_SECRET: ${{ secrets.SCREENCAP_OAUTH_CLIENT_SECRET }}
           SCREENCAP_FIREBASE_API_KEY: ${{ secrets.SCREENCAP_FIREBASE_API_KEY }}
         run: python scripts/generate_provisioned.py
 
