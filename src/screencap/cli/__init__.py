@@ -84,6 +84,17 @@ _AUTH_SCHEMA_VERSION = 2
 # `backfill status --json` envelope (ok + schema_version + the privacy-safe
 # status snapshot the daemon publishes). SCR-178 U6.
 _BACKFILL_SCHEMA_VERSION = 1
+# `clip --json` envelope (ok + reason + path), read by the Swift
+# ClipExportController (SCR-219 U6). Independent of the stderr-event schema so a
+# clip_progress field change never bumps the terminal-envelope version.
+_CLIP_SCHEMA_VERSION = 1
+# Structured `screencap clip` stderr event types (KTD6). String literals are the
+# cross-language contract the Swift app parses (mirrors the UploadEventLine
+# channel/shape); named here so a typo at an emit site fails locally.
+_CLIP_EVENT_STARTED = "clip_started"
+_CLIP_EVENT_PROGRESS = "clip_progress"
+_CLIP_EVENT_DONE = "clip_done"
+_CLIP_EVENT_FAILED = "clip_failed"
 
 
 def _should_default_to_json() -> bool:
@@ -1476,7 +1487,13 @@ def _find_exportable_dirs(base_dir):
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
-def review_data_cmd(name, as_json):
+@click.option("--clip-start-ms", type=int, default=None,
+              help="Scope the consent surface to a clip starting at this epoch "
+                   "millisecond (requires --clip-end-ms).")
+@click.option("--clip-end-ms", type=int, default=None,
+              help="Scope the consent surface to a clip ending (exclusive) at "
+                   "this epoch millisecond (requires --clip-start-ms).")
+def review_data_cmd(name, as_json, clip_start_ms, clip_end_ms):
     """Prepare a recording for native review and emit a JSON envelope.
 
     Called by the SwiftUI shell's review window when the operator clicks
@@ -1485,6 +1502,12 @@ def review_data_cmd(name, as_json):
     it works with no ffmpeg/ffprobe on PATH — and ensures an events.jsonl
     exists. Returns paths the Swift side feeds into the AVKit player and
     the timeline pane.
+
+    ``--clip-start-ms`` / ``--clip-end-ms`` (both epoch milliseconds) scope the
+    consent surface to a single clip's ``[start, end)`` range (SCR-219): the
+    masked screenshots + events are filtered to the range and an additive
+    ``clip_video_capture_blocked_only`` honesty flag is emitted. Omit both for
+    the whole-recording review.
 
     The envelope shape matches `screencap list --json` and
     `screencap info --json`: ok + schema_version + payload, or
@@ -1495,7 +1518,9 @@ def review_data_cmd(name, as_json):
     from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_review_data
 
     try:
-        envelope = prepare_review_data(name)
+        envelope = prepare_review_data(
+            name, clip_start_ms=clip_start_ms, clip_end_ms=clip_end_ms,
+        )
     except ReviewPrepareError as e:
         # A busy terminal_lock surfaces here as ReviewPrepareBusy (a subclass);
         # the review window (unlike inspect) has no auto-retry consumer, so it is
@@ -1596,6 +1621,141 @@ def inspect_data_cmd(name, as_json):
     console.print(f"  events: [dim]{escape(str(events_display))}[/dim]")
     if envelope.get("video_pixfmt_remediated"):
         console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
+
+
+@cli.command("clip")
+@click.argument("name")
+@click.option("--start-ms", type=int, required=True,
+              help="Clip start, milliseconds from recording start (inclusive).")
+@click.option("--end-ms", type=int, required=True,
+              help="Clip end, milliseconds from recording start (exclusive).")
+@click.option("--out", "out_path", type=click.Path(dir_okay=False), required=True,
+              help="Destination .mp4 path for the exported clip.")
+@click.option("--lock-timeout", type=click.FloatRange(min=0), default=None,
+              help="Seconds to wait for the contended per-recording terminal "
+                   "lock before reporting the recording busy (default: 30, "
+                   "matching the engine). The interactive app passes a short "
+                   "value well under its watchdog so a contended lock surfaces "
+                   "as retryable clip_busy rather than a hung export.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
+    """Export ``[start-ms, end-ms)`` of a recording as a local .mp4 (video + audio).
+
+    The auth-free, local clip verb the SwiftUI shell's ClipExportController spawns
+    (SCR-219). It orchestrates the U1/U2 engine trim, holding the per-recording
+    eviction lock around the source-chunk read.
+
+    Emits structured stderr lifecycle events — ``clip_started`` /
+    ``clip_progress{frames_done, frames_total}`` (determinate) / ``clip_done{path}``
+    / ``clip_failed{reason}`` — on the same tolerant-reader channel as the upload
+    events, and a terminal ``--json`` envelope on stdout (``ok`` + ``reason`` +
+    ``path``).
+
+    This command **always exits 0**, carrying success/failure in the envelope:
+    ``CLIClient.runJSONRaw`` discards stdout on a non-zero exit, so a non-zero
+    exit here would drop the typed ``reason`` the app branches on (see
+    docs/solutions/integration-issues/cli-json-envelope-nonzero-exit-discards-stdout-2026-07-02.md).
+
+    Reasons: ``not_eligible`` (not a clippable recording), ``no_frames_in_range``,
+    ``masked_video_required`` (a flag-ON recording fails closed), ``clip_busy``
+    (retryable — the eviction lock stayed contended), ``trim_failed`` (catch-all).
+
+    No account or sign-in is required — clipping reads only local source chunks.
+    """
+    from pathlib import Path
+
+    from screencap._stderr_events import emit_event
+
+    out_p = Path(out_path)
+
+    def _emit_envelope(payload: dict) -> None:
+        payload = {"schema_version": _CLIP_SCHEMA_VERSION, "recording": name, **payload}
+        if as_json:
+            click.echo(json.dumps(payload))
+        elif payload["ok"]:
+            console.print(f"[green]Clip exported[/green] → [dim]{escape(str(payload['path']))}[/dim]")
+        else:
+            console.print(f"[red]Clip failed[/red] ({escape(str(payload['reason']))})")
+
+    def _fail(reason: str, *, retryable: bool = False, error: str | None = None) -> None:
+        emit_event(_CLIP_EVENT_FAILED, recording=name, reason=reason, retryable=retryable)
+        _emit_envelope({
+            "ok": False, "reason": reason, "path": None,
+            "retryable": retryable, "error": error,
+            "start_ms": start_ms, "end_ms": end_ms,
+        })
+        # Always exit 0 — the reason travels in the envelope, not the exit code.
+
+    # Eligibility gate (isClippable, R8): a local, non-stub recording with source
+    # video present. Kept intentionally simple — the engine raises
+    # no_frames_in_range when a *specific* range has no video; not_eligible is for
+    # "this recording can't be clipped at all." Resolve first, then require the
+    # dir exists and holds at least one source chunk_*.mp4 (an evicted stub or a
+    # legacy single-file recording has none). The engine is NOT touched here, so
+    # an ineligible name never reaches the trim.
+    from screencap.config import resolve_recording_dir
+
+    try:
+        rec_dir = resolve_recording_dir(name)
+    except (ValueError, OSError):
+        _fail("not_eligible", error=f"invalid recording name: {name!r}")
+        return
+    if not (rec_dir.is_dir() and any(rec_dir.glob("chunk_*.mp4"))):
+        _fail(
+            "not_eligible",
+            error=f"{name!r} is not a clippable recording (missing, a stub, or "
+                  "has no local source video)",
+        )
+        return
+
+    from screencap.engine.video import (
+        ClipExportError,
+        export_clip,
+    )
+    from screencap.terminal_stage import TerminalStageBusy
+
+    emit_event(_CLIP_EVENT_STARTED, recording=name, start_ms=start_ms, end_ms=end_ms)
+
+    def _on_progress(frames_done: int, frames_total: int) -> None:
+        emit_event(
+            _CLIP_EVENT_PROGRESS, recording=name,
+            frames_done=int(frames_done), frames_total=int(frames_total),
+        )
+
+    export_kwargs: dict[str, Any] = {"on_progress": _on_progress}
+    if lock_timeout is not None:
+        # None → let the engine's default (30s) stand, so "default matches engine".
+        export_kwargs["lock_timeout"] = lock_timeout
+
+    try:
+        export_clip(rec_dir, start_ms, end_ms, out_p, **export_kwargs)
+    except TerminalStageBusy as exc:
+        # A contended eviction lock is retryable, not a hard failure (KTD6). It is
+        # deliberately NOT a ClipExportError, so the app can retry rather than
+        # surface a terminal error.
+        _fail("clip_busy", retryable=True, error=str(exc))
+        return
+    except ClipExportError as exc:
+        # The engine's structured taxonomy: MaskedVideoRequiredError /
+        # NoFramesInRangeError carry their own ``reason`` (masked_video_required /
+        # no_frames_in_range); the base ClipExportError is trim_failed.
+        _fail(getattr(exc, "reason", "trim_failed") or "trim_failed", error=str(exc))
+        return
+    except Exception as exc:
+        # Any unexpected error still exits 0 with the catch-all reason rather than
+        # a raw traceback the app's decoder would never see (non-zero → stdout
+        # dropped). Control-flow BaseExceptions (KeyboardInterrupt/SystemExit)
+        # propagate untouched.
+        _fail("trim_failed", error=str(exc))
+        return
+
+    emit_event(_CLIP_EVENT_DONE, recording=name, path=str(out_p))
+    _emit_envelope({
+        "ok": True, "reason": None, "path": str(out_p),
+        "start_ms": start_ms, "end_ms": end_ms,
+    })
 
 
 @cli.command("login")
