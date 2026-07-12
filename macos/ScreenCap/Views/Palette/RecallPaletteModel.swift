@@ -93,7 +93,11 @@ enum RecallPalette {
                 body = .results
             }
         }
-        let showsBanner = consentNeeded && !consentDeclined && backfillState == .hidden
+        var showsBanner = consentNeeded && !consentDeclined && backfillState == .hidden
+        // SCR-261 U3 (R1/KTD4) — when the empty body owns the Turn-on ask, the
+        // banner must not co-render the same question. It stays for `.results`
+        // with consentNeeded (rows render, the body carries no ask).
+        if case .empty(.consentNeeded, _) = body { showsBanner = false }
         return State(body: body, showsConsentBanner: showsBanner, backfill: backfillState)
     }
 

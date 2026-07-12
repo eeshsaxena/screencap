@@ -71,8 +71,11 @@ final class SearchViewModelBackfillTests: XCTestCase {
         return try! JSONDecoder().decode(BackfillProgressEvent.self, from: Data(json.utf8))
     }
 
+    /// Records every value written through the injected declined-flag seam
+    /// (Skip persists `true`; the empty-state Index-now accept clears with
+    /// `false` — SCR-261 U3).
     private final class PersistRecorder: @unchecked Sendable {
-        var calls = 0
+        var values: [Bool] = []
     }
 
     private func makeVM(
@@ -82,7 +85,7 @@ final class SearchViewModelBackfillTests: XCTestCase {
         SearchViewModel(
             service: SearchViewModelBackfillTests.NoopSearchService(),
             backfill: fake,
-            persistBackfillDeclined: { persist.calls += 1 }
+            persistBackfillDeclined: { persist.values.append($0) }
         )
     }
 
@@ -222,10 +225,10 @@ final class SearchViewModelBackfillTests: XCTestCase {
 
         // The decline is persisted (so it doesn't re-prompt) and no run started.
         let deadline = Date().addingTimeInterval(1)
-        while persist.calls == 0 && Date() < deadline {
+        while persist.values.isEmpty && Date() < deadline {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTAssertEqual(persist.calls, 1)
+        XCTAssertEqual(persist.values, [true])
         XCTAssertFalse(fake.callOrder.contains("start"))
     }
 
@@ -234,6 +237,99 @@ final class SearchViewModelBackfillTests: XCTestCase {
         let vm = makeVM(fake)
         vm.offerBackfill(alreadyDeclined: true)
         XCTAssertEqual(vm.backfillState, .hidden)
+    }
+
+    // MARK: - SCR-261 U3 — empty-state Index-now (explicit accept) + completion hook
+
+    /// KTD5 pin: the empty-state CTA is an explicit accept, so it must start
+    /// the run even for a prior decliner AND clear the persisted declined flag.
+    /// This fails if the CTA were routed through `offerBackfill(alreadyDeclined:
+    /// true)`, which no-ops to `.hidden` and never reaches `start()`.
+    func testEmptyStateIndexNowStartsForPriorDeclinerAndClearsPersistedDecline() async {
+        let fake = FakeBackfillService()
+        let persist = PersistRecorder()
+        let vm = makeVM(fake, persist: persist)
+
+        // A prior decliner: the offer path would no-op…
+        vm.offerBackfill(alreadyDeclined: true)
+        XCTAssertEqual(vm.backfillState, .hidden)
+
+        // …but the explicit accept starts the run anyway.
+        vm.startBackfillFromEmptyState()
+        await wait(for: vm) { $0 == .starting }
+        await wait(for: vm) { _ in fake.callOrder.contains("start") }
+        // The subscribe-before-start ordering holds on this path too.
+        XCTAssertEqual(Array(fake.callOrder.prefix(2)), ["subscribe", "start"])
+
+        // And the persisted decline is cleared (false), so a stale flag can't
+        // suppress future offers.
+        let deadline = Date().addingTimeInterval(1)
+        while persist.values.isEmpty && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(persist.values, [false])
+    }
+
+    /// KTD9: reaching `.done` fires the completion hook exactly once — and
+    /// in-progress ticks never fire it.
+    func testCompletionHookFiresExactlyOnceOnDone() async {
+        let fake = FakeBackfillService()
+        let vm = makeVM(fake)
+        var fired = 0
+        vm.onBackfillCompleted = { fired += 1 }
+
+        vm.acceptBackfill()
+        await wait(for: vm) { $0 == .starting }
+        fake.emit(progress("backfill.progress", state: .running, done: 1, total: 3))
+        await wait(for: vm) { $0 == .indexing(done: 1, total: 3, failed: 0) }
+        XCTAssertEqual(fired, 0, "in-progress ticks must not fire the hook")
+
+        fake.emit(progress("backfill.completed", state: .completed, done: 3, total: 3))
+        await wait(for: vm) { $0 == .done(done: 3, total: 3, failed: 0) }
+        XCTAssertEqual(fired, 1)
+
+        // No further transition → no further fire.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fired, 1)
+    }
+
+    /// KTD9: done-with-partial-failures is still done — the hook fires (the
+    /// index did change; a refresh is warranted).
+    func testCompletionHookFiresOnDoneWithFailures() async {
+        let fake = FakeBackfillService()
+        let vm = makeVM(fake)
+        var fired = 0
+        vm.onBackfillCompleted = { fired += 1 }
+
+        vm.acceptBackfill()
+        await wait(for: vm) { $0 == .starting }
+        fake.emit(progress("backfill.completed", state: .completed, done: 2, failed: 1, total: 3))
+        await wait(for: vm) { $0 == .done(done: 2, total: 3, failed: 1) }
+        XCTAssertEqual(fired, 1)
+    }
+
+    /// KTD9: non-done transitions (starting / indexing / cancelled / paused)
+    /// never fire the hook.
+    func testCompletionHookSilentForNonDoneTransitions() async {
+        let fake = FakeBackfillService()
+        let vm = makeVM(fake)
+        var fired = 0
+        vm.onBackfillCompleted = { fired += 1 }
+
+        vm.acceptBackfill()
+        await wait(for: vm) { $0 == .starting }
+        fake.emit(progress("backfill.progress", state: .running, done: 1, total: 3))
+        await wait(for: vm) { $0 == .indexing(done: 1, total: 3, failed: 0) }
+
+        vm.cancelBackfill()
+        await wait(for: vm) { $0 == .cancelled(done: 1, total: 3) }
+
+        vm.resumeBackfill()
+        await wait(for: vm) { $0 == .starting }
+        fake.emit(progress("backfill.paused", state: .paused, done: 2, total: 3))
+        await wait(for: vm) { $0 == .paused(done: 2, total: 3) }
+
+        XCTAssertEqual(fired, 0)
     }
 
 }

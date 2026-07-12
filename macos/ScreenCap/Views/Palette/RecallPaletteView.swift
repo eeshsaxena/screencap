@@ -27,7 +27,10 @@ struct RecallPaletteView: View {
     @StateObject private var presenceGate = PresenceGate()
 
     @State private var query = ""
-    @State private var contentIndexEnabled = false
+    // nil = settings not yet loaded (or the load failed) — tri-state (SCR-261
+    // R12/KTD6) so an unresolved flag stays quiet in the empty-cause
+    // derivation instead of masquerading as a known "off".
+    @State private var contentIndexEnabled: Bool? = nil
     // nil = not yet loaded. Treated as "gated" until loadSettings() positively
     // resolves it, so recall results never render un-gated during the async load
     // window (fail-closed on the presence gate).
@@ -46,7 +49,17 @@ struct RecallPaletteView: View {
         }
         .task {
             runner = RecallPaletteQueryRunner { [weak model] text in
-                await model?.search(text, contentIndexEnabled: contentIndexEnabled)
+                // The view-model signature stays a plain Bool (DayTimelineView
+                // shares it); an unresolved flag searches as "off".
+                await model?.search(text, contentIndexEnabled: contentIndexEnabled ?? false)
+            }
+            // SCR-261 U3 (KTD9/R9): backfill finished (including with partial
+            // failures) → refresh a live query once, non-debounced, so results
+            // reflect the new index. Never for an empty/cleared query.
+            model.onBackfillCompleted = {
+                let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                runner?.search(query, debounced: false)
             }
             await loadSettings()
             fieldFocused = true
@@ -87,6 +100,7 @@ struct RecallPaletteView: View {
                 onSkipBackfill: skipBackfill,
                 onCancelBackfill: model.cancelBackfill,
                 onResumeBackfill: model.resumeBackfill,
+                onStartBackfill: startBackfill,
                 onRunChip: runChipQuery,
                 onOpen: jump,
                 onRetry: { runner?.search(query, debounced: false) },
@@ -229,7 +243,9 @@ struct RecallPaletteView: View {
             backfillDeclined = env.settings.contentIndexBackfillDeclined ?? false
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
         } catch {
-            contentIndexEnabled = false
+            // SCR-261 R12: a failed settings read leaves the flag unresolved
+            // (nil) — never a fabricated "off", which would nag about consent
+            // the user may already have given.
         }
     }
 
@@ -237,6 +253,7 @@ struct RecallPaletteView: View {
     /// optimistic with revert-on-failure (the retired SearchView's
     /// enableConsent pattern).
     private func enableConsent() {
+        let prior = contentIndexEnabled
         contentIndexEnabled = true
         model.offerBackfill(alreadyDeclined: backfillDeclined)
         Task {
@@ -245,7 +262,9 @@ struct RecallPaletteView: View {
                     ["settings", "--set", "content_index_enabled=true", "--json"]
                 )
             } catch {
-                contentIndexEnabled = false
+                // Revert to what we knew before the optimistic flip (false, or
+                // nil when the settings read never resolved — tri-state).
+                contentIndexEnabled = prior
                 model.dismissBackfillOffer()
                 return
             }
@@ -270,6 +289,17 @@ struct RecallPaletteView: View {
         backfillDeclined = true
         model.skipBackfill()
     }
+
+    /// SCR-261 U3 (KTD5): the not-indexed empty body's "Index now" — an
+    /// explicit accept that must work for a prior decliner, so it goes to
+    /// `startBackfillFromEmptyState()` directly (never through
+    /// `offerBackfill(alreadyDeclined:)`, which no-ops). The view-local decline
+    /// memory resets too, so a same-session `enableConsent` doesn't consult a
+    /// stale decline; the model clears the persisted flag through its seam.
+    private func startBackfill() {
+        backfillDeclined = false
+        model.startBackfillFromEmptyState()
+    }
 }
 
 /// The palette's pure body: renders one `RecallPalette.State` variant plus the
@@ -279,9 +309,9 @@ struct RecallPaletteContent: View {
     let phase: SearchViewModel.Phase
     let consentDeclined: Bool
     let backfillState: SearchViewModel.BackfillUIState
-    /// Live settings flag (nil = not yet resolved) — drives the SCR-261
-    /// empty-cause derivation. The hosting view's plain Bool promotes
-    /// implicitly; a later unit makes the view state itself tri-state.
+    /// Live settings flag (nil = not yet resolved / load failed) — drives the
+    /// SCR-261 empty-cause derivation. The hosting view's state is tri-state
+    /// too (U3), so an unresolved load flows through as nil.
     var contentIndexEnabled: Bool? = nil
     let recentSearches: [String]
     let queryTerms: [String]
@@ -299,8 +329,8 @@ struct RecallPaletteContent: View {
     var onCancelBackfill: () -> Void = {}
     var onResumeBackfill: () -> Void = {}
     /// Start indexing existing recordings — the not-indexed empty state's CTA
-    /// (SCR-261). Rendering only here; U3 wires the behavior at the
-    /// construction site.
+    /// (SCR-261). Wired by the hosting view to the explicit-accept path
+    /// (`startBackfillFromEmptyState`), which works for a prior decliner.
     var onStartBackfill: () -> Void = {}
     var onRunChip: (String) -> Void = { _ in }
     var onOpen: (SearchResultItem) -> Void = { _ in }

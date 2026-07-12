@@ -200,6 +200,27 @@ final class RecallPaletteStateTests: XCTestCase {
         )
     }
 
+    // SCR-261 U3 (R1/KTD4) — when the empty body owns the Turn-on ask
+    // (`.empty(cause: .consentNeeded, _)`), the banner must not co-render the
+    // same question; it stays for a non-empty result set with consentNeeded.
+    func testConsentBannerSuppressedWhenEmptyBodyOwnsTheAsk() {
+        let empty = RecallPalette.state(
+            phase: .loaded(SearchFixtures.emptyResults(screen: .notIndexed, consentNeeded: true)),
+            consentDeclined: false, backfillState: .hidden,
+            contentIndexEnabled: false, recents: []
+        )
+        XCTAssertEqual(empty.body, .empty(cause: .consentNeeded, showsUnavailableNote: false))
+        XCTAssertFalse(empty.showsConsentBanner, "the body owns the ask — never both")
+
+        let results = RecallPalette.state(
+            phase: .loaded(SearchFixtures.consentNeededResults()),
+            consentDeclined: false, backfillState: .hidden,
+            contentIndexEnabled: false, recents: []
+        )
+        XCTAssertEqual(results.body, .results)
+        XCTAssertTrue(results.showsConsentBanner, "rows render, so the banner still carries the ask")
+    }
+
     func testUnknownSettingsFlagStaysQuiet() {
         // Settings pending/failed (nil flag) → a quiet "no matches", never a
         // consent or not-indexed nag (R12).
