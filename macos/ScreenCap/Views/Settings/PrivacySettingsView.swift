@@ -174,32 +174,7 @@ struct PrivacySettingsView: View {
         let state = privacy.cloudE2EEEnabled
         let locked = PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: state) == .locked
         return VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 8) {
-                        Text(PrivacySettingsCopy.e2eeTitle)
-                            .font(SCTypography.sans(size: 14, weight: .semibold))
-                            .foregroundStyle(Color.scInk)
-                        chip(
-                            PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: state),
-                            color: locked ? .scInkMuted : .scTeal
-                        )
-                    }
-                    Text(PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: state))
-                        .font(SCTypography.sans(size: 12.5))
-                        .foregroundStyle(Color.scInkMuted)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
-                // Locked (nil flag — older CLI without the `e2ee` verb,
-                // KTD-8): non-interactive stub presentation, never a toggle
-                // whose write path may not exist.
-                SettingsToggle(
-                    on: PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: state),
-                    action: locked ? nil : toggleE2EE
-                )
-                .disabled(e2eeWriteInFlight)
-            }
+            e2eeRowHeader
             if let e2eeError {
                 Text(e2eeError)
                     .font(SCTypography.sans(size: 12))
@@ -219,6 +194,53 @@ struct PrivacySettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(PrivacySettingsCopy.e2eeConfirmBody)
+        }
+    }
+
+    // Extracted from `e2eeRow` so each view builder stays small enough for the
+    // Swift type-checker to resolve — the full inline chain (VStack → HStack →
+    // VStack → HStack + toggle + trailing `.confirmationDialog`) crashed the
+    // solver ("failed to produce diagnostic for expression"), failing the
+    // universal Release build.
+    private var e2eeRowHeader: some View {
+        let state = privacy.cloudE2EEEnabled
+        let locked = PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: state) == .locked
+        // A ternary between `nil` and the unapplied method reference
+        // `toggleE2EE` is what crashed the solver ("failed to produce
+        // diagnostic for expression") and failed the Release build. A plain
+        // `if` plus an explicit closure literal avoids both the ternary and the
+        // bare method reference.
+        let toggleAction: (() -> Void)?
+        if locked {
+            toggleAction = nil
+        } else {
+            toggleAction = { toggleE2EE() }
+        }
+        return HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(PrivacySettingsCopy.e2eeTitle)
+                        .font(SCTypography.sans(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.scInk)
+                    chip(
+                        PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: state),
+                        color: locked ? .scInkMuted : .scTeal
+                    )
+                }
+                Text(PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: state))
+                    .font(SCTypography.sans(size: 12.5))
+                    .foregroundStyle(Color.scInkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            // Locked (nil flag — older CLI without the `e2ee` verb,
+            // KTD-8): non-interactive stub presentation, never a toggle
+            // whose write path may not exist.
+            SettingsToggle(
+                on: PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: state),
+                action: toggleAction
+            )
+            .disabled(e2eeWriteInFlight)
         }
     }
 
