@@ -145,15 +145,28 @@ struct RecallPaletteView: View {
 
     // MARK: - Footer (design 591–594)
 
+    /// SCR-261 U4 (R11) — the footer claims indexed coverage only when
+    /// indexing is on AND the index is built. Off, unknown settings, or a
+    /// loaded result reporting the index absent all drop the claim.
+    private var showsIndexedBadge: Bool {
+        guard contentIndexEnabled == true else { return false }
+        if case .loaded(let results) = model.phase, results.coverage.screen == .notIndexed {
+            return false
+        }
+        return true
+    }
+
     private var footer: some View {
         HStack {
             Text("↑↓ browse · ↵ jump to moment · esc close")
                 .font(SCTypography.mono(size: 10.5))
                 .foregroundStyle(Color.scInkMuted)
             Spacer()
-            Text("indexed on-device")
-                .font(SCTypography.mono(size: 10.5))
-                .foregroundStyle(Color.scTeal)
+            if showsIndexedBadge {
+                Text("indexed on-device")
+                    .font(SCTypography.mono(size: 10.5))
+                    .foregroundStyle(Color.scTeal)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
