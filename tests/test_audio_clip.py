@@ -62,6 +62,12 @@ def _write_db(rec_dir: Path, video_start: float, audio_start: float | None):
         conn.execute("INSERT INTO audio_info VALUES (?, ?)", (audio_start, _RATE))
     conn.commit()
     conn.close()
+    # The clip gate fails CLOSED on an unreadable frozen intent, so a realistic
+    # recording carries a `.recording_intent`; freeze the default flag-OFF posture
+    # these audio-sync fixtures assume.
+    (rec_dir / ".recording_intent").write_text(
+        json.dumps({"masked_video_upload": False})
+    )
 
 
 def _write_flac_chunks(

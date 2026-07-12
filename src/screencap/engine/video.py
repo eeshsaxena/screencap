@@ -1500,11 +1500,27 @@ def _export_clip_video_locked(
     :class:`NoFramesInRangeError` when there are no chunks (or none in range).
     """
     # Fail closed on rich source video BEFORE reading a single chunk (KTD3).
-    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+    #
+    # The CLIP path is STRICTER than the shared upload resolver: it reads the
+    # frozen ``masked_video_upload`` bit DIRECTLY via
+    # ``catalog.read_masked_video_upload`` rather than through
+    # ``pipeline_chunk_ops.get_frozen_masked_video_upload`` — because that
+    # resolver falls back to the LIVE mutable global for a missing / corrupt /
+    # field-absent ``.recording_intent`` (``None``). A clip exports rich source
+    # video to an EXTERNAL-recipient file, so an UNREADABLE frozen intent must
+    # fail CLOSED here rather than trust a possibly-relaxed-since-capture global.
+    # ONLY an intent that froze the bit explicitly OFF (``is False``) may proceed;
+    # frozen-ON (``True``) and unreadable (``None``) both refuse. The upload seams
+    # keep the resolver's legacy-global fallback — this tightening is clip-only.
+    from screencap.catalog import read_masked_video_upload
 
-    if get_frozen_masked_video_upload(rec_dir):
+    frozen = read_masked_video_upload(rec_dir)
+    if frozen is not False:
+        detail = (
+            "ON" if frozen else "unresolvable (missing/corrupt .recording_intent)"
+        )
         raise MaskedVideoRequiredError(
-            f"masked_video_upload is ON for recording {rec_dir.name!r}; "
+            f"masked_video_upload is {detail} for recording {rec_dir.name!r}; "
             f"refusing to clip unmasked source video"
         )
 
@@ -1584,12 +1600,29 @@ def export_clip(
     # of the chunks, so both reads must be inside the same critical section.
     with terminal_lock(rec_dir.name, timeout=lock_timeout):
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Reclaim clipvid intermediates orphaned by a crashed/hard-killed prior
+        # export (a SIGKILL, or a SIGTERM racing the cleanup) BEFORE writing our
+        # own. The normal exit paths (mux/replace success, or the
+        # ``except BaseException`` unlink below on a SIGTERM the CLI turns into a
+        # raise) already drop the temp; this sweep is the safety net for the case
+        # where neither ran, so a full-size video-only intermediate can never
+        # accumulate world-readable in the user's export dir. Concurrency-safe:
+        # ``_sweep_stale_temps`` skips any temp whose embedded PID is still alive
+        # (a concurrent in-flight export in this or another process).
+        _sweep_stale_temps(out_path.parent, ".clipvid.mp4.*.tmp")
         # Video → a dot-prefixed intermediate (excluded from upload/catalog),
         # then muxed with audio into out_path. A masked/no-frames failure raises
         # out of the video pass before this temp materializes, so no file leaks.
+        #
+        # Name shape ``.clipvid.mp4.<pid>.<uuid>.tmp``: the PID sits immediately
+        # after the (only) ``mp4`` token and the name ends in ``.tmp``, so the
+        # shared ``_sweep_stale_temps`` PID parser reclaims it (the old
+        # ``.<out>.clipvid.<pid>.<uuid>.tmp.mp4`` shape had the PID after a
+        # ``clipvid`` token and hit a ValueError, leaving orphans unreclaimable).
+        # pid + uuid keep it unique across concurrent exports into one dir.
         video_tmp = (
             out_path.parent
-            / f".{out_path.name}.clipvid.{os.getpid()}.{uuid4().hex}.tmp.mp4"
+            / f".clipvid.mp4.{os.getpid()}.{uuid4().hex}.tmp"
         )
         try:
             _export_clip_video_locked(rec_dir, start, end, video_tmp, on_progress)

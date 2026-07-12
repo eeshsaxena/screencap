@@ -1756,6 +1756,8 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
     rel_start_ms = start_ms - anchor_ms
     rel_end_ms = end_ms - anchor_ms
 
+    import signal as _signal
+
     from screencap.engine.video import (
         ClipExportError,
         export_clip,
@@ -1775,7 +1777,39 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
         # None → let the engine's default (30s) stand, so "default matches engine".
         export_kwargs["lock_timeout"] = lock_timeout
 
+    # SCR-219: install a SIGTERM handler around the encode. The Swift Cancel /
+    # window-close / watchdog paths SIGTERM this child; without a handler Python's
+    # default disposition kills it WITHOUT running ``export_clip``'s
+    # ``except BaseException`` cleanup, orphaning the full-size video-only
+    # intermediate in the user's export dir. The handler emits ONE terminal
+    # ``clip_failed(cancelled)`` then raises KeyboardInterrupt, which propagates
+    # INTO ``export_clip`` (whose ``except BaseException`` unlinks the temp) and
+    # back here. Mirrors ``upload_cmd``'s ``_emit_interrupted_and_raise``. The
+    # sentinel + finally restore the previous handler (skipped off-main-thread,
+    # where ``signal.signal`` raises ValueError).
+    _interrupt_emitted = False
+
+    def _emit_interrupted_and_raise(_signum, _frame):
+        nonlocal _interrupt_emitted
+        if not _interrupt_emitted:
+            _interrupt_emitted = True
+            emit_event(
+                _CLIP_EVENT_FAILED, recording=name, reason="cancelled",
+                retryable=False,
+            )
+        raise KeyboardInterrupt
+
+    _UNSET: object = object()
+    _previous_sigterm: object = _UNSET
+
     try:
+        try:
+            _previous_sigterm = _signal.signal(
+                _signal.SIGTERM, _emit_interrupted_and_raise
+            )
+        except ValueError:
+            pass  # off-main-thread — the restore guard below no-ops.
+
         # Relative (from-video-start) ms — the caller-facing envelope/events keep
         # the absolute ``start_ms`` / ``end_ms`` above.
         export_clip(rec_dir, rel_start_ms, rel_end_ms, out_p, **export_kwargs)
@@ -1791,6 +1825,19 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
         # no_frames_in_range); the base ClipExportError is trim_failed.
         _fail(getattr(exc, "reason", "trim_failed") or "trim_failed", error=str(exc))
         return
+    except KeyboardInterrupt:
+        # A SIGTERM (Swift cancel / window-close / watchdog) routed through
+        # ``_emit_interrupted_and_raise``, which already emitted the terminal
+        # ``clip_failed(cancelled)`` event and let ``export_clip`` unlink its
+        # intermediate. Still write the stdout envelope so a stdout reader gets a
+        # typed result, and exit 0 (this command always carries the reason in the
+        # envelope, not the exit code — a non-zero exit would drop stdout).
+        _emit_envelope({
+            "ok": False, "reason": "cancelled", "path": None,
+            "retryable": False, "error": "interrupted",
+            "start_ms": start_ms, "end_ms": end_ms,
+        })
+        return
     except Exception as exc:
         # Any unexpected error still exits 0 with the catch-all reason rather than
         # a raw traceback the app's decoder would never see (non-zero → stdout
@@ -1798,6 +1845,19 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
         # propagate untouched.
         _fail("trim_failed", error=str(exc))
         return
+    finally:
+        # Restore only if the install actually ran (_UNSET ⇒ off-main-thread).
+        # A genuine None previous handler (C-set) restores to SIG_DFL.
+        if _previous_sigterm is not _UNSET:
+            try:
+                _signal.signal(
+                    _signal.SIGTERM,
+                    _previous_sigterm
+                    if _previous_sigterm is not None
+                    else _signal.SIG_DFL,
+                )
+            except ValueError:
+                pass
 
     emit_event(_CLIP_EVENT_DONE, recording=name, path=str(out_p))
     _emit_envelope({

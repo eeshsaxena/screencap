@@ -17,9 +17,13 @@ selects frames whose ``dt`` lies in ``[start_ms/1000, end_ms/1000)``.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import struct
+import subprocess
+import sys
 from pathlib import Path
+from uuid import uuid4
 
 import av
 import pytest
@@ -29,6 +33,7 @@ from screencap.engine.video import (
     MaskedVideoRequiredError,
     NoFramesInRangeError,
     VideoWriter,
+    export_clip,
     export_clip_video,
 )
 
@@ -41,6 +46,7 @@ def _make_recording(
     *,
     base: float = _BASE,
     with_metadata: bool = True,
+    masked_video_upload: bool | None = False,
     size: int = 48,
     fps: int = 24,
 ) -> float:
@@ -55,6 +61,12 @@ def _make_recording(
 
     ``with_metadata=False`` omits the manifests + db so the summed-span fallback
     path is exercised.
+
+    ``masked_video_upload`` writes a frozen ``.recording_intent`` with that bit
+    (default ``False`` — the real flag-OFF posture every genuine recording has).
+    The clip gate now fails CLOSED on an UNREADABLE frozen intent, so a realistic
+    recording must carry one; pass ``None`` to omit the file and exercise that
+    fail-closed-on-missing-intent path.
     """
     for i, frames in enumerate(chunks):
         path = rec_dir / f"chunk_{i:04d}.mp4"
@@ -74,6 +86,10 @@ def _make_recording(
         conn.execute("INSERT INTO recording VALUES (?, ?)", (base, base))
         conn.commit()
         conn.close()
+    if masked_video_upload is not None:
+        (rec_dir / ".recording_intent").write_text(
+            json.dumps({"masked_video_upload": masked_video_upload})
+        )
     return base
 
 
@@ -208,10 +224,7 @@ class TestMidGopStart:
 class TestFailClosed:
     def test_masked_video_upload_on_fails_closed(self, tmp_path):
         """AE3/KTD3: frozen masked_video_upload ON → refuse, write no file."""
-        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)
-        (tmp_path / ".recording_intent").write_text(
-            json.dumps({"masked_video_upload": True})
-        )
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK, masked_video_upload=True)
         out = tmp_path / "clip.mp4"
 
         with pytest.raises(MaskedVideoRequiredError) as exc:
@@ -222,10 +235,7 @@ class TestFailClosed:
 
     def test_masked_video_upload_off_exports(self, tmp_path):
         """The default flag-OFF posture exports normally (control for the above)."""
-        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)
-        (tmp_path / ".recording_intent").write_text(
-            json.dumps({"masked_video_upload": False})
-        )
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK, masked_video_upload=False)
         out = tmp_path / "clip.mp4"
         export_clip_video(tmp_path, 0, 4000, out)
         assert out.is_file()
@@ -253,6 +263,11 @@ class TestBadRange:
         assert not out.exists()
 
     def test_no_chunks_errors(self, tmp_path):
+        # A readable flag-OFF intent so the fail-closed gate passes and the
+        # no-chunks branch (NoFramesInRangeError) is the one exercised.
+        (tmp_path / ".recording_intent").write_text(
+            json.dumps({"masked_video_upload": False})
+        )
         out = tmp_path / "clip.mp4"
         with pytest.raises(NoFramesInRangeError):
             export_clip_video(tmp_path, 0, 4000, out)
@@ -315,3 +330,53 @@ class TestFallbackNoMetadata:
         assert out.is_file()
         colors = [_dominant(img) for _, img in _decode(out)]
         assert "R" in colors and "B" in colors
+
+
+def _dead_pid() -> int:
+    """A PID guaranteed dead: spawn a trivial process, wait for it to be reaped."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
+
+
+class TestClipvidOrphanReclaim:
+    """SCR-219: a full-size clipvid intermediate orphaned by a hard-kill (SIGKILL,
+    or a SIGTERM that raced cleanup) must be reclaimable by a later export.
+
+    The intermediate is named ``.clipvid.mp4.<pid>.<uuid>.tmp`` precisely so the
+    shared ``_sweep_stale_temps`` PID parser (pid immediately after the ``mp4``
+    token, name ending ``.tmp``) can reclaim it; the old ``.<out>.clipvid.<pid>.
+    <uuid>.tmp.mp4`` shape hit a ValueError and left the orphan forever.
+    """
+
+    def test_stale_orphan_with_dead_pid_is_reclaimed(self, tmp_path):
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)  # flag-OFF intent by default
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        out = out_dir / "clip.mp4"
+
+        # A leftover intermediate from a crashed prior export whose PID is DEAD.
+        orphan = out_dir / f".clipvid.mp4.{_dead_pid()}.{uuid4().hex}.tmp"
+        orphan.write_bytes(b"orphaned full-size video-only intermediate")
+
+        export_clip(tmp_path, 0, 4000, out)
+
+        assert out.is_file(), "the new clip must still be produced"
+        assert not orphan.exists(), "the dead-PID clipvid orphan must be reclaimed"
+
+    def test_live_pid_orphan_is_left_untouched(self, tmp_path):
+        """Concurrency safety: a sibling intermediate whose PID is still ALIVE (an
+        in-flight export in this or another process) must NOT be swept."""
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        out = out_dir / "clip.mp4"
+
+        # Our own PID is alive → the sweep's os.kill(pid, 0) liveness check skips it.
+        live = out_dir / f".clipvid.mp4.{os.getpid()}.{uuid4().hex}.tmp"
+        live.write_bytes(b"a concurrent export's in-flight intermediate")
+
+        export_clip(tmp_path, 0, 4000, out)
+
+        assert out.is_file()
+        assert live.exists(), "a live-PID intermediate must survive a concurrent sweep"

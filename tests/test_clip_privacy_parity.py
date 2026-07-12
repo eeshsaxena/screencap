@@ -173,6 +173,73 @@ class TestFailClosedFlagOn:
         assert not out.exists()
 
 
+class TestFailClosedUnreadableIntent:
+    """Fix 2 (fail-closed on unreadable intent): the CLIP gate is STRICTER than the
+    shared upload resolver. It reads the frozen ``masked_video_upload`` bit
+    DIRECTLY, so a missing / corrupt / field-absent ``.recording_intent`` REFUSES
+    rather than falling back to the mutable global (which
+    ``get_frozen_masked_video_upload`` does for the upload seams). A clip exports
+    rich source video to an EXTERNAL-recipient file, so an unreadable frozen
+    posture must never be resolved as "safe" by a possibly-relaxed live flag.
+    """
+
+    def test_missing_intent_fails_closed(self, tmp_path):
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)  # NO _write_intent
+        assert not (tmp_path / ".recording_intent").exists()
+        out = tmp_path / "clip.mp4"
+
+        with pytest.raises(MaskedVideoRequiredError) as exc:
+            export_clip(tmp_path, 0, 4000, out)
+
+        assert exc.value.reason == "masked_video_required"
+        assert not out.exists(), "no file may be written on an unreadable intent"
+
+    def test_corrupt_intent_fails_closed(self, tmp_path):
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)
+        (tmp_path / ".recording_intent").write_text("{ this is not valid json")
+        out = tmp_path / "clip.mp4"
+
+        with pytest.raises(MaskedVideoRequiredError):
+            export_clip(tmp_path, 0, 4000, out)
+        assert not out.exists()
+
+    def test_field_absent_intent_fails_closed(self, tmp_path):
+        """A valid intent that never froze the ``masked_video_upload`` field is
+        AMBIGUOUS for a clip → fail closed, don't consult the global."""
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)
+        (tmp_path / ".recording_intent").write_text(
+            json.dumps({"destination": "local"})
+        )
+        out = tmp_path / "clip.mp4"
+
+        with pytest.raises(MaskedVideoRequiredError):
+            export_clip(tmp_path, 0, 4000, out)
+        assert not out.exists()
+
+    def test_global_off_does_not_rescue_a_missing_intent(self, tmp_path, monkeypatch):
+        """Regression discriminator: with the LIVE global explicitly OFF (the pre-Fix
+        fallback would have made a missing intent EXPORT), the clip gate STILL
+        refuses — proving the global is never consulted on the clip path."""
+        import screencap.config as _config
+
+        monkeypatch.setattr(_config, "get_masked_video_upload_enabled", lambda: False)
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)  # no intent
+        out = tmp_path / "clip.mp4"
+
+        with pytest.raises(MaskedVideoRequiredError):
+            export_clip(tmp_path, 0, 4000, out)
+        assert not out.exists()
+
+    def test_video_only_entry_point_also_fails_closed(self, tmp_path):
+        """Parity: the video-only entry enforces the same unreadable-intent gate."""
+        _make_recording(tmp_path, _SPARSE_TWO_CHUNK)  # no intent
+        out = tmp_path / "clip.mp4"
+
+        with pytest.raises(MaskedVideoRequiredError):
+            export_clip_video(tmp_path, 0, 4000, out)
+        assert not out.exists()
+
+
 class TestFlagOffControl:
     """The gate is the FLAG, not something incidental to the fixture."""
 

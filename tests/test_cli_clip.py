@@ -22,9 +22,12 @@ without encoding real video.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
 from pathlib import Path
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 from click.testing import CliRunner
@@ -452,6 +455,71 @@ def test_already_uploaded_recording_with_video_is_still_clippable(recordings_roo
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Cancel / SIGTERM (SCR-219) — the handler must run the engine's temp cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_sigterm_runs_temp_cleanup_and_reports_cancelled(recordings_root, tmp_path):
+    """A SIGTERM (Swift Cancel / window-close / watchdog) must route through the
+    installed handler so ``export_clip``'s ``except BaseException`` cleanup runs —
+    unlinking the full-size video-only intermediate instead of orphaning it — and
+    land a terminal ``clip_failed(cancelled)`` with exit 0.
+
+    The fake ``export_clip`` mirrors the real engine: it creates the intermediate,
+    then simulates the OS delivering SIGTERM by invoking whatever handler
+    ``clip_cmd`` installed, and unlinks the temp on the resulting BaseException. If
+    ``clip_cmd`` installed NO handler (the bug), ``getsignal`` returns ``SIG_DFL``
+    (an int) and calling it raises ``TypeError`` — the test fails loudly.
+    """
+    _make_clippable(recordings_root, "rec-cancel")
+    out = tmp_path / "clip.mp4"
+    tmp_holder: list[Path] = []
+    sigterm_before = signal.getsignal(signal.SIGTERM)
+
+    def _cancelling_export(
+        recording_dir, start_ms, end_ms, out_path, *, lock_timeout=30.0, on_progress=None
+    ):
+        op = Path(out_path)
+        temp = op.parent / f".clipvid.mp4.{os.getpid()}.{uuid4().hex}.tmp"
+        temp.write_bytes(b"partial video-only intermediate")
+        tmp_holder.append(temp)
+        try:
+            handler = signal.getsignal(signal.SIGTERM)
+            handler(signal.SIGTERM, None)  # emits clip_failed(cancelled) + raises
+            return op  # unreached — the handler raises
+        except BaseException:
+            temp.unlink(missing_ok=True)  # mirrors export_clip's real cleanup
+            raise
+
+    with mock.patch("screencap.engine.video.export_clip", _cancelling_export):
+        result = _invoke(recordings_root, "rec-cancel", out)
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["reason"] == "cancelled"
+    assert payload["retryable"] is False
+    assert not out.exists(), "no deliverable on a cancelled export"
+
+    # The intermediate was reclaimed by export_clip's BaseException cleanup — which
+    # only ran because clip_cmd installed a SIGTERM handler that RAISES.
+    assert tmp_holder, "the fake export never created its intermediate"
+    assert not tmp_holder[0].exists(), "the intermediate temp was orphaned on SIGTERM"
+
+    # Exactly one terminal clip_failed(cancelled), on the stderr channel, after the
+    # clip_started the export emitted.
+    kinds = [e["type"] for e in _events(result)]
+    assert "clip_started" in kinds
+    failed = [e for e in _events(result) if e["type"] == "clip_failed"]
+    assert len(failed) == 1, f"expected exactly one clip_failed, got {failed}"
+    assert failed[0]["reason"] == "cancelled"
+    assert failed[0]["retryable"] is False
+
+    # The previous SIGTERM disposition is restored in the finally (no leak).
+    assert signal.getsignal(signal.SIGTERM) == sigterm_before
 
 
 # ---------------------------------------------------------------------------

@@ -332,6 +332,12 @@ final class ClipExportController: ObservableObject {
             // line) — drop without a state change, mirroring the upload parser.
             return
         }
+        // Once a terminal state has latched (`clip_done` / `clip_failed`, or a
+        // `cancel()` that set the flag), ignore any further line — a late
+        // `clip_progress` / `clip_started` queued just before the cancel SIGTERM
+        // must not re-arm the watchdog or resurrect `.exporting` and wedge the
+        // modal. Mirrors the `guard` the terminal cases already carry.
+        guard !sawTerminalEvent else { return }
         if let schemaVersion = event.schemaVersion,
            schemaVersion != SUPPORTED_API_SCHEMA_VERSION {
             clipLogger.warning(

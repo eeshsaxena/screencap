@@ -423,7 +423,8 @@ struct ReviewWindow: View {
 
     /// The prominent, honest note the clip consent surface shows adjacent to the
     /// preview frames (KTD4): the exported video is capture-blocked but NOT
-    /// text-masked, and it leaves to external recipients.
+    /// text-masked and carries the original, unredacted audio, and it leaves to
+    /// external recipients.
     private var clipHonestyNote: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -432,8 +433,9 @@ struct ReviewWindow: View {
                 Text("The exported clip's video is not text-masked")
                     .font(.callout.weight(.semibold))
                 Text("These preview frames are redacted, but the exported video "
-                    + "shows on-screen text that is not masked. Share this clip only "
-                    + "with people you'd show your screen to.")
+                    + "shows on-screen text that is not masked and includes the "
+                    + "original audio. Share this clip only with people you'd show "
+                    + "your screen to.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
