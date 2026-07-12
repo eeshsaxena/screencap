@@ -10,6 +10,11 @@ from screencap.daemon.schema import envelope
 LOCK_CONTENDED = "lock_contended"
 NOT_OWNED_BY_DAEMON = "not_owned_by_daemon"
 NOT_RECORDING = "not_recording"
+# Editable titles (U3): recording.rename selector could not be resolved to any
+# recording directory, and the target is currently recording (mid-recording
+# rename is deferred to the HUD), respectively.
+RECORDING_NOT_FOUND = "recording_not_found"
+RECORDING_ACTIVE = "recording_active"
 SCHEMA_MISMATCH = "schema_mismatch"
 SLOW_CONSUMER = "slow_consumer"
 CURSOR_UNKNOWN = "cursor_unknown"
@@ -283,6 +288,30 @@ class NotRecordingError(DaemonAPIError):
     """
 
     error_code = NOT_RECORDING
+    http_status = 409
+
+
+class RecordingNotFoundError(DaemonAPIError):
+    """The ``recording.rename`` selector matched no recording (U3).
+
+    Raised when neither a recording's ``.recording_id`` nor its directory name
+    equals the requested ``recording_id``. Maps to HTTP 404 so the client can
+    distinguish a stale/unknown selector from a validation error or a conflict.
+    """
+
+    error_code = RECORDING_NOT_FOUND
+    http_status = 404
+
+
+class RecordingActiveError(DaemonAPIError):
+    """A ``recording.rename`` targeted the currently-active recording (U3).
+
+    Mid-recording rename is deferred to the HUD, so renaming the live recording
+    is refused here. Maps to HTTP 409 (conflict with current state), mirroring
+    :class:`NotRecordingError`.
+    """
+
+    error_code = RECORDING_ACTIVE
     http_status = 409
 
 
@@ -588,6 +617,8 @@ __all__ = [
     "LOCK_CONTENDED",
     "NOT_OWNED_BY_DAEMON",
     "NOT_RECORDING",
+    "RECORDING_NOT_FOUND",
+    "RECORDING_ACTIVE",
     "SCHEMA_MISMATCH",
     "SLOW_CONSUMER",
     "CURSOR_UNKNOWN",
@@ -622,6 +653,8 @@ __all__ = [
     "LockContendedError",
     "NotOwnedByDaemonError",
     "NotRecordingError",
+    "RecordingNotFoundError",
+    "RecordingActiveError",
     "SchemaMismatchError",
     "SlowConsumerError",
     "CursorUnknownError",

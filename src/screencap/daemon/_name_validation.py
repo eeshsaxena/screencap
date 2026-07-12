@@ -23,6 +23,12 @@ code can assume the name is already sanitized.
 from __future__ import annotations
 
 import re
+import unicodedata
+
+# Editable-title display-text cap (U3). A generous ceiling for a human label —
+# long enough for a descriptive rename, short enough that it cannot be abused as
+# a large payload smuggled through a "title". Counted in Unicode code points.
+_MAX_TITLE_LEN = 200
 
 # 255 is the per-component name limit on every macOS-deployable
 # filesystem (HFS+, APFS, ext4 over NFS, etc.). Going past it would
@@ -124,4 +130,50 @@ def validate_recording_name(name: object) -> str:
     return name
 
 
-__all__ = ["validate_recording_name"]
+def validate_recording_title(title: object) -> str:
+    """Validate ``title`` as a recording's editable DISPLAY text (U3).
+
+    This is deliberately NOT the path-safe :func:`validate_recording_name`. A
+    title never becomes a directory, filename, or catalog key — it is stored in
+    the local-only ``recording.db`` and shown in the UI — so unicode letters,
+    emoji, spaces, and punctuation are all allowed. The gate is narrow:
+
+    - Must be a string.
+    - An EMPTY string is VALID and means "clear the rename → revert to the
+      derived default"; it is returned unchanged.
+    - Length must be at most 200 code points.
+    - Must not contain any control character (Unicode category ``Cc``), which
+      covers NUL, tabs, newlines, and ANSI escape introducers — the bytes that
+      would corrupt a log line or terminal if a crafted title were echoed.
+
+    Returns the validated title (unchanged) on success. Raises the same
+    ``InvalidNameError`` :func:`validate_recording_name` raises on rejection,
+    with a title-appropriate reason that NEVER echoes the raw title (only its
+    length), for the identical operator-log-safety reason.
+    """
+    from screencap.daemon import errors, schema
+
+    schema_version = schema._RECORDING_RENAME_API_VERSION
+
+    if not isinstance(title, str):
+        raise errors.InvalidNameError(
+            _reason(title, "title must be a string"),
+            schema_version=schema_version,
+        )
+    # Empty means "clear" — a valid request, returned as-is.
+    if len(title) > _MAX_TITLE_LEN:
+        raise errors.InvalidNameError(
+            _reason(title, f"title exceeds {_MAX_TITLE_LEN}-character limit"),
+            schema_version=schema_version,
+        )
+    # Reject every control character (category Cc) in one pass — NUL, C0/C1
+    # controls, and the ESC that starts an ANSI sequence are all Cc.
+    if any(unicodedata.category(ch) == "Cc" for ch in title):
+        raise errors.InvalidNameError(
+            "title must not contain control characters",
+            schema_version=schema_version,
+        )
+    return title
+
+
+__all__ = ["validate_recording_name", "validate_recording_title"]

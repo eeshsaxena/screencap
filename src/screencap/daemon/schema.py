@@ -16,6 +16,10 @@ _RECORDING_STOP_API_VERSION = 1
 # SCR-218 mid-recording mic mute. Additive (new verb) — no global
 # API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
 _RECORDING_MUTE_API_VERSION = 1
+# Editable titles (U3): the post-hoc recording.rename verb. Additive (new verb) —
+# no global API_SCHEMA_VERSION bump (mirrors the recording.mute / permission.request
+# precedent).
+_RECORDING_RENAME_API_VERSION = 1
 _PERMISSION_REQUEST_API_VERSION = 1
 # SCR-200 identity-scoped decoy/orphan TCC cleanup verb. Additive (new verb) — no
 # global API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
@@ -93,6 +97,8 @@ _MODEL_NAMES = {
     "RecordingStopRequest",
     "RecordingMuteRequest",
     "RecordingMuteResponse",
+    "RecordingRenameRequest",
+    "RecordingRenameResponse",
     "RecordingStopResponse",
     "PermissionRequestRequest",
     "PermissionRequestResponse",
@@ -328,6 +334,34 @@ def _load_models() -> dict[str, Any]:
         # Bus cursor captured BEFORE forwarding, so the app can subscribe to
         # /v0/events?since=<cursor> without missing the confirming audio_muted /
         # audio_unmuted event (late-listener-replay learning).
+        cursor: int
+
+    class RecordingRenameRequest(_DaemonModel):
+        """Editable titles (U3): set or clear a recording's display title.
+
+        ``recording_id`` addresses the target by its stable ``.recording_id`` OR,
+        for legacy recordings predating that sidecar, by directory name (the
+        handler tries both). ``title`` is free display text validated by
+        ``_name_validation.validate_recording_title`` (NOT the path-safe recording
+        name validator): an EMPTY string clears the rename back to the derived
+        default.
+        """
+
+        recording_id: str
+        title: str
+
+    class RecordingRenameResponse(EnvelopeResponse):
+        """The resolved display title after a set-or-clear (U3).
+
+        ``title`` is the value the client should now show: the stripped user title
+        when set, else the freshly-recomputed date/time default (so a cleared
+        rename returns the same default ``recording.list`` would). ``title_is_user_set``
+        is True only when a non-empty title was persisted. ``cursor`` is the bus
+        cursor captured BEFORE the write, mirroring ``recording.mute``.
+        """
+
+        title: str
+        title_is_user_set: bool
         cursor: int
 
     class PermissionRequestRequest(_DaemonModel):
@@ -846,6 +880,8 @@ def _load_models() -> dict[str, Any]:
         "RecordingStopResponse": RecordingStopResponse,
         "RecordingMuteRequest": RecordingMuteRequest,
         "RecordingMuteResponse": RecordingMuteResponse,
+        "RecordingRenameRequest": RecordingRenameRequest,
+        "RecordingRenameResponse": RecordingRenameResponse,
         "PermissionRequestRequest": PermissionRequestRequest,
         "PermissionRequestResponse": PermissionRequestResponse,
         "ContentSearchRequest": ContentSearchRequest,
