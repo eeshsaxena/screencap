@@ -86,6 +86,19 @@ def test_open_interval_marks_to_chunk_end():
     assert marker["end"] == 60.0  # chunk end
 
 
+def test_overlapping_intervals_yield_a_single_merged_marker():
+    # Defensive (SCR-254 polish): a double-open (two mutes without an intervening
+    # unmute, or a stray crash-left interval) must not emit two overlapping
+    # markers. chunk [0,60]; muted [10,25] and [20,35] -> one marker [10,35].
+    out, _text = apply_muted_intervals_to_segments(
+        [], [(10.0, 25.0), (20.0, 35.0)], 0.0, 60.0
+    )
+    markers = [s for s in out if s["text"] == MUTED_MARKER_TEXT]
+    assert len(markers) == 1
+    assert markers[0]["start"] == 10.0
+    assert markers[0]["end"] == 35.0
+
+
 def test_marker_text_is_pii_free_and_stable():
     # The marker is cloud-bound; it must be a fixed, non-sensitive string that
     # survives scrubbing unchanged.

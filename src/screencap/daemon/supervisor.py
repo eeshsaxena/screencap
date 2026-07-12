@@ -60,6 +60,10 @@ _extra_output_dir_allowlist: list[Path] = []
 # deferred TKT-D approach (2): asyncio queue + drop policy.
 _STDERR_PIPE_SIZE = 1 << 20  # 1 MiB
 _STDERR_PIPE_FALLBACK = 1 << 17  # 128 KiB
+# Upper bound on a single engine stdin control-line write (SCR-254 polish). A
+# healthy write is instantaneous; this only fires if the engine's stdin reader
+# stalled and the pipe buffer filled, so it errs generous to avoid false trips.
+_SEND_COMMAND_TIMEOUT_S = 5.0
 
 
 def _widen_stderr_pipe(proc: subprocess.Popen[Any]) -> int | None:
@@ -361,9 +365,26 @@ class Supervisor:
             if proc is None or not proc.is_alive():
                 return False
             try:
-                await asyncio.to_thread(proc.send_line, line)
+                # Bound the pipe write (SCR-254 polish). Today only tiny, low-rate
+                # mute lines ride this channel, so a write never blocks — but if a
+                # future control handler let the engine's stdin reader stall, a
+                # full pipe buffer would wedge ``send_line`` while it holds
+                # ``_operation_lock``, blocking every spawn/stop. ``wait_for``
+                # abandons the await on timeout (the orphaned thread's write drains
+                # or dies with the engine), so the lock is always released; a
+                # timed-out write is treated as an unavailable engine.
+                await asyncio.wait_for(
+                    asyncio.to_thread(proc.send_line, line),
+                    timeout=_SEND_COMMAND_TIMEOUT_S,
+                )
                 return True
             except (BrokenPipeError, ValueError, OSError):
+                return False
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "send_command: engine stdin write timed out; treating engine "
+                    "as unavailable"
+                )
                 return False
 
     async def set_muted(self, muted: bool) -> bool:
