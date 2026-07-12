@@ -272,6 +272,17 @@ final class RecorderController: ObservableObject {
         return .keepWaiting
     }
 
+    /// SCR-264: whether a `state` transition is the recording→idle edge that
+    /// should re-run the deferred stale-daemon check. True only when landing on
+    /// `.idle` from an active state (`.recording`/`.stopping`/`.starting`), so a
+    /// defensive idle→idle re-assignment never re-triggers the check.
+    static func shouldRecheckStaleDaemonAfterRecording(
+        from oldState: RecordingState, to newState: RecordingState
+    ) -> Bool {
+        guard case .idle = newState else { return false }
+        return oldState.isRecording
+    }
+
     @Published private(set) var state: RecordingState = .idle {
         didSet {
             // The capture-health advisory is scoped to an active recording.
@@ -296,6 +307,19 @@ final class RecorderController: ObservableObject {
                 // starts unmuted and no stale in-flight flag survives.
                 muted = false
                 muteInFlight = false
+            }
+            // SCR-264: re-run the post-update stale-daemon swap on the
+            // recording→idle edge. A launch that landed while a daemon-owned
+            // recording was in flight defers the swap (restartStaleDaemonIfNeeded
+            // no-ops during a recording) and, because the launch check is
+            // launch-once, nothing else re-triggers it — the stale daemon would
+            // otherwise squat the socket for the rest of the session, 500ing every
+            // lazy-import verb ("Couldn't load recordings"). This single idle
+            // chokepoint catches every teardown path, including the launch-attach
+            // session end that never posts `.screenCapRecordingDidEnd` (its posts
+            // are gated on `mainWindowHidden`, which the attach path leaves false).
+            if Self.shouldRecheckStaleDaemonAfterRecording(from: oldValue, to: state) {
+                Task { [weak self] in await self?.recheckStaleDaemonAfterRecordingEnd() }
             }
         }
     }
@@ -596,13 +620,43 @@ final class RecorderController: ObservableObject {
             now: now(),
             deadline: Self.updateConvergenceDeadline
         ) {
-            defaults.set(anchor, forKey: Self.updateConvergenceAnchorKey)
-            convergenceDefaults = defaults
-            updateConvergenceAnchor = anchor
-            updateConverging = true
+            enterConvergence(anchor: anchor, defaults: defaults)
         } else {
             defaults.removeObject(forKey: Self.updateConvergenceAnchorKey)
         }
+        await probeDaemon()
+        startConvergenceProbeLoopIfNeeded()
+    }
+
+    /// SCR-264: re-run the stale-daemon check after a recording ends, entering the
+    /// same convergence state the launch check uses. A launch that lands while a
+    /// daemon-owned recording is in flight defers the post-update swap
+    /// (`restartStaleDaemonIfNeeded` no-ops during a recording) and — because the
+    /// launch check is launch-once — nothing re-triggers it, so the stale daemon
+    /// squats the socket for the rest of the session, 500ing every lazy-import
+    /// verb until the next app relaunch.
+    ///
+    /// Called off the single `state` idle chokepoint on the recording→idle edge.
+    /// Idempotent and self-guarding: `restartStaleDaemonIfNeeded` no-ops on a
+    /// fresh daemon, so a recording that ends with the helper already current does
+    /// nothing; a stale one triggers the kickstart and the convergence loop drives
+    /// the swap behind the "Finishing update…" interstitial, exactly as at launch.
+    /// The interstitial surfaces here because the launch gate never latched
+    /// `launchPresentationDecided` during the recording (its evaluator early-returns
+    /// while `state.isRecording`). Firing on every recording end (not once) also
+    /// self-heals the rare case where the daemon still reports the just-ended
+    /// recording on the first probe: that recheck defers, the next end retries.
+    func recheckStaleDaemonAfterRecordingEnd(
+        restartStaleDaemon: () async -> Bool = { await DaemonInstallController.restartStaleDaemonIfNeeded() },
+        defaults: UserDefaults = .standard,
+        now: () -> Date = Date.init
+    ) async {
+        // Only once the launch sequencing has run (the convergence state is owned
+        // from launch onward), and never stack a second loop over an in-flight swap.
+        guard launchDaemonCheckRan, !updateConverging else { return }
+        guard await restartStaleDaemon() else { return }
+        updateConvergenceFailed = false
+        enterConvergence(anchor: now(), defaults: defaults)
         await probeDaemon()
         startConvergenceProbeLoopIfNeeded()
     }
@@ -659,6 +713,19 @@ final class RecorderController: ObservableObject {
                 }
             }
         }
+    }
+
+    /// SCR-262: enter the update-convergence state — persist the trigger anchor
+    /// and flip the observable flag the presentation policy shows the interstitial
+    /// off. The single entry point (symmetric with `finishUpdateConvergence`) so
+    /// the launch path (`runLaunchDaemonCheck`), the post-recording recheck
+    /// (SCR-264), and the loop tests can't drift as convergence fields are added.
+    /// Callers own the anchor derivation and starting the re-probe loop.
+    private func enterConvergence(anchor: Date, defaults: UserDefaults) {
+        defaults.set(anchor, forKey: Self.updateConvergenceAnchorKey)
+        convergenceDefaults = defaults
+        updateConvergenceAnchor = anchor
+        updateConverging = true
     }
 
     private func finishUpdateConvergence(failed: Bool) {
@@ -1696,11 +1763,9 @@ extension RecorderController {
     /// SCR-262: enter convergence directly so loop tests can inject their own
     /// probe/clock/sleep via `startConvergenceProbeLoopIfNeeded` without going
     /// through `runLaunchDaemonCheck` (which starts the live-probe loop itself).
+    /// Routes through the same `enterConvergence` entry the production paths use.
     func _testBeginUpdateConvergence(anchor: Date, defaults: UserDefaults) {
-        convergenceDefaults = defaults
-        defaults.set(anchor, forKey: Self.updateConvergenceAnchorKey)
-        updateConvergenceAnchor = anchor
-        updateConverging = true
+        enterConvergence(anchor: anchor, defaults: defaults)
     }
 
     /// SCR-262: tear down a convergence loop a test left running (e.g. after
