@@ -316,3 +316,18 @@ def test_real_keychain_graceful_on_unentitled_host() -> None:
         assert kg.load(svc, ACCOUNT, GROUP) == "itest-secret"
     finally:
         kg.delete(svc, ACCOUNT, GROUP)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Security.framework is macOS-only")
+def test_real_synchronizable_any_constant_resolves() -> None:
+    """The one new Security constant (`kSecAttrSynchronizableAny`, SCR-253) must
+    resolve via `in_dll` — a typo would raise `ValueError` only at call time on a
+    real host (unit tests stub the primitives). An ANY read may fail with
+    `MissingEntitlement` on an un-entitled runner, but must NOT raise `ValueError`
+    from an unresolved symbol."""
+    try:
+        kg.load("screencap-auth-itest-any", ACCOUNT, GROUP, synchronizable=kg.SYNCHRONIZABLE_ANY)
+    except kg.MissingEntitlement:
+        pass  # un-entitled runner — the constant still resolved past _const()
+    except ValueError as exc:  # c_void_p.in_dll couldn't find the symbol
+        pytest.fail(f"kSecAttrSynchronizableAny did not resolve: {exc}")
