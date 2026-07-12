@@ -166,11 +166,13 @@ struct MainWindow: View {
     /// verified yet.
     @State private var showingUpdateInterstitial = false
     /// SCR-262: the interstitial is launch-scoped. Latched once the first
-    /// post-probe presentation decision lands on shell or wall, so a
-    /// mid-session convergence source (none exists today; defensive against
-    /// e.g. wiring the Library / Day-timeline "restart helper" retries through
-    /// the convergence state) never replaces window content the user is
-    /// working in.
+    /// post-probe presentation decision lands on shell or wall, so a mid-session
+    /// convergence source never replaces window content the user is working in.
+    /// SCR-264's post-recording stale-daemon recheck is such a source, but it
+    /// fires on a recording→idle edge where this latch is still false (the
+    /// evaluator early-returns while recording, so no launch decision settled) —
+    /// so its interstitial shows, while a mid-shell "restart helper" retry
+    /// through the convergence state stays suppressed.
     @State private var launchPresentationDecided = false
     /// True while the permission setup is open because the user explicitly tapped
     /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
@@ -537,13 +539,16 @@ struct MainWindow: View {
         )
         // SCR-262: the interstitial is launch-scoped — once the first post-probe
         // decision landed on shell or wall, the interstitial may not replace
-        // content the user is working in. Today `updateConverging` is only set
-        // by the launch check, so this latch is defensive: it keeps any future
-        // mid-session convergence source (e.g. wiring the Library/Day-timeline
-        // "Restart helper" retries through the convergence state) from becoming
-        // a surprise window takeover. The launch path itself is unaffected: at
-        // onAppear the probe hasn't completed, so the latch only sets after the
-        // launch task's sequenced first probe resolves the real decision.
+        // content the user is working in. SCR-264 added a mid-session convergence
+        // source (the post-recording stale-daemon recheck), but it fires on a
+        // recording→idle edge where this latch is still false — the evaluator
+        // early-returns while recording, so the launch decision never settled — so
+        // its interstitial still shows. The latch keeps the other mid-session
+        // sources (e.g. wiring the Library/Day-timeline "Restart helper" retries
+        // through the convergence state) from becoming a surprise window takeover.
+        // The launch path itself is unaffected: at onAppear the probe hasn't
+        // completed, so the latch only sets after the launch task's sequenced
+        // first probe resolves the real decision.
         switch decision {
         case .updateInterstitial:
             if !launchPresentationDecided {

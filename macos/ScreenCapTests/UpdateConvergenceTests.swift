@@ -307,6 +307,104 @@ final class UpdateConvergenceTests: XCTestCase {
         XCTAssertTrue(recorder.daemonProbeCompleted)
     }
 
+    // MARK: - recheckStaleDaemonAfterRecordingEnd (SCR-264)
+
+    /// The recording→idle edge that re-triggers the deferred swap: landing on
+    /// `.idle` from any active state re-checks; a defensive idle→idle does not,
+    /// and a transition that does not land on `.idle` does not.
+    func testShouldRecheckOnlyOnRecordingToIdleEdge() {
+        XCTAssertTrue(RecorderController.shouldRecheckStaleDaemonAfterRecording(
+            from: .recording(elapsed: 5), to: .idle))
+        XCTAssertTrue(RecorderController.shouldRecheckStaleDaemonAfterRecording(
+            from: .stopping(quitting: false), to: .idle))
+        XCTAssertTrue(RecorderController.shouldRecheckStaleDaemonAfterRecording(
+            from: .starting, to: .idle))
+        XCTAssertFalse(RecorderController.shouldRecheckStaleDaemonAfterRecording(
+            from: .idle, to: .idle))
+        XCTAssertFalse(RecorderController.shouldRecheckStaleDaemonAfterRecording(
+            from: .recording(elapsed: 1), to: .stopping(quitting: false)))
+    }
+
+    /// The SCR-264 fix: a launch that deferred the swap (recording in flight →
+    /// converging never set, launch-once latched) re-checks when the recording
+    /// ends. A still-stale daemon now triggers the kickstart, enters convergence
+    /// anchored at the recheck, and persists the anchor — the same convergence
+    /// state the launch path drives the interstitial off.
+    func testRecheckAfterRecordingEntersConvergence() async {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        // Launch landed while recording: the stale check deferred, so converging
+        // stayed false while the launch-once flag latched.
+        await recorder.runLaunchDaemonCheck(restartStaleDaemon: { false }, defaults: defaults)
+        XCTAssertFalse(recorder.updateConverging)
+        recorder._testCancelConvergenceLoop()
+
+        let now = Date()
+        await recorder.recheckStaleDaemonAfterRecordingEnd(
+            restartStaleDaemon: { true }, defaults: defaults, now: { now }
+        )
+        XCTAssertTrue(recorder.updateConverging)
+        XCTAssertEqual(recorder.updateConvergenceAnchor, now)
+        XCTAssertEqual(
+            defaults.object(forKey: RecorderController.updateConvergenceAnchorKey) as? Date, now
+        )
+        XCTAssertFalse(recorder.updateConvergenceFailed)
+        // Sequencing: the post-kickstart probe ran as part of the recheck.
+        XCTAssertTrue(recorder.daemonProbeCompleted)
+    }
+
+    /// A recording that ends with the helper already current (the stale check
+    /// no-ops) leaves the normal shell untouched — the 99% recording-end path is
+    /// unaffected: no convergence, no anchor, no interstitial.
+    func testRecheckNoOpsWhenDaemonFresh() async {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        await recorder.runLaunchDaemonCheck(restartStaleDaemon: { false }, defaults: defaults)
+        recorder._testCancelConvergenceLoop()
+
+        await recorder.recheckStaleDaemonAfterRecordingEnd(
+            restartStaleDaemon: { false }, defaults: defaults
+        )
+        XCTAssertFalse(recorder.updateConverging)
+        XCTAssertNil(defaults.object(forKey: RecorderController.updateConvergenceAnchorKey))
+    }
+
+    /// Guard: the recheck is inert before the launch sequencing has run, so an
+    /// early idle transition can never fire a kickstart ahead of the launch owner.
+    func testRecheckInertBeforeLaunchCheck() async {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        let restarts = LockedCounter()
+        await recorder.recheckStaleDaemonAfterRecordingEnd(
+            restartStaleDaemon: { _ = restarts.incrementAndGet(); return true },
+            defaults: defaults
+        )
+        XCTAssertEqual(restarts.value, 0, "recheck must not run before the launch check")
+        XCTAssertFalse(recorder.updateConverging)
+    }
+
+    /// Guard: a recheck while a swap is already converging must not stack a second
+    /// kickstart or re-anchor the running loop's deadline.
+    func testRecheckDoesNotStackWhileConverging() async {
+        let recorder = RecorderController()
+        self.recorder = recorder
+        let now = Date()
+        await recorder.runLaunchDaemonCheck(
+            restartStaleDaemon: { true }, defaults: defaults, now: { now }
+        )
+        recorder._testCancelConvergenceLoop()
+        XCTAssertTrue(recorder.updateConverging)
+
+        let restarts = LockedCounter()
+        await recorder.recheckStaleDaemonAfterRecordingEnd(
+            restartStaleDaemon: { _ = restarts.incrementAndGet(); return true },
+            defaults: defaults,
+            now: { now.addingTimeInterval(30) }
+        )
+        XCTAssertEqual(restarts.value, 0, "must not re-check while already converging")
+        XCTAssertEqual(recorder.updateConvergenceAnchor, now, "the original anchor survives")
+    }
+
     // MARK: - Convergence re-probe loop (driven with injected probe/clock/sleep)
 
     func testLoopClearsConvergenceWhenFreshDaemonAnswers() async {
