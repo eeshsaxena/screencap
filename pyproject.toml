@@ -71,6 +71,10 @@ record = [
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreWLAN>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-Vision>=9.0; sys_platform == 'darwin'",
+    # SCR-258 U5: present-user (Touch ID + password fallback) evaluation for the
+    # CLI-local store unseal fallback, via the dynamic-`objc` LocalAuthentication
+    # bridge (mirrors the redaction OCR Vision bridge).
+    "pyobjc-framework-LocalAuthentication>=9.0; sys_platform == 'darwin'",
 ]
 privacy = []  # Moved to base dependencies as of v0.11.0
 sqlcipher = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -1104,6 +1105,7 @@ def list_cmd(as_json, sort):
 @click.option("--max-events", type=int, default=500, help="Max events in viewer (0 for all).")
 def view(name, regenerate, max_events):
     """Open recording viewer in browser."""
+    _guard_store_available()  # SCR-258 U5: refuse on a sealed/absent/errored store.
     from screencap.viewer import open_viewer
 
     try:
@@ -1124,6 +1126,7 @@ def view(name, regenerate, max_events):
               help="Output as JSON. Auto-detected when stdout is not a TTY (todo 030).")
 def info(name, as_json):
     """Show details and system metrics for a recording."""
+    _guard_store_available()  # SCR-258 U5: refuse on a sealed/absent/errored store.
     from screencap.catalog import _read_recording_meta, find_db, read_drops
     from screencap.config import get_recordings_dir
 
@@ -1858,6 +1861,10 @@ def export(name, all_recordings, downloads, output, use_stdout, exclude_moves, p
 
     err_console = Console(stderr=True)
 
+    # SCR-258 U5: refuse on a sealed/absent/errored store before touching any
+    # recordings path (never mkdir plaintext at the mountpoint).
+    _guard_store_available(err_console=err_console)
+
     batch_mode = all_recordings or (downloads and not name)
 
     if not name and not batch_mode:
@@ -2174,6 +2181,7 @@ def status(as_json, no_nlp_check):
         privacy_configured: bool
         nlp_models_cached: bool | None
         filevault: str | None
+        store_state: str | None
 
     payload: StatusPayload = {
         "ok": True,
@@ -2191,6 +2199,11 @@ def status(as_json, no_nlp_check):
         # daemon is unreachable or omits it (older daemon). Rendered as a warning
         # line only when "off" — never blocks anything.
         "filevault": None,
+        # SCR-258 U4/U5 (KTD-14): the encrypted-store state (mounted / locked /
+        # absent / error). Read from daemon.info; derived locally from the sealed
+        # sentinel + bundle when no daemon answers. locked/absent are HEALTHY
+        # states — status renders them and still exits 0.
+        "store_state": None,
     }
     if no_nlp_check:
         payload["nlp_models_cached"] = None
@@ -2231,9 +2244,15 @@ def status(as_json, no_nlp_check):
             # Best-effort — a failure here must never turn `status` into an error,
             # so it degrades to leaving `filevault` None (no warning rendered).
             try:
-                fv = client.info().get("filevault")
+                info = client.info()
+                fv = info.get("filevault")
                 if isinstance(fv, str):
                     payload["filevault"] = fv
+                # SCR-258 U4/U5: the store state, so a locked/absent store reads
+                # as healthy rather than looking like a dead daemon.
+                ss = info.get("store_state")
+                if isinstance(ss, str):
+                    payload["store_state"] = ss
             except Exception:  # noqa: BLE001 - warn-only, never fail status on it
                 pass
     except DaemonUnreachableError:
@@ -2266,6 +2285,25 @@ def status(as_json, no_nlp_check):
             payload["capture_dir"] = str(_Path.home() / ".screencap" / "recordings" / name)
         payload["claimant"] = snapshot.get("claimant")
 
+    # SCR-258 U5: with no daemon reachable (or an older daemon that omits it),
+    # derive the store state locally from the sealed sentinel + bundle presence,
+    # so a CLI-only install still reports locked/absent. Only meaningful with the
+    # container enabled; a plaintext install leaves it None (byte-identical to
+    # today). Never raises — status must stay resilient.
+    if payload["store_state"] is None:
+        try:
+            from screencap import config
+            if config.get_container_enabled():
+                from screencap.daemon import store_lifecycle as _sl
+                if _sl.is_sealed():
+                    payload["store_state"] = _sl.StoreState.LOCKED.value
+                elif not _sl.store_bundle_path().exists():
+                    payload["store_state"] = _sl.StoreState.ABSENT.value
+                else:
+                    payload["store_state"] = _sl.StoreState.MOUNTED.value
+        except Exception:  # noqa: BLE001 - store-state derivation must never fail status
+            pass
+
     if as_json:
         sys.stdout.write(_json.dumps(payload) + "\n")
         sys.stdout.flush()
@@ -2286,6 +2324,26 @@ def status(as_json, no_nlp_check):
         console.print("[dim]Not recording. (Daemon not running.)[/dim]")
     else:
         console.print("[dim]Not recording.[/dim]")
+
+    # SCR-258 U5 (KTD-14): render the encrypted-store state when it is not the
+    # ordinary mounted case. locked/absent are HEALTHY states (status still exits
+    # 0); "error" surfaces the cause so the operator is not left guessing.
+    store_state = payload["store_state"]
+    if store_state == "locked":
+        console.print(
+            "  store: [yellow]locked[/yellow] — unlock with "
+            "[bold]screencap storage unlock[/bold] (or the ScreenCap app)."
+        )
+    elif store_state == "absent":
+        console.print(
+            "  store: [yellow]absent[/yellow] — create it with "
+            "[bold]screencap storage init[/bold]."
+        )
+    elif store_state == "error":
+        console.print(
+            "  store: [red]error[/red] — the encrypted store cannot be opened; "
+            "run [bold]screencap status --json[/bold] and check the daemon log."
+        )
 
     # U7 (KTD-11): warn-only FileVault surface. Only "off" prints a line; "on"
     # and "unknown" stay silent so the check never nags. Never blocks anything.
@@ -4849,13 +4907,254 @@ def e2ee_status_cmd(as_json: bool) -> None:
     console.print(f"  Encryption key:        {'present (id ' + key_id + ')' if key_id else 'none'}")
 
 
+# ---------------------------------------------------------------------------
+# SCR-258 U5 — encrypted-store funnel guard + storage lifecycle helpers
+#
+# The funnel guard is the CLI arm of KTD-14/KTD-16: with the container flag on, a
+# daemon-independent, store-touching CLI command (``view`` / ``export`` / ``info``)
+# must NEVER silently ``mkdir`` a plaintext directory at the mountpoint when the
+# store is sealed / absent / key-unreadable. It resolves the store state through
+# the single U4 resolver (``store_lifecycle.resolve_store_state``) BEFORE any
+# ``get_recordings_dir()`` call and refuses with a state-naming ``rich`` error +
+# non-zero exit. Commands that only talk HTTP to the daemon (``start`` / ``stop``
+# / ``status`` / ``backfill``) never call this — they are untouched.
+# ---------------------------------------------------------------------------
+
+
+def _store_state_guidance(state, reason):  # noqa: ANN001
+    """Map a resolved store state (+ error reason) to (headline, next-step) copy.
+
+    ``state`` is a ``store_lifecycle.StoreState``; ``reason`` is one of the
+    ``store_lifecycle.ERROR_*`` codes when ``state is ERROR`` (else ``None``).
+    Distinguishes key-missing (genuine loss) from entitlement-mismatch (KTD-22),
+    per R10.
+    """
+    from screencap.daemon import store_lifecycle as _sl
+
+    if state is _sl.StoreState.LOCKED:
+        return (
+            "The encrypted store is locked.",
+            "Unlock it first: run [bold]screencap storage unlock[/bold] "
+            "(or open the ScreenCap app in a local session and unlock there).",
+        )
+    if state is _sl.StoreState.ABSENT:
+        return (
+            "No encrypted store exists yet.",
+            "Create it: run [bold]screencap storage init[/bold].",
+        )
+    # ERROR — branch on the reason for an accurate cause (R10 / KTD-22).
+    if reason == _sl.ERROR_ENTITLEMENT_MISMATCH:
+        return (
+            "The encrypted store's key exists but this binary is not entitled to "
+            "read it.",
+            "This is NOT data loss — the store and its key are intact. Use the "
+            "entitled ScreenCap app or its bundled CLI (a pip/pyenv or Debug CLI "
+            "is an unsupported vault consumer).",
+        )
+    if reason == _sl.ERROR_KEYCHAIN_LOCKED:
+        return (
+            "The login Keychain is locked, so the store key could not be read.",
+            "Unlock your login Keychain and retry.",
+        )
+    if reason == _sl.ERROR_DOWNGRADE_UNSUPPORTED:
+        return (
+            "container_enabled is off but an encrypted store already exists.",
+            "Downgrading an encrypted store to plaintext is unsupported. Re-enable "
+            "the container (settings container_enabled=true) to keep using the vault.",
+        )
+    # ERROR_KEY_MISSING (or an unknown reason) — the genuine key-loss diagnosis.
+    return (
+        "The encrypted store exists but its key is missing.",
+        "These recordings can't be unlocked without the key — restore it from "
+        "backup. Nothing on disk was destroyed.",
+    )
+
+
+def _guard_store_available(err_console=None) -> None:
+    """Refuse a store-touching CLI command on a sealed / absent / errored store.
+
+    No-op when the container is disabled (regression-safe: today's plaintext
+    behavior). When the container is on, resolves the store through the single U4
+    resolver and — on any non-``MOUNTED`` state — prints a state-naming error with
+    the next step and exits non-zero, BEFORE the caller ever reaches
+    ``get_recordings_dir()`` (so no plaintext directory is created at the
+    mountpoint). A ROGUE / corrupted-bundle operator error is surfaced as a hard
+    stop too. On a healthy store this returns after ensuring it is mounted (the
+    resolver reuses an existing mount and never force-creates plaintext).
+    """
+    from screencap import config
+
+    if not config.get_container_enabled():
+        return
+
+    out = err_console or console
+    from screencap import container
+    from screencap.daemon import store_lifecycle as _sl
+
+    try:
+        resolution = _sl.resolve_store_state(attempt_mount=True)
+    except container.ContainerError as exc:
+        # ROGUE mountpoint / corrupted bundle / non-retryable operator failure.
+        out.print(f"[red]Store unavailable:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+
+    if resolution.state is _sl.StoreState.MOUNTED:
+        return
+
+    headline, next_step = _store_state_guidance(resolution.state, resolution.reason)
+    out.print(f"[red]Store unavailable:[/red] {headline}")
+    out.print(next_step)
+    raise SystemExit(1)
+
+
+# --- CLI-local seal / unseal fallback (used only when NO daemon responds) -----
+#
+# The daemon owns the safe live lock/unlock quiesce path (U9). These fallbacks
+# run only on a CLI-only install where no daemon is reachable — there is no live
+# mount to detach and no active recording, so seal is just writing the sealed
+# sentinel (which the next daemon start honors) and unseal is a present-user
+# (Touch ID) gate + clearing the sentinel. Neither ever force-detaches.
+
+
+class _NoLocalAuthSurface(Exception):
+    """No LocalAuthentication surface is available (SSH / headless session).
+
+    Present-user unlock is impossible here; the caller refuses and names the
+    recovery route (unlock from a local session / the app).
+    """
+
+
+def _write_sealed_sentinel():
+    """Write the sealed sentinel with the ``O_NOFOLLOW`` + realpath-parent
+    discipline (mirrors ``store_lifecycle._mount_lock`` / ``_autospawn._open_auto_log``),
+    mode ``0o600``. A pre-planted symlink AT the sentinel path is refused
+    (``O_NOFOLLOW`` → ``ELOOP``), not followed; a symlinked run-dir is rejected."""
+    from screencap.daemon import store_lifecycle as _sl
+
+    sentinel = _sl.sealed_sentinel_path()
+    parent = sentinel.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise RuntimeError(
+            f"sealed-sentinel run-dir is a symlink and will not be followed: {parent}"
+        )
+    fd = os.open(
+        str(sentinel),
+        os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(fd, b"sealed\n")
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(str(sentinel), 0o600)  # tighten if it pre-existed looser
+    except OSError:
+        pass
+    return sentinel
+
+
+def _clear_sealed_sentinel() -> None:
+    """Remove the sealed sentinel (unseal). ``unlink`` removes the link itself,
+    never a symlink's target, so it is safe against a swapped-in symlink."""
+    from screencap.daemon import store_lifecycle as _sl
+
+    try:
+        os.unlink(str(_sl.sealed_sentinel_path()))
+    except FileNotFoundError:
+        pass
+
+
+def _evaluate_local_authentication(reason: str) -> None:
+    """Evaluate present-user auth (Touch ID + password fallback) via the dynamic
+    ``objc`` LocalAuthentication bridge (mirrors ``redaction/ocr.py``).
+
+    Returns ``None`` on success. Raises :class:`_NoLocalAuthSurface` when no LA
+    surface exists (framework absent, SSH / headless session — ``canEvaluatePolicy``
+    is false). Raises :class:`PermissionError` when the user fails or cancels the
+    prompt (with the OS error detail). Never eagerly evaluated — called only from
+    the explicit ``storage unlock`` action.
+    """
+    import sys as _sys
+
+    if _sys.platform != "darwin":
+        raise _NoLocalAuthSurface("LocalAuthentication is only available on macOS")
+
+    try:
+        import objc  # noqa: F401
+        from LocalAuthentication import (
+            LAContext,
+            LAPolicyDeviceOwnerAuthentication,
+        )
+    except Exception as exc:  # noqa: BLE001 - framework missing == no LA surface
+        raise _NoLocalAuthSurface(
+            "the LocalAuthentication framework is unavailable"
+        ) from exc
+
+    ctx = LAContext.alloc().init()
+    can_eval, _err = ctx.canEvaluatePolicy_error_(
+        LAPolicyDeviceOwnerAuthentication, None
+    )
+    if not can_eval:
+        # No biometrics AND no device passcode reachable -> present-user auth
+        # cannot be satisfied here (headless / SSH / no console session).
+        raise _NoLocalAuthSurface("no present-user authentication surface is available")
+
+    import threading
+
+    outcome: dict[str, object] = {}
+    done = threading.Event()
+
+    def _reply(success, error) -> None:  # noqa: ANN001 - ObjC callback signature
+        outcome["success"] = bool(success)
+        outcome["error"] = error
+        done.set()
+
+    ctx.evaluatePolicy_localizedReason_reply_(
+        LAPolicyDeviceOwnerAuthentication, reason, _reply
+    )
+    # The reply block is dispatched on LAContext's own queue, so a blocking wait
+    # on the calling thread is safe (no run loop needed).
+    if not done.wait(timeout=120.0):
+        raise PermissionError("authentication timed out")
+    if outcome.get("success"):
+        return
+    err = outcome.get("error")
+    detail = ""
+    try:
+        if err is not None:
+            detail = str(err.localizedDescription())
+    except Exception:  # noqa: BLE001 - best-effort detail only
+        detail = ""
+    raise PermissionError(detail or "authentication failed or was cancelled")
+
+
+def _daemon_is_reachable() -> bool:
+    """True iff a live daemon answers on the UNIX socket (best-effort probe).
+
+    Used to gate the CLI-local seal/unseal fallback to the no-daemon case: a live
+    daemon owns the safe quiesce path (U9), so the fallback runs only when nothing
+    answers. Never auto-spawns."""
+    from screencap.cli._daemon_client import DaemonHTTPClient, DaemonUnreachableError
+
+    try:
+        with DaemonHTTPClient() as client:
+            client.info()
+        return True
+    except DaemonUnreachableError:
+        return False
+    except Exception:  # noqa: BLE001 - any live-but-erroring daemon still counts as up
+        return True
+
+
 @cli.group("storage")
 def storage_group() -> None:
-    """Manage where recordings are stored (SCR-228).
+    """Manage where and how recordings are stored (SCR-228, SCR-258).
 
-    Thin one-shot HTTP client of the daemon's ``storage.migrate`` verb over
-    the UNIX socket. The macOS Privacy pane is the supported UI; this CLI
-    ships ``migrate`` for headless use and scripting.
+    Thin clients of the daemon's ``storage.*`` verbs over the UNIX socket, plus
+    the encrypted-store lifecycle commands (``init`` / ``compact`` / ``lock`` /
+    ``unlock``). The macOS app is the supported UI; these ship for headless use
+    and scripting.
     """
 
 
@@ -4935,6 +5234,276 @@ def storage_migrate_cmd(path: str, as_json: bool) -> None:
             f"[green]Recordings moved to[/green] "
             f"{escape(str(payload.get('moved_to', target)))}"
         )
+
+
+@storage_group.command("init")
+def storage_init_cmd() -> None:
+    """Create the encrypted store (key + sparse bundle) — the ONE creation path.
+
+    Foreground-only: the first Keychain write triggers a one-time ACL prompt, so
+    this must run in an interactive process (this CLI, or the app's onboarding
+    which shells out to it). ``serve --install`` and the app both DELEGATE to this
+    logic — there is a single creation code path (KTD-5).
+
+    Idempotent: on an already-initialized store this is a no-op with a clear
+    message. On a bundle-absent-but-key-present state it reuses the existing key
+    to create a fresh bundle (never minting a second key that would orphan a
+    later-restored bundle).
+    """
+    from screencap import container
+    from screencap.daemon import store_lifecycle as _sl
+
+    bundle = _sl.store_bundle_path()
+    if bundle.exists():
+        console.print(
+            f"[dim]Encrypted store already initialized at "
+            f"{escape(str(bundle))}. Nothing to do.[/dim]"
+        )
+        return
+
+    # Bundle absent. Reuse an existing key if one is present (bundle-absent +
+    # key-present); otherwise mint + persist a fresh one (foreground ACL prompt).
+    try:
+        key = container.get_container_key()
+    except container.ContainerKeyUnreachableError:
+        console.print(
+            "[red]Error:[/red] the store key exists in the shared Keychain group "
+            "but this binary is not entitled to read it. Run the entitled "
+            "ScreenCap app or its bundled CLI."
+        )
+        raise SystemExit(1)
+    except container.KeychainLockedError:
+        console.print(
+            "[red]Error:[/red] the login Keychain is locked; unlock it and retry."
+        )
+        raise SystemExit(1)
+
+    try:
+        if key is None:
+            key = container.create_container_key(str(bundle))
+            key_note = "minted a new key"
+        else:
+            key_note = "reused the existing key"
+        container.create_bundle(str(bundle), key)
+    except container.ContainerError as exc:
+        console.print(f"[red]Error creating encrypted store:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+
+    console.print(
+        f"[green]Encrypted store created[/green] at {escape(str(bundle))} "
+        f"({key_note})."
+    )
+
+
+@storage_group.command("compact")
+def storage_compact_cmd() -> None:
+    """Reclaim freed space in the encrypted store's sparse bundle (KTD-12).
+
+    On-demand only. Quiescent and safe: it refuses while a recording is active,
+    holds ``mount.lock`` for the whole cycle, and NEVER force-detaches (unlike
+    ``lock``). If the store is currently mounted it is gracefully detached,
+    compacted, and left detached (the next daemon start re-mounts it); a busy
+    volume aborts rather than being forced.
+    """
+    from screencap import config, container
+    from screencap.daemon import store_lifecycle as _sl
+
+    if not config.get_container_enabled():
+        console.print(
+            "[red]Error:[/red] the encrypted container is not enabled; "
+            "nothing to compact."
+        )
+        raise SystemExit(1)
+
+    bundle = _sl.store_bundle_path()
+    if not bundle.exists():
+        console.print(
+            "[red]Error:[/red] no encrypted store exists yet "
+            "(run [bold]screencap storage init[/bold])."
+        )
+        raise SystemExit(1)
+
+    # Refuse while a recording is active (never yank the volume from a writer).
+    from screencap.cli._daemon_client import (
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+    )
+
+    try:
+        with DaemonHTTPClient() as client:
+            snap = client.snapshot()
+        if snap.get("is_recording"):
+            console.print(
+                "[red]Error:[/red] a recording is in progress; stop it before "
+                "compacting the store."
+            )
+            raise SystemExit(1)
+    except DaemonUnreachableError:
+        pass  # No daemon => no active recording; safe to proceed.
+
+    try:
+        key = container.require_container_key()
+    except container.ContainerError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+
+    # Hold mount.lock for the whole detach -> compact cycle so no concurrent
+    # resolver (or the daemon) races the mount state.
+    with _hold_mount_lock():
+        st = container.status(str(bundle))
+        if st.attached and st.mountpoint:
+            try:
+                # Compact discipline: graceful-only, never force past a busy volume.
+                container.detach(st.mountpoint, force=False)
+            except container.ContainerBusyError as exc:
+                console.print(
+                    "[red]Error:[/red] the store is busy and cannot be detached "
+                    "without forcing; try again once it is idle."
+                )
+                raise SystemExit(1) from exc
+        try:
+            container.compact(str(bundle), key)
+        except container.ContainerError as exc:
+            console.print(f"[red]Compact failed:[/red] {escape(str(exc))}")
+            raise SystemExit(1) from exc
+
+    console.print(
+        "[green]Store compacted.[/green] It will be re-mounted on the next "
+        "daemon start."
+    )
+
+
+@contextlib.contextmanager
+def _hold_mount_lock():
+    """Hold an exclusive ``flock`` on the run-dir ``mount.lock`` (KTD-3 discipline).
+
+    Mirrors ``store_lifecycle._mount_lock``'s ``O_NOFOLLOW`` + realpath-parent
+    guard so ``storage compact`` serializes against the daemon's store-state
+    resolver / lock verb for the whole detach -> compact cycle.
+    """
+    import fcntl
+
+    from screencap.daemon import store_lifecycle as _sl
+
+    lock_path = _sl.mount_lock_path()
+    parent = lock_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise RuntimeError(
+            f"mount.lock run-dir is a symlink and will not be followed: {parent}"
+        )
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+@storage_group.command("lock")
+def storage_lock_cmd() -> None:
+    """Seal the encrypted store (headless / no-daemon fallback).
+
+    Live locking during a recording — the bounded stop-then-quiesce-then-detach
+    sequence — is performed by the running daemon (the app's Lock button, or the
+    ``storage.lock`` daemon verb). This CLI command is the FALLBACK for a
+    CLI-only install where no daemon is reachable: it writes the sealed sentinel
+    (which the next daemon start honors) and never force-detaches anything.
+    """
+    if _daemon_is_reachable():
+        console.print(
+            "[yellow]A ScreenCap daemon is running.[/yellow] Live lock is performed "
+            "by the daemon (use the app's Lock, or the headless daemon lock verb). "
+            "This CLI fallback only runs when no daemon is reachable."
+        )
+        raise SystemExit(1)
+
+    if not _guard_container_flag_for_lock():
+        return
+
+    try:
+        sentinel = _write_sealed_sentinel()
+    except (OSError, RuntimeError) as exc:
+        console.print(f"[red]Error sealing store:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+
+    console.print(
+        f"[green]Store sealed.[/green] It stays locked (sentinel at "
+        f"{escape(str(sentinel))}) until you run [bold]screencap storage unlock[/bold]."
+    )
+
+
+@storage_group.command("unlock")
+def storage_unlock_cmd() -> None:
+    """Unseal the encrypted store after present-user authentication (fallback).
+
+    Present-user (Touch ID with password fallback) is required on every unlock.
+    Live unlock + reconcile is performed by the running daemon (app / daemon
+    verb); this CLI command is the FALLBACK for a CLI-only install with no daemon
+    reachable. Where no LocalAuthentication surface exists (SSH / headless) it
+    refuses and names the recovery route — present-user means present.
+    """
+    if _daemon_is_reachable():
+        console.print(
+            "[yellow]A ScreenCap daemon is running.[/yellow] Unlock is performed by "
+            "the daemon (use the app, or the headless daemon unlock verb). This CLI "
+            "fallback only runs when no daemon is reachable."
+        )
+        raise SystemExit(1)
+
+    from screencap.daemon import store_lifecycle as _sl
+
+    if not _sl.is_sealed():
+        console.print("[dim]Store is not sealed. Nothing to unlock.[/dim]")
+        return
+
+    try:
+        _evaluate_local_authentication(
+            "Unlock your ScreenCap encrypted recordings store"
+        )
+    except _NoLocalAuthSurface as exc:
+        console.print(
+            "[red]Cannot unlock here:[/red] unlocking requires present-user "
+            "authentication (Touch ID or your login password), and this session "
+            "has no authentication surface "
+            f"({escape(str(exc))})."
+        )
+        console.print(
+            "Unlock from a local login session on this Mac (or Screen Sharing to "
+            "the ScreenCap app) — the store stays sealed."
+        )
+        raise SystemExit(1) from exc
+    except PermissionError as exc:
+        console.print(
+            f"[red]Authentication failed:[/red] {escape(str(exc))}. "
+            "The store stays sealed."
+        )
+        raise SystemExit(1) from exc
+
+    _clear_sealed_sentinel()
+    console.print(
+        "[green]Store unlocked.[/green] It will be mounted on the next daemon start."
+    )
+
+
+def _guard_container_flag_for_lock() -> bool:
+    """True if the container is enabled (so sealing is meaningful); else warn.
+
+    Sealing a store on a plaintext install has no effect (the daemon never reads
+    the sentinel while the flag is off), so we surface that rather than writing a
+    dead sentinel."""
+    from screencap import config
+
+    if config.get_container_enabled():
+        return True
+    console.print(
+        "[yellow]The encrypted container is not enabled;[/yellow] there is no "
+        "store to seal."
+    )
+    return False
 
 
 @cli.group("model")

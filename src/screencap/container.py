@@ -670,6 +670,7 @@ def detach(
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     force_wait: float = _DETACH_FORCE_WAIT_SECONDS,
+    force: bool = True,
 ) -> None:
     """Detach ``target`` (a mountpoint or ``/dev/diskN``), graceful then force.
 
@@ -678,9 +679,17 @@ def detach(
     seconds and retry with ``-force``. A non-transient failure propagates
     unchanged — we do not force past, say, a corruption error.
 
+    ``force=False`` is the **compact discipline** (KTD-12): a busy volume raises
+    :class:`ContainerBusyError` instead of being force-detached, so ``storage
+    compact`` never yanks a volume out from under an active writer. The lock verb
+    (U9) keeps the default ``force=True`` — force is acceptable there precisely
+    because every writer is ledger-disciplined and readers were signalled.
+
     Raises:
         ContainerError: if the graceful detach fails non-transiently, or if the
             forced detach also fails.
+        ContainerBusyError: when ``force=False`` and the graceful detach hit a
+            transient busy condition (never force-detached).
     """
     import time
 
@@ -688,6 +697,9 @@ def detach(
         _run_hdiutil(["detach", target], timeout=timeout)
         return
     except ContainerBusyError:
+        if not force:
+            # Compact discipline (KTD-12): never force past a busy volume.
+            raise
         # Transient busy -> give in-flight I/O a moment to drain, then force.
         time.sleep(force_wait)
     _run_hdiutil(["detach", "-force", target], timeout=timeout)
