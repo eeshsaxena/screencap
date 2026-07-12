@@ -504,7 +504,14 @@ final class RecorderController: ObservableObject {
             return
         }
         if transport == .cliFallback, let permissions, !permissions.allRequiredGranted {
-            lastError = Self.requiredPermissionsErrorMessage
+            // SCR-263: during a post-update helper swap the probe lands mid-swap
+            // as .cliFallback with grants unverifiable — the same shape as a
+            // genuine missing grant. Keying on `updateConverging` tells the two
+            // apart so this block reads like the window's "Finishing update…"
+            // interstitial instead of demanding permissions that aren't missing.
+            lastError = updateConverging
+                ? UpdateConvergenceCopy.startBlockedDuringConvergence
+                : Self.requiredPermissionsErrorMessage
             return
         }
         // Daemon path: hard-block start ONLY on a denied Screen Recording grant
@@ -539,7 +546,11 @@ final class RecorderController: ObservableObject {
         switch transport {
         case .cliFallback:
             if let permissions, !permissions.allRequiredGranted {
-                return Self.requiredPermissionsErrorMessage
+                // SCR-263: mirror start()'s convergence-aware copy so the sheet's
+                // inline block reason doesn't contradict the update interstitial.
+                return updateConverging
+                    ? UpdateConvergenceCopy.startBlockedDuringConvergence
+                    : Self.requiredPermissionsErrorMessage
             }
         case .daemon:
             if let permissions, permissions.daemonGrants.screenRecordingDenied {
@@ -799,7 +810,14 @@ final class RecorderController: ObservableObject {
         // transport) so we must re-check before spawning the CLI.
         if let permissions, !permissions.allRequiredGranted {
             transitionToIdle()
-            lastError = Self.requiredPermissionsErrorMessage
+            // SCR-263: a daemon start that fails over to CLI mid-swap re-enters
+            // this gate as .cliFallback with grants unverifiable; key on
+            // `updateConverging` here too so the failover copy stays consistent
+            // with the "Finishing update…" interstitial rather than the
+            // permission-required error.
+            lastError = updateConverging
+                ? UpdateConvergenceCopy.startBlockedDuringConvergence
+                : Self.requiredPermissionsErrorMessage
             return
         }
 

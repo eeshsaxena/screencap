@@ -22,6 +22,17 @@ enum UpdateConvergenceCopy {
     static let deadlineFallbackNotice =
         "The update didn't finish cleanly, so ScreenCap needs to check its recording helper."
 
+    /// SCR-263: the transient reason a recording Start is blocked while the
+    /// helper swap converges. During convergence the probe lands as
+    /// `.cliFallback` with grants unverifiable — the same shape as a genuine
+    /// missing grant — so the menu-bar Start / New-recording sheet would show the
+    /// permission-required error, contradicting the "Finishing update…"
+    /// interstitial the window is showing. This is the honest stand-in: status
+    /// only (no permission claim, swept by the honesty gate), with a "try again"
+    /// cue since the block clears itself the moment convergence completes.
+    static let startBlockedDuringConvergence =
+        "ScreenCap is finishing an update — try again in a moment."
+
     /// The card's secondary status line for the given elapsed wait, or nil while
     /// the wait is still ordinary. Pure so the elapsed→line decision is
     /// assertable without a render tree.
