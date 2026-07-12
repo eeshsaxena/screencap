@@ -114,6 +114,14 @@ struct ReviewDataEnvelope: Decodable, Equatable {
     /// drops events inside before counting/grouping, so it never counts or reveals
     /// policy-flagged content. Absent → nil → empty.
     var protectedIntervals: [CapturedInterval]? = nil
+    /// SCR-219 (U6) — clip-only honesty flag. Present (`true`) ONLY on a
+    /// clip-scoped `review-data` call (both `--clip-start-ms` / `--clip-end-ms`
+    /// supplied); a whole-recording review omits the key entirely. It signals
+    /// that the exported clip video is capture-blocked (window-level) but its
+    /// in-window on-screen text is NOT masked — less redacted than the preview
+    /// screenshots — and it leaves to external recipients. Additive + optional:
+    /// NEVER gate readiness on it (see the review-data-nullable-timing learning).
+    var clipVideoCaptureBlockedOnly: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -133,6 +141,7 @@ struct ReviewDataEnvelope: Decodable, Equatable {
         case retryable
         case blockedIntervals = "blocked_intervals"
         case protectedIntervals = "protected_intervals"
+        case clipVideoCaptureBlockedOnly = "clip_video_capture_blocked_only"
     }
 }
 
@@ -186,6 +195,12 @@ struct ReviewData: Equatable {
     /// surface a status-specific non-blocking advisory and the timeline stays
     /// at its 0-origin fallback.
     let timingStatus: ReviewTimingStatus
+    /// SCR-219 (U6) — true when this is a clip-scoped review whose exported video
+    /// is capture-blocked but NOT text-masked (from the envelope's
+    /// `clip_video_capture_blocked_only`). Drives the prominent honesty note and
+    /// the "local-only, not uploaded" label override (KTD4). `false` for a
+    /// whole-recording review.
+    let clipVideoCaptureBlockedOnly: Bool
 }
 
 /// Test seam over `CLIClient.runJSONRaw` so the review-data fetch can be
@@ -194,6 +209,19 @@ struct ReviewData: Equatable {
 @MainActor
 protocol ReviewDataLoader {
     func load(name: String) async throws -> ReviewDataEnvelope
+    /// SCR-219 (U6) — clip-scoped variant: passes `--clip-start-ms` /
+    /// `--clip-end-ms` so `review-data` (U4) scopes the consent surface to the
+    /// clip range and emits the `clip_video_capture_blocked_only` honesty flag.
+    /// A default implementation forwards to `load(name:)` (ignoring the range),
+    /// so every existing conformer — and every whole-recording call — needs no
+    /// change; only `LiveReviewDataLoader` overrides it to inject the options.
+    func load(name: String, clipRange: ClipRange?) async throws -> ReviewDataEnvelope
+}
+
+extension ReviewDataLoader {
+    func load(name: String, clipRange: ClipRange?) async throws -> ReviewDataEnvelope {
+        try await load(name: name)
+    }
 }
 
 @MainActor
@@ -205,9 +233,30 @@ final class LiveReviewDataLoader: ReviewDataLoader {
     /// surfaces the failed state via this timeout rather than hanging forever.
     static let reviewDataTimeout: TimeInterval = 600
 
+    /// Builds the `review-data` argv, injecting the clip-range options when a
+    /// range is present. `clipRange.startMs` / `.endMs` are absolute unix-epoch
+    /// ms passed straight through — `review-data` (U4) treats
+    /// `--clip-start-ms` / `--clip-end-ms` as epoch ms. Extracted so the arg
+    /// construction is unit-testable.
+    static func reviewDataArgs(name: String, clipRange: ClipRange?) -> [String] {
+        var args = ["review-data", "--json"]
+        if let clipRange {
+            args += [
+                "--clip-start-ms", String(clipRange.startMs),
+                "--clip-end-ms", String(clipRange.endMs),
+            ]
+        }
+        args += ["--", name]
+        return args
+    }
+
     func load(name: String) async throws -> ReviewDataEnvelope {
+        try await load(name: name, clipRange: nil)
+    }
+
+    func load(name: String, clipRange: ClipRange?) async throws -> ReviewDataEnvelope {
         let raw = try await CLIClient.runJSONRaw(
-            ["review-data", "--json", "--", name],
+            Self.reviewDataArgs(name: name, clipRange: clipRange),
             timeout: Self.reviewDataTimeout
         )
         return try JSONDecoder().decode(ReviewDataEnvelope.self, from: raw)
@@ -293,6 +342,20 @@ final class ReviewWindowViewModel: ObservableObject {
     let recordingName: String
     let uploadController: UploadController
 
+    /// SCR-219 (U6) — the clip range this window is reviewing, consumed once from
+    /// `ReviewWindowOpener.pendingClipRange` at the start of the first
+    /// `loadReviewData()`. Nil for a whole-recording review. Read by the view to
+    /// switch the primary action to "Export clip" and to skip the auth gate.
+    private(set) var clipRange: ClipRange?
+    /// Guards the one-shot consume of `pendingClipRange`: a retry-after-prep-
+    /// failure re-run of `loadReviewData()` must keep the captured range rather
+    /// than re-reading a now-cleared opener entry.
+    private var didConsumeClipRange = false
+
+    /// True when this window is reviewing a clip (a range is pending) — drives
+    /// the "Export clip" action + the auth-skip in `ReviewWindow`.
+    var isClipReview: Bool { clipRange != nil }
+
     /// Set by the view's `.onAppear` so the auto-close timer can dismiss
     /// the window without the viewmodel depending on a SwiftUI
     /// `@Environment(\.dismiss)` reference. Lives on the viewmodel rather
@@ -345,8 +408,25 @@ final class ReviewWindowViewModel: ObservableObject {
         // is never the live state when `loadReviewData` runs. A future caller
         // that re-enters from `.refused` must decide whether re-prep is wanted.
         if case .failed = state { state = .preparing }
+        // Consume the pending clip range (SCR-219 U6) exactly once for this
+        // window, BEFORE the review-data call, so the consent surface is scoped
+        // to the clip (U4) and the `clip_video_capture_blocked_only` honesty flag
+        // is emitted. Cleared from the shared opener so a later plain review of
+        // the same recording can't inherit it (one-shot, the `pendingSeekMs`
+        // disposal semantic); guarded by `didConsumeClipRange` so a retry-after-
+        // prep-failure re-run keeps the captured range instead of re-reading a
+        // now-cleared entry. (Unlike `pendingSeekMs`, which the view consumes on
+        // `.ready` because a seek is a post-`.ready` UI action, a clip range must
+        // reach `review-data` during prep — hence the consume happens here.)
+        if !didConsumeClipRange {
+            didConsumeClipRange = true
+            if let range = ReviewWindowOpener.shared.pendingClipRange[recordingName] {
+                clipRange = range
+                ReviewWindowOpener.shared.pendingClipRange[recordingName] = nil
+            }
+        }
         do {
-            let envelope = try await loader.load(name: recordingName)
+            let envelope = try await loader.load(name: recordingName, clipRange: clipRange)
             // `started_at` / `duration_seconds` are legitimately null for a
             // playable recording with no action events (review.py →
             // `_read_recording_meta` returns None). They must NOT gate the
@@ -380,7 +460,10 @@ final class ReviewWindowViewModel: ObservableObject {
                 // back to the legacy `timing_error` boolean for older envelopes
                 // that omit `timing_status`.
                 timingStatus: ReviewTimingStatus.resolve(
-                    status: envelope.timingStatus, legacyError: envelope.timingError)
+                    status: envelope.timingStatus, legacyError: envelope.timingError),
+                // SCR-219 (U6): additive/optional — false when absent (a
+                // whole-recording review, or an older CLI). Never gates readiness.
+                clipVideoCaptureBlockedOnly: envelope.clipVideoCaptureBlockedOnly ?? false
             )
             state = .ready(data)
         } catch {
