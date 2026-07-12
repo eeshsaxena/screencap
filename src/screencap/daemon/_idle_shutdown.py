@@ -167,6 +167,13 @@ def _daemon_is_busy(app: Starlette) -> bool:
     dl_job = getattr(app.state, "model_download_job", None)
     if dl_job is not None and _backfill_running(dl_job):  # same is_running() shape
         return True
+    # SCR-258 U6: an upgrade migration is in flight. ``storage.encrypt.*`` is NOT
+    # in ``_ACTIVITY_PATHS`` (status-polling must not reset the idle timer), so
+    # this busy predicate is what keeps the auto-spawned daemon alive across a
+    # long copy/verify run.
+    encrypt_job = getattr(app.state, "encrypt_job", None)
+    if encrypt_job is not None and _backfill_running(encrypt_job):  # same shape
+        return True
     return False
 
 

@@ -5505,6 +5505,122 @@ def storage_unlock_cmd() -> None:
     )
 
 
+@storage_group.group("encrypt")
+def storage_encrypt_group() -> None:
+    """Migrate an existing plaintext library into the encrypted store (SCR-258).
+
+    Thin clients of the daemon's ``storage.encrypt.*`` verbs. The migration is a
+    record-through background job: it COPIES and VERIFIES every recording into the
+    container, then a single quiesced cutover swaps the mountpoint, and only AFTER
+    that a sweep deletes the plaintext originals — so a recording never vanishes
+    from the plaintext library mid-migration, and an interrupted run resumes.
+    """
+
+
+def _encrypt_snapshot_line(snap: dict) -> str:
+    """One-line human summary of a migration status snapshot (name-free, R9)."""
+    state = snap.get("state", "?")
+    phase = snap.get("phase", "?")
+    verified = snap.get("verified", 0)
+    deleted = snap.get("deleted", 0)
+    total = snap.get("total", 0)
+    reason = snap.get("paused_reason")
+    line = f"migration: {state} (phase {phase}) — {verified}/{total} verified, {deleted} plaintext removed"
+    if reason:
+        line += f" [{reason}]"
+    return line
+
+
+@storage_encrypt_group.command("start")
+def storage_encrypt_start_cmd() -> None:
+    """Begin (or resume) migrating the plaintext library into the encrypted store.
+
+    Thin client of ``POST /v0/storage.encrypt.start``. Idempotent on the daemon
+    side. A custom-recordings install (or the ``SCREENCAP_RECORDINGS_DIR``
+    override) is refused — those stay plaintext, outside the at-rest claim.
+    """
+    from screencap.cli._autospawn import (
+        DaemonAutoSpawnError,
+        LaunchAgentNotRunningError,
+        ensure_daemon_or_spawn,
+    )
+    from screencap.cli._daemon_client import (
+        DaemonClientError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+    )
+
+    try:
+        ensure_daemon_or_spawn(auto_spawn=True)
+    except (LaunchAgentNotRunningError, DaemonAutoSpawnError) as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+
+    with DaemonHTTPClient() as client:
+        try:
+            snap = client.storage_encrypt_start()
+        except DaemonUnreachableError as exc:
+            console.print(f"[red]Error:[/red] could not reach the ScreenCap daemon: {escape(str(exc))}")
+            raise SystemExit(1) from exc
+        except DaemonClientError as exc:
+            env = exc.envelope
+            msg = env.get("message") or env.get("error", "migration failed")
+            console.print(f"[red]Couldn't start migration:[/red] {escape(str(msg))}")
+            raise SystemExit(1) from exc
+    console.print("[green]Migration started.[/green]")
+    console.print(f"  {_encrypt_snapshot_line(snap)}")
+
+
+@storage_encrypt_group.command("status")
+@click.option("--json", "as_json", is_flag=True, default=lambda: _should_default_to_json())
+def storage_encrypt_status_cmd(as_json: bool) -> None:
+    """Report the current migration state and progress (privacy-safe)."""
+    import json as _json
+
+    from screencap.cli._daemon_client import (
+        DaemonClientError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+    )
+
+    try:
+        with DaemonHTTPClient() as client:
+            snap = client.storage_encrypt_status()
+    except DaemonUnreachableError:
+        console.print("[dim]Daemon not running; no migration in progress.[/dim]")
+        return
+    except DaemonClientError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+    if as_json:
+        click.echo(_json.dumps(snap))
+        return
+    console.print(_encrypt_snapshot_line(snap))
+
+
+@storage_encrypt_group.command("cancel")
+def storage_encrypt_cancel_cmd() -> None:
+    """Cancel the in-flight migration (resumable; plaintext stays intact)."""
+    from screencap.cli._daemon_client import (
+        DaemonClientError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+    )
+
+    try:
+        with DaemonHTTPClient() as client:
+            snap = client.storage_encrypt_cancel()
+    except DaemonUnreachableError:
+        console.print("[dim]Daemon not running; nothing to cancel.[/dim]")
+        return
+    except DaemonClientError as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        raise SystemExit(1) from exc
+    console.print("[yellow]Migration cancelled.[/yellow] Resume later with "
+                  "[bold]screencap storage encrypt start[/bold].")
+    console.print(f"  {_encrypt_snapshot_line(snap)}")
+
+
 def _guard_container_flag_for_lock() -> bool:
     """True if the container is enabled (so sealing is meaningful); else warn.
 

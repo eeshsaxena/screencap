@@ -56,6 +56,9 @@ _STORAGE_MIGRATE_API_VERSION = 1
 # backfill additive precedent).
 _STORAGE_LOCK_API_VERSION = 1
 _STORAGE_UNLOCK_API_VERSION = 1
+# SCR-258 U6 (KTD-18): the ``storage.encrypt.start|status|cancel`` upgrade-migration
+# verbs. Additive (new verbs) — no global API_SCHEMA_VERSION bump.
+_STORAGE_ENCRYPT_API_VERSION = 1
 # U10 (local-first intelligence) read verb: the named-task segments a LOCAL
 # recording's terminal-stage segmentation persisted (U4). Additive (new verb) —
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list

@@ -414,6 +414,29 @@ class DaemonHTTPClient:
             self._request("POST", "/v0/storage.unlock", json_body={})
         )
 
+    def storage_encrypt_start(self) -> dict[str, Any]:
+        """``POST /v0/storage.encrypt.start`` — begin (or resume) the migration (U6).
+
+        Idempotent on the daemon side. A custom-recordings install / plaintext
+        build returns ``ok:false`` with ``error=storage_migration_failed`` + a
+        ``reason``/``message`` (on the raised ``DaemonClientError.envelope``).
+        """
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/storage.encrypt.start", json_body={})
+        )
+
+    def storage_encrypt_status(self) -> dict[str, Any]:
+        """``GET /v0/storage.encrypt.status`` — privacy-safe migration snapshot."""
+        return self._parse_ok_envelope(
+            self._request("GET", "/v0/storage.encrypt.status")
+        )
+
+    def storage_encrypt_cancel(self) -> dict[str, Any]:
+        """``POST /v0/storage.encrypt.cancel`` — signal the migration to stop."""
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/storage.encrypt.cancel", json_body={})
+        )
+
     def model_download_start(self, model_id: str | None = None) -> dict[str, Any]:
         """``POST /v0/model.download.start`` — start (or return) the model download."""
         body = {"model_id": model_id} if model_id else {}

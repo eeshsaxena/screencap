@@ -129,6 +129,15 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         await asyncio.to_thread(corpus_migrate.resume_at_daemon_start)
     except Exception:  # noqa: BLE001 - migration must never break startup
         logger.warning("corpus-migration resume failed", exc_info=True)
+    # SCR-258 U6 (KTD-18): auto-resume an upgrade migration a prior daemon left
+    # incomplete (interrupted before cutover, or a post-cutover sweep that didn't
+    # finish). The ledger is the durable source of truth; ``should_auto_resume``
+    # is the policy (a CANCELLED / COMPLETE / never-started run is skipped).
+    # Strictly fail-open — a resume hiccup must never block daemon start.
+    try:
+        _reconcile_encrypt_job_on_start(app)
+    except Exception:  # noqa: BLE001 - migration resume must never break startup
+        logger.warning("encrypt-migration resume failed", exc_info=True)
     # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
     # daemon start (the stale-daemon-after-app-update lesson — a request-path
     # module must be imported before the first request, never lazily inside the
@@ -196,6 +205,12 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         backfill_job = getattr(app.state, "backfill_job", None)
         if backfill_job is not None:
             await backfill_job.shutdown()
+        # SCR-258 U6: stop an in-flight migration BEFORE closing the bus/loop —
+        # its copy/verify worker runs on a to_thread worker the loop cannot
+        # cancel, so pause it (a paused ledger auto-resumes on the next start).
+        encrypt_job = getattr(app.state, "encrypt_job", None)
+        if encrypt_job is not None:
+            await encrypt_job.shutdown()
         model_download_job = getattr(app.state, "model_download_job", None)
         if model_download_job is not None:
             await model_download_job.shutdown()
@@ -2459,6 +2474,307 @@ async def backfill_cancel(request: Request) -> JSONResponse:
         )
 
 
+# ---------------------------------------------------------------------------
+# SCR-258 U6 (KTD-18): upgrade-migration job — copy/verify → cutover → sweep.
+# ---------------------------------------------------------------------------
+
+_ENCRYPT_INTERIM_MOUNT_NAME = "migrate-mnt"
+_ENCRYPT_ASIDE_SUFFIX = "-migrated-plaintext"
+
+
+def _encrypt_job(app: Starlette) -> Any:
+    """Lazily attach the single migration job holder to ``app.state`` (U6).
+
+    Scoped per app instance (not module-global) so tests building fresh apps
+    don't share a job. This is the ``app.state.encrypt_job`` hook U9 reserved for
+    the lock pause + the unlock auto-resume.
+    """
+    state = app.state
+    if not hasattr(state, "encrypt_job"):
+        from screencap.daemon.encrypt_job import EncryptJob
+
+        state.encrypt_job = EncryptJob(state.event_bus)
+    return state.encrypt_job
+
+
+def _is_custom_recordings_install() -> bool:
+    """True iff this install uses a custom recordings dir / env override (R16).
+
+    Such installs are plaintext bypasses excluded from the migration prompt and
+    documented as outside the at-rest claim — ``storage.encrypt.start`` refuses.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    from screencap import config
+
+    if _os.environ.get("SCREENCAP_RECORDINGS_DIR"):
+        return True
+    try:
+        cfg = config._load_toml()
+    except Exception:  # noqa: BLE001
+        return False
+    val = cfg.get("recordings_dir")
+    if not val:
+        return False
+    try:
+        return _Path(val).resolve() != config._DEFAULT_RECORDINGS.resolve()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _build_encrypt_run_factory(app: Starlette) -> Any:
+    """Build the migration ``run_factory`` (all daemon seams wired) for the job.
+
+    Returns a zero-arg factory producing the bound
+    ``run(stop_event, progress_cb, ledger)`` the engine call needs, wiring:
+    the interim/final mountpoints + aside path, the container mounter (real
+    ``hdiutil`` + the stored key), the active-recording query, the brief
+    ``acquire_migration`` cutover reservation, the sidecar-writer pause, and the
+    disk preflight. Captured here so the verb AND the unlock / daemon-start
+    auto-resume share one plan and cannot drift.
+    """
+    import contextlib as _contextlib
+    import shutil as _shutil
+
+    from screencap import config, migration
+    from screencap.daemon import store_lifecycle as _sl
+
+    supervisor = app.state.supervisor
+    loop = asyncio.get_running_loop()
+    bundle_path = _sl.store_bundle_path()
+
+    def _factory() -> Any:
+        from screencap import container
+
+        key = container.require_container_key()
+        base_dir = config.get_base_dir()
+        recordings = config.get_recordings_dir()
+        paths = migration.MigrationPaths(
+            plaintext_root=recordings,
+            interim_mountpoint=base_dir / "run" / _ENCRYPT_INTERIM_MOUNT_NAME,
+            aside_root=recordings.parent / (recordings.name + _ENCRYPT_ASIDE_SUFFIX),
+            sidecar_source_dir=base_dir,
+        )
+        mounter = migration.ContainerMounter(bundle_path, key)
+
+        def _active_name() -> str | None:
+            session = supervisor.current_session()
+            if not session:
+                return None
+            return session.get("recording_name")
+
+        @_contextlib.contextmanager
+        def _cutover_reservation() -> Any:
+            fut = asyncio.run_coroutine_threadsafe(
+                supervisor.acquire_migration(
+                    schema_version=schema._STORAGE_ENCRYPT_API_VERSION
+                ),
+                loop,
+            )
+            fut.result()
+            try:
+                yield
+            finally:
+                supervisor.release_migration()
+
+        @_contextlib.contextmanager
+        def _pause_sidecar_writers() -> Any:
+            # Pause the backfill OCR writer (the content-index writer) for the
+            # sidecar-copy window; the encrypt job must NOT pause itself.
+            job = getattr(app.state, "backfill_job", None)
+            if job is not None:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(job.shutdown(), loop)
+                    fut.result(timeout=15)
+                except Exception:  # noqa: BLE001 — best-effort pause
+                    logger.debug("encrypt: pausing backfill for cutover raised",
+                                 exc_info=True)
+            yield
+
+        def _disk_preflight(needed_bytes: int) -> str | None:
+            try:
+                free = _shutil.disk_usage(str(bundle_path.parent)).free
+            except OSError:
+                return None
+            return migration.PAUSE_REASON_DISK if free < needed_bytes else None
+
+        def _run(**kwargs: Any) -> Any:
+            return migration.run_migration(
+                paths=paths,
+                mounter=mounter,
+                active_recording_name=_active_name,
+                cutover_reservation=_cutover_reservation,
+                pause_sidecar_writers=_pause_sidecar_writers,
+                disk_preflight=_disk_preflight,
+                **kwargs,
+            )
+
+        return _run
+
+    return _factory
+
+
+def _reconcile_encrypt_job_on_start(app: Starlette) -> None:
+    """Daemon-start auto-resume for an incomplete migration (U6, KTD-18).
+
+    Builds the job (+ its run_factory) and resumes iff the durable ledger says
+    there is work left AND the user did not cancel — the policy is
+    ``migration.should_auto_resume``. A container-disabled / custom-recordings
+    install has nothing to resume.
+    """
+    from screencap import config, migration
+
+    if not config.get_container_enabled() or _is_custom_recordings_install():
+        return
+    ledger = migration.MigrationLedger()
+    if not migration.should_auto_resume(ledger):
+        return
+    job = _encrypt_job(app)
+    job.start(_build_encrypt_run_factory(app))
+
+
+async def _encrypt_body(request: Request) -> dict[str, Any]:
+    """Tolerant body read for the parameterless encrypt verbs (backfill shape)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _ensure_encrypt_bundle() -> None:
+    """Foreground-acceptance key + bundle creation (KTD-18, idempotent).
+
+    The user is present (they just accepted the migration prompt), so the first
+    Keychain write's ACL prompt has a user to answer it. Reuses an existing key /
+    bundle; mints only when neither exists (never orphaning a store).
+    """
+    from screencap import container
+    from screencap.daemon import store_lifecycle as _sl
+
+    bundle = _sl.store_bundle_path()
+    if bundle.exists():
+        return
+    key = container.get_container_key()
+    if key is None:
+        key = container.create_container_key(str(bundle))
+    container.create_bundle(str(bundle), key)
+
+
+async def storage_encrypt_start(request: Request) -> JSONResponse:
+    """``POST /v0/storage.encrypt.start`` — begin (or resume) the migration (U6).
+
+    KTD-18 / KTD-23: refuses a custom-recordings install (R16, typed reason),
+    creates the key+bundle in the foreground acceptance flow, audit-logs
+    ``storage.encrypt.start`` with peer provenance + outcome, then drives the
+    idempotent record-through job. A start while a run is in flight returns the
+    in-flight snapshot.
+    """
+    from screencap import config
+    from screencap.daemon import audit_log, provenance
+
+    schema_version = schema._STORAGE_ENCRYPT_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.encrypt.start",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        await _encrypt_body(request)
+        if _is_custom_recordings_install():
+            _audit("custom_recordings_dir")
+            return _api_error_response(
+                errors.StorageMigrationError(
+                    "custom_recordings_dir",
+                    "This install uses a custom recordings location (or the "
+                    "SCREENCAP_RECORDINGS_DIR override), which stays plaintext and "
+                    "is outside the encrypted-store migration.",
+                    schema_version=schema_version,
+                )
+            )
+        if not config.get_container_enabled():
+            # Migration is what turns the container on; the engine flips the flag
+            # at cutover. But the daemon must be container-capable to serve the
+            # migrated store afterward — refuse a plaintext-only build clearly.
+            _audit("container_disabled")
+            return _api_error_response(
+                errors.StorageMigrationError(
+                    "container_disabled",
+                    "The encrypted container is not enabled on this install.",
+                    schema_version=schema_version,
+                )
+            )
+        # Foreground key+bundle creation (idempotent) on acceptance.
+        await asyncio.to_thread(_ensure_encrypt_bundle)
+        job = _encrypt_job(request.app)
+        snapshot = job.start(_build_encrypt_run_factory(request.app))
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(schema_version=schema_version, **snapshot.as_payload())
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+
+async def storage_encrypt_status(request: Request) -> JSONResponse:
+    """``GET /v0/storage.encrypt.status`` — privacy-safe migration snapshot (R9).
+
+    Read-only. Carries ONLY counts + run state + cutover phase + a non-identifying
+    pause reason — never a recording directory name. NOT in ``_ACTIVITY_PATHS``.
+    """
+    try:
+        job = _encrypt_job(request.app)
+        snapshot = job.status()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._STORAGE_ENCRYPT_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._STORAGE_ENCRYPT_API_VERSION, request=request
+        )
+
+
+async def storage_encrypt_cancel(request: Request) -> JSONResponse:
+    """``POST /v0/storage.encrypt.cancel`` — signal the in-flight migration to stop.
+
+    Resumable: the ledger records partial progress; a later ``encrypt.start``
+    continues. A no-op returning the current snapshot when no run is in flight.
+    Plaintext stays intact (deletion only runs post-cutover).
+    """
+    try:
+        await _encrypt_body(request)
+        job = _encrypt_job(request.app)
+        snapshot = job.cancel()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._STORAGE_ENCRYPT_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._STORAGE_ENCRYPT_API_VERSION, request=request
+        )
+
+
 def _model_download_job(app: Starlette) -> Any:
     """Lazily attach the single model-download job holder to ``app.state`` (SCR-239)."""
     state = app.state
@@ -2946,6 +3262,16 @@ def _resume_after_unlock(app: Starlette) -> None:
                 job.start()
         except Exception:  # noqa: BLE001
             logger.debug("unlock: backfill auto-resume skipped", exc_info=True)
+    # SCR-258 U6: auto-resume a migration a lock paused at its recording boundary
+    # (the encrypt job kept its run_factory from before the lock, so resume needs
+    # no re-plumbing). ``resume_if_pending`` no-ops on a cancelled / complete /
+    # never-started run.
+    encrypt_job = getattr(app.state, "encrypt_job", None)
+    if encrypt_job is not None:
+        try:
+            encrypt_job.resume_if_pending()
+        except Exception:  # noqa: BLE001
+            logger.debug("unlock: encrypt auto-resume skipped", exc_info=True)
 
 
 async def storage_lock(request: Request) -> JSONResponse:
@@ -3228,6 +3554,9 @@ def build_app() -> Starlette:
             Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
             Route("/v0/storage.lock", storage_lock, methods=["POST"]),
             Route("/v0/storage.unlock", storage_unlock, methods=["POST"]),
+            Route("/v0/storage.encrypt.start", storage_encrypt_start, methods=["POST"]),
+            Route("/v0/storage.encrypt.status", storage_encrypt_status, methods=["GET"]),
+            Route("/v0/storage.encrypt.cancel", storage_encrypt_cancel, methods=["POST"]),
             Route("/v0/model.download.start", model_download_start, methods=["POST"]),
             Route("/v0/model.download.status", model_download_status, methods=["GET"]),
             Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),
