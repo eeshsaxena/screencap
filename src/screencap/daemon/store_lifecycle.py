@@ -42,7 +42,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +110,14 @@ def store_bundle_path() -> Path:
 
     ``~/.screencap/store.sparsebundle`` by default — it lives in the plaintext
     run/base dir OUTSIDE the container (it *is* the container), resolved through
-    ``config.get_base_dir`` so tests isolate it.
+    ``config.get_store_bundle_dir`` (which defaults to ``config.get_base_dir``)
+    so tests isolate it AND a vault install that relocated its storage location
+    (SCR-258 U11, KTD-19) resolves the bundle from the chosen volume while the
+    recordings mountpoint stays put.
     """
     from screencap import config, container
 
-    return config.get_base_dir() / container.BUNDLE_NAME
+    return config.get_store_bundle_dir() / container.BUNDLE_NAME
 
 
 def sealed_sentinel_path() -> Path:
@@ -399,6 +402,69 @@ def mount_now() -> StoreResolution:
         return _attempt_mount(bundle, Path(mountpoint), key)
 
 
+def relocate_bundle(target_dir: Path) -> "Any":
+    """Move the encrypted bundle to ``target_dir`` and remount (SCR-258 U11, KTD-19).
+
+    The whole detach → bundle move → config flip → remount cycle runs under a
+    single held ``mount.lock``, so no concurrent resolver (or the U9 lock verb)
+    races the state. Invariants:
+
+    * **Never force-detach** (compact discipline, KTD-12/KTD-19): the quiescent
+      detach uses ``force=False``. A busy volume (:class:`ContainerBusyError`)
+      surfaces a typed refusal with **nothing moved** and the store left mounted —
+      the move does not proceed.
+    * The recordings **mountpoint is unchanged** — only the bundle's backing
+      directory moves. The config flip (``config.set_store_bundle_dir``) inside
+      :func:`storage_migration.migrate_bundle` is the single commit point, so a
+      failed/interrupted move never leaves config pointing at a vanished bundle.
+    * On any failure the source bundle stays authoritative and is **remounted**,
+      so the store is never left detached.
+
+    Returns a :class:`storage_migration.MigrationOutcome`. Callers must have
+    already refused an active recording / running encrypt job / sealed store /
+    cloud-synced target (the daemon verb does this before calling here).
+    """
+    from screencap import config, container, storage_migration
+
+    with _mount_lock():
+        bundle = store_bundle_path()  # current bundle (pre-move)
+        mountpoint = Path(config.get_recordings_dir())
+        # Resolve the key up front so the remount below always has it, whether
+        # the move succeeds or we have to roll back to the source bundle.
+        key = container.require_container_key()
+
+        # Quiescent detach — NEVER force (KTD-12/KTD-19). A busy volume means an
+        # in-flight writer we did not catch above; refuse rather than yank it.
+        try:
+            container.detach(str(mountpoint), force=False)
+        except container.ContainerBusyError:
+            return storage_migration.MigrationOutcome(
+                ok=False,
+                code="recording_active",
+                message=(
+                    "The storage is still in use. Stop any active recording and "
+                    "try again in a moment."
+                ),
+            )
+
+        try:
+            outcome = storage_migration.migrate_bundle(
+                bundle,
+                target_dir / container.BUNDLE_NAME,
+                config.set_store_bundle_dir,
+            )
+        except Exception:
+            # The config flip is the commit point; a raised move never flipped
+            # it, so store_bundle_path() still resolves the intact source bundle.
+            _attempt_mount(store_bundle_path(), mountpoint, key)
+            raise
+
+        # Remount whichever bundle config now points at: the new location on
+        # success, the untouched source on a soft failure.
+        _attempt_mount(store_bundle_path(), mountpoint, key)
+        return outcome
+
+
 __all__ = [
     "StoreState",
     "StoreResolution",
@@ -417,4 +483,5 @@ __all__ = [
     "disk_host_env",
     "resolve_store_state",
     "mount_now",
+    "relocate_bundle",
 ]

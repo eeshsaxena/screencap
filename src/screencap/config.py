@@ -143,6 +143,39 @@ def set_recordings_dir(path: Path) -> None:
         doc["recordings_dir"] = resolved
 
 
+def get_store_bundle_dir() -> Path:
+    """Return the directory that holds the encrypted sparse bundle (SCR-258 U11).
+
+    Default :func:`get_base_dir` (``~/.screencap``); a vault install that moved
+    its storage location via ``storage.migrate`` (KTD-19) persists the chosen
+    directory in the top-level ``store_bundle_dir`` config key so the bundle can
+    live on a different volume than the run/base dir while the recordings
+    *mountpoint* stays :func:`get_recordings_dir`. Deliberately NOT
+    env-overridable — ``SCREENCAP_RECORDINGS_DIR`` disables the container
+    entirely (a plaintext bypass), so it never coexists with a moved bundle.
+    """
+    cfg = _load_toml()
+    val = cfg.get("store_bundle_dir")
+    if val:
+        return Path(val)
+    return get_base_dir()
+
+
+def set_store_bundle_dir(path: Path) -> None:
+    """Persist the encrypted-bundle directory to ``config.toml`` (SCR-258 U11).
+
+    Advisory-locked + atomic through the same writer as
+    :func:`set_recordings_dir`, so the write is lost-update-safe and invalidates
+    the in-process cache on exit (a daemon mid-relocation observes the new bundle
+    directory immediately). Stores the resolved absolute path as a string.
+    """
+    from screencap.privacy_settings import _privacy_config_writer
+
+    resolved = str(Path(path).resolve())
+    with _privacy_config_writer() as doc:
+        doc["store_bundle_dir"] = resolved
+
+
 def get_container_enabled() -> bool:
     """Return whether the at-rest encryption container is enabled (SCR-236, KTD-8).
 

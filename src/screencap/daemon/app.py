@@ -3124,6 +3124,84 @@ def _terminal_stage_active() -> bool:
     return False
 
 
+def _is_vault_migration_install() -> bool:
+    """True when ``storage.migrate`` must move the encrypted bundle (SCR-258 U11).
+
+    A vault install = the container is enabled AND a bundle exists. The
+    ``SCREENCAP_RECORDINGS_DIR`` env override is a documented plaintext bypass
+    (KTD-19, R16): when set the container is off, so the shipped SCR-228 rename
+    path applies unchanged. Legacy custom-dir (container off, no bundle) installs
+    likewise take the plaintext path — behavior is byte-identical to today.
+    """
+    from screencap import config
+    from screencap.daemon import store_lifecycle as _sl
+
+    if os.environ.get("SCREENCAP_RECORDINGS_DIR"):
+        return False
+    return config.get_container_enabled() and _sl.store_bundle_path().exists()
+
+
+async def _storage_migrate_bundle(
+    request: Request, parsed: Any, schema_version: int
+) -> JSONResponse:
+    """The vault arm of ``storage.migrate``: relocate the bundle (SCR-258 U11, KTD-19).
+
+    Refuses (typed reason, nothing moved) on a sealed store or a running encrypt
+    job, validates the target (SCR-228's cloud-synced-target preflight RETAINED),
+    then hands off to ``store_lifecycle.relocate_bundle`` — the quiescent, never-
+    force-detach detach → bundle move → config flip → remount cycle under
+    ``mount.lock``. The recordings mountpoint is unchanged; only the bundle moves.
+    The active-recording / terminal-stage refusals already ran in the caller, so a
+    move is never attempted while a recording is live.
+    """
+    from pathlib import Path
+
+    from screencap import storage_migration
+    from screencap.daemon import store_lifecycle as _sl
+
+    if await asyncio.to_thread(_sl.is_sealed):
+        raise errors.StorageMigrationError(
+            "store_sealed",
+            "Unlock the store before moving the storage location.",
+            schema_version=schema_version,
+        )
+
+    encrypt_job = getattr(request.app.state, "encrypt_job", None)
+    if encrypt_job is not None and encrypt_job.is_running():
+        raise errors.StorageMigrationError(
+            "encrypt_in_progress",
+            "An encryption upgrade is in progress. Try moving the storage "
+            "location again once it finishes.",
+            schema_version=schema_version,
+        )
+
+    current_bundle_dir = _sl.store_bundle_path().parent
+    target = Path(parsed.target).expanduser()
+
+    result = storage_migration.validate_bundle_target(current_bundle_dir, target)
+    if not result.ok:
+        raise errors.StorageMigrationError(
+            result.code or "invalid_target",
+            result.message or "The chosen folder can't be used.",
+            schema_version=schema_version,
+        )
+
+    outcome = await asyncio.to_thread(_sl.relocate_bundle, target)
+    if not outcome.ok:
+        raise errors.StorageMigrationError(
+            outcome.code or "invalid_target",
+            outcome.message or "The storage location could not be moved.",
+            schema_version=schema_version,
+        )
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema_version,
+            moved_from=outcome.moved_from,
+            moved_to=outcome.moved_to,
+        )
+    )
+
+
 async def storage_migrate(request: Request) -> JSONResponse:
     """``POST /v0/storage.migrate`` — relocate the recordings library (SCR-228).
 
@@ -3169,6 +3247,15 @@ async def storage_migrate(request: Request) -> JSONResponse:
                 "A recording is still finishing processing. Try again once "
                 "it completes.",
                 schema_version=schema_version,
+            )
+
+        # SCR-258 U11 (KTD-19): a vault install moves the encrypted BUNDLE (the
+        # mountpoint stays put), not the plaintext tree. The plaintext rename
+        # path below is unchanged for legacy custom-dir installs + the env
+        # override (the narrowed plaintext bypass).
+        if await asyncio.to_thread(_is_vault_migration_install):
+            return await _storage_migrate_bundle(
+                request, parsed, schema_version
             )
 
         source = config.get_recordings_dir()
