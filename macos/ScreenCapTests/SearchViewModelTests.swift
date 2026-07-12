@@ -106,7 +106,7 @@ final class SearchViewModelTests: XCTestCase {
             coverage: .authoritative
         )
         fake.contentResponse = ContentSearchResponse(
-            hits: [ContentHit(recording: "rec", timestampMs: 2000, snippet: "refund", score: -1.2)],
+            hits: [ContentHit(recording: "rec", timestampMs: 2000, snippet: "refund", score: -1.2, matchSource: nil)],
             indexState: .ok
         )
         fake.transcriptResponse = TranscriptSearchResponse(
@@ -138,7 +138,7 @@ final class SearchViewModelTests: XCTestCase {
             coverage: .authoritative
         )
         fake.contentResponse = ContentSearchResponse(
-            hits: [ContentHit(recording: "rec", timestampMs: 1000, snippet: "refund policy", score: -2.0)],
+            hits: [ContentHit(recording: "rec", timestampMs: 1000, snippet: "refund policy", score: -2.0, matchSource: nil)],
             indexState: .ok
         )
         let vm = makeVM(fake)
@@ -203,8 +203,8 @@ final class SearchViewModelTests: XCTestCase {
         let fake = FakeSearchService()
         fake.contentResponse = ContentSearchResponse(
             hits: [
-                ContentHit(recording: "rec", timestampMs: insideMs, snippet: "in", score: -1),
-                ContentHit(recording: "rec", timestampMs: outsideMs, snippet: "out", score: -1),
+                ContentHit(recording: "rec", timestampMs: insideMs, snippet: "in", score: -1, matchSource: nil),
+                ContentHit(recording: "rec", timestampMs: outsideMs, snippet: "out", score: -1, matchSource: nil),
             ],
             indexState: .ok
         )
@@ -312,7 +312,7 @@ final class SearchViewModelTests: XCTestCase {
             coverage: .authoritative
         )
         fake.contentResponse = ContentSearchResponse(
-            hits: [ContentHit(recording: "rec", timestampMs: 5000, snippet: "refund", score: -1)],
+            hits: [ContentHit(recording: "rec", timestampMs: 5000, snippet: "refund", score: -1, matchSource: nil)],
             indexState: .ok
         )
         let vm = makeVM(fake)

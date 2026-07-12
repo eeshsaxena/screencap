@@ -174,3 +174,19 @@ def test_derived_default_title_is_not_searchable(isolated) -> None:
     assert _search("Recording")["hits"] == []
     # The directory name itself is likewise not a title match source.
     assert _search("plain")["hits"] == []
+
+
+@pytest.mark.privacy
+def test_title_hits_respect_the_requested_limit(isolated) -> None:
+    """Title hits are capped to the requested limit.
+
+    Title hits are appended after the ranked content hits, so without a cap the
+    union could overrun the caller's page size. With no content index, five
+    matching titles must still be capped to the requested limit.
+    """
+    recordings, _ = isolated
+    for i in range(5):
+        _make_recording(recordings, f"rec-{i}", title=f"Weekly Report {i}")
+
+    hits = _search("report", limit=2)["hits"]
+    assert len(hits) == 2

@@ -96,10 +96,15 @@ enum RenameModel {
     /// `validate_recording_title` bound (<=200 chars).
     static let maxTitleLength = 200
 
-    /// Truncate `text` to the display-title cap. Counts Swift `Character`s
-    /// (grapheme clusters) — the field enforces this on every keystroke.
+    /// Truncate `text` to the display-title cap, counting Unicode scalars (code
+    /// points) so it matches the daemon's `validate_recording_title`, which caps
+    /// by Python `len()` (also code points). Counting grapheme clusters instead
+    /// would let the field accept a multi-scalar-emoji title the daemon then
+    /// rejects. ASCII is unaffected (1 Character == 1 scalar). Enforced live on
+    /// every keystroke.
     static func cap(_ text: String) -> String {
-        String(text.prefix(maxTitleLength))
+        guard text.unicodeScalars.count > maxTitleLength else { return text }
+        return String(String.UnicodeScalarView(text.unicodeScalars.prefix(maxTitleLength)))
     }
 
     /// Decide what submitting `draft` should do given the recording's current

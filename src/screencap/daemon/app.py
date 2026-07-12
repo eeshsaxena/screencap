@@ -1205,8 +1205,9 @@ def _run_content_search(
     if not path.exists():
         # No content index (the default). Title-only hits still return; the
         # index_state honestly reports the absent content store.
+        title_only = [_title_hit(rec, title) for rec, title in title_matches]
         return {
-            "hits": [_title_hit(rec, title) for rec, title in title_matches],
+            "hits": title_only if limit is None else title_only[:limit],
             "index_state": IndexState.NOT_INDEXED.value,
         }
 
@@ -1232,8 +1233,11 @@ def _run_content_search(
         for rec, title in title_matches
         if rec not in seen
     ]
+    # Ranked content hits first, then title hits; cap the union to the requested
+    # `limit` so appending title hits never overruns the caller's page size.
+    combined = content_hits + title_hits
     return {
-        "hits": content_hits + title_hits,
+        "hits": combined if limit is None else combined[:limit],
         "index_state": result.index_state.value,
     }
 

@@ -30,6 +30,10 @@ import unicodedata
 # a large payload smuggled through a "title". Counted in Unicode code points.
 _MAX_TITLE_LEN = 200
 
+# Unicode categories rejected in a display title: control (Cc), format
+# (Cf — bidi overrides, zero-width, BOM), and line/paragraph separators (Zl/Zp).
+_REJECTED_TITLE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
 # 255 is the per-component name limit on every macOS-deployable
 # filesystem (HFS+, APFS, ext4 over NFS, etc.). Going past it would
 # fail on the filesystem layer with EINVAL/ENAMETOOLONG anyway, but
@@ -144,7 +148,11 @@ def validate_recording_title(title: object) -> str:
     - Length must be at most 200 code points.
     - Must not contain any control character (Unicode category ``Cc``), which
       covers NUL, tabs, newlines, and ANSI escape introducers — the bytes that
-      would corrupt a log line or terminal if a crafted title were echoed.
+      would corrupt a log line or terminal if a crafted title were echoed — nor
+      any format (``Cf``: bidi overrides, zero-width chars, BOM) or line /
+      paragraph separator (``Zl`` / ``Zp``: U+2028 / U+2029). Those are invisible
+      or layout-breaking in a single-line display label and enable display
+      spoofing on the card; a real title never needs them.
 
     Returns the validated title (unchanged) on success. Raises the same
     ``InvalidNameError`` :func:`validate_recording_name` raises on rejection,
@@ -166,11 +174,12 @@ def validate_recording_title(title: object) -> str:
             _reason(title, f"title exceeds {_MAX_TITLE_LEN}-character limit"),
             schema_version=schema_version,
         )
-    # Reject every control character (category Cc) in one pass — NUL, C0/C1
-    # controls, and the ESC that starts an ANSI sequence are all Cc.
-    if any(unicodedata.category(ch) == "Cc" for ch in title):
+    # Reject control (Cc: NUL, C0/C1, ESC), format (Cf: bidi overrides,
+    # zero-width, BOM), and line/paragraph separators (Zl/Zp) in one pass — none
+    # belong in a single-line display label, and Cf enables display spoofing.
+    if any(unicodedata.category(ch) in _REJECTED_TITLE_CATEGORIES for ch in title):
         raise errors.InvalidNameError(
-            "title must not contain control characters",
+            "title must not contain control, format, or line-separator characters",
             schema_version=schema_version,
         )
     return title

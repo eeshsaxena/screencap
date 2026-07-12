@@ -304,3 +304,26 @@ async def test_audit_line_omits_title_text(
     # The title text appears nowhere in the audit line.
     assert secret_title not in raw
     assert "title" not in record
+
+
+@pytest.mark.asyncio
+async def test_format_and_separator_title_is_rejected_and_not_written(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bidi overrides / zero-width (Cf) and line separators (Zl/Zp) are rejected.
+
+    None belong in a single-line display label — Cf enables card display spoofing
+    and Zl/Zp break the layout — so they are refused like control characters, and
+    nothing is written.
+    """
+    _patch_peer(monkeypatch)
+    _patch_active(monkeypatch, None)
+    rec = _make_recording(recordings_dir, "demo", recording_id="rid-demo")
+    db = rec / "recording.db"
+
+    # U+202E bidi override (Cf), U+200B zero-width (Cf), U+2028 line separator (Zl).
+    for bad in ("spoof\u202etitle", "zero\u200bwidth", "line\u2028break"):
+        resp = await _post_rename("rid-demo", bad)
+        assert resp.status_code == 400, bad
+        assert resp.json()["error"] == errors.INVALID_NAME
+        assert _read_title(db) is None
