@@ -51,6 +51,16 @@ struct LibraryView: View {
             } message: {
                 Text(rowError ?? "")
             }
+            // SCR-259: re-probe the daemon when the Library appears while the
+            // "running without the background helper" advisory is showing, so
+            // navigating back here after the daemon rebinds `api.sock` (the
+            // launch-time swap window) clears the banner. RecordingsIndex's
+            // app-activation observer covers window refocus; this covers in-app
+            // navigation, which posts no activation notification. Gated so the
+            // healthy path doesn't re-list on every appearance.
+            .task {
+                if index.usingCLIFallback { await index.refresh() }
+            }
     }
 
     @ViewBuilder
