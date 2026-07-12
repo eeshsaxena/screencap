@@ -235,11 +235,7 @@ final class UpdateConvergenceTests: XCTestCase {
             freshProbe: {
                 let n = probes.incrementAndGet()
                 // Unreachable, unreachable, then the swapped-in daemon.
-                return n < 3
-                    ? nil
-                    : DaemonInstallController.StaleDaemonProbe(
-                        startedAt: anchor.timeIntervalSince1970 + 5, isRecording: false
-                    )
+                return n < 3 ? nil : anchor.timeIntervalSince1970 + 5
             },
             now: { Date() },
             sleep: { _ in }

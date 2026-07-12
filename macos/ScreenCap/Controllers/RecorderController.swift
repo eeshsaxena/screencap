@@ -589,21 +589,21 @@ final class RecorderController: ObservableObject {
     /// read-only; `probeDaemon()` — the single grant/transport writer — runs
     /// once, after freshness confirms.
     func startConvergenceProbeLoopIfNeeded(
-        freshProbe: @escaping () async -> DaemonInstallController.StaleDaemonProbe? =
-            DaemonInstallController.liveStaleDaemonProbe,
+        freshProbe: @escaping () async -> Double? =
+            DaemonInstallController.liveDaemonStartedAtProbe,
         now: @escaping () -> Date = Date.init,
         sleep: @escaping (TimeInterval) async -> Void = {
-            try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(max(0, $0) * 1_000_000_000))
         }
     ) {
         guard updateConverging, convergenceLoopTask == nil,
               let anchor = updateConvergenceAnchor else { return }
         convergenceLoopTask = Task { [weak self] in
             while !Task.isCancelled {
-                let probe = await freshProbe()
+                let probeStartedAt = await freshProbe()
                 guard let self, !Task.isCancelled else { return }
                 switch Self.convergenceStep(
-                    probeStartedAt: probe?.startedAt,
+                    probeStartedAt: probeStartedAt,
                     anchor: anchor,
                     now: now(),
                     deadline: Self.updateConvergenceDeadline
