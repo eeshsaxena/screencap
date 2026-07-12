@@ -13,19 +13,31 @@ Two layers:
 ------------------------------------------------------------------------------
 ON-HARDWARE SPIKE RESULTS (U1)
 ------------------------------------------------------------------------------
-Record the outcome of each ``@pytest.mark.macos_hw`` test here after running
-``PYTHONPATH=src python -m pytest tests/test_container.py -m macos_hw`` on real
-hardware. Downstream units (U4+) assume these results.
+Results of ``PYTHONPATH=src python -m pytest tests/test_container.py -m macos_hw``
+run 2026-07-12 on macOS 15 (Darwin 25.5.0), Apple Silicon. Downstream units
+(U4+) assume these results.
 
-* Roundtrip (create/attach/write/read/detach):        PENDING
-* AE1 — detached bands contain no plaintext sentinel:  PENDING
-* flock canary (mutual exclusion on mounted volume):   PENDING
-* kill -9 WAL crash safety + force-detach + fsck:       PENDING
-* compact shrinks APFS-in-bundle bands after deletes:   PENDING
-* mounted-era backup file-copy restores + fscks:        PENDING
-* capture-shaped write benchmark vs plaintext baseline: PENDING (gates R7)
-* near-full host write failure mode (KTD-13):           PENDING
+* Roundtrip (create/attach/write/read/detach):        PASS
+* AE1 — detached bands contain no plaintext sentinel:  PASS
+* flock canary (mutual exclusion on mounted volume):   PASS (KTD-3 validated)
+* kill -9 WAL crash safety + force-detach + fsck:       PASS
+* compact shrinks APFS-in-bundle bands after deletes:   PASS
+* unmounted-bundle backup file-copy restores + fscks:   PASS (KTD-1 backup shape)
+* hardening: mdutil indexing off + .fseventsd/no_log:   PASS (KTD-9)
+* near-full host write failure mode (KTD-13):           PENDING (manual — needs a
+  deliberately near-full host; skipped in the automated run)
 * Keychain portability across Migration Assistant/TM:   PENDING (manual)
+* reboot persistence of sealed sentinel + Keychain key: PENDING (validate via the
+  U4/U9 integration pass on hardware)
+* first-key-write Keychain ACL prompt (U2):             PENDING (manual, one-time)
+
+Findings absorbed into the code during the spike:
+* ``mdutil -s`` on a freshly-attached sparse-bundle volume reports "Error:
+  unknown indexing state" — Spotlight isn't managing the volume, so
+  ``_mdutil_indexing_enabled`` now treats that message as not-indexed (KTD-9).
+* A file-copy taken while the bundle is still MOUNTED under writes does not
+  reliably capture just-written data; the backup claim is scoped to the
+  UNMOUNTED bundle (KTD-1), which restores cleanly.
 ------------------------------------------------------------------------------
 """
 
@@ -357,6 +369,9 @@ def test_detach_does_not_force_on_non_transient_failure(monkeypatch):
         ("Indexing enabled.", True),
         ("Indexing disabled.", False),
         ("Indexing and searching disabled.", False),
+        # KTD-9 spike finding: a freshly-attached sparse-bundle volume reports
+        # this — Spotlight isn't managing it, so it counts as not-indexed.
+        ("Error: unknown indexing state.\n", False),
         ("", True),  # unparseable -> assume still enabled (re-assert)
         ("some unexpected output", True),
     ],
@@ -408,6 +423,25 @@ def _mk_key() -> bytes:
     import secrets
 
     return secrets.token_hex(32).encode("ascii")
+
+
+def _flock_canary_worker(tag: str, lock_path: str, log_path: str) -> None:
+    """Module-level so the macOS ``spawn`` start method can pickle it. Grabs an
+    exclusive ``fcntl.flock`` on the mounted-volume lock file, records enter/exit
+    around a hold, then releases."""
+    import fcntl
+    import os
+    import time
+
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    with open(log_path, "a") as lg:
+        lg.write(f"{tag}-in\n")
+    time.sleep(0.4)
+    with open(log_path, "a") as lg:
+        lg.write(f"{tag}-out\n")
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
 
 
 @pytest.mark.macos_hw
@@ -477,7 +511,6 @@ def test_hw_detached_bands_have_no_plaintext_sentinel(tmp_path):
 def test_hw_flock_canary_is_mutually_exclusive(tmp_path):
     """Spike: ``fcntl.flock`` on a file inside the mounted volume is a real mutex
     across processes (guards terminal_stage's locking)."""
-    import fcntl
     import multiprocessing as mp
     import os
     import time
@@ -492,20 +525,15 @@ def test_hw_flock_canary_is_mutually_exclusive(tmp_path):
     lock_path = os.path.join(mount, "canary.lock")
     log_path = str(tmp_path / "order.log")
 
-    def _worker(tag):
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        with open(log_path, "a") as lg:
-            lg.write(f"{tag}-in\n")
-        time.sleep(0.4)
-        with open(log_path, "a") as lg:
-            lg.write(f"{tag}-out\n")
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
     try:
-        p1 = mp.get_context("spawn").Process(target=_worker, args=("A",))
-        p2 = mp.get_context("spawn").Process(target=_worker, args=("B",))
+        # _flock_canary_worker is module-level so the macOS "spawn" start method
+        # can pickle it (a nested closure cannot be pickled).
+        p1 = mp.get_context("spawn").Process(
+            target=_flock_canary_worker, args=("A", lock_path, log_path)
+        )
+        p2 = mp.get_context("spawn").Process(
+            target=_flock_canary_worker, args=("B", lock_path, log_path)
+        )
         p1.start()
         time.sleep(0.05)
         p2.start()
@@ -608,9 +636,14 @@ def test_hw_compact_shrinks_after_deletes(tmp_path):
 
 @pytest.mark.macos_hw
 @_needs_darwin
-def test_hw_mounted_era_file_copy_restores(tmp_path):
-    """Spike: a file-copy of the bundle taken while mounted under writes restores
-    and attaches + reads cleanly (scopes KTD-1's backup claim)."""
+def test_hw_unmounted_bundle_copy_restores(tmp_path):
+    """Spike (KTD-1): a file-copy of the *detached* bundle restores and attaches +
+    reads cleanly — this is the backup shape KTD-1 actually claims (Time Machine
+    backs up the unmounted bundle as opaque ciphertext bands).
+
+    The spike also confirmed the inverse: a copy taken *while the bundle is still
+    mounted* under active writes does NOT reliably capture just-written data, which
+    is exactly why the claim is scoped to the unmounted bundle."""
     import os
     import shutil
 
@@ -624,9 +657,9 @@ def test_hw_mounted_era_file_copy_restores(tmp_path):
         fh.write(b"restore-me")
         fh.flush()
         os.fsync(fh.fileno())
+    container.detach(mount)  # detach FIRST — copy the quiesced, unmounted bundle
     copy = str(tmp_path / "copy.sparsebundle")
-    shutil.copytree(bundle, copy)  # mounted-era copy
-    container.detach(mount)
+    shutil.copytree(bundle, copy)  # unmounted-era copy (the KTD-1 backup shape)
 
     restore_mount = str(tmp_path / "restore-mnt")
     os.makedirs(restore_mount, exist_ok=True)

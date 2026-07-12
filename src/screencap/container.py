@@ -524,14 +524,23 @@ def _mdutil_indexing_enabled(text: str) -> bool:
     ``mdutil -s <vol>`` prints e.g. ``Indexing enabled.`` or
     ``Indexing disabled.`` (sometimes ``Indexing and searching disabled.``). We
     treat any explicit "disabled" as disabled; only an explicit "enabled" (and
-    not "disabled") counts as enabled. Ambiguous/empty output is reported as
-    still-enabled so the caller re-asserts rather than trusting a blank result.
+    not "disabled") counts as enabled.
+
+    On a freshly-attached sparse-bundle volume the spike (KTD-9) found ``mdutil
+    -s`` reports ``Error: unknown indexing state`` — Spotlight is not managing or
+    indexing the volume at all, which is the desired end state, so that explicit
+    message counts as *not enabled*. Truly ambiguous/empty output is still
+    reported as enabled so the caller re-asserts rather than trusting a blank
+    result.
     """
     low = text.lower()
     if "disabled" in low:
         return False
     if "enabled" in low:
         return True
+    if "unknown indexing state" in low:
+        # Spotlight isn't tracking this volume — effectively not indexed.
+        return False
     # Unknown / unparseable -> assume the worst (still enabled), forcing a
     # re-assert on the next call rather than a false "already off".
     return True
