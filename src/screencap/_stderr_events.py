@@ -79,6 +79,22 @@ EVENT_DISK_FULL = "disk_full"
 # type already implies it.
 EVENT_AUDIO_MUTED = "audio_muted"
 EVENT_AUDIO_UNMUTED = "audio_unmuted"
+# SCR-218 R3: an unmute that had to (re)acquire the mic FAILED — the device
+# could not be opened (denied / unavailable), so capture stayed muted. ADVISORY:
+# no exit code, NEVER terminal — a failed unmute must not tear the recording
+# down (unlike ``permission_lost``, which pins terminal exit code 3). The app
+# surfaces this as the R3 "unmute never silently fails" error while the
+# recording keeps running muted. Carries ``reason`` (closed-set label) so it can
+# ride the daemon EventBus without leaking runtime text.
+EVENT_AUDIO_UNMUTE_FAILED = "audio_unmute_failed"
+# Closed set of ``audio_unmute_failed`` ``reason`` codes. Like the
+# capture_unhealthy reasons, these ride the daemon EventBus to any same-EUID
+# subscriber, so the field MUST be one of these constants — never interpolated
+# runtime text.
+AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE = "microphone_unavailable"
+AUDIO_UNMUTE_FAILED_REASONS = frozenset({
+    AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE,
+})
 EVENT_PERMISSION_LOST = "permission_lost"
 # Start-time permission block (SCR-142). Re-emitted by the ``screencap start``
 # daemon client when the daemon's pre-spawn permission gate rejects the start
@@ -220,6 +236,9 @@ __all__ = [
     "EVENT_DISK_FULL",
     "EVENT_AUDIO_MUTED",
     "EVENT_AUDIO_UNMUTED",
+    "EVENT_AUDIO_UNMUTE_FAILED",
+    "AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE",
+    "AUDIO_UNMUTE_FAILED_REASONS",
     "EVENT_PERMISSION_LOST",
     "EVENT_PERMISSION_REQUIRED",
     "EVENT_CAPTURE_UNHEALTHY",

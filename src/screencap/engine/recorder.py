@@ -32,7 +32,7 @@ from pympler import tracker
 from pynput import keyboard, mouse
 from tqdm import tqdm
 
-from screencap.engine import utils, video, window
+from screencap.engine import audio_mute, utils, video, window
 from screencap.engine.ax_cache import AXQueryCache
 from screencap.engine.config import RecordingConfig, config
 from screencap.engine.db import create_db, crud, get_session_for_path
@@ -2675,6 +2675,102 @@ def read_gesture_events(
     logger.debug("Gesture event reader stopped")
 
 
+def _apply_audio_mute_command(
+    controller: "audio_mute.AudioStreamController",
+    command: dict,
+    *,
+    session,
+    recording: Recording,
+    emit=None,
+) -> str | None:
+    """Apply one ``set_muted`` command inside ``record_audio`` (SCR-218 U2).
+
+    Confirmed-state (KTD4): the ``muted_intervals`` row is written and the
+    ``audio_muted`` / ``audio_unmuted`` event emitted ONLY after the stream
+    actually toggled — never on the mere request. A denied / unavailable device
+    on unmute emits the advisory ``audio_unmute_failed`` and stays muted (R3:
+    unmute never silently fails), leaving any open interval open.
+
+    ``command['ts']`` is the recording-relative timestamp captured at command
+    *receipt* in the engine-main handler (before the queue hop), so the interval
+    over-covers the ~100 ms stop latency (KTD3); it falls back to a fresh
+    ``get_timestamp()`` only if absent. Isolated from ``record_audio``'s
+    closures so the confirmed-state ordering is unit-testable with a fake
+    controller + in-memory DB.
+
+    Returns the emitted event name, or ``None`` when the stream was already in
+    the requested state (idempotent no-op).
+    """
+    from screencap._stderr_events import (
+        AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE,
+        EVENT_AUDIO_MUTED,
+        EVENT_AUDIO_UNMUTE_FAILED,
+        EVENT_AUDIO_UNMUTED,
+        emit_event,
+    )
+
+    if emit is None:
+        emit = emit_event
+
+    muted = bool(command.get("muted"))
+    ts = command.get("ts")
+    if ts is None:
+        ts = utils.get_timestamp()
+
+    if muted:
+        event = controller.apply_muted(True)
+        if event is not None:
+            # Stream genuinely stopped: open the span (start_ts = command
+            # receipt, so it over-covers the stop latency) and confirm.
+            crud.open_muted_interval(session, recording, ts)
+            emit(EVENT_AUDIO_MUTED, muted=True)
+        return event
+
+    # Unmute may (re)acquire the device, which can fail (denied / unavailable).
+    try:
+        event = controller.apply_muted(False)
+    except Exception as exc:  # noqa: BLE001 — a denied mic must not crash audio.
+        logger.error(f"Audio unmute could not acquire the mic: {exc}")
+        emit(
+            EVENT_AUDIO_UNMUTE_FAILED,
+            reason=AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE,
+        )
+        return EVENT_AUDIO_UNMUTE_FAILED
+    if event is not None:
+        # Capture genuinely resumed: close the span and confirm.
+        crud.close_muted_interval(session, recording, ts)
+        emit(EVENT_AUDIO_UNMUTED, muted=False)
+    return event
+
+
+def _make_set_muted_handler(mute_control_q):
+    """Build the engine-main ``set_muted`` control-channel handler (SCR-218 U2).
+
+    Registered in the ENGINE-MAIN process — where the control-channel reader and
+    its handler registry live — NOT in the ``record_audio`` child, whose handler
+    registry is a separate empty per-process global the reader would never
+    consult (so registering there would silently no-op every mute). The handler
+    captures the command-receipt timestamp on the engine-main clock (established
+    by ``create_recording`` → ``set_start_time``) and forwards ``{muted, ts}`` to
+    the audio child over ``mute_control_q``, mirroring the ``audio_rotate_q``
+    fan-out. The child owns the actual stream toggle, the interval write, and the
+    confirmed event (KTD4).
+    """
+
+    def _handler(command: dict) -> None:
+        muted = bool(command.get("muted"))
+        ts = utils.get_timestamp()
+        if mute_control_q is None:
+            logger.warning("set_muted received but no mute control queue; ignoring")
+            return
+        try:
+            mute_control_q.put({"muted": muted, "ts": ts}, timeout=5)
+        except Exception:  # noqa: BLE001
+            logger.error("set_muted: mute control queue full or dead")
+
+    return _handler
+
+
 def record_audio(
     recording: Recording,
     db_path: str,
@@ -2682,6 +2778,8 @@ def record_audio(
     started_event: multiprocessing.Event,
     audio_rotate_q=None,
     audio_ack_q=None,
+    mute_control_q=None,
+    initially_muted: bool = False,
 ) -> None:
     """Record audio narration during the recording and store data in database.
 
@@ -2689,11 +2787,25 @@ def record_audio(
     recording duration. A flush thread periodically drains the audio callback
     buffer and appends PCM frames to a single open SoundFile writer.
 
+    Mid-recording mute (SCR-218 U2): the process is spawned for EVERY recording,
+    but the mic device is acquired lazily — an ``initially_muted`` (``--no-audio``)
+    recording constructs no ``InputStream`` (and so lights no mic-in-use
+    indicator) until the first unmute. The main thread polls ``mute_control_q``
+    for sub-second toggle latency; the FLAC writer is likewise opened lazily on
+    the first captured frame, so a never-unmuted recording leaves no
+    ``audio_*.flac`` on disk and ``has_audio`` stays false.
+
     Args:
         recording: The recording object.
         db_path: Path to the per-capture database file.
         terminate_processing: An event to signal the termination of the process.
         started_event: Event to set once started.
+        audio_rotate_q: Chunk-rotation command queue (chunked mode only).
+        audio_ack_q: Chunk-rotation ack queue (chunked mode only).
+        mute_control_q: Mute/unmute command queue from the engine-main handler
+            (SCR-218 U2). Each message is ``{"muted": bool, "ts": float}``.
+        initially_muted: When True the recording started with audio off; no
+            device is acquired until the first unmute.
     """
     utils.set_start_time(recording.timestamp)
 
@@ -2731,23 +2843,60 @@ def record_audio(
 
     # Track current chunk index for chunked audio
     _current_chunk_idx = [0]  # mutable container
+    # Finalized flag — set by a ``final_chunk`` rotation. With the lazy writer a
+    # ``None`` writer no longer uniquely means "finalized" (it also means "no
+    # frames captured yet"), so the flush loop / teardown key off this instead.
+    _finalized = [False]
+
+    from pathlib import Path as _Path
+
+    capture_dir = _Path(db_path).parent
+    _is_chunked = audio_rotate_q is not None
+
+    def _audio_path_for(idx: int):
+        return capture_dir / (f"audio_{idx:04d}.flac" if _is_chunked else "audio.flac")
+
+    def _ensure_writer(sf_writer_ref) -> None:
+        """Open the current chunk's FLAC writer lazily (SCR-218 U2).
+
+        Opening a ``SoundFile`` writes a FLAC header → a non-empty file, and
+        ``has_audio`` keys on file existence — so open ONLY when there are real
+        frames to write. A never-unmuted (audio-off) recording therefore leaves
+        no ``audio_*.flac`` at all and stays ``has_audio=false``.
+        """
+        if sf_writer_ref[0] is None:
+            path = _audio_path_for(_current_chunk_idx[0])
+            sf_writer_ref[0] = soundfile.SoundFile(
+                str(path), mode="w", samplerate=SAMPLERATE,
+                channels=CHANNELS, format="FLAC",
+            )
 
     def _rotate_audio(sf_writer_ref, capture_dir, new_idx, *, is_final=False):
-        """Close current FLAC, open new one for the next chunk.
+        """Close the current chunk's FLAC (if any) and advance the index.
 
-        When is_final=True, closes and acks but does NOT open a new file
-        or advance the chunk index — there is no next chunk.
+        Lazy-writer aware (SCR-218 U2): a chunk that was fully muted never
+        opened a writer, so there is nothing to write/close — but the ack is
+        sent REGARDLESS so ``chunk_processor._wait_for_audio`` never stalls its
+        60 s budget (the always-spawn win). The next chunk's writer opens
+        lazily on its first captured frame.
+
+        When is_final=True, acks and marks finalized but does NOT advance the
+        index or open a new file — there is no next chunk.
         """
-        # Drain and write remaining buffer
+        # Drain and write any remaining buffered frames for this chunk.
         frames = _drain_buffer()
         if frames is not None:
+            _ensure_writer(sf_writer_ref)
             try:
                 sf_writer_ref[0].write(frames)
             except Exception as e:
                 logger.error(f"Audio rotation drain failed: {e}")
-        sf_writer_ref[0].close()
+        if sf_writer_ref[0] is not None:
+            sf_writer_ref[0].close()
+            sf_writer_ref[0] = None
 
-        # Send ack for completed chunk
+        # Ack ALWAYS — even for a muted chunk that produced no file — so the
+        # chunk processor's audio wait never stalls.
         if audio_ack_q is not None:
             try:
                 audio_ack_q.put({"type": "audio_rotated", "completed_index": _current_chunk_idx[0]}, timeout=5)
@@ -2755,16 +2904,12 @@ def record_audio(
                 logger.error("Failed to send audio rotation ack")
 
         if is_final:
-            sf_writer_ref[0] = None  # mark as finalized
+            _finalized[0] = True  # no next chunk
             return
 
         _current_chunk_idx[0] = new_idx
-        new_path = capture_dir / f"audio_{new_idx:04d}.flac"
-        sf_writer_ref[0] = soundfile.SoundFile(
-            str(new_path), mode="w", samplerate=SAMPLERATE,
-            channels=CHANNELS, format="FLAC",
-        )
-        logger.info(f"Audio rotated to {new_path}")
+        # Do NOT pre-open the next writer — it opens lazily on the next frame.
+        logger.info(f"Audio rotated to chunk {new_idx:04d}")
 
     def _flush_loop(
         sf_writer_ref: list,
@@ -2785,11 +2930,12 @@ def record_audio(
                     except Exception:
                         break
 
-            if sf_writer_ref[0] is None:
+            if _finalized[0]:
                 return  # finalized by final_chunk rotation
 
             frames = _drain_buffer()
             if frames is not None:
+                _ensure_writer(sf_writer_ref)
                 try:
                     sf_writer_ref[0].write(frames)
                     logger.debug(f"Flushed {len(frames)} audio frames to disk")
@@ -2797,24 +2943,9 @@ def record_audio(
                     logger.error(f"Audio flush failed: {e}")
                     return
 
-    # Open streaming FLAC writer before starting the audio stream
-    from pathlib import Path as _Path
-
-    capture_dir = _Path(db_path).parent
-    _is_chunked = audio_rotate_q is not None
-    if _is_chunked:
-        audio_flac_path = capture_dir / "audio_0000.flac"
-    else:
-        audio_flac_path = capture_dir / "audio.flac"
-
-    sf_writer = soundfile.SoundFile(
-        str(audio_flac_path),
-        mode="w",
-        samplerate=SAMPLERATE,
-        channels=CHANNELS,
-        format="FLAC",
-    )
-    sf_writer_ref = [sf_writer]  # mutable container for rotation
+    # The FLAC writer is opened lazily on the first captured frame
+    # (see _ensure_writer) so a never-unmuted recording leaves no file.
+    sf_writer_ref = [None]  # mutable container for rotation / lazy open
 
     # Start the flush thread
     flush_stop = threading.Event()
@@ -2825,20 +2956,69 @@ def record_audio(
     )
     flush_thread.start()
 
-    # Open InputStream and start recording
-    audio_stream = sounddevice.InputStream(
-        callback=audio_callback, samplerate=SAMPLERATE, channels=CHANNELS
+    # The mic stream is owned by AudioStreamController (SCR-218 U2): lazy device
+    # acquisition means an audio-off recording constructs NOTHING until the first
+    # unmute (constructing an InputStream opens the CoreAudio device + evaluates
+    # mic TCC — it does not defer to .start()).
+    def _make_stream():
+        return sounddevice.InputStream(
+            callback=audio_callback, samplerate=SAMPLERATE, channels=CHANNELS,
+        )
+
+    controller = audio_mute.AudioStreamController(
+        _make_stream, initially_muted=bool(initially_muted),
     )
-    logger.info("Audio recording started.")
     start_timestamp = utils.get_timestamp()
-    audio_stream.start()
+    try:
+        controller.start_initial()
+    except Exception as e:  # noqa: BLE001 — a denied device must not crash audio.
+        logger.error(f"Audio stream failed to start: {e}")
+    if controller.capturing:
+        logger.info("Audio recording started.")
+    else:
+        logger.info("Audio process started muted (lazy mic acquisition).")
 
     # NOTE: listener may not have actually started by now
     started_event.set()
 
-    terminate_processing.wait()
-    audio_stream.stop()
-    audio_stream.close()
+    # Lazy DB session for muted-interval writes (opened on the first toggle).
+    _mute_session_ref: list = [None]
+
+    def _mute_session():
+        if _mute_session_ref[0] is None:
+            _mute_session_ref[0] = get_session_for_path(db_path)
+        return _mute_session_ref[0]
+
+    # Main thread: poll the mute-control queue for sub-second toggle latency
+    # (Risk R-D) while staying responsive to teardown. Replaces the old
+    # blocking ``terminate_processing.wait()``.
+    MUTE_POLL_SECS = 0.1
+    _mute_used = False
+    while not terminate_processing.is_set():
+        if mute_control_q is None:
+            terminate_processing.wait(timeout=MUTE_POLL_SECS)
+            continue
+        try:
+            msg = mute_control_q.get(timeout=MUTE_POLL_SECS)
+        except Exception:
+            continue  # queue.Empty on timeout — re-check terminate
+        _mute_used = True
+        try:
+            _apply_audio_mute_command(
+                controller, msg, session=_mute_session(), recording=recording,
+            )
+        except Exception:  # noqa: BLE001 — a bad toggle must not crash audio.
+            logger.exception("record_audio: mute command failed")
+
+    # Teardown: stop/close the stream and close any span left open by a
+    # teardown-while-muted (U3). ``close_muted_interval`` is a no-op when
+    # nothing is open, so only bother when a toggle was ever processed.
+    controller.shutdown()
+    if _mute_used:
+        try:
+            crud.close_muted_interval(_mute_session(), recording, utils.get_timestamp())
+        except Exception:  # noqa: BLE001
+            logger.exception("record_audio: closing open muted interval failed")
 
     # Signal flush thread to stop and wait for it
     flush_stop.set()
@@ -2858,9 +3038,10 @@ def record_audio(
 
     # Final drain — write any remaining buffered frames (skip if already
     # finalized by a final_chunk rotation above).
-    if sf_writer_ref[0] is not None:
+    if not _finalized[0]:
         final_frames = _drain_buffer()
         if final_frames is not None:
+            _ensure_writer(sf_writer_ref)
             try:
                 sf_writer_ref[0].write(final_frames)
                 logger.debug(f"Final flush: {len(final_frames)} audio frames")
@@ -2890,12 +3071,8 @@ def record_audio(
         except Exception as e:
             logger.error(f"sf_writer close failed: {e}")
 
-    # Derive current audio path from chunk index (audio_flac_path may be stale
-    # if chunks were rotated/deleted during recording)
-    if _is_chunked:
-        _final_audio_path = capture_dir / f"audio_{_current_chunk_idx[0]:04d}.flac"
-    else:
-        _final_audio_path = audio_flac_path
+    # Derive current audio path from chunk index (audio.flac for non-chunked).
+    _final_audio_path = _audio_path_for(_current_chunk_idx[0])
     logger.info(f"Audio saved to {_final_audio_path}")
 
     if not _final_audio_path.exists():
@@ -3496,6 +3673,7 @@ def record(
     flush_ack_counter=None,
     audio_rotate_q=None,
     audio_ack_q=None,
+    mute_control_q=None,
     screen_filter: Any | None = None,
     # --- network proxy capture (V1) ---
     network: bool = False,
@@ -3564,6 +3742,18 @@ def record(
         capture_dir = os.path.join(os.getcwd(), "capture")
     recording, db_path = create_recording(task_description, capture_dir)
     recording_timestamp = recording.timestamp
+
+    # Mid-recording mute (SCR-218 U2): register the ``set_muted`` control-channel
+    # handler in THIS (engine-main) process — where the reader + handler registry
+    # live. create_recording → set_start_time has just established this process's
+    # clock, so the handler can stamp each command's receipt time before
+    # forwarding to the audio child over ``mute_control_q``. Unregistered in the
+    # teardown block below.
+    from screencap.engine import control_channel
+
+    control_channel.register_handler(
+        "set_muted", _make_set_muted_handler(mute_control_q)
+    )
 
     # Pre-import pyobjc symbols on the main thread — pyobjc's lazy-loading
     # bridge is not thread-safe for first-time resolution.
@@ -3870,24 +4060,30 @@ def record(
         video_writer.start()
         task_by_name["video_writer"] = video_writer
 
-    if config.RECORD_AUDIO:
-        audio_recorder = multiprocessing.Process(
-            target=utils.WrapStdout(record_audio),
-            args=(
-                recording,
-                db_path,
-                terminate_processing,
-                task_started_events.setdefault(
-                    "audio_event_writer", multiprocessing.Event()
-                ),
+    # Always spawn the audio process (SCR-218 U2) — even for a ``--no-audio``
+    # recording — so unmute can start capture live. The mic device is acquired
+    # lazily (``initially_muted=True`` opens nothing until first unmute), and
+    # always-spawning also removes today's 60 s-per-chunk ``_wait_for_audio``
+    # stall that occurs with chunking on + audio off.
+    audio_recorder = multiprocessing.Process(
+        target=utils.WrapStdout(record_audio),
+        args=(
+            recording,
+            db_path,
+            terminate_processing,
+            task_started_events.setdefault(
+                "audio_event_writer", multiprocessing.Event()
             ),
-            kwargs={
-                "audio_rotate_q": audio_rotate_q,
-                "audio_ack_q": audio_ack_q,
-            },
-        )
-        audio_recorder.start()
-        task_by_name["audio_recorder"] = audio_recorder
+        ),
+        kwargs={
+            "audio_rotate_q": audio_rotate_q,
+            "audio_ack_q": audio_ack_q,
+            "mute_control_q": mute_control_q,
+            "initially_muted": not config.RECORD_AUDIO,
+        },
+    )
+    audio_recorder.start()
+    task_by_name["audio_recorder"] = audio_recorder
 
     terminate_perf_event = multiprocessing.Event()
     # disabled to increase perf
@@ -4047,6 +4243,14 @@ def record(
         terminate_processing.set()
     except KeyboardInterrupt:
         terminate_processing.set()
+
+    # Stop routing mute commands once the recording is winding down (SCR-218 U2).
+    try:
+        from screencap.engine import control_channel
+
+        control_channel.unregister_handler("set_muted")
+    except Exception:  # noqa: BLE001
+        pass
 
     if status_pipe:
         status_pipe.send({"type": "record.stopping"})
@@ -4376,6 +4580,7 @@ class Recorder:
         self._audio_rotate_q = None
         self._audio_ack_q = None
         self._chunk_process_q = None
+        self._mute_control_q = None
         self._flush_requested = None
         self._flush_ack_counter = None
 
@@ -4478,6 +4683,7 @@ class Recorder:
                 flush_ack_counter=self._flush_ack_counter,
                 audio_rotate_q=self._audio_rotate_q,
                 audio_ack_q=self._audio_ack_q,
+                mute_control_q=self._mute_control_q,
                 screen_filter=self._screen_filter,
                 network=self._network,
                 network_handoff_ready=self._network_handoff_ready,
@@ -4520,6 +4726,10 @@ class Recorder:
             self._forward_fanout_msg(msg)
 
     def __enter__(self) -> "Recorder":
+        # Mute-control queue (SCR-218 U2): created unconditionally (mute must
+        # work regardless of chunking) and handed to the always-spawned audio
+        # process; the engine-main ``set_muted`` handler feeds it.
+        self._mute_control_q = multiprocessing.Queue(maxsize=100)
         # Set up chunking primitives if chunking enabled
         chunk_duration = getattr(self._recording_config, 'video_chunk_duration', None)
         if chunk_duration is None:
@@ -4585,7 +4795,7 @@ class Recorder:
 
         # Clean up multiprocessing queues to prevent feeder-thread hangs at exit.
         for q in (self._chunk_rotate_q, self._audio_rotate_q,
-                  self._audio_ack_q, self._chunk_process_q):
+                  self._audio_ack_q, self._chunk_process_q, self._mute_control_q):
             if q is not None:
                 try:
                     q.cancel_join_thread()

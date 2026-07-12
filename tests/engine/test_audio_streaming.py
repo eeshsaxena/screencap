@@ -320,7 +320,8 @@ class TestRecordAudioIntegration:
     def test_record_audio_immediate_stop(
         self, mock_utils, mock_get_session, mock_crud, tmp_path,
     ):
-        """Immediate stop — produces empty FLAC, skips DB insert."""
+        """Immediate stop with no frames — lazy writer (SCR-218 U2) produces NO
+        FLAC at all (so has_audio stays false), and skips the DB insert."""
         from screencap.engine.recorder import record_audio
         from screencap.engine.db.models import Recording
 
@@ -352,9 +353,9 @@ class TestRecordAudioIntegration:
             record_audio(recording, db_path, terminate, started)
 
         flac_path = tmp_path / "audio.flac"
-        assert flac_path.exists()
-        # Zero-byte file: libsndfile writes nothing when no frames recorded
-        assert flac_path.stat().st_size == 0
+        # Lazy writer: no captured frame → the FLAC is never opened, so no file
+        # (not even an empty header) lands on disk and has_audio stays false.
+        assert not flac_path.exists()
         # insert_audio_info should NOT have been called
         mock_crud.insert_audio_info.assert_not_called()
 
