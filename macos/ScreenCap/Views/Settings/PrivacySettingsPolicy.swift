@@ -100,9 +100,14 @@ enum PrivacySettingsPolicy {
         case gated
     }
 
+    /// `eligibility` is REQUIRED (no default): this is the security gate, so a
+    /// caller must positively supply the auth-derived eligibility. A defaulted
+    /// `.eligible` would let a future call site silently un-gate by omission — a
+    /// compile error is the wanted failure mode here. (`e2eeCaption`/`e2eeHelp`
+    /// default to `.eligible` because they only pick copy, not the gate.)
     static func e2eeTapOutcome(
         cloudE2EEEnabled: Bool?,
-        eligibility: E2EECloudEligibility = .eligible
+        eligibility: E2EECloudEligibility
     ) -> E2EETapOutcome {
         switch cloudE2EEEnabled {
         case .none: return .locked
@@ -311,7 +316,7 @@ enum PrivacySettingsCopy {
             PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: cloudE2EEEnabled),
             PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: cloudE2EEEnabled),
             e2eeSubGatedSignedOut, e2eeSubGatedNoPlan, e2eeSubGatedUnconfirmed,
-            e2eeHelpGated,
+            e2eeHelpGated, e2eeSubChecking,
             e2eeConfirmTitle, e2eeConfirmBody, e2eeConfirmAction,
             maskTitle, maskChip, maskSub, maskLink,
             pauseTitle, pauseSub,

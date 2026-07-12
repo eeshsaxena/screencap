@@ -73,7 +73,7 @@ final class PrivacySettingsPolicyTests: XCTestCase {
     /// current uploads are (or can be) encrypted.
     func testE2EENilStateKeepsLockedStubPresentation() {
         XCTAssertEqual(
-            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: nil), .locked
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: nil, eligibility: .eligible), .locked
         )
         XCTAssertFalse(PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: nil))
 
@@ -90,7 +90,7 @@ final class PrivacySettingsPolicyTests: XCTestCase {
     /// current uploads are encrypted — it says plainly they are not.
     func testE2EEOffStateOptInCopyMakesNoEncryptionClaim() {
         XCTAssertEqual(
-            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: false), .showDisclosure
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: false, eligibility: .eligible), .showDisclosure
         )
         XCTAssertFalse(PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: false))
         XCTAssertEqual(PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: false), "beta")
@@ -109,7 +109,7 @@ final class PrivacySettingsPolicyTests: XCTestCase {
     /// false because the key syncs, must be gone.
     func testE2EEOnStateClaimsMultiDeviceEncryptionAndNamesNoRecovery() {
         XCTAssertEqual(
-            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: true), .disable
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: true, eligibility: .eligible), .disable
         )
         XCTAssertTrue(PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: true))
         XCTAssertEqual(PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: true), "beta")
@@ -175,14 +175,17 @@ final class PrivacySettingsPolicyTests: XCTestCase {
                 )
             }
         }
-        // Paywall on + cloud-capable (incl. a Cloud trial) — eligible.
-        XCTAssertEqual(
-            PrivacySettingsPolicy.e2eeEligibility(
-                isSignedIn: true, cloudCapable: true,
-                planStale: false, paywallEnabled: true
-            ),
-            .eligible
-        )
+        // Paywall on + cloud-capable (incl. a Cloud trial) — eligible regardless
+        // of stale (a positively-resolved Cloud tier outranks the stale bit).
+        for stale in [true, false] {
+            XCTAssertEqual(
+                PrivacySettingsPolicy.e2eeEligibility(
+                    isSignedIn: true, cloudCapable: true,
+                    planStale: stale, paywallEnabled: true
+                ),
+                .eligible
+            )
+        }
         // Paywall on + not cloud-capable + offline/stale — planUnconfirmed,
         // NOT noCloudPlan (an offline payer is never shown "upgrade").
         XCTAssertEqual(

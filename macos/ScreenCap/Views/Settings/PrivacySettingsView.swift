@@ -204,13 +204,20 @@ struct PrivacySettingsView: View {
         e2eeOutcome == .locked || e2eeOutcome == .gated
     }
 
+    /// The pre-first-check window: the flag is readable-off but auth hasn't
+    /// resolved yet (`.unknown`). Neither the caption nor the tooltip should
+    /// assert a cloud-plan requirement to an as-yet-unknown (possibly eligible)
+    /// user, so both fall back to neutral copy here.
+    private var e2eeIsChecking: Bool {
+        if privacy.cloudE2EEEnabled == false, case .unknown = auth.status { return true }
+        return false
+    }
+
     /// The caption, eligibility-keyed — with a neutral "checking" caption during
-    /// the pre-first-check `.unknown` window so an already-eligible user never
-    /// flashes the signed-out "sign in" copy.
+    /// the pre-first-check window so an already-eligible user never flashes the
+    /// signed-out "sign in" copy.
     private var e2eeCaptionText: String {
-        if privacy.cloudE2EEEnabled == false, case .unknown = auth.status {
-            return PrivacySettingsCopy.e2eeSubChecking
-        }
+        if e2eeIsChecking { return PrivacySettingsCopy.e2eeSubChecking }
         return PrivacySettingsPolicy.e2eeCaption(
             cloudE2EEEnabled: privacy.cloudE2EEEnabled,
             eligibility: e2eeEligibility
@@ -218,9 +225,11 @@ struct PrivacySettingsView: View {
     }
 
     /// Hover help, eligibility-keyed (gated rows get gated help, not the
-    /// off-state "turn on to encrypt" copy).
+    /// off-state "turn on to encrypt" copy). During the checking window it stays
+    /// on the neutral "when on" live help so it never contradicts the caption.
     private var e2eeHelpText: String {
-        PrivacySettingsPolicy.e2eeHelp(
+        if e2eeIsChecking { return PrivacySettingsCopy.e2eeHelpLive }
+        return PrivacySettingsPolicy.e2eeHelp(
             cloudE2EEEnabled: privacy.cloudE2EEEnabled,
             eligibility: e2eeEligibility
         )
