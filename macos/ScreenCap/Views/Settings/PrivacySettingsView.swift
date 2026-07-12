@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 
 /// U12 — the prototype Privacy settings pane (design 473–515): the keep-local
-/// toggle wired to `upload_default` (KTD-11), the honest E2EE row (SCR-220
-/// stub), the always-on mask row with an App-rules disclosure, the
+/// toggle wired to `upload_default` (KTD-11), the E2EE opt-in beta toggle
+/// wired to the `e2ee` verb group behind the R4 limits disclosure (SCR-220
+/// U4), the always-on mask row with an App-rules disclosure, the
 /// private-window stub (SCR-224), and the live storage row ("Change…" is
 /// SCR-228). All writes flow through the CLI settings layer (R8) via
 /// `PrivacyController`.
@@ -28,6 +29,15 @@ struct PrivacySettingsView: View {
     /// in-flight guard, whose `false` return would render as a false
     /// "Couldn't save" error for a write that actually succeeded.
     @State private var keepLocalWriteInFlight = false
+
+    /// SCR-220 U4: inline error under the E2EE row after a failed `e2ee`
+    /// write (the optimistic flip has already been reverted).
+    @State private var e2eeError: String?
+    /// Locks the E2EE toggle while a write round-trips (same rationale as
+    /// `keepLocalWriteInFlight`).
+    @State private var e2eeWriteInFlight = false
+    /// Drives the R4 limits disclosure that gates the off→on flip.
+    @State private var showE2EEConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -158,27 +168,94 @@ struct PrivacySettingsView: View {
         }
     }
 
-    // MARK: - E2EE row (stub: SCR-220 end-to-end encryption for shared copies)
+    // MARK: - E2EE row (SCR-220 U4 — opt-in beta toggle, R4 disclosure gate)
 
     private var e2eeRow: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 8) {
-                    Text(PrivacySettingsCopy.e2eeTitle)
-                        .font(SCTypography.sans(size: 14, weight: .semibold))
-                        .foregroundStyle(Color.scInk)
-                    chip(PrivacySettingsCopy.e2eeChip, color: .scInkMuted)
+        let state = privacy.cloudE2EEEnabled
+        let locked = PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: state) == .locked
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(PrivacySettingsCopy.e2eeTitle)
+                            .font(SCTypography.sans(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.scInk)
+                        chip(
+                            PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: state),
+                            color: locked ? .scInkMuted : .scTeal
+                        )
+                    }
+                    Text(PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: state))
+                        .font(SCTypography.sans(size: 12.5))
+                        .foregroundStyle(Color.scInkMuted)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text(PrivacySettingsCopy.e2eeSub)
-                    .font(SCTypography.sans(size: 12.5))
-                    .foregroundStyle(Color.scInkMuted)
+                Spacer(minLength: 8)
+                // Locked (nil flag — older CLI without the `e2ee` verb,
+                // KTD-8): non-interactive stub presentation, never a toggle
+                // whose write path may not exist.
+                SettingsToggle(
+                    on: PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: state),
+                    action: locked ? nil : toggleE2EE
+                )
+                .disabled(e2eeWriteInFlight)
             }
-            Spacer(minLength: 8)
-            SettingsToggle(on: false, action: nil)
+            if let e2eeError {
+                Text(e2eeError)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scRust)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.vertical, 16)
-        .opacity(0.75)
-        .help(PrivacySettingsCopy.e2eeHelp)
+        .opacity(locked ? 0.75 : 1)
+        .help(PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: state))
+        .confirmationDialog(
+            PrivacySettingsCopy.e2eeConfirmTitle,
+            isPresented: $showE2EEConfirm,
+            titleVisibility: .visible
+        ) {
+            Button(PrivacySettingsCopy.e2eeConfirmAction) { confirmEnableE2EE() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(PrivacySettingsCopy.e2eeConfirmBody)
+        }
+    }
+
+    /// R4 gate: the off→on tap only presents the limits disclosure — the
+    /// switch stays OFF and no CLI call fires until the sheet's confirm
+    /// (cancel dismisses with the switch untouched). The on→off tap needs no
+    /// disclosure and flips optimistically.
+    private func toggleE2EE() {
+        guard !e2eeWriteInFlight else { return }
+        e2eeError = nil
+        switch PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: privacy.cloudE2EEEnabled) {
+        case .locked:
+            return
+        case .showDisclosure:
+            showE2EEConfirm = true
+        case .disable:
+            runE2EEWrite(false)
+        }
+    }
+
+    /// The disclosure's confirm — only now does the optimistic flip + CLI
+    /// call happen (`e2ee enable` creates the key before setting the flag,
+    /// KTD-3; a failure reverts and surfaces inline, R2).
+    private func confirmEnableE2EE() {
+        runE2EEWrite(true)
+    }
+
+    private func runE2EEWrite(_ on: Bool) {
+        e2eeWriteInFlight = true
+        Task {
+            let ok = await privacy.setCloudE2EE(on)
+            e2eeWriteInFlight = false
+            if !ok {
+                e2eeError = privacy.lastError.map { "Couldn't save: \($0)" }
+                    ?? "Couldn't save the setting."
+            }
+        }
     }
 
     // MARK: - Mask row (always-on policy engine; per-app overrides SCR-225)

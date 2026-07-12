@@ -1039,8 +1039,8 @@ class TestUnifiedEventExport:
         at runtime, so wiring network rows into the chunk_processor
         would silently leak metadata to the cloud bucket.
         """
-        from screencap.engine.db import crud
         from screencap.chunk_processor import ChunkProcessor
+        from screencap.engine.db import crud
 
         crud.insert_network_event(
             recording_db.session,
@@ -1883,7 +1883,7 @@ class TestUnlistedMarker:
 
         # Server returns a URL for the media file but silently drops _unlisted
         # (legacy behaviour — mirrors what the old filename regex did).
-        def fake_request_signed_urls(recording_name, file_infos):
+        def fake_request_signed_urls(recording_name, file_infos, **kw):
             return ({"chunk_0000.mp4": "https://example.com/signed"}, "gs://bucket/test/")
 
         with mock.patch(

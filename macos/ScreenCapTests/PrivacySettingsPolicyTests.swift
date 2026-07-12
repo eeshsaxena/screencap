@@ -32,24 +32,97 @@ final class PrivacySettingsPolicyTests: XCTestCase {
         XCTAssertEqual(PrivacySettingsPolicy.uploadDefaultValue(togglingTo: false), "ask")
     }
 
-    /// KTD-9/R7: while SCR-220 is open no row claims active encryption (the
-    /// design's "always on" E2EE chip), and while SCR-224 is open no row
-    /// claims auto-pause works. The mask row's "always on" chip is scoped to
-    /// the mask copy alone — the policy engine genuinely always runs.
+    /// KTD-9/KD7 honesty gate, rewritten for SCR-220 U4 (the E2EE row is now
+    /// a live opt-in beta toggle, so its copy is state-keyed): claims that
+    /// unlock only in later stages — "always on" on the E2EE row (Stage 3),
+    /// "shared · encrypted" (SCR-221) — and claims that are never true —
+    /// "keys stay" (KD3), "we can't watch" — stay forbidden in EVERY E2EE
+    /// state. SCR-224's row still states auto-pause is absent.
     func testRowCopyCarriesNoUntrueClaims() {
-        let e2ee = [
-            PrivacySettingsCopy.e2eeChip, PrivacySettingsCopy.e2eeSub,
-        ].joined(separator: " ").lowercased()
-        XCTAssertFalse(e2ee.contains("always on"))
-        XCTAssertFalse(e2ee.contains("is encrypted"))
-        XCTAssertTrue(e2ee.contains("not available yet"))
+        for state in [nil, false, true] as [Bool?] {
+            let all = PrivacySettingsCopy.allRowStrings(cloudE2EEEnabled: state)
+                .joined(separator: " ").lowercased()
+            XCTAssertFalse(all.contains("shared · encrypted"), "state \(String(describing: state))")
+            XCTAssertFalse(all.contains("keys stay"), "state \(String(describing: state))")
+            XCTAssertFalse(all.contains("we can't watch"), "state \(String(describing: state))")
+
+            // "always on" is scoped to the mask chip alone (the policy engine
+            // genuinely always runs) — the E2EE strings must not carry it in
+            // ANY state until the Stage 3 default flip.
+            let e2ee = [
+                PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: state),
+                PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: state),
+                PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: state),
+                PrivacySettingsCopy.e2eeConfirmTitle,
+                PrivacySettingsCopy.e2eeConfirmBody,
+            ].joined(separator: " ").lowercased()
+            XCTAssertFalse(e2ee.contains("always on"), "state \(String(describing: state))")
+        }
 
         let pause = PrivacySettingsCopy.pauseSub.lowercased()
         XCTAssertTrue(pause.contains("not available yet"))
+    }
 
-        let all = PrivacySettingsCopy.allRowStrings.joined(separator: " ").lowercased()
-        XCTAssertFalse(all.contains("shared · encrypted"))
-        XCTAssertFalse(all.contains("keys stay"))
+    // MARK: - E2EE row states (SCR-220 U4, KTD-8/KTD-9)
+
+    /// nil flag (older CLI without the `e2ee` verb, KTD-8): the row stays in
+    /// the locked stub presentation — no toggle, no beta label, no claim that
+    /// current uploads are (or can be) encrypted.
+    func testE2EENilStateKeepsLockedStubPresentation() {
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: nil), .locked
+        )
+        XCTAssertFalse(PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: nil))
+
+        let copy = [
+            PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: nil),
+            PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: nil),
+        ].joined(separator: " ").lowercased()
+        XCTAssertTrue(copy.contains("not available yet"))
+        XCTAssertFalse(copy.contains("is encrypted"))
+        XCTAssertFalse(copy.contains("beta"))
+    }
+
+    /// Off: an opt-in row labeled "beta" whose copy makes no claim that
+    /// current uploads are encrypted — it says plainly they are not.
+    func testE2EEOffStateOptInCopyMakesNoEncryptionClaim() {
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: false), .showDisclosure
+        )
+        XCTAssertFalse(PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: false))
+        XCTAssertEqual(PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: false), "beta")
+
+        let caption = PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: false).lowercased()
+        XCTAssertFalse(caption.contains("is encrypted"))
+        XCTAssertFalse(caption.contains("not available"), "the capability IS available now")
+        XCTAssertTrue(caption.contains("off"))
+        XCTAssertTrue(caption.contains("turn on"))
+    }
+
+    /// On: the beta copy claims per-Mac encryption truthfully — scoped to
+    /// this Mac's cloud copies — and names the no-recovery limit (KD7).
+    func testE2EEOnStateClaimsPerMacEncryptionAndNamesNoRecovery() {
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: true), .disable
+        )
+        XCTAssertTrue(PrivacySettingsPolicy.e2eeToggleOn(cloudE2EEEnabled: true))
+        XCTAssertEqual(PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: true), "beta")
+
+        let caption = PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: true).lowercased()
+        XCTAssertTrue(caption.contains("encrypted"))
+        XCTAssertTrue(caption.contains("only this mac can decrypt"))
+        XCTAssertTrue(caption.contains("no recovery"))
+    }
+
+    /// R4: the disclosure that gates the off→on flip names all three limits
+    /// plainly before the user commits — only this Mac can decrypt, no
+    /// recovery exists, losing this Mac loses access to the encrypted copies.
+    func testE2EEConfirmBodyNamesAllThreeLimits() {
+        let body = PrivacySettingsCopy.e2eeConfirmBody.lowercased()
+        XCTAssertTrue(body.contains("only this mac can decrypt"))
+        XCTAssertTrue(body.contains("no recovery"))
+        XCTAssertTrue(body.contains("lose this mac"))
+        XCTAssertTrue(body.contains("lose access"))
     }
 
     /// The storage row abbreviates the home directory the design's way

@@ -27,8 +27,12 @@ Design notes (see docs/plans/2026-07-08-001-…-plan.md and its U6 spike):
 * **Data-protection keychain, device-local, daemon-readable (KTD-2).**
   ``kSecUseDataProtectionKeychain=true`` + ``kSecAttrAccessGroup`` +
   ``kSecAttrAccessibleAfterFirstUnlock`` (an all-day daemon must read after login
-  even while the screen is locked) + ``kSecAttrSynchronizable=false`` (never sync
-  a refresh token to iCloud Keychain).
+  even while the screen is locked) + ``kSecAttrSynchronizable`` defaulting to
+  false (never sync a refresh token to iCloud Keychain). The flag is a
+  parameter because the SCR-220 cloud KEK flips it on in Stage 2; it must ride
+  the add attributes AND every query — macOS queries match only
+  non-synchronizable items by default, so the synced and non-synced items are
+  effectively distinct and each operation must name its flavor.
 * **The un-entitled fallback trigger is spike-verified (KTD-4):** an un-entitled
   binary returns exactly ``errSecMissingEntitlement`` (-34018) from *both* store
   and load, so :class:`MissingEntitlement` keys off that. Any *other* unexpected
@@ -181,20 +185,31 @@ def _group_pairs(cf: ctypes.CDLL, sec: ctypes.CDLL, access_group: str) -> list:
     ]
 
 
+def _sync_pair(cf: ctypes.CDLL, sec: ctypes.CDLL, synchronizable: bool) -> list:
+    """The ``kSecAttrSynchronizable`` selector. In add *attributes* it sets the
+    item's iCloud-sync behavior; in update/copy/delete *queries* it is what lets
+    a synced item match at all (queries default to non-synchronizable-only), so
+    every primitive carries it."""
+    value = "kCFBooleanTrue" if synchronizable else "kCFBooleanFalse"
+    return [(_const("kSecAttrSynchronizable", sec), _const(value, cf))]
+
+
 # --- primitives (real ctypes; stubbed in unit tests) ----------------------
 
 
-def _sec_item_add(service: str, account: str, secret: bytes, access_group: str) -> int:
+def _sec_item_add(
+    service: str, account: str, secret: bytes, access_group: str, *, synchronizable: bool = False
+) -> int:
     sec, cf = _frameworks()
     attrs = (
         _base_pairs(cf, sec, service, account)
         + _group_pairs(cf, sec, access_group)
+        + _sync_pair(cf, sec, synchronizable)
         + [
             (
                 _const("kSecAttrAccessible", sec),
                 _const("kSecAttrAccessibleAfterFirstUnlock", sec),
             ),
-            (_const("kSecAttrSynchronizable", sec), _const("kCFBooleanFalse", cf)),
             (_const("kSecValueData", sec), _cfdata(cf, secret)),
         ]
     )
@@ -205,9 +220,16 @@ def _sec_item_add(service: str, account: str, secret: bytes, access_group: str) 
         cf.CFRelease(d)
 
 
-def _sec_item_update(service: str, account: str, secret: bytes, access_group: str) -> int:
+def _sec_item_update(
+    service: str, account: str, secret: bytes, access_group: str, *, synchronizable: bool = False
+) -> int:
     sec, cf = _frameworks()
-    query = _cfdict(cf, _base_pairs(cf, sec, service, account) + _group_pairs(cf, sec, access_group))
+    query = _cfdict(
+        cf,
+        _base_pairs(cf, sec, service, account)
+        + _group_pairs(cf, sec, access_group)
+        + _sync_pair(cf, sec, synchronizable),
+    )
     attrs = _cfdict(cf, [(_const("kSecValueData", sec), _cfdata(cf, secret))])
     try:
         return int(sec.SecItemUpdate(query, attrs))
@@ -216,12 +238,15 @@ def _sec_item_update(service: str, account: str, secret: bytes, access_group: st
         cf.CFRelease(attrs)
 
 
-def _sec_item_copy_matching(service: str, account: str, access_group: str) -> tuple[int, bytes | None]:
+def _sec_item_copy_matching(
+    service: str, account: str, access_group: str, *, synchronizable: bool = False
+) -> tuple[int, bytes | None]:
     sec, cf = _frameworks()
     query = _cfdict(
         cf,
         _base_pairs(cf, sec, service, account)
         + _group_pairs(cf, sec, access_group)
+        + _sync_pair(cf, sec, synchronizable)
         + [
             (_const("kSecReturnData", sec), _const("kCFBooleanTrue", cf)),
             (_const("kSecMatchLimit", sec), _const("kSecMatchLimitOne", sec)),
@@ -239,9 +264,16 @@ def _sec_item_copy_matching(service: str, account: str, access_group: str) -> tu
         cf.CFRelease(query)
 
 
-def _sec_item_delete(service: str, account: str, access_group: str) -> int:
+def _sec_item_delete(
+    service: str, account: str, access_group: str, *, synchronizable: bool = False
+) -> int:
     sec, cf = _frameworks()
-    query = _cfdict(cf, _base_pairs(cf, sec, service, account) + _group_pairs(cf, sec, access_group))
+    query = _cfdict(
+        cf,
+        _base_pairs(cf, sec, service, account)
+        + _group_pairs(cf, sec, access_group)
+        + _sync_pair(cf, sec, synchronizable),
+    )
     try:
         return int(sec.SecItemDelete(query))
     finally:
@@ -310,30 +342,38 @@ def _raise_for_status(status: int, operation: str) -> None:
     raise KeychainError(status, operation)
 
 
-def store(service: str, account: str, secret: str, access_group: str) -> None:
+def store(
+    service: str, account: str, secret: str, access_group: str, *, synchronizable: bool = False
+) -> None:
     """Write ``secret`` to the access group, add-or-update (idempotent).
+
+    ``synchronizable`` picks the item flavor (default: device-local, never
+    synced to iCloud Keychain); the synced and non-synced items are distinct,
+    so :func:`load`/:func:`delete` must pass the same value.
 
     Raises :class:`MissingEntitlement` when the binary is not entitled for the
     group (caller falls back to ``keyring``), or :class:`KeychainError` on any
     other unexpected status.
     """
     data = secret.encode("utf-8")
-    status = _sec_item_add(service, account, data, access_group)
+    status = _sec_item_add(service, account, data, access_group, synchronizable=synchronizable)
     if status == errSecSuccess:
         return
     if status == errSecDuplicateItem:
-        status = _sec_item_update(service, account, data, access_group)
+        status = _sec_item_update(service, account, data, access_group, synchronizable=synchronizable)
         if status == errSecSuccess:
             return
     _raise_for_status(status, "SecItemAdd/Update")
 
 
-def load(service: str, account: str, access_group: str) -> str | None:
+def load(
+    service: str, account: str, access_group: str, *, synchronizable: bool = False
+) -> str | None:
     """Read the secret from the access group, or ``None`` when absent.
 
     Raises :class:`MissingEntitlement` / :class:`KeychainError` as :func:`store`.
     """
-    status, data = _sec_item_copy_matching(service, account, access_group)
+    status, data = _sec_item_copy_matching(service, account, access_group, synchronizable=synchronizable)
     if status == errSecSuccess:
         return data.decode("utf-8") if data else None  # normalize empty bytes → None
     if status == errSecItemNotFound:
@@ -341,12 +381,12 @@ def load(service: str, account: str, access_group: str) -> str | None:
     _raise_for_status(status, "SecItemCopyMatching")
 
 
-def delete(service: str, account: str, access_group: str) -> None:
+def delete(service: str, account: str, access_group: str, *, synchronizable: bool = False) -> None:
     """Delete the access-group item; a missing item is a no-op.
 
     Raises :class:`MissingEntitlement` / :class:`KeychainError` as :func:`store`.
     """
-    status = _sec_item_delete(service, account, access_group)
+    status = _sec_item_delete(service, account, access_group, synchronizable=synchronizable)
     if status in (errSecSuccess, errSecItemNotFound):
         return
     _raise_for_status(status, "SecItemDelete")

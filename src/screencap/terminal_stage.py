@@ -1392,12 +1392,19 @@ def _route_cloud(
     # SCR-126 Fix 1: resolve the FROZEN masked-video decision from the SOURCE
     # recording dir (NOT the scrubbed dir being enumerated) and pass it so the
     # rglob path gates any chunk_*.mp4 not under masked_video/ (fail closed).
-    from screencap.pipeline_chunk_ops import get_frozen_masked_video_upload
+    # SCR-220 (KTD-4): same for the frozen E2EE decision — the scrubbed copy
+    # carries no intent of its own, so upload_recording's self-resolve would
+    # read frozen-off there.
+    from screencap.pipeline_chunk_ops import (
+        get_frozen_cloud_e2ee,
+        get_frozen_masked_video_upload,
+    )
 
     try:
         upload_result = upload_recording(
             copy.scrubbed_dir, force=force,
             masked_video_upload=get_frozen_masked_video_upload(recording_dir),
+            cloud_e2ee=get_frozen_cloud_e2ee(recording_dir),
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("terminal_stage: upload failed for %s: %s", name, exc)

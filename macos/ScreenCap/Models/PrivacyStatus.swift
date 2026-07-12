@@ -57,6 +57,10 @@ struct SettingsEnvelope: Decodable {
         /// U12: the configured recordings directory, rendered on the Privacy
         /// pane's storage row. Optional/tolerant — older CLIs omit it.
         let recordingsDir: String?
+        /// SCR-220 U4: whether client-side E2EE for cloud copies is enabled on
+        /// this Mac. Optional/tolerant — an older CLI omits it (→ the Privacy
+        /// pane's E2EE row renders the locked stub state, KTD-8).
+        let cloudE2EEEnabled: Bool?
 
         enum CodingKeys: String, CodingKey {
             case privacy
@@ -68,6 +72,7 @@ struct SettingsEnvelope: Decodable {
             case audioDefault = "audio_default"
             case uploadDefault = "upload_default"
             case recordingsDir = "recordings_dir"
+            case cloudE2EEEnabled = "cloud_e2ee_enabled"
         }
     }
 

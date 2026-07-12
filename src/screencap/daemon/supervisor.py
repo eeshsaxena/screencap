@@ -1628,8 +1628,14 @@ class Supervisor:
         if not request.cloud_intent:
             return None
         from screencap import cloud_crypto
-        from screencap.config import get_cloud_e2ee_enabled
+        from screencap.config import get_cloud_e2ee_enabled, invalidate_config_cache
 
+        # The config cache is per-process with no cross-process invalidation
+        # (config.py) — a `screencap e2ee enable/disable` run between
+        # recordings only invalidates the CLI process's cache. Re-read from
+        # disk before every staging decision so the toggle reaches this
+        # long-running daemon without a restart.
+        invalidate_config_cache()
         if not get_cloud_e2ee_enabled():
             return None
         try:

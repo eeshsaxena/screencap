@@ -46,12 +46,14 @@ final class PrivacyControllerTests: XCTestCase {
     private func settingsEnvelope(
         privacy: [String: Any]?,
         uploadDefault: String? = nil,
-        recordingsDir: String? = nil
+        recordingsDir: String? = nil,
+        cloudE2EEEnabled: Bool? = nil
     ) -> Data {
         var settings: [String: Any] = [:]
         if let privacy { settings["privacy"] = privacy }
         if let uploadDefault { settings["upload_default"] = uploadDefault }
         if let recordingsDir { settings["recordings_dir"] = recordingsDir }
+        if let cloudE2EEEnabled { settings["cloud_e2ee_enabled"] = cloudE2EEEnabled }
         let envelope: [String: Any] = [
             "ok": true,
             "schema_version": 2,
@@ -529,6 +531,108 @@ final class PrivacyControllerTests: XCTestCase {
         XCTAssertEqual(controller.uploadDefault, "both")
         XCTAssertEqual(controller.recordingsDir, "/tmp/recs")
         XCTAssertNil(controller.status)
+    }
+
+    // MARK: - setCloudE2EE (SCR-220 U4, KTD-3)
+
+    /// Enable/disable ship the `e2ee` verb group — never a raw
+    /// `settings --set cloud_e2ee_enabled=…` — because `e2ee enable` creates
+    /// the cloud key BEFORE flipping the flag (KTD-3 ordering). This argv is
+    /// the contract the Python side keys on.
+    func testSetCloudE2EEIssuesExpectedArgv() async {
+        for (on, verb) in [(true, "enable"), (false, "disable")] {
+            let fake = FakeInvoker()
+            let controller = PrivacyController(invoke: fake.invoker())
+
+            let ok = await controller.setCloudE2EE(on)
+
+            XCTAssertTrue(ok)
+            XCTAssertEqual(fake.calls, [["e2ee", verb, "--json"]])
+            XCTAssertEqual(controller.cloudE2EEEnabled, on)
+        }
+    }
+
+    /// A failed enable (e.g. key creation failed, R2) reverts the optimistic
+    /// flip and surfaces the error — the toggle never rests ON with no key
+    /// behind it, and encryption is left off rather than half-configured.
+    func testSetCloudE2EERevertsOnEnableFailure() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] args in
+            if args.first == "e2ee" {
+                throw NSError(domain: "test", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "key creation failed"])
+            }
+            return self?.settingsEnvelope(privacy: nil, cloudE2EEEnabled: false)
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+        await controller.refreshStatus()
+        XCTAssertEqual(controller.cloudE2EEEnabled, false)
+
+        let ok = await controller.setCloudE2EE(true)
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(controller.cloudE2EEEnabled, false,
+                       "failed enable must revert the optimistic flip")
+        XCTAssertEqual(controller.lastError, "key creation failed")
+    }
+
+    /// `refreshStatus` captures the top-level `cloud_e2ee_enabled` even when
+    /// the payload has no v2 privacy block.
+    func testRefreshStatusCapturesCloudE2EE() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] _ in
+            self?.settingsEnvelope(privacy: nil, cloudE2EEEnabled: true)
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.refreshStatus()
+
+        XCTAssertEqual(controller.cloudE2EEEnabled, true)
+    }
+
+    /// An older CLI omits `cloud_e2ee_enabled` → nil, and the policy layer
+    /// renders the E2EE row locked (KTD-8 tolerance) rather than offering a
+    /// toggle whose write path may not exist.
+    func testRefreshStatusNilCloudE2EERendersLockedRow() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] _ in self?.settingsEnvelope(privacy: nil) }
+        let controller = PrivacyController(invoke: fake.invoker())
+
+        await controller.refreshStatus()
+
+        XCTAssertNil(controller.cloudE2EEEnabled)
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeTapOutcome(
+                cloudE2EEEnabled: controller.cloudE2EEEnabled
+            ),
+            .locked
+        )
+    }
+
+    /// The R4 gate + cancel path: with the flag off, a tap resolves to the
+    /// disclosure — never a direct write — and cancelling the sheet leaves
+    /// the fixture untouched: the only CLI call on record is the refresh, so
+    /// no `e2ee` write fires until the user confirms, and the switch state
+    /// (`cloudE2EEEnabled`) is unchanged.
+    func testE2EEEnableTapGatesOnDisclosureAndCancelMakesNoCLICall() async {
+        let fake = FakeInvoker()
+        fake.respond = { [weak self] _ in
+            self?.settingsEnvelope(privacy: nil, cloudE2EEEnabled: false)
+        }
+        let controller = PrivacyController(invoke: fake.invoker())
+        await controller.refreshStatus()
+
+        // The off→on tap is a disclosure, not a flip.
+        XCTAssertEqual(
+            PrivacySettingsPolicy.e2eeTapOutcome(
+                cloudE2EEEnabled: controller.cloudE2EEEnabled
+            ),
+            .showDisclosure
+        )
+        // Cancel = the view calls nothing further. Invocation count stays at
+        // the single refresh; the optimistic value never moved.
+        XCTAssertEqual(fake.calls, [["settings", "--json"]])
+        XCTAssertEqual(controller.cloudE2EEEnabled, false)
     }
 
     // MARK: - toggleAllow (U13's Record segment)

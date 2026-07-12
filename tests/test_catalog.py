@@ -293,6 +293,64 @@ def test_recording_info_namedtuple_asdict_includes_new_fields(recordings_dir):
     assert "upload_warning" in d
 
 
+# --- SCR-220 (KTD-4): frozen per-recording cloud_e2ee bit ---
+
+
+def _write_e2ee_intent(d: Path, *, cloud_e2ee) -> None:
+    intent = {"version": 2, "destination": "cloud", "privacy_mode": "public"}
+    if cloud_e2ee is not None:
+        intent["cloud_e2ee"] = cloud_e2ee
+    (d / ".recording_intent").write_text(json.dumps(intent))
+
+
+@pytest.mark.privacy
+def test_list_recordings_frozen_cloud_e2ee_on(recordings_dir):
+    """The frozen bit surfaces on RecordingInfo and serializes via _asdict (so
+    `list --json` and the daemon parity assertion both pick it up)."""
+    d = _make_recording(recordings_dir, "e2ee-rec", duration=10.0)
+    _write_e2ee_intent(d, cloud_e2ee=True)
+    info = list_recordings(recordings_dir)[0]
+    assert info.cloud_e2ee is True
+    assert info._asdict()["cloud_e2ee"] is True
+
+
+@pytest.mark.privacy
+def test_list_recordings_cloud_e2ee_false_when_field_absent(recordings_dir):
+    """Pre-arc recording (intent predates SCR-220): reports False, never errors."""
+    d = _make_recording(recordings_dir, "pre-arc-rec", duration=10.0)
+    _write_e2ee_intent(d, cloud_e2ee=None)
+    info = list_recordings(recordings_dir)[0]
+    assert info.cloud_e2ee is False
+
+
+@pytest.mark.privacy
+def test_list_recordings_cloud_e2ee_false_when_no_intent(recordings_dir):
+    """Legacy recording with no .recording_intent at all: False, never errors."""
+    _make_recording(recordings_dir, "legacy-rec", duration=10.0)
+    info = list_recordings(recordings_dir)[0]
+    assert info.cloud_e2ee is False
+
+
+@pytest.mark.privacy
+def test_frozen_on_reported_even_when_upload_failed_closed(recordings_dir, monkeypatch):
+    """A frozen-on recording whose upload failed closed (no key, live flag off)
+    still reports frozen-on — the badge reflects how the recording RAN, not
+    whether an upload succeeded."""
+    import keyring
+
+    from screencap import cloud_crypto, upload
+
+    d = _make_recording(recordings_dir, "failed-closed-rec", duration=10.0)
+    _write_e2ee_intent(d, cloud_e2ee=True)
+    monkeypatch.setenv("SCREENCAP_CLOUD_E2EE", "false")
+    monkeypatch.delenv(cloud_crypto.ENGINE_CLOUD_KEY_FILE_ENV, raising=False)
+    monkeypatch.setattr(keyring, "get_password", lambda s, a: None)  # no key
+    with pytest.raises(upload.CloudEncryptionUnavailable):
+        upload._cloud_upload_key(True)
+    info = list_recordings(recordings_dir)[0]
+    assert info.cloud_e2ee is True
+
+
 # --- SCR-148: cloud account-mismatch observability fields ---
 
 

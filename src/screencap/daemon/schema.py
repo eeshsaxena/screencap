@@ -215,6 +215,11 @@ def _load_models() -> dict[str, Any]:
         title: str = ""
         state: str = "ready"
         recording_id: str | None = None
+        # SCR-220 (KTD-4): the frozen per-recording E2EE bit — badge truth.
+        # Kept in EXACT sync with catalog.RecordingInfo.cloud_e2ee (recording.list
+        # asserts field parity). Additive on the wire — no _LIST_API_VERSION
+        # bump; Swift decodes it as optional and treats absent as not-encrypted.
+        cloud_e2ee: bool = False
 
     class ListResponse(EnvelopeResponse):
         recordings: list[RecordingSummary]

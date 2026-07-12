@@ -24,6 +24,11 @@ final class PrivacyController: ObservableObject {
     @Published private(set) var uploadDefault: String?
     /// U12: the configured recordings directory (storage row). nil-tolerant.
     @Published private(set) var recordingsDir: String?
+    /// SCR-220 U4: whether E2EE for cloud copies is on (`cloud_e2ee_enabled`).
+    /// nil until the first `refreshStatus()` (or on an older CLI that omits
+    /// it) — the E2EE row renders locked with the stub copy rather than
+    /// offering a toggle whose write path may not exist (KTD-8).
+    @Published private(set) var cloudE2EEEnabled: Bool?
 
     /// SCR-228 U6: storage-migration lifecycle for the Privacy pane's storage
     /// row. `.migrating` covers the (near-instant, same-volume) CLI round-trip;
@@ -62,6 +67,11 @@ final class PrivacyController: ObservableObject {
     /// toggle mid-round-trip would otherwise race two `--set` writes and leave
     /// the optimistic value pointing at whichever landed last.
     private var uploadDefaultWriteInFlight: Bool = false
+
+    /// Serializes `setCloudE2EE` writes — a double-tap on the E2EE toggle
+    /// mid-round-trip would otherwise race an enable against a disable and
+    /// leave the optimistic value pointing at whichever landed last.
+    private var cloudE2EEWriteInFlight: Bool = false
 
     /// Serializes `startMigration` — the storage row disables its control while
     /// `.migrating`, but this guards a re-entrant call regardless.
@@ -145,6 +155,7 @@ final class PrivacyController: ObservableObject {
             // block can still carry.
             uploadDefault = envelope.settings.uploadDefault
             recordingsDir = envelope.settings.recordingsDir
+            cloudE2EEEnabled = envelope.settings.cloudE2EEEnabled
             guard let p = envelope.settings.privacy else { return }
             status = p
             lastError = nil
@@ -224,6 +235,35 @@ final class PrivacyController: ObservableObject {
             return true
         } catch {
             uploadDefault = previous
+            lastError = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Enable/disable E2EE for cloud copies (SCR-220 U4). The write goes
+    /// through the `e2ee` verb group — never a raw `settings --set` — because
+    /// `e2ee enable` creates/ensures the cloud key BEFORE flipping the flag
+    /// (KTD-3 ordering: key first, flag second, so the flag is never on with
+    /// no key behind it). Optimistic flip + revert-on-failure, mirroring
+    /// `setUploadDefault`: an enable failure (e.g. key creation failed, R2)
+    /// restores the previous value and surfaces the error, leaving encryption
+    /// off rather than half-configured. Returns success so the pane can show
+    /// an inline error. The R4 limits disclosure is the VIEW's job — it gates
+    /// the call, so by the time this runs the user has already confirmed.
+    @discardableResult
+    func setCloudE2EE(_ on: Bool) async -> Bool {
+        guard !cloudE2EEWriteInFlight else { return false }
+        cloudE2EEWriteInFlight = true
+        defer { cloudE2EEWriteInFlight = false }
+
+        let previous = cloudE2EEEnabled
+        cloudE2EEEnabled = on
+        do {
+            _ = try await invoke(["e2ee", on ? "enable" : "disable", "--json"])
+            lastError = nil
+            return true
+        } catch {
+            cloudE2EEEnabled = previous
             lastError = error.localizedDescription
             return false
         }
