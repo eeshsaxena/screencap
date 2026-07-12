@@ -16,6 +16,30 @@ enum RecallPalette {
     /// Search pane's mutual-exclusivity rule: the backfill affordance
     /// displaces the consent banner while active.
     struct State: Equatable {
+        /// SCR-261 — why a searched query rendered zero rows. Derived from the
+        /// live settings flag + per-stream coverage, never from the wire's
+        /// frozen `consentNeeded` snapshot (that flag flips the moment the
+        /// user turns indexing on).
+        enum EmptyCause: Equatable {
+            /// Everything searched ran fine — genuinely nothing matched.
+            case noMatches
+            /// On-screen-text indexing is off and the user hasn't declined —
+            /// the body owns the Turn-on ask.
+            case consentNeeded
+            /// Indexing was declined — a button-free honest notice.
+            case consentDeclined
+            /// Indexing is on but this history isn't indexed yet.
+            /// `ctaAvailable` is false while the backfill section owns the ask
+            /// (offer / progress / resume states); start-failed's section has
+            /// no action button, so the body CTA returns.
+            case notIndexed(ctaAvailable: Bool)
+            /// Content search fell back to the LIKE scan (FTS5 absent) —
+            /// results may be incomplete.
+            case degraded
+            /// A searched stream's store errored outright.
+            case unavailable
+        }
+
         enum Body: Equatable {
             /// Empty query — curated examples + recent-search chips.
             case idle(recents: [String])
@@ -27,7 +51,10 @@ enum RecallPalette {
             /// search", never "search is broken".
             case subscriptionRequired
             case results
-            case empty
+            /// Zero rendered rows — carries the honest cause so the body can
+            /// say *why* (SCR-261), plus whether a *different* searched stream
+            /// failed outright (rendered as one de-emphasized note line).
+            case empty(cause: EmptyCause, showsUnavailableNote: Bool)
         }
 
         let body: Body
@@ -39,6 +66,7 @@ enum RecallPalette {
         phase: SearchViewModel.Phase,
         consentDeclined: Bool,
         backfillState: SearchViewModel.BackfillUIState,
+        contentIndexEnabled: Bool?,
         recents: [String]
     ) -> State {
         let body: State.Body
@@ -54,10 +82,72 @@ enum RecallPalette {
             body = .subscriptionRequired
         case .loaded(let results):
             consentNeeded = results.consentNeeded
-            body = results.items.isEmpty ? .empty : .results
+            if results.items.isEmpty {
+                body = emptyBody(
+                    coverage: results.coverage,
+                    contentIndexEnabled: contentIndexEnabled,
+                    consentDeclined: consentDeclined,
+                    backfillState: backfillState
+                )
+            } else {
+                body = .results
+            }
         }
         let showsBanner = consentNeeded && !consentDeclined && backfillState == .hidden
         return State(body: body, showsConsentBanner: showsBanner, backfill: backfillState)
+    }
+
+    /// SCR-261 — the cause behind zero rendered rows, in precedence order: a
+    /// pure time query (content stream not searched) never nags about
+    /// indexing; unknown settings (`contentIndexEnabled == nil`) stay quiet;
+    /// the consent tier follows the *live* flag; then not-indexed, stream
+    /// failure, degraded, and only then a genuine "no matches".
+    private static func emptyBody(
+        coverage: CoverageReport,
+        contentIndexEnabled: Bool?,
+        consentDeclined: Bool,
+        backfillState: SearchViewModel.BackfillUIState
+    ) -> State.Body {
+        let searched = [coverage.screen, coverage.audio, coverage.activity]
+            .filter { $0 != .notRun }
+        func healthOrNoMatches() -> State.Body {
+            if searched.contains(.unavailable) {
+                return .empty(cause: .unavailable, showsUnavailableNote: false)
+            }
+            if searched.contains(.degraded) {
+                return .empty(cause: .degraded, showsUnavailableNote: false)
+            }
+            return .empty(cause: .noMatches, showsUnavailableNote: false)
+        }
+        guard coverage.screen != .notRun else { return healthOrNoMatches() }
+        guard let enabled = contentIndexEnabled else {
+            return .empty(cause: .noMatches, showsUnavailableNote: false)
+        }
+        let otherUnavailable = coverage.audio == .unavailable || coverage.activity == .unavailable
+        if !enabled {
+            return .empty(
+                cause: consentDeclined ? .consentDeclined : .consentNeeded,
+                showsUnavailableNote: otherUnavailable
+            )
+        }
+        if coverage.screen == .notIndexed {
+            return .empty(
+                cause: .notIndexed(ctaAvailable: backfillCTAAvailable(backfillState)),
+                showsUnavailableNote: otherUnavailable
+            )
+        }
+        return healthOrNoMatches()
+    }
+
+    /// Whether the not-indexed empty body may carry its own Index CTA: only
+    /// while the backfill section isn't already owning the ask.
+    private static func backfillCTAAvailable(_ state: SearchViewModel.BackfillUIState) -> Bool {
+        switch state {
+        case .hidden, .startFailed:
+            return true
+        case .offering, .starting, .indexing, .done, .paused, .cancelled:
+            return false
+        }
     }
 
     // MARK: - Day grouping

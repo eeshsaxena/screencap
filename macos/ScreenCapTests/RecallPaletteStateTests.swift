@@ -13,7 +13,7 @@ final class RecallPaletteStateTests: XCTestCase {
     func testIdleVariantCarriesRecentChips() {
         let state = RecallPalette.state(
             phase: .idle, consentDeclined: false, backfillState: .hidden,
-            recents: ["meeting with John"]
+            contentIndexEnabled: nil, recents: ["meeting with John"]
         )
         XCTAssertEqual(state.body, .idle(recents: ["meeting with John"]))
         XCTAssertFalse(state.showsConsentBanner)
@@ -22,12 +22,14 @@ final class RecallPaletteStateTests: XCTestCase {
     func testSearchingAndErrorVariants() {
         XCTAssertEqual(
             RecallPalette.state(phase: .searching, consentDeclined: false,
-                                backfillState: .hidden, recents: []).body,
+                                backfillState: .hidden, contentIndexEnabled: nil,
+                                recents: []).body,
             .searching
         )
         XCTAssertEqual(
             RecallPalette.state(phase: .daemonDown, consentDeclined: false,
-                                backfillState: .hidden, recents: []).body,
+                                backfillState: .hidden, contentIndexEnabled: nil,
+                                recents: []).body,
             .daemonDown
         )
     }
@@ -38,7 +40,7 @@ final class RecallPaletteStateTests: XCTestCase {
     func testSubscriptionRequiredVariant() {
         let state = RecallPalette.state(
             phase: .subscriptionRequired, consentDeclined: false,
-            backfillState: .hidden, recents: []
+            backfillState: .hidden, contentIndexEnabled: nil, recents: []
         )
         XCTAssertEqual(state.body, .subscriptionRequired)
         XCTAssertNotEqual(state.body, .daemonDown)
@@ -48,20 +50,23 @@ final class RecallPaletteStateTests: XCTestCase {
     func testConsentNeededShowsBannerUnlessDeclinedOrBackfillActive() {
         let phase = SearchViewModel.Phase.loaded(SearchFixtures.consentNeededResults())
         let shown = RecallPalette.state(
-            phase: phase, consentDeclined: false, backfillState: .hidden, recents: []
+            phase: phase, consentDeclined: false, backfillState: .hidden,
+            contentIndexEnabled: false, recents: []
         )
         XCTAssertTrue(shown.showsConsentBanner)
         XCTAssertEqual(shown.body, .results)
 
         let declined = RecallPalette.state(
-            phase: phase, consentDeclined: true, backfillState: .hidden, recents: []
+            phase: phase, consentDeclined: true, backfillState: .hidden,
+            contentIndexEnabled: false, recents: []
         )
         XCTAssertFalse(declined.showsConsentBanner)
 
         // The backfill affordance displaces the banner (the retired Search
         // pane's mutual-exclusivity rule).
         let backfilling = RecallPalette.state(
-            phase: phase, consentDeclined: false, backfillState: .offering, recents: []
+            phase: phase, consentDeclined: false, backfillState: .offering,
+            contentIndexEnabled: false, recents: []
         )
         XCTAssertFalse(backfilling.showsConsentBanner)
         XCTAssertEqual(backfilling.backfill, .offering)
@@ -71,16 +76,139 @@ final class RecallPaletteStateTests: XCTestCase {
         XCTAssertEqual(
             RecallPalette.state(
                 phase: .loaded(SearchFixtures.noMatchesResults()),
-                consentDeclined: false, backfillState: .hidden, recents: []
+                consentDeclined: false, backfillState: .hidden,
+                contentIndexEnabled: true, recents: []
             ).body,
-            .empty
+            .empty(cause: .noMatches, showsUnavailableNote: false)
         )
         XCTAssertEqual(
             RecallPalette.state(
                 phase: .loaded(SearchFixtures.multiDayResults()),
-                consentDeclined: false, backfillState: .hidden, recents: []
+                consentDeclined: false, backfillState: .hidden,
+                contentIndexEnabled: true, recents: []
             ).body,
             .results
+        )
+        // Coverage never blocks results: a non-empty set renders rows even
+        // with the content stream not indexed.
+        XCTAssertEqual(
+            RecallPalette.state(
+                phase: .loaded(SearchFixtures.consentNeededResults()),
+                consentDeclined: false, backfillState: .hidden,
+                contentIndexEnabled: false, recents: []
+            ).body,
+            .results
+        )
+    }
+
+    // MARK: - Empty causes (SCR-261)
+
+    /// Convenience: derive the body for a zero-hit loaded phase.
+    private func emptyBody(
+        _ results: SearchResults,
+        consentDeclined: Bool = false,
+        backfillState: SearchViewModel.BackfillUIState = .hidden,
+        contentIndexEnabled: Bool? = true
+    ) -> RecallPalette.State.Body {
+        RecallPalette.state(
+            phase: .loaded(results), consentDeclined: consentDeclined,
+            backfillState: backfillState, contentIndexEnabled: contentIndexEnabled,
+            recents: []
+        ).body
+    }
+
+    func testEmptyNotIndexedWithBackfillHiddenOffersCTA() {
+        XCTAssertEqual(
+            emptyBody(SearchFixtures.emptyResults(screen: .notIndexed)),
+            .empty(cause: .notIndexed(ctaAvailable: true), showsUnavailableNote: false)
+        )
+    }
+
+    func testEmptyConsentTierFollowsLiveFlagNotWireSnapshot() {
+        // Indexing off, not declined → the body owns the Turn-on ask. The wire
+        // snapshot's consentNeeded is not the truth here — the live flag is.
+        XCTAssertEqual(
+            emptyBody(
+                SearchFixtures.emptyResults(screen: .notIndexed, consentNeeded: true),
+                contentIndexEnabled: false
+            ),
+            .empty(cause: .consentNeeded, showsUnavailableNote: false)
+        )
+    }
+
+    func testEmptyDeclinedConsentReadsHonestNotice() {
+        XCTAssertEqual(
+            emptyBody(
+                SearchFixtures.emptyResults(screen: .notIndexed, consentNeeded: true),
+                consentDeclined: true, contentIndexEnabled: false
+            ),
+            .empty(cause: .consentDeclined, showsUnavailableNote: false)
+        )
+    }
+
+    func testTimeOnlyQueryEmptyStaysQuiet() {
+        // Pure time query: only activity ran (SCR-176) and the window had no
+        // events — never a consent or not-indexed nag, whatever the flag.
+        let results = SearchFixtures.emptyResults(
+            screen: .notRun, audio: .notRun, activity: .empty, queryTerms: []
+        )
+        XCTAssertEqual(
+            emptyBody(results, contentIndexEnabled: false),
+            .empty(cause: .noMatches, showsUnavailableNote: false)
+        )
+    }
+
+    func testEmptySearchedStreamUnavailableSurfaces() {
+        XCTAssertEqual(
+            emptyBody(SearchFixtures.emptyResults(screen: .empty, audio: .unavailable)),
+            .empty(cause: .unavailable, showsUnavailableNote: false)
+        )
+    }
+
+    func testEmptyDegradedContentDistinctFromUnavailable() {
+        XCTAssertEqual(
+            emptyBody(SearchFixtures.emptyResults(screen: .degraded)),
+            .empty(cause: .degraded, showsUnavailableNote: false)
+        )
+    }
+
+    func testNotIndexedCTAStandsDownWhileBackfillSectionOwnsTheAsk() {
+        let stoodDown: [SearchViewModel.BackfillUIState] = [
+            .offering, .starting,
+            .indexing(done: 3, total: 9, failed: 0),
+            .paused(done: 2, total: 9),
+            .cancelled(done: 1, total: 9),
+        ]
+        for backfill in stoodDown {
+            XCTAssertEqual(
+                emptyBody(SearchFixtures.emptyResults(screen: .notIndexed), backfillState: backfill),
+                .empty(cause: .notIndexed(ctaAvailable: false), showsUnavailableNote: false),
+                "the backfill section owns the ask in \(backfill)"
+            )
+        }
+        // start-failed's section carries no action button — the body CTA returns.
+        XCTAssertEqual(
+            emptyBody(SearchFixtures.emptyResults(screen: .notIndexed), backfillState: .startFailed),
+            .empty(cause: .notIndexed(ctaAvailable: true), showsUnavailableNote: false)
+        )
+    }
+
+    func testNotIndexedCarriesSecondaryUnavailableNote() {
+        XCTAssertEqual(
+            emptyBody(SearchFixtures.emptyResults(screen: .notIndexed, audio: .unavailable)),
+            .empty(cause: .notIndexed(ctaAvailable: true), showsUnavailableNote: true)
+        )
+    }
+
+    func testUnknownSettingsFlagStaysQuiet() {
+        // Settings pending/failed (nil flag) → a quiet "no matches", never a
+        // consent or not-indexed nag (R12).
+        XCTAssertEqual(
+            emptyBody(
+                SearchFixtures.emptyResults(screen: .notIndexed, consentNeeded: true),
+                contentIndexEnabled: nil
+            ),
+            .empty(cause: .noMatches, showsUnavailableNote: false)
         )
     }
 

@@ -72,6 +72,7 @@ struct RecallPaletteView: View {
                 phase: model.phase,
                 consentDeclined: consentDeclined,
                 backfillState: model.backfillState,
+                contentIndexEnabled: contentIndexEnabled,
                 recentSearches: recentStore.recent,
                 queryTerms: queryTerms,
                 selectedResultID: selectedResultID,
@@ -278,6 +279,10 @@ struct RecallPaletteContent: View {
     let phase: SearchViewModel.Phase
     let consentDeclined: Bool
     let backfillState: SearchViewModel.BackfillUIState
+    /// Live settings flag (nil = not yet resolved) — drives the SCR-261
+    /// empty-cause derivation. The hosting view's plain Bool promotes
+    /// implicitly; a later unit makes the view state itself tri-state.
+    var contentIndexEnabled: Bool? = nil
     let recentSearches: [String]
     let queryTerms: [String]
     let selectedResultID: SearchResultItem.ID?
@@ -305,6 +310,7 @@ struct RecallPaletteContent: View {
             phase: phase,
             consentDeclined: consentDeclined,
             backfillState: backfillState,
+            contentIndexEnabled: contentIndexEnabled,
             recents: recentSearches
         )
     }
