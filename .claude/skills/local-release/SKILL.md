@@ -94,14 +94,15 @@ Use a dedicated venv per arch so they don't poison each other. Default venv path
 
 #### Inject provisioned credentials (once, before any arch build)
 
-Release binaries must carry the OAuth client id + Firebase Web API key, or every `screencap login` fails. The values stay out of git: source keeps placeholders, and `scripts/generate_provisioned.py` writes the gitignored `src/screencap/_provisioned.py` that PyInstaller bundles. Run this ONCE before building — it writes into the source tree (`pathex=src`), so it applies to both the arm64 and x86_64 builds; it depends on no venv.
+Release binaries must carry the OAuth client id + its client secret + Firebase Web API key, or every `screencap login` fails (a Google Desktop client's token exchange needs the secret even under PKCE). The values stay out of git: source keeps placeholders, and `scripts/generate_provisioned.py` writes the gitignored `src/screencap/_provisioned.py` that PyInstaller bundles. Run this ONCE before building — it writes into the source tree (`pathex=src`), so it applies to both the arm64 and x86_64 builds; it depends on no venv.
 
 ```bash
-# Export the two non-secret values (they live in the gitignored .env — both
-# `SCREENCAP_OAUTH_CLIENT_ID` and `SCREENCAP_FIREBASE_API_KEY`; see
-# docs/runbooks/cloud-auth-setup.md). Easiest: source the .env, then generate.
+# Export the three non-confidential values (they live in the gitignored .env —
+# `SCREENCAP_OAUTH_CLIENT_ID`, `SCREENCAP_OAUTH_CLIENT_SECRET` and
+# `SCREENCAP_FIREBASE_API_KEY`; see docs/runbooks/cloud-auth-setup.md). Easiest:
+# source the .env, then generate.
 set -a; . ./.env; set +a
-python scripts/generate_provisioned.py   # exits non-zero (writes nothing) if either var is missing
+python scripts/generate_provisioned.py   # exits non-zero (writes nothing) if any var is missing
 ```
 
 If you skip this, the fail-closed guard in Step 5 stops the release rather than letting a placeholder (broken-sign-in) binary ship.

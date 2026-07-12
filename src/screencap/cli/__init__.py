@@ -5317,7 +5317,10 @@ def auth_config_check() -> None:
     the release job against the BUILT binary, after scripts/generate_provisioned.py:
     if the injected screencap._provisioned module is missing/empty, the bundled creds
     fall back to the REPLACE_WITH_PROVISIONED_* sentinels and every sign-in would
-    fail — so such a binary must never ship.
+    fail — so such a binary must never ship. The Google Desktop-client secret has no
+    placeholder (its unprovisioned state is empty), but is equally mandatory: Google's
+    token endpoint rejects the exchange with "client_secret is missing" without it, so
+    an empty bundled secret fails the guard too.
 
     Checks ``auth.bundled_credentials()`` (``_provisioned`` > placeholder) and
     deliberately IGNORES the env-var layer: an end user has no env override, so a
@@ -5329,14 +5332,20 @@ def auth_config_check() -> None:
     """
     from screencap import auth
 
-    api_key, client_id = auth.bundled_credentials()
+    api_key, client_id, client_secret = auth.bundled_credentials()
     checked = (
         ("Firebase Web API key", api_key),
         ("OAuth client id", client_id),
     )
-    placeholders = [
+    unprovisioned = [
         label for label, value in checked if auth.is_placeholder_credential(value)
     ]
+    # The Google Desktop-client secret is REQUIRED at the token endpoint but has no
+    # placeholder sentinel — its unprovisioned state is simply empty. Treat an empty
+    # bundled secret as a placeholder-equivalent failure so a release can't ship a
+    # secret-less binary whose every sign-in dies with "client_secret is missing".
+    if not client_secret:
+        unprovisioned.append("OAuth client secret")
     release_build = os.environ.get("SCREENCAP_RELEASE_BUILD", "").strip().lower() not in (
         "",
         "0",
@@ -5344,24 +5353,25 @@ def auth_config_check() -> None:
         "no",
     )
 
-    if not placeholders:
+    if not unprovisioned:
         console.print(
             "[green]auth-config-check:[/green] resolved cloud-auth credentials are provisioned."
         )
         return
 
-    joined = ", ".join(placeholders)
+    joined = ", ".join(unprovisioned)
     if release_build:
         console.print(
-            f"[red]auth-config-check FAILED:[/red] release build resolved placeholder "
+            f"[red]auth-config-check FAILED:[/red] release build resolved unprovisioned "
             f"credential(s): {joined}. Run scripts/generate_provisioned.py with "
-            "SCREENCAP_OAUTH_CLIENT_ID + SCREENCAP_FIREBASE_API_KEY set before the build "
+            "SCREENCAP_OAUTH_CLIENT_ID + SCREENCAP_FIREBASE_API_KEY + "
+            "SCREENCAP_OAUTH_CLIENT_SECRET set before the build "
             "(see docs/runbooks/cloud-auth-setup.md)."
         )
         raise SystemExit(1)
 
     console.print(
-        f"[yellow]auth-config-check:[/yellow] placeholder credential(s) present ({joined}) — "
+        f"[yellow]auth-config-check:[/yellow] unprovisioned credential(s) present ({joined}) — "
         "OK for a dev/PR build (SCREENCAP_RELEASE_BUILD unset). A release build fails this check."
     )
 

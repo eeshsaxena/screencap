@@ -954,10 +954,82 @@ def test_bundled_credentials_ignores_env(monkeypatch):
     # never the build-shell env — otherwise the release guard could be masked.
     monkeypatch.setenv("SCREENCAP_FIREBASE_API_KEY", "env-key")
     monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_ID", "env-id")
+    monkeypatch.setenv("SCREENCAP_OAUTH_CLIENT_SECRET", "env-secret")
     _install_provisioned(monkeypatch, None)
-    api_key, client_id = a.bundled_credentials()
+    api_key, client_id, client_secret = a.bundled_credentials()
     assert api_key == a.DEFAULT_FIREBASE_API_KEY  # env ignored → placeholder
     assert client_id == a.DEFAULT_OAUTH_CLIENT_ID
+    assert client_secret == ""  # env ignored; no placeholder → empty (guard rejects)
+
+
+def test_oauth_client_secret_resolves_from_provisioned(monkeypatch, _no_cred_env):
+    # The Google Desktop-client secret must ship via _provisioned like the client id,
+    # NOT depend on an env var no shipped app has. Regression for the sign-in failure
+    # "Google token exchange failed: invalid_request: client_secret is missing."
+    monkeypatch.delenv("SCREENCAP_OAUTH_CLIENT_SECRET", raising=False)
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(
+            FIREBASE_API_KEY="prov-key",
+            OAUTH_CLIENT_ID="prov-id",
+            OAUTH_CLIENT_SECRET="prov-secret",
+        ),
+    )
+    assert a._oauth_client_secret() == "prov-secret"
+
+
+def test_oauth_client_secret_tolerates_secretless_provisioned(monkeypatch, _no_cred_env):
+    # A present _provisioned MISSING the secret (a stale module, or a secret-less
+    # client) must degrade to "" — never crash sign-in with AttributeError. The
+    # release guard is the fail-closed net for a mis-provisioned release, not this
+    # runtime resolver.
+    monkeypatch.delenv("SCREENCAP_OAUTH_CLIENT_SECRET", raising=False)
+    _install_provisioned(
+        monkeypatch, _fake_provisioned(FIREBASE_API_KEY="prov-key", OAUTH_CLIENT_ID="prov-id")
+    )
+    assert a._oauth_client_secret() == ""
+
+
+def test_exchange_sends_client_secret_when_resolved(monkeypatch):
+    # When a secret resolves, it MUST be in the token-exchange POST body — otherwise
+    # Google rejects a Desktop-client exchange with "client_secret is missing".
+    monkeypatch.setattr(a, "_oauth_client_secret", lambda: "shhh")
+    monkeypatch.setattr(a, "_oauth_client_id", lambda: "cid")
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"id_token": "gtok"}
+
+    def _fake_post(url, data=None, timeout=None):
+        captured.update(data)
+        return _Resp()
+
+    monkeypatch.setattr(a.requests, "post", _fake_post)
+    assert a._exchange_code_for_google_token("code", "verifier", "http://127.0.0.1:1") == "gtok"
+    assert captured["client_secret"] == "shhh"
+
+
+def test_exchange_omits_client_secret_when_unresolved(monkeypatch):
+    # Source checkout / dev: no secret resolves → the key is absent (not an empty
+    # string) so a secret-less client config isn't sent a bogus "".
+    monkeypatch.setattr(a, "_oauth_client_secret", lambda: "")
+    monkeypatch.setattr(a, "_oauth_client_id", lambda: "cid")
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"id_token": "gtok"}
+
+    monkeypatch.setattr(
+        a.requests, "post", lambda url, data=None, timeout=None: captured.update(data) or _Resp()
+    )
+    a._exchange_code_for_google_token("code", "verifier", "http://127.0.0.1:1")
+    assert "client_secret" not in captured
 
 
 def test_env_var_overrides_provisioned_and_placeholder(monkeypatch):
