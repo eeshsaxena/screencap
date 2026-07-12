@@ -360,14 +360,14 @@ final class ClipExportController: ObservableObject {
             if let total = event.framesTotal { framesTotal = total }
             state = .exporting(progress: progressSnapshot())
         case "clip_done":
-            // First-write-wins on terminal events: a late duplicate or a
-            // contradictory follow-up must not flip the settled state.
-            guard !sawTerminalEvent else { return }
+            // First-write-wins on terminal events: the outer `sawTerminalEvent`
+            // guard already dropped any line after the latch, so a late
+            // duplicate or contradictory follow-up cannot reach here and flip the
+            // settled state; latch it for the terminationHandler / cancel paths.
             sawTerminalEvent = true
             cancelWatchdog()
             state = .succeeded(path: event.path ?? outPathHint ?? "")
         case "clip_failed":
-            guard !sawTerminalEvent else { return }
             sawTerminalEvent = true
             cancelWatchdog()
             let reason = ClipFailureReason(rawReason: event.reason)

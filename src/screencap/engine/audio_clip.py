@@ -102,24 +102,43 @@ def mux_clip_audio(
     # at clip-output time ``anchor_delta + p - start``.
     anchor_delta = audio_start - video_start
 
-    durations = [_flac_duration_s(p) for p in audio_chunks]
-    cum: list[float] = []
-    running = 0.0
-    for d in durations:
-        cum.append(running)
-        running += d
-    total_audio = running
-
     # Kept range in the concatenated-audio (p) domain: keep samples whose
-    # clip-output time lands in [0, clip_dur).
+    # clip-output time lands in [0, clip_dur). ``hi_bound`` is the clip's end on
+    # the audio timeline (``end - anchor_delta``).
     p_lo = max(0.0, start - anchor_delta)
-    p_hi = min(total_audio, end - anchor_delta)
+    hi_bound = end - anchor_delta
+
+    # Build the cumulative per-chunk offset map LAZILY: probe FLAC durations in
+    # order and STOP as soon as the running cumulative offset reaches the clip's
+    # end on the audio timeline (``hi_bound``). ``_flac_duration_s`` falls
+    # through to a FULL PyAV decode for a recorder-written FLAC (its header often
+    # lacks total-samples), so probing every chunk up front would decode the
+    # entire (possibly hours-long) audio track just to clip a few seconds. Once
+    # ``running >= hi_bound`` every remaining chunk starts at ``cum >= hi_bound
+    # >= p_hi`` and can never be in the overlap set, so it is never opened.
+    cum: list[float] = []
+    durations: list[float] = []
+    running = 0.0
+    for p in audio_chunks:
+        if running >= hi_bound:
+            break
+        cum.append(running)
+        durations.append(_flac_duration_s(p))
+        running += durations[-1]
+
+    # ``running`` is the sum of the PROBED durations. When we stopped early it is
+    # already ``>= hi_bound`` and the true total is ``>= running``, so
+    # ``min(running, hi_bound) == hi_bound == min(total_audio, hi_bound)``; when
+    # we probed every chunk ``running == total_audio`` — so ``p_hi`` is identical
+    # to the eager ``min(total_audio, end - anchor_delta)`` either way.
+    p_hi = min(running, hi_bound)
     if p_hi <= p_lo:
         # No captured audio overlaps the requested window.
         return False
 
-    # Only the chunks overlapping [p_lo, p_hi) contribute — never decode the
-    # whole (possibly hours-long) recording for a short clip.
+    # Only the chunks overlapping [p_lo, p_hi) contribute — every such chunk has
+    # ``cum < p_hi`` and so was probed above; chunks past the window were never
+    # opened or decoded.
     overlap = [
         i
         for i, c0 in enumerate(cum)
@@ -165,31 +184,23 @@ def _audio_chunks(rec_dir: Path) -> list[Path]:
 def _read_audio_anchors(rec_dir: Path) -> tuple[float | None, float | None]:
     """Return ``(video_start, audio_start)`` wall-clock anchors from recording.db.
 
-    ``video_start`` mirrors ``viewer._chunk_offsets_for_concat`` /
-    ``get_frame_at`` exactly (``video_start_time`` falling back to
-    ``timestamp``); ``audio_start`` is the earliest ``audio_info.timestamp`` (the
-    instant the FLAC stream began). Either is ``None`` when unavailable.
+    ``video_start`` is the canonical anchor from
+    :func:`catalog.read_video_start_anchor` (``video_start_time`` falling back to
+    ``timestamp``, mirroring ``viewer.get_frame_at`` and the clip trim);
+    ``audio_start`` is the earliest ``audio_info.timestamp`` (the instant the
+    FLAC stream began). Either is ``None`` when unavailable.
     """
+    from screencap.catalog import read_video_start_anchor
+
+    video_start = read_video_start_anchor(rec_dir)
+
+    audio_start: float | None = None
     db = rec_dir / "recording.db"
-    if not db.exists():
-        return (None, None)
-    try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return (None, None)
-    try:
-        video_start: float | None = None
-        audio_start: float | None = None
+    if db.exists():
         try:
-            row = conn.execute(
-                "SELECT video_start_time, timestamp FROM recording LIMIT 1"
-            ).fetchone()
-            if row is not None:
-                anchor = row[0] if row[0] is not None else row[1]
-                if anchor is not None:
-                    video_start = float(anchor)
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         except sqlite3.Error:
-            pass
+            return (video_start, None)
         try:
             arow = conn.execute(
                 "SELECT timestamp FROM audio_info "
@@ -199,9 +210,9 @@ def _read_audio_anchors(rec_dir: Path) -> tuple[float | None, float | None]:
                 audio_start = float(arow[0])
         except sqlite3.Error:
             pass
-        return (video_start, audio_start)
-    finally:
-        conn.close()
+        finally:
+            conn.close()
+    return (video_start, audio_start)
 
 
 def _flac_duration_s(path: Path) -> float:

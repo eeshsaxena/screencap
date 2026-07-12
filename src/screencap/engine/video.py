@@ -1404,6 +1404,36 @@ def _prep_out_frame(
     return out
 
 
+def _coerce_clip_args(
+    recording_dir: str | Path,
+    out_path: str | Path,
+    start_ms: int,
+    end_ms: int,
+) -> tuple[Path, Path, float, float]:
+    """Coerce + validate the shared clip entry-point preamble.
+
+    Both public clip entry points (:func:`export_clip_video`,
+    :func:`export_clip`) open with the identical path coercion, empty/inverted
+    range guard, and ms→seconds conversion. Extracted verbatim so the two stay
+    in lockstep.
+
+    Returns ``(rec_dir, out_path, start, end)`` — the coerced :class:`~pathlib.Path`
+    directory + output and the range in seconds. Raises
+    :class:`NoFramesInRangeError` (writing no file) when the range is empty or
+    inverted (``end_ms <= start_ms``).
+    """
+    rec_dir = Path(recording_dir)
+    out_path = Path(out_path)
+
+    if end_ms <= start_ms:
+        raise NoFramesInRangeError(
+            f"empty clip range: start_ms={start_ms} >= end_ms={end_ms}"
+        )
+    start = start_ms / 1000.0
+    end = end_ms / 1000.0
+    return rec_dir, out_path, start, end
+
+
 def export_clip_video(
     recording_dir: str | Path,
     start_ms: int,
@@ -1457,15 +1487,9 @@ def export_clip_video(
         ClipExportError: The re-encode failed / could not be finalized.
         terminal_stage.TerminalStageBusy: The eviction lock stayed contended.
     """
-    rec_dir = Path(recording_dir)
-    out_path = Path(out_path)
-
-    if end_ms <= start_ms:
-        raise NoFramesInRangeError(
-            f"empty clip range: start_ms={start_ms} >= end_ms={end_ms}"
-        )
-    start = start_ms / 1000.0
-    end = end_ms / 1000.0
+    rec_dir, out_path, start, end = _coerce_clip_args(
+        recording_dir, out_path, start_ms, end_ms
+    )
 
     # Serialize the source-chunk read against U8 eviction on the SAME
     # per-recording flock (deferred import — terminal_stage pulls heavier
@@ -1583,15 +1607,9 @@ def export_clip(
         ClipExportError: The video re-encode failed / could not be finalized.
         terminal_stage.TerminalStageBusy: The eviction lock stayed contended.
     """
-    rec_dir = Path(recording_dir)
-    out_path = Path(out_path)
-
-    if end_ms <= start_ms:
-        raise NoFramesInRangeError(
-            f"empty clip range: start_ms={start_ms} >= end_ms={end_ms}"
-        )
-    start = start_ms / 1000.0
-    end = end_ms / 1000.0
+    rec_dir, out_path, start, end = _coerce_clip_args(
+        recording_dir, out_path, start_ms, end_ms
+    )
 
     from screencap.terminal_stage import terminal_lock
 

@@ -1721,29 +1721,15 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
     # ``review-data`` verb) passes ABSOLUTE epoch milliseconds, but the engine's
     # ``export_clip`` wants milliseconds-from-video-start (relative to
     # ``recording.db.video_start_time``). Read the video-start anchor exactly as
-    # the rest of the codebase does — ``video_start_time or timestamp`` (epoch
-    # seconds), mirroring viewer.get_frame_at / audio_clip — and subtract it. A
-    # missing DB or unusable anchor can't be converted, so it is not_eligible
-    # (structured, exit 0, engine untouched) rather than a crash or a wrong range.
-    import sqlite3
+    # the rest of the codebase does — ``video_start_time`` falling back to
+    # ``timestamp`` (epoch seconds), via the one canonical
+    # ``catalog.read_video_start_anchor`` reader (shared with audio_clip) — and
+    # subtract it. A missing DB or unusable anchor can't be converted, so it is
+    # not_eligible (structured, exit 0, engine untouched) rather than a crash or
+    # a wrong range.
+    from screencap.catalog import read_video_start_anchor
 
-    anchor_s: float | None = None
-    db_path = rec_dir / "recording.db"
-    if db_path.exists():
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                row = conn.execute(
-                    "SELECT video_start_time, timestamp FROM recording LIMIT 1"
-                ).fetchone()
-            finally:
-                conn.close()
-            if row is not None:
-                raw = row[0] or row[1]
-                if raw is not None:
-                    anchor_s = float(raw)
-        except (sqlite3.Error, ValueError, TypeError):
-            anchor_s = None
+    anchor_s = read_video_start_anchor(rec_dir)
     if anchor_s is None:
         _fail(
             "not_eligible",
