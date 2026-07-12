@@ -16,6 +16,8 @@ struct PrivacySettingsView: View {
     @EnvironmentObject private var privacy: PrivacyController
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
+    /// SCR-260: the E2EE enable gate reads sign-in + cloud-plan state from here.
+    @EnvironmentObject private var auth: CloudAuthController
 
     /// The mask row's disclosure — App rules is the per-app view of what the
     /// policy engine masks and blocks.
@@ -72,6 +74,10 @@ struct PrivacySettingsView: View {
         .background(Color.scCanvas)
         .task {
             await privacy.refreshStatus()
+            // SCR-260/SCR-241: coalesced, no-op-once-resolved refresh so the
+            // E2EE gate reflects current sign-in/plan state without an eager
+            // `whoami` Keychain decrypt on every pane open.
+            await auth.refreshIfNeeded()
         }
         .onAppear {
             // Visiting the pane is the disclosure the first-run banner asks
@@ -168,12 +174,60 @@ struct PrivacySettingsView: View {
         }
     }
 
-    // MARK: - E2EE row (SCR-220 U4 — opt-in beta toggle, R4 disclosure gate)
+    // MARK: - E2EE row (SCR-220 U4 — opt-in beta toggle, R4 disclosure gate;
+    // SCR-260 — cloud-capability gate on the enable path)
+
+    /// SCR-260: cloud-eligibility for the E2EE enable gate, from the app's auth
+    /// signals. `.unknown` auth (pre-first-check) resolves to `signedOut` here,
+    /// which gates the row (safe default); `e2eeCaptionText` softens that window.
+    /// Kept as plain computed state (not in a view builder) so the type-checker
+    /// solver stays well clear of the e2eeRowHeader fragility.
+    private var e2eeEligibility: PrivacySettingsPolicy.E2EECloudEligibility {
+        PrivacySettingsPolicy.e2eeEligibility(
+            isSignedIn: auth.isSignedIn,
+            cloudCapable: auth.isSubscribed,
+            planStale: auth.status.isStale,
+            paywallEnabled: auth.paywallEnabled
+        )
+    }
+
+    /// The tap outcome for the current flag + eligibility.
+    private var e2eeOutcome: PrivacySettingsPolicy.E2EETapOutcome {
+        PrivacySettingsPolicy.e2eeTapOutcome(
+            cloudE2EEEnabled: privacy.cloudE2EEEnabled,
+            eligibility: e2eeEligibility
+        )
+    }
+
+    /// The row is non-interactive when locked (older CLI) or gated (SCR-260).
+    private var e2eeNonInteractive: Bool {
+        e2eeOutcome == .locked || e2eeOutcome == .gated
+    }
+
+    /// The caption, eligibility-keyed — with a neutral "checking" caption during
+    /// the pre-first-check `.unknown` window so an already-eligible user never
+    /// flashes the signed-out "sign in" copy.
+    private var e2eeCaptionText: String {
+        if privacy.cloudE2EEEnabled == false, case .unknown = auth.status {
+            return PrivacySettingsCopy.e2eeSubChecking
+        }
+        return PrivacySettingsPolicy.e2eeCaption(
+            cloudE2EEEnabled: privacy.cloudE2EEEnabled,
+            eligibility: e2eeEligibility
+        )
+    }
+
+    /// Hover help, eligibility-keyed (gated rows get gated help, not the
+    /// off-state "turn on to encrypt" copy).
+    private var e2eeHelpText: String {
+        PrivacySettingsPolicy.e2eeHelp(
+            cloudE2EEEnabled: privacy.cloudE2EEEnabled,
+            eligibility: e2eeEligibility
+        )
+    }
 
     private var e2eeRow: some View {
-        let state = privacy.cloudE2EEEnabled
-        let locked = PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: state) == .locked
-        return VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
             e2eeRowHeader
             if let e2eeError {
                 Text(e2eeError)
@@ -183,8 +237,8 @@ struct PrivacySettingsView: View {
             }
         }
         .padding(.vertical, 16)
-        .opacity(locked ? 0.75 : 1)
-        .help(PrivacySettingsPolicy.e2eeHelp(cloudE2EEEnabled: state))
+        .opacity(e2eeNonInteractive ? 0.75 : 1)
+        .help(e2eeHelpText)
         .confirmationDialog(
             PrivacySettingsCopy.e2eeConfirmTitle,
             isPresented: $showE2EEConfirm,
@@ -204,14 +258,16 @@ struct PrivacySettingsView: View {
     // universal Release build.
     private var e2eeRowHeader: some View {
         let state = privacy.cloudE2EEEnabled
-        let locked = PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: state) == .locked
+        // Non-interactive when locked (older CLI, KTD-8) OR gated (SCR-260 —
+        // not cloud-capable): both render a dimmed row with a nil-action toggle.
+        let nonInteractive = e2eeNonInteractive
         // A ternary between `nil` and the unapplied method reference
         // `toggleE2EE` is what crashed the solver ("failed to produce
         // diagnostic for expression") and failed the Release build. A plain
         // `if` plus an explicit closure literal avoids both the ternary and the
         // bare method reference.
         let toggleAction: (() -> Void)?
-        if locked {
+        if nonInteractive {
             toggleAction = nil
         } else {
             toggleAction = { toggleE2EE() }
@@ -224,10 +280,10 @@ struct PrivacySettingsView: View {
                         .foregroundStyle(Color.scInk)
                     chip(
                         PrivacySettingsPolicy.e2eeChip(cloudE2EEEnabled: state),
-                        color: locked ? .scInkMuted : .scTeal
+                        color: nonInteractive ? .scInkMuted : .scTeal
                     )
                 }
-                Text(PrivacySettingsPolicy.e2eeCaption(cloudE2EEEnabled: state))
+                Text(e2eeCaptionText)
                     .font(SCTypography.sans(size: 12.5))
                     .foregroundStyle(Color.scInkMuted)
                     .fixedSize(horizontal: false, vertical: true)
@@ -251,8 +307,11 @@ struct PrivacySettingsView: View {
     private func toggleE2EE() {
         guard !e2eeWriteInFlight else { return }
         e2eeError = nil
-        switch PrivacySettingsPolicy.e2eeTapOutcome(cloudE2EEEnabled: privacy.cloudE2EEEnabled) {
-        case .locked:
+        // Uses the eligibility-aware outcome: a gated row's toggle already has a
+        // nil action, so this is defense-in-depth — a gated (or locked) tap is a
+        // no-op, never a disclosure or a KEK-creating write (SCR-260).
+        switch e2eeOutcome {
+        case .locked, .gated:
             return
         case .showDisclosure:
             showE2EEConfirm = true

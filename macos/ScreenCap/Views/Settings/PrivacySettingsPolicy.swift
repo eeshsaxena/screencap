@@ -247,6 +247,9 @@ enum PrivacySettingsCopy {
     static let e2eeSubGatedNoPlan = "Cloud copies need a cloud plan. Encrypting future uploads is available on the Cloud subscription."
     static let e2eeSubGatedUnconfirmed = "Couldn't confirm your plan while offline. Reconnect to turn on encryption for cloud copies."
     static let e2eeHelpGated = "Encrypting cloud copies is available with a cloud plan."
+    // Shown only during the pre-first-check auth window (`.unknown`), so an
+    // already-eligible user never flashes the signed-out "sign in" copy.
+    static let e2eeSubChecking = "Checking your plan…"
 
     // R4: the limits disclosure that gates the off→on flip. The body must name
     // the custody and limits plainly BEFORE the user commits (SCR-253 U8,
