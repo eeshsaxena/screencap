@@ -76,7 +76,9 @@ def _write_identity_files(
     # locally to keep the engine-subprocess import surface small.
     from screencap.pipeline_policy import resolve_policy
 
-    resolved = resolve_policy(destination=destination)
+    # SCR-214 U8/KTD5: an ambient recording resolves to DELETE_AFTER_DAYS (default
+    # 30d) so its raw footage rolls off; the window is frozen here per recording.
+    resolved = resolve_policy(destination=destination, ambient=ambient)
 
     if masked_video_upload is None:
         from screencap.config import get_masked_video_upload_enabled

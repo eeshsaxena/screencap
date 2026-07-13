@@ -210,6 +210,41 @@ def get_ambient_autostart() -> bool:
     return _parse_ambient_bool("SCREENCAP_AMBIENT_AUTOSTART", "autostart", True)
 
 
+# SCR-214 U8/KTD5: the DEFAULT ambient retention window, in days. An always-on,
+# full-fidelity ambient stream cannot inherit the keep_forever retention default
+# (R11) — raw footage must roll off — so ambient recordings resolve to
+# DELETE_AFTER_DAYS with this window (see ``pipeline_policy.resolve_policy``).
+_AMBIENT_RETENTION_DAYS_DEFAULT = 30
+
+
+def get_ambient_retention_days() -> int:
+    """Return the default ambient retention window in days (default 30).
+
+    Raw ambient footage rolls off after this many days (R13); a chunk covered by
+    a *kept* (user-curated) task span is retained beyond it (R14, enforced in
+    ``retention.py``). User-overridable: ``SCREENCAP_AMBIENT_RETENTION_DAYS`` env >
+    ``[ambient].retention_days`` config > ``30``. A non-positive / non-integer
+    value is rejected — a retention window must be a positive number of days.
+
+    Frozen-per-recording caveat: this value is read at recording START and frozen
+    into ``.recording_intent`` by ``pipeline_policy.resolve_policy``. Because the
+    resolved policy is durable on disk, a later change to this default applies to
+    FUTURE ambient days only — each existing day keeps the window it started with.
+    """
+    env = os.environ.get("SCREENCAP_AMBIENT_RETENTION_DAYS")
+    if env is not None:
+        return _coerce_pos_int("SCREENCAP_AMBIENT_RETENTION_DAYS", env)
+    section = _load_toml().get("ambient", {})
+    if isinstance(section, dict) and "retention_days" in section:
+        val = section.get("retention_days")
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise SystemExit(
+                f"Error: [ambient].retention_days must be a positive integer, got: {val!r}"
+            )
+        return val
+    return _AMBIENT_RETENTION_DAYS_DEFAULT
+
+
 def set_ambient_enabled(value: bool) -> None:
     """Persist the ambient-enabled opt-in to ``[ambient].enabled`` in config.toml.
 

@@ -86,8 +86,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "EvictionReport",
     "ScreenshotEvictionReport",
+    "chunk_capture_bounds",
     "evict_recording",
     "evict_screenshots",
+    "task_span_is_orphaned",
 ]
 
 
@@ -431,6 +433,148 @@ def _evictable_candidates(
 
 
 # ---------------------------------------------------------------------------
+# SCR-214 U8/KTD5 — capture-time chunk bounds + kept-task-span protection.
+#
+# A "kept task span" pins its footage past the retention window (R14). Mapping a
+# task span [start_ts, end_ts] (CAPTURE-time coords) to the chunk indices it
+# overlaps MUST use per-chunk CAPTURE bounds — never the ledger ``updated_at``,
+# which is a state-transition time (a chunk re-transitioned near eviction would
+# mis-map). The chunk manifest carries ``chunk_start`` / ``chunk_end`` (Unix
+# epoch) in BOTH the v1 and v2 formats; it is the authoritative capture window.
+# The recording.db frame tables (action_event / screenshot / window_event) carry
+# only ``timestamp`` and no ``chunk_index``, so there is no reliable per-chunk
+# frame fallback — the manifest is the single source. It is unlinked ONLY at
+# eviction, so every surviving (candidate) chunk still has it.
+# ---------------------------------------------------------------------------
+
+
+def _spans_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
+    """Half-open ``[a_start, a_end)`` ∩ ``[b_start, b_end)`` is non-empty."""
+    return a_start < b_end and b_start < a_end
+
+
+def chunk_capture_bounds(recording_dir: Path, idx: int) -> tuple[float, float] | None:
+    """Per-chunk CAPTURE-time bounds ``(chunk_start, chunk_end)`` from its manifest.
+
+    Reads ``chunk_<idx>_manifest.json``'s ``chunk_start`` / ``chunk_end`` (present
+    in the v1 and v2 formats). Returns ``None`` when the manifest is missing /
+    unparseable / lacks finite ordered bounds — the safe "unknown window" signal
+    the protector treats conservatively. NEVER derived from the ledger
+    ``updated_at`` (a state-transition time, not a capture window — KTD5).
+    """
+    import json
+    import math
+
+    manifest = recording_dir / f"chunk_{idx:04d}_manifest.json"
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    start = data.get("chunk_start")
+    end = data.get("chunk_end")
+    if isinstance(start, bool) or isinstance(end, bool):
+        return None
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
+        return None
+    return float(start), float(end)
+
+
+def _kept_task_spans(ledger: "PipelineLedger") -> list[tuple[float, float]]:
+    """The recording's KEPT (user-curated) task spans: ``source='user' OR edited=1``.
+
+    Only user-curated tasks pin footage past the retention window (R14/KTD5). The
+    agent's ephemeral auto-split (``source='agent' AND edited=0``) does NOT — it
+    relabels most of the active day, so pinning its spans would leave retention
+    almost nothing to evict. Fail-safe: a read error yields no spans (retention
+    proceeds under the age floor; a spurious protection is never invented).
+    """
+    from screencap.pipeline_state import TASK_SOURCE_USER
+
+    try:
+        rows = ledger.read_task_segments()
+    except Exception as exc:  # noqa: BLE001 — protection is best-effort over the age floor
+        logger.debug("retention: kept-task read failed (%s); no task protection", exc)
+        return []
+    spans: list[tuple[float, float]] = []
+    for r in rows:
+        if r.source != TASK_SOURCE_USER and not r.edited:
+            continue
+        try:
+            s, e = float(r.start_ts), float(r.end_ts)
+        except (TypeError, ValueError):
+            continue
+        if e > s:
+            spans.append((s, e))
+    return spans
+
+
+def _task_protected_indices(
+    recording_dir: Path, ledger: "PipelineLedger", candidates: list["ChunkRow"],
+) -> set[int]:
+    """Candidate chunk indices to EXCLUDE because a KEPT task span covers them (R14).
+
+    Maps each kept span to chunk indices via :func:`chunk_capture_bounds`
+    (capture-time, never ``updated_at``) and protects any candidate whose capture
+    window overlaps a kept span — whole-chunk granularity, so a chunk partially
+    under a kept span is kept WHOLE (chunks are the eviction unit). A candidate
+    with an unknown capture window while kept spans exist is conservatively
+    protected (never evict footage that MIGHT lie under a kept task). Empty when
+    there are no kept spans — the common non-ambient / no-user-task case is a
+    zero-cost no-op.
+    """
+    spans = _kept_task_spans(ledger)
+    if not spans:
+        return set()
+    protected: set[int] = set()
+    for c in candidates:
+        bounds = chunk_capture_bounds(recording_dir, c.chunk_index)
+        if bounds is None:
+            protected.add(c.chunk_index)
+            continue
+        cs, ce = bounds
+        if any(_spans_overlap(cs, ce, ss, se) for ss, se in spans):
+            protected.add(c.chunk_index)
+    return protected
+
+
+def task_span_is_orphaned(
+    recording_dir: Path, ledger: "PipelineLedger", start_ts: float, end_ts: float,
+) -> bool:
+    """True iff ``[start_ts, end_ts)`` points ONLY at EVICTED / absent footage (U8).
+
+    The orphan guard for ``tasks.create``: a task must point at PLAYABLE footage,
+    so persisting one over already-evicted chunks would leave an unplayable task.
+    Evicted chunks have their media AND manifest unlinked, so their capture window
+    is unknowable from disk; surviving chunks keep their manifest. To avoid
+    blocking normal creation over live / legacy recordings, this refuses ONLY on
+    POSITIVE eviction evidence: the recording has >=1 ``EVICTED`` chunk AND the
+    requested span overlaps NONE of the surviving on-disk chunk windows. A
+    recording with no evicted chunks (or no chunk/ledger info at all) fails OPEN
+    (returns False). Any read hiccup fails open.
+    """
+    from screencap.pipeline_state import EvictState
+
+    try:
+        rows = ledger.all_chunks()
+    except Exception as exc:  # noqa: BLE001 — the guard must never block a create on a hiccup
+        logger.debug("retention: orphan-guard chunk read failed (%s); allowing", exc)
+        return False
+    has_evicted = False
+    for r in rows:
+        if r.evict_state == EvictState.EVICTED:
+            has_evicted = True
+            continue
+        bounds = chunk_capture_bounds(recording_dir, r.chunk_index)
+        if bounds is not None and _spans_overlap(bounds[0], bounds[1], start_ts, end_ts):
+            return False  # surviving footage covers the span → playable → not orphaned
+    return has_evicted
+
+
+# ---------------------------------------------------------------------------
 # Per-policy candidate selection — decides WHICH evictable chunks to evict.
 # The floor is applied first; these only narrow within the candidate set.
 # ---------------------------------------------------------------------------
@@ -632,6 +776,16 @@ def evict_recording(
     candidates = _evictable_candidates(ledger, local=local)
     if not candidates:
         return report
+
+    # SCR-214 U8/KTD5 (R14): never evict a chunk covered by a KEPT (user-curated)
+    # task span. Map kept spans → chunk indices via CAPTURE-time bounds and drop
+    # those candidates BEFORE the policy selects. A no-op (empty set) whenever the
+    # recording has no user/edited task rows — the entire non-ambient path.
+    protected = _task_protected_indices(recording_dir, ledger, candidates)
+    if protected:
+        candidates = [c for c in candidates if c.chunk_index not in protected]
+        if not candidates:
+            return report
 
     selected = _select_for_policy(
         recording_dir, candidates, policy,

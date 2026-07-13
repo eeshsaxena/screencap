@@ -2307,6 +2307,26 @@ def _resolve_task_ledger(recording: str, schema_version: int):
         raise errors.RecordingNotFoundError(schema_version=schema_version) from exc
 
 
+def _task_span_orphaned(recording: str, ledger, start_ts: float, end_ts: float) -> bool:
+    """SCR-214 U8 orphan guard: is ``[start_ts, end_ts)`` over EVICTED footage?
+
+    Resolves the recording dir (the ``recording`` name is pre-validated at the
+    handler boundary) and delegates to
+    :func:`screencap.retention.task_span_is_orphaned`, which refuses ONLY on
+    positive eviction evidence and otherwise fails open — so a task over live /
+    legacy footage is never blocked. Pure disk IO; the handler runs it off the
+    loop via ``asyncio.to_thread``.
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.retention import task_span_is_orphaned
+
+    try:
+        rec_dir = resolve_recording_dir(recording)
+    except ValueError:
+        return False  # defense-in-depth; name is pre-validated + ledger already resolved
+    return task_span_is_orphaned(rec_dir, ledger, start_ts, end_ts)
+
+
 def _task_crud_peer_audit(request: Request, verb: str):
     """Build the (peer, ``_audit``) pair shared by the five task CRUD handlers.
 
@@ -2338,8 +2358,10 @@ async def tasks_create(request: Request) -> JSONResponse:
     it never collides with the agent's low range and survives the next agent
     re-segmentation. Rejects a zero-length / inverted / out-of-range span and an
     empty/control-char label with a typed 400; a traversal recording name with
-    400 ``invalid_name``; an unknown recording with 404. Local-only — the row
-    lives in ``recording.db`` and is never uploaded.
+    400 ``invalid_name``; an unknown recording with 404; and (U8 orphan guard) a
+    span pointing only at already-EVICTED footage with 400 ``invalid_request`` —
+    so no unplayable task is persisted. Local-only — the row lives in
+    ``recording.db`` and is never uploaded.
     """
     from screencap.daemon._name_validation import validate_recording_name
     from screencap.pipeline_state import TaskSegmentRow
@@ -2355,6 +2377,17 @@ async def tasks_create(request: Request) -> JSONResponse:
         _validate_task_span(parsed.start_ts, parsed.end_ts, schema_version=_v)
 
         ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+
+        # SCR-214 U8 orphan guard: refuse a task whose span points only at
+        # already-EVICTED footage — persisting it would leave an unplayable task.
+        # Fails open on live / legacy recordings with no eviction, so normal
+        # creation is never blocked.
+        if await asyncio.to_thread(
+            _task_span_orphaned, parsed.recording, ledger,
+            parsed.start_ts, parsed.end_ts,
+        ):
+            raise errors.InvalidRequestError(schema_version=_v)
+
         row = TaskSegmentRow(
             task_index=0,  # ignored; insert_task_segment allocates the HIGH index
             start_ts=parsed.start_ts,

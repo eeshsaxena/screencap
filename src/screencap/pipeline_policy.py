@@ -142,6 +142,7 @@ PolicyOverride = Callable[[ResolvedPolicy], ResolvedPolicy]
 def resolve_policy(
     *,
     destination: str | Destination,
+    ambient: bool = False,
     override: PolicyOverride | None = None,
 ) -> ResolvedPolicy:
     """Resolve the ``ResolvedPolicy`` to FREEZE for a recording (the R13 seam).
@@ -155,6 +156,14 @@ def resolve_policy(
     Args:
         destination: ``local`` / ``cloud`` / ``both`` (the user/config intent
             for this recording). Accepts the enum or its string value.
+        ambient: True for the SCR-214 always-on ambient stream. An ambient
+            recording overrides the config retention default with
+            ``DELETE_AFTER_DAYS`` at a user-configurable window
+            (``config.get_ambient_retention_days``, default 30) so raw footage
+            rolls off (R13/KTD5); non-ambient recordings keep the config default
+            (``keep_forever``). This resolved value is FROZEN per recording, so a
+            later window-default change applies to FUTURE ambient days only —
+            each existing day keeps the window it started with.
         override: optional per-call plan-tier hook (the seam). Receives the
             config-default policy and returns the policy to freeze. Defaults
             to the process-wide default override if one is registered.
@@ -179,6 +188,21 @@ def resolve_policy(
     from screencap.config import get_retention_policy
 
     policy_name, params = get_retention_policy()
+
+    if ambient:
+        # SCR-214 U8/KTD5: an always-on, full-fidelity ambient stream CANNOT
+        # inherit the keep_forever default (R11) — raw footage must roll off, so
+        # ambient resolves to DELETE_AFTER_DAYS with a user-configurable window
+        # (default 30). Non-ambient recordings are untouched. Because this
+        # resolved policy is FROZEN into ``.recording_intent`` at start, a later
+        # change to the window default applies to FUTURE ambient days only; each
+        # existing day keeps the window it started with (surface this in the
+        # ambient-retention setting copy).
+        from screencap.config import get_ambient_retention_days
+
+        policy_name = RetentionPolicy.DELETE_AFTER_DAYS.value
+        params = {"days": get_ambient_retention_days()}
+
     base = ResolvedPolicy(
         destination=dest,
         retention_policy=RetentionPolicy(policy_name),
