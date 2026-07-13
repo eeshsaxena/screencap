@@ -75,6 +75,24 @@ def test_list_json_empty(tmp_path):
     assert parsed == []
 
 
+def test_list_json_locked_store_is_distinguishable_from_empty(tmp_path):
+    """SCR-258 U10 (AE8): `list --json` against a LOCKED store must NOT emit a
+    bare ``[]`` that a consumer would render as an empty library. It emits a
+    typed envelope carrying ``store_state`` so the Swift Library can tell a
+    locked vault from a genuinely-empty archive."""
+    runner = CliRunner()
+    with mock.patch("screencap.catalog.get_recordings_dir", return_value=tmp_path), \
+         mock.patch("screencap.cli._derive_local_store_state", return_value="locked"):
+        result = runner.invoke(cli, ["list", "--json"])
+    assert result.exit_code == 0
+    parsed = json.loads(result.output)
+    # Crucially NOT a bare empty array.
+    assert parsed != []
+    assert isinstance(parsed, dict)
+    assert parsed["store_state"] == "locked"
+    assert parsed["recordings"] == []
+
+
 def test_view_not_found(tmp_path):
     runner = CliRunner()
     with mock.patch("screencap.config.get_recordings_dir", return_value=tmp_path):

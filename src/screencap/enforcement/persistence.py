@@ -32,6 +32,9 @@ from screencap.privacy.domain_loader import extract_root_domain
 
 logger = logging.getLogger(__name__)
 
+# RUN-DIR boundary (SCR-236 R3): config.toml + its advisory lock stay OUTSIDE the
+# at-rest container as plaintext by design (the flag that would relocate the data
+# plane is itself read from here). Do NOT route through config.get_data_root().
 _BASE_DIR = Path.home() / ".screencap"
 _CONFIG_PATH = _BASE_DIR / "config.toml"
 _LOCK_PATH = _BASE_DIR / "config.lock"

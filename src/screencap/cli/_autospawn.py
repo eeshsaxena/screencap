@@ -52,6 +52,8 @@ LAUNCHAGENT_LABEL = "com.screencap.daemon"
 # in the middle of a multi-command sequence.
 DEFAULT_IDLE_SHUTDOWN_S = 600
 
+# RUN-DIR boundary (SCR-236 R3): the auto-spawn diagnostic log stays OUTSIDE the
+# at-rest container as plaintext. Do NOT route through config.get_data_root().
 _AUTO_LOG_PATH = Path.home() / ".screencap" / "run" / "auto-serve.log"
 
 

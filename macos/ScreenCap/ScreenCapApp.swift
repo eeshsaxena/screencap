@@ -13,6 +13,9 @@ struct ScreenCapApp: App {
     @StateObject private var permissions = PermissionController()
     @StateObject private var index = RecordingsIndex()
     @StateObject private var privacy = PrivacyController()
+    /// SCR-258 U10: owns the encrypted-store Lock / Unlock actions + the
+    /// store-scoped present-user gate. Shared by the shell and the menu bar.
+    @StateObject private var store = StoreController()
     @StateObject private var intelligence = IntelligenceController()
     @StateObject private var uploads: UploadCoordinator
     @StateObject private var auth: CloudAuthController
@@ -60,12 +63,15 @@ struct ScreenCapApp: App {
                 .environmentObject(intelligence)
                 .environmentObject(auth)
                 .environmentObject(uploads)
+                .environmentObject(store)
                 .frame(minWidth: 880, minHeight: 560)
                 .background(OpenWindowBridge())
                 .onAppear {
                     appDelegate.bind(recorder: recorder)
                     recorder.bindIndex(index)
                     recorder.bindPermissions(permissions)
+                    // SCR-258 U10: lock/unlock refresh the store state via the index.
+                    store.bind(index: index)
                     permissions.refresh()
                 }
                 // Cloud sign-in state is deliberately NOT probed here at launch.
@@ -153,6 +159,9 @@ struct ScreenCapApp: App {
                 .environmentObject(recorder)
                 .environmentObject(auth)
                 .environmentObject(uploads)
+                .environmentObject(index)
+                .environmentObject(store)
+                .environmentObject(privacy)
         } label: {
             MenuBarLabel(isRecording: recorder.state.isRecording)
         }

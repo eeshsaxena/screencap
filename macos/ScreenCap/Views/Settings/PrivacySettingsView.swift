@@ -68,6 +68,8 @@ struct PrivacySettingsView: View {
                 pauseRow
                 rowDivider
                 StorageRow()
+                rowDivider
+                EncryptedStorageRow()
             }
             .frame(maxWidth: 720)
 
@@ -79,6 +81,9 @@ struct PrivacySettingsView: View {
         .background(Color.scCanvas)
         .task {
             await privacy.refreshStatus()
+            // SCR-258 U10: the persistent encrypt-migration entry reflects live
+            // progress / the paused state.
+            await privacy.refreshEncryptStatus()
             // SCR-260/SCR-241: coalesced, no-op-once-resolved refresh so the
             // E2EE gate reflects current sign-in/plan state without an eager
             // `whoami` Keychain decrypt on every pane open.
@@ -587,5 +592,97 @@ private struct StorageRow: View {
             panel.directoryURL = URL(fileURLWithPath: current).deletingLastPathComponent()
         }
         return panel.runModal() == .OK ? panel.urls.first : nil
+    }
+}
+
+/// SCR-258 U10 (KTD-18): the persistent encrypted-storage / upgrade-migration
+/// entry. Always available in the storage section (the Library banner is the
+/// one-shot, dismissable sibling). Shows an "On — encrypted at rest" state once the
+/// library is a container, an "Encrypt now" offer for an eligible plaintext
+/// install, live progress while migrating, the distinct auto-resuming paused copy
+/// (never rendered as a failure), and a retry on a refusal/failure.
+private struct EncryptedStorageRow: View {
+    @EnvironmentObject private var privacy: PrivacyController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text("Encrypted on-disk storage")
+                            .font(SCTypography.sans(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.scInk)
+                        if privacy.storeEncrypted == true {
+                            chip("On", color: .scTeal)
+                        }
+                    }
+                    Text(caption)
+                        .font(SCTypography.sans(size: 12.5))
+                        .foregroundStyle(Color.scInkMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                trailingControl
+            }
+            if let status = VaultMigrationPolicy.statusLine(for: privacy.encryptState),
+               privacy.storeEncrypted != true {
+                Text(status)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(statusColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 16)
+    }
+
+    private var caption: String {
+        if privacy.storeEncrypted == true {
+            return "Your recordings are stored as ciphertext on this Mac and can be sealed with Touch ID."
+        }
+        return VaultMigrationPolicy.bannerBody
+    }
+
+    @ViewBuilder
+    private var trailingControl: some View {
+        if privacy.storeEncrypted == true {
+            EmptyView()
+        } else {
+            switch privacy.encryptState {
+            case .migrating, .paused:
+                ProgressView().controlSize(.small)
+            case .idle, .failed, .succeeded:
+                Button(privacy.encryptState.isFailedOrIdleOffersRetry ? "Try again" : "Encrypt now") {
+                    Task { await privacy.startEncryption() }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.scTeal)
+            }
+        }
+    }
+
+    private var statusColor: Color {
+        switch privacy.encryptState {
+        case .failed: return .scAmberText
+        case .succeeded: return .scTeal
+        default: return .scInkMuted
+        }
+    }
+
+    private func chip(_ label: String, color: Color) -> some View {
+        Text(label)
+            .font(SCTypography.mono(size: 9.5))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .overlay(Capsule().strokeBorder(color.opacity(0.35), lineWidth: 1))
+    }
+}
+
+extension PrivacyController.EncryptMigrationState {
+    /// Whether the trailing control should read "Try again" (a prior refusal /
+    /// failure) rather than the first-time "Encrypt now".
+    var isFailedOrIdleOffersRetry: Bool {
+        if case .failed = self { return true }
+        return false
     }
 }

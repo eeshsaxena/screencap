@@ -38,7 +38,10 @@ _REPO = Path(__file__).resolve().parent.parent
 
 def _cli(home: Path, *args: str, key_file: Path | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("SCREENCAP_")}
-    env.update(HOME=str(home), PYTHONPATH="src")
+    # Pin the vault container off: this suite exercises corpus/search encryption
+    # (the plaintext content_index layout), not the on-disk container which now
+    # defaults on (SCR-258).
+    env.update(HOME=str(home), PYTHONPATH="src", SCREENCAP_CONTAINER_ENABLED="0")
     if key_file is not None:
         env["SCREENCAP_CORPUS_KEY_FILE"] = str(key_file)
     return subprocess.run(
@@ -49,7 +52,10 @@ def _cli(home: Path, *args: str, key_file: Path | None = None):
 
 def _py(home: Path, code: str, key_file: Path | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("SCREENCAP_")}
-    env.update(HOME=str(home), PYTHONPATH="src")
+    # Pin the vault container off: this suite exercises corpus/search encryption
+    # (the plaintext content_index layout), not the on-disk container which now
+    # defaults on (SCR-258).
+    env.update(HOME=str(home), PYTHONPATH="src", SCREENCAP_CONTAINER_ENABLED="0")
     if key_file is not None:
         env["SCREENCAP_CORPUS_KEY_FILE"] = str(key_file)
     return subprocess.run([sys.executable, "-c", code], env=env, cwd=str(_REPO), capture_output=True, text=True)

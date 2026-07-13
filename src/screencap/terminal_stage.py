@@ -84,6 +84,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TerminalStageBusy",
+    "TerminalStageInterrupted",
     "TerminalResult",
     "AccountMismatch",
     "CloudCopyProducer",
@@ -98,6 +99,8 @@ __all__ = [
 # created here if needed), so it is never inside a recording dir the uploader
 # enumerates. Kernel auto-releases the flock on process death (same property
 # pidfile.py relies on) — no stale-lock cleanup needed.
+# RUN-DIR boundary (SCR-236 R3): stays OUTSIDE the at-rest container as plaintext
+# live-process state. Do NOT route through config.get_data_root().
 _RUN_DIR = Path.home() / ".screencap" / "run"
 
 # Blocking-with-timeout default: poll LOCK_NB so we can bound the wait and
@@ -130,6 +133,34 @@ class PromotionRefused(RuntimeError):
     The message names the missing chunk indices and the recording so the user
     can act.
     """
+
+
+class TerminalStageInterrupted(RuntimeError):
+    """A cooperative ``stop_event`` halted the terminal stage at a safe boundary.
+
+    Raised by :func:`run_terminal_stage` (SCR-258 U9) when the caller-supplied
+    ``stop_event`` is set — checked ONLY BETWEEN per-chunk ledger transitions, so
+    the halt always lands at a ledger-safe boundary (the ``PipelineLedger``'s
+    crash-safe ordering is what makes the interrupted cycle resumable). This is
+    the quiescence engine's seam: a ``storage.lock`` sets the event so an in-flight
+    resume stops promptly and the store can seal within the grace budget WITHOUT
+    waiting for a slow upload to finish; the recording resumes on unlock (AE7).
+    Never leaves a partial ledger transition — no chunk is marked UPLOADED that was
+    not actually confirmed, and no sentinel is written on this path.
+    """
+
+
+def _check_stop(stop_event: "threading.Event | None") -> None:
+    """Raise :class:`TerminalStageInterrupted` iff ``stop_event`` is set (U9).
+
+    Call ONLY at ledger-safe boundaries (before a phase, between per-chunk
+    transitions) — never mid-transition — so the halt is always resumable.
+    """
+    if stop_event is not None and stop_event.is_set():
+        raise TerminalStageInterrupted(
+            "terminal stage halted at a ledger-safe boundary by stop_event "
+            "(store lock); the recording resumes on unlock"
+        )
 
 
 @dataclass(frozen=True)
@@ -611,6 +642,7 @@ def run_terminal_stage(
     force_destination: "Destination | str | None" = None,
     retention_override: "RetentionPolicy | str | None" = None,
     on_progress: Callable[[str], None] | None = None,
+    stop_event: "threading.Event | None" = None,
     _remote_exists: Callable[[int], bool] | None = None,
     _on_locked: Callable[[], None] | None = None,
 ) -> TerminalResult:
@@ -647,6 +679,13 @@ def run_terminal_stage(
             watcher there; best-effort and never affects the outcome.
         _remote_exists: test/eviction seam — a callback ``(idx) -> bool`` used
             in place of a real GCS stat.
+        stop_event: SCR-258 U9 cooperative quiescence seam — a ``threading.Event``
+            checked ONLY BETWEEN per-chunk ledger transitions (never mid-
+            transition). When set, the stage raises :class:`TerminalStageInterrupted`
+            at the next ledger-safe boundary so a ``storage.lock`` can seal within
+            its grace budget without waiting for a slow upload; the recording
+            resumes on unlock (AE7). ``None`` (the default) on every existing caller
+            — byte-identical to today. Mirrors ``backfill_job._stop_event``.
         _on_locked: test hook invoked immediately after the lock is acquired,
             before any ledger read (used by the AE12 decision-time race test).
 
@@ -660,6 +699,9 @@ def run_terminal_stage(
             it; never a partial cloud copy.
         TerminalStageBusy: when the lock is contended (per ``non_blocking`` /
             ``lock_timeout``).
+        TerminalStageInterrupted: when ``stop_event`` is set at a ledger-safe
+            boundary (U9 quiescence). The ledger is left consistent and the
+            recording resumes on unlock.
     """
     recording_dir = Path(recording_dir)
     name = recording_dir.name
@@ -678,6 +720,9 @@ def run_terminal_stage(
             remote_exists=_remote_exists,
         )
 
+    # U9: if the lock already fired before we even acquired the flock, bail at
+    # this ledger-safe boundary (nothing written yet).
+    _check_stop(stop_event)
     # === STEP 0: flock FIRST. Nothing below runs until we hold it. ===
     with terminal_lock(name, non_blocking=non_blocking, timeout=lock_timeout):
         if _on_locked is not None:
@@ -696,6 +741,7 @@ def run_terminal_stage(
             retention_override=retention_override,
             on_progress=on_progress,
             remote_exists=_remote_exists,
+            stop_event=stop_event,
         )
 
 
@@ -709,6 +755,7 @@ def _run_locked(
     retention_override: "RetentionPolicy | str | None" = None,
     on_progress: Callable[[str], None] | None = None,
     remote_exists: Callable[[int], bool] | None = None,
+    stop_event: "threading.Event | None" = None,
 ) -> TerminalResult:
     """The critical section — runs only while the terminal flock is held."""
     from screencap.catalog import read_intent_policy
@@ -744,6 +791,10 @@ def _run_locked(
     ledger = _open_ledger(recording_dir)
     if ledger is not None:
         result.n_expected = ledger.chunks_expected()
+
+    # U9: ledger-safe boundary between the (cheap, no-op-safe) schema-ensure above
+    # and the routing work below. Bail here if the lock fired.
+    _check_stop(stop_event)
 
     if destination is Destination.LOCAL:
         # local → no scrub, no upload. Mark each chunk LOCAL_DONE so the
@@ -781,6 +832,7 @@ def _run_locked(
         policy=policy,
         retention_override=retention_override,
         on_progress=on_progress,
+        stop_event=stop_event,
     )
 
 
@@ -1241,6 +1293,7 @@ def _route_cloud(
     policy: "ResolvedPolicy | None" = None,
     retention_override: "RetentionPolicy | str | None" = None,
     on_progress: Callable[[str], None] | None = None,
+    stop_event: "threading.Event | None" = None,
 ) -> TerminalResult:
     """Produce the cloud copy, reconcile, upload, gate the sentinel.
 
@@ -1360,6 +1413,12 @@ def _route_cloud(
         )
         return result
 
+    # U9: ledger-safe boundary before the long produce/upload phase. The reconcile
+    # above only re-stat'd chunks (idempotent, no partial transition), so bailing
+    # here leaves the ledger consistent and the recording resumes on unlock — the
+    # store can seal WITHOUT waiting for this upload (AE7).
+    _check_stop(stop_event)
+
     # 2. Produce the cloud copy via the scrub seam adapter. SCR-175: ping just
     # before the longest silent phase (recovery + scrub + OCR masking) so the
     # interactive watchdog enters produce() with a freshly-reset budget rather
@@ -1385,6 +1444,12 @@ def _route_cloud(
         )
         # We still attempt to upload the chunks that DID succeed (resumable),
         # but the sentinel gate below will not be satisfied.
+
+    # U9: ledger-safe boundary between produce (scrubbed copy on disk, but NO
+    # ledger UPLOADED mark yet) and the upload. Bailing here means no chunk is
+    # marked UPLOADED that was not confirmed remote, and no sentinel is written —
+    # the recording resumes cleanly on unlock.
+    _check_stop(stop_event)
 
     # 3. Upload the scrubbed copy's artifacts. ``upload_recording`` enumerates
     # via ``list_recording_files`` which already excludes recording.db + WAL

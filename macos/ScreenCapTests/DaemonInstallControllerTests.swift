@@ -20,6 +20,29 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .installedAndRunning)
     }
 
+    /// SCR-258 U10 (item 7): `storage init` runs BEFORE SMAppService registration so
+    /// the daemon that starts on registration mounts a real container rather than
+    /// reporting `absent`.
+    func testStorageInitRunsBeforeRegistration() async {
+        let log = OrderLog()
+        let controller = DaemonInstallController(
+            registrationService: OrderRecordingRegistrationService(log: log),
+            probe: FakeDaemonProbe(results: [true]),
+            sleep: { _ in },
+            ensureStoreInit: { await log.record("init") }
+        )
+
+        await controller.install(timeoutSeconds: 1, probeIntervalSeconds: 0.01)
+
+        let entries = await log.entries
+        XCTAssertEqual(entries.first, "init", "storage init must run before registration")
+        guard let iInit = entries.firstIndex(of: "init"),
+              let iReg = entries.firstIndex(of: "register") else {
+            return XCTFail("expected both init and register to run: \(entries)")
+        }
+        XCTAssertLessThan(iInit, iReg)
+    }
+
     // SCR-200 U3/U4: proactive TCC setup (register SR+Accessibility, clear
     // decoys) fires exactly once per daemon version, not on every poll.
     func testProactiveTccSetupFiresOncePerVersion() async {
@@ -667,4 +690,31 @@ private actor ProactiveSetupCounter {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
+}
+
+/// SCR-258 U10: an ordered event log for the storage-init-before-registration test.
+private actor OrderLog {
+    private(set) var entries: [String] = []
+    func record(_ s: String) { entries.append(s) }
+}
+
+/// Registration service that records the order it is called relative to the
+/// injected `ensureStoreInit` step.
+@MainActor
+private final class OrderRecordingRegistrationService: DaemonRegistrationService {
+    private let log: OrderLog
+    private let status: SMAppService.Status
+    init(log: OrderLog, status: SMAppService.Status = .enabled) {
+        self.log = log
+        self.status = status
+    }
+    func register(plistName: String) async throws -> SMAppService.Status {
+        await log.record("register")
+        return status
+    }
+    func refresh(plistName: String) async throws -> SMAppService.Status {
+        await log.record("refresh")
+        return status
+    }
+    func currentStatus(plistName: String) -> SMAppService.Status { status }
 }

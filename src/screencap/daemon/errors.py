@@ -44,6 +44,24 @@ INVALID_REQUEST = "invalid_request"
 STORAGE_MIGRATION_FAILED = "storage_migration_failed"
 MIGRATION_IN_PROGRESS = "migration_in_progress"
 
+# SCR-258 U4 (KTD-14): store-touching MUTATION verbs refuse when the encrypted
+# store is not available. STORE_LOCKED = a sealed sentinel is present (unlock
+# first); STORE_ABSENT = the store has not been initialized yet (``storage init``).
+# Read verbs never raise these — they carry ``store_state`` on their SUCCESS
+# envelope instead (the IndexState.STORE_UNAVAILABLE precedent).
+STORE_LOCKED = "store_locked"
+STORE_ABSENT = "store_absent"
+
+# SCR-258 U9 (KTD-15): the ``storage.lock`` / ``storage.unlock`` OPERATION itself
+# failed or was refused (as opposed to a mutation refused *because* the store is
+# already sealed, which is STORE_LOCKED above). Carries a specific ``reason``
+# (``detach_failed`` on a lock whose graceful-then-force detach failed;
+# ``keychain_locked`` / ``key_missing`` / ``entitlement_mismatch`` on an unlock
+# whose remount could not read the key) + a human ``message`` + a ``retryable``
+# flag so the surface can distinguish "try again in a moment" (Keychain locked)
+# from "the store is stuck mounted, nothing was sealed" (detach failed).
+STORE_LOCK_FAILED = "store_lock_failed"
+
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
 # as named constants prevents drift between handlers and tests.
@@ -355,6 +373,134 @@ class MigrationInProgressError(DaemonAPIError):
     http_status = 409
 
 
+class StoreLockedError(DaemonAPIError):
+    """A store-touching mutation was refused because the store is sealed (SCR-258 U4).
+
+    Raised by ``Supervisor.spawn`` (recording.start) — and any other store-touching
+    mutation verb — when the encrypted container is locked (a sealed sentinel is
+    present, KTD-14). Fired BEFORE any ``started`` signal and before any plaintext
+    directory is created at the mountpoint (the typed-error-before-spawn
+    convention, mirroring :class:`PermissionRequiredError`). Carries a static
+    human ``message`` naming the recovery route (unlock), mirroring
+    :class:`StorageMigrationError`'s reason/message shape. Maps to HTTP 409
+    (conflict with current state).
+    """
+
+    error_code = STORE_LOCKED
+    http_status = 409
+
+    def __init__(
+        self,
+        *,
+        schema_version: int,
+        message: str = (
+            "The recordings store is locked. Unlock it (screencap storage unlock) "
+            "before recording."
+        ),
+        reason: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        self.message = message
+        # Optional ERROR sub-cause (key_missing / entitlement_mismatch /
+        # keychain_locked / downgrade_unsupported) so the mutation-refusal path can
+        # distinguish the cause, mirroring StorageMigrationError. Backward-compatible:
+        # omitted from the envelope when None.
+        self.reason = reason
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"message": self.message}
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        return error_envelope(
+            schema_version=self.schema_version,
+            error=self.error_code,
+            **payload,
+        )
+
+
+class StoreAbsentError(DaemonAPIError):
+    """A store-touching mutation was refused because no store exists yet (SCR-258 U4).
+
+    Raised when the container is enabled but the encrypted bundle has not been
+    initialized (the SMAppService-starts-daemon-before-onboarding window, KTD-14).
+    Refusing here — rather than letting the historic silent path ``mkdir`` a
+    plaintext directory at the mountpoint (R10) — is the whole point. Fired before
+    any ``started`` signal. Maps to HTTP 409; ``message`` names ``storage init``.
+    """
+
+    error_code = STORE_ABSENT
+    http_status = 409
+
+    def __init__(
+        self,
+        *,
+        schema_version: int,
+        message: str = (
+            "The recordings store has not been set up yet. Run "
+            "'screencap storage init' before recording."
+        ),
+        reason: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        self.message = message
+        # Optional ERROR sub-cause, mirroring StorageMigrationError / StoreLockedError.
+        # Backward-compatible: omitted from the envelope when None.
+        self.reason = reason
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"message": self.message}
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        return error_envelope(
+            schema_version=self.schema_version,
+            error=self.error_code,
+            **payload,
+        )
+
+
+class StoreLockError(DaemonAPIError):
+    """A ``storage.lock`` / ``storage.unlock`` OPERATION failed or was refused (U9).
+
+    Distinct from :class:`StoreLockedError` (a *mutation* refused because the store
+    is already sealed): this is the lock/unlock verb's own failure. ``reason`` is a
+    code — ``detach_failed`` when a lock's graceful-then-force detach failed (the
+    store is left MOUNTED and unlocked, nothing sealed — never a half-sealed
+    state), or ``keychain_locked`` / ``key_missing`` / ``entitlement_mismatch``
+    when an unlock's remount could not read the key (the sentinel is left intact).
+    ``retryable`` tells the surface whether trying again in a moment can help (a
+    locked Keychain) versus a terminal operator condition. Mirrors
+    :class:`StorageMigrationError`'s reason/message shape. HTTP 409.
+    """
+
+    error_code = STORE_LOCK_FAILED
+    http_status = 409
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        schema_version: int,
+        retryable: bool = False,
+        http_status: int | None = None,
+    ) -> None:
+        self.reason = reason
+        self.message = message
+        self.retryable = retryable
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        return error_envelope(
+            schema_version=self.schema_version,
+            error=self.error_code,
+            reason=self.reason,
+            message=self.message,
+            retryable=self.retryable,
+        )
+
+
 class SchemaMismatchError(DaemonAPIError):
     error_code = SCHEMA_MISMATCH
     http_status = 400
@@ -632,6 +778,9 @@ __all__ = [
     "INVALID_PERMISSION",
     "INVALID_RANGE",
     "SUBSCRIPTION_REQUIRED",
+    "STORE_LOCKED",
+    "STORE_ABSENT",
+    "STORE_LOCK_FAILED",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
@@ -667,4 +816,7 @@ __all__ = [
     "PermissionRequiredError",
     "InvalidPermissionError",
     "SubscriptionRequiredError",
+    "StoreLockedError",
+    "StoreAbsentError",
+    "StoreLockError",
 ]

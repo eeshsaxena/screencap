@@ -145,9 +145,15 @@ async def test_resolve_frame_maps_pointer(monkeypatch):
     assert result.stem == "1719400010.000000"
     assert result.delta_ms == -1000
     assert result.encrypted is False  # unencrypted corpus -> read the .jpg directly
-    # Pointer-only by construction: a stem + delta + the encrypted steer, no
-    # path/bytes field.
-    assert set(server.FrameNearest.model_fields) == {"stem", "delta_ms", "encrypted"}
+    assert result.store_state == "mounted"  # SCR-258: carries store_state like its siblings
+    # Pointer-only by construction: a stem + delta + the encrypted steer + the
+    # store_state metadata, no path/bytes field.
+    assert set(server.FrameNearest.model_fields) == {
+        "stem",
+        "delta_ms",
+        "encrypted",
+        "store_state",
+    }
 
 
 @pytest.mark.asyncio

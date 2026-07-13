@@ -148,6 +148,12 @@ def _daemon_is_busy(app: Starlette) -> bool:
     # auto-spawned daemon idle-exiting mid-migration.
     if supervisor is not None and _is_migrating(supervisor):
         return True
+    # SCR-258 U9 (KTD-15): an in-flight ``storage.lock`` OPERATION pins the
+    # watchdog so an auto-spawned daemon cannot idle-exit mid stop→quiesce→detach.
+    # The sealed STEADY state is deliberately NOT pinned here (a locked daemon
+    # idle-exits normally; the next start re-enters sealed serving).
+    if supervisor is not None and _is_lock_in_flight(supervisor):
+        return True
     # SCR-178 U5: a content-index backfill run is in flight. ``backfill.*`` is
     # deliberately NOT in ``_ACTIVITY_PATHS`` (status-polling must not reset the
     # idle timer), so the only thing keeping the daemon alive across a long
@@ -160,6 +166,13 @@ def _daemon_is_busy(app: Starlette) -> bool:
     # predicate is what keeps the auto-spawned daemon alive across a ~2 GB fetch.
     dl_job = getattr(app.state, "model_download_job", None)
     if dl_job is not None and _backfill_running(dl_job):  # same is_running() shape
+        return True
+    # SCR-258 U6: an upgrade migration is in flight. ``storage.encrypt.*`` is NOT
+    # in ``_ACTIVITY_PATHS`` (status-polling must not reset the idle timer), so
+    # this busy predicate is what keeps the auto-spawned daemon alive across a
+    # long copy/verify run.
+    encrypt_job = getattr(app.state, "encrypt_job", None)
+    if encrypt_job is not None and _backfill_running(encrypt_job):  # same shape
         return True
     return False
 
@@ -186,6 +199,16 @@ def _has_inflight_resume(supervisor: object) -> bool:
 
 def _is_migrating(supervisor: object) -> bool:
     getter = getattr(supervisor, "is_migrating", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 — watchdog stays robust against test doubles
+        return False
+
+
+def _is_lock_in_flight(supervisor: object) -> bool:
+    getter = getattr(supervisor, "is_lock_in_flight", None)
     if getter is None:
         return False
     try:

@@ -455,6 +455,8 @@ pytest tests/ -v --cov
 
 ScreenCap's recording daemon trusts any process running as the same macOS user. The trust boundary is your user account; processes from other accounts cannot reach the daemon socket or read recordings. See [`SECURITY.md`](SECURITY.md) for the full threat model, alternatives considered, and instructions for reporting a vulnerability.
 
+ScreenCap can also store the entire local library inside an app-managed **encrypted container** (an AES-256 sparse bundle), ciphertext at rest and mountable only by the entitled app daemon and its bundled CLI, with an optional Touch ID-gated **Lock** for a deliberately sealed state. See the "on-disk vault container" section of [`SECURITY.md`](SECURITY.md) for what it protects (backups, copies, disk images, FileVault-off machines, other local users, the sealed state) and its boundaries (a live same-user process while mounted; the unlock gate is a present-user UX gate, not a cryptographic boundary; lost key means unrecoverable recordings).
+
 ## License
 
 ScreenCap is dual-licensed:

@@ -57,6 +57,13 @@ def _isolate_recordings_and_run_dir(tmp_path, monkeypatch):
     # and reset the module-level cache on both sides so neither the leak-in nor the
     # isolated ``{}`` persists across tests.
     monkeypatch.setattr(cfg, "_CONFIG_PATH", base / "config.toml")
+    # SCR-236 U3: also isolate the container-aware data root. With
+    # SCREENCAP_RECORDINGS_DIR set above, ``get_data_root()`` bypasses the
+    # container and resolves to ``get_base_dir()`` (the isolated ``base`` here), so
+    # the content-index / backfill sidecars land in tmp. Explicitly clear any
+    # inherited SCREENCAP_CONTAINER_ENABLED so a developer's env can't flip daemon
+    # tests into container-path resolution mid-suite.
+    monkeypatch.delenv("SCREENCAP_CONTAINER_ENABLED", raising=False)
     cfg.invalidate_config_cache()
     yield
     cfg.invalidate_config_cache()
