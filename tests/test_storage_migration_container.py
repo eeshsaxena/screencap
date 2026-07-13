@@ -264,6 +264,64 @@ def test_relocate_bundle_never_force_detaches_on_busy(vault_config, monkeypatch)
     assert not (target / BUNDLE).exists()
 
 
+def test_relocate_bundle_cross_volume_copy_runs_outside_mount_lock(
+    vault_config, monkeypatch
+):
+    """FIX 6 (availability): the unbounded cross-volume ``copytree`` is staged
+    OUTSIDE ``mount.lock``, so a concurrent resolver / unlock is NOT wedged behind
+    the lock for the copy's duration. Proven by observing ``mount.lock`` is FREE
+    (acquirable non-blocking) while the copy is blocked."""
+    import fcntl
+    import os
+    import threading
+
+    target = vault_config["tmp"] / "moved-here"
+    _patch_container(monkeypatch)
+    # Force the cross-volume path (both dirs are really on one fs here).
+    monkeypatch.setattr(sm, "bundle_move_is_same_volume", lambda *a, **k: False)
+
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    real_copytree = sm.shutil.copytree
+
+    def _blocking_copytree(s, d, *a, **k):
+        copy_started.set()
+        release_copy.wait(3.0)
+        return real_copytree(s, d, *a, **k)
+
+    monkeypatch.setattr(sm.shutil, "copytree", _blocking_copytree)
+
+    outcome_box: dict = {}
+
+    def _run():
+        outcome_box["outcome"] = sl.relocate_bundle(target)
+
+    t = threading.Thread(target=_run)
+    t.start()
+    assert copy_started.wait(3.0), "the staging copy never started"
+
+    # mount.lock MUST be free while the copy blocks (the copy is outside it).
+    lock_path = sl.mount_lock_path()
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    got_lock = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        got_lock = True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except BlockingIOError:
+        got_lock = False
+    finally:
+        os.close(fd)
+
+    release_copy.set()
+    t.join(5.0)
+
+    assert got_lock, "mount.lock was held during the cross-volume copy (FIX 6)"
+    assert outcome_box["outcome"].ok
+    # The bundle actually moved to the new location (copy promoted under the lock).
+    assert (target / BUNDLE / "token").read_text() == TOKEN
+
+
 # ---------------------------------------------------------------------------
 # Daemon verb — refusals (typed reason, nothing moved) + plaintext regression
 # ---------------------------------------------------------------------------

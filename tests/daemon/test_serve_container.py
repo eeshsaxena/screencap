@@ -268,6 +268,44 @@ def test_rogue_mountpoint_raises_operator_stop(container_base, monkeypatch):
         resolve_store_state()
 
 
+def test_migration_in_progress_serves_plaintext_not_rogue(
+    container_base, monkeypatch
+):
+    """FIX 3 (availability): a daemon restart mid-COPYING — plaintext still at the
+    recordings mountpoint with an in-progress migration ledger — resolves to
+    MOUNTED (serving the plaintext mountpoint) instead of tripping
+    RogueMountpointError + exiting 1, so the lifespan auto-resume can finish the
+    migration. The container is NOT attached over the plaintext."""
+    from screencap import config, migration
+
+    _make_bundle(container_base)
+
+    # A migration is mid-flight: run RUNNING + phase COPYING, ledger at the base.
+    ledger = migration.MigrationLedger()
+    ledger.seed(["rec-a"])
+    ledger.set_run(
+        state=migration.MigrationState.RUNNING,
+        phase=migration.MigrationPhase.COPYING,
+    )
+
+    # Plaintext still occupies the recordings mountpoint (non-empty, not a volume).
+    mountpoint = Path(config.get_recordings_dir())
+    (mountpoint / "rec-a").mkdir(parents=True, exist_ok=True)
+    (mountpoint / "rec-a" / "recording.db").write_bytes(b"AAA")
+
+    monkeypatch.setattr(container, "require_container_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        container,
+        "attach",
+        lambda *a, **k: pytest.fail("must not attach over migrating plaintext"),
+    )
+
+    resolution = resolve_store_state()  # must NOT raise RogueMountpointError
+
+    assert resolution.state is StoreState.MOUNTED
+    assert resolution.mountpoint == str(mountpoint)
+
+
 def test_healthy_path_attaches_and_hardens(container_base, monkeypatch):
     _make_bundle(container_base)
     monkeypatch.setattr(container, "require_container_key", lambda: b"k" * 32)

@@ -3429,6 +3429,23 @@ async def storage_lock(request: Request) -> JSONResponse:
             )
         )
 
+    # FIX 5 (fast path): if an encrypt cutover is in its non-interruptible swap
+    # window, refuse BEFORE stopping the recording — the lock's detach must never
+    # run ``hdiutil`` on the mountpoint concurrently with the cutover's swap. The
+    # user retries once the (seconds-long) cutover finishes. The airtight backstop
+    # after the pause signal below closes the check→enter-cutover race.
+    encrypt_job = getattr(request.app.state, "encrypt_job", None)
+    if encrypt_job is not None and encrypt_job.is_in_cutover():
+        _audit("encrypt_cutover_in_progress")
+        return _api_error_response(
+            errors.StoreLockError(
+                "encrypt_cutover_in_progress",
+                "An encryption cutover is finishing. Try locking again in a moment.",
+                schema_version=schema_version,
+                retryable=True,
+            )
+        )
+
     # KTD-15 step 1: refuse flag FIRST, before anything else.
     supervisor.begin_lock()
     request.app.state.store_state = StoreState.LOCKED.value
@@ -3450,6 +3467,28 @@ async def storage_lock(request: Request) -> JSONResponse:
             request.app, EVENT_STORE_LOCK_PROGRESS, phase="signal_readers"
         )
         await _signal_background_jobs_to_pause(request.app)
+
+        # FIX 5 (airtight backstop): the pause signal above set the encrypt job's
+        # stop flag, which halts a NOT-yet-started cutover at its ledger-safe
+        # boundary (phase stays COPYING). If the phase still reads CUTTING_OVER
+        # here, the swap was already in flight and could not be halted — refuse
+        # rather than force-detach the mountpoint concurrently with it. This read
+        # happens AFTER the pause await, so it reflects whether the swap committed;
+        # combined with the engine's pre-swap stop check it closes the race.
+        if encrypt_job is not None and encrypt_job.is_in_cutover():
+            supervisor.abort_lock()
+            request.app.state.store_state = StoreState.MOUNTED.value
+            _audit("encrypt_cutover_in_progress")
+            return _api_error_response(
+                errors.StoreLockError(
+                    "encrypt_cutover_in_progress",
+                    "An encryption cutover is finishing. Try locking again in a "
+                    "moment.",
+                    schema_version=schema_version,
+                    retryable=True,
+                )
+            )
+
         quiesced = await supervisor.quiesce_for_lock(grace=_LOCK_QUIESCE_GRACE_S)
         await _emit_store_event(
             request.app,

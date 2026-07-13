@@ -194,6 +194,27 @@ def _bundle_exists() -> bool:
     return store_bundle_path().exists()
 
 
+def _migration_holds_mountpoint() -> bool:
+    """True iff an upgrade migration is mid-flight with plaintext still at the
+    recordings mountpoint (FIX 3, SCR-258 U6).
+
+    Consulted by :func:`resolve_store_state` BEFORE the rogue-mountpoint hard stop
+    so a daemon restart mid-``COPYING`` (plaintext legitimately occupying the real
+    mountpoint) serves + auto-resumes instead of exiting 1. Cheap and side-effect-
+    free: it does NOT create a ledger DB when none exists, and never raises.
+    """
+    try:
+        from screencap import migration
+
+        if not migration.default_ledger_path().exists():
+            return False
+        ledger = migration.MigrationLedger()
+        return migration.migration_holds_plaintext_mountpoint(ledger)
+    except Exception:  # noqa: BLE001 — a ledger read must never break resolve/serve
+        logger.debug("migration-in-progress probe failed", exc_info=True)
+        return False
+
+
 def host_disk_path() -> Path | None:
     """The HOST volume path whose free space bounds recording (KTD-13).
 
@@ -360,6 +381,21 @@ def resolve_store_state(*, attempt_mount: bool = True) -> StoreResolution:
             return StoreResolution(StoreState.MOUNTED)
 
         mountpoint = config.get_recordings_dir()
+        # FIX 3 (availability): if an upgrade migration is mid-flight, the
+        # plaintext library legitimately still occupies the recordings mountpoint
+        # (phase COPYING / CUTTING_OVER — the container is at the interim mount).
+        # That non-empty mountpoint is NOT a rogue mountpoint; attaching the
+        # container over it would clobber the plaintext mid-migration. Serve the
+        # plaintext mountpoint (MOUNTED, no attach) so the daemon binds and the
+        # lifespan auto-resume drives the migration to completion, instead of
+        # tripping RogueMountpointError and exiting 1.
+        if _migration_holds_mountpoint():
+            logger.info(
+                "upgrade migration in progress; serving the plaintext recordings "
+                "mountpoint and deferring the container attach to the migration "
+                "cutover (not a rogue mountpoint)"
+            )
+            return StoreResolution(StoreState.MOUNTED, mountpoint=str(mountpoint))
         return _attempt_mount(bundle, Path(mountpoint), key)
 
 
@@ -405,20 +441,28 @@ def mount_now() -> StoreResolution:
 def relocate_bundle(target_dir: Path) -> "Any":
     """Move the encrypted bundle to ``target_dir`` and remount (SCR-258 U11, KTD-19).
 
-    The whole detach → bundle move → config flip → remount cycle runs under a
-    single held ``mount.lock``, so no concurrent resolver (or the U9 lock verb)
-    races the state. Invariants:
+    Invariants:
 
     * **Never force-detach** (compact discipline, KTD-12/KTD-19): the quiescent
       detach uses ``force=False``. A busy volume (:class:`ContainerBusyError`)
       surfaces a typed refusal with **nothing moved** and the store left mounted —
       the move does not proceed.
     * The recordings **mountpoint is unchanged** — only the bundle's backing
-      directory moves. The config flip (``config.set_store_bundle_dir``) inside
-      :func:`storage_migration.migrate_bundle` is the single commit point, so a
-      failed/interrupted move never leaves config pointing at a vanished bundle.
+      directory moves. The config flip (``config.set_store_bundle_dir``) is the
+      single commit point, so a failed/interrupted move never leaves config
+      pointing at a vanished bundle.
     * On any failure the source bundle stays authoritative and is **remounted**,
       so the store is never left detached.
+
+    FIX 6 (availability): a **cross-volume** move's unbounded ``copytree`` is
+    staged to the ``.partial`` path OUTSIDE ``mount.lock`` — so a concurrent
+    ``unlock`` / ``resolve_store_state`` is not wedged behind the lock for the
+    whole copy. ``mount.lock`` is then held only for the brief detach → promote
+    (partial→final rename) → config-commit → remount. The store stays mounted +
+    available during the copy; the daemon verb already refused an active recording
+    / terminal stage / running encrypt job, so the bundle has no in-flight writer
+    and the staged copy is quiescent. A **same-volume** move is an O(1) rename and
+    stays entirely inside the (brief) lock hold.
 
     Returns a :class:`storage_migration.MigrationOutcome`. Callers must have
     already refused an active recording / running encrypt job / sealed store /
@@ -426,9 +470,19 @@ def relocate_bundle(target_dir: Path) -> "Any":
     """
     from screencap import config, container, storage_migration
 
+    bundle = store_bundle_path()  # current bundle (pre-move)
+    bundle_dst = target_dir / container.BUNDLE_NAME
+    mountpoint = Path(config.get_recordings_dir())
+
+    same_volume = storage_migration.bundle_move_is_same_volume(bundle, target_dir)
+
+    # Stage the long cross-volume copy BEFORE taking the lock (FIX 6). Nothing
+    # destructive happens here and the source stays authoritative, so an
+    # interrupted copy just leaves a stale ``.partial`` a retry cleans.
+    if not same_volume:
+        storage_migration.stage_bundle_copy(bundle, bundle_dst)
+
     with mount_lock():
-        bundle = store_bundle_path()  # current bundle (pre-move)
-        mountpoint = Path(config.get_recordings_dir())
         # Resolve the key up front so the remount below always has it, whether
         # the move succeeds or we have to roll back to the source bundle.
         key = container.require_container_key()
@@ -438,6 +492,9 @@ def relocate_bundle(target_dir: Path) -> "Any":
         try:
             container.detach(str(mountpoint), force=False)
         except container.ContainerBusyError:
+            if not same_volume:
+                # Nothing was moved — drop the staged copy so a retry starts clean.
+                storage_migration.discard_staged_bundle_copy(bundle_dst)
             return storage_migration.MigrationOutcome(
                 ok=False,
                 code="recording_active",
@@ -448,11 +505,14 @@ def relocate_bundle(target_dir: Path) -> "Any":
             )
 
         try:
-            outcome = storage_migration.migrate_bundle(
-                bundle,
-                target_dir / container.BUNDLE_NAME,
-                config.set_store_bundle_dir,
-            )
+            if same_volume:
+                outcome = storage_migration.migrate_bundle(
+                    bundle, bundle_dst, config.set_store_bundle_dir
+                )
+            else:
+                outcome = storage_migration.promote_bundle_copy(
+                    bundle, bundle_dst, config.set_store_bundle_dir
+                )
         except Exception:
             # The config flip is the commit point; a raised move never flipped
             # it, so store_bundle_path() still resolves the intact source bundle.

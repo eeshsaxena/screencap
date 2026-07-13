@@ -513,6 +513,161 @@ def test_ledger_seed_is_closed_set_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# FIX 1 — record-through straggler is never lost; sweep never blanket-deletes
+# ---------------------------------------------------------------------------
+
+
+def test_record_through_straggler_is_not_lost_at_cutover(tmp_path):
+    """FIX 1 (data-loss): a recording created in the plaintext root AFTER the
+    closed set was seeded (a record-through straggler started+stopped during the
+    long copy window) is detected before cutover, seeded, and migrated on a later
+    pass — never moved aside by the wholesale swap and destroyed by the sweep."""
+    env = _Env(tmp_path)
+    _write_recording(env.plaintext_root, "rec-a", {"recording.db": b"AAA"})
+
+    made = {"done": False}
+
+    def _straggler_preflight(_needed):
+        # Fires once, AFTER the closed set is seeded but BEFORE the copy loop —
+        # exactly the window where a record-through recording escapes the seed.
+        if not made["done"]:
+            _write_recording(
+                env.plaintext_root, "rec-straggler", {"recording.db": b"SSS"}
+            )
+            made["done"] = True
+        return None
+
+    summary = env.run(disk_preflight=_straggler_preflight)
+
+    # The pass must NOT cutover: it detects the untracked straggler and re-drives.
+    assert summary.state is MigrationState.RUNNING
+    assert not env.aside.exists()
+    # The straggler is intact in the plaintext root, seeded PENDING, NOT deleted.
+    assert (
+        env.plaintext_root / "rec-straggler" / "recording.db"
+    ).read_bytes() == b"SSS"
+    assert env.ledger.unit_status("rec-straggler") is UnitState.PENDING
+
+    # Next pass: the straggler is copied+verified, then cutover + sweep — no loss.
+    summary2 = env.run()
+    assert summary2.state is MigrationState.COMPLETED
+    view = env.container_view()
+    assert (view / "rec-a" / "recording.db").read_bytes() == b"AAA"
+    assert (view / "rec-straggler" / "recording.db").read_bytes() == b"SSS"
+    assert not env.aside.exists()
+
+
+def test_sweep_preserves_untracked_aside_entry(tmp_path):
+    """FIX 1: the post-cutover sweep deletes ONLY ledger-tracked recordings and
+    never blanket-rmtrees the aside root — an untracked directory under aside (a
+    straggler a wholesale swap moved aside) is preserved, never destroyed."""
+    env = _Env(tmp_path)
+    env.aside.mkdir(parents=True)
+    _write_recording(env.aside, "rec-a", {"recording.db": b"AAA"})  # tracked
+    _write_recording(env.aside, "stray-rec", {"recording.db": b"ZZZ"})  # untracked
+    env.ledger.seed(["rec-a"])
+    env.ledger.mark("rec-a", UnitState.VERIFIED)
+    env.ledger.set_run(
+        phase=MigrationPhase.CUTOVER_DONE, aside_path=str(env.aside)
+    )
+
+    summary = env.run()  # resume fast-path → post-cutover sweep
+
+    assert summary.state is MigrationState.COMPLETED
+    # Tracked recording swept; untracked stray PRESERVED; aside root kept intact.
+    assert not (env.aside / "rec-a").exists()
+    assert (env.aside / "stray-rec" / "recording.db").read_bytes() == b"ZZZ"
+    assert env.aside.exists()
+    assert env.ledger.unit_status("rec-a") is UnitState.PLAINTEXT_DELETED
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 — interrupted-cutover recovery must not write plaintext to a detached
+# host path
+# ---------------------------------------------------------------------------
+
+
+def test_interrupted_cutover_after_detach_writes_no_host_plaintext(
+    tmp_path, monkeypatch
+):
+    """FIX 4 (privacy): recovering a cutover that crashed AFTER the interim was
+    detached must NOT re-copy the plaintext sidecars onto the bare (detached)
+    interim host path. The sidecars are already inside the container; recovery
+    skips the re-copy and leaves no plaintext residue on the host."""
+    env = _Env(tmp_path)
+    _write_recording(env.plaintext_root, "rec-a", {"recording.db": b"AAA"})
+    _make_index_db(env.sidecar_src / "content_index.db", ["row-A"])
+    # The sidecars were already copied INTO the container before the crash+detach.
+    (env.backing / ".store").mkdir(parents=True)
+    _make_index_db(env.backing / ".store" / "content_index.db", ["row-A"])
+    # Ledger: mid-CUTTING_OVER, rec-a verified, interim NOT attached (post-detach).
+    env.ledger.seed(["rec-a"])
+    env.ledger.mark("rec-a", UnitState.VERIFIED)
+    env.ledger.set_run(
+        phase=MigrationPhase.CUTTING_OVER, aside_path=str(env.aside)
+    )
+    assert not env.mounter.is_attached(env.interim)  # detached before the crash
+
+    copied = {"n": 0}
+    real = migration._copy_sidecars_into_container
+
+    def _spy(paths, names):
+        copied["n"] += 1
+        return real(paths, names)
+
+    monkeypatch.setattr(migration, "_copy_sidecars_into_container", _spy)
+
+    summary = env.run()
+
+    assert summary.state is MigrationState.COMPLETED
+    # No sidecar re-copy attempted (it would leak plaintext to the detached host).
+    assert copied["n"] == 0
+    # No plaintext residue at the detached interim host path.
+    assert not (env.interim / ".store").exists()
+    # The container still carries the sidecar (copied before the crash).
+    assert (env.container_view() / ".store" / "content_index.db").exists()
+
+
+# ---------------------------------------------------------------------------
+# FIX 5 (engine arm) — cutover halts at a ledger-safe boundary on a stop signal
+# ---------------------------------------------------------------------------
+
+
+def test_cutover_halts_at_safe_boundary_when_stopped(tmp_path):
+    """FIX 5: a stop signalled as the cutover reservation opens halts the cutover
+    at its ledger-safe boundary — no swap, no ``hdiutil`` on the mountpoint —
+    leaving the run RUNNING (resumable). Proves a lock cannot race the swap."""
+    import contextlib
+    import threading
+
+    env = _Env(tmp_path)
+    _write_recording(env.plaintext_root, "rec-a", {"recording.db": b"AAA"})
+    stop = threading.Event()
+
+    @contextlib.contextmanager
+    def _reservation_that_locks():
+        # Model a storage.lock arriving exactly as the cutover reservation opens.
+        stop.set()
+        yield
+
+    summary = env.run(
+        stop_event=stop, cutover_reservation=_reservation_that_locks
+    )
+
+    # Halted BEFORE the swap: phase stayed COPYING, run is RUNNING (resumable).
+    assert summary.state is MigrationState.RUNNING
+    assert env.ledger.phase() is MigrationPhase.COPYING
+    # No swap hdiutil ran on the mountpoint: the interim was never detached, and
+    # the container was never attached at the final mountpoint for the swap.
+    assert env.mounter.detach_calls == []
+    assert not env.mounter.is_attached(env.plaintext_root)
+    assert (env.plaintext_root / "rec-a" / "recording.db").exists()
+    assert should_auto_resume(env.ledger)
+    # A fresh (unlocked) pass converges to COMPLETED.
+    assert env.run().state is MigrationState.COMPLETED
+
+
+# ---------------------------------------------------------------------------
 # The job (mirrors BackfillJob) — idempotent start, cancel, status, pause/resume
 # ---------------------------------------------------------------------------
 
@@ -671,6 +826,109 @@ async def test_job_cancel_marks_cancelled(tmp_path):
         await asyncio.sleep(0.05)
     assert env.ledger.run_state() is MigrationState.CANCELLED
     assert (env.plaintext_root / "rec-a").exists()  # plaintext intact on cancel
+
+
+async def test_running_result_redrives_to_completed_and_emits_completed_once(
+    tmp_path,
+):
+    """FIX 2: a RUNNING result (an active recording blocking cutover) is re-driven
+    to COMPLETED on its OWN — no external daemon restart — and encrypt.completed is
+    emitted EXACTLY ONCE, only at real completion (never for the RUNNING pass)."""
+    import asyncio
+
+    from screencap.daemon.encrypt_job import EVENT_ENCRYPT_COMPLETED, EncryptJob
+
+    env = _Env(tmp_path)
+    _write_recording(env.plaintext_root, "rec-a", {"recording.db": b"AAA"})
+    bus = _bus()
+    job = EncryptJob(bus, ledger=env.ledger)
+    job._redrive_delay = 0.01  # fast re-drive for the test
+
+    calls = {"n": 0}
+
+    def _factory():
+        def _run(*, stop_event, progress_cb, ledger):
+            calls["n"] += 1
+            # First pass: an active recording blocks cutover → RUNNING. Later
+            # passes: the recording finished → migrate + cutover + sweep.
+            active = "rec-a" if calls["n"] == 1 else None
+            return env.run(
+                stop_event=stop_event,
+                progress_cb=progress_cb,
+                ledger=ledger,
+                active_recording_name=lambda: active,
+            )
+
+        return _run
+
+    sub = await bus.subscribe()
+    job.start(_factory)
+    for _ in range(300):
+        if not job.is_running():
+            break
+        await asyncio.sleep(0.01)
+
+    assert not job.is_running()
+    assert env.ledger.is_done()
+    assert calls["n"] >= 2  # it re-drove itself, with no external restart
+
+    completed = 0
+    while True:
+        try:
+            ev = sub.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if ev.get("type") == EVENT_ENCRYPT_COMPLETED:
+            completed += 1
+    await bus.remove(sub)
+    assert completed == 1  # exactly once, only at real completion
+
+
+async def test_running_then_lock_pause_never_emits_completed(tmp_path):
+    """FIX 2: a run that returns RUNNING and is then paused (a lock ``shutdown``)
+    must NEVER emit encrypt.completed; the ledger stays RUNNING (auto-resumable)."""
+    import asyncio
+
+    from screencap.daemon.encrypt_job import EVENT_ENCRYPT_COMPLETED, EncryptJob
+
+    env = _Env(tmp_path)
+    _write_recording(env.plaintext_root, "rec-a", {"recording.db": b"AAA"})
+    bus = _bus()
+    job = EncryptJob(bus, ledger=env.ledger)
+    job._redrive_delay = 5.0  # long, so the loop parks between re-drives
+
+    def _factory():
+        def _run(*, stop_event, progress_cb, ledger):
+            # Always RUNNING (a perpetual active recording), honoring stop.
+            return env.run(
+                stop_event=stop_event,
+                progress_cb=progress_cb,
+                ledger=ledger,
+                active_recording_name=lambda: "rec-a",
+            )
+
+        return _run
+
+    sub = await bus.subscribe()
+    job.start(_factory)
+    await asyncio.sleep(0.1)  # let the first RUNNING pass complete + park
+    await job.shutdown(timeout=3.0)  # lock pause: set stop flag + await worker
+
+    assert not job.is_running()
+    # Interrupted → RUNNING (auto-resumes), NEVER flipped to COMPLETED.
+    assert env.ledger.run_state() is MigrationState.RUNNING
+    assert should_auto_resume(env.ledger)
+
+    saw_completed = False
+    while True:
+        try:
+            ev = sub.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if ev.get("type") == EVENT_ENCRYPT_COMPLETED:
+            saw_completed = True
+    await bus.remove(sub)
+    assert not saw_completed
 
 
 # ---------------------------------------------------------------------------

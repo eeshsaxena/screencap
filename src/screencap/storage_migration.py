@@ -478,6 +478,75 @@ def migrate_bundle(
     )
 
 
+def bundle_move_is_same_volume(bundle_src: Path, target_dir: Path) -> bool:
+    """True iff ``bundle_src`` and ``target_dir`` are on the same filesystem.
+
+    Used by ``store_lifecycle.relocate_bundle`` to decide (BEFORE taking any lock)
+    whether the move is an O(1) same-volume rename or a long cross-volume copy —
+    so the copy can be staged OUTSIDE ``mount_lock`` (FIX 6). Creates ``target_dir``
+    (needed for the ``st_dev`` probe); a probe error conservatively returns False
+    (the cross-volume copy path is the safe superset).
+    """
+    bundle_src = bundle_src.resolve()
+    target_dir = Path(os.path.realpath(target_dir))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _st_dev(bundle_src.parent) == _st_dev(target_dir)
+    except OSError:
+        return False
+
+
+def stage_bundle_copy(bundle_src: Path, bundle_dst: Path) -> Path:
+    """Copy the bundle to a ``.partial`` staging dir NEXT TO ``bundle_dst`` (FIX 6).
+
+    Runs OUTSIDE any lock: nothing here is destructive and the source stays
+    authoritative, so a concurrent ``unlock`` / ``resolve_store_state`` is not
+    wedged for the copy's duration. Idempotent — a stale ``.partial`` from a prior
+    attempt is dropped first. Returns the staging path (promoted later under the
+    brief lock hold by :func:`promote_bundle_copy`).
+    """
+    bundle_src = bundle_src.resolve()
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    bundle_dst = dst_dir / bundle_dst.name
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    partial = dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX)
+    _rmtree_quiet(partial)
+    shutil.copytree(bundle_src, partial)
+    _fsync_tree(partial)
+    return partial
+
+
+def promote_bundle_copy(
+    bundle_src: Path,
+    bundle_dst: Path,
+    commit_config: Callable[[Path], None],
+) -> MigrationOutcome:
+    """Promote a pre-staged ``.partial`` copy to the final bundle + commit + retire
+    the source (FIX 6 cross-volume finalize).
+
+    Assumes :func:`stage_bundle_copy` already produced the ``.partial``. The
+    partial→final ``rename`` is atomic within the destination volume; the config
+    flip is the single commit point (nothing before it is destructive); only then
+    is the old source removed. Held under the caller's ``mount.lock`` — brief.
+    """
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    bundle_dst = dst_dir / bundle_dst.name
+    bundle_src = bundle_src.resolve()
+    partial = dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX)
+    os.rename(partial, bundle_dst)  # atomic within the dst volume: now complete
+    commit_config(dst_dir)  # single commit point — dst is now authoritative
+    _rmtree_quiet(bundle_src)  # old copy retired
+    return MigrationOutcome(
+        ok=True, moved_from=str(bundle_src), moved_to=str(bundle_dst)
+    )
+
+
+def discard_staged_bundle_copy(bundle_dst: Path) -> None:
+    """Remove a ``.partial`` staged copy (FIX 6 cleanup on a pre-promote abort)."""
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    _rmtree_quiet(dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX))
+
+
 def _rmtree_quiet(path: Path) -> None:
     """Best-effort recursive delete of ``path`` (a dir tree or a file)."""
     try:
@@ -575,5 +644,9 @@ __all__ = [
     "reconcile_pending",
     "validate_bundle_target",
     "migrate_bundle",
+    "bundle_move_is_same_volume",
+    "stage_bundle_copy",
+    "promote_bundle_copy",
+    "discard_staged_bundle_copy",
     "BUNDLE_PARTIAL_SUFFIX",
 ]

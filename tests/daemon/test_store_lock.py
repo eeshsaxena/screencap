@@ -212,6 +212,44 @@ async def test_lock_nothing_active_seals_fast(container_on, monkeypatch):
     assert detach.calls[0]["force"] is True
 
 
+async def test_lock_refuses_during_encrypt_cutover_no_detach(
+    container_on, monkeypatch, tmp_path
+):
+    """FIX 5: ``storage.lock`` refuses (typed, retryable) while the encrypt job is
+    in its non-interruptible cutover window, and NEVER runs ``hdiutil`` detach on
+    the mountpoint concurrently with the cutover's swap."""
+    from screencap.daemon.encrypt_job import EncryptJob
+    from screencap.migration import (
+        MigrationLedger,
+        MigrationPhase,
+        MigrationState,
+    )
+
+    detach = _DetachSpy()
+    monkeypatch.setattr(container, "detach", detach)
+    app, sup = _build_app(StoreState.MOUNTED)
+
+    # An encrypt migration in its cutover swap window (ledger phase CUTTING_OVER).
+    ledger = MigrationLedger(tmp_path / "m.db")
+    ledger.seed(["rec-a"])
+    ledger.set_run(state=MigrationState.RUNNING, phase=MigrationPhase.CUTTING_OVER)
+    app.state.encrypt_job = EncryptJob(app.state.event_bus, ledger=ledger)
+
+    async with _client(app) as c:
+        resp = await c.post("/v0/storage.lock", json={})
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["error"] == errors.STORE_LOCK_FAILED
+    assert body["reason"] == "encrypt_cutover_in_progress"
+    # The lock NEVER detached the mountpoint concurrently with the cutover swap.
+    assert detach.calls == []
+    # Nothing sealed; the store stays usable + unlocked.
+    assert not sl.is_sealed()
+    assert not sup.is_locked()
+
+
 async def test_second_lock_is_idempotent_noop(container_on, monkeypatch):
     detach = _DetachSpy()
     monkeypatch.setattr(container, "detach", detach)

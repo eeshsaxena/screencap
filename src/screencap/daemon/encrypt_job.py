@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from screencap import _stderr_events
 from screencap.migration import (
     MigrationLedger,
+    MigrationPhase,
     MigrationState,
     MigrationSummary,
     should_auto_resume,
@@ -85,6 +86,12 @@ _TERMINAL_EVENT_FOR_STATE = {
 # Run-level state surfaced when no run has ever been started in this process and
 # the ledger carries no prior run row.
 STATE_IDLE = "idle"
+
+# Bounded backoff between successive RUNNING re-drive passes (FIX 2). A RUNNING
+# result means "call again later" — an active recording is blocking cutover, or a
+# record-through straggler needs copying. The delay bounds the re-drive loop into
+# a poll rather than a busy spin while still honoring the stop flag promptly.
+_REDRIVE_DELAY_SECONDS = 2.0
 
 # Factory returning the bound engine call. Injected by the verb / auto-resume.
 RunFactory = Callable[[], Callable[..., MigrationSummary]]
@@ -147,6 +154,8 @@ class EncryptJob:
         self._last: MigrationSummary | None = None
         self._terminal_state: str | None = None
         self._running = False
+        # Bounded delay between RUNNING re-drive passes; overridable in tests.
+        self._redrive_delay = _REDRIVE_DELAY_SECONDS
 
     # ------------------------------------------------------------------
     # Public API (driven by the daemon verbs + the U9 lock/unlock hooks).
@@ -155,6 +164,20 @@ class EncryptJob:
     def is_running(self) -> bool:
         """True while a run is in flight (feeds the idle-shutdown busy predicate)."""
         return self._running
+
+    def is_in_cutover(self) -> bool:
+        """True iff the migration is in its non-interruptible cutover swap window.
+
+        FIX 5: ``storage.lock`` refuses while this holds so the lock's ``hdiutil``
+        detach never races the cutover's attach/detach on the recordings
+        mountpoint. Reads the durable ledger phase (``CUTTING_OVER``), so it is
+        correct across the worker thread + cross-process. Never raises.
+        """
+        try:
+            return self._ledger.phase() is MigrationPhase.CUTTING_OVER
+        except Exception:  # noqa: BLE001 — a ledger read must never break the lock
+            logger.debug("encrypt is_in_cutover probe failed", exc_info=True)
+            return False
 
     def start(self, run_factory: RunFactory | None = None) -> EncryptStatusSnapshot:
         """Start (or resume) a migration, or return the in-flight snapshot.
@@ -267,22 +290,62 @@ class EncryptJob:
     # ------------------------------------------------------------------
 
     async def _run(self) -> None:
+        """Drive the engine in a LOOP until a genuinely terminal state (FIX 2).
+
+        ``run_migration`` returns ``RUNNING`` as a "call again later" signal — an
+        active recording is blocking cutover, or a record-through straggler needs
+        copying. That is NOT terminal and must NEVER surface as
+        ``encrypt.completed``; instead we re-drive (bounded backoff) until the
+        engine reaches COMPLETED / PAUSED / CANCELLED on its own. A stop signal (a
+        lock pause or a cancel) breaks the loop at a boundary: a bare stop leaves
+        the ledger RUNNING (auto-resumes on unlock), a cancel leaves it CANCELLED —
+        neither emits ``encrypt.completed``.
+        """
         factory = self._run_factory
         assert factory is not None  # start() guards this
         try:
             run = factory()
-            summary = await asyncio.to_thread(
-                run,
-                stop_event=self._stop_event,
-                progress_cb=self._on_progress,
-                ledger=self._ledger,
-            )
-            await self._on_terminal(summary)
+            while True:
+                summary = await asyncio.to_thread(
+                    run,
+                    stop_event=self._stop_event,
+                    progress_cb=self._on_progress,
+                    ledger=self._ledger,
+                )
+                if summary.state is not MigrationState.RUNNING:
+                    # Genuinely terminal: COMPLETED / PAUSED / CANCELLED.
+                    await self._on_terminal(summary)
+                    return
+                # RUNNING — re-drive later. Record the snapshot for ``status`` but
+                # publish NOTHING terminal.
+                self._last = summary
+                if self._stop_event.is_set():
+                    # A lock pause halted at a boundary with cutover still pending:
+                    # leave the ledger RUNNING for auto-resume; no terminal event.
+                    return
+                if not await self._wait_before_redrive():
+                    # Stop signalled during the backoff → same clean pause exit.
+                    return
         except Exception:  # noqa: BLE001 — a crash must leave the daemon up
             logger.exception("encrypt migration job crashed; reporting failed state")
             await self._publish_failed()
         finally:
             self._running = False
+
+    async def _wait_before_redrive(self) -> bool:
+        """Bounded backoff between RUNNING passes; False if a stop is signalled.
+
+        Wakes immediately when the stop flag is set (a lock pause / cancel), so a
+        pause never waits out the whole backoff before halting.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._redrive_delay
+        while not self._stop_event.is_set():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return True
+            await asyncio.sleep(min(remaining, 0.05))
+        return False
 
     def _on_progress(self, summary: MigrationSummary) -> None:
         """Engine ``progress_cb`` — runs on the ``to_thread`` worker thread.
@@ -294,11 +357,21 @@ class EncryptJob:
         self._bridge_publish(EVENT_ENCRYPT_PROGRESS, **summary.as_payload())
 
     async def _on_terminal(self, summary: MigrationSummary) -> None:
+        if summary.state is MigrationState.RUNNING:
+            # Defensive (FIX 2): RUNNING is not terminal and must NEVER surface as
+            # ``encrypt.completed``. The ``_run`` loop already guards this; this is
+            # the last-line assertion so a future caller can't reintroduce the bug.
+            logger.error(
+                "encrypt _on_terminal called with RUNNING; not emitting a "
+                "terminal event (would have falsely signalled completion)"
+            )
+            return
         self._last = summary
         self._terminal_state = summary.state.value
-        event_type = _TERMINAL_EVENT_FOR_STATE.get(
-            summary.state, EVENT_ENCRYPT_COMPLETED
-        )
+        event_type = _TERMINAL_EVENT_FOR_STATE.get(summary.state)
+        if event_type is None:  # unreachable: the map covers all non-RUNNING states
+            logger.error("encrypt _on_terminal: no event for state %s", summary.state)
+            return
         await self._bus.publish(self._event(event_type, **summary.as_payload()))
         # One-time completion suggestion so the UI can offer ``storage compact``.
         if summary.state is MigrationState.COMPLETED:

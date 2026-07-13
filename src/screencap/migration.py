@@ -76,6 +76,7 @@ __all__ = [
     "ContainerMounter",
     "default_ledger_path",
     "run_migration",
+    "migration_holds_plaintext_mountpoint",
     "DiskPreflightError",
     "SIDECAR_NAMES",
 ]
@@ -695,6 +696,44 @@ def _list_plaintext_recordings(root: Path) -> list[str]:
         return []
 
 
+def _untracked_plaintext_recordings(
+    ledger: MigrationLedger, paths: MigrationPaths
+) -> list[str]:
+    """Plaintext recording dirs on disk but NOT in the ledger's closed set (FIX 1).
+
+    These are record-through stragglers created after the closed set was seeded;
+    they must be seeded + copied + verified before any cutover so the wholesale
+    swap/sweep never destroys them. Returned sorted so seeding is deterministic.
+    """
+    current = set(_list_plaintext_recordings(paths.plaintext_root))
+    tracked = set(
+        ledger.names_in(
+            UnitState.PENDING,
+            UnitState.COPIED,
+            UnitState.VERIFIED,
+            UnitState.PLAINTEXT_DELETED,
+        )
+    )
+    return sorted(current - tracked)
+
+
+def migration_holds_plaintext_mountpoint(ledger: MigrationLedger) -> bool:
+    """True iff a migration is mid-flight with plaintext still at the real
+    recordings mountpoint (FIX 3).
+
+    During ``COPYING`` / ``CUTTING_OVER`` the plaintext library legitimately
+    occupies the recordings mountpoint (the container is at the interim mount),
+    so a non-empty mountpoint is expected migration state — NOT a rogue
+    mountpoint. Post-cutover (``CUTOVER_DONE`` / ``DONE``) the container owns the
+    mountpoint (it is a live volume), so this returns False. A never-started /
+    CANCELLED / COMPLETED run also returns False.
+    """
+    state = ledger.run_state()
+    if state not in (MigrationState.RUNNING, MigrationState.PAUSED):
+        return False
+    return ledger.phase() in (MigrationPhase.COPYING, MigrationPhase.CUTTING_OVER)
+
+
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
@@ -854,8 +893,30 @@ def run_migration(
         _emit()
         return ledger.summary()
 
-    _cutover(ledger, paths, mounter, sidecar_names, cutover_reservation,
-             pause_sidecar_writers, set_container_enabled)
+    # FIX 1 (data-loss guard): a recording can be started AND stopped in the
+    # plaintext root during the minutes-long copy loop, AFTER the closed set was
+    # seeded. Such a straggler is not in the ledger, so ``all_verified()`` over
+    # the seeded set passes and the wholesale cutover swap would move it aside and
+    # the sweep would destroy it. Re-enumerate the plaintext root and, if any
+    # recording is not yet tracked, seed it and re-drive (RUNNING) so it is
+    # copied+verified BEFORE any cutover — never lost (R13/AE6 "no recording lost").
+    stragglers = _untracked_plaintext_recordings(ledger, paths)
+    if stragglers:
+        ledger.seed(stragglers)
+        ledger.set_run(state=MigrationState.RUNNING)
+        _emit()
+        return ledger.summary()
+
+    # FIX 5: ``stop_event`` is threaded into the cutover so a ``storage.lock``
+    # pause (or a cancel) signalled BEFORE the destructive swap halts at the
+    # ledger-safe boundary — no swap, no ``hdiutil`` on the mountpoint racing the
+    # lock's detach. Returns False when it halted there.
+    did_cutover = _cutover(
+        ledger, paths, mounter, sidecar_names, cutover_reservation,
+        pause_sidecar_writers, set_container_enabled, stop_event,
+    )
+    if not did_cutover:
+        return _halt()
     _emit()
 
     # (4) Post-cutover sweep.
@@ -884,17 +945,30 @@ def _cutover(
     cutover_reservation: Callable[[], ContextManager[Any]],
     pause_sidecar_writers: Callable[[], ContextManager[Any]],
     set_container_enabled: Callable[[bool], None],
-) -> None:
-    """The single quiesced cutover swap (KTD-18).
+    stop_event: threading.Event | None = None,
+) -> bool:
+    """The single quiesced cutover swap (KTD-18). Returns True iff the swap ran.
 
     Under the caller's ``acquire_migration`` reservation and with the sidecar
     writers paused, copy the sidecars INTO the container, detach the interim
     mount, move the plaintext aside, attach the container at the real mountpoint,
     and flip the flag. The aside path is durably recorded BEFORE the destructive
     move so a crash mid-swap resumes forward.
+
+    FIX 5 — ``stop_event`` gates a ledger-safe boundary: a stop signalled (a
+    ``storage.lock`` pause / a cancel) BEFORE the ``CUTTING_OVER`` phase is set
+    halts here cleanly (returns False; phase stays ``COPYING``, run resumable), so
+    the lock's ``hdiutil`` detach never races the swap's attach/detach on the same
+    mountpoint. Once ``CUTTING_OVER`` is set the swap is non-interruptible and
+    completes (the lock verb refuses concurrently while the phase reads
+    ``CUTTING_OVER``).
     """
     aside = paths.aside_root
     with cutover_reservation():
+        # Safe boundary: halt before any destructive step / phase commit if a
+        # stop was signalled while we waited on the reservation.
+        if stop_event is not None and stop_event.is_set():
+            return False
         # Mark the dangerous window open + record where the plaintext will go,
         # BEFORE any destructive step, so a crash here resumes as CUTTING_OVER.
         ledger.set_run(phase=MigrationPhase.CUTTING_OVER, aside_path=str(aside))
@@ -906,6 +980,7 @@ def _cutover(
             mounter.detach(paths.interim_mountpoint)
         _swap_plaintext_for_container(paths, mounter, set_container_enabled)
         ledger.set_run(phase=MigrationPhase.CUTOVER_DONE)
+    return True
 
 
 def _complete_interrupted_cutover(
@@ -918,20 +993,44 @@ def _complete_interrupted_cutover(
 ) -> None:
     """Finish a cutover that crashed inside the ``CUTTING_OVER`` window.
 
-    Idempotent recovery: re-copy the sidecars (a partial copy is overwritten),
-    ensure the interim is detached, complete the plaintext→container swap, then
-    mark ``CUTOVER_DONE``. Safe to run whether the crash landed before or after
-    the plaintext move — :func:`_swap_plaintext_for_container` is itself
-    idempotent.
+    Idempotent recovery: complete the plaintext→container swap, then mark
+    ``CUTOVER_DONE``. Safe to run whether the crash landed before or after the
+    plaintext move — :func:`_swap_plaintext_for_container` is itself idempotent.
+
+    FIX 4 (privacy) — the sidecar re-copy is gated on the interim being ACTUALLY
+    attached. In :func:`_cutover` the sidecars are copied while the interim is
+    attached and only THEN is the interim detached, so a crash that landed AFTER
+    the detach already has the sidecars inside the container. Re-copying then would
+    ``mkdir`` + ``copy2`` the plaintext sidecar DBs onto the bare host path where
+    the interim mount used to be (``…/run/migrate-mnt/.store``) — a plaintext leak
+    that is never cleaned. So when the interim is detached we SKIP the re-copy and
+    scrub any such host residue instead.
     """
-    with pause_sidecar_writers():
-        with contextlib.suppress(FileNotFoundError):
-            _copy_sidecars_into_container(paths, sidecar_names)
-    if mounter.is_attached(paths.interim_mountpoint):
+    interim = paths.interim_mountpoint
+    if mounter.is_attached(interim):
+        # Crash landed BEFORE the detach: the interim is still the container mount,
+        # so re-copying writes back INTO the container (idempotent overwrite).
+        with pause_sidecar_writers():
+            with contextlib.suppress(FileNotFoundError):
+                _copy_sidecars_into_container(paths, sidecar_names)
         with contextlib.suppress(Exception):
-            mounter.detach(paths.interim_mountpoint)
+            mounter.detach(interim)
+    else:
+        # Crash landed AFTER the detach: the sidecars are already in the container;
+        # do NOT write plaintext to the detached host path. Clean any residue a
+        # prior (buggy) recovery may have written there.
+        _clean_detached_interim_store(interim, paths.store_subdir_name)
     _swap_plaintext_for_container(paths, mounter, set_container_enabled)
     ledger.set_run(phase=MigrationPhase.CUTOVER_DONE)
+
+
+def _clean_detached_interim_store(interim: Path, store_subdir_name: str) -> None:
+    """Remove plaintext ``.store`` residue written onto a DETACHED interim host
+    path by a prior buggy recovery (FIX 4). Best-effort; never raises."""
+    residue = interim / store_subdir_name
+    with contextlib.suppress(OSError):
+        if residue.is_dir() and not residue.is_symlink():
+            shutil.rmtree(residue, ignore_errors=True)
 
 
 def _copy_sidecars_into_container(
@@ -996,6 +1095,16 @@ def _run_sweep(
     """
     aside_str = ledger.aside_path()
     aside = Path(aside_str) if aside_str else paths.aside_root
+    # The names this migration is authoritatively responsible for. ONLY these may
+    # be deleted from the aside tree (FIX 1) — never a blanket ``rmtree(aside)``.
+    tracked = set(
+        ledger.names_in(
+            UnitState.PENDING,
+            UnitState.COPIED,
+            UnitState.VERIFIED,
+            UnitState.PLAINTEXT_DELETED,
+        )
+    )
     for name in ledger.names_in(
         UnitState.PENDING, UnitState.COPIED, UnitState.VERIFIED
     ):
@@ -1004,11 +1113,35 @@ def _run_sweep(
             shutil.rmtree(target, ignore_errors=True)
         ledger.mark(name, UnitState.PLAINTEXT_DELETED)
         emit()
-    # Remove the now-empty aside root (best-effort — leftover non-recording
-    # cruft must not wedge completion).
-    if aside.exists():
-        with contextlib.suppress(OSError):
-            shutil.rmtree(aside, ignore_errors=True)
+    # FIX 1: remove the aside root ONLY if nothing untracked remains inside it. A
+    # directory that is NOT a ledger-tracked recording (e.g. a record-through
+    # straggler a wholesale swap moved aside) must be PRESERVED, never blanket-
+    # deleted — the R13/AE6 "no recording lost" guarantee. (FIX 1's pre-cutover
+    # re-enumeration means this should not normally occur; this is the last-line
+    # guard so the sweep can never destroy an untracked recording.)
+    _sweep_aside_root(aside, tracked)
     ledger.set_run(state=MigrationState.COMPLETED, phase=MigrationPhase.DONE)
     emit()
     return ledger.summary()
+
+
+def _sweep_aside_root(aside: Path, tracked: set[str]) -> None:
+    """Remove the aside root, but ONLY when every remaining entry is a ledger-
+    tracked (already-swept) recording. Any untracked entry is preserved intact
+    (never deleted) — the FIX 1 no-loss guarantee."""
+    if not aside.exists():
+        return
+    try:
+        remaining = list(aside.iterdir())
+    except OSError:
+        return
+    untracked = [p for p in remaining if p.name not in tracked]
+    if untracked:
+        logger.warning(
+            "migration sweep: %d untracked entrie(s) under the aside root; "
+            "preserving them (not deleting)",
+            len(untracked),
+        )
+        return
+    with contextlib.suppress(OSError):
+        shutil.rmtree(aside, ignore_errors=True)
