@@ -401,14 +401,18 @@ async def test_lock_forces_detach_compact_does_not(container_on, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_lock_audit_record_has_peer_and_outcome(container_on, monkeypatch):
+async def test_lock_audit_record_has_peer_and_outcome(container_on, monkeypatch, tmp_path):
+    from screencap.daemon import audit_log
+
+    # Isolate the audit log to a tmp path — record_verb assumes the run-dir
+    # already exists and no-ops on ENOENT, and a fresh CI home has no
+    # ~/.screencap/run/ (so reading the real path would find nothing).
+    monkeypatch.setattr(audit_log, "_audit_log_path", lambda: tmp_path / "audit.log")
     monkeypatch.setattr(container, "detach", _DetachSpy())
     app, sup = _build_app(StoreState.MOUNTED)
 
     async with _client(app) as c:
         await c.post("/v0/storage.lock", json={})
-
-    from screencap.daemon import audit_log
 
     log = audit_log._audit_log_path()
     assert log.exists()
@@ -478,7 +482,10 @@ async def test_unlock_keychain_locked_is_retryable_sentinel_intact(
     assert sl.is_sealed(), "a failed unlock leaves the sentinel INTACT"
 
 
-async def test_unlock_audit_record(container_on, monkeypatch):
+async def test_unlock_audit_record(container_on, monkeypatch, tmp_path):
+    from screencap.daemon import audit_log
+
+    monkeypatch.setattr(audit_log, "_audit_log_path", lambda: tmp_path / "audit.log")
     sl.write_sealed_sentinel()
     app, sup = _build_app(StoreState.LOCKED)
     monkeypatch.setattr(
@@ -488,8 +495,6 @@ async def test_unlock_audit_record(container_on, monkeypatch):
 
     async with _client(app) as c:
         await c.post("/v0/storage.unlock", json={})
-
-    from screencap.daemon import audit_log
 
     lines = [
         json.loads(x)
