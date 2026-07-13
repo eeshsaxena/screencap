@@ -31,7 +31,10 @@ struct RecallPaletteView: View {
     @StateObject private var presenceGate = PresenceGate()
 
     @State private var query = ""
-    @State private var contentIndexEnabled = false
+    // nil = settings not yet loaded (or the load failed) — tri-state (SCR-261
+    // R12/KTD6) so an unresolved flag stays quiet in the empty-cause
+    // derivation instead of masquerading as a known "off".
+    @State private var contentIndexEnabled: Bool? = nil
     // nil = not yet loaded. Treated as "gated" until loadSettings() positively
     // resolves it, so recall results never render un-gated during the async load
     // window (fail-closed on the presence gate).
@@ -39,6 +42,10 @@ struct RecallPaletteView: View {
     @State private var consentDeclined = false
     @State private var backfillDeclined = false
     @State private var selectedResultID: SearchResultItem.ID?
+    // nil = no `.loaded` phase observed yet this palette session — the footer's
+    // indexed badge stays quiet until a loaded result has positively reported
+    // the index built (SCR-261 R11).
+    @State private var lastKnownScreenNotIndexed: Bool? = nil
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
@@ -50,7 +57,17 @@ struct RecallPaletteView: View {
         }
         .task {
             runner = RecallPaletteQueryRunner { [weak model] text in
-                await model?.search(text, contentIndexEnabled: contentIndexEnabled)
+                // The view-model signature stays a plain Bool (DayTimelineView
+                // shares it); an unresolved flag searches as "off".
+                await model?.search(text, contentIndexEnabled: contentIndexEnabled ?? false)
+            }
+            // SCR-261 U3 (KTD9/R9): backfill finished (including with partial
+            // failures) → refresh a live query once, non-debounced, so results
+            // reflect the new index. Never for an empty/cleared query. Weak
+            // runner capture only — capturing the view struct here would cycle
+            // model → closure → view copy → @StateObject box → model.
+            model.onBackfillCompleted = { [weak runner] in
+                runner?.refreshIfNonEmpty()
             }
             // SCR-258 U10: refresh so the store state is current when the palette
             // opens (a store locked from another surface flips this).
@@ -60,7 +77,10 @@ struct RecallPaletteView: View {
         }
         .onChange(of: query) { _ in runner?.search(query, debounced: true) }
         .onChange(of: model.phase) { phase in
-            if case .loaded = phase { selectedResultID = nil }
+            if case .loaded(let results) = phase {
+                selectedResultID = nil
+                lastKnownScreenNotIndexed = results.coverage.screen == .notIndexed
+            }
         }
     }
 
@@ -80,6 +100,7 @@ struct RecallPaletteView: View {
                     phase: model.phase,
                     consentDeclined: consentDeclined,
                     backfillState: model.backfillState,
+                    contentIndexEnabled: contentIndexEnabled,
                     recentSearches: recentStore.recent,
                     queryTerms: queryTerms,
                     selectedResultID: selectedResultID,
@@ -94,6 +115,7 @@ struct RecallPaletteView: View {
                     onSkipBackfill: skipBackfill,
                     onCancelBackfill: model.cancelBackfill,
                     onResumeBackfill: model.resumeBackfill,
+                    onStartBackfill: startBackfill,
                     onRunChip: runChipQuery,
                     onOpen: jump,
                     onRetry: { runner?.search(query, debounced: false) },
@@ -150,15 +172,26 @@ struct RecallPaletteView: View {
 
     // MARK: - Footer (design 591–594)
 
+    /// SCR-261 U4 (R11) — the footer claims indexed coverage only when
+    /// indexing is on AND the index was observed built by a loaded result.
+    /// Idle/searching inherit the last honest observation (the latch),
+    /// defaulting to no claim before any search has loaded. Off or unknown
+    /// settings drop the claim outright.
+    private var showsIndexedBadge: Bool {
+        contentIndexEnabled == true && lastKnownScreenNotIndexed == false
+    }
+
     private var footer: some View {
         HStack {
             Text("↑↓ browse · ↵ jump to moment · esc close")
                 .font(SCTypography.mono(size: 10.5))
                 .foregroundStyle(Color.scInkMuted)
             Spacer()
-            Text("indexed on-device")
-                .font(SCTypography.mono(size: 10.5))
-                .foregroundStyle(Color.scTeal)
+            if showsIndexedBadge {
+                Text("indexed on-device")
+                    .font(SCTypography.mono(size: 10.5))
+                    .foregroundStyle(Color.scTeal)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -248,7 +281,9 @@ struct RecallPaletteView: View {
             backfillDeclined = env.settings.contentIndexBackfillDeclined ?? false
             if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
         } catch {
-            contentIndexEnabled = false
+            // SCR-261 R12: a failed settings read leaves the flag unresolved
+            // (nil) — never a fabricated "off", which would nag about consent
+            // the user may already have given.
         }
     }
 
@@ -256,6 +291,7 @@ struct RecallPaletteView: View {
     /// optimistic with revert-on-failure (the retired SearchView's
     /// enableConsent pattern).
     private func enableConsent() {
+        let prior = contentIndexEnabled
         contentIndexEnabled = true
         model.offerBackfill(alreadyDeclined: backfillDeclined)
         Task {
@@ -264,7 +300,9 @@ struct RecallPaletteView: View {
                     ["settings", "--set", "content_index_enabled=true", "--json"]
                 )
             } catch {
-                contentIndexEnabled = false
+                // Revert to what we knew before the optimistic flip (false, or
+                // nil when the settings read never resolved — tri-state).
+                contentIndexEnabled = prior
                 model.dismissBackfillOffer()
                 return
             }
@@ -289,6 +327,17 @@ struct RecallPaletteView: View {
         backfillDeclined = true
         model.skipBackfill()
     }
+
+    /// SCR-261 U3 (KTD5): the not-indexed empty body's "Index now" — an
+    /// explicit accept that must work for a prior decliner, so it goes to
+    /// `startBackfillFromEmptyState()` directly (never through
+    /// `offerBackfill(alreadyDeclined:)`, which no-ops). The view-local decline
+    /// memory resets too, so a same-session `enableConsent` doesn't consult a
+    /// stale decline; the model clears the persisted flag through its seam.
+    private func startBackfill() {
+        backfillDeclined = false
+        model.startBackfillFromEmptyState()
+    }
 }
 
 /// The palette's pure body: renders one `RecallPalette.State` variant plus the
@@ -298,6 +347,10 @@ struct RecallPaletteContent: View {
     let phase: SearchViewModel.Phase
     let consentDeclined: Bool
     let backfillState: SearchViewModel.BackfillUIState
+    /// Live settings flag (nil = not yet resolved / load failed) — drives the
+    /// SCR-261 empty-cause derivation. The hosting view's state is tri-state
+    /// too (U3), so an unresolved load flows through as nil.
+    var contentIndexEnabled: Bool? = nil
     let recentSearches: [String]
     let queryTerms: [String]
     let selectedResultID: SearchResultItem.ID?
@@ -313,6 +366,10 @@ struct RecallPaletteContent: View {
     var onSkipBackfill: () -> Void = {}
     var onCancelBackfill: () -> Void = {}
     var onResumeBackfill: () -> Void = {}
+    /// Start indexing existing recordings — the not-indexed empty state's CTA
+    /// (SCR-261). Wired by the hosting view to the explicit-accept path
+    /// (`startBackfillFromEmptyState`), which works for a prior decliner.
+    var onStartBackfill: () -> Void = {}
     var onRunChip: (String) -> Void = { _ in }
     var onOpen: (SearchResultItem) -> Void = { _ in }
     /// Re-run the current query — the daemon-down state's retry affordance.
@@ -325,6 +382,7 @@ struct RecallPaletteContent: View {
             phase: phase,
             consentDeclined: consentDeclined,
             backfillState: backfillState,
+            contentIndexEnabled: contentIndexEnabled,
             recents: recentSearches
         )
     }
@@ -355,7 +413,8 @@ struct RecallPaletteContent: View {
                 icon: "bolt.horizontal.circle",
                 title: "ScreenCap isn't running",
                 note: "Start ScreenCap's background helper to search your history.",
-                retry: onRetry
+                retry: onRetry,
+                retryHint: RecallPaletteContent.retryAgainHint
             )
         case .subscriptionRequired:
             // U12: lapsed / not-entitled. An upgrade CTA — NOT the error/retry
@@ -367,14 +426,11 @@ struct RecallPaletteContent: View {
                 title: "Subscribe to search",
                 note: "Search needs an active subscription. Your recordings are safe on this Mac — you can still browse and export them.",
                 actionTitle: "Subscribe",
-                action: onUpgrade
+                action: onUpgrade,
+                actionHint: "Opens the upgrade options."
             )
-        case .empty:
-            message(
-                icon: "magnifyingglass",
-                title: "No matches on this Mac",
-                note: "Try different words, an app name, or a time like \u{201C}yesterday afternoon\u{201D}."
-            )
+        case .empty(let cause, let showsUnavailableNote):
+            emptyState(cause: cause, showsUnavailableNote: showsUnavailableNote)
         case .results:
             resultsList
         }
@@ -531,15 +587,130 @@ struct RecallPaletteContent: View {
         .overlay(alignment: .bottom) { Divider().overlay(Color.scFillSubtle) }
     }
 
+    // MARK: - Empty causes (SCR-261)
+
+    /// Everything the empty body renders for one cause — icon, honest copy,
+    /// and which CTA (if any). Pure and equatable so RecallPaletteStateTests
+    /// can pin the copy and button presence without reading the render.
+    struct EmptySpec: Equatable {
+        enum CTA: Equatable {
+            /// "Turn on" → `onEnableConsent`.
+            case enableConsent(title: String, hint: String)
+            /// "Index now" → `onStartBackfill`.
+            case startBackfill(title: String, hint: String)
+            /// The daemon-down state's existing Retry mechanism → `onRetry`.
+            case retry(hint: String)
+        }
+        let icon: String
+        let title: String
+        let note: String
+        var cta: CTA? = nil
+    }
+
+    /// The one de-emphasized aside every consent/indexing-tier empty carries
+    /// when a *different* searched stream errored (`showsUnavailableNote`).
+    static let unavailableNote = "Some of this Mac couldn't be searched right now."
+
+    /// The retry CTA's VoiceOver hint, shared by every retry-bearing state.
+    static let retryAgainHint = "Searches again now."
+
+    static func emptySpec(for cause: RecallPalette.State.EmptyCause) -> EmptySpec {
+        switch cause {
+        case .noMatches:
+            // The legacy empty state, verbatim — a pinned regression surface.
+            return EmptySpec(
+                icon: "magnifyingglass",
+                title: "No matches on this Mac",
+                note: "Try different words, an app name, or a time like \u{201C}yesterday afternoon\u{201D}."
+            )
+        case .consentNeeded:
+            // "isn't being indexed", never "wasn't searched" — a stale index
+            // may well have been searched.
+            return EmptySpec(
+                icon: "doc.text.magnifyingglass",
+                title: "On-screen text isn't being indexed",
+                note: "Turn it on and Search can look through the text that was on your screen — it all stays on this Mac.",
+                cta: .enableConsent(title: "Turn on", hint: "Turns on on-screen text indexing.")
+            )
+        case .consentDeclined:
+            // The user said no — an honest notice, no nagging CTA.
+            return EmptySpec(
+                icon: "doc.text.magnifyingglass",
+                title: "Screen text isn't being indexed",
+                note: "Matches may exist on screen. You can turn on indexing anytime."
+            )
+        case .notIndexed(ctaAvailable: true):
+            return EmptySpec(
+                icon: "clock.arrow.circlepath",
+                title: "Your recordings aren't indexed for text search yet",
+                note: "Index your history to make the text that was on screen searchable — it all stays on this Mac.",
+                cta: .startBackfill(title: "Index now", hint: "Starts indexing your recordings.")
+            )
+        case .notIndexed(ctaAvailable: false):
+            // The backfill section above owns the ask — defer to it.
+            return EmptySpec(
+                icon: "clock.arrow.circlepath",
+                title: "Your recordings aren't indexed for text search yet",
+                note: "Indexing is available above."
+            )
+        case .degraded:
+            // A search DID run, just in a limited mode — softer than
+            // unavailable, and nothing to retry into a better mode.
+            return EmptySpec(
+                icon: "magnifyingglass",
+                title: "Results may be incomplete",
+                note: "Text search ran in a limited mode on this Mac, so some matches may not appear."
+            )
+        case .unavailable:
+            return EmptySpec(
+                icon: "exclamationmark.circle",
+                title: "Couldn't search everything",
+                note: "Part of search on this Mac isn't available right now. Your recordings are safe.",
+                cta: .retry(hint: retryAgainHint)
+            )
+        }
+    }
+
+    /// One empty cause → the message layout, with its CTA routed to the
+    /// matching callback. No Unlock/presence affordance on any empty variant
+    /// (KTD2).
+    @ViewBuilder
+    private func emptyState(
+        cause: RecallPalette.State.EmptyCause,
+        showsUnavailableNote: Bool
+    ) -> some View {
+        let spec = Self.emptySpec(for: cause)
+        let secondary = showsUnavailableNote ? Self.unavailableNote : nil
+        switch spec.cta {
+        case .enableConsent(let title, let hint):
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary,
+                    actionTitle: title, action: onEnableConsent, actionHint: hint)
+        case .startBackfill(let title, let hint):
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary,
+                    actionTitle: title, action: onStartBackfill, actionHint: hint)
+        case .retry(let hint):
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary, retry: onRetry, retryHint: hint)
+        case nil:
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary)
+        }
+    }
+
     // MARK: - Message state
 
     private func message(
         icon: String,
         title: String,
         note: String,
+        secondaryNote: String? = nil,
         retry: (() -> Void)? = nil,
+        retryHint: String? = nil,
         actionTitle: String? = nil,
-        action: (() -> Void)? = nil
+        action: (() -> Void)? = nil,
+        actionHint: String? = nil
     ) -> some View {
         VStack(spacing: 8) {
             Image(systemName: icon)
@@ -552,21 +723,30 @@ struct RecallPaletteContent: View {
                 .font(SCTypography.sans(size: 12))
                 .foregroundStyle(Color.scInkSecondary)
                 .multilineTextAlignment(.center)
-            // Give the daemon-down state a way to act on its own instruction:
-            // re-run the query once the helper is back, instead of a dead end.
+            // The "a different stream errored" aside (SCR-261) — one
+            // de-emphasized line below the primary note.
+            if let secondaryNote {
+                Text(secondaryNote)
+                    .font(SCTypography.sans(size: 11))
+                    .foregroundStyle(Color.scInkMuted)
+                    .multilineTextAlignment(.center)
+            }
+            // Give the retrying states a way to act on their own instruction:
+            // re-run the query, instead of a dead end.
             if let retry {
                 Button("Retry") { retry() }
                     .padding(.top, 4)
+                    .accessibilityHint(retryHint ?? Self.retryAgainHint)
             }
-            // U12: a labeled call-to-action (e.g. "Subscribe" for the
-            // subscription-required state) — prominent so it reads as the way
-            // forward, not an error acknowledgement.
+            // A labeled call-to-action (e.g. "Subscribe", "Turn on",
+            // "Index now") — prominent so it reads as the way forward, not an
+            // error acknowledgement.
             if let actionTitle, let action {
                 Button(actionTitle) { action() }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.scTeal)
                     .padding(.top, 4)
-                    .accessibilityHint("Opens the upgrade options.")
+                    .accessibilityHint(actionHint ?? "")
             }
         }
         .frame(maxWidth: .infinity)

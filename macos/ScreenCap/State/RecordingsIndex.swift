@@ -1,12 +1,17 @@
+import AppKit
 import Combine
 import Foundation
 
-/// Cache for `screencap list --json` output. Reloaded on init and on demand
-/// (`refresh()` runs when the `recording_finalized` event fires).
+/// Cache for the recordings list. Reloaded on init and on demand — `refresh()`
+/// runs after `recording_finalized`, a successful upload, a rename, and
+/// (SCR-259) on app re-activation while the CLI-fallback advisory is showing,
+/// so a daemon that rebinds `api.sock` after a launch-time swap window clears
+/// the "running without the background helper" banner without user action.
 ///
-/// This is intentionally a state-only ObservableObject — no lifecycle, no
-/// timers. Consumers: the Library grid (U5) and the Journal's day sections
-/// (U8), both reading `recordings` and deriving their own groupings.
+/// State-only ObservableObject — no timers; its only lifecycle is the
+/// NotificationCenter observers wired in `init`. Consumers: the Library grid
+/// (U5) and the Journal's day sections (U8), both reading `recordings` and
+/// deriving their own groupings.
 @MainActor
 final class RecordingsIndex: ObservableObject {
     /// Why the last load failed — lets the Library grid (U5) distinguish a
@@ -45,8 +50,11 @@ final class RecordingsIndex: ObservableObject {
     @Published private(set) var usingCLIFallback: Bool = false
 
     private var uploadSucceededObserver: NSObjectProtocol?
+    private var didBecomeActiveObserver: NSObjectProtocol?
+    private let notificationCenter: NotificationCenter
 
-    init(autoload: Bool = true) {
+    init(autoload: Bool = true, notificationCenter: NotificationCenter = .default) {
+        self.notificationCenter = notificationCenter
         if autoload {
             Task { await refresh() }
         }
@@ -54,7 +62,7 @@ final class RecordingsIndex: ObservableObject {
         // so the source row's `isUploadEligible` predicate flips off
         // `uploaded` and the Upload button disappears on the next render.
         // ReviewWindow posts this notification via LiveReviewWindowEffects.
-        uploadSucceededObserver = NotificationCenter.default.addObserver(
+        uploadSucceededObserver = notificationCenter.addObserver(
             forName: .reviewWindowUploadSucceeded,
             object: nil,
             queue: .main
@@ -63,11 +71,34 @@ final class RecordingsIndex: ObservableObject {
                 await self?.refresh()
             }
         }
+        // SCR-259: `usingCLIFallback` is set when a load during the daemon-swap
+        // window (e.g. right after an app update, while the old daemon is still
+        // being booted off `api.sock`) falls back to the CLI. Nothing re-lists
+        // once the fresh daemon rebinds the socket, so the "running without the
+        // background helper" advisory would otherwise persist for the whole
+        // session. Re-probe the daemon when the app is re-activated while the
+        // advisory is showing; a reachable daemon clears it without user action.
+        // Gated on the advisory so a refocus in the healthy path doesn't re-list
+        // on every activation. The Library also re-probes on navigation (its
+        // `.task`), covering the case where the window never lost focus.
+        didBecomeActiveObserver = notificationCenter.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.usingCLIFallback else { return }
+                await self.refresh()
+            }
+        }
     }
 
     deinit {
         if let uploadSucceededObserver {
-            NotificationCenter.default.removeObserver(uploadSucceededObserver)
+            notificationCenter.removeObserver(uploadSucceededObserver)
+        }
+        if let didBecomeActiveObserver {
+            notificationCenter.removeObserver(didBecomeActiveObserver)
         }
     }
 

@@ -74,7 +74,7 @@ git log "$(git tag --list 'macos-app-v*' --sort=-v:refname | head -1)"..HEAD --o
 ( set -a; . ./.env; set +a; .venv/bin/python scripts/generate_provisioned.py )
 ```
 
-Writes the gitignored `src/screencap/_provisioned.py` that PyInstaller bundles. Without it, the Step 4 fail-closed guard blocks the release rather than shipping a binary whose every `screencap login` fails.
+Writes the gitignored `src/screencap/_provisioned.py` that PyInstaller bundles. Your `.env` must define all three of `SCREENCAP_OAUTH_CLIENT_ID`, `SCREENCAP_OAUTH_CLIENT_SECRET` and `SCREENCAP_FIREBASE_API_KEY` — the generator exits non-zero (writing nothing) if any is missing. The client secret is required because the token exchange for a Google Desktop OAuth client needs it even under PKCE. Without a complete injection, the Step 4 fail-closed guard blocks the release rather than shipping a binary whose every `screencap login` fails with `client_secret is missing`.
 
 ## Step 4: Build + verify the embedded daemon
 

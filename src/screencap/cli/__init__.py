@@ -89,6 +89,17 @@ _AUTH_SCHEMA_VERSION = 2
 # `backfill status --json` envelope (ok + schema_version + the privacy-safe
 # status snapshot the daemon publishes). SCR-178 U6.
 _BACKFILL_SCHEMA_VERSION = 1
+# `clip --json` envelope (ok + reason + path), read by the Swift
+# ClipExportController (SCR-219 U6). Independent of the stderr-event schema so a
+# clip_progress field change never bumps the terminal-envelope version.
+_CLIP_SCHEMA_VERSION = 1
+# Structured `screencap clip` stderr event types (KTD6). String literals are the
+# cross-language contract the Swift app parses (mirrors the UploadEventLine
+# channel/shape); named here so a typo at an emit site fails locally.
+_CLIP_EVENT_STARTED = "clip_started"
+_CLIP_EVENT_PROGRESS = "clip_progress"
+_CLIP_EVENT_DONE = "clip_done"
+_CLIP_EVENT_FAILED = "clip_failed"
 
 
 def _should_default_to_json() -> bool:
@@ -1553,7 +1564,13 @@ def _find_exportable_dirs(base_dir):
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
-def review_data_cmd(name, as_json):
+@click.option("--clip-start-ms", type=int, default=None,
+              help="Scope the consent surface to a clip starting at this epoch "
+                   "millisecond (requires --clip-end-ms).")
+@click.option("--clip-end-ms", type=int, default=None,
+              help="Scope the consent surface to a clip ending (exclusive) at "
+                   "this epoch millisecond (requires --clip-start-ms).")
+def review_data_cmd(name, as_json, clip_start_ms, clip_end_ms):
     """Prepare a recording for native review and emit a JSON envelope.
 
     Called by the SwiftUI shell's review window when the operator clicks
@@ -1562,6 +1579,12 @@ def review_data_cmd(name, as_json):
     it works with no ffmpeg/ffprobe on PATH — and ensures an events.jsonl
     exists. Returns paths the Swift side feeds into the AVKit player and
     the timeline pane.
+
+    ``--clip-start-ms`` / ``--clip-end-ms`` (both epoch milliseconds) scope the
+    consent surface to a single clip's ``[start, end)`` range (SCR-219): the
+    masked screenshots + events are filtered to the range and an additive
+    ``clip_video_capture_blocked_only`` honesty flag is emitted. Omit both for
+    the whole-recording review.
 
     The envelope shape matches `screencap list --json` and
     `screencap info --json`: ok + schema_version + payload, or
@@ -1572,7 +1595,9 @@ def review_data_cmd(name, as_json):
     from screencap.review import REVIEW_SCHEMA_VERSION, ReviewPrepareError, prepare_review_data
 
     try:
-        envelope = prepare_review_data(name)
+        envelope = prepare_review_data(
+            name, clip_start_ms=clip_start_ms, clip_end_ms=clip_end_ms,
+        )
     except ReviewPrepareError as e:
         # A busy terminal_lock surfaces here as ReviewPrepareBusy (a subclass);
         # the review window (unlike inspect) has no auto-retry consumer, so it is
@@ -1673,6 +1698,254 @@ def inspect_data_cmd(name, as_json):
     console.print(f"  events: [dim]{escape(str(events_display))}[/dim]")
     if envelope.get("video_pixfmt_remediated"):
         console.print("  [dim](video remediated for AVKit compatibility)[/dim]")
+
+
+@cli.command("clip")
+@click.argument("name")
+@click.option("--start-ms", type=int, required=True,
+              help="Clip start, absolute epoch milliseconds (inclusive).")
+@click.option("--end-ms", type=int, required=True,
+              help="Clip end, absolute epoch milliseconds (exclusive).")
+@click.option("--out", "out_path", type=click.Path(dir_okay=False), required=True,
+              help="Destination .mp4 path for the exported clip.")
+@click.option("--lock-timeout", type=click.FloatRange(min=0), default=None,
+              help="Seconds to wait for the contended per-recording terminal "
+                   "lock before reporting the recording busy (default: 30, "
+                   "matching the engine). The interactive app passes a short "
+                   "value well under its watchdog so a contended lock surfaces "
+                   "as retryable clip_busy rather than a hung export.")
+@click.option("--json", "as_json", is_flag=True,
+              default=lambda: _should_default_to_json(),
+              help="Output as JSON. Auto-detected when stdout is not a TTY.")
+def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
+    """Export ``[start-ms, end-ms)`` of a recording as a local .mp4 (video + audio).
+
+    ``--start-ms`` / ``--end-ms`` are **absolute epoch milliseconds** — the same
+    anchor the Swift ``ClipRange`` and the ``review-data`` verb speak. The engine
+    ``export_clip`` expects milliseconds-from-video-start, so this command reads
+    the recording's ``video_start_time`` anchor and converts before the trim; the
+    stderr events and stdout envelope keep reporting the absolute values the
+    caller passed (that is what the app correlates on).
+
+    The auth-free, local clip verb the SwiftUI shell's ClipExportController spawns
+    (SCR-219). It orchestrates the U1/U2 engine trim, holding the per-recording
+    eviction lock around the source-chunk read.
+
+    Emits structured stderr lifecycle events — ``clip_started`` /
+    ``clip_progress{frames_done, frames_total}`` (determinate) / ``clip_done{path}``
+    / ``clip_failed{reason}`` — on the same tolerant-reader channel as the upload
+    events, and a terminal ``--json`` envelope on stdout (``ok`` + ``reason`` +
+    ``path``).
+
+    This command **always exits 0**, carrying success/failure in the envelope:
+    ``CLIClient.runJSONRaw`` discards stdout on a non-zero exit, so a non-zero
+    exit here would drop the typed ``reason`` the app branches on (see
+    docs/solutions/integration-issues/cli-json-envelope-nonzero-exit-discards-stdout-2026-07-02.md).
+
+    Reasons: ``not_eligible`` (not a clippable recording), ``no_frames_in_range``,
+    ``masked_video_required`` (a flag-ON recording fails closed), ``clip_busy``
+    (retryable — the eviction lock stayed contended), ``trim_failed`` (catch-all).
+
+    No account or sign-in is required — clipping reads only local source chunks.
+    """
+    from pathlib import Path
+
+    from screencap._stderr_events import emit_event
+
+    out_p = Path(out_path)
+
+    def _emit_envelope(payload: dict) -> None:
+        payload = {"schema_version": _CLIP_SCHEMA_VERSION, "recording": name, **payload}
+        if as_json:
+            click.echo(json.dumps(payload))
+        elif payload["ok"]:
+            console.print(f"[green]Clip exported[/green] → [dim]{escape(str(payload['path']))}[/dim]")
+        else:
+            console.print(f"[red]Clip failed[/red] ({escape(str(payload['reason']))})")
+
+    def _fail(reason: str, *, retryable: bool = False, error: str | None = None) -> None:
+        emit_event(_CLIP_EVENT_FAILED, recording=name, reason=reason, retryable=retryable)
+        _emit_envelope({
+            "ok": False, "reason": reason, "path": None,
+            "retryable": retryable, "error": error,
+            "start_ms": start_ms, "end_ms": end_ms,
+        })
+        # Always exit 0 — the reason travels in the envelope, not the exit code.
+
+    # Eligibility gate (isClippable, R8): a local, non-stub recording with source
+    # video present. Kept intentionally simple — the engine raises
+    # no_frames_in_range when a *specific* range has no video; not_eligible is for
+    # "this recording can't be clipped at all." Resolve first, then require the
+    # dir exists and holds at least one source chunk_*.mp4 (an evicted stub or a
+    # legacy single-file recording has none). The engine is NOT touched here, so
+    # an ineligible name never reaches the trim.
+    from screencap.config import resolve_recording_dir
+
+    try:
+        rec_dir = resolve_recording_dir(name)
+    except (ValueError, OSError):
+        _fail("not_eligible", error=f"invalid recording name: {name!r}")
+        return
+    if not (rec_dir.is_dir() and any(rec_dir.glob("chunk_*.mp4"))):
+        _fail(
+            "not_eligible",
+            error=f"{name!r} is not a clippable recording (missing, a stub, or "
+                  "has no local source video)",
+        )
+        return
+
+    # Cross-unit anchor conversion. The caller (Swift ``ClipRange`` / the
+    # ``review-data`` verb) passes ABSOLUTE epoch milliseconds, but the engine's
+    # ``export_clip`` wants milliseconds-from-video-start (relative to
+    # ``recording.db.video_start_time``). Read the video-start anchor exactly as
+    # the rest of the codebase does — ``video_start_time`` falling back to
+    # ``timestamp`` (epoch seconds), via the one canonical
+    # ``catalog.read_video_start_anchor`` reader (shared with audio_clip) — and
+    # subtract it. A missing DB or unusable anchor can't be converted, so it is
+    # not_eligible (structured, exit 0, engine untouched) rather than a crash or
+    # a wrong range.
+    from screencap.catalog import read_video_start_anchor
+
+    anchor_s = read_video_start_anchor(rec_dir)
+    if anchor_s is None:
+        _fail(
+            "not_eligible",
+            error=f"{name!r} has no readable video-start anchor "
+                  "(missing recording.db or null video_start_time/timestamp)",
+        )
+        return
+
+    anchor_ms = round(anchor_s * 1000)
+    rel_start_ms = start_ms - anchor_ms
+    rel_end_ms = end_ms - anchor_ms
+
+    import signal as _signal
+
+    from screencap.engine.video import (
+        ClipExportError,
+        export_clip,
+    )
+    from screencap.terminal_stage import TerminalStageBusy
+
+    emit_event(_CLIP_EVENT_STARTED, recording=name, start_ms=start_ms, end_ms=end_ms)
+
+    def _on_progress(frames_done: int, frames_total: int) -> None:
+        emit_event(
+            _CLIP_EVENT_PROGRESS, recording=name,
+            frames_done=int(frames_done), frames_total=int(frames_total),
+        )
+
+    export_kwargs: dict[str, Any] = {"on_progress": _on_progress}
+    if lock_timeout is not None:
+        # None → let the engine's default (30s) stand, so "default matches engine".
+        export_kwargs["lock_timeout"] = lock_timeout
+
+    # SCR-219: install a SIGTERM handler around the encode. The Swift Cancel /
+    # window-close / watchdog paths SIGTERM this child; without a handler Python's
+    # default disposition kills it WITHOUT running ``export_clip``'s
+    # ``except BaseException`` cleanup, orphaning the full-size video-only
+    # intermediate in the user's export dir. The handler emits ONE terminal
+    # ``clip_failed(cancelled)`` then raises KeyboardInterrupt, which propagates
+    # INTO ``export_clip`` (whose ``except BaseException`` unlinks the temp) and
+    # back here. Mirrors ``upload_cmd``'s ``_emit_interrupted_and_raise``. The
+    # sentinel + finally restore the previous handler (skipped off-main-thread,
+    # where ``signal.signal`` raises ValueError).
+    _interrupt_emitted = False
+    # ``export_clip`` returns BEFORE the ``finally`` restores the previous SIGTERM
+    # handler, so the custom handler is still installed during that window. A
+    # SIGTERM delivered there (Swift racing a watchdog against a just-finished
+    # export) must NOT clobber the real clip already on disk: without this guard
+    # the handler would emit a terminal ``clip_failed(cancelled)`` and raise out
+    # of the ``finally``, so the ``clip_done`` / ok-envelope below never runs and
+    # Swift sees a spurious cancel. Once ``export_clip`` has returned we flip
+    # ``succeeded`` and the handler becomes a no-op (neither emits nor raises) —
+    # the success envelope owns the outcome. Mid-export cancel (before success)
+    # is unchanged.
+    succeeded = False
+
+    def _emit_interrupted_and_raise(_signum, _frame):
+        nonlocal _interrupt_emitted
+        if succeeded:
+            # Post-success SIGTERM: the clip is finalized on disk and the
+            # ok-envelope is about to be written. Swallow the signal so we don't
+            # overwrite success with a cancel.
+            return
+        if not _interrupt_emitted:
+            _interrupt_emitted = True
+            emit_event(
+                _CLIP_EVENT_FAILED, recording=name, reason="cancelled",
+                retryable=False,
+            )
+        raise KeyboardInterrupt
+
+    _UNSET: object = object()
+    _previous_sigterm: object = _UNSET
+
+    try:
+        try:
+            _previous_sigterm = _signal.signal(
+                _signal.SIGTERM, _emit_interrupted_and_raise
+            )
+        except ValueError:
+            pass  # off-main-thread — the restore guard below no-ops.
+
+        # Relative (from-video-start) ms — the caller-facing envelope/events keep
+        # the absolute ``start_ms`` / ``end_ms`` above.
+        export_clip(rec_dir, rel_start_ms, rel_end_ms, out_p, **export_kwargs)
+        # A real clip is now on disk. Latch success so a SIGTERM racing the
+        # handler-restore below can't re-enter the handler and emit a cancel.
+        succeeded = True
+    except TerminalStageBusy as exc:
+        # A contended eviction lock is retryable, not a hard failure (KTD6). It is
+        # deliberately NOT a ClipExportError, so the app can retry rather than
+        # surface a terminal error.
+        _fail("clip_busy", retryable=True, error=str(exc))
+        return
+    except ClipExportError as exc:
+        # The engine's structured taxonomy: MaskedVideoRequiredError /
+        # NoFramesInRangeError carry their own ``reason`` (masked_video_required /
+        # no_frames_in_range); the base ClipExportError is trim_failed.
+        _fail(getattr(exc, "reason", "trim_failed") or "trim_failed", error=str(exc))
+        return
+    except KeyboardInterrupt:
+        # A SIGTERM (Swift cancel / window-close / watchdog) routed through
+        # ``_emit_interrupted_and_raise``, which already emitted the terminal
+        # ``clip_failed(cancelled)`` event and let ``export_clip`` unlink its
+        # intermediate. Still write the stdout envelope so a stdout reader gets a
+        # typed result, and exit 0 (this command always carries the reason in the
+        # envelope, not the exit code — a non-zero exit would drop stdout).
+        _emit_envelope({
+            "ok": False, "reason": "cancelled", "path": None,
+            "retryable": False, "error": "interrupted",
+            "start_ms": start_ms, "end_ms": end_ms,
+        })
+        return
+    except Exception as exc:
+        # Any unexpected error still exits 0 with the catch-all reason rather than
+        # a raw traceback the app's decoder would never see (non-zero → stdout
+        # dropped). Control-flow BaseExceptions (KeyboardInterrupt/SystemExit)
+        # propagate untouched.
+        _fail("trim_failed", error=str(exc))
+        return
+    finally:
+        # Restore only if the install actually ran (_UNSET ⇒ off-main-thread).
+        # A genuine None previous handler (C-set) restores to SIG_DFL.
+        if _previous_sigterm is not _UNSET:
+            try:
+                _signal.signal(
+                    _signal.SIGTERM,
+                    _previous_sigterm
+                    if _previous_sigterm is not None
+                    else _signal.SIG_DFL,
+                )
+            except ValueError:
+                pass
+
+    emit_event(_CLIP_EVENT_DONE, recording=name, path=str(out_p))
+    _emit_envelope({
+        "ok": True, "reason": None, "path": str(out_p),
+        "start_ms": start_ms, "end_ms": end_ms,
+    })
 
 
 @cli.command("login")
@@ -5826,7 +6099,10 @@ def auth_config_check() -> None:
     the release job against the BUILT binary, after scripts/generate_provisioned.py:
     if the injected screencap._provisioned module is missing/empty, the bundled creds
     fall back to the REPLACE_WITH_PROVISIONED_* sentinels and every sign-in would
-    fail — so such a binary must never ship.
+    fail — so such a binary must never ship. The Google Desktop-client secret has no
+    placeholder (its unprovisioned state is empty), but is equally mandatory: Google's
+    token endpoint rejects the exchange with "client_secret is missing" without it, so
+    an empty bundled secret fails the guard too.
 
     Checks ``auth.bundled_credentials()`` (``_provisioned`` > placeholder) and
     deliberately IGNORES the env-var layer: an end user has no env override, so a
@@ -5838,14 +6114,20 @@ def auth_config_check() -> None:
     """
     from screencap import auth
 
-    api_key, client_id = auth.bundled_credentials()
+    api_key, client_id, client_secret = auth.bundled_credentials()
     checked = (
         ("Firebase Web API key", api_key),
         ("OAuth client id", client_id),
     )
-    placeholders = [
+    unprovisioned = [
         label for label, value in checked if auth.is_placeholder_credential(value)
     ]
+    # The Google Desktop-client secret is REQUIRED at the token endpoint but has no
+    # placeholder sentinel — its unprovisioned state is simply empty. Treat an empty
+    # bundled secret as a placeholder-equivalent failure so a release can't ship a
+    # secret-less binary whose every sign-in dies with "client_secret is missing".
+    if not client_secret:
+        unprovisioned.append("OAuth client secret")
     release_build = os.environ.get("SCREENCAP_RELEASE_BUILD", "").strip().lower() not in (
         "",
         "0",
@@ -5853,24 +6135,25 @@ def auth_config_check() -> None:
         "no",
     )
 
-    if not placeholders:
+    if not unprovisioned:
         console.print(
             "[green]auth-config-check:[/green] resolved cloud-auth credentials are provisioned."
         )
         return
 
-    joined = ", ".join(placeholders)
+    joined = ", ".join(unprovisioned)
     if release_build:
         console.print(
-            f"[red]auth-config-check FAILED:[/red] release build resolved placeholder "
+            f"[red]auth-config-check FAILED:[/red] release build resolved unprovisioned "
             f"credential(s): {joined}. Run scripts/generate_provisioned.py with "
-            "SCREENCAP_OAUTH_CLIENT_ID + SCREENCAP_FIREBASE_API_KEY set before the build "
+            "SCREENCAP_OAUTH_CLIENT_ID + SCREENCAP_FIREBASE_API_KEY + "
+            "SCREENCAP_OAUTH_CLIENT_SECRET set before the build "
             "(see docs/runbooks/cloud-auth-setup.md)."
         )
         raise SystemExit(1)
 
     console.print(
-        f"[yellow]auth-config-check:[/yellow] placeholder credential(s) present ({joined}) — "
+        f"[yellow]auth-config-check:[/yellow] unprovisioned credential(s) present ({joined}) — "
         "OK for a dev/PR build (SCREENCAP_RELEASE_BUILD unset). A release build fails this check."
     )
 

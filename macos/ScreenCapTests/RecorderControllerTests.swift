@@ -247,6 +247,64 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(recorder.lastError, RecorderController.requiredPermissionsErrorMessage)
     }
 
+    /// SCR-263: a menu-bar Start during a post-update helper swap lands in the
+    /// same `.cliFallback` + grants-unverifiable state as a genuine missing
+    /// grant. Keyed on `updateConverging`, the block copy reads like the window's
+    /// "Finishing update…" interstitial instead of the permission-required error
+    /// — the two must not contradict each other.
+    func testCLIFallbackStartDuringConvergenceShowsFinishingUpdateCopy() {
+        let permissions = PermissionController()
+        permissions._testSetRequiredPermissionsGranted(false)
+
+        let recorder = RecorderController()
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.cliFallback)
+        let suiteName = "sc-scr263-start-\(UUID().uuidString.prefix(8))"
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        recorder._testBeginUpdateConvergence(
+            anchor: Date(timeIntervalSince1970: 1_000), defaults: suite
+        )
+
+        recorder.start(name: "cli-owned")
+
+        XCTAssertEqual(recorder.state, .idle)
+        XCTAssertEqual(
+            recorder.lastError,
+            UpdateConvergenceCopy.startBlockedDuringConvergence
+        )
+    }
+
+    /// SCR-263: the New-recording sheet's inline block reason mirrors the same
+    /// convergence-aware copy — permission error when settled, finishing-update
+    /// stand-in mid-swap — so the sheet can't contradict the interstitial either.
+    func testNewRecordingBlockReasonIsConvergenceAware() {
+        let permissions = PermissionController()
+        permissions._testSetRequiredPermissionsGranted(false)
+
+        let recorder = RecorderController()
+        recorder.bindPermissions(permissions)
+        recorder._testSetTransport(.cliFallback)
+
+        // Settled (not converging): today's permission-required copy is preserved.
+        XCTAssertEqual(
+            recorder.newRecordingBlockReason(),
+            RecorderController.requiredPermissionsErrorMessage
+        )
+
+        // Mid-swap: the same unverifiable state now reads as the update stand-in.
+        let suiteName = "sc-scr263-reason-\(UUID().uuidString.prefix(8))"
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        recorder._testBeginUpdateConvergence(
+            anchor: Date(timeIntervalSince1970: 1_000), defaults: suite
+        )
+        XCTAssertEqual(
+            recorder.newRecordingBlockReason(),
+            UpdateConvergenceCopy.startBlockedDuringConvergence
+        )
+    }
+
     func testDaemonTransportPermissionWatchdogIgnoresAppProcessPermissions() {
         let permissions = PermissionController()
         permissions._testSetRequiredPermissionsGranted(false)

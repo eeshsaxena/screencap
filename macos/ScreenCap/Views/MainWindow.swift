@@ -2,53 +2,95 @@ import Combine
 import SwiftUI
 
 enum FirstRunSetupPresentationPolicy {
-    /// Decide whether to present the first-run permission walkthrough (R3, U4).
+    /// What the window shows at launch (and on state updates) for the
+    /// permission-setup surface (SCR-262 tri-state, superseding the old Bool).
+    enum LaunchPresentation: Equatable {
+        /// The normal app shell.
+        case shell
+        /// SCR-262: a helper swap is converging — show the "Finishing update…"
+        /// interstitial, never the permission checklist (whose rows can't be
+        /// verified until the swapped-in helper is up).
+        case updateInterstitial
+        /// The permission wall (`PermissionSetupTakeover`).
+        case permissionWall
+    }
+
+    /// Decide what the window presents for permission setup (R3, U4; SCR-262).
     ///
-    /// This now keys on *daemon-reported* grant state, not on the daemon being
+    /// This keys on *daemon-reported* grant state, not on the daemon being
     /// unreachable. It **supersedes SCR-54's "do not pre-block on the daemon
     /// transport"** — but legitimately so: SCR-54 removed pre-blocking on the
     /// *app process's* (irrelevant) TCC state; this gate keys on the *daemon's*
     /// (the TCC subject's) state.
     ///
-    /// - `.cliFallback` (daemon unreachable): preserve the existing CLI-path
-    ///   walkthrough — the recording would run under the app's own TCC identity.
-    /// - `.daemon` (reachable): present only when the daemon reports a missing
+    /// - Converging (SCR-262): while a stale-daemon kickstart is converging and
+    ///   its deadline hasn't passed, the interstitial wins over everything the
+    ///   probe can't verify — including the migration banner (which resumes
+    ///   after convergence) and a persisted `setupDismissed` (the interstitial
+    ///   is status, not a nag). Only the explicit converging signal enters
+    ///   here — bare `.cliFallback` unreachability still means the wall, so a
+    ///   dead registration keeps its immediate repair surface.
+    /// - `.cliFallback` (daemon unreachable, not converging): the wall — the
+    ///   recording would run under the app's own TCC identity, and the wall's
+    ///   auto-fired helper install is the only self-heal for dead registrations.
+    /// - `.daemon` (reachable): the wall only when the daemon reports a missing
     ///   required grant. Indeterminate / absent-block is never "missing" (the
     ///   engine preflight is the backstop), so it never presents.
     ///
-    /// A persisted `setupDismissed` ("Skip for now") suppresses the gate so it
+    /// A persisted `setupDismissed` ("Skip for now") suppresses the wall so it
     /// stops re-popping every launch. The start-block (R4) is independent of
     /// `setupDismissed`, so a dismissed sheet never lets a broken recording start.
     ///
-    /// U11: `onboardingTakeoverActive` suppresses the sheet outright while the
+    /// U11: `onboardingTakeoverActive` suppresses everything while the
     /// onboarding wizard owns the window — the wizard embeds the same
-    /// install + grant machinery, so popping the sheet over it would run two
+    /// install + grant machinery, so popping the wall over it would run two
     /// copies of the walkthrough at once. On a fresh install the migration
     /// marker is also absent, so without this guard the migration override
-    /// would force the sheet over the wizard's welcome step.
-    static func shouldPresentOnLaunch(
+    /// would force the wall over the wizard's welcome step.
+    static func launchPresentation(
         daemonProbeCompleted: Bool,
         transport: RecorderTransport,
         daemonGrants: DaemonPermissionGrants,
         setupDismissed: Bool,
         migrationNeeded: Bool,
-        onboardingTakeoverActive: Bool = false
-    ) -> Bool {
-        guard !onboardingTakeoverActive else { return false }
-        guard daemonProbeCompleted else { return false }
+        onboardingTakeoverActive: Bool = false,
+        updateConverging: Bool = false,
+        convergenceDeadlineExpired: Bool = false
+    ) -> LaunchPresentation {
+        guard !onboardingTakeoverActive else { return .shell }
+        guard daemonProbeCompleted else { return .shell }
+        // SCR-262: mid-swap, nothing UNVERIFIABLE presents the wall — hold the
+        // interstitial until the loop verifies a fresh daemon or expires. An
+        // answered DENIAL is different: the spurious-wall bug is about
+        // indeterminate rows, never an affirmative denied report, so a
+        // reachable daemon reporting a required denial presents the wall
+        // without waiting out convergence. Past the deadline the wall (the
+        // repair surface) presents; the converging flag is normally already
+        // false by then (the loop clears it), so the expired input is
+        // belt-and-suspenders for the same tick.
+        if updateConverging, !convergenceDeadlineExpired {
+            // The denial escape honors setupDismissed exactly like the
+            // non-converging path below — a user who persisted "Skip for now"
+            // must not get the wall mid-swap on a (possibly dying-daemon)
+            // denial the settled gate would suppress.
+            if transport == .daemon, daemonGrants.anyRequiredDenied, !setupDismissed {
+                return .permissionWall
+            }
+            return .updateInterstitial
+        }
         // Phase 1c (SCR-49): the one-time upgrade migration banner shows even when
         // the daemon already reports grants, and even if the walkthrough was
         // previously skipped — it is the upgrade explanation, shown once until
         // migration completes (marker written). It therefore overrides
         // `setupDismissed`. The caller's `recorder.state.isRecording` guard still
         // suppresses the sheet over an active capture (R3).
-        if migrationNeeded { return true }
-        guard !setupDismissed else { return false }
+        if migrationNeeded { return .permissionWall }
+        guard !setupDismissed else { return .shell }
         switch transport {
         case .cliFallback:
-            return true
+            return .permissionWall
         case .daemon:
-            return daemonGrants.anyRequiredDenied
+            return daemonGrants.anyRequiredDenied ? .permissionWall : .shell
         }
     }
 
@@ -119,6 +161,19 @@ struct MainWindow: View {
     /// the onboarding permissions screen doubling as the recovery surface;
     /// replaces the retired modal walkthrough sheet).
     @State private var showingPermissionSetup = false
+    /// SCR-262: true while the "Finishing update…" interstitial owns the window
+    /// content — a helper swap is converging and the permission rows can't be
+    /// verified yet.
+    @State private var showingUpdateInterstitial = false
+    /// SCR-262: the interstitial is launch-scoped. Latched once the first
+    /// post-probe presentation decision lands on shell or wall, so a mid-session
+    /// convergence source never replaces window content the user is working in.
+    /// SCR-264's post-recording stale-daemon recheck is such a source, but it
+    /// fires on a recording→idle edge where this latch is still false (the
+    /// evaluator early-returns while recording, so no launch decision settled) —
+    /// so its interstitial shows, while a mid-shell "restart helper" retry
+    /// through the convergence state stays suppressed.
+    @State private var launchPresentationDecided = false
     /// True while the permission setup is open because the user explicitly tapped
     /// "Finish setup" (the recovery latch), as opposed to the launch gate. Set when
     /// the recovery latch presents the takeover, cleared when it closes.
@@ -172,6 +227,10 @@ struct MainWindow: View {
                     // onboarding completes (existing installs get it on plain launch).
                     Task { await maybePresentSearchDisclosure() }
                 }
+            } else if showingUpdateInterstitial {
+                // SCR-262: a helper swap is converging — honest status instead
+                // of a permission checklist whose rows can't be verified yet.
+                UpdateConvergenceView(anchor: recorder.updateConvergenceAnchor)
             } else if showingPermissionSetup {
                 // U14: permission repair reuses the onboarding permissions
                 // screen as a window takeover (the retired walkthrough sheet's
@@ -203,6 +262,11 @@ struct MainWindow: View {
             // U7: a recording ended and the main window was restored — land on
             // Library (with the fresh draft card).
             route = .library
+            // SCR-262: state changes that fired mid-recording were swallowed by
+            // the isRecording early return (e.g. convergence finishing while a
+            // recording ran would otherwise leave the interstitial latched with
+            // no remaining exit trigger) — re-evaluate now.
+            updatePermissionSetupPresentation()
         }
         .onChange(of: recorder.daemonProbeCompleted) { _ in
             updatePermissionSetupPresentation()
@@ -222,6 +286,14 @@ struct MainWindow: View {
             // when the helper install completes mid-sheet. Re-evaluate so the
             // post-migration auto-close path keys on daemon grants again rather
             // than the migration override holding the sheet open.
+            updatePermissionSetupPresentation()
+        }
+        .onChange(of: recorder.updateConverging) { _ in
+            // SCR-262: the ONLY trigger for the deadline's interstitial→wall
+            // transition — at expiry the loop clears converging while nothing
+            // else observable changes (transport stays .cliFallback, grants stay
+            // indeterminate), so without this the interstitial would latch
+            // forever on a failed convergence.
             updatePermissionSetupPresentation()
         }
         .onChange(of: permissions.reopenSetupRequested) { requested in
@@ -394,6 +466,7 @@ struct MainWindow: View {
         guard !didEvaluateSearchDisclosure,
               onboarding == nil,
               !showingPermissionSetup,
+              !showingUpdateInterstitial,
               recorder.matrixDisclosure == nil else { return }
         didEvaluateSearchDisclosure = true
         do {
@@ -402,6 +475,15 @@ struct MainWindow: View {
             let acknowledged = env.settings.corpusEncrypted ?? false
             let declined = env.settings.contentIndexConsentDeclined ?? false
             if SearchDisclosurePolicy.shouldPresent(acknowledged: acknowledged, declined: declined) {
+                // Re-check the takeover guards: the interstitial or wall can
+                // appear while the settings read was in flight (the launch
+                // task's first probe completes after onAppear evaluated the
+                // guard above). Retry next evaluation instead of popping the
+                // consent sheet over a takeover.
+                guard onboarding == nil, !showingPermissionSetup, !showingUpdateInterstitial else {
+                    didEvaluateSearchDisclosure = false
+                    return
+                }
                 showingSearchDisclosure = true
             }
         } catch {
@@ -445,15 +527,41 @@ struct MainWindow: View {
         ) {
             closePermissionSetup()
         }
-        if FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+        let decision = FirstRunSetupPresentationPolicy.launchPresentation(
             daemonProbeCompleted: recorder.daemonProbeCompleted,
             transport: recorder.transport,
             daemonGrants: permissions.daemonGrants,
             setupDismissed: permissions.setupDismissed,
             migrationNeeded: permissions.migrationNeeded,
-            onboardingTakeoverActive: onboarding != nil
-        ) {
-            showingPermissionSetup = true
+            onboardingTakeoverActive: onboarding != nil,
+            updateConverging: recorder.updateConverging,
+            convergenceDeadlineExpired: recorder.updateConvergenceFailed
+        )
+        // SCR-262: the interstitial is launch-scoped — once the first post-probe
+        // decision landed on shell or wall, the interstitial may not replace
+        // content the user is working in. SCR-264 added a mid-session convergence
+        // source (the post-recording stale-daemon recheck), but it fires on a
+        // recording→idle edge where this latch is still false — the evaluator
+        // early-returns while recording, so the launch decision never settled — so
+        // its interstitial still shows. The latch keeps the other mid-session
+        // sources (e.g. wiring the Library/Day-timeline "Restart helper" retries
+        // through the convergence state) from becoming a surprise window takeover.
+        // The launch path itself is unaffected: at onAppear the probe hasn't
+        // completed, so the latch only sets after the launch task's sequenced
+        // first probe resolves the real decision.
+        switch decision {
+        case .updateInterstitial:
+            if !launchPresentationDecided {
+                showingUpdateInterstitial = true
+            }
+        case .shell, .permissionWall:
+            showingUpdateInterstitial = false
+            if recorder.daemonProbeCompleted {
+                launchPresentationDecided = true
+            }
+            if decision == .permissionWall {
+                showingPermissionSetup = true
+            }
         }
     }
 
@@ -464,7 +572,7 @@ struct MainWindow: View {
     /// migration wasn't pending; also covers the already-installed upgrade
     /// cohort whose helper never produces the `installedAndRunning` edge that
     /// otherwise writes the marker). Without the marker write,
-    /// `shouldPresentOnLaunch` returns true *unconditionally* while
+    /// `launchPresentation` returns the wall *unconditionally* while
     /// `migrationNeeded` and a close would be immediately undone by the next
     /// daemon-grant refresh.
     private func closePermissionSetup() {

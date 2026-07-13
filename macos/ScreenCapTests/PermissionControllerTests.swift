@@ -138,14 +138,17 @@ final class PermissionControllerTests: XCTestCase {
     ) -> Bool {
         // These truth-table tests model the already-migrated (post-Phase-1c)
         // state by default; the migration-override cases live in
-        // FirstRunSetupPresentationPolicyTests.
-        FirstRunSetupPresentationPolicy.shouldPresentOnLaunch(
+        // FirstRunSetupPresentationPolicyTests, and the SCR-262 converging
+        // dimension defaults to the non-converging state there too — every
+        // pin below maps unchanged onto the tri-state decision (wall ↔ true,
+        // shell ↔ false).
+        FirstRunSetupPresentationPolicy.launchPresentation(
             daemonProbeCompleted: daemonProbeCompleted,
             transport: transport,
             daemonGrants: daemonGrants,
             setupDismissed: setupDismissed,
             migrationNeeded: migrationNeeded
-        )
+        ) == .permissionWall
     }
 
     func testFirstRunSetupWaitsForDaemonProbeBeforePresenting() {
@@ -330,7 +333,7 @@ final class PermissionControllerTests: XCTestCase {
         permissions.markSetupDismissed()
         permissions._testSetRequiredPermissionsGranted(true)
         XCTAssertFalse(
-            permissions.shouldShowFinishSetupBanner,
+            permissions.shouldShowFinishSetupBanner(transport: .cliFallback),
             "banner must clear once required permissions are granted, even with the daemon absent"
         )
     }
@@ -343,7 +346,7 @@ final class PermissionControllerTests: XCTestCase {
         let (permissions, _) = makeController()
         permissions.markSetupDismissed()
         permissions._testSetRequiredPermissionsGranted(false)
-        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
     }
 
     @MainActor
@@ -352,7 +355,7 @@ final class PermissionControllerTests: XCTestCase {
         // while permissions are still missing.
         let (permissions, _) = makeController()
         permissions._testSetRequiredPermissionsGranted(false)
-        XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
     }
 
     @MainActor
@@ -366,7 +369,7 @@ final class PermissionControllerTests: XCTestCase {
         permissions.markSetupDismissed()
         // Deliberately do NOT call _testSetRequiredPermissionsGranted: statuses
         // stay `.notDetermined`.
-        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
     }
 
     @MainActor
@@ -380,7 +383,7 @@ final class PermissionControllerTests: XCTestCase {
         permissions.markSetupDismissed()
         permissions._testSetRequiredPermissionsGranted(false)
         XCTAssertFalse(permissions.allRequiredGranted)
-        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
     }
 
     @MainActor
@@ -392,10 +395,48 @@ final class PermissionControllerTests: XCTestCase {
         let (permissions, _) = makeController()
         permissions.markSetupDismissed()
         permissions._testSetRequiredPermissionsGranted(false)
-        XCTAssertTrue(permissions.shouldShowFinishSetupBanner)
+        XCTAssertTrue(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
 
         permissions._testSetRequiredPermissionsGranted(true)
-        XCTAssertFalse(permissions.shouldShowFinishSetupBanner)
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
+    }
+
+    // MARK: - SCR-185: "Finish setup" banner on the daemon transport
+
+    @MainActor
+    func testFinishSetupBannerShownOnDaemonPathWhenDaemonScreenRecordingDenied() {
+        // The daemon-transport sibling of SCR-143. On the daemon path the recording
+        // subject is the daemon, not the app process — so the banner's can-record
+        // claim must key on `daemonGrants.screenRecordingDenied` (mirroring the
+        // daemon start gate in RecorderController.start), not on the app-process
+        // `allRequiredGranted` snapshot.
+        //
+        // Reachable state: the app process reads its OWN TCC as granted — a stale
+        // post-launch `CGPreflight` cache, or a leftover/decoy Accessibility grant
+        // on `com.screencap.macos` — while the daemon reports Screen Recording
+        // denied and the user has skipped setup. Pre-SCR-185 the predicate keyed on
+        // the app-process snapshot for BOTH transports, so `true && !true == false`
+        // hid the banner here, stranding the user with no proactive recovery.
+        let (permissions, _) = makeController()
+        permissions.markSetupDismissed()
+        // App-process snapshot reads recordable (the misleading signal on daemon).
+        permissions._testSetRequiredPermissionsGranted(true)
+        // Daemon — the actual TCC subject — reports Screen Recording denied.
+        permissions.updateDaemonGrants(
+            DaemonPermissionGrants(screenRecording: .denied, accessibility: .granted, inputMonitoring: .granted)
+        )
+        // A denied Screen Recording keeps the dismissal latched (daemon
+        // `allRequiredGranted` is false), so `updateDaemonGrants` does not clear it.
+        XCTAssertTrue(permissions.setupDismissed)
+        // Daemon path mirrors the daemon start gate → banner must show.
+        XCTAssertTrue(
+            permissions.shouldShowFinishSetupBanner(transport: .daemon),
+            "daemon-path banner must show when the daemon can't record, even while the app process reads granted"
+        )
+        // Same controller state on the CLI-fallback path still keys on the
+        // app-process snapshot (recordable here) → banner stays hidden. Pins that
+        // the fix is transport-selective and leaves SCR-143 behavior intact.
+        XCTAssertFalse(permissions.shouldShowFinishSetupBanner(transport: .cliFallback))
     }
 
     // MARK: - U5: daemon-grant refresh lifecycle + row icons

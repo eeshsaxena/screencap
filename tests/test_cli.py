@@ -1755,12 +1755,34 @@ def test_auth_config_check_passes_when_provisioned(monkeypatch):
         _fake_provisioned(
             FIREBASE_API_KEY="AIzaSyRealLookingWebKey",
             OAUTH_CLIENT_ID="123456789.apps.googleusercontent.com",
+            OAUTH_CLIENT_SECRET="GOCSPX-real-looking-secret",
         ),
     )
     runner = CliRunner()
     result = runner.invoke(cli, ["_auth-config-check"], env={"SCREENCAP_RELEASE_BUILD": "1"})
     assert result.exit_code == 0
     assert "provisioned" in result.output
+
+
+def test_auth_config_check_fails_release_when_secret_missing(monkeypatch):
+    """A release build with id+key bundled but NO OAuth client secret must fail.
+
+    Regression for the sign-in break: a Google Desktop client with the secret omitted
+    dies at the token endpoint with "client_secret is missing". The secret has no
+    placeholder sentinel, so the guard treats an empty bundled secret as a failure."""
+    _install_provisioned(
+        monkeypatch,
+        _fake_provisioned(
+            FIREBASE_API_KEY="AIzaSyRealLookingWebKey",
+            OAUTH_CLIENT_ID="123456789.apps.googleusercontent.com",
+            OAUTH_CLIENT_SECRET="",
+        ),
+    )
+    runner = CliRunner()
+    result = runner.invoke(cli, ["_auth-config-check"], env={"SCREENCAP_RELEASE_BUILD": "1"})
+    assert result.exit_code == 1
+    assert "FAILED" in result.output
+    assert "OAuth client secret" in result.output
 
 
 def test_auth_config_check_fails_release_build_with_placeholders(monkeypatch):

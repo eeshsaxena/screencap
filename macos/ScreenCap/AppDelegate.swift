@@ -27,12 +27,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.appearance = NSAppearance(named: .aqua)
         NSApp.setActivationPolicy(.regular)
         DaemonInstallController.registerDaemonOnFirstLaunchIfNeeded()
-        // After an app update the old daemon process keeps serving the previous
-        // on-disk bundle; its lazy imports then break (HTTP 500 "Couldn't load
-        // recordings"). Restart it if it predates the freshly installed bundle —
-        // the SCR-121 version gate can't see this because the daemon version
-        // string is unchanged across an app update.
-        Task { await DaemonInstallController.restartStaleDaemonIfNeeded() }
+        // The launch-time stale-daemon restart (post-update helper swap) now
+        // runs inside the window's launch task via
+        // `RecorderController.runLaunchDaemonCheck()` — sequenced BEFORE the
+        // first daemon probe, so the probe can't adopt a daemon the kickstart
+        // is about to kill and the SCR-262 convergence interstitial can key on
+        // the restart decision.
         // Switch to .accessory whenever the main window closes; keep the menu
         // bar item alive so the user can reopen the app from there.
         windowCloseObserver = NotificationCenter.default.addObserver(

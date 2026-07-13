@@ -96,14 +96,21 @@ final class SearchViewModel: ObservableObject {
 
     @Published private(set) var backfillState: BackfillUIState = .hidden
 
+    /// SCR-261 U3 (KTD9/R9) — fired exactly once per run when the backfill
+    /// reaches `.done` (including done-with-partial-failures; never for
+    /// paused/cancelled/startFailed). The palette installs a one-shot query
+    /// refresh here so live results reflect the newly built index.
+    var onBackfillCompleted: (() -> Void)?
+
     private let service: SearchService
     private let backfill: BackfillService
-    /// Persists a `content_index_backfill_declined=true` (Skip) the same way the
-    /// consent decline is persisted (CLI `settings --set`). Injected so the
-    /// state machine is testable without spawning the CLI; the live wiring passes
-    /// the real CLI call. Throwing surfaces as a no-op (the affordance still
-    /// hides locally — see `skipBackfill`).
-    private let persistBackfillDeclined: @Sendable () async throws -> Void
+    /// Persists the `content_index_backfill_declined` flag (Skip writes `true`;
+    /// the empty-state Index-now accept clears it with `false` — SCR-261 U3)
+    /// the same way the consent decline is persisted (CLI `settings --set`).
+    /// Injected so the state machine is testable without spawning the CLI; the
+    /// live wiring passes the real CLI call. Throwing surfaces as a no-op (the
+    /// affordance still hides locally — see `skipBackfill`).
+    private let persistBackfillDeclined: @Sendable (Bool) async throws -> Void
     /// `var` so SCR-179 U5 can rebuild it once per session with the index-sourced
     /// vocabulary unioned onto the static seed (see `refreshVocabularyIfNeeded`).
     private var parser: QueryParser
@@ -123,9 +130,9 @@ final class SearchViewModel: ObservableObject {
     init(
         service: SearchService = LiveSearchService(),
         backfill: BackfillService = LiveBackfillService(),
-        persistBackfillDeclined: @escaping @Sendable () async throws -> Void = {
+        persistBackfillDeclined: @escaping @Sendable (Bool) async throws -> Void = { declined in
             _ = try await CLIClient.runJSONRaw(
-                ["settings", "--set", "content_index_backfill_declined=true", "--json"]
+                ["settings", "--set", "content_index_backfill_declined=\(declined)", "--json"]
             )
         },
         parser: QueryParser = QueryParser(),
@@ -353,6 +360,25 @@ final class SearchViewModel: ObservableObject {
         startRun()
     }
 
+    /// SCR-261 U3 (KTD5) — the not-indexed empty body's "Index now" CTA. An
+    /// explicit accept, so unlike `offerBackfill(alreadyDeclined:)` (which
+    /// no-ops for a prior decliner) it never consults the decline: the click
+    /// itself is fresh consent. Clears the persisted decline (best-effort,
+    /// through the same seam Skip writes) so a stale flag can't suppress
+    /// future offers, then starts the run.
+    func startBackfillFromEmptyState() {
+        persistDeclined(false)
+        startRun()
+    }
+
+    /// Best-effort, fire-and-forget write of the declined flag (Skip writes
+    /// `true`; the empty-state accept clears with `false`).
+    private func persistDeclined(_ declined: Bool) {
+        Task { [persistBackfillDeclined] in
+            try? await persistBackfillDeclined(declined)
+        }
+    }
+
     private func startRun() {
         backfillTask?.cancel()
         backfillState = .starting
@@ -396,9 +422,7 @@ final class SearchViewModel: ObservableObject {
     func skipBackfill() {
         backfillTask?.cancel()
         backfillState = .hidden
-        Task { [persistBackfillDeclined] in
-            try? await persistBackfillDeclined()
-        }
+        persistDeclined(true)
     }
 
     /// Cancel an in-flight run. Optimistic local transition to `cancelled` with
@@ -454,7 +478,13 @@ final class SearchViewModel: ObservableObject {
                 ? .indexing(done: status.done, total: status.total, failed: status.failed)
                 : .starting
         case .completed:
+            // SCR-261 U3 (KTD9): fire the completion hook only on the
+            // transition INTO `.done` — a duplicate completed snapshot (e.g.
+            // seed status after a terminal event) must not re-fire it.
+            let wasDone: Bool
+            if case .done = backfillState { wasDone = true } else { wasDone = false }
             backfillState = .done(done: status.done, total: status.total, failed: status.failed)
+            if !wasDone { onBackfillCompleted?() }
         case .paused:
             backfillState = .paused(done: status.done, total: status.total)
         case .cancelled:

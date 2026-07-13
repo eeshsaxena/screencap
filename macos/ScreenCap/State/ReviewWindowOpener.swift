@@ -28,6 +28,19 @@ final class ReviewWindowOpener: ObservableObject {
     /// two different moments reuses one window instead of spawning duplicates.
     var pendingSeekMs: [String: Int] = [:]
 
+    /// SCR-219 (U5): pending one-shot **clip ranges** keyed by recording name —
+    /// the clip-mode sibling of `pendingSeekMs`. The Day timeline's clip-bounds
+    /// overlay sets this just before opening the Review window; `ReviewWindow`
+    /// (U6) reads and clears it when it reaches `.ready`, then scopes the
+    /// consent surface + local-file export to `[startMs, endMs)`. Carried
+    /// out-of-band (not through the scene value) for exactly the reason
+    /// `pendingSeekMs` is: the review `WindowGroup` scene stays keyed on the
+    /// recording name (a `String`, KTD5), so a clip review and a whole-recording
+    /// review of the same recording address one window key without changing the
+    /// scene's value type. Absence of an entry means "not a clip" — the window
+    /// behaves as a normal whole-recording review.
+    var pendingClipRange: [String: ClipRange] = [:]
+
     private init() {}
 
     /// Convenience entry point. Forwards to `openReview` if registered,

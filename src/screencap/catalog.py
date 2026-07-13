@@ -118,6 +118,47 @@ def read_masked_video_upload(directory: Path) -> bool | None:
     return bool(val) if isinstance(val, bool) else None
 
 
+def read_video_start_anchor(directory: Path) -> float | None:
+    """Read the canonical video-start wall-clock anchor from ``recording.db``.
+
+    Returns ``recording.video_start_time`` (epoch seconds) when present, else the
+    ``recording.timestamp`` fallback — the SAME anchor ``viewer.get_frame_at`` /
+    ``_chunk_offsets_for_concat`` and the clip trim use. ``None`` when there is no
+    ``recording.db``, no ``recording`` row, both columns are null, or the DB is
+    unreadable (mirrors the other read-only catalog readers' error handling).
+
+    Unifies on the ``is not None`` fallback (``video_start_time`` unless null,
+    then ``timestamp``): epoch anchors are never ``0.0``, so this agrees with the
+    historical ``video_start_time or timestamp`` — the two call sites (the clip
+    CLI's absolute→relative-ms conversion and ``audio_clip._read_audio_anchors``)
+    both funnel through this one reader.
+    """
+    import sqlite3
+
+    db = directory / "recording.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT video_start_time, timestamp FROM recording LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        if row[0] is not None:
+            return float(row[0])
+        if row[1] is not None:
+            return float(row[1])
+        return None
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+    finally:
+        conn.close()
+
+
 def read_cloud_e2ee(directory: Path) -> bool | None:
     """Read the FROZEN ``cloud_e2ee`` decision from ``.recording_intent``.
 

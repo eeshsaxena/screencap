@@ -188,13 +188,27 @@ enum SearchFixtures {
     /// Non-authoritative empty: free-text search with no matches and no time
     /// window → "No matches".
     static func noMatchesResults() -> SearchResults {
+        emptyResults(screen: .empty, activity: .empty, queryTerms: ["nonexistent"])
+    }
+
+    /// A zero-hit result set with explicit per-stream coverage — the SCR-261
+    /// empty-cause derivation is driven entirely by this shape. Defaults are
+    /// wire-realistic for a free-text query (SCR-176): transcript searched,
+    /// activity `.notRun`.
+    static func emptyResults(
+        screen: StreamState,
+        audio: StreamState = .empty,
+        activity: StreamState = .notRun,
+        consentNeeded: Bool = false,
+        queryTerms: [String] = ["salesforce"]
+    ) -> SearchResults {
         SearchResults(
             items: [],
-            coverage: CoverageReport(screen: .empty, audio: .empty, activity: .empty),
-            consentNeeded: false,
+            coverage: CoverageReport(screen: screen, audio: audio, activity: activity),
+            consentNeeded: consentNeeded,
             timeWindow: nil,
             appFilter: nil,
-            queryTerms: ["nonexistent"]
+            queryTerms: queryTerms
         )
     }
 

@@ -1,5 +1,25 @@
 import SwiftUI
 
+/// SCR-262 (KTD-8): whether closing the permission takeover persists the
+/// "Skip for now" dismissal that suppresses the launch gate.
+///
+/// Keyed on the wall's provenance, not grant state. A wall reached via the
+/// update-convergence path shows unverifiable (indeterminate) rows — a Continue
+/// there is "get me past this update hiccup", and persisting it would
+/// permanently suppress the gate for real future denials. The ordinary
+/// (non-convergence) wall persists exactly as before. Deliberately NOT a
+/// denied-only rule: on `.cliFallback` grants are always all-indeterminate, so
+/// denied-only would make the dead-registration repair wall permanently
+/// unsuppressable.
+enum PermissionSetupDismissalPolicy {
+    static func shouldPersistDismissal(
+        allRequiredDaemonGrantsGranted: Bool,
+        reachedViaUpdateConvergence: Bool
+    ) -> Bool {
+        !allRequiredDaemonGrantsGranted && !reachedViaUpdateConvergence
+    }
+}
+
 /// U14 — the permission-repair takeover: the onboarding permissions screen
 /// (design 87–151, `OnboardingPermissionsStep`) presented as the main
 /// window's content whenever permission setup is needed after onboarding —
@@ -41,14 +61,27 @@ struct PermissionSetupTakeover: View {
                 DaemonMigrationView(onContinue: { migrationStepAcknowledged = true })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                OnboardingPermissionsStep(
-                    daemonInstaller: daemonInstaller,
-                    // Live repair surface, never a read-only replay — the
-                    // helper-install auto-start (self-heal) is wanted here.
-                    replay: false,
-                    onContinue: close
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 0) {
+                    if recorder.updateConvergenceFailed {
+                        // SCR-262 (KTD-6): reached via the convergence deadline —
+                        // bridge from "Finishing update…" so the checklist
+                        // doesn't appear unexplained after a long wait.
+                        Text(UpdateConvergenceCopy.deadlineFallbackNotice)
+                            .font(SCTypography.sans(size: 13))
+                            .foregroundStyle(Color.scAmberText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 28)
+                            .padding(.top, 4)
+                    }
+                    OnboardingPermissionsStep(
+                        daemonInstaller: daemonInstaller,
+                        // Live repair surface, never a read-only replay — the
+                        // helper-install auto-start (self-heal) is wanted here.
+                        replay: false,
+                        onContinue: close
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
         .background(Color.scCanvas)
@@ -80,8 +113,14 @@ struct PermissionSetupTakeover: View {
     private func close() {
         // Exiting with required grants still missing = the retired sheet's
         // "Skip for now": persist the dismissal so the state-derived launch
-        // gate doesn't re-present on the next update (U4).
-        if !permissions.allRequiredDaemonGrantsGranted {
+        // gate doesn't re-present on the next update (U4). SCR-262 (KTD-8):
+        // provenance-keyed — a wall reached via the update-convergence deadline
+        // never persists, so a Continue past unverifiable rows can't
+        // permanently suppress the gate for real future denials.
+        if PermissionSetupDismissalPolicy.shouldPersistDismissal(
+            allRequiredDaemonGrantsGranted: permissions.allRequiredDaemonGrantsGranted,
+            reachedViaUpdateConvergence: recorder.updateConvergenceFailed
+        ) {
             permissions.markSetupDismissed()
         }
         onClose()
