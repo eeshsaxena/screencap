@@ -33,6 +33,8 @@ struct ChatView: View {
     /// Resolves a source pointer's recording → a `RecordingSummary` so the
     /// sources strip can reuse `RecordingCardThumbnail` (no new thumbnail path).
     @EnvironmentObject private var index: RecordingsIndex
+    /// SCR-258 U10: the store-scoped Unlock action for a sealed store (AE3/AE8).
+    @EnvironmentObject private var store: StoreController
 
     @State private var draft = ""
     @State private var frameIndex = RecordingFrameIndex()
@@ -51,8 +53,21 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            transcript
-            composer
+            if index.storeState.isMounted {
+                transcript
+                composer
+            } else {
+                // SCR-258 U10 (AE3/AE8): a locked / absent / key-missing store
+                // renders the explicit state instead of an empty transcript +
+                // composer — never a blank chat over a sealed store.
+                StoreStateView(
+                    storeState: index.storeState,
+                    onUnlock: { store.unlock() },
+                    onRetry: { Task { await index.refresh() } },
+                    onSetup: { store.initializeStore() },
+                    isBusy: store.phase != .idle
+                )
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.scPaper)

@@ -17,6 +17,10 @@ struct RecallPaletteView: View {
 
     @StateObject private var model = SearchViewModel()
     @StateObject private var recentStore = RecentSearchesStore()
+    /// SCR-258 U10 (AE3/AE8): the store state gates the panel so a locked / absent
+    /// store shows the explicit state instead of a blank/empty result list.
+    @EnvironmentObject private var index: RecordingsIndex
+    @EnvironmentObject private var store: StoreController
     @State private var runner: RecallPaletteQueryRunner?
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
@@ -48,6 +52,9 @@ struct RecallPaletteView: View {
             runner = RecallPaletteQueryRunner { [weak model] text in
                 await model?.search(text, contentIndexEnabled: contentIndexEnabled)
             }
+            // SCR-258 U10: refresh so the store state is current when the palette
+            // opens (a store locked from another surface flips this).
+            await index.refresh()
             await loadSettings()
             fieldFocused = true
         }
@@ -68,29 +75,42 @@ struct RecallPaletteView: View {
     private var panel: some View {
         VStack(spacing: 0) {
             header
-            RecallPaletteContent(
-                phase: model.phase,
-                consentDeclined: consentDeclined,
-                backfillState: model.backfillState,
-                recentSearches: recentStore.recent,
-                queryTerms: queryTerms,
-                selectedResultID: selectedResultID,
-                frameIndex: frameIndex,
-                thumbnailLoader: thumbnailLoader,
-                // Unknown (nil, pre-load) -> gated: default to requiring presence
-                // until settings confirm the corpus is NOT encrypted.
-                presenceGate: (corpusEncrypted ?? true) ? presenceGate : nil,
-                onEnableConsent: enableConsent,
-                onDeclineConsent: declineConsent,
-                onAcceptBackfill: model.acceptBackfill,
-                onSkipBackfill: skipBackfill,
-                onCancelBackfill: model.cancelBackfill,
-                onResumeBackfill: model.resumeBackfill,
-                onRunChip: runChipQuery,
-                onOpen: jump,
-                onRetry: { runner?.search(query, debounced: false) },
-                onUpgrade: upgrade
-            )
+            if index.storeState.isMounted {
+                RecallPaletteContent(
+                    phase: model.phase,
+                    consentDeclined: consentDeclined,
+                    backfillState: model.backfillState,
+                    recentSearches: recentStore.recent,
+                    queryTerms: queryTerms,
+                    selectedResultID: selectedResultID,
+                    frameIndex: frameIndex,
+                    thumbnailLoader: thumbnailLoader,
+                    // Unknown (nil, pre-load) -> gated: default to requiring presence
+                    // until settings confirm the corpus is NOT encrypted.
+                    presenceGate: (corpusEncrypted ?? true) ? presenceGate : nil,
+                    onEnableConsent: enableConsent,
+                    onDeclineConsent: declineConsent,
+                    onAcceptBackfill: model.acceptBackfill,
+                    onSkipBackfill: skipBackfill,
+                    onCancelBackfill: model.cancelBackfill,
+                    onResumeBackfill: model.resumeBackfill,
+                    onRunChip: runChipQuery,
+                    onOpen: jump,
+                    onRetry: { runner?.search(query, debounced: false) },
+                    onUpgrade: upgrade
+                )
+            } else {
+                // SCR-258 U10 (AE3/AE8): a non-mounted store renders the explicit
+                // locked/absent/key-missing state, not an empty result list.
+                StoreStateView(
+                    storeState: index.storeState,
+                    onUnlock: { store.unlock() },
+                    onRetry: { Task { await index.refresh() } },
+                    onSetup: { store.initializeStore() },
+                    isBusy: store.phase != .idle,
+                    compact: true
+                )
+            }
             footer
         }
         .background(Color.scSurface, in: RoundedRectangle(cornerRadius: 16))

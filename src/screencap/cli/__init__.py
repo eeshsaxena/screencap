@@ -1053,6 +1053,21 @@ def _derive_local_store_state() -> str | None:
         return None
 
 
+def _store_bundle_exists() -> bool:
+    """Whether an encrypted store bundle exists (SCR-258 U10, ``settings --json``).
+
+    True → the library is a container (encrypted at rest). Used by the app to hide
+    the migration offer on an already-migrated install. Never raises: a resolution
+    failure reports ``False`` (offer stays available) rather than breaking settings.
+    """
+    try:
+        from screencap.daemon import store_lifecycle as _sl
+
+        return _sl.store_bundle_path().exists()
+    except Exception:  # noqa: BLE001 - settings must never fail on this derivation
+        return False
+
+
 def _list_json(recordings, store_state: str | None) -> str:
     """Render ``list --json`` output, store-state-aware (AE8, U10).
 
@@ -3290,6 +3305,7 @@ def settings(ctx, set_pair, as_json):
         get_auto_delete_after_upload,
         get_chunk_duration,
         get_cloud_e2ee_enabled,
+        get_container_enabled,
         get_content_index_backfill_declined,
         get_content_index_consent_declined,
         get_content_index_enabled,
@@ -3380,6 +3396,12 @@ def settings(ctx, set_pair, as_json):
         # Search U8: whether the recall corpus is encrypted (guardrails on) — the app
         # gates present-user auth on corpus-still display only when this is true.
         "corpus_encrypted": bool(get_corpus_encrypted()),
+        # SCR-258 U10: whether the on-disk encrypted container is enabled (gates the
+        # app's Lock affordance + the encrypt-migration offer, KTD-19), and whether a
+        # store bundle already exists (distinguishes an already-migrated install from
+        # an eligible plaintext one). Derived defensively — never break `settings`.
+        "container_enabled": bool(get_container_enabled()),
+        "store_encrypted": _store_bundle_exists(),
         "privacy": _build_privacy_settings_block(),
     }
 

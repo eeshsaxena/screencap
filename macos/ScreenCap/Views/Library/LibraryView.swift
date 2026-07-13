@@ -12,6 +12,8 @@ struct LibraryView: View {
     @EnvironmentObject private var index: RecordingsIndex
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var auth: CloudAuthController
+    @EnvironmentObject private var store: StoreController
+    @EnvironmentObject private var privacy: PrivacyController
     @Environment(\.openWindow) private var openWindow
 
     /// Present the New-recording sheet (U6). U5 wires this to the existing start
@@ -46,6 +48,12 @@ struct LibraryView: View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.scPaper)
+            .task {
+                // SCR-258 U10: reflect an in-progress / paused encrypt migration so
+                // the banner shows live progress (settings/containerEnabled are
+                // already loaded at app launch).
+                await privacy.refreshEncryptStatus()
+            }
             .alert("Can't open recording", isPresented: rowErrorBinding) {
                 Button("OK") { rowError = nil }
             } message: {
@@ -59,11 +67,26 @@ struct LibraryView: View {
             loadingState
         } else if index.lastError != nil {
             errorState
+        } else if !index.storeState.isMounted {
+            // SCR-258 U10 (KTD-20, AE8): a locked / absent / key-missing store is a
+            // FIRST-CLASS state, branched BEFORE the isEmpty check so a sealed store
+            // never falls through to the "Nothing recorded yet" welcome screen.
+            storeStateView
         } else if index.recordings.isEmpty {
             emptyState
         } else {
             populated
         }
+    }
+
+    private var storeStateView: some View {
+        StoreStateView(
+            storeState: index.storeState,
+            onUnlock: { store.unlock() },
+            onRetry: { Task { await index.refresh() } },
+            onSetup: { store.initializeStore() },
+            isBusy: store.phase != .idle
+        )
     }
 
     // MARK: - Populated grid
@@ -75,6 +98,8 @@ struct LibraryView: View {
             // touch their already-captured local recordings (R8), so gated never
             // reads as data loss. Only shown while actually gated.
             if auth.isGatedForLapse { recordingsSafeBanner }
+            // SCR-258 U10: the one-shot encrypt-migration offer / progress banner.
+            if showsMigrationBanner { migrationBanner }
             header
                 .padding(.bottom, 22)
             chipRow
@@ -228,6 +253,67 @@ struct LibraryView: View {
         .padding(.vertical, 10)
         .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
         .padding(.bottom, 18)
+    }
+
+    // MARK: - Encrypt-migration banner (SCR-258 U10, KTD-18)
+
+    private var showsMigrationBanner: Bool {
+        VaultMigrationPolicy.shouldShowBanner(
+            containerEnabled: privacy.containerEnabled == true,
+            storeEncrypted: privacy.storeEncrypted == true,
+            recordingsPresent: !index.recordings.isEmpty,
+            state: privacy.encryptState,
+            dismissed: privacy.encryptBannerDismissed
+        )
+    }
+
+    @ViewBuilder
+    private var migrationBanner: some View {
+        let status = VaultMigrationPolicy.statusLine(for: privacy.encryptState)
+        let isActive: Bool = {
+            switch privacy.encryptState {
+            case .migrating, .paused: return true
+            default: return false
+            }
+        }()
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "lock.rectangle.stack")
+                .foregroundStyle(Color.scTeal)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(VaultMigrationPolicy.bannerTitle)
+                    .font(SCTypography.sans(size: 13.5, weight: .semibold))
+                    .foregroundStyle(Color.scInk)
+                Text(VaultMigrationPolicy.bannerBody)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let status {
+                    Text(status)
+                        .font(SCTypography.sans(size: 12, weight: .medium))
+                        .foregroundStyle(Color.scInkMuted)
+                        .padding(.top, 2)
+                }
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 6) {
+                if isActive {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Encrypt now") { Task { await privacy.startEncryption() } }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.scTeal)
+                    Button("Not now") { privacy.dismissEncryptBanner() }
+                        .buttonStyle(.plain)
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkSecondary)
+                }
+            }
+        }
+        .padding(14)
+        .background(Color.scAdvisorySurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .padding(.bottom, 18)
+        .accessibilityElement(children: .combine)
     }
 
     /// U12 reassurance affordance: a lapsed user keeps browse + export of their

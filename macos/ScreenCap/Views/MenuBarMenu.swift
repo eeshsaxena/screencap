@@ -31,6 +31,9 @@ extension Notification.Name {
 struct MenuBarMenu: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var auth: CloudAuthController
+    @EnvironmentObject private var index: RecordingsIndex
+    @EnvironmentObject private var store: StoreController
+    @EnvironmentObject private var privacy: PrivacyController
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -100,7 +103,22 @@ struct MenuBarMenu: View {
         // coalesces + no-ops once resolved, so opening the menu repeatedly
         // re-decrypts nothing. See CloudAuthController.refreshIfNeeded / SCR-241.
         accountSection
-            .onAppear { Task { await auth.refreshIfNeeded() } }
+            .onAppear {
+                Task { await auth.refreshIfNeeded() }
+                // SCR-258 U10: bind the index (idempotent) so lock/unlock refresh
+                // the store state even in menu-only usage, and refresh settings so
+                // `containerEnabled` gates the Lock item.
+                store.bind(index: index)
+                Task { await privacy.refreshStatus() }
+            }
+
+        Divider()
+
+        // SCR-258 U10: Lock / Unlock the encrypted store. Lock gives immediate
+        // "Locking…" feedback decoupled from the async stop→quiesce→detach chain
+        // (StoreController.phase flips on tap); Unlock runs the store-scoped
+        // PresenceGate (Touch ID) then the unlock verb.
+        storageSection
 
         Divider()
 
@@ -134,6 +152,33 @@ struct MenuBarMenu: View {
         Button(MenuBarMenuPolicy.accountItemTitle) {
             openMainWindow()
             NotificationCenter.default.post(name: .screenCapOpenAccountPane, object: nil)
+        }
+    }
+
+    /// SCR-258 U10: the encrypted-store Lock / Unlock section. Shows an in-flight
+    /// "Locking…" / "Unlocking…" line (decoupled from the async chain), the Unlock
+    /// item for a sealed store, the Lock item for a mounted container, and a last
+    /// error if one surfaced. Nothing renders on a plaintext-only install.
+    @ViewBuilder
+    private var storageSection: some View {
+        if store.phase == .locking {
+            Text("Locking…")
+        } else if store.phase == .unlocking {
+            Text("Unlocking…")
+        } else {
+            if MenuBarMenuPolicy.unlockItemVisible(storeState: index.storeState, phase: store.phase) {
+                Button("Unlock Library…") { store.unlock() }
+            }
+            if MenuBarMenuPolicy.lockItemVisible(
+                storeState: index.storeState,
+                containerEnabled: privacy.containerEnabled == true,
+                phase: store.phase
+            ) {
+                Button("Lock Library") { store.lock() }
+            }
+        }
+        if let err = store.lastError {
+            Text("Storage: \(err)")
         }
     }
 
