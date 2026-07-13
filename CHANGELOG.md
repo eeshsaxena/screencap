@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.25.0] - 2026-07-13
+
+### Added
+
+- **vault:** Local encrypted-at-rest container, on by default from first recording; locked/absent states, Touch ID lock/unlock, migration prompt (SCR-258)
+- **pricing:** Two-tier plans (Free/Pro) with trial UI, checkout, customer portal, bounded entitlement leases, and paywall-gated record/search/lapse UX (SCR-237)
+- **recall:** Conversational recall chat — daemon generation seam spanning on-device, downloaded-model, BYO-cloud, and local-server providers, with evidence-bundle grounding, egress guard, and coverage-honest per-app aggregation (SCR-243)
+- **intelligence:** BYO cloud providers (OpenAI, Anthropic, Gemini) with per-vendor API-key storage and a sequential connect flow; Apple Intelligence on-device availability detection; restructured two-section intelligence pane
+- **search:** SQLCipher-encrypted content index, secrets-only scrub at index time, plaintext→encrypted corpus migration, presence-gated decrypt-on-read, and honest per-cause empty states (U1-U8)
+- **storage:** Change storage location — same-volume migration engine with breadcrumb recovery, `screencap storage migrate` CLI, `storage.migrate` daemon verb (SCR-228)
+- **e2ee:** Multi-device custody via iCloud Keychain KEK sync, cloud-capability gating on the Privacy E2EE row, distinct key-unavailable download signal (SCR-253, SCR-260)
+- **auth:** Shared Keychain access-group credential storage across app, daemon, and helpers (SCR-241)
+- **engine:** Mid-recording mic mute (client, controller, HUD, menu) with muted-interval persistence and transcript markers (SCR-218, SCR-254)
+- **engine:** Cross-chunk PTS-preserving video clip trim + muxed audio, clip-selection UI, `screencap clip` verb, range-scoped clip consent
+- **cli:** `screencap rename`, `screencap portal-url`, `screencap storage migrate` commands
+- **daemon:** `recording.rename`, `recording.mute`, `chat.answer`, `storage.migrate`, and lock/unlock verbs
+- **billing:** Customer portal endpoint, multi-subscription-safe webhook revocation, dropped-webhook reconcile recovery
+- **inspect:** Recorded-events digest + summary pane, blocked/protected interval reporting
+- **recordings:** Editable recording titles (rename), searchable user-set titles
+
+### Fixed
+
+- **auth:** Ship Google Desktop-client secret so sign-in token exchange succeeds
+- **migration:** Harden record-through resume, sweep safety, and crash/race/permission edge cases
+- **search:** `frame.read` never serves an unscrubbed still; presence gate fails closed during load; SQLCipher invariants run on CI
+- **billing:** Point checkout return URLs at screencap.sh and keep keys out of deploys; settle pending state across trial transitions; guard superseded checkouts
+- **recall:** Strip evidence against genuine privacy intervals, not screenshot-file residuals
+- **macos:** Stale-daemon and helper-swap banner/interstitial honesty fixes (SCR-259, SCR-261 through SCR-264); avoid x86_64 Swift type-checker crash in the E2EE row
+- Extensive code-review hardening passes across pricing, e2ee, search, recall, intelligence, and storage-migration subsystems
+
+### Changed
+
+- **catalog:** Share one `.recording_intent` loader across field readers
+- **config:** Data-plane root resolver + dot-entry skip
+- **clip:** Dedup anchor read + clip-arg preamble, lazy audio probe
+- **search:** Skip timeline fan-out for pure free-text search
+
 ## [0.24.0] - 2026-07-07
 
 ### Added
