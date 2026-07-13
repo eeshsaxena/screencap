@@ -35,6 +35,19 @@ from screencap.cli import cli
 pytestmark = pytest.mark.privacy
 
 
+def _norm(output: str) -> str:
+    """Collapse rich's line-wrapping so multi-word phrase assertions are
+    wrap-insensitive.
+
+    An 80-col ``Console`` (no TTY under ``CliRunner``) can split a phrase across
+    a newline when a long tmp path pushes the wrap boundary — a macOS
+    ``/private/var/folders/…`` path is long enough to break ``reused the\\nexisting
+    key``, while a short Linux ``/tmp/…`` path wraps elsewhere. That made a raw
+    substring check a macOS-CI-only failure; normalizing whitespace fixes it.
+    """
+    return " ".join(output.lower().split())
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -144,7 +157,7 @@ def test_init_idempotent_noop_on_existing_store(store_env, monkeypatch):
     result = CliRunner().invoke(cli, ["storage", "init"])
 
     assert result.exit_code == 0, result.output
-    assert "already initialized" in result.output.lower()
+    assert "already initialized" in _norm(result.output)
 
 
 def test_init_bundle_absent_key_present_reuses_key(store_env, monkeypatch):
@@ -171,7 +184,7 @@ def test_init_bundle_absent_key_present_reuses_key(store_env, monkeypatch):
     assert result.exit_code == 0, result.output
     assert minted["called"] is False
     assert seen["key"] == existing
-    assert "reused the existing key" in result.output.lower()
+    assert "reused the existing key" in _norm(result.output)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +283,7 @@ def test_local_unseal_la_fail_keeps_sentinel(store_env, monkeypatch):
 
     assert result.exit_code != 0
     assert sentinel.exists()  # still sealed
-    assert "stays sealed" in result.output.lower()
+    assert "stays sealed" in _norm(result.output)
 
 
 def test_local_unseal_no_la_surface_refuses_with_recovery_route(store_env, monkeypatch):
@@ -327,7 +340,7 @@ def test_funnel_guard_absent_store_names_init(store_env, monkeypatch):
     result = CliRunner().invoke(cli, ["info", "rec1"])
 
     assert result.exit_code != 0
-    assert "storage init" in result.output.lower()
+    assert "storage init" in _norm(result.output)
     assert not store_env.mountpoint.exists()
 
 
@@ -389,7 +402,7 @@ def test_flag_off_guard_is_noop(tmp_path, monkeypatch):
     # never the store-state path — proving the guard is a no-op when off.
     result = CliRunner().invoke(cli, ["info", "does-not-exist"])
     assert result.exit_code != 0
-    assert "not found" in result.output.lower()
+    assert "not found" in _norm(result.output)
     cfg.invalidate_config_cache()
 
 
