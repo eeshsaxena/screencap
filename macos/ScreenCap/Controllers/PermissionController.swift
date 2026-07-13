@@ -265,17 +265,36 @@ final class PermissionController: ObservableObject {
     }
 
     /// Whether the Privacy tab's "Finish setup" recovery banner should show
-    /// (SCR-143). Decouples "did the user skip the walkthrough" (`setupDismissed`,
-    /// the launch-gate concern) from "can this machine record" (the banner's
-    /// claim). Keying on `setupDismissed` alone strands the banner forever on the
+    /// (SCR-143, SCR-185). Decouples "did the user skip the walkthrough"
+    /// (`setupDismissed`, the launch-gate concern) from "can this machine record"
+    /// (the banner's claim) — and keys the can-record half on the SAME TCC subject
+    /// the *active transport's* recording-start gate uses, so the banner mirrors
+    /// the real start block instead of a second, divergent source of truth.
+    ///
+    /// Keying on `setupDismissed` alone stranded the banner forever on the
     /// CLI-fallback path, where the daemon-grant auto-clear (`updateDaemonGrants`)
-    /// never fires — so the orange "can't record" claim persists even after the
-    /// user has granted permissions and recording works. Requiring
-    /// `!allRequiredGranted` too mirrors the CLI-fallback recording-start gate
-    /// (`RecorderController.start`), so the banner clears exactly when the app's
-    /// own contract permits recording.
-    var shouldShowFinishSetupBanner: Bool {
-        setupDismissed && !allRequiredGranted
+    /// never fires (SCR-143). But keying the can-record half on the app-process
+    /// `allRequiredGranted` for *both* transports (the first SCR-143 shape) then
+    /// hid the banner on the daemon path whenever the app process happened to read
+    /// its own TCC state as granted — a stale post-launch `CGPreflight` cache, or a
+    /// leftover/decoy Accessibility grant on `com.screencap.macos` — while the
+    /// daemon (the actual recording subject) reported Screen Recording denied
+    /// (SCR-185). So the predicate is transport-aware:
+    ///
+    /// - `.daemon`: mirror the daemon start gate (`RecorderController.start`, which
+    ///   hard-blocks only on `daemonGrants.screenRecordingDenied`; Accessibility /
+    ///   Input Monitoring are advisory there, not capture-fatal). The app-process
+    ///   snapshot is irrelevant on this transport — the daemon is the TCC subject.
+    /// - `.cliFallback`: mirror the CLI-fallback start gate (`!allRequiredGranted`,
+    ///   the app-process subject). `daemonGrants` is forced `.allIndeterminate` on
+    ///   this transport, so it never reads "denied" — the app-process snapshot is
+    ///   the only truthful can-record signal here.
+    func shouldShowFinishSetupBanner(transport: RecorderTransport) -> Bool {
+        guard setupDismissed else { return false }
+        switch transport {
+        case .daemon:      return daemonGrants.screenRecordingDenied
+        case .cliFallback: return !allRequiredGranted
+        }
     }
 
     /// Dev-only hint shown to explain the "System Settings says granted but the
