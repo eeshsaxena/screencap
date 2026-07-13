@@ -16,6 +16,11 @@ struct PrivacySettingsView: View {
     @EnvironmentObject private var privacy: PrivacyController
     @EnvironmentObject private var permissions: PermissionController
     @EnvironmentObject private var index: RecordingsIndex
+    /// SCR-185: the "Finish setup" banner keys its can-record claim on the active
+    /// transport (daemon vs CLI-fallback gate on different TCC subjects), so it
+    /// needs the recorder's `transport`, which is `@Published` so the banner
+    /// re-evaluates when the transport flips.
+    @EnvironmentObject private var recorder: RecorderController
     /// SCR-260: the E2EE enable gate reads sign-in + cloud-plan state from here.
     @EnvironmentObject private var auth: CloudAuthController
 
@@ -94,9 +99,22 @@ struct PrivacySettingsView: View {
 
     // MARK: - Recovery banner (SCR-143, carried over from the legacy pane)
 
+    /// The banner's detail line, aligned to the active transport's hard start-block
+    /// (SCR-185). The daemon gate blocks only on Screen Recording (Accessibility /
+    /// Input Monitoring are advisory there), so naming Accessibility as required on
+    /// the daemon path overstates the block; the CLI-fallback gate requires both.
+    private var finishSetupBannerDetail: String {
+        switch recorder.transport {
+        case .daemon:
+            return "Grant Screen Recording to enable recording."
+        case .cliFallback:
+            return "Grant Screen Recording and Accessibility to enable recording."
+        }
+    }
+
     @ViewBuilder
     private var finishSetupBanner: some View {
-        if permissions.shouldShowFinishSetupBanner {
+        if permissions.shouldShowFinishSetupBanner(transport: recorder.transport) {
             HStack(spacing: 12) {
                 Image(systemName: "exclamationmark.shield")
                     .font(.system(size: 18))
@@ -106,7 +124,7 @@ struct PrivacySettingsView: View {
                     Text("Finish permission setup")
                         .font(SCTypography.sans(size: 13.5, weight: .semibold))
                         .foregroundStyle(Color.scInk)
-                    Text("Grant Screen Recording and Accessibility to enable recording.")
+                    Text(finishSetupBannerDetail)
                         .font(SCTypography.sans(size: 12))
                         .foregroundStyle(Color.scInkMuted)
                 }
