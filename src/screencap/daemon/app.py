@@ -55,7 +55,14 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     if not hasattr(app.state, "supervisor"):
         from screencap.daemon.supervisor import Supervisor
 
-        app.state.supervisor = Supervisor(app.state.event_bus)
+        # SCR-214 U2/KTD8: hand the supervisor the SAME start gate the HTTP
+        # recording.start path runs, so the internal ambient auto-start is held
+        # to the identical permission + paywall checks (a future gate can't be
+        # added to one path but missed on the other).
+        app.state.supervisor = Supervisor(
+            app.state.event_bus,
+            start_gate=lambda: enforce_recording_start_gate(app),
+        )
     # SCR-228: reconcile a storage migration that crashed between the tree
     # rename and the config flip, so the daemon serves the correct recordings
     # dir from the first request. Fail-open — a reconcile error must never
@@ -318,6 +325,49 @@ async def _enforce_recording_subscription_gate() -> None:
         raise errors.SubscriptionRequiredError(
             schema_version=schema._RECORDING_START_API_VERSION,
         )
+
+
+async def enforce_recording_start_gate(app: Starlette) -> None:
+    """Shared pre-spawn gate for ``recording.start``: permission + paywall (KTD8).
+
+    Extracted from the ``recording.start`` HTTP handler so BOTH it and the
+    internal ambient auto-start (``Supervisor``) run the *exact same* gates —
+    a future gate added here can't be wired into one path and missed on the
+    other (SCR-214 U2 / KTD8). Raises the same typed errors as before.
+
+    Permission gate (U6): reuse U2's cached grant snapshot (no second fresh
+    spawn) and block BEFORE ``supervisor.spawn`` claims the pidfile lock — a
+    fresh spawn inside the lock would widen the lock-contended window and risk
+    the app's 10s ``recording.start`` timeout. This replaces the old daemon-path
+    behavior (200 OK, then the worker emits ``permission_lost`` and crashes): the
+    worker never spawns, so there is no ``EVENT_STARTED`` and no duplicate
+    ``permission_lost`` for this attempt. The block is TRIGGERED by a denied
+    Screen Recording grant ONLY (the one permission fatal to capture);
+    indeterminate defers to the engine preflight backstop, and Accessibility /
+    Input Monitoring denials warn-and-proceed (they never trigger the block).
+    Once triggered, the reported ``missing`` list includes every denied required
+    permission — not just Screen Recording — so the app can surface the full
+    picture.
+
+    Paywall gate (U8, KTD-4): a no-op unless ``SCREENCAP_LOCAL_PAYWALL_ENFORCE``
+    is on; raised BEFORE the spawn (typed-error-before-spawn) so a refused start
+    never spawns an engine worker.
+    """
+    from screencap.daemon import permission_probe
+
+    grants = await _current_grants(app)
+    if grants.get(permission_probe.PERMISSION_SCREEN_RECORDING) == "denied":
+        missing = [
+            perm
+            for perm in permission_probe.PERMISSION_KEYS
+            if grants.get(perm) == "denied"
+        ]
+        raise errors.PermissionRequiredError(
+            missing,
+            schema_version=schema._RECORDING_START_API_VERSION,
+        )
+
+    await _enforce_recording_subscription_gate()
 
 
 def _check_subscription_for_recall(*, schema_version: int) -> None:
@@ -626,41 +676,12 @@ async def recording_start(request: Request) -> JSONResponse:
             )
         parsed = parsed.model_copy(update={"started_by": peer.classification})
 
-        # Pre-spawn permission gate (U6). Reuse U2's cached grant snapshot (no
-        # second fresh spawn) and block BEFORE supervisor.spawn claims the
-        # pidfile lock — a fresh spawn inside the lock would widen the
-        # lock-contended window and risk the app's 10s recording.start timeout.
-        # This replaces the old daemon-path behavior (200 OK, then the worker
-        # emits permission_lost and crashes): the worker never spawns, so there
-        # is no EVENT_STARTED and no duplicate permission_lost for this attempt.
-        # The block is TRIGGERED by a denied Screen Recording grant ONLY (the one
-        # permission fatal to capture); indeterminate defers to the engine
-        # preflight backstop, and Accessibility / Input Monitoring denials
-        # warn-and-proceed (they never trigger the block). Once triggered, the
-        # reported `missing` list includes every denied required permission — not
-        # just Screen Recording — so the app can surface the full picture to the
-        # user (the client-side U4 block, which only knows to gate on Screen
-        # Recording, names just that one).
-        from screencap.daemon import permission_probe
-
-        grants = await _current_grants(request.app)
-        if grants.get(permission_probe.PERMISSION_SCREEN_RECORDING) == "denied":
-            missing = [
-                perm
-                for perm in permission_probe.PERMISSION_KEYS
-                if grants.get(perm) == "denied"
-            ]
-            raise errors.PermissionRequiredError(
-                missing,
-                schema_version=schema._RECORDING_START_API_VERSION,
-            )
-
-        # Local paywall gate (U8, KTD-4). Only when SCREENCAP_LOCAL_PAYWALL_ENFORCE
-        # is on — otherwise a no-op, byte-identical to today. Raised BEFORE the
-        # spawn (typed-error-before-spawn, like the permission gate) so a refused
-        # start never spawns an engine worker. This one daemon chokepoint covers
-        # CLI, MCP, and the app (all POST /v0/recording.start).
-        await _enforce_recording_subscription_gate()
+        # Pre-spawn permission + paywall gates (U6/U8), extracted into a single
+        # shared helper so this HTTP path and the internal ambient auto-start
+        # (SCR-214 U2) can never diverge — a future gate added to the helper is
+        # enforced on both (KTD8). Both raise typed-errors-before-spawn, so a
+        # refused start never spawns an engine worker.
+        await enforce_recording_start_gate(request.app)
 
         result = await request.app.state.supervisor.spawn(parsed)
         # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what

@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +33,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
+
+# SCR-214 U2/KTD8: the shared ``recording.start`` gate (permission + paywall),
+# injected by the daemon app so the internal ambient auto-start runs the exact
+# same checks as the HTTP path. Awaitable, raises the same typed errors.
+StartGate = Callable[[], Awaitable[None]]
 
 # Bound the best-effort ``whoami`` enrichment in ``_maybe_emit_account_mismatch``
 # so a slow Keychain/token-refresh I/O can't pace the serial startup sweep (each
@@ -194,6 +199,27 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _ambient_rearm_params() -> tuple[float, float, int, float]:
+    """Backoff/ceiling knobs for ambient re-arm (SCR-214 U2), env-overridable.
+
+    Returns ``(base_delay, max_delay, max_retries, quiescence)``:
+
+    * ``base_delay`` — first backoff after a rapid crash; doubles each retry.
+    * ``max_delay`` — cap on the exponential backoff.
+    * ``max_retries`` — consecutive rapid-failure ceiling; past it we surface a
+      degraded state instead of thrash-respawning.
+    * ``quiescence`` — a run lasting at least this long (or a clean rc==0 exit)
+      is treated as stable: it resets the crash budget and re-arms promptly.
+
+    Read fresh each time so tests can shrink the delays / ceiling via env.
+    """
+    base = _float_env("SCREENCAP_AMBIENT_REARM_BASE_DELAY", 2.0)
+    max_delay = _float_env("SCREENCAP_AMBIENT_REARM_MAX_DELAY", 300.0)
+    max_retries = int(_float_env("SCREENCAP_AMBIENT_REARM_MAX_RETRIES", 5))
+    quiescence = _float_env("SCREENCAP_AMBIENT_REARM_QUIESCENCE", 60.0)
+    return base, max_delay, max_retries, quiescence
+
+
 def _default_engine_command(encoded_args: str) -> list[str]:
     override = os.environ.get("SCREENCAP_DAEMON_ENGINE_COMMAND")
     if override:
@@ -307,6 +333,7 @@ class Supervisor:
         startup_timeout: float | None = None,
         stop_timeout: float | None = None,
         reconcile_grace: float | None = None,
+        start_gate: StartGate | None = None,
     ) -> None:
         self._bus = event_bus
         self._engine_command_factory = engine_command_factory or _default_engine_command
@@ -366,6 +393,26 @@ class Supervisor:
         # SCR-228: set while a storage-location migration holds the daemon.
         # Guarded by `_operation_lock` so it serializes against spawn/stop.
         self._migration_active = False
+
+        # SCR-214 U2/KTD8: supervised always-on ambient capture.
+        # ``_start_gate`` (injected by the app) is the shared permission+paywall
+        # gate the internal ambient spawn runs — identical to the HTTP path.
+        self._start_gate = start_gate
+        # True while the current live ``_proc`` is the ambient stream (drives
+        # idle-shutdown + re-arm). ``_ambient_spawn_at`` is its monotonic start
+        # time, used to tell a stable run from a rapid crash.
+        self._ambient_active = False
+        self._ambient_spawn_at: float | None = None
+        # Surfaced blocked/degraded reason the app can read (None = healthy):
+        # permission/paywall denial, or the retry ceiling after repeated crashes.
+        self._ambient_degraded: str | None = None
+        # Consecutive rapid-failure count toward the re-arm ceiling.
+        self._ambient_retry_count = 0
+        # The pending auto-start / backoff re-arm task (keeps the daemon alive
+        # across the backoff gap so the always-on stream isn't idle-shut-down).
+        self._ambient_spawn_task: asyncio.Task[Any] | None = None
+        # Set at the top of ``shutdown`` so a torn-down daemon never re-arms.
+        self._shutting_down = False
 
         if reconcile_on_init:
             self.start_reconcile()
@@ -968,6 +1015,12 @@ class Supervisor:
 
     async def shutdown(self) -> None:
         """Stop any owned engine and release the daemon lock."""
+        # SCR-214 U2: mark the daemon as tearing down BEFORE the engine exit is
+        # handled, so `_handle_engine_exit` does not re-arm the ambient stream
+        # into a dying loop. Cancel any pending ambient re-arm for the same reason.
+        self._shutting_down = True
+        if self._ambient_spawn_task is not None and not self._ambient_spawn_task.done():
+            self._ambient_spawn_task.cancel()
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
@@ -1073,6 +1126,11 @@ class Supervisor:
             # never blocks request handling: _recovering is already cleared, and a
             # long backlog upload must not make `spawn`/`stop` raise Reconciling.
             self._track_resume(self._run_startup_sweep())
+            # SCR-214 U2: now that reconcile has cleared `_recovering`, auto-start
+            # the always-on ambient stream if the user enabled it. A no-op when
+            # ambient is disabled (the default); scheduled detached so a slow
+            # gate/spawn never blocks reconcile completion.
+            self._maybe_autostart_ambient()
 
     @staticmethod
     def _prune_stale_engine_token_files() -> None:
@@ -1197,6 +1255,14 @@ class Supervisor:
             # has the recording dir even if a concurrent stop/shutdown raced.
             capture_dir = (self._session_state or {}).get("capture_dir")
 
+            # SCR-214 U2: snapshot whether THIS exit was the ambient stream (and
+            # how long it ran) before teardown, so the re-arm decision below has
+            # it. The engine is gone → no longer "active"; re-arm (if any) revives.
+            was_ambient = self._ambient_active
+            ambient_spawn_at = self._ambient_spawn_at
+            if was_ambient:
+                self._ambient_active = False
+
             if not self._finalized_seen:
                 if rc != 0 and not self._stopping:
                     self._mark_catalog_terminated_unexpectedly(
@@ -1241,6 +1307,18 @@ class Supervisor:
                 and _is_cloud_recording(Path(capture_dir))
             ):
                 self._track_resume(self._run_resume_safely(Path(capture_dir)))
+
+            # SCR-214 U2: re-arm the always-on ambient stream after its engine
+            # exits (unless the daemon is shutting down or ambient was disabled).
+            # A clean/long-lived exit re-arms promptly; a rapid crash loop backs
+            # off and surfaces a degraded state at the ceiling rather than thrash.
+            if was_ambient:
+                run_duration = (
+                    time.monotonic() - ambient_spawn_at
+                    if ambient_spawn_at is not None
+                    else 0.0
+                )
+                self._schedule_ambient_rearm(rc, run_duration)
 
     def _observe_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -1384,6 +1462,184 @@ class Supervisor:
             if not candidate.exists():
                 return name, candidate
         raise RuntimeError(f"could not allocate capture dir for {day_name!r}")
+
+    # ------------------------------------------------------------------
+    # SCR-214 U2/KTD8: supervised always-on ambient capture
+    # ------------------------------------------------------------------
+
+    def ambient_supervision_active(self) -> bool:
+        """True while ambient capture is running OR a re-arm is pending.
+
+        Mirrors :meth:`has_inflight_resume` for the idle-shutdown watchdog: an
+        active always-on recording, or the backoff gap before its re-arm fires,
+        must keep the (auto-spawned) daemon alive so ambient is never silently
+        dropped. A degraded/ceiling'd ambient holds nothing pending, so it does
+        NOT keep the daemon alive (nothing left to supervise).
+        """
+        if self._ambient_active:
+            return True
+        task = self._ambient_spawn_task
+        return task is not None and not task.done()
+
+    def ambient_state(self) -> dict[str, Any]:
+        """Surfaced ambient supervision state for the app (SCR-214 U2/U12).
+
+        ``enabled`` reflects config; ``active`` is a live ambient recording;
+        ``degraded`` is a human-readable blocked/ceiling reason (None = healthy)
+        so the app can show *why* an enabled ambient is not recording instead of
+        a silent on-with-nothing-captured toggle.
+        """
+        from screencap.config import get_ambient_enabled
+
+        return {
+            "enabled": get_ambient_enabled(),
+            "active": self._ambient_active,
+            "degraded": self._ambient_degraded,
+            "retry_count": self._ambient_retry_count,
+        }
+
+    def _maybe_autostart_ambient(self) -> None:
+        """Kick the ambient auto-start after reconcile clears (SCR-214 U2/R2).
+
+        A no-op when ambient is disabled (``get_ambient_enabled() → False``, the
+        default). Otherwise schedules the gated spawn detached so a slow gate or
+        engine startup never blocks reconcile completion. Tracked in
+        ``_ambient_spawn_task`` so idle-shutdown + ``shutdown`` see it.
+        """
+        from screencap.config import get_ambient_enabled
+
+        if self._shutting_down or not get_ambient_enabled():
+            return
+        self._ambient_spawn_task = asyncio.create_task(self._spawn_ambient())
+
+    def _build_ambient_request(self) -> "RecordingStartRequest":
+        """Build the internal always-on ambient ``RecordingStartRequest`` (U2).
+
+        Hard-pins local-only (``cloud_intent=False``, no ``force_mode``)
+        regardless of ``get_upload_default()`` — KTD2: the always-on stream must
+        never upload; U1's intent freeze + the ``lock_policy`` assertion enforce
+        it downstream. ``ambient=True`` routes the deterministic per-day
+        ``ambient-YYYYMMDD`` dir and forces the audio substream on (R3).
+        """
+        from screencap.daemon.schema import RecordingStartRequest
+
+        return RecordingStartRequest(
+            ambient=True,
+            cloud_intent=False,
+            force_mode=None,
+        )
+
+    async def _spawn_ambient(self) -> None:
+        """Gate + spawn the internal ambient recording (SCR-214 U2/KTD8).
+
+        Runs the SHARED start gate (permission + paywall) first — the same gate
+        the HTTP ``recording.start`` path runs — so a future gate can't be added
+        there but missed here. A gate denial records a surfaced degraded state
+        and does NOT spawn. A ``LockContendedError`` means another recording
+        already holds the lock (an explicit start won the race); that is not a
+        failure — a later exit re-arm or the next boot retries. Any other spawn
+        error is treated as a rapid failure toward the backoff ceiling.
+        """
+        if self._shutting_down:
+            return
+        if self._start_gate is not None:
+            try:
+                await self._start_gate()
+            except errors.DaemonAPIError as exc:
+                self._set_ambient_degraded(f"blocked: {exc.error_code}")
+                return
+            except Exception:  # noqa: BLE001 — a gate error must not crash the supervisor
+                logger.warning("ambient start gate raised; not spawning", exc_info=True)
+                self._set_ambient_degraded("blocked: gate_error")
+                return
+
+        request = self._build_ambient_request()
+        try:
+            await self.spawn(request)
+        except errors.LockContendedError:
+            logger.info("ambient auto-start deferred: recording lock already held")
+            return
+        except errors.ReconcilingError:
+            logger.info("ambient auto-start deferred: still reconciling")
+            return
+        except Exception:  # noqa: BLE001 — never let a spawn error crash the supervisor
+            logger.warning("ambient auto-start spawn failed", exc_info=True)
+            self._backoff_and_reschedule(
+                ceiling_reason="ambient spawn repeatedly failed; "
+                "re-arm paused at the retry ceiling"
+            )
+            return
+
+        # Spawn succeeded — ambient is live and healthy.
+        self._ambient_active = True
+        self._ambient_spawn_at = time.monotonic()
+        self._ambient_degraded = None
+
+    def _schedule_ambient_rearm(self, rc: int, run_duration: float) -> None:
+        """Decide whether/how to re-arm ambient after its engine exited (U2).
+
+        A clean exit (``rc == 0``) or a run that lasted past the quiescence
+        window resets the crash budget and re-arms promptly. A rapid non-zero
+        exit engages exponential backoff and, past the retry ceiling, surfaces a
+        degraded state instead of thrash-respawning.
+        """
+        if self._shutting_down:
+            return
+        from screencap.config import get_ambient_enabled
+
+        if not get_ambient_enabled():
+            # The user turned ambient off — do not re-arm; clear the crash budget.
+            self._ambient_retry_count = 0
+            return
+
+        _base, _max_delay, _max_retries, quiescence = _ambient_rearm_params()
+        if rc == 0 or run_duration >= quiescence:
+            self._ambient_retry_count = 0
+            self._ambient_spawn_task = asyncio.create_task(
+                self._ambient_rearm_after(0.0)
+            )
+            return
+
+        self._backoff_and_reschedule(
+            ceiling_reason="engine exited rapidly and repeatedly; "
+            "ambient re-arm paused at the retry ceiling"
+        )
+
+    def _backoff_and_reschedule(self, *, ceiling_reason: str) -> None:
+        """Increment the crash budget and schedule a backed-off re-arm (U2).
+
+        Past ``max_retries`` consecutive rapid failures, stop re-arming and
+        surface ``ceiling_reason`` as the degraded state — the anti-thrash valve.
+        """
+        base, max_delay, max_retries, _quiescence = _ambient_rearm_params()
+        self._ambient_retry_count += 1
+        if self._ambient_retry_count > max_retries:
+            self._set_ambient_degraded(ceiling_reason)
+            return
+        delay = min(base * (2 ** (self._ambient_retry_count - 1)), max_delay)
+        self._ambient_spawn_task = asyncio.create_task(
+            self._ambient_rearm_after(delay)
+        )
+
+    async def _ambient_rearm_after(self, delay: float) -> None:
+        """Sleep ``delay`` then re-spawn ambient, unless torn down / disabled."""
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._shutting_down:
+            return
+        from screencap.config import get_ambient_enabled
+
+        if not get_ambient_enabled():
+            return
+        await self._spawn_ambient()
+
+    def _set_ambient_degraded(self, reason: str) -> None:
+        """Record + log the surfaced ambient degraded/blocked reason (U2)."""
+        logger.warning("ambient capture degraded: %s", reason)
+        self._ambient_degraded = reason
 
     def _worker_args(
         self,

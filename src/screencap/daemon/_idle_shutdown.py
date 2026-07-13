@@ -142,6 +142,13 @@ def _daemon_is_busy(app: Starlette) -> bool:
     # auto-spawned daemon could idle-exit mid-upload.
     if supervisor is not None and _has_inflight_resume(supervisor):
         return True
+    # SCR-214 U2: the always-on ambient stream is running OR a re-arm is pending
+    # in its backoff gap. ``current_session()`` covers the running case, but the
+    # backoff gap between an engine exit and its re-arm has no session — without
+    # this, an auto-spawned daemon could idle-exit mid-backoff and silently drop
+    # ambient capture. Mirrors ``_has_inflight_resume``.
+    if supervisor is not None and _ambient_supervision_active(supervisor):
+        return True
     # SCR-228: a storage-location migration holds the daemon. /v0/storage.migrate
     # is deliberately NOT in _ACTIVITY_PATHS, and its handler yields the loop
     # across an asyncio.to_thread move, so this busy check is what stops an
@@ -176,6 +183,16 @@ def _backfill_running(job: object) -> bool:
 
 def _has_inflight_resume(supervisor: object) -> bool:
     getter = getattr(supervisor, "has_inflight_resume", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 — watchdog stays robust against test doubles
+        return False
+
+
+def _ambient_supervision_active(supervisor: object) -> bool:
+    getter = getattr(supervisor, "ambient_supervision_active", None)
     if getter is None:
         return False
     try:
