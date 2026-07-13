@@ -201,6 +201,14 @@ def _load_models() -> dict[str, Any]:
         # older daemons omit it, so no API version bump is required. Warn-only —
         # a consumer renders a warning only for "off" and never blocks on it.
         filevault: str | None = None
+        # SCR-258 U4 (KTD-14/KTD-20): the encrypted-store state on the wire, one of
+        # "mounted"/"locked"/"absent"/"error" (see StoreState). Always present on a
+        # current daemon; older daemons / plaintext installs omit it → default
+        # "mounted". ``store_reason`` accompanies an "error" state with the ERROR_*
+        # sub-cause (key_missing / entitlement_mismatch / …); null otherwise. Typed
+        # as ``str`` (not a Literal) so a future token decodes tolerantly.
+        store_state: str = "mounted"
+        store_reason: str | None = None
 
     class RecordingSummary(_DaemonModel):
         """Recording summary shape returned by ``catalog.list_recordings()``."""
@@ -254,6 +262,10 @@ def _load_models() -> dict[str, Any]:
 
     class ListResponse(EnvelopeResponse):
         recordings: list[RecordingSummary]
+        # KTD-20: mounted / locked / absent / error — a locked store returns an
+        # empty list + store_state, never a 500. Absent on an older daemon →
+        # "mounted".
+        store_state: str = "mounted"
 
     class SessionSnapshotResponse(EnvelopeResponse):
         is_recording: bool | None
@@ -427,6 +439,9 @@ def _load_models() -> dict[str, Any]:
         # index_degraded / store_unavailable. Typed as str (not Literal) so a
         # future state decodes tolerantly.
         index_state: str
+        # KTD-20: mounted / locked / absent / error — a locked store returns empty
+        # hits + store_state. Absent on an older daemon → "mounted".
+        store_state: str = "mounted"
 
     class TranscriptSearchRequest(_DaemonModel):
         """SCR-118 transcript keyword-search input."""
@@ -462,6 +477,9 @@ def _load_models() -> dict[str, Any]:
         # 'best_effort' — transcript recall lags transcription. (Coherent
         # interface != coherent recall.)
         coverage: str
+        # KTD-20: mounted / locked / absent / error. Absent on an older daemon →
+        # "mounted".
+        store_state: str = "mounted"
 
     class TimelineQueryRequest(_DaemonModel):
         """SCR-118 timeline query input (absolute unix ms time range)."""
@@ -492,6 +510,9 @@ def _load_models() -> dict[str, Any]:
         rows: list[TimelineRow]
         # 'authoritative' — event tables, no OCR/redaction recall loss.
         coverage: str
+        # KTD-20: mounted / locked / absent / error. Absent on an older daemon →
+        # "mounted".
+        store_state: str = "mounted"
 
     class TimelineDayRequest(_DaemonModel):
         """U3 day-timeline input: a local calendar day + its UTC offset.
@@ -579,6 +600,9 @@ def _load_models() -> dict[str, Any]:
         # path directly. Additive/non-breaking — a stale daemon omits it (defaults
         # False → the agent reads the path as before).
         encrypted: bool = False
+        # KTD-20: mounted / locked / absent / error — a locked store returns null
+        # stem/delta + store_state. Absent on an older daemon → "mounted".
+        store_state: str = "mounted"
 
     class FrameReadRequest(_DaemonModel):
         """Search U8 / KTD6 decrypt-and-serve input.
@@ -880,6 +904,9 @@ def _load_models() -> dict[str, Any]:
         question_kind: str
         target: str
         reason: str | None = None
+        # KTD-20: mounted / locked / absent / error — a locked store returns a
+        # refusal + store_state. Absent on an older daemon → "mounted".
+        store_state: str = "mounted"
 
     _MODELS = {
         "EnvelopeResponse": EnvelopeResponse,

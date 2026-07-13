@@ -293,35 +293,14 @@ class MigrationLedger:
     # -- connection + schema (content_index.py-style perms/symlink guard) ----
 
     def _connect(self) -> sqlite3.Connection:
-        path = self._db_path
-        parent = path.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(parent, 0o700)
-        except OSError:
-            pass
-        if os.path.realpath(str(parent)) != os.path.abspath(str(parent)):
-            raise OSError(f"migration-ledger parent dir resolves through a symlink: {parent}")
-        if path.is_symlink():
-            raise OSError(f"migration-ledger db path is a symlink: {path}")
-        existed = path.exists()
-        conn = sqlite3.connect(str(path))
-        if not existed:
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
-        for suffix in ("-wal", "-shm"):
-            side = Path(str(path) + suffix)
-            if side.exists():
-                try:
-                    os.chmod(side, 0o600)
-                except OSError:
-                    pass
-        conn.row_factory = sqlite3.Row
-        return conn
+        # Shared connection-open discipline (mkdir/chmod parent, symlink guard,
+        # WAL + busy_timeout pragmas, sidecar chmod) lives in the leaf
+        # ``screencap.ledger_db`` so this and ``BackfillLedger`` can never drift.
+        from screencap.ledger_db import open_ledger_connection
+
+        return open_ledger_connection(
+            self._db_path, label="migration-ledger", busy_timeout_ms=_BUSY_TIMEOUT_MS
+        )
 
     def _ensure_schema(self) -> None:
         with self._lock:

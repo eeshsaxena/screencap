@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -1025,6 +1024,57 @@ def _auto_transcribe(capture_dir, audio_path):
     # No transcription backend available — not an error
 
 
+# States in which the recordings dir is unreachable, so an empty ``list``
+# result is NOT a genuinely-empty library. For these the JSON output carries a
+# typed envelope instead of a bare ``[]`` (AE8) so a consumer never renders a
+# locked/absent vault as "no recordings".
+_NON_MOUNTED_STORE_STATES = frozenset({"locked", "absent", "error"})
+
+
+def _derive_local_store_state() -> str | None:
+    """Best-effort local derivation of the encrypted-store state for ``list``.
+
+    Mirrors the ``status`` command's local derivation (sealed sentinel + bundle
+    presence). Returns None when the container is disabled (plaintext install) or
+    the state cannot be determined — the caller then emits today's bare-array
+    output byte-for-byte. Never raises: ``list`` must stay resilient.
+    """
+    try:
+        from screencap import config
+        if not config.get_container_enabled():
+            return None
+        from screencap.daemon import store_lifecycle as _sl
+        if _sl.is_sealed():
+            return _sl.StoreState.LOCKED.value
+        if not _sl.store_bundle_path().exists():
+            return _sl.StoreState.ABSENT.value
+        return _sl.StoreState.MOUNTED.value
+    except Exception:  # noqa: BLE001 - store-state derivation must never fail list
+        return None
+
+
+def _list_json(recordings, store_state: str | None) -> str:
+    """Render ``list --json`` output, store-state-aware (AE8, U10).
+
+    Backward-compatible by design: for the ordinary mounted/plaintext case this
+    emits the SAME bare JSON array consumers already parse
+    (``[{...recording...}]`` / ``[]``). Only for a non-mounted state
+    (locked/absent/error) — where a bare ``[]`` would be indistinguishable from
+    an empty library — does it emit a typed envelope
+    ``{"store_state": "locked", "recordings": []}`` so the consumer can render a
+    "vault locked" state instead of a misleading empty grid.
+
+    TODO(U10): macos/ScreenCap/State/RecordingsIndex.swift currently decodes this
+    as a bare ``[RecordingSummary]``; it must be taught to decode the store_state
+    envelope (a non-mounted state currently surfaces as a decode error, which the
+    Library treats as a generic load error rather than a locked-vault state).
+    """
+    rows = [r._asdict() for r in recordings]
+    if store_state in _NON_MOUNTED_STORE_STATES:
+        return json.dumps({"store_state": store_state, "recordings": rows}, indent=2)
+    return json.dumps(rows, indent=2)
+
+
 @cli.command("list")
 @click.option("--json", "as_json", is_flag=True,
               default=lambda: _should_default_to_json(),
@@ -1041,12 +1091,21 @@ def list_cmd(as_json, sort):
 
     recordings = list_recordings()
 
+    # SCR-258 U5/U10: derive the encrypted-store state locally (mirrors the
+    # ``status`` command). When the store is locked/absent the recordings dir is
+    # unreachable, so ``list_recordings()`` returns [] — byte-identical to an
+    # empty library. The JSON output MUST carry that distinction (AE8) so the
+    # Swift Library's RecordingsIndex fallback can tell "vault locked" from
+    # "genuinely empty". Only meaningful with the container enabled; a plaintext
+    # install leaves it None (byte-identical to today). Never raises.
+    store_state = _derive_local_store_state()
+
     if not recordings:
         # JSON consumers (e.g. the SwiftUI shell's RecordingsIndex) need a
         # parseable empty list, not Rich-styled prose. Plain-text output
         # stays for human callers.
         if as_json:
-            click.echo(json.dumps([]))
+            click.echo(_list_json(recordings, store_state))
         else:
             console.print("[dim]No recordings found.[/dim]")
         return
@@ -1060,12 +1119,7 @@ def list_cmd(as_json, sort):
     recordings.sort(key=sort_keys[sort])
 
     if as_json:
-        click.echo(
-            json.dumps(
-                [r._asdict() for r in recordings],
-                indent=2,
-            )
-        )
+        click.echo(_list_json(recordings, store_state))
         return
 
     table = Table(show_header=True, header_style="bold #60a5fa")
@@ -5327,8 +5381,11 @@ def storage_compact_cmd() -> None:
         raise SystemExit(1) from exc
 
     # Hold mount.lock for the whole detach -> compact cycle so no concurrent
-    # resolver (or the daemon) races the mount state.
-    with _hold_mount_lock():
+    # resolver (or the daemon) races the mount state. Reuse the daemon's shared
+    # KTD-3 contextmanager verbatim so the lock discipline can never drift.
+    from screencap.daemon import store_lifecycle as _sl
+
+    with _sl.mount_lock():
         st = container.status(str(bundle))
         if st.attached and st.mountpoint:
             try:
@@ -5351,35 +5408,6 @@ def storage_compact_cmd() -> None:
         "daemon start."
     )
 
-
-@contextlib.contextmanager
-def _hold_mount_lock():
-    """Hold an exclusive ``flock`` on the run-dir ``mount.lock`` (KTD-3 discipline).
-
-    Mirrors ``store_lifecycle._mount_lock``'s ``O_NOFOLLOW`` + realpath-parent
-    guard so ``storage compact`` serializes against the daemon's store-state
-    resolver / lock verb for the whole detach -> compact cycle.
-    """
-    import fcntl
-
-    from screencap.daemon import store_lifecycle as _sl
-
-    lock_path = _sl.mount_lock_path()
-    parent = lock_path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    if parent.is_symlink():
-        raise RuntimeError(
-            f"mount.lock run-dir is a symlink and will not be followed: {parent}"
-        )
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
 
 @storage_group.command("lock")

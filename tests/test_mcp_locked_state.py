@@ -78,6 +78,13 @@ async def test_timeline_query_reports_locked_as_data(_patch_locked_client):
     assert result.rows == []
 
 
+async def test_resolve_frame_reports_locked_as_data(_patch_locked_client):
+    result = await server.resolve_frame("rec", 1000)
+    assert result.store_state == "locked"
+    assert result.stem is None
+    assert result.delta_ms is None
+
+
 async def test_list_recordings_reports_locked_as_data(_patch_locked_client):
     result = await server.list_recordings()
     assert result.store_state == "locked"
@@ -97,6 +104,7 @@ async def test_no_read_tool_raises_on_locked_store(_patch_locked_client):
     await server.search_screen_content("x")
     await server.search_transcript("x")
     await server.query_timeline()
+    await server.resolve_frame("rec", 1000)
     await server.list_recordings()
     await server.chat_answer("x")
 

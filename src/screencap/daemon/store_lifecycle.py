@@ -149,7 +149,7 @@ def is_sealed() -> bool:
 def write_sealed_sentinel() -> Path:
     """Write the sealed sentinel with ``O_NOFOLLOW`` + realpath-parent discipline.
 
-    Mirrors :func:`_mount_lock` / ``_autospawn._open_auto_log``: a pre-planted
+    Mirrors :func:`mount_lock` / ``_autospawn._open_auto_log``: a pre-planted
     symlink AT the sentinel path is refused (``O_NOFOLLOW`` → ``ELOOP``), not
     followed, and a symlinked run-dir is rejected. Mode ``0o600``. Returns the
     sentinel path. The U9 lock verb writes this LAST (after a successful detach);
@@ -226,7 +226,7 @@ def disk_host_env() -> dict[str, str]:
 
 
 @contextmanager
-def _mount_lock() -> Iterator[None]:
+def mount_lock() -> Iterator[None]:
     """Hold an exclusive ``flock`` on ``run/mount.lock`` for the resolution.
 
     Uses the ``_autospawn._open_auto_log`` discipline (``O_NOFOLLOW`` on the lock
@@ -329,7 +329,7 @@ def resolve_store_state(*, attempt_mount: bool = True) -> StoreResolution:
 
     # container ON: resolve under mount.lock so a concurrent resolver (or the U9
     # lock verb) never races the sealed-sentinel / attach decision.
-    with _mount_lock():
+    with mount_lock():
         # Sealed sentinel wins over everything: serve locked, NEVER attempt a
         # mount. This is the load-bearing bind-before-mount amendment.
         if is_sealed():
@@ -383,7 +383,7 @@ def mount_now() -> StoreResolution:
     if not config.get_container_enabled():
         return StoreResolution(StoreState.MOUNTED)
 
-    with _mount_lock():
+    with mount_lock():
         bundle = store_bundle_path()
         if not bundle.exists():
             return StoreResolution(StoreState.ABSENT)
@@ -426,7 +426,7 @@ def relocate_bundle(target_dir: Path) -> "Any":
     """
     from screencap import config, container, storage_migration
 
-    with _mount_lock():
+    with mount_lock():
         bundle = store_bundle_path()  # current bundle (pre-move)
         mountpoint = Path(config.get_recordings_dir())
         # Resolve the key up front so the remount below always has it, whether

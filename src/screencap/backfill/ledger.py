@@ -41,7 +41,6 @@ is injectable for tests. Local-only either way — nothing here is uploaded.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 import time
@@ -138,42 +137,14 @@ class BackfillLedger:
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        path = self._db_path
-        parent = path.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(parent, 0o700)
-        except OSError:
-            pass
+        # Shared connection-open discipline (mkdir/chmod parent, symlink guard,
+        # WAL + busy_timeout pragmas, sidecar chmod) lives in the leaf
+        # ``screencap.ledger_db`` so this and ``MigrationLedger`` can never drift.
+        from screencap.ledger_db import open_ledger_connection
 
-        # Symlink guard: sqlite cannot open with O_NOFOLLOW, so refuse a
-        # symlinked DB path or parent before connect (mirrors content_index._open).
-        if os.path.realpath(str(parent)) != os.path.abspath(str(parent)):
-            raise OSError(f"backfill-ledger parent dir resolves through a symlink: {parent}")
-        if path.is_symlink():
-            raise OSError(f"backfill-ledger db path is a symlink: {path}")
-
-        existed = path.exists()
-        conn = sqlite3.connect(str(path))
-        # Close the create-to-chmod window before any second reader can open it.
-        if not existed:
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
-        # WAL sidecars are created by SQLite's C internals at umask mode — lock
-        # them down immediately, before a concurrent reader could open them.
-        for suffix in ("-wal", "-shm"):
-            side = Path(str(path) + suffix)
-            if side.exists():
-                try:
-                    os.chmod(side, 0o600)
-                except OSError:
-                    pass
-        conn.row_factory = sqlite3.Row
-        return conn
+        return open_ledger_connection(
+            self._db_path, label="backfill-ledger", busy_timeout_ms=_BUSY_TIMEOUT_MS
+        )
 
     def _ensure_schema(self) -> None:
         with self._lock:

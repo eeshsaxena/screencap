@@ -340,6 +340,12 @@ class Supervisor:
         from screencap.daemon.store_lifecycle import StoreState
 
         self._store_state: StoreState = StoreState.MOUNTED
+        # SCR-258 U4/U9 (KTD-14): the ERROR_* sub-cause (key_missing /
+        # entitlement_mismatch / keychain_locked / downgrade_unsupported) that
+        # accompanies an ERROR store_state, threaded into the recording.start
+        # refusal so the client can distinguish the cause. None for MOUNTED /
+        # LOCKED / ABSENT-without-cause.
+        self._store_reason: str | None = None
 
         # SCR-258 U9 (KTD-15): the quiescence engine's cooperative stop flag, shared
         # by reference into EVERY terminal-stage resume this supervisor launches
@@ -475,14 +481,17 @@ class Supervisor:
         """
         return self._migration_active
 
-    def set_store_state(self, state: "StoreState") -> None:
+    def set_store_state(self, state: "StoreState", reason: str | None = None) -> None:
         """Record the resolved encrypted-store state (SCR-258 U4, KTD-14).
 
         Called by the daemon lifespan with the ``StoreResolution`` that
         ``server.serve`` produced after binding the socket. ``spawn`` reads it as
-        the recording.start refusal flag.
+        the recording.start refusal flag. ``reason`` carries the ERROR_* sub-cause
+        (``resolution.reason``) so the refusal can name why the store is
+        unavailable; None for MOUNTED / LOCKED / cause-less ABSENT.
         """
         self._store_state = state
+        self._store_reason = reason
 
     def is_locked(self) -> bool:
         """True iff the store is sealed (SCR-258 U4).
@@ -602,13 +611,16 @@ class Supervisor:
 
             if self._store_state is StoreState.LOCKED:
                 raise errors.StoreLockedError(
-                    schema_version=schema._RECORDING_START_API_VERSION
+                    schema_version=schema._RECORDING_START_API_VERSION,
+                    reason=self._store_reason,
                 )
             if self._store_state is not StoreState.MOUNTED:
                 # ABSENT (pre-init) or ERROR (key missing / entitlement mismatch /
-                # keychain locked / downgrade unsupported): no usable store.
+                # keychain locked / downgrade unsupported): no usable store. The
+                # ERROR_* sub-cause (when known) rides along so the refusal names why.
                 raise errors.StoreAbsentError(
-                    schema_version=schema._RECORDING_START_API_VERSION
+                    schema_version=schema._RECORDING_START_API_VERSION,
+                    reason=self._store_reason,
                 )
             if self._migration_active:
                 # SCR-228 U4: a storage migration holds the daemon; refuse to

@@ -5,10 +5,10 @@ container (AES-256, APFS inside) that holds ScreenCap's recording data plane. It
 is the foundation unit: it owns the raw create / attach / detach / compact /
 status primitives, the single shared passphrase-piping helper, the typed
 exception taxonomy a daemon can later map to exit codes, ``-plist`` output
-parsing, and the per-attach host-leak hardening. It does **not** do key
-management (Keychain read/write — that is U2) and it does **not** own mount
-orchestration or lifecycle state (``ensure_store_mounted()`` — that is U4). Those
-higher layers call the primitives here.
+parsing, the per-attach host-leak hardening, and the container-key management
+(Keychain read/write — the U2 primitives near the bottom of this file). It does
+**not** own mount orchestration or lifecycle state (``ensure_store_mounted()`` —
+that is U4). Those higher layers call the primitives here.
 
 Design references (all in ``docs/plans/2026-07-06-001-feat-scr-236-encrypt-recordings-at-rest-plan.md``):
 
@@ -766,12 +766,27 @@ def harden_mount(mountpoint: str, *, timeout: float = _DEFAULT_TIMEOUT) -> None:
     Raises:
         ContainerError: if the ``.fseventsd/no_log`` sentinel cannot be written.
     """
-    # 1 + 2: disable indexing and verify, re-asserting once if needed.
-    for _attempt in range(2):
-        _run_cmd(["mdutil", "-i", "off", mountpoint], timeout=timeout)
-        probe = _run_cmd(["mdutil", "-s", mountpoint], timeout=timeout)
-        if not _mdutil_indexing_enabled(probe.stdout.decode("utf-8", "replace")):
-            break
+    import logging
+
+    # 1 + 2: disable indexing and verify, re-asserting once if needed. Strictly
+    # fail-open (see docstring): a stalled/missing ``mdutil`` (TimeoutExpired,
+    # subprocess error) must degrade to a warning, never escape and crash the
+    # attach path / daemon startup. Only the ``.fseventsd/no_log`` sentinel below
+    # is a real filesystem gate that may raise.
+    try:
+        for _attempt in range(2):
+            _run_cmd(["mdutil", "-i", "off", mountpoint], timeout=timeout)
+            probe = _run_cmd(["mdutil", "-s", mountpoint], timeout=timeout)
+            if not _mdutil_indexing_enabled(probe.stdout.decode("utf-8", "replace")):
+                break
+    except Exception:
+        # Indexing hardening is defense in depth, not a data-integrity gate.
+        logging.getLogger(__name__).warning(
+            "mdutil indexing-disable hardening failed at %s; continuing "
+            "(defense-in-depth only)",
+            mountpoint,
+            exc_info=True,
+        )
 
     # 3: FSEvents no-log sentinel at the volume root.
     fseventsd = os.path.join(mountpoint, ".fseventsd")

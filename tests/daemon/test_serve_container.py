@@ -97,7 +97,7 @@ def _app_locked(state: StoreState = StoreState.LOCKED, reason: str | None = None
     app.state.store_state = state.value
     app.state.store_reason = reason
     sup = Supervisor(app.state.event_bus, reconcile_on_init=False)
-    sup.set_store_state(state)
+    sup.set_store_state(state, reason)
     app.state.supervisor = sup
     return app
 
@@ -470,6 +470,31 @@ async def test_recording_start_refused_before_started(state, code, monkeypatch):
     assert app.state.event_bus.current_cursor() == cursor_before
     # No plaintext recording directory was created at the mountpoint.
     assert list(recordings.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_recording_start_refusal_surfaces_error_reason():
+    """SCR-258 U4/U9 (KTD-14): when the store is in an ERROR sub-state the
+    recording.start refusal envelope carries the ERROR_* ``reason`` (e.g.
+    ``key_missing``) so the client can distinguish the cause, mirroring
+    StorageMigrationError. Backward-compatible: no reason -> the key is omitted."""
+    from screencap.daemon import store_lifecycle as sl
+
+    app = _app_locked(StoreState.ERROR, reason=sl.ERROR_KEY_MISSING)
+    async with _client(app) as client:
+        r = await client.post("/v0/recording.start", json={"name": "demo"})
+
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"] == errors.STORE_ABSENT
+    assert body["reason"] == sl.ERROR_KEY_MISSING
+
+    # A refusal with no known sub-cause omits the reason key entirely (compat).
+    app2 = _app_locked(StoreState.LOCKED)
+    async with _client(app2) as client:
+        r2 = await client.post("/v0/recording.start", json={"name": "demo"})
+    assert r2.status_code == 409
+    assert "reason" not in r2.json()
 
 
 # ---------------------------------------------------------------------------

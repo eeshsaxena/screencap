@@ -397,16 +397,25 @@ class StoreLockedError(DaemonAPIError):
             "The recordings store is locked. Unlock it (screencap storage unlock) "
             "before recording."
         ),
+        reason: str | None = None,
         http_status: int | None = None,
     ) -> None:
         self.message = message
+        # Optional ERROR sub-cause (key_missing / entitlement_mismatch /
+        # keychain_locked / downgrade_unsupported) so the mutation-refusal path can
+        # distinguish the cause, mirroring StorageMigrationError. Backward-compatible:
+        # omitted from the envelope when None.
+        self.reason = reason
         super().__init__(schema_version=schema_version, http_status=http_status)
 
     def envelope(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"message": self.message}
+        if self.reason is not None:
+            payload["reason"] = self.reason
         return error_envelope(
             schema_version=self.schema_version,
             error=self.error_code,
-            message=self.message,
+            **payload,
         )
 
 
@@ -431,16 +440,23 @@ class StoreAbsentError(DaemonAPIError):
             "The recordings store has not been set up yet. Run "
             "'screencap storage init' before recording."
         ),
+        reason: str | None = None,
         http_status: int | None = None,
     ) -> None:
         self.message = message
+        # Optional ERROR sub-cause, mirroring StorageMigrationError / StoreLockedError.
+        # Backward-compatible: omitted from the envelope when None.
+        self.reason = reason
         super().__init__(schema_version=schema_version, http_status=http_status)
 
     def envelope(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"message": self.message}
+        if self.reason is not None:
+            payload["reason"] = self.reason
         return error_envelope(
             schema_version=self.schema_version,
             error=self.error_code,
-            message=self.message,
+            **payload,
         )
 
 

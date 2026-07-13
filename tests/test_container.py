@@ -381,6 +381,25 @@ def test_mdutil_status_parser(text, enabled):
 
 
 @pytest.mark.privacy
+def test_harden_mount_fails_open_on_mdutil_timeout(monkeypatch, tmp_path):
+    """A stalled/missing ``mdutil`` (TimeoutExpired) must NOT propagate out of
+    harden_mount — indexing hardening is defense-in-depth (fail-open) — while the
+    ``.fseventsd/no_log`` sentinel is still created (the real filesystem gate)."""
+    import os
+
+    def _boom(args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=1.0)
+
+    monkeypatch.setattr(container, "_run_cmd", _boom)
+
+    mount = str(tmp_path)
+    # Must not raise despite mdutil blowing up.
+    container.harden_mount(mount)
+
+    assert os.path.exists(os.path.join(mount, ".fseventsd", "no_log"))
+
+
+@pytest.mark.privacy
 def test_host_volume_capacity_positive(tmp_path):
     """Declared-size source (KTD-13) resolves against an existing ancestor even
     when the bundle path itself does not exist yet."""

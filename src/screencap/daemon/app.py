@@ -107,7 +107,9 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     # the supervisor's default MOUNTED — byte-identical to today.
     resolution = getattr(app.state, "store_resolution", None)
     if resolution is not None:
-        app.state.supervisor.set_store_state(resolution.state)
+        app.state.supervisor.set_store_state(
+            resolution.state, getattr(resolution, "reason", None)
+        )
     # SCR-228: reconcile a storage migration that crashed between the tree
     # rename and the config flip, so the daemon serves the correct recordings
     # dir from the first request. Fail-open — a reconcile error must never
@@ -3591,7 +3593,7 @@ async def storage_unlock(request: Request) -> JSONResponse:
 
     # Mounted (or, degenerately, absent): clear the sentinel and reconcile.
     sl.clear_sealed_sentinel()
-    supervisor.set_store_state(resolution.state)
+    supervisor.set_store_state(resolution.state, resolution.reason)
     supervisor.reset_quiesce()
     request.app.state.store_state = resolution.state.value
     request.app.state.store_reason = resolution.reason

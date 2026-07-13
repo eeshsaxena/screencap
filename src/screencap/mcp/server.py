@@ -103,6 +103,8 @@ class FrameNearest(BaseModel):
     stem: str | None
     delta_ms: int | None
     encrypted: bool = False
+    # KTD-20: mounted / locked / absent / error — a locked vault is data, not an error.
+    store_state: str = _DEFAULT_STORE_STATE
 
 
 class FrameBytes(BaseModel):
@@ -354,6 +356,7 @@ async def resolve_frame(
         stem=env.get("stem"),
         delta_ms=env.get("delta_ms"),
         encrypted=bool(env.get("encrypted", False)),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
 
 
