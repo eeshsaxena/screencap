@@ -2206,6 +2206,399 @@ async def tasks_list(request: Request) -> JSONResponse:
         )
 
 
+# ---------------------------------------------------------------------------
+# tasks.create / update / delete / merge / split — U7 user task CRUD verbs.
+#
+# Post-hoc MUTATING verbs over the LOCAL-only ``pipeline_task_segments`` store
+# (inside ``recording.db`` — never uploaded, R8). Each mirrors ``recording.rename``
+# end-to-end: derive the peer descriptor, ``_audit`` on EVERY exit path (ok / typed
+# error / unhandled), a validated request model, and typed error responses. Unlike
+# ``recording.rename`` they do NOT refuse the live recording — for ambient the user
+# curates tasks WHILE the day records, and ``PipelineLedger`` is built to coexist
+# with the live engine writer (busy_timeout=10000 + BEGIN IMMEDIATE per write). The
+# five verbs ARE mutations, so they join the ``_ACTIVITY_PATHS`` set (like
+# recording.stop) in ``daemon/_idle_shutdown.py``.
+# ---------------------------------------------------------------------------
+
+
+def _validate_task_body(model: Any, body: Any, *, schema_version: int) -> Any:
+    """Validate a task-CRUD request body → a typed 400 on any malformed input.
+
+    A non-dict body or a pydantic ``ValidationError`` raises
+    :class:`errors.InvalidRequestError` (400 ``invalid_request``) so the single
+    ``except DaemonAPIError`` path audits the exit — no validation failure skips
+    the audit line.
+    """
+    from pydantic import ValidationError
+
+    if not isinstance(body, dict):
+        raise errors.InvalidRequestError(schema_version=schema_version)
+    try:
+        return model.model_validate(body)
+    except ValidationError as exc:
+        raise errors.InvalidRequestError(schema_version=schema_version) from exc
+
+
+def _validate_task_span(
+    start_ts: float, end_ts: float, *, schema_version: int
+) -> None:
+    """Reject a zero-length / inverted / out-of-range task span (400).
+
+    A valid span is two FINITE, non-negative Unix-second bounds with
+    ``end_ts > start_ts``. ``math.isfinite`` rejects the ``NaN`` / ``Infinity``
+    tokens Python's ``json`` decoder accepts by default, so a direct UDS caller
+    cannot smuggle a non-finite bound past the boundary.
+    """
+    import math
+
+    if not (math.isfinite(start_ts) and math.isfinite(end_ts)):
+        raise errors.InvalidRequestError(schema_version=schema_version)
+    if start_ts < 0 or end_ts <= start_ts:
+        raise errors.InvalidRequestError(schema_version=schema_version)
+
+
+def _validate_task_name(name: str, *, schema_version: int) -> str:
+    """Validate a task label as display text; require it non-empty.
+
+    Reuses ``validate_recording_title`` (control chars / bidi / length<=200
+    rejected → 400 ``invalid_name``), then rejects an empty/whitespace-only
+    label with 400 ``invalid_request`` (a task must carry a name). Returns the
+    stripped label.
+    """
+    from screencap.daemon._name_validation import validate_recording_title
+
+    validated = validate_recording_title(name)
+    stripped = validated.strip()
+    if not stripped:
+        raise errors.InvalidRequestError(schema_version=schema_version)
+    return stripped
+
+
+def _resolve_task_ledger(recording: str, schema_version: int):
+    """Resolve a recording name to its :class:`PipelineLedger` (off the loop).
+
+    Pure disk IO — the handlers run it via ``asyncio.to_thread``. The recording
+    name is validated by ``validate_recording_name`` at the handler boundary
+    BEFORE this runs, so ``resolve_recording_dir`` can only produce an in-root
+    path. A missing recording dir / ``recording.db`` / recording row raises
+    :class:`errors.RecordingNotFoundError` (404) — the mutating counterpart to
+    ``tasks.list``'s fail-soft empty list (a write has no empty-result to return).
+    """
+    import sqlite3
+
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import (
+        LedgerError,
+        PipelineLedger,
+        ensure_pipeline_state_schema,
+    )
+
+    try:
+        rec_dir = resolve_recording_dir(recording)
+    except ValueError as exc:  # defense-in-depth; name is pre-validated
+        raise errors.RecordingNotFoundError(schema_version=schema_version) from exc
+    db_path = rec_dir / "recording.db"
+    if not db_path.exists():
+        raise errors.RecordingNotFoundError(schema_version=schema_version)
+    try:
+        ensure_pipeline_state_schema(db_path)
+        return PipelineLedger(db_path)
+    except (LedgerError, sqlite3.Error) as exc:
+        raise errors.RecordingNotFoundError(schema_version=schema_version) from exc
+
+
+def _task_crud_peer_audit(request: Request, verb: str):
+    """Build the (peer, ``_audit``) pair shared by the five task CRUD handlers.
+
+    Mirrors ``recording.rename``: the peer descriptor is derived once so every
+    exit path records the same descriptor, and the audit line carries peer +
+    outcome ONLY — never the free-text task label (labels must not accrue in the
+    local audit log, same rule as editable titles).
+    """
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            verb,
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    return peer, _audit
+
+
+async def tasks_create(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.create`` — add a USER-authored task span (U7).
+
+    Writes one ``source='user'`` row at a disjoint HIGH ``task_index`` (KTD3) so
+    it never collides with the agent's low range and survives the next agent
+    re-segmentation. Rejects a zero-length / inverted / out-of-range span and an
+    empty/control-char label with a typed 400; a traversal recording name with
+    400 ``invalid_name``; an unknown recording with 404. Local-only — the row
+    lives in ``recording.db`` and is never uploaded.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+    from screencap.pipeline_state import TaskSegmentRow
+
+    _v = schema._TASKS_CREATE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.create")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksCreateRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        name = _validate_task_name(parsed.name, schema_version=_v)
+        _validate_task_span(parsed.start_ts, parsed.end_ts, schema_version=_v)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        row = TaskSegmentRow(
+            task_index=0,  # ignored; insert_task_segment allocates the HIGH index
+            start_ts=parsed.start_ts,
+            end_ts=parsed.end_ts,
+            name=name,
+            category=parsed.category,
+        )
+        idx = await asyncio.to_thread(ledger.insert_task_segment, row)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task=schema.TaskSegment(
+                    task_index=idx,
+                    start_ts=parsed.start_ts,
+                    end_ts=parsed.end_ts,
+                    name=name,
+                    category=parsed.category,
+                    confidence=None,
+                ).model_dump(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_update(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.update`` — rename / re-bound an existing task (U7).
+
+    Every edit marks the row curated (``edited=1``); an agent row is additionally
+    RE-HOMED into the HIGH range so the next scoped agent replace preserves it
+    (KTD3). Only the provided fields are written. A missing ``task_index`` and a
+    provided-but-inverted span each return 400 ``invalid_request``; a traversal
+    name 400 ``invalid_name``; an unknown recording 404. Local-only.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_UPDATE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.update")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksUpdateRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        name = (
+            _validate_task_name(parsed.name, schema_version=_v)
+            if parsed.name is not None
+            else None
+        )
+        # Only cross-validate the span when BOTH bounds are supplied — a partial
+        # bound update (one side) is left to the stored counterpart.
+        if parsed.start_ts is not None and parsed.end_ts is not None:
+            _validate_task_span(parsed.start_ts, parsed.end_ts, schema_version=_v)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        # Always mark_edited: a user touch protects the row from the agent
+        # replace, and re-homes an agent row out of the clobbered low range.
+        new_index = await asyncio.to_thread(
+            lambda: ledger.update_task_segment(
+                parsed.task_index,
+                name=name,
+                start_ts=parsed.start_ts,
+                end_ts=parsed.end_ts,
+                category=parsed.category,
+                mark_edited=True,
+            )
+        )
+        if new_index is None:
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task_index=new_index,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_delete(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.delete`` — remove one task by ``task_index`` (U7).
+
+    Idempotent: deleting an already-absent task returns 200 ``deleted:false``
+    rather than an error, so a dropped/retried delete converges. A traversal name
+    returns 400 ``invalid_name``; an unknown recording 404. Local-only.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_DELETE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.delete")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksDeleteRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        deleted = await asyncio.to_thread(
+            ledger.delete_task_segment, parsed.task_index
+        )
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                deleted=bool(deleted),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_merge(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.merge`` — combine >=2 segments into one, atomically (U7).
+
+    The surviving label is the caller's choice, the span is the union, and the
+    result is one ``source='user'`` row (HIGH range) that survives the next agent
+    replace — all in a single ``BEGIN IMMEDIATE`` transaction, so a partial
+    failure never leaves a half-merge. Fewer than two resolvable segments returns
+    400 ``invalid_request``; a traversal name 400 ``invalid_name``; an unknown
+    recording 404. Local-only.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_MERGE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.merge")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksMergeRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        name = _validate_task_name(parsed.name, schema_version=_v)
+        # >=2 DISTINCT targets required — the ledger also re-checks against the
+        # rows that actually exist, so a stale index list can't half-merge.
+        if len(set(parsed.task_indices)) < 2:
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        new_index = await asyncio.to_thread(
+            lambda: ledger.merge_task_segments(
+                parsed.task_indices,
+                name=name,
+                category=parsed.category,
+            )
+        )
+        if new_index is None:
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task_index=new_index,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_split(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.split`` — split one segment into two at ``split_ts`` (U7).
+
+    ``split_ts`` must lie STRICTLY within the segment's span (validated against
+    the stored bounds inside the transaction); otherwise, or if the segment is
+    absent, returns 400 ``invalid_request``. Produces two ``source='user'`` rows
+    (HIGH range) in one atomic transaction — never a half-split. A traversal name
+    returns 400 ``invalid_name``; an unknown recording 404. Local-only.
+    """
+    import math
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_SPLIT_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.split")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksSplitRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        if not math.isfinite(parsed.split_ts):
+            raise errors.InvalidRequestError(schema_version=_v)
+        name_left = (
+            _validate_task_name(parsed.name_left, schema_version=_v)
+            if parsed.name_left is not None
+            else None
+        )
+        name_right = (
+            _validate_task_name(parsed.name_right, schema_version=_v)
+            if parsed.name_right is not None
+            else None
+        )
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        result = await asyncio.to_thread(
+            lambda: ledger.split_task_segment(
+                parsed.task_index,
+                parsed.split_ts,
+                name_left=name_left,
+                name_right=name_right,
+            )
+        )
+        if result is None:
+            # No such row, or split_ts not strictly inside the stored span.
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task_indices=list(result),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
 async def timeline_day(request: Request) -> JSONResponse:
     """``POST /v0/timeline.day`` — day-scoped spans + honest blocked intervals (U3).
 
@@ -2837,6 +3230,11 @@ def build_app() -> Starlette:
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
             Route("/v0/frame.read", frame_read, methods=["POST"]),
             Route("/v0/tasks.list", tasks_list, methods=["POST"]),
+            Route("/v0/tasks.create", tasks_create, methods=["POST"]),
+            Route("/v0/tasks.update", tasks_update, methods=["POST"]),
+            Route("/v0/tasks.delete", tasks_delete, methods=["POST"]),
+            Route("/v0/tasks.merge", tasks_merge, methods=["POST"]),
+            Route("/v0/tasks.split", tasks_split, methods=["POST"]),
             Route("/v0/chat.answer", chat_answer, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),

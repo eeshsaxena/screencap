@@ -58,6 +58,15 @@ _ACTIVITY_PATHS = frozenset(
         # ambient recording is still an intentional, in-progress session.
         "/v0/recording.pause",
         "/v0/recording.resume",
+        # SCR-214 U7: the user task CRUD verbs mutate the local tasks store (like
+        # recording.stop, a genuine mutation), so they count as activity — a user
+        # curating the day's tasks must not let the daemon idle-shut mid-edit.
+        # (recording.mute is deliberately NOT here, but a task edit is a write.)
+        "/v0/tasks.create",
+        "/v0/tasks.update",
+        "/v0/tasks.delete",
+        "/v0/tasks.merge",
+        "/v0/tasks.split",
     }
 )
 

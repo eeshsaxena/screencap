@@ -63,6 +63,15 @@ _STORAGE_MIGRATE_API_VERSION = 1
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
 # additive precedent).
 _TASKS_LIST_API_VERSION = 1
+# SCR-214 U7 user task CRUD verbs (create/update/delete/merge/split). Each
+# mutates the LOCAL-only tasks store (never uploaded — R8). Additive (new verbs)
+# — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
+# precedent); one version const per verb so they can bump independently.
+_TASKS_CREATE_API_VERSION = 1
+_TASKS_UPDATE_API_VERSION = 1
+_TASKS_DELETE_API_VERSION = 1
+_TASKS_MERGE_API_VERSION = 1
+_TASKS_SPLIT_API_VERSION = 1
 # SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
 # global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
 _MODELS_API_VERSION = 1
@@ -138,6 +147,16 @@ _MODEL_NAMES = {
     "TasksListRequest",
     "TaskSegment",
     "TasksListResponse",
+    "TasksCreateRequest",
+    "TasksCreateResponse",
+    "TasksUpdateRequest",
+    "TasksUpdateResponse",
+    "TasksDeleteRequest",
+    "TasksDeleteResponse",
+    "TasksMergeRequest",
+    "TasksMergeResponse",
+    "TasksSplitRequest",
+    "TasksSplitResponse",
     "ModelDownloadStartRequest",
     "ModelDownloadCancelRequest",
     "ModelDownloadStatusResponse",
@@ -794,6 +813,117 @@ def _load_models() -> dict[str, Any]:
         recording: str
         tasks: list[TaskSegment]
 
+    class TasksCreateRequest(_DaemonModel):
+        """U7 ``tasks.create`` input: add a USER-authored task span.
+
+        ``recording`` is validated by the canonical name validator in the handler
+        (traversal-safe). ``name`` is validated as DISPLAY text
+        (``validate_recording_title`` — control chars rejected, <=200 chars) and
+        must be non-empty. ``start_ts`` / ``end_ts`` are Unix seconds; the handler
+        rejects a zero-length / inverted / out-of-range span with a 400
+        ``invalid_request``. The store forces ``source='user'`` at a disjoint
+        HIGH ``task_index`` (KTD3) — the caller does not choose the index.
+        """
+
+        recording: str
+        name: str
+        start_ts: float
+        end_ts: float
+        category: str | None = None
+
+    class TasksCreateResponse(EnvelopeResponse):
+        """The created user task, echoed as a full :class:`TaskSegment`.
+
+        ``task`` carries the store-allocated ``task_index`` (HIGH range) so the
+        app can address the new row for a later update/delete without a re-list.
+        """
+
+        recording: str
+        task: TaskSegment
+
+    class TasksUpdateRequest(_DaemonModel):
+        """U7 ``tasks.update`` input: rename / re-bound an existing task.
+
+        Addresses the row by ``task_index``. Every provided field is written; an
+        omitted field is left unchanged. Editing ANY row marks it curated
+        (``edited=1``) — an agent row is additionally RE-HOMED into the HIGH
+        range so the next scoped agent replace preserves it (KTD3). When both
+        ``start_ts`` and ``end_ts`` are provided the handler validates the new
+        span (400 ``invalid_request`` on inversion / zero-length).
+        """
+
+        recording: str
+        task_index: int
+        name: str | None = None
+        start_ts: float | None = None
+        end_ts: float | None = None
+        category: str | None = None
+
+    class TasksUpdateResponse(EnvelopeResponse):
+        """The row's (possibly re-homed) ``task_index`` after an update."""
+
+        recording: str
+        task_index: int
+
+    class TasksDeleteRequest(_DaemonModel):
+        """U7 ``tasks.delete`` input: remove one task by ``task_index``."""
+
+        recording: str
+        task_index: int
+
+    class TasksDeleteResponse(EnvelopeResponse):
+        """``deleted`` is True when a row went, False when none matched.
+
+        Deleting an already-absent task is idempotent (200 with ``deleted:false``),
+        not an error — a dropped/retried delete converges.
+        """
+
+        recording: str
+        deleted: bool
+
+    class TasksMergeRequest(_DaemonModel):
+        """U7 ``tasks.merge`` input: combine >=2 segments into one.
+
+        ``task_indices`` names the segments to merge (>=2 distinct); ``name`` is
+        the surviving label (validated display text, non-empty). The merge is one
+        atomic transaction: span = union, the originals are deleted and one
+        ``source='user'`` row is inserted in the HIGH range so it survives the
+        next agent replace (KTD3). Fewer than two resolvable rows → 400
+        ``invalid_request``.
+        """
+
+        recording: str
+        task_indices: list[int]
+        name: str
+        category: str | None = None
+
+    class TasksMergeResponse(EnvelopeResponse):
+        """The merged row's allocated ``task_index`` (HIGH range)."""
+
+        recording: str
+        task_index: int
+
+    class TasksSplitRequest(_DaemonModel):
+        """U7 ``tasks.split`` input: split one segment into two at ``split_ts``.
+
+        ``split_ts`` must lie STRICTLY within the segment's span (else 400
+        ``invalid_request``). Optional ``name_left`` / ``name_right`` label the
+        halves; each defaults to the original name. The split is one atomic
+        transaction producing two ``source='user'`` rows in the HIGH range.
+        """
+
+        recording: str
+        task_index: int
+        split_ts: float
+        name_left: str | None = None
+        name_right: str | None = None
+
+    class TasksSplitResponse(EnvelopeResponse):
+        """The two allocated ``task_index`` values, left-span first."""
+
+        recording: str
+        task_indices: list[int]
+
     class ModelDownloadStartRequest(_DaemonModel):
         """SCR-239 ``model.download.start`` input.
 
@@ -964,6 +1094,16 @@ def _load_models() -> dict[str, Any]:
         "TasksListRequest": TasksListRequest,
         "TaskSegment": TaskSegment,
         "TasksListResponse": TasksListResponse,
+        "TasksCreateRequest": TasksCreateRequest,
+        "TasksCreateResponse": TasksCreateResponse,
+        "TasksUpdateRequest": TasksUpdateRequest,
+        "TasksUpdateResponse": TasksUpdateResponse,
+        "TasksDeleteRequest": TasksDeleteRequest,
+        "TasksDeleteResponse": TasksDeleteResponse,
+        "TasksMergeRequest": TasksMergeRequest,
+        "TasksMergeResponse": TasksMergeResponse,
+        "TasksSplitRequest": TasksSplitRequest,
+        "TasksSplitResponse": TasksSplitResponse,
         "ModelDownloadStartRequest": ModelDownloadStartRequest,
         "ModelDownloadCancelRequest": ModelDownloadCancelRequest,
         "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
@@ -1011,6 +1151,11 @@ __all__ = [
     "_ENTITLEMENT_REFRESH_API_VERSION",
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
+    "_TASKS_CREATE_API_VERSION",
+    "_TASKS_UPDATE_API_VERSION",
+    "_TASKS_DELETE_API_VERSION",
+    "_TASKS_MERGE_API_VERSION",
+    "_TASKS_SPLIT_API_VERSION",
     "_MODELS_API_VERSION",
     "_CHAT_ANSWER_API_VERSION",
     "daemon_version",

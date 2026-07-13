@@ -1193,6 +1193,161 @@ class PipelineLedger:
         finally:
             conn.close()
 
+    def merge_task_segments(
+        self,
+        task_indices: list[int],
+        *,
+        name: str,
+        category: str | None = None,
+        confidence: str | None = None,
+        metadata: str | None = None,
+    ) -> int | None:
+        """Merge >=2 task segments into ONE user-owned row, atomically (U7).
+
+        Reads the rows named by ``task_indices`` under a SINGLE
+        ``BEGIN IMMEDIATE`` transaction, unions their spans (min ``start_ts`` /
+        max ``end_ts``), deletes them ALL, and inserts one ``source='user'`` row
+        at a freshly-allocated HIGH-range ``task_index`` carrying the caller's
+        ``name`` — the surviving label of the merge. Because the survivor is a
+        user row in the disjoint high range, it survives the next scoped agent
+        replace (KTD3): a merge is a curation act. Returns the new ``task_index``;
+        returns ``None`` (rolling back) when fewer than two of the named rows
+        exist — nothing to merge. Any failure between the delete and the insert
+        rolls the WHOLE transaction back, so a partial failure never leaves a
+        half-merge (the originals are deleted only if the survivor commits).
+        """
+        # De-dup while preserving order; a merge needs >=2 DISTINCT targets.
+        wanted = list(dict.fromkeys(int(i) for i in task_indices))
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if len(wanted) < 2:
+                    conn.rollback()
+                    return None
+                placeholders = ",".join("?" for _ in wanted)
+                rows = conn.execute(
+                    "SELECT task_index, start_ts, end_ts FROM pipeline_task_segments "
+                    f"WHERE recording_id=? AND task_index IN ({placeholders})",
+                    (self._recording_id, *wanted),
+                ).fetchall()
+                if len(rows) < 2:
+                    # Fewer than two of the named rows exist — nothing to merge.
+                    conn.rollback()
+                    return None
+                union_start = min(float(r["start_ts"]) for r in rows)
+                union_end = max(float(r["end_ts"]) for r in rows)
+                conn.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    f"WHERE recording_id=? AND task_index IN ({placeholders})",
+                    (self._recording_id, *wanted),
+                )
+                new_index = self._next_user_task_index(conn)
+                conn.execute(
+                    "INSERT INTO pipeline_task_segments "
+                    "(recording_id, task_index, start_ts, end_ts, name, "
+                    " category, confidence, metadata, source, edited, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self._recording_id, new_index, union_start, union_end,
+                        name, category, confidence, metadata,
+                        TASK_SOURCE_USER, 0, _now(),
+                    ),
+                )
+                conn.commit()
+                return new_index
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def split_task_segment(
+        self,
+        task_index: int,
+        split_ts: float,
+        *,
+        name_left: str | None = None,
+        name_right: str | None = None,
+    ) -> tuple[int, int] | None:
+        """Split one task segment into TWO at ``split_ts``, atomically (U7).
+
+        Reads the row at ``task_index`` under a SINGLE ``BEGIN IMMEDIATE``
+        transaction; ``split_ts`` must lie STRICTLY within the row's span
+        (``start_ts < split_ts < end_ts``). Deletes the original and inserts two
+        ``source='user'`` rows — ``[start_ts, split_ts]`` and
+        ``[split_ts, end_ts]`` — at freshly-allocated HIGH-range indices, so both
+        halves survive the next scoped agent replace (KTD3). Each half inherits
+        the original's ``category`` / ``confidence`` / ``metadata`` and, unless
+        overridden by ``name_left`` / ``name_right``, its ``name``. Returns
+        ``(left_index, right_index)``; returns ``None`` (rolling back) when the
+        row is absent OR ``split_ts`` is not strictly inside the span. Any failure
+        rolls the whole transaction back — never a half-split.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT start_ts, end_ts, name, category, confidence, metadata "
+                    "FROM pipeline_task_segments WHERE recording_id=? AND task_index=?",
+                    (self._recording_id, task_index),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                start = float(row["start_ts"])
+                end = float(row["end_ts"])
+                if not (start < split_ts < end):
+                    conn.rollback()
+                    return None
+                base_name = row["name"]
+                category = row["category"]
+                confidence = row["confidence"]
+                metadata = row["metadata"]
+                conn.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    "WHERE recording_id=? AND task_index=?",
+                    (self._recording_id, task_index),
+                )
+                now = _now()
+                left_index = self._next_user_task_index(conn)
+                conn.execute(
+                    "INSERT INTO pipeline_task_segments "
+                    "(recording_id, task_index, start_ts, end_ts, name, "
+                    " category, confidence, metadata, source, edited, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self._recording_id, left_index, start, split_ts,
+                        name_left if name_left is not None else base_name,
+                        category, confidence, metadata,
+                        TASK_SOURCE_USER, 0, now,
+                    ),
+                )
+                # The just-inserted left row is visible on this connection, so the
+                # second allocation returns left_index+1 — the two halves never
+                # collide on UNIQUE(recording_id, task_index).
+                right_index = self._next_user_task_index(conn)
+                conn.execute(
+                    "INSERT INTO pipeline_task_segments "
+                    "(recording_id, task_index, start_ts, end_ts, name, "
+                    " category, confidence, metadata, source, edited, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self._recording_id, right_index, split_ts, end,
+                        name_right if name_right is not None else base_name,
+                        category, confidence, metadata,
+                        TASK_SOURCE_USER, 0, now,
+                    ),
+                )
+                conn.commit()
+                return (left_index, right_index)
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
 
 # ---------------------------------------------------------------------------
 # U9 migration reconciler — seed the ledger from on-disk evidence,
