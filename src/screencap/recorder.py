@@ -592,6 +592,7 @@ def start_recording(
     scrub_enabled: bool = True,
     show_on_website: bool = True,
     network: bool = False,
+    ambient: bool = False,
     *,
     # Session-controller worker-mode injection points. The optional seams
     # here are normally set only by screencap.session.run_recording_worker;
@@ -641,6 +642,7 @@ def start_recording(
         segmentation_mode=segmentation_mode,
         scrub_enabled=scrub_enabled,
         show_on_website=show_on_website,
+        ambient=ambient,
     )
     channels = _channels if _channels is not None else IpcChannels.create()
     menubar = _menubar_policy if _menubar_policy is not None else SpawnNewMenubar()

@@ -168,6 +168,85 @@ def set_audio_default(value: bool) -> None:
     invalidate_config_cache()
 
 
+def _parse_ambient_bool(env_name: str, cfg_key: str, default: bool) -> bool:
+    """Env var (truthy → bool) > ``[ambient].<cfg_key>`` > default.
+
+    A section-scoped twin of :func:`_parse_bool_env` for the opt-in ambient
+    (always-on) capture settings (SCR-214 U1). Same env+toml precedence and
+    bool parsing as :func:`get_audio_default`, but keyed into the ``[ambient]``
+    config block rather than a top-level key.
+    """
+    env = os.environ.get(env_name)
+    if env is not None:
+        return env.lower() in _BOOL_TRUE
+    section = _load_toml().get("ambient", {})
+    if isinstance(section, dict):
+        val = section.get(cfg_key, default)
+        if isinstance(val, bool):
+            return val
+    return default
+
+
+def get_ambient_enabled() -> bool:
+    """Return whether opt-in always-on ambient capture is enabled (default OFF).
+
+    Ambient capture is a single continuous per-day recording at full fidelity
+    (screen + audio + transcript), local-only, that the user can pause or stop
+    (SCR-214 R1/R2/R3). It is **off by default** and requires explicit opt-in
+    (first-run consent covering always-on audio, gated in the app). Precedence:
+    ``SCREENCAP_AMBIENT_ENABLED`` env > ``[ambient].enabled`` config > ``False``.
+    """
+    return _parse_ambient_bool("SCREENCAP_AMBIENT_ENABLED", "enabled", False)
+
+
+def get_ambient_autostart() -> bool:
+    """Return whether ambient auto-starts on daemon boot/login (default ON).
+
+    Only meaningful when :func:`get_ambient_enabled` is true — an always-on
+    recording implies resuming after a reboot (SCR-214 R2). It is an independent
+    control so a user can enable ambient while keeping a manual start. Precedence:
+    ``SCREENCAP_AMBIENT_AUTOSTART`` env > ``[ambient].autostart`` config > ``True``.
+    """
+    return _parse_ambient_bool("SCREENCAP_AMBIENT_AUTOSTART", "autostart", True)
+
+
+def set_ambient_enabled(value: bool) -> None:
+    """Persist the ambient-enabled opt-in to ``[ambient].enabled`` in config.toml.
+
+    Mirrors :func:`set_audio_default` (tomlkit load/save preserves comments and
+    formatting; atomic write) and invalidates the in-process cache so a
+    subsequent read in the same process observes the write.
+    """
+    _write_ambient_key("enabled", bool(value))
+
+
+def set_ambient_autostart(value: bool) -> None:
+    """Persist the ambient auto-start setting to ``[ambient].autostart``.
+
+    See :func:`set_ambient_enabled`; only meaningful when ambient is enabled.
+    """
+    _write_ambient_key("autostart", bool(value))
+
+
+def _write_ambient_key(key: str, value: bool) -> None:
+    """Write a single ``[ambient]`` key via the setup-wizard tomlkit loader/saver.
+
+    Mirrors :func:`set_audio_default`'s persistence path (comment/format
+    preserving, atomic) and invalidates the in-process config cache on exit,
+    creating the ``[ambient]`` table if it does not exist yet.
+    """
+    import tomlkit
+
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    if "ambient" not in doc:
+        doc["ambient"] = tomlkit.table()
+    doc["ambient"][key] = value
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
 def get_wifi_metrics() -> bool:
     """Return whether WiFi metrics collection is enabled (True = on)."""
     return _parse_bool_env("SCREENCAP_WIFI_METRICS", "wifi_metrics", True)

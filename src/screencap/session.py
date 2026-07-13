@@ -127,6 +127,7 @@ def run_recording_worker(args: dict) -> None:
             scrub_enabled=args.get("scrub_enabled", True),
             show_on_website=args.get("show_on_website", True),
             network=args.get("network", False),
+            ambient=args.get("ambient", False),
             # Worker-mode injection points ------------------------------------
             _channels=IpcChannels(
                 window_feed=args["_window_feed_q"],

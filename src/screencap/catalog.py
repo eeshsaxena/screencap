@@ -179,6 +179,23 @@ def read_cloud_e2ee(directory: Path) -> bool | None:
     return bool(val) if isinstance(val, bool) else None
 
 
+def read_ambient(directory: Path) -> bool:
+    """Read the FROZEN ``ambient`` flag from ``.recording_intent`` (SCR-214 U1).
+
+    The ambient (always-on per-day capture) flag is frozen once at recording
+    start (``engine/lock_policy._write_identity_files``). Downstream consumers
+    (incremental segmentation, retention window, day-timeline) read THIS value to
+    identify the continuous per-day stream.
+
+    Returns ``True`` only when the frozen field is explicitly ``true``; a missing
+    file, a corrupt intent, or an intent written before the field existed all read
+    as ``False`` (fail-safe: an unmarked recording is treated as an ordinary,
+    non-ambient recording).
+    """
+    data = _read_intent_data(directory)
+    return bool(data.get("ambient")) if data is not None else False
+
+
 def read_intent_privacy_mode(directory: Path) -> str | None:
     """Read the FROZEN capture-time ``privacy_mode`` from ``.recording_intent``.
 

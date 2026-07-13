@@ -293,6 +293,11 @@ def _load_models() -> dict[str, Any]:
         scrub_enabled: bool = True
         show_on_website: bool = True
         network: bool = False
+        # SCR-214 U1: opt-in always-on ambient capture. When true the supervisor
+        # allocates the deterministic per-day ``ambient-YYYYMMDD`` dir and the
+        # recording is frozen local-only + audio-forced-on. Additive/default-off
+        # so existing start callers are unaffected.
+        ambient: bool = False
 
     class RecordingStartResponse(EnvelopeResponse):
         session_id: str

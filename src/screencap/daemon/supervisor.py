@@ -253,6 +253,47 @@ def build_engine_worker_args(
     return args
 
 
+def _ambient_dir_finalized(candidate: Path) -> bool:
+    """Whether an existing ``ambient-YYYYMMDD`` dir has already been finalized.
+
+    Reopening a finalized day and appending fresh chunks would push past the
+    frozen closed set (``chunks_expected``) and corrupt the ledger, so
+    :meth:`Supervisor._allocate_ambient_capture_dir` must NOT reopen one
+    (SCR-214 U1). A day is finalized when either:
+
+    * the terminal stage wrote the completeness sentinel
+      (``recording_complete.json`` — its last write), or
+    * ``recording.db``'s ``recording.chunks_expected`` is frozen (non-null),
+      which the final chunk rotation / terminal stage sets when the recording
+      closes. A local ambient recording never writes the cloud sentinel, so this
+      ledger check is the load-bearing signal for the common local case.
+
+    Fail-safe: a missing/unreadable DB, or a pre-U1 DB without the column, reads
+    as *not finalized* (the dir is treated as reopenable) — a fresh same-day dir
+    is only ever forked when finalization is positively proven.
+    """
+    if (candidate / "recording_complete.json").exists():
+        return True
+    db = candidate / "recording.db"
+    if not db.exists():
+        return False
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT chunks_expected FROM recording LIMIT 1"
+        ).fetchone()
+        return row is not None and row[0] is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
 class Supervisor:
     """Own daemon recording lifecycle, crash recovery, and stderr bridging."""
 
@@ -1285,6 +1326,13 @@ class Supervisor:
         # cron jobs). Re-validate so the gate is single-sourced.
         if requested_name is not None:
             validate_recording_name(requested_name)
+        # SCR-214 U1 / KTD1: ambient capture is a single continuous per-day
+        # recording. Resolve a DETERMINISTIC ``ambient-YYYYMMDD`` dir (local day)
+        # and reopen today's if it already exists and is not finalized, so a
+        # daemon restart or re-enable mid-day keeps ONE dir per day rather than
+        # forking ``ambient-YYYYMMDD-2`` through the collision-suffix loop below.
+        if getattr(request, "ambient", False):
+            return self._allocate_ambient_capture_dir(get_recordings_dir())
         base_name = requested_name or time.strftime("rec-%Y%m%dT%H%M%S")
         if requested_output:
             capture_dir = Path(requested_output).expanduser().resolve()
@@ -1309,6 +1357,33 @@ class Supervisor:
             if not candidate.exists():
                 return name, candidate
         raise RuntimeError(f"could not allocate capture dir for {base_name!r}")
+
+    def _allocate_ambient_capture_dir(
+        self, recordings_dir: Path
+    ) -> tuple[str, Path]:
+        """Resolve-or-reopen the deterministic per-day ambient dir (SCR-214 U1).
+
+        Returns ``ambient-YYYYMMDD`` for the local day. When today's dir already
+        exists and is NOT finalized it is reopened verbatim (no ``-2`` suffix), so
+        the day stays a single continuous container across a daemon restart or a
+        mid-day re-enable (KTD1). When it exists AND is finalized, reopening would
+        corrupt the frozen ledger (:func:`_ambient_dir_finalized`), so a fresh
+        suffixed dir is forked instead — the rare edge where a day was already
+        closed (e.g. a manual stop) but ambient restarts on the same calendar day.
+        """
+        day_name = time.strftime("ambient-%Y%m%d")
+        candidate = recordings_dir / day_name
+        if not candidate.exists():
+            return day_name, candidate
+        if not _ambient_dir_finalized(candidate):
+            return day_name, candidate
+        # Finalized: do not reopen. Fork a suffixed dir so capture still proceeds.
+        for index in range(2, 1000):
+            name = f"{day_name}-{index}"
+            candidate = recordings_dir / name
+            if not candidate.exists():
+                return name, candidate
+        raise RuntimeError(f"could not allocate capture dir for {day_name!r}")
 
     def _worker_args(
         self,
