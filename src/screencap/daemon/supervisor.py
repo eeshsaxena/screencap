@@ -354,6 +354,7 @@ class Supervisor:
         start_gate: StartGate | None = None,
         clock: Callable[[], float] | None = None,
         ambient_day_tick_interval: float | None = None,
+        ambient_seg_tick_interval: float | None = None,
     ) -> None:
         self._bus = event_bus
         self._engine_command_factory = engine_command_factory or _default_engine_command
@@ -367,6 +368,16 @@ class Supervisor:
             ambient_day_tick_interval
             if ambient_day_tick_interval is not None
             else _float_env("SCREENCAP_AMBIENT_DAY_TICK_INTERVAL", 30.0)
+        )
+        # SCR-214 U6/KTD4: cadence of the incremental-segmentation sweep. Heavier
+        # than the day-roll watch (it re-runs the terminal-stage segmenter over the
+        # growing ambient day), so a coarser default; env/param-overridable so
+        # tests can tick fast. Consequence (KTD4): today's Journal labels refresh
+        # on this interval, not per closed chunk.
+        self._ambient_seg_tick_interval = (
+            ambient_seg_tick_interval
+            if ambient_seg_tick_interval is not None
+            else _float_env("SCREENCAP_AMBIENT_SEG_TICK_INTERVAL", 300.0)
         )
         self._poll_interval = (
             poll_interval
@@ -448,6 +459,11 @@ class Supervisor:
         # the roll's intentional stop as a roll — NOT a crash to re-arm/back off.
         self._ambient_day_task: asyncio.Task[Any] | None = None
         self._ambient_rolling = False
+        # SCR-214 U6/KTD4: the long-lived incremental-segmentation watch task
+        # (re-runs the terminal-stage segmenter over the live ambient day so
+        # today's Journal fills before the stream stops). Persists across re-arms
+        # and day rolls; cancelled in ``shutdown``.
+        self._ambient_seg_task: asyncio.Task[Any] | None = None
         # Set at the top of ``shutdown`` so a torn-down daemon never re-arms.
         self._shutting_down = False
 
@@ -1073,6 +1089,10 @@ class Supervisor:
         # SCR-214 U3: stop the day-boundary watch so a torn-down daemon never rolls.
         if self._ambient_day_task is not None and not self._ambient_day_task.done():
             self._ambient_day_task.cancel()
+        # SCR-214 U6: stop the incremental-segmentation watch so a torn-down daemon
+        # never kicks off a new pass.
+        if self._ambient_seg_task is not None and not self._ambient_seg_task.done():
+            self._ambient_seg_task.cancel()
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
@@ -1584,6 +1604,10 @@ class Supervisor:
         # live for the whole ambient lifetime (it persists across re-arms and
         # rolls). No-op if already running.
         self._start_ambient_day_watch()
+        # SCR-214 U6: start the incremental-segmentation watch alongside auto-start
+        # so today's Journal fills as the day progresses (R7). Also persists across
+        # re-arms and rolls. No-op if already running.
+        self._start_ambient_segmentation_watch()
 
     def _build_ambient_request(self) -> "RecordingStartRequest":
         """Build the internal always-on ambient ``RecordingStartRequest`` (U2).
@@ -1816,6 +1840,102 @@ class Supervisor:
             await self._spawn_ambient()
         finally:
             self._ambient_rolling = False
+
+    # ------------------------------------------------------------------
+    # SCR-214 U6/KTD4/R7: incremental segmentation of the live ambient day
+    # ------------------------------------------------------------------
+
+    def _active_ambient_dir(self) -> "Path | None":
+        """The on-disk dir of the live ambient recording, or ``None`` (U6).
+
+        Derives the recording dir from the current session's ``capture_dir`` when
+        an ambient stream is live, so the incremental segmenter targets exactly the
+        dir the engine is writing. Returns ``None`` when nothing ambient is live
+        (mirrors :meth:`_active_ambient_day`, but yields the path the segmenter
+        needs rather than the day name the roll watch compares).
+        """
+        session = self._session_state
+        if not self._ambient_active or not session:
+            return None
+        capture_dir = session.get("capture_dir")
+        if not isinstance(capture_dir, str):
+            return None
+        return Path(capture_dir)
+
+    def _start_ambient_segmentation_watch(self) -> None:
+        """Start the long-lived incremental-segmentation watch task (idempotent, U6)."""
+        if self._ambient_seg_task is not None and not self._ambient_seg_task.done():
+            return
+        self._ambient_seg_task = asyncio.create_task(
+            self._ambient_segmentation_watch()
+        )
+
+    async def _ambient_segmentation_watch(self) -> None:
+        """Re-segment the live ambient day on a timer so today's Journal fills (U6/R7).
+
+        A periodic sweep (env ``SCREENCAP_AMBIENT_SEG_TICK_INTERVAL``, default 300s)
+        that, for the active ambient recording, runs one incremental segmentation
+        pass on a WORKER THREAD (mirroring ``resume_terminal_stage``'s non-blocking
+        pattern so the asyncio loop is never blocked by the terminal-stage
+        segmenter). Started alongside ambient auto-start and cancelled in
+        ``shutdown``; persists across re-arms and day rolls (KTD4). A tick is a
+        no-op when nothing ambient is live, or while a day roll is in progress (the
+        recording is mid stop→start).
+        """
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(self._ambient_seg_tick_interval)
+            except asyncio.CancelledError:
+                return
+            if self._shutting_down:
+                return
+            # A roll is stopping/reopening the recording — let it settle rather than
+            # segmenting a dir mid-teardown (the finalize's own final pass covers it).
+            if self._ambient_rolling:
+                continue
+            recording_dir = self._active_ambient_dir()
+            if recording_dir is None:
+                continue
+            try:
+                await self._run_incremental_segmentation(recording_dir)
+            except Exception:  # noqa: BLE001 — a pass error must not kill the watch
+                logger.warning(
+                    "ambient incremental segmentation tick failed; will retry on "
+                    "the next tick", exc_info=True,
+                )
+
+    async def _run_incremental_segmentation(self, recording_dir: Path) -> None:
+        """Run one incremental segmentation pass off-loop (U6/KTD4).
+
+        Mirrors ``resume_terminal_stage``'s worker-thread + non-blocking-flock
+        pattern: the terminal-stage segmenter is blocking work (DB reads, provider
+        call) that must not stall the event loop, so it runs in a worker thread; it
+        acquires the per-recording terminal flock NON-BLOCKING, so a concurrent
+        finalize that holds the flock makes this pass SKIP (``TerminalStageBusy``)
+        rather than race (AE12). Strictly fail-open — every error is swallowed so a
+        bad pass never crashes the watch or the daemon (the R11 privacy strip is
+        fail-closed INSIDE the segmenter, independent of this fail-open outer belt).
+        """
+        from screencap.terminal_stage import (
+            TerminalStageBusy,
+            run_incremental_segmentation,
+        )
+
+        def _run() -> None:
+            try:
+                run_incremental_segmentation(recording_dir, non_blocking=True)
+            except TerminalStageBusy:
+                logger.debug(
+                    "ambient incremental segmentation: %s busy (a finalize/upload "
+                    "holds the flock); skipping this tick", recording_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 — never propagate into the loop
+                logger.warning(
+                    "ambient incremental segmentation failed for %s (%s); fail-open",
+                    recording_dir, exc,
+                )
+
+        await asyncio.to_thread(_run)
 
     def _worker_args(
         self,
