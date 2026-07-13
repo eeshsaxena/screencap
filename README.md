@@ -1,6 +1,6 @@
 # ScreenCap
 
-ScreenCap is a private screen memory for your Mac. It records what you work on — screen, input, audio, window context — keeps everything on your machine, and makes it searchable by you and by your AI agents. Nothing leaves your Mac unless you sign in, review, and say so.
+ScreenCap is a private screen memory for your Mac. It records what you work on — screen, input, audio, window context — keeps everything on your machine, and makes it searchable by you and by your AI agents. Nothing leaves your Mac unless you sign in and say so.
 
 It ships two ways: a native macOS app (the easiest way to use it) and a CLI with a background daemon (the engine underneath, useful on its own for scripting and headless setups).
 
@@ -9,8 +9,8 @@ It ships two ways: a native macOS app (the easiest way to use it) and a CLI with
 Screen recorders that promise "local and private" usually mean *we redact things afterwards*. ScreenCap's privacy is enforced while recording, and you can verify every claim in this repo:
 
 - **Capture-time blocking, fail-closed.** A real-time filter watches the foreground window and blocks capture for sensitive apps *before* anything is written — excluded screenshots never touch disk, keystrokes are nulled, video frames are dropped. The filter starts blocked and stays blocked on errors, so failure means less capture, never more.
-- **Password managers are never captured, in any mode.** Banking, login, and checkout pages are excluded from cloud-bound recordings and masked in personal ones — driven by a context-classification matrix you can inspect and override per app.
-- **Nothing uploads without review.** Cloud sync is opt-in and per-account. What you approve in the review step is exactly what uploads — recordings are scrubbed first, and the local `recording.db` never leaves your machine, ever.
+- **Password managers are excluded by default, in every mode.** Banking, login, and checkout pages are excluded from cloud-bound recordings and masked in personal ones — driven by a context-classification matrix you can inspect and override per app (overriding an excluded category takes an explicit confirmation step).
+- **Nothing uploads without your say-so.** Cloud sync is opt-in, per-account, and per-recording — nothing leaves your machine unless you signed in and chose a cloud destination. Cloud-bound copies are scrubbed first, the app adds a review step (the copy you approve is exactly the copy that uploads), and the local `recording.db` never leaves your machine, ever.
 - **Search is consent-gated and encrypted.** On-device search only turns on after you acknowledge what it stores, and the search corpus (screenshots + text index) is encrypted at rest. It is never uploaded.
 - **Action-gated capture.** Video and screenshots are written around your actual activity rather than as a 24/7 firehose, which keeps the footprint small enough to run all day.
 
@@ -77,7 +77,7 @@ To make your recordings searchable, turn on on-device search once:
 screencap search enable
 ```
 
-This is a deliberate consent step, not a config flag: it shows you what search will store, encrypts the search corpus, and from then on new recordings are indexed automatically. `screencap search status` shows the current state, and `screencap backfill start` indexes the recordings you made before turning it on — with the same privacy rules applied.
+This is a deliberate consent step, not a config flag: it acknowledges the search disclosure (the app walks you through it during onboarding), encrypts the search corpus, and from then on new recordings are indexed automatically. `screencap search status` shows the current state, and `screencap backfill start` indexes the recordings you made before turning it on — with the same privacy rules applied.
 
 ## Search, chat, and agents
 
@@ -85,7 +85,7 @@ Once search is on, three surfaces sit on top of the same local index:
 
 - **The app** — search across everything you've seen, browse the timeline, or just ask in Chat ("what was that error I hit on Tuesday?") and get answers grounded in your own history.
 - **The daemon API** — read-only query verbs (`content.search`, `transcript.search`, `timeline.query`, `frame.nearest`) over a local UNIX socket, for tooling.
-- **MCP** — `screencap mcp` runs a stdio MCP server, so Claude Desktop, Codex, or any MCP client can search your recordings and pull up the exact frame where something happened. Setup guide: [docs/mcp-client-setup.md](docs/mcp-client-setup.md).
+- **MCP** — `screencap mcp` runs a stdio MCP server, so Claude Desktop, Codex, or any MCP client can search your recordings, ask grounded questions about your history (the same capability behind the app's Chat, citations included), and pull up the exact frame where something happened. Setup guide: [docs/mcp-client-setup.md](docs/mcp-client-setup.md).
 
 Everything here is local-only. The index lives at `~/.screencap/content_index.db`, is built only from frames the privacy policy allowed, and is never uploaded.
 
@@ -131,15 +131,15 @@ ScreenCap never requires an account. Recording, scrubbing, search, and playback 
 
 ```bash
 screencap login          # browser sign-in; token lives in your Keychain
-screencap upload --all   # scrub → review → upload, per-account
+screencap upload --all   # scrub → upload, per-account (the app adds a review step)
 screencap download       # pull your recordings onto another machine
 screencap whoami
 ```
 
-- What you review is what uploads — the reviewed, scrubbed copy is reused at upload time.
+- In the app, what you review is what uploads — the reviewed, scrubbed copy is reused at upload time.
 - `recording.db` (the raw event database) is excluded from upload by a hard rule.
 - End-to-end encryption for cloud copies is available in beta: `screencap e2ee enable` creates a device-held key first and only turns the setting on once the key exists, so the account can never end up half-configured.
-- Cloud recordings are listed on your account page by default; use `--unlisted` or `screencap settings --set show_on_website=false` to change that.
+- Cloud recordings are listed on your account page by default; record with `screencap start --unlisted` or set `screencap settings --set show_on_website=false` to change that.
 
 Cloud storage is a paid feature — see [screencap.sh](https://screencap.sh) for plans.
 
@@ -212,7 +212,7 @@ ScreenCap is built for people who work across a dozen tools a day and lose the t
 - **Recording you can forget about** — reliability and low overhead good enough to leave on all day.
 - **Privacy that stays ahead** — deeper capture-time enforcement, E2EE from beta to default, consent that's real rather than fine print.
 - **A native experience** — the macOS app is the product: journal, search, chat, and review, no terminal needed.
-- **Memory for agents** — richer MCP and daemon surfaces, so your tools can answer "what was I doing?" as well as you can.
+- **Memory for agents** — deepening the MCP and daemon surfaces that already let your tools answer "what was I doing?", so they get as good at it as you are.
 - **Opt-in data, honestly sourced** — structured exports and a consented pipeline for teams building computer-use automation.
 
 macOS only, deliberately, until it's excellent there.
