@@ -53,9 +53,15 @@ def isolated_base(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_flag_off_paths_are_todays_layout(isolated_base):
-    """Every data path resolves under ``~/.screencap`` exactly as before U3."""
-    assert cfg.get_container_enabled() is False  # default OFF (U8 flips it later)
+def test_flag_off_paths_are_todays_layout(isolated_base, monkeypatch):
+    """Every data path resolves under ``~/.screencap`` exactly as before U3.
+
+    The shipped default is now ON (SCR-258), so the off-path is requested
+    explicitly here rather than relied on from the default.
+    """
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "false")
+    cfg.invalidate_config_cache()
+    assert cfg.get_container_enabled() is False  # explicitly forced off
 
     base = isolated_base
     # get_base_dir is the anchor today's formulas are written against.

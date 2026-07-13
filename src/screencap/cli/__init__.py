@@ -5341,7 +5341,12 @@ def _guard_store_available(err_console=None) -> None:
     """
     from screencap import config
 
-    if not config.get_container_enabled():
+    # No-op unless container-aware resolution is actually in effect. This must
+    # match the data-root resolver (``_container_data_root_active``), which is
+    # bypassed by the ``SCREENCAP_RECORDINGS_DIR`` dev/test seam regardless of
+    # the flag — otherwise, with the flag on by default, the guard would resolve
+    # a container while path resolution stays plaintext under the env override.
+    if not config._container_data_root_active():
         return
 
     out = err_console or console

@@ -181,14 +181,17 @@ def get_container_enabled() -> bool:
 
     Standard bool-env/config shape (mirrors :func:`get_wifi_metrics` et al.): env
     ``SCREENCAP_CONTAINER_ENABLED`` > config.toml ``container_enabled`` > default.
-    **Default OFF.** U8 makes the flag *settable* and *documented* but does NOT
-    flip the shipped default — the on-by-default flip is a separate
-    post-validation release step; do not flip it here.
+    **Default ON (SCR-258 shipped posture).** The product launches with no
+    installed base, so the container ships from the first recording (the
+    original v1 design) — there is nothing to migrate and no plaintext-era users
+    to surprise. The flag stays settable so a fresh (no-bundle) install can turn
+    it off; on a bundle-present install, turning it off does not revert to
+    plaintext (downgrade-unsupported, see KTD-19 / SECURITY.md).
     When on (and no ``SCREENCAP_RECORDINGS_DIR`` override is active) the data-plane
     sidecars relocate inside the recordings mountpoint's reserved ``.store/`` dir;
     run-dir paths are unaffected.
     """
-    return _parse_bool_env("SCREENCAP_CONTAINER_ENABLED", "container_enabled", False)
+    return _parse_bool_env("SCREENCAP_CONTAINER_ENABLED", "container_enabled", True)
 
 
 def _container_data_root_active() -> bool:

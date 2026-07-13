@@ -56,7 +56,11 @@ def store_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "_DEFAULT_BASE", base)
     monkeypatch.setattr(cfg, "_CONFIG_PATH", base / "config.toml")
     mountpoint = tmp_path / "recordings"  # deliberately NOT created here
-    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(mountpoint))
+    # Point the mountpoint via the default, NOT SCREENCAP_RECORDINGS_DIR — the
+    # env override is the plaintext bypass seam, so setting it would (correctly)
+    # make the container inactive and the funnel guard a no-op.
+    monkeypatch.setattr(cfg, "_DEFAULT_RECORDINGS", mountpoint)
+    monkeypatch.delenv("SCREENCAP_RECORDINGS_DIR", raising=False)
     monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
     # Key-file channel off + never touch a real Keychain by accident.
     monkeypatch.delenv(container.CONTAINER_KEY_FILE_ENV, raising=False)

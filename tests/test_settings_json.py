@@ -204,12 +204,12 @@ def test_content_index_consent_declined_set_roundtrips():
     assert _invoke_settings_json()["settings"]["content_index_consent_declined"] is True
 
 
-def test_container_enabled_defaults_false_in_json():
-    """The on-disk vault flag (SCR-258 U8) is exposed in the read payload and
-    **defaults off** — U8 makes the flag settable/documented but does NOT flip
-    the shipped default (the on-by-default flip is a later release step)."""
+def test_container_enabled_defaults_true_in_json():
+    """The on-disk vault flag (SCR-258) is exposed in the read payload and
+    **defaults on** — the product ships with no installed base, so the container
+    is the shipped posture from the first recording (KTD-8/KTD-19)."""
     settings = _invoke_settings_json()["settings"]
-    assert settings["container_enabled"] is False
+    assert settings["container_enabled"] is True
 
 
 def test_container_enabled_set_roundtrips():
