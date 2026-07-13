@@ -22,6 +22,7 @@ The two proof-first invariants (per the unit brief):
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,10 @@ def store_env(tmp_path, monkeypatch):
 
     base = tmp_path / "screencap"
     (base / "run").mkdir(parents=True)
+    # Force the darwin shared-group key path so store-touching commands don't
+    # take the keyring fallback and hit a real (absent) keyring backend on a
+    # Linux CI runner — the vault key channels are macOS-only in practice.
+    monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(cfg, "_DEFAULT_BASE", base)
     monkeypatch.setattr(cfg, "_CONFIG_PATH", base / "config.toml")
     mountpoint = tmp_path / "recordings"  # deliberately NOT created here

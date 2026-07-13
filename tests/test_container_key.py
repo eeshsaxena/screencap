@@ -43,7 +43,13 @@ def _patch_keychain(monkeypatch, *, load=None, store=None):
 
     Any unpatched side (default) raises to make an unexpected call loud — e.g. a
     read-only test that accidentally writes.
+
+    Forces the darwin shared-group branch so these tests exercise the
+    ``keychain_group`` path (where the KTD-22 entitlement logic lives) on any
+    runner — otherwise a Linux CI host takes the ``keyring`` fallback and hits a
+    real (absent) keyring backend. The keyring branch has its own dedicated test.
     """
+    monkeypatch.setattr(sys, "platform", "darwin")
     if load is None:
         def load(*a, **k):  # noqa: ANN001
             raise AssertionError("keychain_group.load must not be called")
