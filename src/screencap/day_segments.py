@@ -130,6 +130,55 @@ def _blocked_intervals(
     return proven, unverifiable
 
 
+def _read_task_segments(rec_dir: Path) -> list[dict[str, Any]]:
+    """Read a recording's named task segments for the day-level ``tasks`` band (U9).
+
+    Reuses the SAME read path ``tasks.list`` uses — ``read_task_segments`` off the
+    recording's local-only ``recording.db`` (never uploaded — R4/R8) — so the day
+    strip gets every task band in one round-trip without a per-recording
+    ``tasks.list`` call, and the two surfaces can't drift.
+
+    Returns ``[]`` on any legitimate absence — a missing ``recording.db`` (legacy /
+    pre-U1 recording), a DB with no ``recording`` row, an unreadable DB, or a
+    recording whose segmentation produced no tasks. Never raises for those (this is
+    a fail-open read surface), so a recording with no tasks yields ``tasks: []``
+    rather than a 500. Emits only the 6-field ``TaskSegment`` wire shape — the
+    store's ``source`` / ``edited`` ownership columns stay internal. Local-only:
+    nothing new leaves the machine.
+    """
+    import sqlite3
+
+    from screencap.pipeline_state import (
+        LedgerError,
+        PipelineLedger,
+        ensure_pipeline_state_schema,
+    )
+
+    db_path = rec_dir / "recording.db"
+    if not db_path.exists():
+        return []
+    try:
+        # Idempotent, read-tolerant: creates the table on an old DB (no-op on a
+        # current one), so a recording captured before the tasks store existed
+        # never raises "no such table".
+        ensure_pipeline_state_schema(db_path)
+        segments = PipelineLedger(db_path).read_task_segments()
+    except (LedgerError, sqlite3.Error):
+        # No recording row / unreadable DB → "no tasks", never a 500.
+        return []
+    return [
+        {
+            "task_index": seg.task_index,
+            "start_ts": seg.start_ts,
+            "end_ts": seg.end_ts,
+            "name": seg.name,
+            "category": seg.category,
+            "confidence": seg.confidence,
+        }
+        for seg in segments
+    ]
+
+
 def day_segments(
     date_str: str,
     tz_offset_seconds: int = 0,
@@ -143,7 +192,9 @@ def day_segments(
             {"name", "recording_id", "state",
              "start_ms", "end_ms",            # span clamped to the day
              "blocked_proven": [{"start_ms","end_ms"}, ...],
-             "unverifiable":   [{"start_ms","end_ms"}, ...]},
+             "unverifiable":   [{"start_ms","end_ms"}, ...],
+             "tasks": [{"task_index","start_ts","end_ts","name",
+                        "category","confidence"}, ...]},  # U9 day-level bands
             ...
         ]}
 
@@ -197,6 +248,9 @@ def day_segments(
                 "end_ms": int(round(clamped_end * 1000)),
                 "blocked_proven": proven,
                 "unverifiable": unverifiable,
+                # U9: every task band for this recording, so the day strip
+                # renders all bands without a per-recording tasks.list round-trip.
+                "tasks": _read_task_segments(rec_dir),
             }
         )
     return result

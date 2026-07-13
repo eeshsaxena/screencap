@@ -31,7 +31,11 @@ _PERMISSION_CLEANUP_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
-_TIMELINE_DAY_API_VERSION = 1
+# v2 (U9): additive ``tasks: [TaskSegment]`` band nested on each
+# ``DaySegmentRecording``. No global API_SCHEMA_VERSION bump — older clients
+# ignore the unknown key (mirrors the transcript.search / daemon.info additive
+# precedent); the verb const bump signals the new field to clients that read it.
+_TIMELINE_DAY_API_VERSION = 2
 # SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
 # gains nullable timing fields without an API bump (mirrors the additive
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
@@ -533,12 +537,42 @@ def _load_models() -> dict[str, Any]:
         start_ms: int
         end_ms: int
 
+    class TaskSegment(_DaemonModel):
+        """One named task segment from a LOCAL recording's tasks store (U4).
+
+        Read from the ``pipeline_task_segments`` ledger table inside the
+        local-only ``recording.db`` (never uploaded — R4/R8), so these named
+        tasks stay on the Mac. ``start_ts`` / ``end_ts`` are Unix seconds (the
+        ledger's native units). ``category`` / ``confidence`` are optional
+        provider metadata; the idle-gap heuristic fallback (U7) emits neither.
+
+        Shared between ``tasks.list`` (per-recording) and the day-level ``tasks``
+        band nested on :class:`DaySegmentRecording` (U9) — one wire shape, so the
+        strip and the per-recording view can't drift. ``source`` / ``edited``
+        (KTD3) are deliberately NOT exposed: task ownership is an internal store
+        concern, not part of the read wire shape.
+        """
+
+        task_index: int
+        start_ts: float
+        end_ts: float
+        name: str
+        category: str | None = None
+        confidence: str | None = None
+
     class DaySegmentRecording(_DaemonModel):
         """One recording's day-clamped span + honest blocked-interval split (U3).
 
         ``blocked_proven`` is provable MASK/EXCLUDE masking (safe to label
         "blocked"); ``unverifiable`` is fail-closed coverage-gap / null-column
         ambiguity the UI must render as a neutral gap, never "blocked" (R7).
+
+        ``tasks`` (U9, additive) carries this recording's named task segments so
+        the Day-timeline gets every band for the day in ONE round-trip — no
+        second ``tasks.list`` call per recording. Empty (never absent) for a
+        recording with no tasks store / a legacy or cloud recording. Local-only:
+        it is read straight off the recording's local ``recording.db`` and adds
+        no new upload surface.
         """
 
         name: str
@@ -548,6 +582,7 @@ def _load_models() -> dict[str, Any]:
         end_ms: int
         blocked_proven: list[DayBlockedInterval]
         unverifiable: list[DayBlockedInterval]
+        tasks: list[TaskSegment] = []
 
     class TimelineDayResponse(EnvelopeResponse):
         date: str
@@ -744,23 +779,6 @@ def _load_models() -> dict[str, Any]:
         """
 
         recording: str
-
-    class TaskSegment(_DaemonModel):
-        """One named task segment from a LOCAL recording's tasks store (U4).
-
-        Read from the ``pipeline_task_segments`` ledger table inside the
-        local-only ``recording.db`` (never uploaded — R4/R8), so these named
-        tasks stay on the Mac. ``start_ts`` / ``end_ts`` are Unix seconds (the
-        ledger's native units). ``category`` / ``confidence`` are optional
-        provider metadata; the idle-gap heuristic fallback (U7) emits neither.
-        """
-
-        task_index: int
-        start_ts: float
-        end_ts: float
-        name: str
-        category: str | None = None
-        confidence: str | None = None
 
     class TasksListResponse(EnvelopeResponse):
         """A recording's named-task segments, ordered by ``task_index``.
