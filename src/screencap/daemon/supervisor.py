@@ -220,6 +220,24 @@ def _ambient_rearm_params() -> tuple[float, float, int, float]:
     return base, max_delay, max_retries, quiescence
 
 
+def _is_yyyymmdd(token: str) -> bool:
+    """Whether ``token`` is an 8-digit ``YYYYMMDD`` day stamp (SCR-214 U3)."""
+    return len(token) == 8 and token.isdigit()
+
+
+def _ambient_day_name(clock: Callable[[], float]) -> str:
+    """``ambient-YYYYMMDD`` for the LOCAL day of ``clock()`` (SCR-214 U3).
+
+    A module-level function (not just a method) so the deterministic per-day dir
+    naming and the day-roll change-detection share ONE definition of "what local
+    day is it", and so :meth:`Supervisor._allocate_ambient_capture_dir` can call it
+    with a graceful ``time.time`` fallback (the U1 ``_AllocOnly`` test double binds
+    only the alloc methods, with no ``_clock`` instance state). ``time.localtime``
+    collapses any DST / timezone shift to one unambiguous local day.
+    """
+    return time.strftime("ambient-%Y%m%d", time.localtime(clock()))
+
+
 def _default_engine_command(encoded_args: str) -> list[str]:
     override = os.environ.get("SCREENCAP_DAEMON_ENGINE_COMMAND")
     if override:
@@ -334,9 +352,22 @@ class Supervisor:
         stop_timeout: float | None = None,
         reconcile_grace: float | None = None,
         start_gate: StartGate | None = None,
+        clock: Callable[[], float] | None = None,
+        ambient_day_tick_interval: float | None = None,
     ) -> None:
         self._bus = event_bus
         self._engine_command_factory = engine_command_factory or _default_engine_command
+        # SCR-214 U3: injectable wall-clock so the day-boundary roll can be
+        # exercised deterministically (a test can cross local midnight without
+        # waiting). Defaults to ``time.time`` in production.
+        self._clock = clock or time.time
+        # SCR-214 U3: cadence of the day-roll watch. Cheap (a string compare), so
+        # a coarse default is fine; env/param-overridable so tests can tick fast.
+        self._ambient_day_tick_interval = (
+            ambient_day_tick_interval
+            if ambient_day_tick_interval is not None
+            else _float_env("SCREENCAP_AMBIENT_DAY_TICK_INTERVAL", 30.0)
+        )
         self._poll_interval = (
             poll_interval
             if poll_interval is not None
@@ -411,6 +442,12 @@ class Supervisor:
         # The pending auto-start / backoff re-arm task (keeps the daemon alive
         # across the backoff gap so the always-on stream isn't idle-shut-down).
         self._ambient_spawn_task: asyncio.Task[Any] | None = None
+        # SCR-214 U3: the long-lived day-boundary watch task (rolls ambient to the
+        # next per-day dir at local midnight / on the first post-wake tick), and a
+        # guard flag marking an in-progress roll so the engine-exit funnel treats
+        # the roll's intentional stop as a roll — NOT a crash to re-arm/back off.
+        self._ambient_day_task: asyncio.Task[Any] | None = None
+        self._ambient_rolling = False
         # Set at the top of ``shutdown`` so a torn-down daemon never re-arms.
         self._shutting_down = False
 
@@ -1033,6 +1070,9 @@ class Supervisor:
         self._shutting_down = True
         if self._ambient_spawn_task is not None and not self._ambient_spawn_task.done():
             self._ambient_spawn_task.cancel()
+        # SCR-214 U3: stop the day-boundary watch so a torn-down daemon never rolls.
+        if self._ambient_day_task is not None and not self._ambient_day_task.done():
+            self._ambient_day_task.cancel()
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
@@ -1324,7 +1364,14 @@ class Supervisor:
             # exits (unless the daemon is shutting down or ambient was disabled).
             # A clean/long-lived exit re-arms promptly; a rapid crash loop backs
             # off and surfaces a degraded state at the ceiling rather than thrash.
-            if was_ambient:
+            #
+            # SCR-214 U3: a DAY-BOUNDARY ROLL is an intentional stop, not a crash.
+            # ``_roll_ambient_day`` owns the respawn (into the next per-day dir), so
+            # skip the exit-funnel re-arm here — otherwise the roll would both
+            # re-arm the old day AND spawn the new one (double spawn), or a rc!=0
+            # force-stop of a short (test-clock) run would wrongly count toward the
+            # crash-loop backoff ceiling.
+            if was_ambient and not self._ambient_rolling:
                 run_duration = (
                     time.monotonic() - ambient_spawn_at
                     if ambient_spawn_at is not None
@@ -1469,7 +1516,9 @@ class Supervisor:
         suffixed dir is forked instead — the rare edge where a day was already
         closed (e.g. a manual stop) but ambient restarts on the same calendar day.
         """
-        day_name = time.strftime("ambient-%Y%m%d")
+        # ``getattr`` fallback keeps the U1 ``_AllocOnly`` test double (which binds
+        # this method with no ``_clock`` instance state) working on real wall time.
+        day_name = _ambient_day_name(getattr(self, "_clock", time.time))
         candidate = recordings_dir / day_name
         if not candidate.exists():
             return day_name, candidate
@@ -1531,6 +1580,10 @@ class Supervisor:
         if self._shutting_down or not get_ambient_enabled():
             return
         self._ambient_spawn_task = asyncio.create_task(self._spawn_ambient())
+        # SCR-214 U3: start the day-boundary watch alongside auto-start so it is
+        # live for the whole ambient lifetime (it persists across re-arms and
+        # rolls). No-op if already running.
+        self._start_ambient_day_watch()
 
     def _build_ambient_request(self) -> "RecordingStartRequest":
         """Build the internal always-on ambient ``RecordingStartRequest`` (U2).
@@ -1660,6 +1713,109 @@ class Supervisor:
         """Record + log the surfaced ambient degraded/blocked reason (U2)."""
         logger.warning("ambient capture degraded: %s", reason)
         self._ambient_degraded = reason
+
+    # ------------------------------------------------------------------
+    # SCR-214 U3/KTD1/R5: day-boundary recording roll
+    # ------------------------------------------------------------------
+
+    def _local_day_name(self) -> str:
+        """Current local calendar day as the ambient dir name (SCR-214 U3).
+
+        ``ambient-YYYYMMDD`` for the local day of the injectable clock — the
+        day-roll watch's change-detection side of the shared :func:`_ambient_day_name`
+        definition (``_allocate_ambient_capture_dir`` is the naming side), so the
+        two can never disagree on "what day is it".
+        """
+        return _ambient_day_name(self._clock)
+
+    def _active_ambient_day(self) -> str | None:
+        """The day-container name of the live ambient recording, or ``None``.
+
+        Derives ``ambient-YYYYMMDD`` from the current session's recording name,
+        stripping any collision suffix (a forked ``ambient-YYYYMMDD-2`` still
+        compares by its DAY) so a same-day fork never triggers a spurious roll.
+        Returns ``None`` when nothing ambient is live.
+        """
+        session = self._session_state
+        if not self._ambient_active or not session:
+            return None
+        name = session.get("recording_name")
+        if not isinstance(name, str):
+            return None
+        parts = name.split("-")
+        if len(parts) >= 2 and parts[0] == "ambient" and _is_yyyymmdd(parts[1]):
+            return f"ambient-{parts[1]}"
+        return None
+
+    def _start_ambient_day_watch(self) -> None:
+        """Start the long-lived day-boundary watch task (idempotent)."""
+        if self._ambient_day_task is not None and not self._ambient_day_task.done():
+            return
+        self._ambient_day_task = asyncio.create_task(self._ambient_day_watch())
+
+    async def _ambient_day_watch(self) -> None:
+        """Roll the ambient recording at the LOCAL day boundary (SCR-214 U3/R5).
+
+        Periodically compares the live ambient recording's day (from its
+        ``ambient-YYYYMMDD`` dir name) against the current local day; on an advance
+        it performs a stop→start roll to the next per-day dir.
+
+        WAKE-SAFE by construction: the roll is driven by an *observed* date change,
+        NOT a fired-at-midnight timer. While the Mac sleeps the daemon (and this
+        loop) is suspended, so no tick fires at the real midnight; the FIRST tick
+        after wake sees the advanced date and rolls then. No macOS wake
+        notification is needed for correctness. The check is cheap (a string
+        compare) and rolls at most once per boundary — post-roll the live day
+        equals ``now`` again, so the next tick is a no-op.
+        """
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(self._ambient_day_tick_interval)
+            except asyncio.CancelledError:
+                return
+            if self._shutting_down:
+                return
+            active_day = self._active_ambient_day()
+            if active_day is None or active_day == self._local_day_name():
+                continue
+            try:
+                await self._roll_ambient_day()
+            except Exception:  # noqa: BLE001 — a roll error must not kill the watch
+                logger.warning(
+                    "ambient day-roll failed; will retry on the next tick",
+                    exc_info=True,
+                )
+
+    async def _roll_ambient_day(self) -> None:
+        """Close today's ambient recording and open the next day's (U3/R5/KTD1).
+
+        A RECORDING-level roll (new per-day dir), not an unbounded single dir, so
+        day-grouping, ``timeline.day``, and per-day retention stay clean.
+
+        1. ``stop()`` drives the live ambient recording through its NORMAL terminal
+           path (finalize → final segmentation pass — NOT reimplemented here). That
+           stop force-closes the currently-open chunk via
+           ``ChunkedVideoWriter.close()``, so a chunk left open across midnight
+           (e.g. during sleep) is attributed to exactly ONE day: the day it STARTED
+           in (day N). The new day's dir opens only afterwards, so no chunk can
+           straddle two per-day dirs.
+        2. U2's ambient spawn path opens the fresh ``ambient-YYYYMMDD`` dir for the
+           now-current local day (day N+1), via the same shared start gate.
+
+        ``_ambient_rolling`` marks the stop as an INTENTIONAL roll so the
+        engine-exit funnel skips its own re-arm/backoff (this method owns the
+        respawn) — an intentional stop is not a crash.
+        """
+        if self._ambient_rolling or not self._ambient_active or self._shutting_down:
+            return
+        self._ambient_rolling = True
+        try:
+            await self.stop()
+            if self._shutting_down:
+                return
+            await self._spawn_ambient()
+        finally:
+            self._ambient_rolling = False
 
     def _worker_args(
         self,
