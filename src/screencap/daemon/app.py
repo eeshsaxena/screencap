@@ -2297,6 +2297,20 @@ def _task_span_orphaned(recording: str, ledger, start_ts: float, end_ts: float) 
     return task_span_is_orphaned(rec_dir, ledger, start_ts, end_ts)
 
 
+def _find_task_segment(ledger, task_index: int):
+    """Return the stored task row at ``task_index`` (or ``None``) (SCR-214 U8).
+
+    The counterpart the ``tasks.update`` orphan guard reads to compute an update's
+    EFFECTIVE post-update span: a one-sided bound change combines the provided
+    bound with this row's stored bound. Pure disk IO; the handler runs it off the
+    loop via ``asyncio.to_thread``.
+    """
+    for row in ledger.read_task_segments():
+        if row.task_index == task_index:
+            return row
+    return None
+
+
 def _task_crud_peer_audit(request: Request, verb: str):
     """Build the (peer, ``_audit``) pair shared by the five task CRUD handlers.
 
@@ -2398,6 +2412,11 @@ async def tasks_update(request: Request) -> JSONResponse:
     (KTD3). Only the provided fields are written. A missing ``task_index`` and a
     provided-but-inverted span each return 400 ``invalid_request``; a traversal
     name 400 ``invalid_name``; an unknown recording 404. Local-only.
+
+    SCR-214 U8 orphan guard (parity with ``tasks.create``): when the request
+    supplies a span bound, re-bounding the task onto already-EVICTED footage —
+    which ``mark_edited=True`` would then PROTECT as a kept span — is rejected with
+    the same 400 ``invalid_request``, so no unplayable task is persisted.
     """
     from screencap.daemon._name_validation import validate_recording_name
 
@@ -2419,6 +2438,32 @@ async def tasks_update(request: Request) -> JSONResponse:
             _validate_task_span(parsed.start_ts, parsed.end_ts, schema_version=_v)
 
         ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+
+        # SCR-214 U8 orphan guard (parity with tasks.create): a span re-bound onto
+        # footage the 30-day ambient retention already rolled off would persist an
+        # unplayable task — and mark_edited=True below would then make that orphan a
+        # PROTECTED kept span. When the request supplies a span bound, run the SAME
+        # check create runs, over the EFFECTIVE post-update span (a one-sided bound
+        # combines with the stored counterpart). Skipped for a name-only edit (no
+        # span bound) and when the row is absent (update_task_segment returns None →
+        # invalid_request below); fails open on live / legacy footage exactly like
+        # create, so a normal re-bound onto surviving footage is never blocked.
+        if parsed.start_ts is not None or parsed.end_ts is not None:
+            existing = await asyncio.to_thread(
+                _find_task_segment, ledger, parsed.task_index
+            )
+            if existing is not None:
+                eff_start = (
+                    parsed.start_ts if parsed.start_ts is not None else existing.start_ts
+                )
+                eff_end = (
+                    parsed.end_ts if parsed.end_ts is not None else existing.end_ts
+                )
+                if await asyncio.to_thread(
+                    _task_span_orphaned, parsed.recording, ledger, eff_start, eff_end,
+                ):
+                    raise errors.InvalidRequestError(schema_version=_v)
+
         # Always mark_edited: a user touch protects the row from the agent
         # replace, and re-homes an agent row out of the clobbered low range.
         new_index = await asyncio.to_thread(

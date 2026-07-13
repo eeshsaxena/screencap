@@ -553,3 +553,161 @@ async def test_agent_resegmentation_preserves_user_outcomes(
     )
     assert [r.name for r in fresh] == ["fresh 0", "fresh 1"]
     assert [r.task_index for r in fresh] == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# update — U8 orphan guard parity with create: a span re-bound onto already-
+# EVICTED footage is rejected (else mark_edited=True would PROTECT the orphan).
+# ---------------------------------------------------------------------------
+
+_NOW = 1_000_000_000.0
+_DAY = 86400.0
+# chunk 0's capture window (later evicted); chunk 1's window (survives).
+_C0 = (_NOW - 40 * _DAY, _NOW - 40 * _DAY + 900)
+_C1 = (_NOW - 39 * _DAY, _NOW - 39 * _DAY + 900)
+
+
+def _make_recording_with_evicted_chunk(base: Path, name: str = "demo") -> Path:
+    """Create a recording whose chunk 0 is EVICTED and chunk 1 survives.
+
+    Two LOCAL_DONE chunks with capture-bound manifests; chunk 0 is aged past the
+    30-day window and evicted (media + manifest unlinked → EVICTED), chunk 1 stays
+    fresh. This gives the U8 orphan guard real eviction evidence: a span over
+    ``_C0`` maps ONLY to gone footage (orphan), a span over ``_C1`` is playable.
+    Mirrors the tests/test_retention_ambient.py orphan-guard fixture.
+    """
+    import sqlite3
+
+    from screencap.engine.db import create_db, crud
+    from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+    from screencap.retention import evict_recording
+
+    rec_dir = base / name
+    rec_dir.mkdir(parents=True)
+    db_path = rec_dir / "recording.db"
+
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    crud.insert_recording(session, {
+        "timestamp": _NOW - 40 * _DAY,
+        "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080, "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5, "double_click_distance_pixels": 5.0,
+    })
+    session.close()
+    engine.dispose()
+
+    for i, (cs, ce) in enumerate((_C0, _C1)):
+        (rec_dir / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * (1024 * 1024))
+        (rec_dir / f"chunk_{i:04d}_manifest.json").write_text(
+            json.dumps({"format_version": 2, "chunk_index": i,
+                        "chunk_start": cs, "chunk_end": ce})
+        )
+
+    ensure_pipeline_state_schema(db_path)
+    ledger = PipelineLedger(db_path)
+    for i in range(2):
+        ledger.seed_chunk(i)
+        ledger.mark_staged(i)
+        ledger.mark_local_done(i)
+    ledger.freeze_chunks_expected(2)
+
+    # Age chunk 0 past the 30-day cutoff (evicts); chunk 1 stays fresh (survives).
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("UPDATE pipeline_chunk_state SET updated_at=? WHERE chunk_index=0",
+                     (_NOW - 40 * _DAY,))
+        conn.execute("UPDATE pipeline_chunk_state SET updated_at=? WHERE chunk_index=1",
+                     (_NOW - 1 * _DAY,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    evict_recording(
+        rec_dir,
+        policy=ResolvedPolicy(
+            destination=Destination.LOCAL,
+            retention_policy=RetentionPolicy.DELETE_AFTER_DAYS,
+            params={"days": 30},
+        ),
+        ledger=ledger, now=_NOW,
+    )
+    assert not (rec_dir / "chunk_0000.mp4").exists(), "precondition: chunk 0 evicted"
+    assert (rec_dir / "chunk_0001.mp4").exists(), "precondition: chunk 1 survives"
+    return rec_dir
+
+
+async def _create_live_task(recording: str = "demo") -> int:
+    """Create a task over the SURVIVING chunk 1 and return its task_index."""
+    resp = await _post("tasks.create", {
+        "recording": recording, "name": "Live task",
+        "start_ts": _C1[0] + 100, "end_ts": _C1[0] + 300,
+    })
+    assert resp.status_code == 200, resp.text
+    return resp.json()["task"]["task_index"]
+
+
+@pytest.mark.asyncio
+async def test_update_rebound_onto_evicted_footage_is_rejected(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-bounding a task's span onto EVICTED footage → 400, same as create.
+
+    The deterministic update-path hole: create runs the orphan guard, update did
+    not — so a task re-bound onto footage the 30-day retention rolled off persisted
+    an unplayable (and, via mark_edited=True, PROTECTED) task.
+    """
+    _patch_peer(monkeypatch)
+    rec = _make_recording_with_evicted_chunk(recordings_dir, "demo")
+    idx = await _create_live_task("demo")
+
+    resp = await _post("tasks.update", {
+        "recording": "demo", "task_index": idx,
+        "start_ts": _C0[0] + 100, "end_ts": _C0[0] + 300,  # onto evicted chunk 0
+    })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == errors.INVALID_REQUEST  # SAME shape as create
+
+    # Nothing was written: the row keeps its original (live) span.
+    row = _rows_by_index(rec)[idx]
+    assert (row.start_ts, row.end_ts) == (_C1[0] + 100, _C1[0] + 300)
+
+
+@pytest.mark.asyncio
+async def test_update_rebound_onto_live_footage_succeeds(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal re-bound onto SURVIVING footage still succeeds (guard fails open)."""
+    _patch_peer(monkeypatch)
+    rec = _make_recording_with_evicted_chunk(recordings_dir, "demo")
+    idx = await _create_live_task("demo")
+
+    resp = await _post("tasks.update", {
+        "recording": "demo", "task_index": idx,
+        "start_ts": _C1[0] + 200, "end_ts": _C1[0] + 400,  # still within live chunk 1
+    })
+    assert resp.status_code == 200, resp.text
+
+    row = _rows_by_index(rec)[resp.json()["task_index"]]
+    assert (row.start_ts, row.end_ts) == (_C1[0] + 200, _C1[0] + 400)
+
+
+@pytest.mark.asyncio
+async def test_update_name_only_is_unaffected_by_orphan_guard(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name-only update (no span bound) never triggers the orphan guard."""
+    _patch_peer(monkeypatch)
+    rec = _make_recording_with_evicted_chunk(recordings_dir, "demo")
+    idx = await _create_live_task("demo")
+
+    resp = await _post("tasks.update", {
+        "recording": "demo", "task_index": idx, "name": "Renamed",
+    })
+    assert resp.status_code == 200, resp.text
+
+    row = _rows_by_index(rec)[resp.json()["task_index"]]
+    assert row.name == "Renamed"
+    # Span untouched — the guard did not run, and did not alter the bounds.
+    assert (row.start_ts, row.end_ts) == (_C1[0] + 100, _C1[0] + 300)

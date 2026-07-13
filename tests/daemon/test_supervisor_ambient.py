@@ -359,6 +359,96 @@ async def test_rapid_crash_loop_backs_off_and_stops_at_ceiling(
 
 
 # ---------------------------------------------------------------------------
+# Deferred auto-start: a held lock defers ambient, and the lock-holder's exit
+# (NOT a daemon restart) eventually starts it — exactly once (reliability fix).
+# ---------------------------------------------------------------------------
+
+
+def _spawn_recorder(supervisor, monkeypatch) -> list:
+    """Wrap ``supervisor.spawn`` to record every attempt as ``(request, ok)``.
+
+    Unlike ``_count_spawns`` (which records the attempt BEFORE calling through, so
+    a deferred spawn that raises ``LockContendedError`` still counts), this records
+    whether the underlying spawn SUCCEEDED — so a deferred (raised) ambient attempt
+    is distinguishable from an ambient recording that actually started.
+    """
+    attempts: list = []
+    real_spawn = supervisor.spawn
+
+    async def recording(request):
+        try:
+            result = await real_spawn(request)
+        except BaseException:
+            attempts.append((request, False))
+            raise
+        attempts.append((request, True))
+        return result
+
+    monkeypatch.setattr(supervisor, "spawn", recording)
+    return attempts
+
+
+@pytest.mark.asyncio
+async def test_deferred_ambient_starts_when_explicit_lock_holder_exits(
+    fake_engine_script: Path, isolated_lock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reliability: ambient DEFERRED by a held lock starts when the lock frees.
+
+    An explicit (non-ambient) recording holds the recording lock, so the ambient
+    auto-start (``_maybe_autostart_ambient`` — exactly what reconcile calls once it
+    clears) DEFERS on ``LockContendedError``: no ambient recording starts, but
+    ambient is NOT permanently degraded. Before the fix, the exit-funnel re-arm
+    only fired for ambient's OWN exit (``was_ambient``), so when the explicit
+    lock-holder exited (``was_ambient=False``) ambient stayed silently down until
+    the next daemon restart. Now the explicit recording's exit auto-starts the
+    deferred ambient — exactly once, with no double-spawn.
+    """
+    monkeypatch.setenv("SCREENCAP_AMBIENT_ENABLED", "1")
+    sup = _make_supervisor(fake_engine_script)
+    attempts = _spawn_recorder(sup, monkeypatch)
+
+    def _ambient_started() -> int:
+        return sum(1 for req, ok in attempts if ok and getattr(req, "ambient", False))
+
+    def _ambient_deferred() -> int:
+        return sum(
+            1 for req, ok in attempts if not ok and getattr(req, "ambient", False)
+        )
+
+    # An explicit recording claims the lock first.
+    await sup.spawn(schema.RecordingStartRequest(name="explicit"))
+    assert sup.current_session()["recording_name"] == "explicit"
+
+    # The ambient auto-start fires (as it would at the tail of reconcile) while the
+    # explicit recording holds the lock → it DEFERS, starting nothing.
+    sup._maybe_autostart_ambient()
+    assert sup._ambient_spawn_task is not None
+    await sup._ambient_spawn_task  # the deferred spawn returns cleanly (LockContended)
+
+    assert _ambient_started() == 0, "ambient must not start while the lock is held"
+    assert _ambient_deferred() == 1, "the deferred attempt was made and swallowed"
+    state = sup.ambient_state()
+    assert state["active"] is False
+    assert state["degraded"] is None, "a lock-defer is NOT a permanent degrade"
+    # The explicit recording is still the live session.
+    assert sup.current_session()["recording_name"] == "explicit"
+
+    # The explicit lock-holder exits → the lock frees → ambient auto-starts.
+    await sup.stop()
+    await _wait_until(lambda: sup.ambient_state()["active"] is True)
+
+    assert _ambient_started() == 1, "ambient auto-starts exactly once after the exit"
+    session = sup.current_session()
+    assert session is not None and session["recording_name"].startswith("ambient-")
+    assert sup.ambient_state()["degraded"] is None
+
+    # No double-spawn / thrash: it stays at exactly one while the engine runs.
+    await asyncio.sleep(0.2)
+    assert _ambient_started() == 1
+    await sup.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Idle-shutdown treats an active/pending ambient as non-idle
 # ---------------------------------------------------------------------------
 

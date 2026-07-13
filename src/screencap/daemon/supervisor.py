@@ -1406,6 +1406,21 @@ class Supervisor:
                     else 0.0
                 )
                 self._schedule_ambient_rearm(rc, run_duration)
+            elif not was_ambient:
+                # SCR-214 reliability: a NON-ambient (explicit) recording just
+                # exited, FREEING the recording lock. If ambient is enabled but was
+                # DEFERRED by that held lock — ``_spawn_ambient`` swallowed a
+                # ``LockContendedError`` at reconcile / day-roll and never started —
+                # the ``was_ambient`` re-arm above would never fire for it, so
+                # ambient would stay silently down until the next daemon restart.
+                # Attempt the same gated auto-start now that the lock is free (the
+                # lock frees exactly when the explicit recording exits).
+                # ``_maybe_autostart_ambient`` is idempotent + self-guarding — a
+                # no-op when ambient is already active/pending, the daemon is
+                # shutting down, ambient is disabled, or it already hit its degraded
+                # ceiling — so this can never double-spawn and a persistent failure
+                # stays surfaced as degraded rather than retrying forever.
+                self._maybe_autostart_ambient()
 
     def _observe_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -1596,16 +1611,35 @@ class Supervisor:
         }
 
     def _maybe_autostart_ambient(self) -> None:
-        """Kick the ambient auto-start after reconcile clears (SCR-214 U2/R2).
+        """Kick the ambient auto-start once the recording lock is free (SCR-214 U2/R2).
 
-        A no-op when ambient is disabled (``get_ambient_enabled() → False``, the
-        default). Otherwise schedules the gated spawn detached so a slow gate or
-        engine startup never blocks reconcile completion. Tracked in
-        ``_ambient_spawn_task`` so idle-shutdown + ``shutdown`` see it.
+        Called at TWO points: after reconcile clears (the daemon-boot auto-start),
+        and from the engine-exit funnel when a NON-ambient recording exits and
+        frees a lock that had DEFERRED ambient. A no-op when ambient is disabled
+        (``get_ambient_enabled() → False``, the default). Otherwise schedules the
+        gated spawn detached so a slow gate or engine startup never blocks the
+        caller. Tracked in ``_ambient_spawn_task`` so idle-shutdown + ``shutdown``
+        see it.
+
+        Idempotent + self-guarding so the exit-funnel caller can never double-spawn
+        onto a live ambient stream, over a spawn / backoff re-arm already pending,
+        or past the degraded ceiling — a persistently-failing ambient must stay
+        surfaced as degraded, never silently retried forever. (These guards are
+        inert at the reconcile call: at boot ambient is never active, pending, or
+        degraded.)
         """
         from screencap.config import get_ambient_enabled
 
         if self._shutting_down or not get_ambient_enabled():
+            return
+        # Never double-spawn: ambient already live, or the retry ceiling already
+        # reached (surfaced as degraded — a persistent failure stays surfaced).
+        if self._ambient_active or self._ambient_degraded is not None:
+            return
+        # A spawn attempt / backoff re-arm is already pending — it will start (or
+        # re-defer) ambient on its own; scheduling another would double-spawn.
+        pending = self._ambient_spawn_task
+        if pending is not None and not pending.done():
             return
         self._ambient_spawn_task = asyncio.create_task(self._spawn_ambient())
         # SCR-214 U3: start the day-boundary watch alongside auto-start so it is
