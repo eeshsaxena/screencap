@@ -202,3 +202,34 @@ def test_content_index_consent_declined_set_roundtrips():
     """The Search consent flow persists a decline via this writable bool."""
     _invoke_set("content_index_consent_declined=true")
     assert _invoke_settings_json()["settings"]["content_index_consent_declined"] is True
+
+
+def test_container_enabled_defaults_false_in_json():
+    """The on-disk vault flag (SCR-258 U8) is exposed in the read payload and
+    **defaults off** — U8 makes the flag settable/documented but does NOT flip
+    the shipped default (the on-by-default flip is a later release step)."""
+    settings = _invoke_settings_json()["settings"]
+    assert settings["container_enabled"] is False
+
+
+def test_container_enabled_set_roundtrips():
+    """`settings --set container_enabled=true|false` is writable through the
+    _BOOL_KEYS allowlist and reflected in `settings --json`. NOTE: this only
+    round-trips the config *flag* — on a bundle-present install the daemon still
+    refuses a plaintext downgrade (see the settings docstring / SECURITY.md);
+    here there is no bundle, so the flag simply toggles."""
+    _invoke_set("container_enabled=true")
+    assert _invoke_settings_json()["settings"]["container_enabled"] is True
+
+    _invoke_set("container_enabled=false")
+    assert _invoke_settings_json()["settings"]["container_enabled"] is False
+
+
+def test_container_enabled_rejects_non_bool():
+    """A non-boolean value is rejected, matching the other _BOOL_KEYS."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["settings", "--set", "container_enabled=maybe"], catch_exceptions=False
+    )
+    assert result.exit_code == 1
+    assert "true or false" in result.output

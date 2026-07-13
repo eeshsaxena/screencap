@@ -3295,6 +3295,13 @@ def settings(ctx, set_pair, as_json):
       audio_default      Record audio by default (true/false)
       upload_default     Default destination (local/cloud/both/ask)
       content_index_enabled  Index on-screen text for local search (true/false)
+      container_enabled  Store recordings in an encrypted at-rest container
+                         (true/false). NOTE: not a plaintext downgrade switch —
+                         setting it false on an install that already has an
+                         encrypted store bundle does NOT revert to plaintext; the
+                         daemon surfaces a "downgrade unsupported" state instead.
+                         Off is honored only on fresh, no-bundle installs. See
+                         SECURITY.md for the at-rest boundary.
     """
     if ctx.invoked_subcommand is not None:
         # privacy subcommand path — defer to the subcommand handler.
@@ -3331,7 +3338,8 @@ def settings(ctx, set_pair, as_json):
         _BOOL_KEYS = {"show_on_website", "audio_default",
                        "auto_update", "auto_delete_after_upload", "wifi_metrics", "app_versions",
                        "content_index_enabled", "content_index_consent_declined",
-                       "content_index_backfill_declined", "cloud_e2ee_enabled"}
+                       "content_index_backfill_declined", "cloud_e2ee_enabled",
+                       "container_enabled"}
         _CHOICE_KEYS = {"upload_default": ("local", "cloud", "both", "ask"),
                          "segmentation_mode": ("llm", "idle")}
 

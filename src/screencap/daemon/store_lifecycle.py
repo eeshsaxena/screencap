@@ -147,13 +147,17 @@ def is_sealed() -> bool:
 
 
 def write_sealed_sentinel() -> Path:
-    """Write the sealed sentinel with ``O_NOFOLLOW`` + realpath-parent discipline.
+    """Write the sealed sentinel with ``O_NOFOLLOW``-leaf + immediate-parent discipline.
 
     Mirrors :func:`mount_lock` / ``_autospawn._open_auto_log``: a pre-planted
     symlink AT the sentinel path is refused (``O_NOFOLLOW`` → ``ELOOP``), not
-    followed, and a symlinked run-dir is rejected. Mode ``0o600``. Returns the
-    sentinel path. The U9 lock verb writes this LAST (after a successful detach);
-    the CLI-local fallback (no daemon) writes it directly.
+    followed, and the *immediate* run-dir parent is rejected if it is a symlink.
+    Like ``audit_log``'s ``O_NOFOLLOW`` note, this is a leaf + immediate-parent
+    check only — it does NOT ``realpath``-resolve the path, so it does not defend
+    against a symlinked *ancestor* or a hardlink; those stay inside the accepted
+    same-EUID trust boundary documented in ``SECURITY.md``. Mode ``0o600``.
+    Returns the sentinel path. The U9 lock verb writes this LAST (after a
+    successful detach); the CLI-local fallback (no daemon) writes it directly.
     """
     sentinel = sealed_sentinel_path()
     parent = sentinel.parent
@@ -242,7 +246,7 @@ def disk_host_env() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# mount.lock (KTD-3): O_NOFOLLOW + realpath-parent discipline, fcntl.flock
+# mount.lock (KTD-3): O_NOFOLLOW-leaf + immediate-parent-symlink check, fcntl.flock
 # ---------------------------------------------------------------------------
 
 

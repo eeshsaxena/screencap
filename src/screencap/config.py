@@ -181,7 +181,9 @@ def get_container_enabled() -> bool:
 
     Standard bool-env/config shape (mirrors :func:`get_wifi_metrics` et al.): env
     ``SCREENCAP_CONTAINER_ENABLED`` > config.toml ``container_enabled`` > default.
-    **Default OFF for now** — U8 flips the shipped default on; do not flip it here.
+    **Default OFF.** U8 makes the flag *settable* and *documented* but does NOT
+    flip the shipped default — the on-by-default flip is a separate
+    post-validation release step; do not flip it here.
     When on (and no ``SCREENCAP_RECORDINGS_DIR`` override is active) the data-plane
     sidecars relocate inside the recordings mountpoint's reserved ``.store/`` dir;
     run-dir paths are unaffected.
