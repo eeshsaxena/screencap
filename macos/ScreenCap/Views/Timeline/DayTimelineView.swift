@@ -43,6 +43,14 @@ struct DayTimelineView: View {
     @State private var clipCenterMs = 0
     @State private var longClipNudgeDismissed = false
 
+    // SCR-214 U11 — retroactive span-select task creation (AE3). The user marks
+    // two playhead endpoints (each snapped to a task/recording boundary), then a
+    // label sheet confirms them into `tasks.create`. `dayTasks` is the shared
+    // write-through layer (also the source of the failed-write alert).
+    @StateObject private var dayTasks = JournalTasks()
+    @State private var markSelection = DaySpanSelection()
+    @State private var pendingTaskLabel: PendingTaskLabel?
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -55,6 +63,33 @@ struct DayTimelineView: View {
             searchTask?.cancel()
             engine.tearDown()
         }
+        .sheet(item: $pendingTaskLabel) { pending in
+            MarkTaskLabelSheet(
+                startMs: pending.startMs,
+                endMs: pending.endMs,
+                onSave: { confirmMarkedTask(name: $0) },
+                onCancel: { cancelMarkedTask() }
+            )
+        }
+        .alert(
+            "Couldn't create the task",
+            isPresented: markTaskErrorPresented,
+            presenting: dayTasks.writeError
+        ) { _ in
+            Button("Retry") { Task { await dayTasks.retryLastWrite() } }
+            Button("Dismiss", role: .cancel) { dayTasks.dismissWriteError() }
+        } message: { err in
+            Text(err.message)
+        }
+    }
+
+    /// Bridges `dayTasks.writeError` to an `isPresented` binding for the
+    /// retroactive create path (mirrors JournalView's write-error surfacing).
+    private var markTaskErrorPresented: Binding<Bool> {
+        Binding(
+            get: { dayTasks.writeError != nil },
+            set: { if !$0 { dayTasks.dismissWriteError() } }
+        )
     }
 
     // MARK: - Day window
@@ -191,6 +226,7 @@ struct DayTimelineView: View {
 
     private var actionButtons: some View {
         HStack(spacing: 8) {
+            markTaskButton
             clipButton
             if let recording = shareableRecording {
                 Button("Share from here") {
@@ -228,6 +264,88 @@ struct DayTimelineView: View {
             .help(clippable
                 ? "Clip this moment to a local video file"
                 : "Clipping isn't available for this recording")
+    }
+
+    /// SCR-214 U11 — "Mark a task" (manual creation, path b, AE3). Each press
+    /// captures the current playhead as an endpoint, snapped to the nearest
+    /// task/recording boundary; the second press opens the label sheet. A
+    /// two-endpoint selection (seek → mark → seek → mark) rather than a drag
+    /// gesture, so the shared strip's seek behavior is untouched. Disabled when no
+    /// footage sits under the playhead (a task needs a stream to attach to).
+    @ViewBuilder
+    private var markTaskButton: some View {
+        let canMark = engine.currentRecording != nil && engine.currentDayMs != nil
+        Button(markTaskButtonTitle) { markTaskEndpoint() }
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: canMark ? .semibold : .regular))
+            .foregroundStyle(canMark ? Color.scCanvas : Color.scCanvas.opacity(0.6))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color.scInk.opacity(0.85), in: Capsule())
+            .disabled(!canMark)
+            .help(canMark
+                ? "Mark a task span: set the start, then the end"
+                : "Seek to footage first — a task needs a stream to attach to")
+    }
+
+    private var markTaskButtonTitle: String {
+        markSelection.firstMs == nil ? "Mark a task" : "Mark task end"
+    }
+
+    /// Snap boundaries for the current day (each recording's edges + each existing
+    /// task band's edges) so a new user task abuts its neighbours cleanly.
+    private var markSnapBoundaries: [Int] {
+        DaySpanSnap.boundaries(baseTracks: stripBaseTracks, segments: stripSegments)
+    }
+
+    /// The pending selection band + lone-endpoint tick handed to the strip.
+    private var markPendingSelection: (startMs: Int, endMs: Int)? {
+        markSelection.range
+    }
+
+    private var markPendingEndpoint: Int? {
+        markSelection.range == nil ? markSelection.firstMs : nil
+    }
+
+    /// Capture the playhead as the next selection endpoint. On the second
+    /// endpoint, resolve the recording under the span midpoint and open the label
+    /// sheet; a span that lands entirely in a "nothing captured" gap is discarded
+    /// (no recording to attach to).
+    private func markTaskEndpoint() {
+        guard let playheadMs = engine.currentDayMs else { return }
+        let snapped = DaySpanSnap.snap(playheadMs, to: markSnapBoundaries)
+        markSelection.mark(snapped)
+        guard let range = markSelection.range else { return }
+        guard let recording = DaySpanSnap.recording(
+            forRangeMidpoint: range.startMs, range.endMs, baseTracks: stripBaseTracks
+        ) else {
+            // Span sits in a gap — nothing to attach a task to. Reset silently.
+            markSelection.reset()
+            return
+        }
+        pendingTaskLabel = PendingTaskLabel(recording: recording, startMs: range.startMs, endMs: range.endMs)
+    }
+
+    /// Confirm the label → `tasks.create` over the selected span, then reload the
+    /// day so the new band renders. A failed write surfaces on `dayTasks`.
+    private func confirmMarkedTask(name: String) {
+        guard let pending = pendingTaskLabel else { return }
+        pendingTaskLabel = nil
+        markSelection.reset()
+        Task {
+            let ok = await dayTasks.create(
+                recording: pending.recording,
+                name: name,
+                startTs: Double(pending.startMs) / 1000,
+                endTs: Double(pending.endMs) / 1000
+            )
+            if ok { await loadDay() }
+        }
+    }
+
+    private func cancelMarkedTask() {
+        pendingTaskLabel = nil
+        markSelection.reset()
     }
 
     /// The clip-bounds selection panel, shown at the bottom of the playback
@@ -357,7 +475,9 @@ struct DayTimelineView: View {
                 blockedBands: DayStripBlockedBand.provenBands(from: spans),
                 matchesMs: dayMatchesMs,
                 playheadMs: engine.currentDayMs,
-                onSeek: { engine.seek(toDayMs: $0) }
+                onSeek: { engine.seek(toDayMs: $0) },
+                pendingSelection: markPendingSelection,
+                pendingEndpointMs: markPendingEndpoint
             )
         }
         .padding(.horizontal, 24)
@@ -499,4 +619,66 @@ struct DayTimelineView: View {
         f.dateFormat = "HH:mm:ss"
         return f
     }()
+}
+
+/// The confirmed two-endpoint selection awaiting a label (SCR-214 U11). Absolute
+/// unix ms; `recording` is resolved from the span midpoint's base track.
+private struct PendingTaskLabel: Identifiable {
+    let id = UUID()
+    let recording: String
+    let startMs: Int
+    let endMs: Int
+}
+
+/// Label-entry sheet for a retroactively-marked task span (SCR-214 U11, AE3).
+/// Shows the selected wall-clock window and takes a non-empty name for
+/// `tasks.create`.
+private struct MarkTaskLabelSheet: View {
+    let startMs: Int
+    let endMs: Int
+    var onSave: (String) -> Void
+    var onCancel: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft = ""
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Name this task")
+                .font(.title2.weight(.semibold))
+            Text("\(Self.clock(startMs)) – \(Self.clock(endMs)) · marked from the day timeline")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            TextField("Task name", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .focused($fieldFocused)
+                .onSubmit(submit)
+            HStack {
+                Button("Cancel") { onCancel(); dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Create task", action: submit)
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 420)
+        .onAppear { fieldFocused = true }
+    }
+
+    private func submit() {
+        let name = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        onSave(name)
+        dismiss()
+    }
+
+    private static func clock(_ ms: Int) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
 }

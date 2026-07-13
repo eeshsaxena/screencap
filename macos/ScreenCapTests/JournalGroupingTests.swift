@@ -203,4 +203,24 @@ private final class FakeJournalSearchService: SearchService, @unchecked Sendable
     func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
         TasksListResponse(recording: req.recording, tasks: [])
     }
+
+    // SCR-214 U11 — trivial write-verb stubs to keep the fake conforming.
+    func tasksCreate(_ req: TasksCreateRequest) async throws -> TasksCreateResponse {
+        TasksCreateResponse(
+            recording: req.recording,
+            task: RecordingTask(taskIndex: 0, startTs: req.startTs, endTs: req.endTs, name: req.name)
+        )
+    }
+    func tasksUpdate(_ req: TasksUpdateRequest) async throws -> TasksUpdateResponse {
+        TasksUpdateResponse(recording: req.recording, taskIndex: req.taskIndex)
+    }
+    func tasksDelete(_ req: TasksDeleteRequest) async throws -> TasksDeleteResponse {
+        TasksDeleteResponse(recording: req.recording, deleted: true)
+    }
+    func tasksMerge(_ req: TasksMergeRequest) async throws -> TasksMergeResponse {
+        TasksMergeResponse(recording: req.recording, taskIndex: 0)
+    }
+    func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse {
+        TasksSplitResponse(recording: req.recording, taskIndices: [0, 1])
+    }
 }

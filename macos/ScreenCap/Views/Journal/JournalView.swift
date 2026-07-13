@@ -2,9 +2,14 @@ import SwiftUI
 
 // U8 — the Journal screen (design 380–421): day-grouped recording cards with
 // title, summary, duration, badge, and app tag, plus the per-day
-// "Open day timeline →" link (the sole day-timeline entry point until U9's
-// other affordances land). Until SCR-214, Journal deliberately shows the same
-// recordings as Library — its interim value is the day-grouped reading.
+// "Open day timeline →" link.
+//
+// SCR-214 U11 turns Journal into the curation surface for ambient task
+// segments: cards render the day's agent/user tasks (via `JournalTasks`), a live
+// "start a task" affordance opens an in-progress span, each task row can be
+// renamed / split / merged / deleted through the write-through verbs, and a
+// failed write surfaces a visible retry (never a silent divergence). A recording
+// with no tasks reads as "unsplit — still searchable" rather than a blank.
 struct JournalView: View {
     @EnvironmentObject private var index: RecordingsIndex
 
@@ -21,15 +26,50 @@ struct JournalView: View {
     @State private var frameIndex = RecordingFrameIndex()
     @State private var thumbnailLoader = ThumbnailLoader()
     @StateObject private var appChips = JournalAppChips()
-    // U10 — one `tasks.list` per recording, shared across every card (like the
-    // frame index + app chips). Populates the day-grouped task breakdown from the
-    // LOCAL tasks store with no cloud round-trip.
-    @StateObject private var journalTasks = JournalTasks()
+    // U10/U11 — one `tasks.list` per recording, shared across every card, plus the
+    // write-through curation layer. `liveTask` drives the in-progress "start a
+    // task" span and persists it through the SAME `JournalTasks` instance so a
+    // closed live task lands in the same cache the cards render.
+    @StateObject private var journalTasks: JournalTasks
+    @StateObject private var liveTask: LiveTaskController
+
+    /// Draft name for the next live task (the header field).
+    @State private var liveTaskName = ""
+
+    init(
+        onOpenSearch: @escaping () -> Void,
+        onOpenTimeline: @escaping (Date, Int?) -> Void
+    ) {
+        self.onOpenSearch = onOpenSearch
+        self.onOpenTimeline = onOpenTimeline
+        let tasks = JournalTasks()
+        _journalTasks = StateObject(wrappedValue: tasks)
+        _liveTask = StateObject(wrappedValue: LiveTaskController(tasks: tasks))
+    }
 
     var body: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.scPaper)
+            .alert(
+                "Task change didn't save",
+                isPresented: writeErrorPresented,
+                presenting: journalTasks.writeError
+            ) { _ in
+                Button("Retry") { Task { await journalTasks.retryLastWrite() } }
+                Button("Dismiss", role: .cancel) { journalTasks.dismissWriteError() }
+            } message: { err in
+                Text(err.message)
+            }
+    }
+
+    /// Bridges `JournalTasks.writeError` (private-set) to an `isPresented`
+    /// binding; dismissing routes through `dismissWriteError()`.
+    private var writeErrorPresented: Binding<Bool> {
+        Binding(
+            get: { journalTasks.writeError != nil },
+            set: { if !$0 { journalTasks.dismissWriteError() } }
+        )
     }
 
     @ViewBuilder
@@ -50,7 +90,11 @@ struct JournalView: View {
     private var populated: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-                .padding(.bottom, 26)
+                .padding(.bottom, liveTask.draft == nil ? 26 : 14)
+            if let draft = liveTask.draft {
+                LiveTaskBanner(draft: draft) { Task { await liveTask.stop() } }
+                    .padding(.bottom, 20)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 34) {
                     ForEach(JournalModel.days(index.recordings)) { day in
@@ -72,16 +116,59 @@ struct JournalView: View {
                 .foregroundStyle(Color.scInk)
             Spacer()
             HStack(spacing: 12) {
-                // Stub: SCR-214 — the design's "ambient recording · split by the
-                // agent" caption claims agent task-splitting that doesn't exist
-                // yet; until then the caption states what Journal really does.
-                Text("grouped by day")
+                // SCR-214: ambient capture + on-device segmentation now exist, so
+                // the design's caption states what Journal really does.
+                Text("ambient recording · split by the agent")
                     .font(SCTypography.mono(size: 11))
                     .foregroundStyle(Color.scInkMuted)
-                    .help("Coming soon — SCR-214")
+                startTaskControl
                 searchPill
             }
         }
+    }
+
+    /// The live "start a task" affordance (manual creation, path a). Disabled
+    /// with a tooltip when no ambient recording is running today — the span has
+    /// nowhere to attach (surfaced gracefully rather than a silent no-op).
+    @ViewBuilder
+    private var startTaskControl: some View {
+        if liveTask.draft == nil {
+            let target = liveTaskTarget
+            Button {
+                guard let target else { return }
+                let name = liveTaskName.trimmingCharacters(in: .whitespacesAndNewlines)
+                Task { await liveTask.start(name: name.isEmpty ? "Untitled task" : name, recording: target.name) }
+                liveTaskName = ""
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "record.circle")
+                        .font(.system(size: 12))
+                    Text("Start a task")
+                        .font(SCTypography.sans(size: 12.5))
+                }
+                .foregroundStyle(target == nil ? Color.scInkMuted : Color.scTeal)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .overlay(Capsule().strokeBorder(target == nil ? Color.scBorderWarm : Color.scTeal.opacity(0.5), lineWidth: 1))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(target == nil)
+            .help(target == nil
+                ? "Ambient recording isn't running — a task needs a live stream to attach to"
+                : "Mark a task span in today's stream")
+        }
+    }
+
+    /// The ambient recording a live task attaches to: today's most recently
+    /// started recording (best-effort). The authoritative "active ambient
+    /// recording" comes from the session snapshot once U12 wires ambient state;
+    /// until then the newest same-day recording is the pragmatic target.
+    private var liveTaskTarget: RecordingSummary? {
+        let today = Calendar.current.startOfDay(for: Date())
+        return index.recordings
+            .filter { $0.startedDay == today }
+            .max { ($0.startedAt ?? 0) < ($1.startedAt ?? 0) }
     }
 
     private var searchPill: some View {
@@ -139,7 +226,7 @@ struct JournalView: View {
                             frameIndex: frameIndex,
                             thumbnailLoader: thumbnailLoader,
                             app: appChips.app(for: rec),
-                            tasks: journalTasks.tasks(for: rec),
+                            journalTasks: journalTasks,
                             onOpen: {
                                 if let date = day.day {
                                     onOpenTimeline(date, rec.startedAt.map { Int($0 * 1000) })
@@ -205,10 +292,72 @@ struct JournalView: View {
     }
 }
 
+/// The in-progress live task indicator (SCR-214 U11): a slim banner that reads
+/// as a "growing" provisional card — the task name, a live elapsed timer, and a
+/// Stop control that closes + persists the span. Shown under the header while a
+/// live task is open.
+struct LiveTaskBanner: View {
+    let draft: LiveTaskDraft
+    var onStop: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(Color.scTeal)
+                .frame(width: 8, height: 8)
+            Text(draft.name)
+                .font(SCTypography.sans(size: 13, weight: .semibold))
+                .foregroundStyle(Color.scInk)
+                .lineLimit(1)
+            // A live, self-updating elapsed timer — the "growing" span cue.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(Self.elapsedText(draft.elapsed(at: context.date)))
+                    .font(SCTypography.mono(size: 11))
+                    .foregroundStyle(Color.scInkMuted)
+                    .monospacedDigit()
+            }
+            Text("recording task")
+                .font(SCTypography.mono(size: 10))
+                .foregroundStyle(Color.scInkMuted)
+            Spacer()
+            Button(action: onStop) {
+                Text("Stop")
+                    .font(SCTypography.sans(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.scCanvas)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(Color.scTeal, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .help("Stop and save this task")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.scTealSoft.opacity(0.12), in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .strokeBorder(Color.scTeal.opacity(0.35), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Recording task \(draft.name)")
+    }
+
+    private static func elapsedText(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds)
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
+    }
+}
+
 /// A Journal card (design 403–416): 290pt wide, 16/9 thumbnail with duration
-/// chip, title, summary (hidden when the recording has none), and the
-/// badge + app chip row. The thumbnail/badge pieces are shared with U5's
-/// Library card; the summary line and app chip are Journal-only.
+/// chip, title, summary (hidden when the recording has none), the task
+/// breakdown, and the badge + app chip row.
+///
+/// SCR-214 U11: the task breakdown is now editable — each task row carries a
+/// context menu (rename / split / merge / delete) routed through
+/// `JournalTasks`' write-through layer, and a recording with no tasks renders an
+/// "unsplit — still searchable" placeholder rather than an empty gap.
 struct JournalCard: View {
     let recording: RecordingSummary
     let frameIndex: RecordingFrameIndex
@@ -216,24 +365,28 @@ struct JournalCard: View {
     /// Dominant app for the recording's span (JournalAppChips) — chip omitted
     /// while unresolved or when the lookup failed (nullable contract).
     let app: String?
-    /// The recording's locally-named task segments (U10, JournalTasks) — empty
-    /// while unresolved, on a daemon miss, or when the recording has no tasks
-    /// store. Feeds the day-grouped task breakdown + title/summary fallback.
-    var tasks: [RecordingTask] = []
+    /// The shared task store — the card reads this recording's tasks from it and
+    /// routes edits back through its write-through verbs.
+    @ObservedObject var journalTasks: JournalTasks
     var onOpen: () -> Void
 
     @State private var hovering = false
+    @State private var renamingTask: RecordingTask?
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
 
-    /// Title prefers the recording's own, falling back to the first local task name when
-    /// the recording is otherwise un-named (U10).
+    /// The recording's locally-named task segments, ordered by task index.
+    private var tasks: [RecordingTask] { journalTasks.tasks(for: recording) }
+    /// Whether the tasks have been resolved at least once — gates the empty-state
+    /// placeholder so it doesn't flash before agent tasks land.
+    private var resolved: Bool { journalTasks.hasResolved(recording) }
+
+    /// Title prefers the recording's own, falling back to the first local task
+    /// name when the recording is otherwise un-named (U10).
     private var title: String { JournalModel.displayTitle(recording, tasks: tasks) }
 
-    /// The card's task breakdown — the named tasks under the summary (U10). The
-    /// prototype had no per-recording task list; this reuses the card body rather
-    /// than adding a new surface. Empty (section omitted) when the recording has
-    /// no tasks store. Capped so a long session doesn't blow out the card.
+    /// The card's task breakdown — capped so a long session doesn't blow out the
+    /// card.
     private var breakdown: [RecordingTask] { Array(tasks.prefix(4)) }
 
     var body: some View {
@@ -261,6 +414,11 @@ struct JournalCard: View {
         .frame(width: 290)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityText)
+        .sheet(item: $renamingTask) { task in
+            TaskRenameSheet(initial: task.name) { newName in
+                Task { await journalTasks.rename(recording: recording.name, taskIndex: task.taskIndex, to: newName) }
+            }
+        }
     }
 
     private var info: some View {
@@ -296,23 +454,16 @@ struct JournalCard: View {
         .padding(.bottom, 3)
     }
 
-    /// The day-grouped task breakdown (U10): the recording's locally-named tasks
-    /// as a compact bulleted list. Omitted entirely when there are no tasks, so a
-    /// recording with no tasks store renders exactly as before.
+    /// The day-grouped task breakdown (U10/U11): the recording's locally-named
+    /// tasks as a compact editable list, or the "unsplit — still searchable"
+    /// placeholder once resolution confirms the recording has no tasks (never a
+    /// blank — R10). Each row's context menu curates the task.
     @ViewBuilder
     private var taskBreakdown: some View {
         if !breakdown.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(breakdown) { task in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("•")
-                            .font(SCTypography.sans(size: 11))
-                            .foregroundStyle(Color.scInkMuted)
-                        Text(task.name)
-                            .font(SCTypography.sans(size: 11.5))
-                            .foregroundStyle(Color.scInkSecondary)
-                            .lineLimit(1)
-                    }
+                    taskRow(task)
                 }
                 if tasks.count > breakdown.count {
                     Text("+\(tasks.count - breakdown.count) more")
@@ -321,7 +472,66 @@ struct JournalCard: View {
                 }
             }
             .padding(.top, 5)
+        } else if resolved {
+            // Graceful empty state (R10): footage exists and is searchable, it
+            // just hasn't been carved into a task yet.
+            Text("unsplit — still searchable")
+                .font(SCTypography.mono(size: 10.5))
+                .foregroundStyle(Color.scInkMuted)
+                .padding(.top, 5)
+                .accessibilityLabel("Unsplit, still searchable")
         }
+    }
+
+    private func taskRow(_ task: RecordingTask) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("•")
+                .font(SCTypography.sans(size: 11))
+                .foregroundStyle(Color.scInkMuted)
+            Text(task.name)
+                .font(SCTypography.sans(size: 11.5))
+                .foregroundStyle(Color.scInkSecondary)
+                .lineLimit(1)
+        }
+        .contentShape(Rectangle())
+        .contextMenu { taskMenu(task) }
+    }
+
+    /// Per-task curation menu (SCR-214 U11) routed through the write-through
+    /// verbs. "Split in half" splits at the span midpoint (always strictly inside
+    /// a non-zero span); "Merge with next" combines this task with the
+    /// chronologically-following one.
+    @ViewBuilder
+    private func taskMenu(_ task: RecordingTask) -> some View {
+        Button("Rename…") { renamingTask = task }
+        Button("Split in half") {
+            let mid = (task.startTs + task.endTs) / 2
+            Task { await journalTasks.split(recording: recording.name, taskIndex: task.taskIndex, splitTs: mid) }
+        }
+        .disabled(task.endTs - task.startTs < 2)
+        if let next = nextTask(after: task) {
+            Button("Merge with next") {
+                Task {
+                    await journalTasks.merge(
+                        recording: recording.name,
+                        taskIndices: [task.taskIndex, next.taskIndex],
+                        name: task.name
+                    )
+                }
+            }
+        }
+        Divider()
+        Button("Delete", role: .destructive) {
+            Task { await journalTasks.delete(recording: recording.name, taskIndex: task.taskIndex) }
+        }
+    }
+
+    /// The chronologically-next task after `task` (by start time), for "Merge
+    /// with next". Nil when `task` is the last span.
+    private func nextTask(after task: RecordingTask) -> RecordingTask? {
+        tasks
+            .filter { $0.taskIndex != task.taskIndex && $0.startTs >= task.startTs }
+            .min { $0.startTs < $1.startTs }
     }
 
     private var accessibilityText: String {
@@ -330,7 +540,57 @@ struct JournalCard: View {
         if let app { parts.append(app) }
         if !breakdown.isEmpty {
             parts.append("tasks: " + breakdown.map(\.name).joined(separator: ", "))
+        } else if resolved {
+            parts.append("unsplit, still searchable")
         }
         return parts.joined(separator: ", ")
+    }
+}
+
+/// A minimal rename sheet for a task (SCR-214 U11), mirroring the recording
+/// `RenameSheet` pattern. Reports the new (non-empty) name to the caller, which
+/// routes it through `JournalTasks.rename`.
+private struct TaskRenameSheet: View {
+    let initial: String
+    var onSave: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: String
+    @FocusState private var fieldFocused: Bool
+
+    init(initial: String, onSave: @escaping (String) -> Void) {
+        self.initial = initial
+        self.onSave = onSave
+        _draft = State(initialValue: initial)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename task")
+                .font(.title2.weight(.semibold))
+            TextField("Task name", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .focused($fieldFocused)
+                .onSubmit(submit)
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Save", action: submit)
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 380)
+        .onAppear { fieldFocused = true }
+    }
+
+    private func submit() {
+        let name = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != initial else { dismiss(); return }
+        onSave(name)
+        dismiss()
     }
 }

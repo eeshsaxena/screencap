@@ -101,3 +101,330 @@ struct TasksListResponse: Decodable, Sendable {
         case tasks
     }
 }
+
+// MARK: - SCR-214 U7 task CRUD write verbs (request/response models)
+//
+// The five mutating verbs mirror `recording.rename`'s post-hoc, LOCAL-only
+// pattern — the rows live in `pipeline_task_segments` inside the recording's
+// `recording.db` and are never uploaded (R4/R8). `source` / `edited` (KTD3) are
+// deliberately NOT on the wire: task ownership is an internal store concern, so
+// the app never sends or decodes them. Editing an agent task simply routes
+// through `tasks.update`, and the daemon marks the row `edited=1` server-side so
+// the next agent re-segmentation preserves it.
+//
+// Daemon error codes surface through the existing `DaemonClientError.envelopeError`
+// seam unchanged: `invalid_name` (traversal recording name, 400), `invalid_request`
+// (bad/zero-length/out-of-range/evicted-footage span, 400), and
+// `recording_not_found` (404). Optional request fields are `Optional` so the
+// synthesized `Encodable` omits them (via `encodeIfPresent`) when nil, mirroring
+// `RecordingStartRequest.audio`.
+
+/// `tasks.create` input (U7): add a USER-authored task span. `startTs`/`endTs`
+/// are Unix seconds. The daemon forces `source='user'` at a disjoint HIGH
+/// `task_index` (KTD3) — the caller never chooses the index.
+struct TasksCreateRequest: Encodable, Sendable {
+    let recording: String
+    let name: String
+    let startTs: Double
+    let endTs: Double
+    let category: String?
+
+    init(recording: String, name: String, startTs: Double, endTs: Double, category: String? = nil) {
+        self.recording = recording
+        self.name = name
+        self.startTs = startTs
+        self.endTs = endTs
+        self.category = category
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case name
+        case startTs = "start_ts"
+        case endTs = "end_ts"
+        case category
+    }
+}
+
+/// `tasks.create` output: the created row echoed as a full `RecordingTask`
+/// (same wire shape as `tasks.list`), carrying its store-allocated HIGH
+/// `task_index` so the app can address it later without a re-list.
+struct TasksCreateResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let recording: String
+    let task: RecordingTask
+
+    init(
+        ok: Bool = true,
+        schemaVersion: Int = 1,
+        daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1,
+        recording: String,
+        task: RecordingTask
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.recording = recording
+        self.task = task
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case recording
+        case task
+    }
+}
+
+/// `tasks.update` input (U7): rename / re-bound an existing task by `taskIndex`.
+/// Only the provided fields are written; every edit marks the row curated
+/// (`edited=1`) and re-homes an agent row into the HIGH range so the next agent
+/// replace preserves it (KTD3).
+struct TasksUpdateRequest: Encodable, Sendable {
+    let recording: String
+    let taskIndex: Int
+    let name: String?
+    let startTs: Double?
+    let endTs: Double?
+    let category: String?
+
+    init(
+        recording: String,
+        taskIndex: Int,
+        name: String? = nil,
+        startTs: Double? = nil,
+        endTs: Double? = nil,
+        category: String? = nil
+    ) {
+        self.recording = recording
+        self.taskIndex = taskIndex
+        self.name = name
+        self.startTs = startTs
+        self.endTs = endTs
+        self.category = category
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case taskIndex = "task_index"
+        case name
+        case startTs = "start_ts"
+        case endTs = "end_ts"
+        case category
+    }
+}
+
+/// `tasks.update` output: the row's (possibly re-homed) `task_index`.
+struct TasksUpdateResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let recording: String
+    let taskIndex: Int
+
+    init(
+        ok: Bool = true,
+        schemaVersion: Int = 1,
+        daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1,
+        recording: String,
+        taskIndex: Int
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.recording = recording
+        self.taskIndex = taskIndex
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case recording
+        case taskIndex = "task_index"
+    }
+}
+
+/// `tasks.delete` input (U7): remove one task by `taskIndex`.
+struct TasksDeleteRequest: Encodable, Sendable {
+    let recording: String
+    let taskIndex: Int
+
+    init(recording: String, taskIndex: Int) {
+        self.recording = recording
+        self.taskIndex = taskIndex
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case taskIndex = "task_index"
+    }
+}
+
+/// `tasks.delete` output: `deleted` is true when a row went, false when none
+/// matched (idempotent — a dropped/retried delete converges, never an error).
+struct TasksDeleteResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let recording: String
+    let deleted: Bool
+
+    init(
+        ok: Bool = true,
+        schemaVersion: Int = 1,
+        daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1,
+        recording: String,
+        deleted: Bool
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.recording = recording
+        self.deleted = deleted
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case recording
+        case deleted
+    }
+}
+
+/// `tasks.merge` input (U7): combine >=2 segments (`taskIndices`, >=2 distinct)
+/// into one atomic `source='user'` row with `name` as the surviving label and
+/// the union as its span.
+struct TasksMergeRequest: Encodable, Sendable {
+    let recording: String
+    let taskIndices: [Int]
+    let name: String
+    let category: String?
+
+    init(recording: String, taskIndices: [Int], name: String, category: String? = nil) {
+        self.recording = recording
+        self.taskIndices = taskIndices
+        self.name = name
+        self.category = category
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case taskIndices = "task_indices"
+        case name
+        case category
+    }
+}
+
+/// `tasks.merge` output: the merged row's allocated HIGH `task_index`.
+struct TasksMergeResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let recording: String
+    let taskIndex: Int
+
+    init(
+        ok: Bool = true,
+        schemaVersion: Int = 1,
+        daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1,
+        recording: String,
+        taskIndex: Int
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.recording = recording
+        self.taskIndex = taskIndex
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case recording
+        case taskIndex = "task_index"
+    }
+}
+
+/// `tasks.split` input (U7): split one segment into two at `splitTs` (Unix
+/// seconds, strictly within the segment's span). Optional `nameLeft`/`nameRight`
+/// label the halves; each defaults to the original name.
+struct TasksSplitRequest: Encodable, Sendable {
+    let recording: String
+    let taskIndex: Int
+    let splitTs: Double
+    let nameLeft: String?
+    let nameRight: String?
+
+    init(recording: String, taskIndex: Int, splitTs: Double, nameLeft: String? = nil, nameRight: String? = nil) {
+        self.recording = recording
+        self.taskIndex = taskIndex
+        self.splitTs = splitTs
+        self.nameLeft = nameLeft
+        self.nameRight = nameRight
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case taskIndex = "task_index"
+        case splitTs = "split_ts"
+        case nameLeft = "name_left"
+        case nameRight = "name_right"
+    }
+}
+
+/// `tasks.split` output: the two allocated `task_index` values, left-span first.
+struct TasksSplitResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let recording: String
+    let taskIndices: [Int]
+
+    init(
+        ok: Bool = true,
+        schemaVersion: Int = 1,
+        daemonVersion: String = "test",
+        apiSchemaVersion: Int = 1,
+        recording: String,
+        taskIndices: [Int]
+    ) {
+        self.ok = ok
+        self.schemaVersion = schemaVersion
+        self.daemonVersion = daemonVersion
+        self.apiSchemaVersion = apiSchemaVersion
+        self.recording = recording
+        self.taskIndices = taskIndices
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case recording
+        case taskIndices = "task_indices"
+    }
+}

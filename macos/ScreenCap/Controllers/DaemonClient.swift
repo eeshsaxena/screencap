@@ -975,6 +975,52 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/tasks.list", body: body)
     }
 
+    // MARK: - SCR-214 U7 task CRUD write verbs
+
+    /// Add a USER-authored task span (U7). Local-only mutating verb over the
+    /// recording's `pipeline_task_segments` store (never uploaded — R4/R8). The
+    /// daemon rejects a traversal recording name (400 `invalid_name`), a
+    /// zero-length / inverted / out-of-range / evicted-footage span (400
+    /// `invalid_request`), and an unknown recording (404 `recording_not_found`) —
+    /// all surfaced through `DaemonClientError.envelopeError(code:_)` unchanged.
+    /// The store forces `source='user'` at a disjoint HIGH `task_index` (KTD3).
+    static func tasksCreate(_ req: TasksCreateRequest) async throws -> TasksCreateResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.create", body: body)
+    }
+
+    /// Rename / re-bound an existing task by `task_index` (U7). Every edit marks
+    /// the row curated (`edited=1`) server-side and re-homes an agent row into the
+    /// HIGH range so the next agent re-segmentation preserves it (KTD3). A missing
+    /// row or an inverted span returns 400 `invalid_request`.
+    static func tasksUpdate(_ req: TasksUpdateRequest) async throws -> TasksUpdateResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.update", body: body)
+    }
+
+    /// Remove one task by `task_index` (U7). Idempotent: an already-absent task
+    /// returns 200 with `deleted:false`, so a dropped/retried delete converges.
+    static func tasksDelete(_ req: TasksDeleteRequest) async throws -> TasksDeleteResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.delete", body: body)
+    }
+
+    /// Combine >=2 segments into one atomic `source='user'` row (U7). The span is
+    /// the union and `name` is the surviving label. Fewer than two resolvable
+    /// segments returns 400 `invalid_request`.
+    static func tasksMerge(_ req: TasksMergeRequest) async throws -> TasksMergeResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.merge", body: body)
+    }
+
+    /// Split one segment into two at `split_ts` (U7). `split_ts` must lie strictly
+    /// within the segment's span (else 400 `invalid_request`). Produces two
+    /// `source='user'` rows in one atomic transaction — never a half-split.
+    static func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.split", body: body)
+    }
+
     /// Conversational-recall answer (conversational-recall U5). Daemon-only,
     /// local, POINTER-ONLY response (R2/R8 — sources carry `(recording,
     /// timestamp_ms, stream)`, never image bytes). Prior-turn context is carried

@@ -243,6 +243,14 @@ struct DayStripView: View {
     let matchesMs: [Int]
     let playheadMs: Int?
     var onSeek: (Int) -> Void
+    /// SCR-214 U11 — the in-progress retroactive task selection (both endpoints
+    /// marked), drawn as a dashed amber band so the user sees the span they're
+    /// about to label. Nil when no selection is in flight (default) — additive,
+    /// so existing call sites are unaffected.
+    var pendingSelection: (startMs: Int, endMs: Int)? = nil
+    /// SCR-214 U11 — a single marked endpoint awaiting its partner, drawn as a
+    /// standalone tick.
+    var pendingEndpointMs: Int? = nil
 
     /// Strip metrics per the design (444–461): 64pt band area, 16pt track.
     private let stripHeight: CGFloat = 64
@@ -343,6 +351,18 @@ struct DayStripView: View {
                 let x = DayStripLayout.x(forMs: playheadMs, bounds: bounds, width: width)
                 let rect = CGRect(x: x - 1, y: trackTop - 10, width: 2, height: trackHeight + 20)
                 ctx.fill(Path(rect), with: .color(.scInk))
+            }
+
+            // SCR-214 U11 — the in-progress retroactive task selection.
+            if let selection = pendingSelection {
+                let rect = bandRect(startMs: selection.startMs, endMs: selection.endMs, width: width)
+                let path = Path(roundedRect: rect, cornerRadius: 4)
+                ctx.fill(path, with: .color(.scAmber.opacity(0.18)))
+                ctx.stroke(path, with: .color(.scAmber), style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+            } else if let endpointMs = pendingEndpointMs {
+                let x = DayStripLayout.x(forMs: endpointMs, bounds: bounds, width: width)
+                let rect = CGRect(x: x - 1.5, y: trackTop - 6, width: 3, height: trackHeight + 12)
+                ctx.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(.scAmber))
             }
         }
     }
