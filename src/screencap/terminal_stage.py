@@ -1189,25 +1189,59 @@ def _persist_local_tasks(
       (tmp + ``os.replace``) so a crash never leaves a torn file.
     * the ``pipeline_task_segments`` ledger table inside ``recording.db`` —
       queryable per-task rows (task_index, start/end, name, category,
-      confidence, metadata). ``replace_task_segments`` deletes-then-inserts in
-      one transaction, so re-running terminal REPLACES rather than duplicates.
+      confidence, metadata, source, edited). This is an AGENT re-segmentation
+      pass: ``replace_task_segments`` is SCOPED (U5, KTD3) — it refreshes only
+      unedited agent rows and PRESERVES ``source='user'`` / user-edited rows, so
+      a re-run never clobbers user work (R8).
+
+    Both sinks are source-aware: agent entries are written ``source='agent'`` and
+    any pre-existing user / edited entries in ``tasks.json`` are carried forward
+    (mirroring the ledger's scoped replace), so an agent pass never overwrites a
+    user-curated task in either store.
     """
     import json
 
-    from screencap.pipeline_state import TaskSegmentRow
+    from screencap.pipeline_state import TASK_SOURCE_AGENT, TaskSegmentRow
 
-    task_list = tasks.get("tasks", []) if isinstance(tasks, dict) else []
+    task_list = [
+        t for t in (tasks.get("tasks", []) if isinstance(tasks, dict) else [])
+        if isinstance(t, dict)
+    ]
+    final_path = recording_dir / _LOCAL_TASKS_FILE
+
+    # Preserve user-authored / user-edited entries from any existing tasks.json
+    # so this AGENT pass never clobbers user work (R8, KTD3) — the tasks.json
+    # mirror of the ledger's scoped replace. Best-effort: a torn / legacy file is
+    # ignored (the ledger remains the authoritative store).
+    preserved: list[dict] = []
+    if final_path.exists():
+        try:
+            prior = json.loads(final_path.read_text())
+            prior_tasks = prior.get("tasks", []) if isinstance(prior, dict) else []
+            preserved = [
+                t for t in prior_tasks
+                if isinstance(t, dict)
+                and (t.get("source") == "user" or t.get("edited"))
+            ]
+        except (OSError, ValueError):
+            preserved = []
 
     # 1. tasks.json — atomic write (tmp + replace), local-only by upload rule.
-    payload = json.dumps(tasks, indent=2)
-    final_path = recording_dir / _LOCAL_TASKS_FILE
+    #    Agent entries carry an explicit source/edited marker so a later pass (or
+    #    the app) can tell them apart from preserved user / edited entries.
+    agent_json_tasks = [
+        {**t, "source": TASK_SOURCE_AGENT, "edited": False} for t in task_list
+    ]
+    merged = dict(tasks) if isinstance(tasks, dict) else {}
+    merged["tasks"] = agent_json_tasks + preserved
+    payload = json.dumps(merged, indent=2)
     tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
     tmp_path.write_text(payload)
     os.replace(tmp_path, final_path)
 
-    # 2. pipeline_task_segments ledger table (idempotent replace). Skipped for a
-    # legacy / no-ledger recording (no recording.db row to key on) — tasks.json
-    # still carries the tasks in that case.
+    # 2. pipeline_task_segments ledger table (SCOPED agent replace — preserves
+    # user / edited rows). Skipped for a legacy / no-ledger recording (no
+    # recording.db row to key on) — tasks.json still carries the tasks then.
     if ledger is not None:
         segments = [
             TaskSegmentRow(
@@ -1222,6 +1256,8 @@ def _persist_local_tasks(
                     for k in ("description", "apps_used", "derived_name")
                     if k in t
                 }) or None,
+                source=TASK_SOURCE_AGENT,
+                edited=False,
             )
             for i, t in enumerate(task_list)
         ]
