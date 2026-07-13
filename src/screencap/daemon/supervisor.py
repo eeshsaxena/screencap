@@ -486,6 +486,18 @@ class Supervisor:
         """
         return await self.send_command({"type": "set_muted", "muted": bool(muted)})
 
+    async def set_paused(self, paused: bool) -> bool:
+        """Forward a pause/resume request to the running engine (SCR-214 U4).
+
+        A pass-through mirroring :meth:`set_muted`: returns ``True`` if forwarded,
+        ``False`` if there is no live engine. It deliberately does NOT write pause
+        state into ``_session_state`` — the engine's confirmed ``recording_paused``
+        / ``recording_resumed`` event (emitted only after capture is actually
+        gated, KTD7) is the sole writer, so the snapshot never reports a request
+        that may have raced engine teardown.
+        """
+        return await self.send_command({"type": "set_paused", "paused": bool(paused)})
+
     async def acquire_migration(self, *, schema_version: int) -> None:
         """Reserve the daemon for a storage-location migration (SCR-228 U3/U4).
 
@@ -1337,6 +1349,14 @@ class Supervisor:
             self._session_state["muted"] = True
         elif event_type == _stderr_events.EVENT_AUDIO_UNMUTED:
             self._session_state["muted"] = False
+        # SCR-214 U4: the confirmed pause events are the SOLE writer of pause
+        # state. Engine-main emits them only after the video/screenshot capture
+        # gate is actually set (KTD7), so the snapshot / events reflect gated
+        # capture, never the pause request.
+        elif event_type == _stderr_events.EVENT_RECORDING_PAUSED:
+            self._session_state["paused"] = True
+        elif event_type == _stderr_events.EVENT_RECORDING_RESUMED:
+            self._session_state["paused"] = False
 
     async def _wait_on_subscription(
         self,

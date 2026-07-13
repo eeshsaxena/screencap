@@ -53,6 +53,11 @@ _ACTIVITY_PATHS = frozenset(
     {
         "/v0/recording.start",
         "/v0/recording.stop",
+        # SCR-214 U4: pause/resume are mutating lifecycle verbs on a live
+        # recording (like start/stop), so they count as activity — a paused
+        # ambient recording is still an intentional, in-progress session.
+        "/v0/recording.pause",
+        "/v0/recording.resume",
     }
 )
 

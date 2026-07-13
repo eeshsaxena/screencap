@@ -16,6 +16,9 @@ _RECORDING_STOP_API_VERSION = 1
 # SCR-218 mid-recording mic mute. Additive (new verb) — no global
 # API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
 _RECORDING_MUTE_API_VERSION = 1
+# SCR-214 U4 capture-pause / resume. Additive (new verbs) — no global
+# API_SCHEMA_VERSION bump (mirrors the recording.mute precedent).
+_RECORDING_PAUSE_API_VERSION = 1
 # Editable titles (U3): the post-hoc recording.rename verb. Additive (new verb) —
 # no global API_SCHEMA_VERSION bump (mirrors the recording.mute / permission.request
 # precedent).
@@ -97,6 +100,8 @@ _MODEL_NAMES = {
     "RecordingStopRequest",
     "RecordingMuteRequest",
     "RecordingMuteResponse",
+    "RecordingPauseRequest",
+    "RecordingPauseResponse",
     "RecordingRenameRequest",
     "RecordingRenameResponse",
     "RecordingStopResponse",
@@ -259,6 +264,11 @@ def _load_models() -> dict[str, Any]:
         # mute event (additive, back-compat) — a missing value means unmuted, so
         # a stale daemon and a pre-first-mute recording both read as audio-on.
         muted: bool = False
+        # SCR-214 U4: confirmed capture-pause state. Absent until the first
+        # confirmed pause event (additive, back-compat) — a missing value means
+        # running, so a stale daemon and a never-paused recording both read as
+        # not-paused.
+        paused: bool = False
         cursor: int
 
     class RecordingStartRequest(_DaemonModel):
@@ -339,6 +349,24 @@ def _load_models() -> dict[str, Any]:
         # Bus cursor captured BEFORE forwarding, so the app can subscribe to
         # /v0/events?since=<cursor> without missing the confirming audio_muted /
         # audio_unmuted event (late-listener-replay learning).
+        cursor: int
+
+    class RecordingPauseRequest(_DaemonModel):
+        # SCR-214 U4: absolute desired pause state (True=paused). Absolute rather
+        # than a toggle so a dropped/retried request can never desync app vs
+        # engine — mirrors RecordingMuteRequest. ``recording.pause`` sends
+        # ``paused=True`` and ``recording.resume`` sends ``paused=False``; a
+        # single model backs both verbs.
+        paused: bool
+
+    class RecordingPauseResponse(EnvelopeResponse):
+        # Echoes the REQUESTED state for transport bookkeeping only. The app must
+        # NOT treat this as confirmation — confirmed pause state arrives on the
+        # events stream / snapshot after the engine actually gates capture (KTD7).
+        paused: bool
+        # Bus cursor captured BEFORE forwarding, so the app can subscribe to
+        # /v0/events?since=<cursor> without missing the confirming
+        # recording_paused / recording_resumed event.
         cursor: int
 
     class RecordingRenameRequest(_DaemonModel):
@@ -885,6 +913,8 @@ def _load_models() -> dict[str, Any]:
         "RecordingStopResponse": RecordingStopResponse,
         "RecordingMuteRequest": RecordingMuteRequest,
         "RecordingMuteResponse": RecordingMuteResponse,
+        "RecordingPauseRequest": RecordingPauseRequest,
+        "RecordingPauseResponse": RecordingPauseResponse,
         "RecordingRenameRequest": RecordingRenameRequest,
         "RecordingRenameResponse": RecordingRenameResponse,
         "PermissionRequestRequest": PermissionRequestRequest,

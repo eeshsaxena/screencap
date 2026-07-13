@@ -569,7 +569,11 @@ async def session_snapshot(request: Request) -> JSONResponse:
             # first confirmed mute event, so an unmuted (or pre-first-mute)
             # recording omits it and the app defaults to unmuted — the additive,
             # back-compatible contract mirrored on the app decoder side.
-            for key in ("engine_pid", "frames_written", "started_by", "muted"):
+            # SCR-214 U4: ``paused`` rides the same additive overlay as ``muted``
+            # — absent until the first confirmed pause event, so a never-paused
+            # recording omits it and the app defaults to not-paused.
+            for key in ("engine_pid", "frames_written", "started_by", "muted",
+                        "paused"):
                 if current.get(key) is not None:
                     payload[key] = current[key]
     elif not daemon_owned:
@@ -807,6 +811,84 @@ async def recording_mute(request: Request) -> JSONResponse:
             schema_version=schema._RECORDING_MUTE_API_VERSION,
             request=request,
         )
+
+
+async def _recording_set_paused(
+    request: Request, *, paused: bool, verb: str
+) -> JSONResponse:
+    """Shared implementation for ``recording.pause`` / ``recording.resume``
+    (SCR-214 U4).
+
+    Mirrors ``recording.mute``'s trust-boundary posture end-to-end: it derives a
+    peer descriptor and audits every exit path (ok, typed error, unhandled),
+    validates ``RecordingPauseRequest``, captures the bus cursor BEFORE forwarding
+    (so a client subscribing to ``/v0/events?since=<cursor>`` never misses the
+    confirming event), and forwards to the engine via ``supervisor.set_paused``.
+    It does NOT set pause state itself — the engine's confirmed
+    ``recording_paused`` / ``recording_resumed`` event does (KTD7) — so the
+    response echoes only the *requested* state and the app must not treat it as
+    confirmation. Unlike mute (audio-only), pause gates the WHOLE capture surface,
+    so a paused span records nothing (AE1).
+
+    The request body's ``paused`` is ignored in favor of the verb-derived
+    ``paused`` argument, so ``recording.pause`` always pauses and
+    ``recording.resume`` always resumes regardless of a mismatched body.
+    """
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            verb,
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        # Validate the body so a malformed request is a typed 400, not a crash —
+        # even though the effective state comes from the verb, not the body.
+        schema.RecordingPauseRequest.model_validate(await request.json())
+        # Capture the cursor BEFORE forwarding so a client can subscribe to
+        # /v0/events?since=<cursor> and never miss the confirming event.
+        cursor = request.app.state.event_bus.current_cursor()
+        forwarded = await request.app.state.supervisor.set_paused(paused)
+        if not forwarded:
+            raise errors.NotRecordingError(
+                schema_version=schema._RECORDING_PAUSE_API_VERSION
+            )
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._RECORDING_PAUSE_API_VERSION,
+                paused=paused,
+                cursor=cursor,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_PAUSE_API_VERSION,
+            request=request,
+        )
+
+
+async def recording_pause(request: Request) -> JSONResponse:
+    """Pause capture (video + screenshots + audio) on the running recording
+    without ending it (SCR-214 U4). See :func:`_recording_set_paused`."""
+    return await _recording_set_paused(request, paused=True, verb="recording.pause")
+
+
+async def recording_resume(request: Request) -> JSONResponse:
+    """Resume capture on a paused recording (SCR-214 U4). See
+    :func:`_recording_set_paused`."""
+    return await _recording_set_paused(request, paused=False, verb="recording.resume")
 
 
 def _resolve_rename_target(selector: str) -> tuple[Path, Path, float | None] | None:
@@ -2743,6 +2825,8 @@ def build_app() -> Starlette:
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/recording.mute", recording_mute, methods=["POST"]),
+            Route("/v0/recording.pause", recording_pause, methods=["POST"]),
+            Route("/v0/recording.resume", recording_resume, methods=["POST"]),
             Route("/v0/recording.rename", recording_rename, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
