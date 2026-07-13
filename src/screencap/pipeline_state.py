@@ -108,6 +108,9 @@ __all__ = [
     "ensure_pipeline_state_schema",
     "from_chunk_status",
     "reconcile_ledger_from_disk",
+    "read_task_segments_wire",
+    "spans_overlap",
+    "task_row_is_protected",
     "USER_TASK_INDEX_BASE",
     "TASK_SOURCE_AGENT",
     "TASK_SOURCE_USER",
@@ -137,6 +140,17 @@ _BUSY_TIMEOUT_MS = 10000
 TASK_SOURCE_AGENT = "agent"
 TASK_SOURCE_USER = "user"
 USER_TASK_INDEX_BASE = 1_000_000
+
+
+def spans_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
+    """Half-open ``[a_start, a_end)`` ∩ ``[b_start, b_end)`` is non-empty.
+
+    The single canonical span-overlap predicate shared by capture-time retention
+    (task-span vs chunk-window protection) and the terminal-stage carve-out
+    (task-span vs kept-span). Symmetric in ``a``/``b``, so callers may pass the
+    task span as ``a`` and the protected/other span as ``b`` (or vice versa).
+    """
+    return a_start < b_end and b_start < a_end
 
 
 class Lifecycle(str, Enum):
@@ -261,6 +275,19 @@ class TaskSegmentRow:
     edited: bool = False
 
 
+def task_row_is_protected(row: TaskSegmentRow) -> bool:
+    """True iff ``row`` is a KEPT (user-curated) task row: user OR user-edited.
+
+    The single canonical "must survive an agent re-segmentation / pins its footage"
+    predicate (U5/KTD3): a ``source='user'`` row OR any user-edited agent row
+    (``edited=1``). Shared by the retention kept-span protector and the
+    terminal-stage carve-out so the two can never disagree on what counts as
+    protected. Only the predicate is shared — each caller keeps its own span
+    assembly.
+    """
+    return row.source == TASK_SOURCE_USER or bool(row.edited)
+
+
 def from_chunk_status(status: "ChunkStatus") -> UploadState:
     """Map a legacy ``chunk_processor.ChunkStatus`` onto an ``UploadState``.
 
@@ -380,6 +407,41 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
 
 def _now() -> float:
     return time.time()
+
+
+def _insert_user_task_row(
+    conn: sqlite3.Connection,
+    recording_id: int,
+    task_index: int,
+    *,
+    start_ts: float,
+    end_ts: float,
+    name: str,
+    category: str | None,
+    confidence: str | None,
+    metadata: str | None,
+    edited: int,
+    now: float,
+) -> None:
+    """Insert ONE ``source='user'`` task-segment row on ``conn`` (no commit).
+
+    The shared body behind the user-authored insert paths (``insert_task_segment``
+    / ``merge_task_segments`` / ``split_task_segment``): a single canonical INSERT
+    so the column list and value order can't drift. ``source`` is always
+    ``TASK_SOURCE_USER`` on these paths. The caller owns the surrounding
+    ``BEGIN IMMEDIATE`` transaction and commit.
+    """
+    conn.execute(
+        "INSERT INTO pipeline_task_segments "
+        "(recording_id, task_index, start_ts, end_ts, name, "
+        " category, confidence, metadata, source, edited, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            recording_id, task_index, start_ts, end_ts, name,
+            category, confidence, metadata,
+            TASK_SOURCE_USER, edited, now,
+        ),
+    )
 
 
 class PipelineLedger:
@@ -1032,18 +1094,11 @@ class PipelineLedger:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 idx = self._next_user_task_index(conn)
-                conn.execute(
-                    "INSERT INTO pipeline_task_segments "
-                    "(recording_id, task_index, start_ts, end_ts, name, "
-                    " category, confidence, metadata, source, edited, "
-                    " updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        self._recording_id, idx,
-                        seg.start_ts, seg.end_ts, seg.name,
-                        seg.category, seg.confidence, seg.metadata,
-                        TASK_SOURCE_USER, int(seg.edited), _now(),
-                    ),
+                _insert_user_task_row(
+                    conn, self._recording_id, idx,
+                    start_ts=seg.start_ts, end_ts=seg.end_ts, name=seg.name,
+                    category=seg.category, confidence=seg.confidence,
+                    metadata=seg.metadata, edited=int(seg.edited), now=_now(),
                 )
                 conn.commit()
                 return idx
@@ -1243,16 +1298,11 @@ class PipelineLedger:
                     (self._recording_id, *wanted),
                 )
                 new_index = self._next_user_task_index(conn)
-                conn.execute(
-                    "INSERT INTO pipeline_task_segments "
-                    "(recording_id, task_index, start_ts, end_ts, name, "
-                    " category, confidence, metadata, source, edited, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        self._recording_id, new_index, union_start, union_end,
-                        name, category, confidence, metadata,
-                        TASK_SOURCE_USER, 0, _now(),
-                    ),
+                _insert_user_task_row(
+                    conn, self._recording_id, new_index,
+                    start_ts=union_start, end_ts=union_end, name=name,
+                    category=category, confidence=confidence, metadata=metadata,
+                    edited=0, now=_now(),
                 )
                 conn.commit()
                 return new_index
@@ -1312,33 +1362,23 @@ class PipelineLedger:
                 )
                 now = _now()
                 left_index = self._next_user_task_index(conn)
-                conn.execute(
-                    "INSERT INTO pipeline_task_segments "
-                    "(recording_id, task_index, start_ts, end_ts, name, "
-                    " category, confidence, metadata, source, edited, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        self._recording_id, left_index, start, split_ts,
-                        name_left if name_left is not None else base_name,
-                        category, confidence, metadata,
-                        TASK_SOURCE_USER, 0, now,
-                    ),
+                _insert_user_task_row(
+                    conn, self._recording_id, left_index,
+                    start_ts=start, end_ts=split_ts,
+                    name=name_left if name_left is not None else base_name,
+                    category=category, confidence=confidence, metadata=metadata,
+                    edited=0, now=now,
                 )
                 # The just-inserted left row is visible on this connection, so the
                 # second allocation returns left_index+1 — the two halves never
                 # collide on UNIQUE(recording_id, task_index).
                 right_index = self._next_user_task_index(conn)
-                conn.execute(
-                    "INSERT INTO pipeline_task_segments "
-                    "(recording_id, task_index, start_ts, end_ts, name, "
-                    " category, confidence, metadata, source, edited, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        self._recording_id, right_index, split_ts, end,
-                        name_right if name_right is not None else base_name,
-                        category, confidence, metadata,
-                        TASK_SOURCE_USER, 0, now,
-                    ),
+                _insert_user_task_row(
+                    conn, self._recording_id, right_index,
+                    start_ts=split_ts, end_ts=end,
+                    name=name_right if name_right is not None else base_name,
+                    category=category, confidence=confidence, metadata=metadata,
+                    edited=0, now=now,
                 )
                 conn.commit()
                 return (left_index, right_index)
@@ -1347,6 +1387,53 @@ class PipelineLedger:
                 raise
             finally:
                 conn.close()
+
+
+def read_task_segments_wire(rec_dir: Path) -> list[dict]:
+    """Read a recording's named task segments as the 6-field ``TaskSegment`` wire shape.
+
+    The single shared read path behind ``tasks.list`` (daemon) and the day-level
+    ``tasks`` band (``day_segments``): reads ``read_task_segments`` off the
+    recording's local-only ``recording.db`` (never uploaded — R4/R8) and projects
+    each row to ``{task_index, start_ts, end_ts, name, category, confidence}`` — the
+    store's ``source`` / ``edited`` ownership columns stay internal.
+
+    READ-FIRST: reads directly and only migrates
+    (``ensure_pipeline_state_schema``) on a missing-table / missing-column
+    ``sqlite3.OperationalError``, so an already-migrated DB never runs DDL per call
+    while a legacy DB still migrates once and retries. Returns ``[]`` on any
+    legitimate absence — a missing ``recording.db`` (legacy / pre-U1 recording), a
+    DB with no ``recording`` row, an unreadable DB, or a recording whose
+    segmentation produced no tasks — never raising for those (fail-open read
+    surface). Local-only: nothing new leaves the machine.
+    """
+    db_path = rec_dir / "recording.db"
+    if not db_path.exists():
+        return []
+    try:
+        segments = PipelineLedger(db_path).read_task_segments()
+    except sqlite3.OperationalError:
+        # Legacy DB missing the task table / pre-U5 source/edited columns → migrate
+        # once (idempotent, creates the table on an old DB), then retry the read.
+        try:
+            ensure_pipeline_state_schema(db_path)
+            segments = PipelineLedger(db_path).read_task_segments()
+        except (LedgerError, sqlite3.Error):
+            return []
+    except (LedgerError, sqlite3.Error):
+        # No recording row / unreadable DB → treat as "no tasks" rather than raise.
+        return []
+    return [
+        {
+            "task_index": seg.task_index,
+            "start_ts": seg.start_ts,
+            "end_ts": seg.end_ts,
+            "name": seg.name,
+            "category": seg.category,
+            "confidence": seg.confidence,
+        }
+        for seg in segments
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -1087,7 +1087,7 @@ def _carve_out_protected_spans(
     if not isinstance(task_list, list) or not task_list:
         return tasks
 
-    from screencap.pipeline_state import TASK_SOURCE_USER
+    from screencap.pipeline_state import spans_overlap, task_row_is_protected
 
     try:
         rows = ledger.read_task_segments()
@@ -1100,7 +1100,7 @@ def _carve_out_protected_spans(
     protected = [
         (r.start_ts, r.end_ts)
         for r in rows
-        if r.source == TASK_SOURCE_USER or r.edited
+        if task_row_is_protected(r)
     ]
     if not protected:
         return tasks
@@ -1112,7 +1112,7 @@ def _carve_out_protected_spans(
         except (TypeError, ValueError):
             return False
         # Half-open overlap: [start, end) intersects [p_start, p_end).
-        return any(start < p_end and p_start < end for p_start, p_end in protected)
+        return any(spans_overlap(start, end, p_start, p_end) for p_start, p_end in protected)
 
     kept = [
         t for t in task_list if isinstance(t, dict) and not _overlaps_protected(t)
@@ -1326,7 +1326,11 @@ def _persist_local_tasks(
     """
     import json
 
-    from screencap.pipeline_state import TASK_SOURCE_AGENT, TaskSegmentRow
+    from screencap.pipeline_state import (
+        TASK_SOURCE_AGENT,
+        TASK_SOURCE_USER,
+        TaskSegmentRow,
+    )
 
     task_list = [
         t for t in (tasks.get("tasks", []) if isinstance(tasks, dict) else [])
@@ -1346,7 +1350,7 @@ def _persist_local_tasks(
             preserved = [
                 t for t in prior_tasks
                 if isinstance(t, dict)
-                and (t.get("source") == "user" or t.get("edited"))
+                and (t.get("source") == TASK_SOURCE_USER or t.get("edited"))
             ]
         except (OSError, ValueError):
             preserved = []

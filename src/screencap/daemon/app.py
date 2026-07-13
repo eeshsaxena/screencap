@@ -2119,40 +2119,10 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     upload rules are unchanged: this only reads rows the local pipeline already
     persisted; nothing leaves the Mac.
     """
-    import sqlite3
-
     from screencap.config import resolve_recording_dir
-    from screencap.pipeline_state import (
-        LedgerError,
-        PipelineLedger,
-        ensure_pipeline_state_schema,
-    )
+    from screencap.pipeline_state import read_task_segments_wire
 
-    rec_dir = resolve_recording_dir(recording)
-    db_path = rec_dir / "recording.db"
-    if not db_path.exists():
-        return []
-    try:
-        # Idempotent, read-tolerant: creates the table on an old DB (no-op on a
-        # current one), so reading a recording captured before U4 landed never
-        # raises "no such table".
-        ensure_pipeline_state_schema(db_path)
-        ledger = PipelineLedger(db_path)
-        segments = ledger.read_task_segments()
-    except (LedgerError, sqlite3.Error):
-        # No recording row / unreadable DB → treat as "no tasks" rather than 500.
-        return []
-    return [
-        {
-            "task_index": seg.task_index,
-            "start_ts": seg.start_ts,
-            "end_ts": seg.end_ts,
-            "name": seg.name,
-            "category": seg.category,
-            "confidence": seg.confidence,
-        }
-        for seg in segments
-    ]
+    return read_task_segments_wire(resolve_recording_dir(recording))
 
 
 async def tasks_list(request: Request) -> JSONResponse:

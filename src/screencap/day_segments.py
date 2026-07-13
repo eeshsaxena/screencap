@@ -146,37 +146,9 @@ def _read_task_segments(rec_dir: Path) -> list[dict[str, Any]]:
     store's ``source`` / ``edited`` ownership columns stay internal. Local-only:
     nothing new leaves the machine.
     """
-    import sqlite3
+    from screencap.pipeline_state import read_task_segments_wire
 
-    from screencap.pipeline_state import (
-        LedgerError,
-        PipelineLedger,
-        ensure_pipeline_state_schema,
-    )
-
-    db_path = rec_dir / "recording.db"
-    if not db_path.exists():
-        return []
-    try:
-        # Idempotent, read-tolerant: creates the table on an old DB (no-op on a
-        # current one), so a recording captured before the tasks store existed
-        # never raises "no such table".
-        ensure_pipeline_state_schema(db_path)
-        segments = PipelineLedger(db_path).read_task_segments()
-    except (LedgerError, sqlite3.Error):
-        # No recording row / unreadable DB → "no tasks", never a 500.
-        return []
-    return [
-        {
-            "task_index": seg.task_index,
-            "start_ts": seg.start_ts,
-            "end_ts": seg.end_ts,
-            "name": seg.name,
-            "category": seg.category,
-            "confidence": seg.confidence,
-        }
-        for seg in segments
-    ]
+    return read_task_segments_wire(rec_dir)
 
 
 def day_segments(

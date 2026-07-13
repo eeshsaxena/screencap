@@ -464,6 +464,13 @@ class Supervisor:
         # today's Journal fills before the stream stops). Persists across re-arms
         # and day rolls; cancelled in ``shutdown``.
         self._ambient_seg_task: asyncio.Task[Any] | None = None
+        # SCR-214 U6: change-detection key for the last segmentation sweep — a cheap
+        # fingerprint of the ambient day's completed-manifest set + kept-task count.
+        # The sweep SKIPS a tick whose fingerprint is unchanged (a no-op re-segment
+        # on an idle always-on recorder). ``None`` (no completed manifests yet /
+        # unreadable) fails OPEN — the pass runs — so we only skip on positive
+        # evidence nothing changed.
+        self._last_segmentation_key: tuple[Any, ...] | None = None
         # Set at the top of ``shutdown`` so a torn-down daemon never re-arms.
         self._shutting_down = False
 
@@ -1084,15 +1091,16 @@ class Supervisor:
         # handled, so `_handle_engine_exit` does not re-arm the ambient stream
         # into a dying loop. Cancel any pending ambient re-arm for the same reason.
         self._shutting_down = True
-        if self._ambient_spawn_task is not None and not self._ambient_spawn_task.done():
-            self._ambient_spawn_task.cancel()
-        # SCR-214 U3: stop the day-boundary watch so a torn-down daemon never rolls.
-        if self._ambient_day_task is not None and not self._ambient_day_task.done():
-            self._ambient_day_task.cancel()
-        # SCR-214 U6: stop the incremental-segmentation watch so a torn-down daemon
-        # never kicks off a new pass.
-        if self._ambient_seg_task is not None and not self._ambient_seg_task.done():
-            self._ambient_seg_task.cancel()
+        # Cancel the pending ambient re-arm (U2), the day-boundary watch (U3 — a
+        # torn-down daemon never rolls), and the incremental-segmentation watch (U6
+        # — never kicks off a new pass).
+        for _ambient_task in (
+            self._ambient_spawn_task,
+            self._ambient_day_task,
+            self._ambient_seg_task,
+        ):
+            if _ambient_task is not None and not _ambient_task.done():
+                _ambient_task.cancel()
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
@@ -1771,44 +1779,77 @@ class Supervisor:
             return f"ambient-{parts[1]}"
         return None
 
+    def _start_watch(
+        self, task_attr: str, coro_factory: "Callable[[], Any]"
+    ) -> None:
+        """Idempotently start a long-lived watch task stored on ``task_attr``.
+
+        Shared by the day-boundary (U3) and incremental-segmentation (U6) watches:
+        a no-op if the task on ``task_attr`` is still running, else create it from
+        ``coro_factory`` (a zero-arg callable returning the watch coroutine).
+        """
+        existing = getattr(self, task_attr)
+        if existing is not None and not existing.done():
+            return
+        setattr(self, task_attr, asyncio.create_task(coro_factory()))
+
+    async def _periodic_watch(
+        self,
+        interval: float,
+        tick: "Callable[[], Any]",
+        failure_msg: str,
+    ) -> None:
+        """Shared driver for the long-lived ambient watches (U3/U6).
+
+        Loops until shutdown: sleep ``interval`` (a cancel is a clean exit), then
+        run ``tick`` (a zero-arg coroutine factory) fail-open — a tick error is
+        logged with ``failure_msg`` and the watch keeps going. The distinct
+        per-watch work lives entirely in ``tick``; the sleep cadence, the
+        cancel/shutdown guards, and the fail-open belt are identical across watches.
+        """
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if self._shutting_down:
+                return
+            try:
+                await tick()
+            except Exception:  # noqa: BLE001 — a tick error must not kill the watch
+                logger.warning(failure_msg, exc_info=True)
+
     def _start_ambient_day_watch(self) -> None:
         """Start the long-lived day-boundary watch task (idempotent)."""
-        if self._ambient_day_task is not None and not self._ambient_day_task.done():
-            return
-        self._ambient_day_task = asyncio.create_task(self._ambient_day_watch())
+        self._start_watch(
+            "_ambient_day_task",
+            lambda: self._periodic_watch(
+                self._ambient_day_tick_interval,
+                self._ambient_day_watch_tick,
+                "ambient day-roll failed; will retry on the next tick",
+            ),
+        )
 
-    async def _ambient_day_watch(self) -> None:
+    async def _ambient_day_watch_tick(self) -> None:
         """Roll the ambient recording at the LOCAL day boundary (SCR-214 U3/R5).
 
-        Periodically compares the live ambient recording's day (from its
-        ``ambient-YYYYMMDD`` dir name) against the current local day; on an advance
-        it performs a stop→start roll to the next per-day dir.
+        Per-tick body of the day-boundary watch (driven by :meth:`_periodic_watch`).
+        Compares the live ambient recording's day (from its ``ambient-YYYYMMDD`` dir
+        name) against the current local day; on an advance it performs a stop→start
+        roll to the next per-day dir.
 
         WAKE-SAFE by construction: the roll is driven by an *observed* date change,
         NOT a fired-at-midnight timer. While the Mac sleeps the daemon (and this
-        loop) is suspended, so no tick fires at the real midnight; the FIRST tick
+        watch) is suspended, so no tick fires at the real midnight; the FIRST tick
         after wake sees the advanced date and rolls then. No macOS wake
         notification is needed for correctness. The check is cheap (a string
         compare) and rolls at most once per boundary — post-roll the live day
         equals ``now`` again, so the next tick is a no-op.
         """
-        while not self._shutting_down:
-            try:
-                await asyncio.sleep(self._ambient_day_tick_interval)
-            except asyncio.CancelledError:
-                return
-            if self._shutting_down:
-                return
-            active_day = self._active_ambient_day()
-            if active_day is None or active_day == self._local_day_name():
-                continue
-            try:
-                await self._roll_ambient_day()
-            except Exception:  # noqa: BLE001 — a roll error must not kill the watch
-                logger.warning(
-                    "ambient day-roll failed; will retry on the next tick",
-                    exc_info=True,
-                )
+        active_day = self._active_ambient_day()
+        if active_day is None or active_day == self._local_day_name():
+            return
+        await self._roll_ambient_day()
 
     async def _roll_ambient_day(self) -> None:
         """Close today's ambient recording and open the next day's (U3/R5/KTD1).
@@ -1864,45 +1905,97 @@ class Supervisor:
 
     def _start_ambient_segmentation_watch(self) -> None:
         """Start the long-lived incremental-segmentation watch task (idempotent, U6)."""
-        if self._ambient_seg_task is not None and not self._ambient_seg_task.done():
-            return
-        self._ambient_seg_task = asyncio.create_task(
-            self._ambient_segmentation_watch()
+        self._start_watch(
+            "_ambient_seg_task",
+            lambda: self._periodic_watch(
+                self._ambient_seg_tick_interval,
+                self._ambient_segmentation_watch_tick,
+                "ambient incremental segmentation tick failed; will retry on "
+                "the next tick",
+            ),
         )
 
-    async def _ambient_segmentation_watch(self) -> None:
-        """Re-segment the live ambient day on a timer so today's Journal fills (U6/R7).
+    async def _ambient_segmentation_watch_tick(self) -> None:
+        """Re-segment the live ambient day so today's Journal fills (U6/R7).
 
-        A periodic sweep (env ``SCREENCAP_AMBIENT_SEG_TICK_INTERVAL``, default 300s)
-        that, for the active ambient recording, runs one incremental segmentation
-        pass on a WORKER THREAD (mirroring ``resume_terminal_stage``'s non-blocking
-        pattern so the asyncio loop is never blocked by the terminal-stage
-        segmenter). Started alongside ambient auto-start and cancelled in
-        ``shutdown``; persists across re-arms and day rolls (KTD4). A tick is a
-        no-op when nothing ambient is live, or while a day roll is in progress (the
-        recording is mid stop→start).
+        Per-tick body of the incremental-segmentation sweep (env
+        ``SCREENCAP_AMBIENT_SEG_TICK_INTERVAL``, default 300s), driven by
+        :meth:`_periodic_watch`. For the active ambient recording it runs one
+        incremental segmentation pass on a WORKER THREAD (mirroring
+        ``resume_terminal_stage``'s non-blocking pattern so the asyncio loop is never
+        blocked by the terminal-stage segmenter). Started alongside ambient
+        auto-start and cancelled in ``shutdown``; persists across re-arms and day
+        rolls (KTD4). A tick is a no-op when nothing ambient is live, or while a day
+        roll is in progress (the recording is mid stop→start).
+
+        CHANGE-DETECTION (U6): the pass SKIPS when the ambient day's fingerprint
+        (completed-manifest set + kept-task count) is unchanged since the last pass —
+        a full-day re-segment on an idle always-on recorder is a no-op that produces
+        identical output. An unknown fingerprint (no completed manifests yet /
+        unreadable) fails OPEN and runs the pass, so we skip only on positive
+        evidence nothing changed. The kept-task count is in the key so a user
+        curation edit still forces a re-carve even with no new footage.
         """
-        while not self._shutting_down:
-            try:
-                await asyncio.sleep(self._ambient_seg_tick_interval)
-            except asyncio.CancelledError:
-                return
-            if self._shutting_down:
-                return
-            # A roll is stopping/reopening the recording — let it settle rather than
-            # segmenting a dir mid-teardown (the finalize's own final pass covers it).
-            if self._ambient_rolling:
-                continue
-            recording_dir = self._active_ambient_dir()
-            if recording_dir is None:
-                continue
-            try:
-                await self._run_incremental_segmentation(recording_dir)
-            except Exception:  # noqa: BLE001 — a pass error must not kill the watch
-                logger.warning(
-                    "ambient incremental segmentation tick failed; will retry on "
-                    "the next tick", exc_info=True,
-                )
+        # A roll is stopping/reopening the recording — let it settle rather than
+        # segmenting a dir mid-teardown (the finalize's own final pass covers it).
+        if self._ambient_rolling:
+            return
+        recording_dir = self._active_ambient_dir()
+        if recording_dir is None:
+            return
+        key = self._segmentation_fingerprint(recording_dir)
+        if key is not None and key == self._last_segmentation_key:
+            return
+        await self._run_incremental_segmentation(recording_dir)
+        self._last_segmentation_key = key
+
+    def _segmentation_fingerprint(
+        self, recording_dir: Path
+    ) -> "tuple[Any, ...] | None":
+        """A cheap change-key for the ambient day, or ``None`` to force a pass (U6).
+
+        Combines the completed-manifest set (``chunk_*_manifest.json`` count, highest
+        chunk index, max manifest mtime — statted, never re-read) with the kept
+        (user/edited) task-row count, plus the dir name so a day roll never aliases a
+        prior day's key. Returns ``None`` — meaning "run the pass" (fail-open) — when
+        there is no completed manifest yet or anything is unreadable, so a skip only
+        ever happens on positive evidence of an unchanged, non-empty state.
+        """
+        try:
+            manifests = list(recording_dir.glob("chunk_*_manifest.json"))
+        except OSError:
+            return None
+        if not manifests:
+            return None
+        try:
+            count = len(manifests)
+            highest_index = max(
+                int(m.name.split("_")[1]) for m in manifests
+            )
+            max_mtime = max(m.stat().st_mtime_ns for m in manifests)
+            kept = self._kept_task_row_count(recording_dir)
+        except (OSError, ValueError, IndexError):
+            return None
+        return (recording_dir.name, count, highest_index, max_mtime, kept)
+
+    def _kept_task_row_count(self, recording_dir: Path) -> int:
+        """Count the recording's KEPT (user/edited) task rows for the change-key (U6).
+
+        Reads the local-only ``recording.db`` task-segment store and counts the
+        protected (``source='user'`` OR edited) rows, so a user curation edit shifts
+        the segmentation fingerprint and forces a re-carve. A missing DB yields ``0``;
+        a read error propagates to the fingerprint's fail-open ``None``.
+        """
+        from screencap.pipeline_state import (
+            PipelineLedger,
+            task_row_is_protected,
+        )
+
+        db_path = recording_dir / "recording.db"
+        if not db_path.exists():
+            return 0
+        rows = PipelineLedger(db_path).read_task_segments()
+        return sum(1 for r in rows if task_row_is_protected(r))
 
     async def _run_incremental_segmentation(self, recording_dir: Path) -> None:
         """Run one incremental segmentation pass off-loop (U6/KTD4).

@@ -448,11 +448,6 @@ def _evictable_candidates(
 # ---------------------------------------------------------------------------
 
 
-def _spans_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
-    """Half-open ``[a_start, a_end)`` ∩ ``[b_start, b_end)`` is non-empty."""
-    return a_start < b_end and b_start < a_end
-
-
 def chunk_capture_bounds(recording_dir: Path, idx: int) -> tuple[float, float] | None:
     """Per-chunk CAPTURE-time bounds ``(chunk_start, chunk_end)`` from its manifest.
 
@@ -492,7 +487,7 @@ def _kept_task_spans(ledger: "PipelineLedger") -> list[tuple[float, float]]:
     almost nothing to evict. Fail-safe: a read error yields no spans (retention
     proceeds under the age floor; a spurious protection is never invented).
     """
-    from screencap.pipeline_state import TASK_SOURCE_USER
+    from screencap.pipeline_state import task_row_is_protected
 
     try:
         rows = ledger.read_task_segments()
@@ -501,7 +496,7 @@ def _kept_task_spans(ledger: "PipelineLedger") -> list[tuple[float, float]]:
         return []
     spans: list[tuple[float, float]] = []
     for r in rows:
-        if r.source != TASK_SOURCE_USER and not r.edited:
+        if not task_row_is_protected(r):
             continue
         try:
             s, e = float(r.start_ts), float(r.end_ts)
@@ -526,6 +521,8 @@ def _task_protected_indices(
     there are no kept spans — the common non-ambient / no-user-task case is a
     zero-cost no-op.
     """
+    from screencap.pipeline_state import spans_overlap
+
     spans = _kept_task_spans(ledger)
     if not spans:
         return set()
@@ -536,7 +533,7 @@ def _task_protected_indices(
             protected.add(c.chunk_index)
             continue
         cs, ce = bounds
-        if any(_spans_overlap(cs, ce, ss, se) for ss, se in spans):
+        if any(spans_overlap(cs, ce, ss, se) for ss, se in spans):
             protected.add(c.chunk_index)
     return protected
 
@@ -556,7 +553,7 @@ def task_span_is_orphaned(
     recording with no evicted chunks (or no chunk/ledger info at all) fails OPEN
     (returns False). Any read hiccup fails open.
     """
-    from screencap.pipeline_state import EvictState
+    from screencap.pipeline_state import EvictState, spans_overlap
 
     try:
         rows = ledger.all_chunks()
@@ -569,7 +566,7 @@ def task_span_is_orphaned(
             has_evicted = True
             continue
         bounds = chunk_capture_bounds(recording_dir, r.chunk_index)
-        if bounds is not None and _spans_overlap(bounds[0], bounds[1], start_ts, end_ts):
+        if bounds is not None and spans_overlap(bounds[0], bounds[1], start_ts, end_ts):
             return False  # surviving footage covers the span → playable → not orphaned
     return has_evicted
 
