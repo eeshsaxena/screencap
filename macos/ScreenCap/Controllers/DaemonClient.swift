@@ -542,6 +542,15 @@ struct DayBlockedInterval: Decodable, Sendable, Hashable {
 /// One recording's day-clamped span + honest blocked-interval split (U3).
 /// `blockedProven` may be hatched "blocked"; `unverifiable` must render as a
 /// neutral gap, never labelled "blocked" (R7).
+///
+/// `tasks` (U9/SCR-214, additive) carries this recording's named task segments
+/// so the Day-timeline gets every band for the day in ONE `timeline.day`
+/// round-trip — no second `tasks.list` per recording. It reuses the shared
+/// `RecordingTask` wire shape (`tasks.list` and the nested day band are one
+/// model, so the strip and the per-recording view can't drift). Empty (never
+/// absent) for a recording with no tasks store, a legacy recording, or an older
+/// daemon that predates the field — decoded via `decodeIfPresent`, so the app
+/// stays compatible with a daemon that never emits `tasks`.
 struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let name: String
     let recordingId: String?
@@ -550,11 +559,13 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let endMs: Int
     let blockedProven: [DayBlockedInterval]
     let unverifiable: [DayBlockedInterval]
+    let tasks: [RecordingTask]
 
     init(
         name: String, recordingId: String? = nil, state: String = "ready",
         startMs: Int, endMs: Int,
-        blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = []
+        blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = [],
+        tasks: [RecordingTask] = []
     ) {
         self.name = name
         self.recordingId = recordingId
@@ -563,6 +574,20 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         self.endMs = endMs
         self.blockedProven = blockedProven
         self.unverifiable = unverifiable
+        self.tasks = tasks
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        recordingId = try c.decodeIfPresent(String.self, forKey: .recordingId)
+        state = try c.decode(String.self, forKey: .state)
+        startMs = try c.decode(Int.self, forKey: .startMs)
+        endMs = try c.decode(Int.self, forKey: .endMs)
+        blockedProven = try c.decode([DayBlockedInterval].self, forKey: .blockedProven)
+        unverifiable = try c.decode([DayBlockedInterval].self, forKey: .unverifiable)
+        // Older daemon (pre-U9 `timeline.day` v2) omits `tasks` entirely.
+        tasks = try c.decodeIfPresent([RecordingTask].self, forKey: .tasks) ?? []
     }
 
     enum CodingKeys: String, CodingKey {
@@ -573,6 +598,7 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         case endMs = "end_ms"
         case blockedProven = "blocked_proven"
         case unverifiable
+        case tasks
     }
 }
 

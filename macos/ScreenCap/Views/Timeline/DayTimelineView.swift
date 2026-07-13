@@ -352,6 +352,7 @@ struct DayTimelineView: View {
         VStack(alignment: .leading, spacing: 0) {
             DayStripView(
                 bounds: axisBounds,
+                baseTracks: stripBaseTracks,
                 segments: stripSegments,
                 blockedBands: DayStripBlockedBand.provenBands(from: spans),
                 matchesMs: dayMatchesMs,
@@ -366,15 +367,25 @@ struct DayTimelineView: View {
         .overlay(alignment: .top) { Divider().overlay(Color.scBorderWarm) }
     }
 
-    private var stripSegments: [DayStripSegment] {
+    /// The "unsplit — still searchable" base layer: one full-span rectangle per
+    /// recording, titled from the local index (falling back to the directory
+    /// name). Task bands overlay these.
+    private var stripBaseTracks: [DayStripBaseTrack] {
         spans.map { span in
-            DayStripSegment(
+            DayStripBaseTrack(
                 recording: span.name,
                 title: index.recordings.first { $0.name == span.name }?.title ?? span.name,
                 startMs: span.startMs,
                 endMs: span.endMs
             )
         }
+    }
+
+    /// N agent/user task bands per recording, from the additive `tasks` field on
+    /// `timeline.day` (U9) — see `DayStripSegment.bands(from:)`. A recording with
+    /// no tasks contributes nothing here and renders as a plain unsplit base band.
+    private var stripSegments: [DayStripSegment] {
+        DayStripSegment.bands(from: spans)
     }
 
     // MARK: - Search (day-scoped)
