@@ -212,6 +212,35 @@ async def test_lock_nothing_active_seals_fast(container_on, monkeypatch):
     assert detach.calls[0]["force"] is True
 
 
+async def test_lock_refused_when_store_not_mounted(container_on, monkeypatch):
+    """``storage.lock`` from an ABSENT/ERROR store refuses upfront (typed).
+
+    Entering the lock flow from a non-MOUNTED state is actively dangerous: the
+    failed-detach unwind (KTD-15 step 6) restores MOUNTED, which would flip an
+    unavailable store — e.g. the alive ``mountpoint_occupied`` / key-error
+    states — into one the ``recording.start`` gate trusts, re-enabling plaintext
+    capture while the container is enabled and a bundle exists."""
+    from screencap.daemon import store_lifecycle as sl2
+
+    detach = _DetachSpy()
+    monkeypatch.setattr(container, "detach", detach)
+    app, sup = _build_app(StoreState.ERROR)
+    app.state.store_reason = sl2.ERROR_MOUNTPOINT_OCCUPIED
+
+    async with _client(app) as c:
+        resp = await c.post("/v0/storage.lock", json={})
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"] == errors.STORE_LOCK_FAILED
+    assert body["reason"] == "store_not_mounted"
+    # The store state was never flipped — recording.start stays refused.
+    assert app.state.store_state == "error"
+    assert not sup.is_locked()
+    assert not sl.is_sealed()
+    assert detach.calls == []  # the lock flow was never entered
+
+
 async def test_lock_refuses_during_encrypt_cutover_no_detach(
     container_on, monkeypatch, tmp_path
 ):

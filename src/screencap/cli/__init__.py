@@ -5319,6 +5319,13 @@ def _store_state_guidance(state, reason):  # noqa: ANN001
             "Downgrading an encrypted store to plaintext is unsupported. Re-enable "
             "the container (settings container_enabled=true) to keep using the vault.",
         )
+    if reason == _sl.ERROR_MOUNTPOINT_OCCUPIED:
+        return (
+            "Existing recordings occupy the recordings directory, so the "
+            "encrypted store can't be mounted over them.",
+            "Nothing was destroyed. Migrate the library into the encrypted "
+            "store: run [bold]screencap storage encrypt start[/bold].",
+        )
     # ERROR_KEY_MISSING (or an unknown reason) — the genuine key-loss diagnosis.
     return (
         "The encrypted store exists but its key is missing.",
@@ -5335,9 +5342,11 @@ def _guard_store_available(err_console=None) -> None:
     resolver and — on any non-``MOUNTED`` state — prints a state-naming error with
     the next step and exits non-zero, BEFORE the caller ever reaches
     ``get_recordings_dir()`` (so no plaintext directory is created at the
-    mountpoint). A ROGUE / corrupted-bundle operator error is surfaced as a hard
-    stop too. On a healthy store this returns after ensuring it is mounted (the
-    resolver reuses an existing mount and never force-creates plaintext).
+    mountpoint). A corrupted-bundle / auth operator error is surfaced as a hard
+    stop too; an occupied mountpoint resolves to the typed ``ERROR`` guidance
+    above instead of raising. On a healthy store this returns after ensuring it
+    is mounted (the resolver reuses an existing mount and never force-creates
+    plaintext).
     """
     from screencap import config
 
@@ -5591,16 +5600,50 @@ def storage_init_cmd() -> None:
     to create a fresh bundle (never minting a second key that would orphan a
     later-restored bundle).
     """
+    from screencap import config as _config
     from screencap import container
     from screencap.daemon import store_lifecycle as _sl
 
     bundle = _sl.store_bundle_path()
+    mountpoint = _config.get_recordings_dir()
+
+    def _occupied_error() -> None:
+        console.print(
+            "[red]Error:[/red] existing recordings occupy "
+            f"{escape(str(mountpoint))}, which is not yet an encrypted volume. "
+            "A bare init would leave the store unmountable. Run "
+            "[bold]screencap storage encrypt start[/bold] to migrate the "
+            "library into the encrypted store instead."
+        )
+        raise SystemExit(1)
+
     if bundle.exists():
         console.print(
             f"[dim]Encrypted store already initialized at "
             f"{escape(str(bundle))}. Nothing to do.[/dim]"
         )
+        # An already-wedged install (a pre-guard bare init over a plaintext
+        # library): stay idempotent (exit 0 — the app's setup flow relies on
+        # it), but don't hide the breakage behind the calm no-op message.
+        if _sl.mountpoint_is_occupied(mountpoint):
+            console.print(
+                "[yellow]Warning:[/yellow] existing recordings still occupy "
+                f"{escape(str(mountpoint))}, so the store cannot mount over "
+                "them. Run [bold]screencap storage encrypt start[/bold] to "
+                "migrate them into the encrypted store."
+            )
         return
+
+    # A non-empty plain directory at the recordings mountpoint means an existing
+    # plaintext library. Creating the bundle now would wedge every daemon start
+    # into the occupied-mountpoint error (the resolver refuses to attach over
+    # it) — that library must go through the encrypt-migration flow instead,
+    # which creates the bundle itself. This is the single creation path (KTD-5),
+    # so the guard also covers the app's onboarding auto-init. Same predicate as
+    # the resolver (store_lifecycle.mountpoint_is_occupied) so the two never
+    # drift.
+    if _sl.mountpoint_is_occupied(mountpoint):
+        _occupied_error()
 
     # Bundle absent. Reuse an existing key if one is present (bundle-absent +
     # key-present); otherwise mint + persist a fresh one (foreground ACL prompt).
@@ -5625,7 +5668,15 @@ def storage_init_cmd() -> None:
             key_note = "minted a new key"
         else:
             key_note = "reused the existing key"
-        container.create_bundle(str(bundle), key)
+        # Re-check occupancy under mount.lock right before creating: the key
+        # mint above can sit behind a Keychain ACL prompt for a long time, and
+        # a writer landing at the mountpoint in that window (a stale-state
+        # daemon still recording, Finder debris) would otherwise recreate the
+        # exact wedge the guard above exists to prevent.
+        with _sl.mount_lock():
+            if _sl.mountpoint_is_occupied(mountpoint):
+                _occupied_error()
+            container.create_bundle(str(bundle), key)
     except container.ContainerError as exc:
         console.print(f"[red]Error creating encrypted store:[/red] {escape(str(exc))}")
         raise SystemExit(1) from exc
