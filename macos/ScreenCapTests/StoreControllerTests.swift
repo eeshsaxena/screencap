@@ -88,4 +88,34 @@ final class StoreControllerTests: XCTestCase {
         XCTAssertNotNil(controller.lastError, "a failed lock verb surfaces an error")
         XCTAssertEqual(controller.phase, .idle)
     }
+
+    func testInitializeCallsInitActionAndReturnsIdle() async {
+        let initCounter = Counter()
+        let controller = StoreController(
+            presenceGate: PresenceGate(evaluator: FakePresence(), graceWindow: 0),
+            lockAction: {},
+            unlockAction: {},
+            initAction: { initCounter.bump() }
+        )
+        await controller.performInitialize()
+        XCTAssertEqual(initCounter.count, 1, "setup runs the init action (init + daemon adopt)")
+        XCTAssertNil(controller.lastError)
+        XCTAssertEqual(controller.phase, .idle)
+    }
+
+    /// The "nothing happened" fix's defense-in-depth arm: a failing setup (e.g. the
+    /// daemon adopt returning `store_lock_failed`, or a locked Keychain) must set
+    /// `lastError` so `StoreStateView` can render it instead of silently reverting.
+    func testInitializeSurfacesActionError() async {
+        struct Boom: Error {}
+        let controller = StoreController(
+            presenceGate: PresenceGate(evaluator: FakePresence(), graceWindow: 0),
+            lockAction: {},
+            unlockAction: {},
+            initAction: { throw Boom() }
+        )
+        await controller.performInitialize()
+        XCTAssertNotNil(controller.lastError, "a failed setup surfaces an error (not silent)")
+        XCTAssertEqual(controller.phase, .idle)
+    }
 }

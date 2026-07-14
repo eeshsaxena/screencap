@@ -112,6 +112,11 @@ struct StoreStateView: View {
     var onSetup: (() -> Void)?
     /// A lock/unlock/setup round-trip is in flight — disables the action + relabels.
     var isBusy: Bool = false
+    /// A failed lock/unlock/setup action's message (`StoreController.lastError`),
+    /// surfaced here so a Library/Chat/Recall failure isn't invisible — it was only
+    /// ever shown in the menu bar, which is why a failed "Set up encrypted storage"
+    /// read as "nothing happened". nil / empty renders nothing.
+    var errorText: String? = nil
     /// Tighter spacing for the Recall palette panel (vs the full-area Library/Chat).
     var compact: Bool = false
 
@@ -132,6 +137,15 @@ struct StoreStateView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: compact ? 360 : 420)
                 actions(copy)
+                if let errorText, !errorText.isEmpty {
+                    Text(errorText)
+                        .font(compact ? SCTypography.sans(size: 11.5) : SCTypography.sans(size: 12.5))
+                        .foregroundStyle(Color.scErrorFg)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: compact ? 360 : 420)
+                        .accessibilityLabel("Error: \(errorText)")
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: compact ? nil : .infinity)
             .padding(compact ? SCMetrics.space6 : SCMetrics.space8)

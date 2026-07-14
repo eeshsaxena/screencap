@@ -63,6 +63,10 @@ _STORAGE_MIGRATE_API_VERSION = 1
 # backfill additive precedent).
 _STORAGE_LOCK_API_VERSION = 1
 _STORAGE_UNLOCK_API_VERSION = 1
+# SCR-258 U10: the ``storage.mount`` verb — makes an already-running daemon adopt
+# a store the foreground ``storage init`` CLI just created (the ``absent ->
+# mounted`` transition). Additive (new verb) — no global API_SCHEMA_VERSION bump.
+_STORAGE_MOUNT_API_VERSION = 1
 # SCR-258 U6 (KTD-18): the ``storage.encrypt.start|status|cancel`` upgrade-migration
 # verbs. Additive (new verbs) — no global API_SCHEMA_VERSION bump.
 _STORAGE_ENCRYPT_API_VERSION = 1

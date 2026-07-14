@@ -127,15 +127,29 @@ def _info_plist(bundle_path, mountpoint="/Users/x/.screencap/recordings", device
 
 
 @pytest.mark.privacy
-def test_passphrase_piped_verbatim_no_trailing_newline(monkeypatch):
-    """The shared helper pipes the key exactly, appending no newline (KTD-6)."""
-    key = b"c2NyZWVuY2FwLWtleQ=="  # base64-ish; deliberately no trailing \n
+def test_passphrase_piped_as_utf8_base64_no_trailing_newline(monkeypatch):
+    """The shared helper pipes the key's stable base64 TEXT (KTD-6), not the raw
+    bytes, and appends no newline.
+
+    Regression (macOS 26 ``hdiutil -stdinpass``): a raw 256-bit key
+    (``secrets.token_bytes``) almost always contains high bytes (0x80-0xFF) that
+    are NOT valid UTF-8, and modern ``hdiutil`` rejects a non-UTF-8 passphrase with
+    "unable to process -stdinpass argument" — so every ``storage init`` failed. The
+    passphrase must therefore be the key's ASCII base64, valid UTF-8 for ANY key.
+    The old assertion here piped the raw bytes and only passed because its test key
+    happened to be ASCII — which is exactly how the bug reached users.
+    """
+    key = bytes(range(224, 256))  # 32 bytes, all 0xe0-0xff — NOT valid UTF-8 raw
+    with pytest.raises(UnicodeDecodeError):
+        key.decode("utf-8")  # precondition: the raw key really is non-UTF-8
     rec = _install_popen(monkeypatch, stdout=_attach_plist())
 
     container.attach("/tmp/store.sparsebundle", key, "/tmp/mp")
 
-    assert rec["input"] == key
-    assert not rec["input"].endswith(b"\n")
+    piped = rec["input"]
+    assert piped == container._encode_key(key).encode("ascii")
+    piped.decode("utf-8")  # MUST NOT raise — hdiutil requires a UTF-8 passphrase
+    assert not piped.endswith(b"\n")
     # The child's stdin was actually opened as a pipe.
     assert rec["stdin_mode"] == subprocess.PIPE
 
@@ -151,14 +165,17 @@ def test_passphrase_piped_verbatim_no_trailing_newline(monkeypatch):
         lambda k: container.compact("/tmp/b.sparsebundle", k),
     ],
 )
-def test_every_key_piping_wrapper_uses_the_shared_helper(monkeypatch, call):
-    """create / attach / compact all pipe through the one helper, no newline."""
-    key = b"raw-passphrase-bytes"
+def test_every_key_piping_wrapper_encodes_via_the_shared_helper(monkeypatch, call):
+    """create / attach / compact all pipe the SAME base64 derivation of the key
+    through the one helper — so the create passphrase always matches attach's — with
+    no trailing newline. A non-UTF-8 raw key proves the encoding, not verbatim bytes.
+    """
+    key = bytes(range(224, 256))  # non-UTF-8 raw key
     rec = _install_popen(monkeypatch, stdout=_attach_plist())
 
     call(key)
 
-    assert rec["input"] == key
+    assert rec["input"] == container._encode_key(key).encode("ascii")
     assert not rec["input"].endswith(b"\n")
 
 
@@ -439,9 +456,18 @@ _needs_darwin = pytest.mark.skipif(not _DARWIN, reason="hdiutil is macOS-only")
 
 
 def _mk_key() -> bytes:
+    """A production-shaped container key: RAW 256-bit bytes, exactly as
+    ``container.create_container_key`` mints them (``secrets.token_bytes``).
+
+    NOT ``token_hex`` (ASCII): the on-hardware roundtrip that used an ASCII key is
+    precisely why the macOS-26 ``hdiutil -stdinpass`` non-UTF-8 failure went
+    unnoticed — a raw random key almost always has high bytes, and the real product
+    passes raw bytes, not hex. Using the production shape here means these hardware
+    tests actually exercise the passphrase-encoding path (KTD-6).
+    """
     import secrets
 
-    return secrets.token_hex(32).encode("ascii")
+    return secrets.token_bytes(container._CONTAINER_KEY_LEN)
 
 
 def _flock_canary_worker(tag: str, lock_path: str, log_path: str) -> None:

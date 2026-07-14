@@ -4323,6 +4323,112 @@ async def storage_unlock(request: Request) -> JSONResponse:
     )
 
 
+async def storage_mount(request: Request) -> JSONResponse:
+    """``POST /v0/storage.mount`` — adopt a store the ``storage init`` CLI created (SCR-258 U10).
+
+    The one-time store CREATION (key mint + sparse bundle) is foreground-only in
+    the ``storage init`` CLI — the first Keychain write triggers a one-time ACL
+    prompt, so it must run in an interactive process (KTD-5), which is why the
+    app's "Set up encrypted storage" button shells out to that CLI rather than
+    minting the store inside this background daemon.
+
+    But the daemon resolves ``store_state`` ONCE at bind time (``server.serve`` ->
+    ``app.state.store_state``); a CLI ``storage init`` that runs while the daemon is
+    ALREADY alive leaves that cached value stale at ``absent``, so read verbs and
+    the ``recording.start`` gate keep refusing even though the bundle now exists.
+    This verb is the ``absent -> mounted`` transition that closes the gap — the
+    sibling of ``storage.unlock``'s ``locked -> mounted`` remount, without the
+    sealed sentinel (a fresh init was never sealed).
+
+    Mounts via ``store_lifecycle.mount_now`` and propagates the result to BOTH
+    ``app.state`` and the supervisor (so ``recording.start`` stops refusing). A
+    bundle that still does not exist -> ``absent`` (an init that never completed —
+    reported, not error'd); an unreadable key -> a typed retryable/terminal
+    ``store_lock_failed`` with the store left unmounted (mirrors ``storage.unlock``).
+    Idempotent — an already-mounted store re-mounts to the same live volume.
+    Audit-logged with peer provenance + outcome (KTD-23).
+    """
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon import store_lifecycle as sl
+    from screencap.daemon.store_lifecycle import ERROR_KEYCHAIN_LOCKED, StoreState
+
+    schema_version = schema._STORAGE_MOUNT_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.mount",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    supervisor = request.app.state.supervisor
+
+    # This verb adopts an ``absent`` (never-sealed) store. A sealed / LOCKED store
+    # is ``storage.unlock``'s job: ``mount_now`` deliberately IGNORES the sealed
+    # sentinel, so attaching here while sealed would flip the live mount to unlocked
+    # while leaving the on-disk sentinel behind — a cross-restart state disagreement
+    # (the next bind re-resolves LOCKED). Not reachable from the app (``defaultInit``
+    # only calls this from ``absent``), but the guard makes the contract self-enforcing.
+    if sl.is_sealed() or _store_state_value(request) == StoreState.LOCKED.value:
+        _audit("store_sealed")
+        return _api_error_response(
+            errors.StoreLockError(
+                "store_sealed",
+                "The store is locked; unlock it with storage.unlock instead.",
+                schema_version=schema_version,
+            )
+        )
+
+    # Mount (idempotent). ROGUE / corrupted bundle -> operator hard stop (500),
+    # matching ``storage.unlock``'s ``mount_now`` failure handling.
+    try:
+        resolution = await asyncio.to_thread(sl.mount_now)
+    except Exception as exc:  # noqa: BLE001 — ROGUE / corrupted bundle re-raised
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+    if resolution.state is StoreState.ERROR:
+        # The key is unreachable (a locked Keychain is retryable; a missing key or
+        # entitlement mismatch is terminal). The store stays unmounted; the surface
+        # shows the typed reason. Mirrors ``storage.unlock``'s ERROR arm.
+        reason = resolution.reason or ERROR_KEYCHAIN_LOCKED
+        retryable = reason == ERROR_KEYCHAIN_LOCKED
+        _audit(reason)
+        message = (
+            "The Keychain is locked; unlock your Mac and try again."
+            if retryable
+            else "The encrypted store could not be mounted (the encryption key is "
+            "unreachable)."
+        )
+        return _api_error_response(
+            errors.StoreLockError(
+                reason,
+                message,
+                schema_version=schema_version,
+                retryable=retryable,
+            )
+        )
+
+    # MOUNTED (or, degenerately, ABSENT when the bundle still does not exist).
+    # Propagate to app.state + the supervisor so the read verbs and the
+    # recording.start gate see the new state without a daemon restart.
+    supervisor.set_store_state(resolution.state, resolution.reason)
+    request.app.state.store_state = resolution.state.value
+    request.app.state.store_reason = resolution.reason
+    _audit("ok")
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema_version,
+            store_state=resolution.state.value,
+        )
+    )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -4362,6 +4468,7 @@ def build_app() -> Starlette:
             Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
             Route("/v0/storage.lock", storage_lock, methods=["POST"]),
             Route("/v0/storage.unlock", storage_unlock, methods=["POST"]),
+            Route("/v0/storage.mount", storage_mount, methods=["POST"]),
             Route("/v0/storage.encrypt.start", storage_encrypt_start, methods=["POST"]),
             Route("/v0/storage.encrypt.status", storage_encrypt_status, methods=["GET"]),
             Route("/v0/storage.encrypt.cancel", storage_encrypt_cancel, methods=["POST"]),
