@@ -244,6 +244,18 @@ struct OnboardingAccountStep: View {
         onSignedIn()
     }
 
+    /// The signed-in "Continue": the user finished the account step and is
+    /// *deferring* the plan choice (still one tap away here, or later in
+    /// Settings). Routes forward exactly like a resolved entitlement would —
+    /// `onSignedIn`'s tier routing — deliberately bypassing the entitlement
+    /// soft-gate the user chose to defer. Shares the one-shot latch so it can't
+    /// double-fire with an entitlement that resolves in the same moment.
+    private func continueDeferringPlan() {
+        guard !didAdvance else { return }
+        didAdvance = true
+        onSignedIn()
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             AccountSheetView(
@@ -256,11 +268,11 @@ struct OnboardingAccountStep: View {
                     // onChange wiring below advances once it resolves.
                     advanceIfSettled()
                 }
-                // No onDismiss: embedded in the wizard chrome, the skip link
-                // below is the way past this step.
+                // No onDismiss: embedded in the wizard chrome, the exit
+                // affordance below is the way past this step.
             )
 
-            OnboardingLinkButton(title: "Skip for now", action: onSkip)
+            accountExit
                 .padding(.top, 24)
         }
         .padding(.horizontal, 100)
@@ -280,6 +292,29 @@ struct OnboardingAccountStep: View {
         .task {
             await auth.refreshIfNeeded()
             advanceIfSettled()
+        }
+    }
+
+    /// The bottom wizard-chrome exit affordance. Signed out → a muted "Skip for
+    /// now" link (the account step is skipped). Signed in → a deliberate
+    /// "Continue" primary with a "choose a plan later" note, so a user who just
+    /// signed in is never asked to "skip" the step they just completed.
+    @ViewBuilder
+    private var accountExit: some View {
+        switch OnboardingStepPolicy.accountStepExit(isSignedIn: auth.isSignedIn) {
+        case .skip:
+            OnboardingLinkButton(title: OnboardingCopy.accountSkipLink, action: onSkip)
+        case .continueDeferringPlan:
+            VStack(spacing: 8) {
+                OnboardingPrimaryButton(
+                    title: OnboardingCopy.accountContinueButton,
+                    action: continueDeferringPlan
+                )
+                Text(OnboardingCopy.accountDeferPlanNote)
+                    .font(SCTypography.sans(size: 12.5))
+                    .foregroundStyle(Color.scInkMuted)
+                    .multilineTextAlignment(.center)
+            }
         }
     }
 }

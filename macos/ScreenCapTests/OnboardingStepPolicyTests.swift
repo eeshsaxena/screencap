@@ -273,6 +273,33 @@ final class OnboardingStepPolicyTests: XCTestCase {
         )
     }
 
+    // MARK: - Account step exit affordance
+
+    /// Signed out: the account step's exit is a "Skip for now" — the step is
+    /// genuinely being skipped.
+    func testAccountStepExitSkipsWhenSignedOut() {
+        XCTAssertEqual(OnboardingStepPolicy.accountStepExit(isSignedIn: false), .skip)
+    }
+
+    /// Signed in (the paid-launch soft-gate holds the wizard on this step until
+    /// checkout): the exit becomes a deliberate "Continue", never a "Skip" — the
+    /// user just completed sign-in, so "Skip" would mislabel deferring the plan
+    /// as throwing the account step away. This is the reported dead-end.
+    func testAccountStepExitContinuesWhenSignedIn() {
+        XCTAssertEqual(
+            OnboardingStepPolicy.accountStepExit(isSignedIn: true), .continueDeferringPlan
+        )
+    }
+
+    /// The signed-in forward affordance reads as progress, not abandonment, and
+    /// the defer note stays truthful (points at Settings, makes no plan claim).
+    func testSignedInContinueCopyDoesNotReadAsSkip() {
+        XCTAssertEqual(OnboardingCopy.accountContinueButton, "Continue")
+        XCTAssertFalse(OnboardingCopy.accountContinueButton.lowercased().contains("skip"))
+        XCTAssertEqual(OnboardingCopy.accountSkipLink, "Skip for now")
+        XCTAssertTrue(OnboardingCopy.accountDeferPlanNote.contains("Settings"))
+    }
+
     // MARK: - Honesty gate (KTD-9 / R7)
 
     /// The storage and account steps carry no end-to-end-encryption or
