@@ -186,6 +186,15 @@ final class DaemonInstallController: ObservableObject {
     /// install — container disabled — never gets a bundle it would then refuse to
     /// serve as a downgrade).
     private let ensureStoreInit: @Sendable () async -> Void
+    /// Non-destructive daemon respawn (`launchctl kickstart -k`) for the
+    /// poll-timeout recovery: a registered + `.enabled` agent whose process
+    /// launchd never spawned — its login-item executable was replaced in place
+    /// (a dev re-embed, or an app update, after which launchd holds the job
+    /// `uninitialized` while `.status` still reads `.enabled`) — comes up on a
+    /// kickstart without disturbing the BTM approval. Injectable so the recovery
+    /// is testable without launchctl; the default no-ops under XCTest (returns
+    /// false → the caller falls back to the destructive registration refresh).
+    private let kickstart: () async -> Bool
 
     init(
         registrationService: DaemonRegistrationService = SMAppServiceRegistration(),
@@ -198,7 +207,8 @@ final class DaemonInstallController: ObservableObject {
         now: @escaping () -> Date = Date.init,
         defaults: UserDefaults = .standard,
         proactiveTccSetup: @escaping @Sendable () async -> Void = DaemonInstallController.defaultProactiveTccSetup,
-        ensureStoreInit: @escaping @Sendable () async -> Void = DaemonInstallController.defaultEnsureStoreInit
+        ensureStoreInit: @escaping @Sendable () async -> Void = DaemonInstallController.defaultEnsureStoreInit,
+        kickstart: @escaping () async -> Bool = DaemonInstallController.liveKickstartRestart
     ) {
         self.registrationService = registrationService
         self.probe = probe
@@ -209,6 +219,7 @@ final class DaemonInstallController: ObservableObject {
         self.defaults = defaults
         self.proactiveTccSetup = proactiveTccSetup
         self.ensureStoreInit = ensureStoreInit
+        self.kickstart = kickstart
     }
 
     /// The default store-init step (SCR-258 U10). No-op under XCTest. Reads
@@ -496,6 +507,27 @@ final class DaemonInstallController: ObservableObject {
                 break  // pollDaemon set .installedAndRunning and posted the notice
             case .timedOut:
                 if allowRegistrationRefresh {
+                    // Non-destructive recovery first: a registered + `.enabled`
+                    // agent whose process launchd never spawned — its login-item
+                    // executable was replaced in place (a dev re-embed, or an app
+                    // update, where SMAppService does not restart the LoginItem),
+                    // leaving launchd holding the job `uninitialized` while
+                    // `.status` still reads `.enabled` — is respawned by
+                    // `launchctl kickstart -k` without disturbing the BTM
+                    // approval. Only when that still doesn't bring the daemon up
+                    // (e.g. the recorded bundle path is stale/gone) do we fall
+                    // back to the destructive unregister+register, which
+                    // re-registers from the current bundle path. `refresh()`'s
+                    // own contract already names kickstart the preferred recovery
+                    // for a wedged-but-registered process. Safe: this fires only
+                    // after a poll TIMEOUT, so there is no healthy daemon to
+                    // disturb.
+                    if await kickstartAndRepoll(
+                        timeoutSeconds: timeoutSeconds,
+                        probeIntervalSeconds: probeIntervalSeconds
+                    ) {
+                        return
+                    }
                     await refreshRegistrationAfterFailedPoll(
                         timeoutSeconds: timeoutSeconds,
                         probeIntervalSeconds: probeIntervalSeconds,
@@ -615,6 +647,30 @@ final class DaemonInstallController: ObservableObject {
             allowRegistrationRefresh: false,
             priorMismatchVersion: priorMismatchVersion
         )
+    }
+
+    /// Non-destructive poll-timeout recovery: `launchctl kickstart -k` respawns a
+    /// registered-but-unspawned daemon in place from its current bundle, then a
+    /// fresh reachability poll confirms it came up. Returns true only when the
+    /// daemon answered and `pollDaemon` set `.installedAndRunning`; false when the
+    /// kickstart was a no-op (nothing registered to kick, or under XCTest) or the
+    /// daemon still did not respond — in which case the caller falls back to the
+    /// destructive registration refresh. Uses the plain reachability budget (no
+    /// convergence): there is no version swap in flight here, just a process that
+    /// needs starting.
+    private func kickstartAndRepoll(
+        timeoutSeconds: TimeInterval,
+        probeIntervalSeconds: TimeInterval
+    ) async -> Bool {
+        guard await kickstart() else { return false }
+        let outcome = await pollDaemon(
+            timeoutSeconds: timeoutSeconds,
+            probeIntervalSeconds: probeIntervalSeconds,
+            convergenceTimeoutSeconds: timeoutSeconds,
+            convergeOnMismatch: false
+        )
+        if case .running = outcome { return true }
+        return false
     }
 
     /// How an approval wait ended. `stillPending` (deadline expiry with the
