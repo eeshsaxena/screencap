@@ -2647,6 +2647,133 @@ async def tasks_split(request: Request) -> JSONResponse:
         return _internal_error_response(exc, schema_version=_v, request=request)
 
 
+# ---------------------------------------------------------------------------
+# ambient.status / ambient.set — SCR-214 U12 runtime ambient control (U12
+# prerequisite: the macOS app enables/disables + reads always-on ambient at
+# runtime). ``ambient.status`` is a READ snapshot (like session.snapshot /
+# tasks.list — deliberately NOT in ``_ACTIVITY_PATHS`` so polling it never resets
+# the idle-shutdown clock). ``ambient.set`` MUTATES persisted config AND drives the
+# supervisor to start/stop ambient NOW, so it mirrors recording.mute's audited
+# trust-boundary posture (peer descriptor + ``_audit`` on every exit path, a
+# validated model, typed errors) and joins ``_ACTIVITY_PATHS`` (a genuine
+# recording-lifecycle mutation, like recording.stop).
+# ---------------------------------------------------------------------------
+
+
+def _ambient_status_payload(supervisor: Any) -> dict[str, Any]:
+    """Map ``Supervisor.ambient_state()`` to the app-facing status wire fields.
+
+    Selects exactly the six ``AmbientStatusResponse`` fields (dropping the
+    internal ``retry_count`` diagnostic ``ambient_state`` also carries), so
+    ``ambient.status`` and ``ambient.set`` return one identical shape.
+    """
+    state = supervisor.ambient_state()
+    return {
+        "enabled": bool(state["enabled"]),
+        "autostart": bool(state["autostart"]),
+        "active": bool(state["active"]),
+        "paused": bool(state["paused"]),
+        "degraded": state["degraded"],
+        "recording": state["recording"],
+    }
+
+
+async def ambient_status(request: Request) -> JSONResponse:
+    """``GET /v0/ambient.status`` — the app's runtime view of ambient capture (U12).
+
+    A read-only snapshot of always-on ambient supervision: the persisted
+    enabled/autostart toggles plus the live active/paused/degraded state and the
+    ambient recording's name (so the app can target ``recording.pause`` /
+    ``.resume``). Reads only in-process supervisor state + cached config — no
+    recording data leaves the Mac. Deliberately NOT in ``_ACTIVITY_PATHS``: a
+    status poll must not keep an auto-spawned daemon alive.
+    """
+    try:
+        payload = _ambient_status_payload(request.app.state.supervisor)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._AMBIENT_STATUS_API_VERSION,
+                **payload,
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._AMBIENT_STATUS_API_VERSION,
+            request=request,
+        )
+
+
+async def ambient_set(request: Request) -> JSONResponse:
+    """``POST /v0/ambient.set`` — enable/disable ambient (+ autostart) at runtime (U12).
+
+    Body ``{enabled?: bool, autostart?: bool}`` — each key is applied only when
+    present, so the app can flip ``autostart`` without touching ``enabled``.
+    ``enabled=True`` persists the opt-in then drives the supervisor to START
+    ambient NOW via the idempotent, gate-checked ``_maybe_autostart_ambient`` (a
+    no-op if ambient is already active). ``enabled=False`` persists the opt-out
+    FIRST then STOPS the running ambient recording via ``stop_ambient_now`` —
+    because config is now False, the engine-exit re-arm won't respawn it.
+    ``autostart`` only persists config. Returns the NEW ambient.status payload.
+
+    A MUTATING verb on the same trust boundary as recording.mute: the peer
+    descriptor is derived and every exit path (ok / typed error / unhandled) is
+    audited. A malformed body (non-dict, or a non-bool value) is a typed 400
+    ``invalid_request``. The config writes run off the event loop (tomlkit disk IO).
+    """
+    from screencap.config import set_ambient_autostart, set_ambient_enabled
+    from screencap.daemon import audit_log, provenance
+
+    _v = schema._AMBIENT_SET_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "ambient.set",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        parsed = _validate_task_body(
+            schema.AmbientSetRequest, await request.json(), schema_version=_v
+        )
+        supervisor = request.app.state.supervisor
+
+        if parsed.enabled is not None:
+            # Persist the opt-in/out FIRST (off-loop: tomlkit load/save is disk IO),
+            # so both the start/stop below AND the engine-exit re-arm observe the
+            # new config value.
+            await asyncio.to_thread(set_ambient_enabled, parsed.enabled)
+            if parsed.enabled:
+                # Idempotent + gate-checked: schedules a detached spawn only when
+                # ambient is not already active/pending/degraded (R2).
+                supervisor._maybe_autostart_ambient()
+            else:
+                # Config is already False, so the exit-funnel re-arm will NOT
+                # respawn what we stop here.
+                await supervisor.stop_ambient_now()
+
+        if parsed.autostart is not None:
+            await asyncio.to_thread(set_ambient_autostart, parsed.autostart)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                **_ambient_status_payload(supervisor),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
 async def timeline_day(request: Request) -> JSONResponse:
     """``POST /v0/timeline.day`` — day-scoped spans + honest blocked intervals (U3).
 
@@ -3283,6 +3410,8 @@ def build_app() -> Starlette:
             Route("/v0/tasks.delete", tasks_delete, methods=["POST"]),
             Route("/v0/tasks.merge", tasks_merge, methods=["POST"]),
             Route("/v0/tasks.split", tasks_split, methods=["POST"]),
+            Route("/v0/ambient.status", ambient_status, methods=["GET"]),
+            Route("/v0/ambient.set", ambient_set, methods=["POST"]),
             Route("/v0/chat.answer", chat_answer, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),

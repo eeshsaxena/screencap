@@ -80,6 +80,12 @@ _MODELS_API_VERSION = 1
 # precedent). Pointer-only response (answer prose + source POINTERS, no image
 # bytes / paths) — the same R8 boundary as every other query verb.
 _CHAT_ANSWER_API_VERSION = 1
+# SCR-214 U12: runtime ambient control for the macOS app — a READ (ambient.status)
+# + a MUTATE (ambient.set) verb. Additive (new verbs) — no global
+# API_SCHEMA_VERSION bump (mirrors the tasks.list / frame.nearest additive
+# precedent); one version const per verb so they can bump independently.
+_AMBIENT_STATUS_API_VERSION = 1
+_AMBIENT_SET_API_VERSION = 1
 
 
 @cache
@@ -167,6 +173,9 @@ _MODEL_NAMES = {
     "ChatSourcePointer",
     "ChatCoverage",
     "ChatAnswerResponse",
+    "AmbientStatusResponse",
+    "AmbientSetRequest",
+    "AmbientSetResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -924,6 +933,48 @@ def _load_models() -> dict[str, Any]:
         recording: str
         task_indices: list[int]
 
+    class AmbientStatusResponse(EnvelopeResponse):
+        """The app's runtime view of always-on ambient supervision (SCR-214 U12).
+
+        ``enabled`` / ``autostart`` are the persisted config toggles; ``active``
+        is a live ambient recording; ``paused`` is that recording's CONFIRMED
+        pause state (U4 — written only by the engine's ``recording_paused`` /
+        ``recording_resumed`` event), ``False`` when nothing ambient is live;
+        ``degraded`` is a human-readable blocked/ceiling reason (``None`` =
+        healthy) so the app can show WHY an enabled ambient is not recording
+        instead of a silent on-with-nothing-captured toggle; ``recording`` is the
+        live ambient recording's name so the app can target ``recording.pause`` /
+        ``.resume`` at it, or ``None`` when nothing ambient is live. Read-only —
+        deliberately NOT in ``_ACTIVITY_PATHS``.
+        """
+
+        enabled: bool
+        autostart: bool
+        active: bool
+        paused: bool
+        degraded: str | None = None
+        recording: str | None = None
+
+    class AmbientSetRequest(_DaemonModel):
+        """SCR-214 U12 ``ambient.set`` input: toggle ambient at runtime.
+
+        Both fields are OPTIONAL — a request applies only the keys it carries, so
+        the app can flip ``autostart`` without touching ``enabled`` (or vice
+        versa). ``enabled=True`` persists the opt-in and STARTS ambient now;
+        ``enabled=False`` persists the opt-out and STOPS the running ambient
+        recording now. ``autostart`` only persists config. A non-bool value for
+        either key is a 400 ``invalid_request`` at the handler boundary.
+        """
+
+        enabled: bool | None = None
+        autostart: bool | None = None
+
+    class AmbientSetResponse(AmbientStatusResponse):
+        """``ambient.set`` echoes the NEW :class:`AmbientStatusResponse` payload
+        after applying the change (``active`` may still be ``False`` on an
+        ``enabled=True`` request until the detached spawn completes — the app
+        confirms via ``/v0/events`` or a follow-up ``ambient.status``)."""
+
     class ModelDownloadStartRequest(_DaemonModel):
         """SCR-239 ``model.download.start`` input.
 
@@ -1114,6 +1165,9 @@ def _load_models() -> dict[str, Any]:
         "ChatSourcePointer": ChatSourcePointer,
         "ChatCoverage": ChatCoverage,
         "ChatAnswerResponse": ChatAnswerResponse,
+        "AmbientStatusResponse": AmbientStatusResponse,
+        "AmbientSetRequest": AmbientSetRequest,
+        "AmbientSetResponse": AmbientSetResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that

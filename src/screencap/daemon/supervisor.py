@@ -1596,17 +1596,38 @@ class Supervisor:
     def ambient_state(self) -> dict[str, Any]:
         """Surfaced ambient supervision state for the app (SCR-214 U2/U12).
 
-        ``enabled`` reflects config; ``active`` is a live ambient recording;
-        ``degraded`` is a human-readable blocked/ceiling reason (None = healthy)
-        so the app can show *why* an enabled ambient is not recording instead of
-        a silent on-with-nothing-captured toggle.
+        ``enabled`` / ``autostart`` reflect config; ``active`` is a live ambient
+        recording; ``paused`` is that recording's CONFIRMED pause state (U4);
+        ``recording`` is its name (so the app can target ``recording.pause`` /
+        ``.resume`` at it); ``degraded`` is a human-readable blocked/ceiling
+        reason (None = healthy) so the app can show *why* an enabled ambient is
+        not recording instead of a silent on-with-nothing-captured toggle.
+
+        ``paused`` / ``recording`` are read from the live session snapshot ONLY
+        while ``_ambient_active`` (the live ``_proc`` is the ambient stream), so an
+        explicit user recording is never mis-reported as the ambient one; both are
+        their inert defaults (``False`` / ``None``) whenever nothing ambient is
+        live. ``paused`` defaults to ``False`` until the engine's confirmed
+        ``recording_paused`` event first writes it (KTD7).
         """
-        from screencap.config import get_ambient_enabled
+        from screencap.config import get_ambient_autostart, get_ambient_enabled
+
+        recording: str | None = None
+        paused = False
+        session = self._session_state
+        if self._ambient_active and session is not None:
+            name = session.get("recording_name")
+            if isinstance(name, str):
+                recording = name
+            paused = bool(session.get("paused", False))
 
         return {
             "enabled": get_ambient_enabled(),
+            "autostart": get_ambient_autostart(),
             "active": self._ambient_active,
+            "paused": paused,
             "degraded": self._ambient_degraded,
+            "recording": recording,
             "retry_count": self._ambient_retry_count,
         }
 
@@ -1650,6 +1671,27 @@ class Supervisor:
         # so today's Journal fills as the day progresses (R7). Also persists across
         # re-arms and rolls. No-op if already running.
         self._start_ambient_segmentation_watch()
+
+    async def stop_ambient_now(self) -> bool:
+        """Stop the live ambient recording now, if one is running (SCR-214 U12).
+
+        The runtime counterpart to :meth:`_maybe_autostart_ambient` for the
+        ``ambient.set`` verb's ``enabled=False`` path. It stops ONLY the always-on
+        ambient stream — never an explicit user recording — by gating on
+        ``_ambient_active`` (True exactly while the live ``_proc`` is the ambient
+        stream). A no-op returning ``False`` when no ambient recording is live, so
+        an explicit recording or an idle daemon is left untouched.
+
+        The caller MUST have already flipped ``get_ambient_enabled()`` to False:
+        ``stop`` funnels through ``_handle_engine_exit`` whose ambient re-arm
+        (:meth:`_schedule_ambient_rearm`) re-reads that config and, seeing it
+        False, does NOT respawn — so this stop is final, not a bounce. Returns
+        True iff an ambient recording was actually stopped.
+        """
+        if not self._ambient_active:
+            return False
+        await self.stop()
+        return True
 
     def _build_ambient_request(self) -> "RecordingStartRequest":
         """Build the internal always-on ambient ``RecordingStartRequest`` (U2).

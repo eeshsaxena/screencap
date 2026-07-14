@@ -67,6 +67,13 @@ _ACTIVITY_PATHS = frozenset(
         "/v0/tasks.delete",
         "/v0/tasks.merge",
         "/v0/tasks.split",
+        # SCR-214 U12: ambient.set is a lifecycle mutation — it starts or stops the
+        # always-on ambient recording (like recording.start / recording.stop), so it
+        # counts as activity. ambient.status is a READ (no body) and is deliberately
+        # EXCLUDED, mirroring tasks.list / session.snapshot: a status poll must not
+        # keep an auto-spawned daemon alive. (An enabled=true ambient.set is doubly
+        # covered — once here, and thereafter by the ambient supervision busy check.)
+        "/v0/ambient.set",
     }
 )
 
