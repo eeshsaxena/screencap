@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.26.1] - 2026-07-14
+
+### Fixed
+
+- **storage:** Encrypted-storage setup silently failed on macOS 26 — `hdiutil -stdinpass` rejected the raw non-UTF-8 256-bit key; now pipes a stable base64-encoded passphrase, adds a `storage.mount` daemon verb so a running daemon adopts a freshly-initialized store, and surfaces setup errors in the storage UI instead of swallowing them
+
 ## [0.26.0] - 2026-07-14
 
 ### Added
