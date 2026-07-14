@@ -369,6 +369,47 @@ struct RecordingMuteResponse: Decodable {
     }
 }
 
+/// Body for the mid-recording capture-pause verb (SCR-214 U4). `paused` is the
+/// ABSOLUTE desired state (true = paused), not a toggle, so a dropped/retried
+/// request can never desync app vs engine (mirrors `RecordingMuteRequest`). A
+/// single model backs both verbs: `recording.pause` posts `paused: true` and
+/// `recording.resume` posts `paused: false`. The daemon validates the body but
+/// derives the effective state from the verb, so the field is required-but-echoed.
+struct RecordingPauseRequest: Encodable {
+    let paused: Bool
+
+    init(paused: Bool) {
+        self.paused = paused
+    }
+}
+
+struct RecordingPauseResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    /// ECHO of the REQUESTED state for transport bookkeeping only. The app must
+    /// NOT treat this as confirmation — unlike mute (audio-only), pause gates the
+    /// WHOLE capture surface, and the CONFIRMED pause state arrives on the events
+    /// stream / `ambient.status` after the engine actually gates capture (KTD7).
+    /// `AmbientController` deliberately re-reads `ambient.status` rather than
+    /// trusting this echo.
+    let paused: Bool
+    /// Bus cursor captured BEFORE the command was forwarded — a fresh subscriber
+    /// could `/v0/events?since=<cursor>` without missing the confirming
+    /// `recording_paused` / `recording_resumed` event. Decoded for completeness.
+    let cursor: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case paused
+        case cursor
+    }
+}
+
 /// Ack for the SCR-200 decoy-cleanup verb. The envelope carries no payload
 /// beyond the standard fields — the sweep is fire-and-forget on the daemon.
 struct CleanupDecoysResponse: Decodable {
@@ -880,6 +921,49 @@ enum DaemonClient {
     static func recordingMute(_ req: RecordingMuteRequest) async throws -> RecordingMuteResponse {
         let body = try JSONEncoder().encode(req)
         return try await request(method: "POST", path: "/v0/recording.mute", body: body)
+    }
+
+    // MARK: - SCR-214 U4/U12 ambient runtime control
+
+    /// Pause capture on the running recording (SCR-214 U4). Forwards to the engine
+    /// over the daemon's stdin control channel; the response echoes only the
+    /// REQUESTED state (not confirmation — the confirmed pause settles on
+    /// `ambient.status` / the events stream). A `not_recording` envelope error
+    /// (nothing live to pause) surfaces through the existing typed-error seam. The
+    /// body carries `paused: true` even though the daemon derives the state from
+    /// the verb — the required field keeps a malformed body a typed 400.
+    @discardableResult
+    static func recordingPause() async throws -> RecordingPauseResponse {
+        let body = try JSONEncoder().encode(RecordingPauseRequest(paused: true))
+        return try await request(method: "POST", path: "/v0/recording.pause", body: body)
+    }
+
+    /// Resume capture on a paused recording (SCR-214 U4). See `recordingPause()`.
+    @discardableResult
+    static func recordingResume() async throws -> RecordingPauseResponse {
+        let body = try JSONEncoder().encode(RecordingPauseRequest(paused: false))
+        return try await request(method: "POST", path: "/v0/recording.resume", body: body)
+    }
+
+    /// Read the runtime ambient-supervision snapshot (SCR-214 U12). Read-only —
+    /// the daemon deliberately keeps it out of `_ACTIVITY_PATHS`, so polling it
+    /// never resets an auto-spawned daemon's idle-shutdown clock. On
+    /// `socketUnavailable`/`connectionFailed` the caller surfaces a daemon-down
+    /// state rather than guessing at a default.
+    static func ambientStatus() async throws -> AmbientStatus {
+        try await request(method: "GET", path: "/v0/ambient.status")
+    }
+
+    /// Toggle ambient (and/or its auto-start-on-login) at runtime (SCR-214 U12).
+    /// `enabled == true` persists the opt-in and starts ambient now; `enabled ==
+    /// false` persists the opt-out and stops the running ambient recording now;
+    /// `autostart` only persists config. A nil argument omits that key so the verb
+    /// applies only what changed. Returns the NEW `ambient.status` payload (which
+    /// may still report `active == false` on an enable until the detached spawn
+    /// completes — the app confirms via a follow-up `ambientStatus()`).
+    static func ambientSet(enabled: Bool? = nil, autostart: Bool? = nil) async throws -> AmbientStatus {
+        let body = try JSONEncoder().encode(AmbientSetRequest(enabled: enabled, autostart: autostart))
+        return try await request(method: "POST", path: "/v0/ambient.set", body: body)
     }
 
     /// On-demand daemon-driven TCC registration (U8). The daemon runs the
