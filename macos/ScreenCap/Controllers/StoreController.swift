@@ -148,8 +148,22 @@ final class StoreController: ObservableObject {
         }
     }
 
-    /// `storage init` — no daemon dependency; creates the key + bundle.
+    /// Set up encrypted storage: create the store, then adopt it into the running
+    /// daemon. Creation is foreground-only (the first Keychain write triggers a
+    /// one-time ACL prompt), so the key + bundle are minted via the bundled CLI —
+    /// the single creation code path (KTD-5). But the daemon resolved its
+    /// `store_state` ONCE at bind time and would keep serving the stale `absent`
+    /// (Library refresh + `recording.start` stay refused) until a restart, since
+    /// the CLI init runs out-of-band. So we then call `storage.mount` to make the
+    /// already-running daemon re-mount and flip its cached state `absent → mounted`.
+    /// Daemon-unavailable is fine: the no-daemon `list` fallback re-resolves the
+    /// store fresh on the next refresh, so there is nothing to adopt.
     static let defaultInit: @Sendable () async throws -> Void = {
         try await CLIClient.runAwaitingExit(["storage", "init"], timeout: 30)
+        do {
+            _ = try await DaemonClient.storageMount()
+        } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
+            // No daemon to notify — the CLI-fallback refresh re-resolves fresh.
+        }
     }
 }

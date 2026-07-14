@@ -130,6 +130,7 @@ struct RecallPaletteView: View {
                     onRetry: { Task { await index.refresh() } },
                     onSetup: { store.initializeStore() },
                     isBusy: store.phase != .idle,
+                    errorText: store.lastError,
                     compact: true
                 )
             }

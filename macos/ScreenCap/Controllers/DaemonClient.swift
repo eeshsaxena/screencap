@@ -1015,6 +1015,20 @@ enum DaemonClient {
         )
     }
 
+    /// Adopt a store the foreground `storage init` CLI just created (SCR-258 U10).
+    /// The app's "Set up encrypted storage" mints the key + bundle via the bundled
+    /// CLI (foreground, for the one-time Keychain ACL prompt); a daemon that is
+    /// already running resolved its `store_state` ONCE at bind time and would keep
+    /// serving the stale `absent` until a restart. This verb makes it re-mount and
+    /// flip its cached state `absent → mounted` so the Library refresh and
+    /// `recording.start` stop refusing. An unreadable key surfaces as a typed
+    /// `.envelopeError` (`store_lock_failed`) with the store left unmounted.
+    static func storageMount() async throws -> StorageStateResponse {
+        try await request(
+            method: "POST", path: "/v0/storage.mount", body: Data("{}".utf8), timeout: 30
+        )
+    }
+
     /// Begin (or resume) the plaintext→container upgrade migration (SCR-258 U6).
     /// Idempotent daemon-side; refuses a custom-recordings install / plaintext-only
     /// build with a typed `.envelopeError`.

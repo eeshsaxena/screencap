@@ -65,7 +65,8 @@ struct ChatView: View {
                     onUnlock: { store.unlock() },
                     onRetry: { Task { await index.refresh() } },
                     onSetup: { store.initializeStore() },
-                    isBusy: store.phase != .idle
+                    isBusy: store.phase != .idle,
+                    errorText: store.lastError
                 )
             }
         }

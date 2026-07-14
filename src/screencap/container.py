@@ -17,10 +17,13 @@ Design references (all in ``docs/plans/2026-07-06-001-feat-scr-236-encrypt-recor
   (KTD-13) so the volume's virtual free space never invites writes the host
   cannot back.
 * **KTD-6** — exactly one helper (:func:`_run_hdiutil`) constructs the passphrase
-  pipe. Every ``hdiutil`` invocation that needs the key pipes it via
-  ``proc.communicate(input=key)`` with **no trailing newline** — a trailing
-  ``\\n`` becomes part of the passphrase and fails authentication (verified on
-  this hardware). No call site rolls its own pipe.
+  pipe. The passphrase is the key's stable base64 text (:func:`_encode_key`), NOT
+  the raw key bytes: macOS 26's ``hdiutil -stdinpass`` rejects a non-UTF-8
+  passphrase ("unable to process -stdinpass argument"), and a raw 256-bit key
+  (``secrets.token_bytes``) almost always contains high bytes (0x80-0xFF) that are
+  not valid UTF-8. Encoding at the single pipe means create / attach / compact all
+  derive the SAME passphrase from the same key, so they always match. No trailing
+  newline is added. No call site rolls its own pipe.
 * **KTD-9** — host-leak hardening (:func:`harden_mount`) runs on **every** attach,
   not once: ``mdutil -i off`` + verify with ``mdutil -s`` (macOS silently
   re-enables indexing after OS updates), ensure ``.fseventsd/no_log`` at the
@@ -339,12 +342,17 @@ def _run_hdiutil(
     """Run ``hdiutil`` with ``args``, optionally piping ``key`` as the passphrase.
 
     **This is the one and only place that constructs the passphrase pipe (KTD-6).**
-    When ``key`` is given it is written to the child's stdin verbatim via
-    ``proc.communicate(input=key)`` — the bytes are piped exactly as passed, with
-    **no trailing newline appended**. A trailing ``\\n`` would become part of the
-    passphrase and fail authentication, so callers must pass the raw key bytes
-    and this helper must never mutate them. No other function in this module (or
-    its callers) may build its own ``hdiutil`` pipe.
+    When ``key`` is given, the passphrase written to the child's stdin is the key's
+    stable base64 text (:func:`_encode_key`), NOT the raw key bytes. macOS 26's
+    ``hdiutil -stdinpass`` rejects a non-UTF-8 passphrase ("unable to process
+    -stdinpass argument"), and a raw 256-bit key (``secrets.token_bytes``) almost
+    always contains high bytes (0x80-0xFF) that are not valid UTF-8, so piping the
+    raw key made every ``create``/``attach`` fail. Encoding here — the single pipe —
+    means ``create_bundle`` / :func:`attach` / :func:`compact` all derive the SAME
+    passphrase from the same key, so the create/attach passphrases always match.
+    No trailing newline is appended (``communicate`` adds nothing). Callers pass the
+    raw key bytes; only this helper text-encodes them for the passphrase channel.
+    No other function in this module (or its callers) may build its own pipe.
 
     Mirrors the ``screencapture`` subprocess idiom in ``engine/utils.py``
     (deferred ``import subprocess``, explicit ``timeout=``) but raises a typed
@@ -372,16 +380,19 @@ def _run_hdiutil(
     import subprocess
 
     action = args[0] if args else "hdiutil"
+    # KTD-6: the passphrase is the key's base64 text, never the raw bytes — macOS 26
+    # rejects a non-UTF-8 -stdinpass passphrase, and a raw random key almost always
+    # has non-UTF-8 high bytes. Same derivation everywhere → create/attach match.
+    passphrase = _encode_key(key).encode("ascii") if key is not None else None
     proc = subprocess.Popen(
         ["hdiutil", *args],
-        stdin=subprocess.PIPE if key is not None else subprocess.DEVNULL,
+        stdin=subprocess.PIPE if passphrase is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     try:
-        # KTD-6: pipe the key verbatim, no trailing newline. communicate() does
-        # NOT append anything to `input`.
-        stdout, stderr = proc.communicate(input=key, timeout=timeout)
+        # No trailing newline: communicate() appends nothing to `input`.
+        stdout, stderr = proc.communicate(input=passphrase, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         proc.kill()
         proc.communicate()

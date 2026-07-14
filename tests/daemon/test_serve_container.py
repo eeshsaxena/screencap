@@ -536,6 +536,129 @@ async def test_recording_start_refusal_surfaces_error_reason():
 
 
 # ---------------------------------------------------------------------------
+# storage.mount — adopt a store the CLI ``storage init`` created out-of-band
+# (SCR-258 U10). A daemon that resolved ABSENT at bind and is STILL running when
+# the app's "Set up encrypted storage" button shells out to the foreground
+# ``storage init`` CLI never learns the bundle now exists — it caches the
+# bind-time resolution. This verb is the ``absent -> mounted`` transition that
+# closes that gap (the sibling of ``storage.unlock``'s ``locked -> mounted``).
+# ---------------------------------------------------------------------------
+
+
+def _absent_app():
+    """A daemon that resolved ABSENT at bind (container on, no bundle yet)."""
+    app = build_app()
+    app.state.store_state = StoreState.ABSENT.value
+    app.state.store_reason = None
+    sup = Supervisor(app.state.event_bus, reconcile_on_init=False)
+    sup.set_store_state(StoreState.ABSENT)
+    app.state.supervisor = sup
+    return app
+
+
+@pytest.mark.asyncio
+async def test_storage_mount_adopts_freshly_initialized_store(
+    container_base, monkeypatch
+):
+    """The regression: a running daemon booted ABSENT adopts the bundle the CLI
+    ``storage init`` just created, flipping its cached ``store_state`` to MOUNTED
+    so the Library refresh (``recording.list``) and the ``recording.start`` gate
+    stop refusing — WITHOUT a daemon restart."""
+    _make_bundle(container_base)  # `storage init` already created the bundle
+    monkeypatch.setattr(container, "require_container_key", lambda: b"k" * 32)
+
+    def _attach(bundle, key, mountpoint, **k):
+        return container.AttachInfo(device="/dev/disk9", mountpoint=mountpoint)
+
+    monkeypatch.setattr(container, "attach", _attach)
+    monkeypatch.setattr(container, "harden_mount", lambda m, **k: None)
+
+    app = _absent_app()
+    async with _client(app) as client:
+        # Precondition: the daemon still serves the stale ABSENT on a read verb.
+        pre = await client.get("/v0/recording.list")
+        assert pre.json()["store_state"] == "absent"
+
+        r = await client.post("/v0/storage.mount")
+        assert r.status_code == 200
+        assert r.json()["store_state"] == "mounted"
+
+        # The cached state flipped for the read verbs the app's refresh reads.
+        post = await client.get("/v0/recording.list")
+        assert post.json()["store_state"] == "mounted"
+
+    # ...and for the supervisor's recording.start gate.
+    assert app.state.store_state == "mounted"
+    assert app.state.supervisor.is_locked() is False
+
+
+@pytest.mark.asyncio
+async def test_storage_mount_reports_absent_when_bundle_missing(
+    container_base, monkeypatch
+):
+    """If ``storage init`` never created the bundle (a failed/aborted init), mount
+    reports ABSENT — the store stays un-set-up, NOT a spurious error or attach."""
+    assert not sl.store_bundle_path().exists()
+    monkeypatch.setattr(
+        container, "attach", lambda *a, **k: pytest.fail("must not attach")
+    )
+    app = _absent_app()
+    async with _client(app) as client:
+        r = await client.post("/v0/storage.mount")
+    assert r.status_code == 200
+    assert r.json()["store_state"] == "absent"
+    assert app.state.store_state == "absent"
+
+
+@pytest.mark.asyncio
+async def test_storage_mount_key_missing_is_typed_error_unmounted(
+    container_base, monkeypatch
+):
+    """A bundle present but the key unreadable -> typed ``store_lock_failed`` with
+    the store left unmounted (mirrors ``storage.unlock``'s ERROR arm)."""
+    _make_bundle(container_base)
+
+    def _missing():
+        raise container.ContainerKeyMissingError("no key")
+
+    monkeypatch.setattr(container, "require_container_key", _missing)
+    monkeypatch.setattr(
+        container, "attach", lambda *a, **k: pytest.fail("must not attach")
+    )
+    app = _absent_app()
+    async with _client(app) as client:
+        r = await client.post("/v0/storage.mount")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"] == errors.STORE_LOCK_FAILED
+    assert body["reason"] == sl.ERROR_KEY_MISSING
+    assert body["retryable"] is False
+    # The store was NOT mounted; the daemon still serves absent.
+    assert app.state.store_state == "absent"
+
+
+@pytest.mark.asyncio
+async def test_storage_mount_refuses_when_sealed(container_base, monkeypatch):
+    """A sealed / LOCKED store is the unlock path's job: ``storage.mount`` must
+    refuse rather than attach behind the sentinel (which ``mount_now`` ignores) and
+    leave the on-disk sentinel disagreeing with the live mount."""
+    _make_bundle(container_base)
+    sl.sealed_sentinel_path().parent.mkdir(parents=True, exist_ok=True)
+    sl.sealed_sentinel_path().write_text("sealed\n")
+    # Any attach/mount attempt while sealed is a bug.
+    monkeypatch.setattr(
+        container, "attach", lambda *a, **k: pytest.fail("must not attach while sealed")
+    )
+    app = _app_locked(StoreState.LOCKED)
+    async with _client(app) as client:
+        r = await client.post("/v0/storage.mount")
+    assert r.status_code == 409
+    assert r.json()["error"] == errors.STORE_LOCK_FAILED
+    assert r.json()["reason"] == "store_sealed"
+    assert app.state.store_state == "locked"
+
+
+# ---------------------------------------------------------------------------
 # idle-shutdown fires normally while locked
 # ---------------------------------------------------------------------------
 
