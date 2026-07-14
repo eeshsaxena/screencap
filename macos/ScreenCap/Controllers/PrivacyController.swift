@@ -29,6 +29,64 @@ final class PrivacyController: ObservableObject {
     /// it) — the E2EE row renders locked with the stub copy rather than
     /// offering a toggle whose write path may not exist (KTD-8).
     @Published private(set) var cloudE2EEEnabled: Bool?
+    /// SCR-258 U10 (KTD-19): whether the on-disk encrypted container is enabled on
+    /// this install. Gates the menu-bar Lock item and the encrypt-migration offer.
+    /// nil until the first `refreshStatus()` (or on an older CLI that omits it).
+    @Published private(set) var containerEnabled: Bool?
+    /// SCR-258 U10: whether the library is already encrypted at rest (a bundle
+    /// exists). Distinguishes an already-migrated install from an eligible one.
+    @Published private(set) var storeEncrypted: Bool?
+
+    /// SCR-258 U10 (KTD-18): the plaintext→container upgrade-migration lifecycle for
+    /// the one-shot Library banner + the Privacy pane's storage entry. Mirrors the
+    /// SCR-228 `MigrationState` pattern but adds a distinct `.paused(reason:)` case:
+    /// the encrypt job's ENOSPC / disk-preflight pause is AUTO-RESUMING, semantically
+    /// distinct from `.failed`, so it must render "waiting for free disk space — will
+    /// resume automatically", never a failure.
+    enum EncryptMigrationState: Equatable {
+        case idle
+        case migrating(EncryptProgress)
+        case paused(reason: String)
+        case succeeded
+        case failed(message: String)
+
+        /// Map a privacy-safe migration snapshot to the UI state. `running` →
+        /// migrating, `paused` → the auto-resuming disk pause, `completed` →
+        /// succeeded; `idle` / `cancelled` / unknown → idle. `failed` never comes
+        /// from a status snapshot (MigrationState has no failed run state) — it
+        /// arrives from a verb refusal/exception, so it is set by the caller.
+        static func from(_ r: StorageEncryptResponse) -> EncryptMigrationState {
+            switch r.state {
+            case "running":
+                return .migrating(EncryptProgress(
+                    verified: r.verified, total: r.total, phase: r.phase
+                ))
+            case "paused":
+                return .paused(reason: r.pausedReason ?? "insufficient_disk")
+            case "completed":
+                return .succeeded
+            default:
+                return .idle
+            }
+        }
+    }
+
+    /// Privacy-safe migration progress (counts only — no recording names, R9).
+    struct EncryptProgress: Equatable {
+        let verified: Int
+        let total: Int
+        let phase: String
+    }
+
+    @Published private(set) var encryptState: EncryptMigrationState = .idle
+    /// Persisted "declined the one-shot banner" flag so a decline sticks across
+    /// launches (the settings-pane entry stays available regardless).
+    @Published private(set) var encryptBannerDismissed: Bool =
+        UserDefaults.standard.bool(forKey: PrivacyController.encryptBannerDismissedKey)
+
+    static let encryptBannerDismissedKey = "com.screencap.macos.encryptBannerDismissed"
+    /// Serializes encrypt start/cancel round-trips.
+    private var encryptInFlight = false
 
     /// SCR-228 U6: storage-migration lifecycle for the Privacy pane's storage
     /// row. `.migrating` covers the (near-instant, same-volume) CLI round-trip;
@@ -156,6 +214,8 @@ final class PrivacyController: ObservableObject {
             uploadDefault = envelope.settings.uploadDefault
             recordingsDir = envelope.settings.recordingsDir
             cloudE2EEEnabled = envelope.settings.cloudE2EEEnabled
+            containerEnabled = envelope.settings.containerEnabled
+            storeEncrypted = envelope.settings.storeEncrypted
             guard let p = envelope.settings.privacy else { return }
             status = p
             lastError = nil
@@ -312,6 +372,74 @@ final class PrivacyController: ObservableObject {
     func clearMigrationState() {
         if case .migrating = migrationState { return }  // don't interrupt a run
         migrationState = .idle
+    }
+
+    // MARK: - Encrypt-migration (SCR-258 U10, KTD-18)
+
+    /// Begin (or resume) the plaintext→container upgrade migration. Daemon-backed;
+    /// a refusal (custom recordings dir, container disabled, …) surfaces as
+    /// `.failed` with the daemon's human message. Serialized so a double-tap can't
+    /// race two starts.
+    func startEncryption() async {
+        guard !encryptInFlight else { return }
+        encryptInFlight = true
+        defer { encryptInFlight = false }
+        do {
+            let resp = try await DaemonClient.storageEncryptStart()
+            encryptState = EncryptMigrationState.from(resp)
+        } catch let DaemonClientError.envelopeError(code, rawBody) {
+            encryptState = .failed(
+                message: Self.encryptRefusalMessage(code: code, rawBody: rawBody)
+            )
+        } catch {
+            encryptState = .failed(message: error.localizedDescription)
+        }
+    }
+
+    /// Refresh the migration snapshot (drives progress / the auto-resuming paused
+    /// state). A transient daemon-unreachable is swallowed so the pane doesn't flash
+    /// an error mid-migration; a prior terminal `.failed` is preserved.
+    func refreshEncryptStatus() async {
+        do {
+            let resp = try await DaemonClient.storageEncryptStatus()
+            let mapped = EncryptMigrationState.from(resp)
+            // Preserve a terminal .failed we set from a refusal — an idle status
+            // snapshot afterward shouldn't erase the reason the user needs to see.
+            if case .failed = encryptState, case .idle = mapped { return }
+            encryptState = mapped
+        } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
+            // No daemon — leave the current state as-is.
+        } catch {
+            // Transient — leave the current state as-is.
+        }
+    }
+
+    /// Cancel the in-flight migration (resumable; plaintext stays intact).
+    func cancelEncryption() async {
+        do {
+            let resp = try await DaemonClient.storageEncryptCancel()
+            encryptState = EncryptMigrationState.from(resp)
+        } catch {
+            // Best-effort — a failed cancel leaves the run going; status refresh
+            // will reconcile.
+        }
+    }
+
+    /// Dismiss the one-shot Library banner (persists). The settings-pane storage
+    /// entry stays available regardless.
+    func dismissEncryptBanner() {
+        encryptBannerDismissed = true
+        UserDefaults.standard.set(true, forKey: Self.encryptBannerDismissedKey)
+    }
+
+    /// Extract the daemon's human `message` from a refusal envelope, falling back to
+    /// a code-derived line.
+    private static func encryptRefusalMessage(code: String, rawBody: Data) -> String {
+        if let obj = try? JSONSerialization.jsonObject(with: rawBody) as? [String: Any],
+           let message = obj["message"] as? String, !message.isEmpty {
+            return message
+        }
+        return VaultMigrationPolicy.refusalFallback(code: code)
     }
 
     /// Mark first-run setup complete (`setup_skipped = true`). Both banner

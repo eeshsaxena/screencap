@@ -16,6 +16,26 @@ enum MenuBarMenuPolicy {
         return false
     }
 
+    // MARK: - Encrypted-store Lock / Unlock (SCR-258 U10)
+
+    /// Whether the menu-bar "Lock" item should appear. Shown only when the store is
+    /// MOUNTED (there is something to seal), the encrypted container is enabled
+    /// (locking a plaintext install would just be refused), and no lock/unlock is
+    /// already in flight. Hidden when the store is absent or a plaintext-only build.
+    static func lockItemVisible(
+        storeState: StoreState, containerEnabled: Bool, phase: StoreController.Phase
+    ) -> Bool {
+        storeState.isMounted && containerEnabled && phase == .idle
+    }
+
+    /// Whether the menu-bar "Unlock" item should appear — only for a sealed store.
+    /// A locked store always implies a container, so no container-enabled check is
+    /// needed here.
+    static func unlockItemVisible(storeState: StoreState, phase: StoreController.Phase) -> Bool {
+        if case .locked = storeState { return phase == .idle }
+        return false
+    }
+
     // MARK: - Mute mic item (SCR-254 U8)
 
     /// Whether the menu-bar mute item should appear. Gated on `.recording` — it

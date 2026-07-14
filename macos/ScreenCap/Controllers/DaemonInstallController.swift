@@ -178,6 +178,14 @@ final class DaemonInstallController: ObservableObject {
     /// so the gate is testable in isolation).
     private let defaults: UserDefaults
     private let proactiveTccSetup: @Sendable () async -> Void
+    /// SCR-258 U10: create the encrypted store (`storage init`) BEFORE SMAppService
+    /// registration so a daemon that starts on registration mounts a real container
+    /// rather than reporting `absent`. Injectable so the controller sequence is
+    /// testable without a real CLI; the default no-ops under XCTest and only runs
+    /// init when the container is enabled and not already encrypted (so a plaintext
+    /// install — container disabled — never gets a bundle it would then refuse to
+    /// serve as a downgrade).
+    private let ensureStoreInit: @Sendable () async -> Void
 
     init(
         registrationService: DaemonRegistrationService = SMAppServiceRegistration(),
@@ -189,7 +197,8 @@ final class DaemonInstallController: ObservableObject {
         },
         now: @escaping () -> Date = Date.init,
         defaults: UserDefaults = .standard,
-        proactiveTccSetup: @escaping @Sendable () async -> Void = DaemonInstallController.defaultProactiveTccSetup
+        proactiveTccSetup: @escaping @Sendable () async -> Void = DaemonInstallController.defaultProactiveTccSetup,
+        ensureStoreInit: @escaping @Sendable () async -> Void = DaemonInstallController.defaultEnsureStoreInit
     ) {
         self.registrationService = registrationService
         self.probe = probe
@@ -199,6 +208,26 @@ final class DaemonInstallController: ObservableObject {
         self.now = now
         self.defaults = defaults
         self.proactiveTccSetup = proactiveTccSetup
+        self.ensureStoreInit = ensureStoreInit
+    }
+
+    /// The default store-init step (SCR-258 U10). No-op under XCTest. Reads
+    /// `settings --json` (works without a daemon) and runs `storage init` in the
+    /// foreground ONLY when the container is enabled and the library isn't already
+    /// encrypted — so a plaintext install never gets a bundle it would then refuse
+    /// to serve (the downgrade-unsupported state). Best-effort: any failure leaves
+    /// the daemon to report `absent`, which the app surfaces as onboarding guidance.
+    static let defaultEnsureStoreInit: @Sendable () async -> Void = {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        do {
+            let data = try await CLIClient.runJSONRaw(["settings", "--json"])
+            let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
+            guard env.settings.containerEnabled == true,
+                  env.settings.storeEncrypted != true else { return }
+            try await CLIClient.runAwaitingExit(["storage", "init"], timeout: 30)
+        } catch {
+            daemonInstallLogger.error("storage init before registration failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// SCR-200 U3/U4: once per installed daemon version, register the daemon's
@@ -237,6 +266,12 @@ final class DaemonInstallController: ObservableObject {
         guard !Self.installInFlight else { return }
         Self.installInFlight = true
         defer { Self.installInFlight = false }
+
+        // SCR-258 U10: create the encrypted store BEFORE registration so the daemon
+        // that starts on registration mounts a real container rather than reporting
+        // `absent`. Best-effort — a failure leaves the daemon to surface the
+        // absent-state onboarding guidance rather than an error.
+        await ensureStoreInit()
 
         state = .registering
         let status: SMAppService.Status

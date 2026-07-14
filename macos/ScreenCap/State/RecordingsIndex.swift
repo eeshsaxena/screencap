@@ -31,6 +31,15 @@ final class RecordingsIndex: ObservableObject {
     @Published private(set) var recordings: [RecordingSummary] = []
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
+    /// SCR-258 U10 (KTD-20): the encrypted-store state, parsed from the
+    /// `recording.list` SUCCESS envelope (and the CLI `list --json` fallback's typed
+    /// output) — an INDEPENDENT property, NOT a `LoadErrorKind` case, because that
+    /// verb succeeds with an empty payload for a locked/absent/error store and never
+    /// throws. `LibraryView` (and Search/Chat) branch on this BEFORE the
+    /// `recordings.isEmpty` check so a sealed store never falls through to the
+    /// "Nothing recorded yet" welcome screen (the R6 data-loss look). `.mounted` for
+    /// a plaintext install, an older daemon, or a generic load failure.
+    @Published private(set) var storeState: StoreState = .mounted
     /// Classification of `lastError` for the Library error state (U5). `nil`
     /// whenever `lastError` is `nil`.
     @Published private(set) var lastErrorKind: LoadErrorKind?
@@ -100,10 +109,19 @@ final class RecordingsIndex: ObservableObject {
         do {
             let rows: [RecordingSummary]
             do {
-                rows = try await DaemonClient.recordingList().recordings
+                let response = try await DaemonClient.recordingList()
+                rows = response.recordings
+                storeState = await Self.resolveDaemonStoreState(response)
                 usingCLIFallback = false
             } catch DaemonClientError.socketUnavailable, DaemonClientError.connectionFailed {
-                rows = try await CLIClient.runJSON(["list", "--json"])
+                // SCR-258 U10: the CLI `list --json` now emits TWO shapes — a bare
+                // array when mounted, or a typed `{store_state, recordings}` object
+                // for a non-mounted store. Decode both so the fallback path can
+                // render a locked/absent state instead of a misleading empty grid.
+                let data = try await CLIClient.runJSONRaw(["list", "--json"])
+                let payload = try StoreListPayload.decode(data)
+                rows = payload.recordings
+                storeState = payload.storeState
                 usingCLIFallback = true
             }
             recordings = rows
@@ -114,11 +132,29 @@ final class RecordingsIndex: ObservableObject {
             // doesn't leave stale cards in the Library. The Library detail
             // distinguishes "loading", "error", and "empty" so the user sees
             // a banner with a Retry button instead of a misleading welcome
-            // state.
+            // state. A transport/decode failure is a LOAD error, not a store
+            // state — reset `storeState` so a stale locked/absent state doesn't
+            // render over the generic error surface.
             recordings = []
+            storeState = .mounted
             lastError = error.localizedDescription
             lastErrorKind = Self.classify(error)
         }
+    }
+
+    /// Resolve the store state for the daemon path. `recording.list` carries
+    /// `store_state` but NOT `store_reason`, so an `error` state is enriched from
+    /// `daemon.info` (which does carry the reason) to distinguish a key-missing
+    /// store (no Unlock button, R10) from a retryable cause. A `daemon.info` hiccup
+    /// degrades to the reason-less `error` (rendered with the generic error copy)
+    /// rather than throwing.
+    static func resolveDaemonStoreState(_ response: ListResponse) async -> StoreState {
+        let resolved = response.resolvedStoreState
+        guard case .error = resolved else { return resolved }
+        if let info = try? await DaemonClient.daemonInfo() {
+            return info.resolvedStoreState
+        }
+        return resolved
     }
 
     /// Map a load failure to the actionable kind the Library error state keys on

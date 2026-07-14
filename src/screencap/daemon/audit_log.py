@@ -53,6 +53,9 @@ def _audit_log_path() -> Path:
     ``HOME`` after this module is imported. Mirrors the lazy shape used by
     ``default_socket_path`` in ``screencap.daemon.socket``.
     """
+    # RUN-DIR boundary (SCR-236 R3): the audit log stays OUTSIDE the at-rest
+    # container as plaintext (metadata-sensitive residual, documented in
+    # SECURITY.md). Do NOT route through config.get_data_root().
     return Path.home() / ".screencap" / "run" / "audit.log"
 
 

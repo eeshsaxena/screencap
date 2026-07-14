@@ -82,12 +82,38 @@ def serve(
         resolved_socket_path = Path(socket_path).expanduser() if socket_path else default_socket_path()
         listener = bind_unix_socket(resolved_socket_path)
 
+        # SCR-258 U4 (KTD-14): the daemon binds FIRST, then resolves the
+        # encrypted-store state. A sealed (locked) / not-yet-initialized (absent) /
+        # key-error store is a HEALTHY serving state — the daemon serves
+        # ``store_state`` on ``daemon.info`` + read verbs so a locked store is
+        # distinguishable from a dead daemon (never a launchd crash-loop). Only a
+        # ROGUE mountpoint or a corrupted bundle is a fatal operator stop; those
+        # carry the right exit code (operator -> 1, retryable -> EX_TEMPFAIL) on the
+        # container exception. This runs AFTER bind so the ordering is observable
+        # (the bind-before-mount amendment).
+        from screencap.container import ContainerError
+        from screencap.daemon import store_lifecycle
+
+        try:
+            store_resolution = store_lifecycle.resolve_store_state()
+        except ContainerError as exc:
+            _print_stderr(str(exc))
+            listener.close()
+            cleanup_socket(resolved_socket_path)
+            return exc.exit_code
+
         async def run() -> int:
             nonlocal server_ref, buffered_signal
 
             import uvicorn
 
             app = build_app()
+            # Publish the resolved store state so ``daemon.info`` + the read verbs
+            # can surface it and the supervisor (created in the lifespan) can read
+            # it as the recording.start refusal flag.
+            app.state.store_resolution = store_resolution
+            app.state.store_state = store_resolution.state.value
+            app.state.store_reason = store_resolution.reason
             if idle_shutdown_seconds is not None and idle_shutdown_seconds > 0:
                 from screencap.daemon._idle_shutdown import attach as _attach_idle
 

@@ -21,6 +21,7 @@ from starlette.routing import Route
 from screencap import _stderr_events
 from screencap.daemon import errors, schema
 from screencap.daemon.event_bus import CursorOutOfRangeError, EventBus
+from screencap.daemon.store_lifecycle import StoreState
 from screencap.pidfile import CLAIMANT_DAEMON
 
 # U5 (conversational recall): the ``chat.answer`` request-path modules are
@@ -47,6 +48,49 @@ logger = logging.getLogger(__name__)
 
 _STARTED_AT = time.time()
 
+# SCR-258 U9 (KTD-15): store lock/unlock lifecycle events ride ``/v0/events`` so
+# the Swift app and MCP-adjacent surfaces update without polling. ``store.locking``
+# is the PRE-DETACH signal direct readers (Swift frame reads, in-flight pipeline
+# workers) consume to release open handles BEFORE the volume goes away — since
+# direct readers have no daemon in the byte path (base KTD-12) and would otherwise
+# see raw EIO/ENOENT mid-read. ``store.lock.progress`` carries per-phase heartbeats
+# (the state machine REFUSE_SET → STOPPING → SIGNAL_READERS → QUIESCING →
+# DETACHING → SEALED) so a Swift watchdog never stares at a silent blocking wait.
+EVENT_STORE_LOCKING = "store.locking"
+EVENT_STORE_LOCKED = "store.locked"
+EVENT_STORE_UNLOCKED = "store.unlocked"
+EVENT_STORE_LOCK_PROGRESS = "store.lock.progress"
+
+# The quiescence grace budget (KTD-15 Outstanding Question). "Seconds, not
+# until-upload-completes": in-flight ledger-disciplined workers are given this long
+# to reach a ledger-safe boundary and stop; if they do not, the graceful-then-force
+# detach is the backstop (force is safe precisely because every writer is
+# ledger-disciplined and readers were signalled). Pinned in the AE7 test.
+_LOCK_QUIESCE_GRACE_S = 5.0
+
+
+async def _emit_store_event(app: Starlette, event_type: str, **fields: Any) -> None:
+    """Publish a store lock/unlock lifecycle event on ``/v0/events`` (U9).
+
+    Best-effort: a publish failure (e.g. the bus closing during teardown) must
+    never abort the lock/unlock chain. The payload is recording-name-free (R9) —
+    it carries only phase/state, never a recording identity.
+    """
+    bus = getattr(app.state, "event_bus", None)
+    if bus is None:
+        return
+    try:
+        await bus.publish(
+            {
+                "type": event_type,
+                "schema_version": _stderr_events.EVENT_SCHEMA_VERSION,
+                "ts": time.time(),
+                **fields,
+            }
+        )
+    except Exception:  # noqa: BLE001 — a lifecycle event is best-effort telemetry
+        logger.debug("store lifecycle event publish skipped (%s)", event_type)
+
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -62,6 +106,16 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         app.state.supervisor = Supervisor(
             app.state.event_bus,
             start_gate=lambda: enforce_recording_start_gate(app),
+        )
+    # SCR-258 U4 (KTD-14): thread the store state ``server.serve`` resolved AFTER
+    # binding the socket into the supervisor, so ``recording.start`` is refused
+    # (typed, before any ``started`` signal) while the store is locked / absent /
+    # unmountable. Absent (a lifespan-less test app or a plaintext install) leaves
+    # the supervisor's default MOUNTED — byte-identical to today.
+    resolution = getattr(app.state, "store_resolution", None)
+    if resolution is not None:
+        app.state.supervisor.set_store_state(
+            resolution.state, getattr(resolution, "reason", None)
         )
     # SCR-228: reconcile a storage migration that crashed between the tree
     # rename and the config flip, so the daemon serves the correct recordings
@@ -84,6 +138,15 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         await asyncio.to_thread(corpus_migrate.resume_at_daemon_start)
     except Exception:  # noqa: BLE001 - migration must never break startup
         logger.warning("corpus-migration resume failed", exc_info=True)
+    # SCR-258 U6 (KTD-18): auto-resume an upgrade migration a prior daemon left
+    # incomplete (interrupted before cutover, or a post-cutover sweep that didn't
+    # finish). The ledger is the durable source of truth; ``should_auto_resume``
+    # is the policy (a CANCELLED / COMPLETE / never-started run is skipped).
+    # Strictly fail-open — a resume hiccup must never block daemon start.
+    try:
+        _reconcile_encrypt_job_on_start(app)
+    except Exception:  # noqa: BLE001 - migration resume must never break startup
+        logger.warning("encrypt-migration resume failed", exc_info=True)
     # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
     # daemon start (the stale-daemon-after-app-update lesson — a request-path
     # module must be imported before the first request, never lazily inside the
@@ -100,6 +163,28 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     # warm finishing first; it only makes the common case fast. Fail-open inside
     # _warm_grant_cache: a probe error must never break the daemon.
     app.state._grant_warm_task = asyncio.create_task(_warm_grant_cache(app))
+    # U7 (SCR-236/SCR-258 KTD-11): live-check FileVault ONCE at daemon start,
+    # cache it on app.state for daemon.info, and log it once. Warn-only (R11/R15):
+    # a FileVault-off or unknown result is surfaced but never blocks recording.
+    # Strictly fail-open — the probe itself never raises, and this whole block is
+    # additionally guarded so it can never break daemon boot.
+    app.state.filevault_status = "unknown"
+    try:
+        from screencap import container
+
+        fv = await asyncio.to_thread(container.filevault_status)
+        app.state.filevault_status = fv.value
+        if fv is container.FileVaultStatus.OFF:
+            logger.warning(
+                "FileVault is OFF on this machine: recordings at rest are protected by "
+                "the encrypted container and file permissions, but not by full-disk "
+                "encryption. Turn FileVault on in System Settings > Privacy & Security "
+                "for defense in depth. (Recording is not affected.)"
+            )
+        else:
+            logger.info("FileVault status at daemon start: %s", fv.value)
+    except Exception:  # noqa: BLE001 - the FileVault check must never break startup
+        logger.debug("FileVault startup check failed", exc_info=True)
     # Periodic screenshot-retention sweep (search U5): applies the age/size bound to
     # converged recordings that no recording-lifecycle event revisits. Not
     # auth-gated (runs signed-out); a no-op until a bound is configured. Fail-open —
@@ -129,6 +214,12 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         backfill_job = getattr(app.state, "backfill_job", None)
         if backfill_job is not None:
             await backfill_job.shutdown()
+        # SCR-258 U6: stop an in-flight migration BEFORE closing the bus/loop —
+        # its copy/verify worker runs on a to_thread worker the loop cannot
+        # cancel, so pause it (a paused ledger auto-resumes on the next start).
+        encrypt_job = getattr(app.state, "encrypt_job", None)
+        if encrypt_job is not None:
+            await encrypt_job.shutdown()
         model_download_job = getattr(app.state, "model_download_job", None)
         if model_download_job is not None:
             await model_download_job.shutdown()
@@ -215,18 +306,46 @@ async def daemon_info(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 - readiness probe must never 500
         logger.debug("daemon.info grant probe failed", exc_info=True)
         grants = permission_probe.indeterminate_result()
+    # U7 (KTD-11): surface the warn-only FileVault status resolved once at daemon
+    # start (see the lifespan). Absent (e.g. a lifespan-less test app) → "unknown",
+    # which is not alarming and renders no warning. Never blocks recording.
+    filevault = getattr(request.app.state, "filevault_status", "unknown")
+    # SCR-258 U4 (KTD-14): the encrypted-store state, so a locked / absent store is
+    # distinguishable from a dead daemon. Always present (the IndexState precedent);
+    # a lifespan-less test app or a plaintext install reports ``mounted``. The
+    # ``store_reason`` (an ``ERROR_*`` code) accompanies ``error`` for an accurate
+    # cause (key missing vs entitlement mismatch vs downgrade unsupported).
+    store_state = _store_state_value(request)
+    store_reason = getattr(request.app.state, "store_reason", None)
     return JSONResponse(
         schema.envelope(
             schema_version=schema._DAEMON_INFO_API_VERSION,
             build=_build_string(),
             started_at=_STARTED_AT,
             permissions=grants,
+            filevault=filevault,
+            store_state=store_state,
+            store_reason=store_reason,
         )
     )
 
 
 async def recording_list(request: Request) -> JSONResponse:
     from screencap import catalog
+
+    # SCR-258 U4 (KTD-14/KTD-20): a locked / absent / error store returns the
+    # NORMAL envelope with ``store_state`` set and an EMPTY list — never a 500 and
+    # never a silent empty payload indistinguishable from "no recordings" (the R6
+    # data-loss look the Swift Library branches on before its isEmpty check).
+    store_state = _store_state_value(request)
+    if store_state != StoreState.MOUNTED.value:
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._LIST_API_VERSION,
+                recordings=[],
+                store_state=store_state,
+            )
+        )
 
     try:
         recordings = await asyncio.to_thread(catalog.list_recordings)
@@ -265,6 +384,7 @@ async def recording_list(request: Request) -> JSONResponse:
         schema.envelope(
             schema_version=schema._LIST_API_VERSION,
             recordings=summaries,
+            store_state=store_state,
         )
     )
 
@@ -611,6 +731,23 @@ def _api_error_response(exc: errors.DaemonAPIError) -> JSONResponse:
         status_code=exc.http_status,
         headers=exc.response_headers() or None,
     )
+
+
+def _store_state_value(request: Request) -> str:
+    """The resolved encrypted-store state string for this daemon (SCR-258 U4).
+
+    Read off ``app.state.store_state`` (set by ``server.serve`` -> lifespan after
+    the socket is bound). Absent (a lifespan-less test app, or an old daemon) ->
+    ``mounted``, so read verbs behave exactly as today on a plaintext install.
+    """
+    state = getattr(request.app.state, "store_state", None)
+    if state is None:
+        return StoreState.MOUNTED.value
+    return state.value if isinstance(state, StoreState) else str(state)
+
+
+def _store_is_mounted(request: Request) -> bool:
+    return _store_state_value(request) == StoreState.MOUNTED.value
 
 
 def _validation_error_response(*, schema_version: int) -> JSONResponse:
@@ -1363,6 +1500,19 @@ async def content_search(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._CONTENT_SEARCH_API_VERSION
         )
+        # SCR-258 U4: a locked / absent / error store returns empty hits +
+        # ``store_state`` (never a 500). ``index_state=store_unavailable`` is the
+        # IndexState precedent — the content index lives inside the store.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._CONTENT_SEARCH_API_VERSION,
+                    hits=[],
+                    index_state="store_unavailable",
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1380,6 +1530,7 @@ async def content_search(request: Request) -> JSONResponse:
                 schema_version=schema._CONTENT_SEARCH_API_VERSION,
                 hits=result["hits"],
                 index_state=result["index_state"],
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1801,6 +1952,17 @@ async def transcript_search(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION
         )
+        # SCR-258 U4: locked / absent / error store -> empty hits + store_state.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
+                    hits=[],
+                    coverage="best_effort",
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1816,6 +1978,7 @@ async def transcript_search(request: Request) -> JSONResponse:
                 schema_version=schema._TRANSCRIPT_SEARCH_API_VERSION,
                 hits=hits,
                 coverage="best_effort",
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1836,6 +1999,17 @@ async def timeline_query(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._TIMELINE_QUERY_API_VERSION
         )
+        # SCR-258 U4: locked / absent / error store -> empty rows + store_state.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._TIMELINE_QUERY_API_VERSION,
+                    rows=[],
+                    coverage="authoritative",
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1864,6 +2038,7 @@ async def timeline_query(request: Request) -> JSONResponse:
                 schema_version=schema._TIMELINE_QUERY_API_VERSION,
                 rows=rows,
                 coverage="authoritative",
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -1926,6 +2101,22 @@ async def frame_nearest(request: Request) -> JSONResponse:
         _check_subscription_for_recall(
             schema_version=schema._FRAME_NEAREST_API_VERSION
         )
+        from screencap.config import get_corpus_encrypted
+
+        # SCR-258 U4: locked / absent / error store -> a miss (null stem) +
+        # store_state, never a 500. A locked volume has no on-disk frames to
+        # resolve; the agent must see the locked state, not an ambiguous miss.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._FRAME_NEAREST_API_VERSION,
+                    stem=None,
+                    delta_ms=None,
+                    encrypted=get_corpus_encrypted(),
+                    store_state=store_state,
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -1941,7 +2132,6 @@ async def frame_nearest(request: Request) -> JSONResponse:
             parsed.recording, parsed.timestamp_ms, parsed.staleness_cap_ms,
         )
         stem, delta_ms = result if result is not None else (None, None)
-        from screencap.config import get_corpus_encrypted
 
         return JSONResponse(
             schema.envelope(
@@ -1951,6 +2141,7 @@ async def frame_nearest(request: Request) -> JSONResponse:
                 # KTD6: signal encrypted storage so the agent calls frame.read
                 # instead of reading the .jpg path directly.
                 encrypted=get_corpus_encrypted(),
+                store_state=store_state,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -2956,6 +3147,307 @@ async def backfill_cancel(request: Request) -> JSONResponse:
         )
 
 
+# ---------------------------------------------------------------------------
+# SCR-258 U6 (KTD-18): upgrade-migration job — copy/verify → cutover → sweep.
+# ---------------------------------------------------------------------------
+
+_ENCRYPT_INTERIM_MOUNT_NAME = "migrate-mnt"
+_ENCRYPT_ASIDE_SUFFIX = "-migrated-plaintext"
+
+
+def _encrypt_job(app: Starlette) -> Any:
+    """Lazily attach the single migration job holder to ``app.state`` (U6).
+
+    Scoped per app instance (not module-global) so tests building fresh apps
+    don't share a job. This is the ``app.state.encrypt_job`` hook U9 reserved for
+    the lock pause + the unlock auto-resume.
+    """
+    state = app.state
+    if not hasattr(state, "encrypt_job"):
+        from screencap.daemon.encrypt_job import EncryptJob
+
+        state.encrypt_job = EncryptJob(state.event_bus)
+    return state.encrypt_job
+
+
+def _is_custom_recordings_install() -> bool:
+    """True iff this install uses a custom recordings dir / env override (R16).
+
+    Such installs are plaintext bypasses excluded from the migration prompt and
+    documented as outside the at-rest claim — ``storage.encrypt.start`` refuses.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    from screencap import config
+
+    if _os.environ.get("SCREENCAP_RECORDINGS_DIR"):
+        return True
+    try:
+        cfg = config._load_toml()
+    except Exception:  # noqa: BLE001
+        return False
+    val = cfg.get("recordings_dir")
+    if not val:
+        return False
+    try:
+        return _Path(val).resolve() != config._DEFAULT_RECORDINGS.resolve()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _build_encrypt_run_factory(app: Starlette) -> Any:
+    """Build the migration ``run_factory`` (all daemon seams wired) for the job.
+
+    Returns a zero-arg factory producing the bound
+    ``run(stop_event, progress_cb, ledger)`` the engine call needs, wiring:
+    the interim/final mountpoints + aside path, the container mounter (real
+    ``hdiutil`` + the stored key), the active-recording query, the brief
+    ``acquire_migration`` cutover reservation, the sidecar-writer pause, and the
+    disk preflight. Captured here so the verb AND the unlock / daemon-start
+    auto-resume share one plan and cannot drift.
+    """
+    import contextlib as _contextlib
+    import shutil as _shutil
+
+    from screencap import config, migration
+    from screencap.daemon import store_lifecycle as _sl
+
+    supervisor = app.state.supervisor
+    loop = asyncio.get_running_loop()
+    bundle_path = _sl.store_bundle_path()
+
+    def _factory() -> Any:
+        from screencap import container
+
+        key = container.require_container_key()
+        base_dir = config.get_base_dir()
+        recordings = config.get_recordings_dir()
+        paths = migration.MigrationPaths(
+            plaintext_root=recordings,
+            interim_mountpoint=base_dir / "run" / _ENCRYPT_INTERIM_MOUNT_NAME,
+            aside_root=recordings.parent / (recordings.name + _ENCRYPT_ASIDE_SUFFIX),
+            sidecar_source_dir=base_dir,
+        )
+        mounter = migration.ContainerMounter(bundle_path, key)
+
+        def _active_name() -> str | None:
+            session = supervisor.current_session()
+            if not session:
+                return None
+            return session.get("recording_name")
+
+        @_contextlib.contextmanager
+        def _cutover_reservation() -> Any:
+            fut = asyncio.run_coroutine_threadsafe(
+                supervisor.acquire_migration(
+                    schema_version=schema._STORAGE_ENCRYPT_API_VERSION
+                ),
+                loop,
+            )
+            fut.result()
+            try:
+                yield
+            finally:
+                supervisor.release_migration()
+
+        @_contextlib.contextmanager
+        def _pause_sidecar_writers() -> Any:
+            # Pause the backfill OCR writer (the content-index writer) for the
+            # sidecar-copy window; the encrypt job must NOT pause itself.
+            job = getattr(app.state, "backfill_job", None)
+            if job is not None:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(job.shutdown(), loop)
+                    fut.result(timeout=15)
+                except Exception:  # noqa: BLE001 — best-effort pause
+                    logger.debug("encrypt: pausing backfill for cutover raised",
+                                 exc_info=True)
+            yield
+
+        def _disk_preflight(needed_bytes: int) -> str | None:
+            try:
+                free = _shutil.disk_usage(str(bundle_path.parent)).free
+            except OSError:
+                return None
+            return migration.PAUSE_REASON_DISK if free < needed_bytes else None
+
+        def _run(**kwargs: Any) -> Any:
+            return migration.run_migration(
+                paths=paths,
+                mounter=mounter,
+                active_recording_name=_active_name,
+                cutover_reservation=_cutover_reservation,
+                pause_sidecar_writers=_pause_sidecar_writers,
+                disk_preflight=_disk_preflight,
+                **kwargs,
+            )
+
+        return _run
+
+    return _factory
+
+
+def _reconcile_encrypt_job_on_start(app: Starlette) -> None:
+    """Daemon-start auto-resume for an incomplete migration (U6, KTD-18).
+
+    Builds the job (+ its run_factory) and resumes iff the durable ledger says
+    there is work left AND the user did not cancel — the policy is
+    ``migration.should_auto_resume``. A container-disabled / custom-recordings
+    install has nothing to resume.
+    """
+    from screencap import config, migration
+
+    if not config.get_container_enabled() or _is_custom_recordings_install():
+        return
+    ledger = migration.MigrationLedger()
+    if not migration.should_auto_resume(ledger):
+        return
+    job = _encrypt_job(app)
+    job.start(_build_encrypt_run_factory(app))
+
+
+async def _encrypt_body(request: Request) -> dict[str, Any]:
+    """Tolerant body read for the parameterless encrypt verbs (backfill shape)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _ensure_encrypt_bundle() -> None:
+    """Foreground-acceptance key + bundle creation (KTD-18, idempotent).
+
+    The user is present (they just accepted the migration prompt), so the first
+    Keychain write's ACL prompt has a user to answer it. Reuses an existing key /
+    bundle; mints only when neither exists (never orphaning a store).
+    """
+    from screencap import container
+    from screencap.daemon import store_lifecycle as _sl
+
+    bundle = _sl.store_bundle_path()
+    if bundle.exists():
+        return
+    key = container.get_container_key()
+    if key is None:
+        key = container.create_container_key(str(bundle))
+    container.create_bundle(str(bundle), key)
+
+
+async def storage_encrypt_start(request: Request) -> JSONResponse:
+    """``POST /v0/storage.encrypt.start`` — begin (or resume) the migration (U6).
+
+    KTD-18 / KTD-23: refuses a custom-recordings install (R16, typed reason),
+    creates the key+bundle in the foreground acceptance flow, audit-logs
+    ``storage.encrypt.start`` with peer provenance + outcome, then drives the
+    idempotent record-through job. A start while a run is in flight returns the
+    in-flight snapshot.
+    """
+    from screencap import config
+    from screencap.daemon import audit_log, provenance
+
+    schema_version = schema._STORAGE_ENCRYPT_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.encrypt.start",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        await _encrypt_body(request)
+        if _is_custom_recordings_install():
+            _audit("custom_recordings_dir")
+            return _api_error_response(
+                errors.StorageMigrationError(
+                    "custom_recordings_dir",
+                    "This install uses a custom recordings location (or the "
+                    "SCREENCAP_RECORDINGS_DIR override), which stays plaintext and "
+                    "is outside the encrypted-store migration.",
+                    schema_version=schema_version,
+                )
+            )
+        if not config.get_container_enabled():
+            # Migration is what turns the container on; the engine flips the flag
+            # at cutover. But the daemon must be container-capable to serve the
+            # migrated store afterward — refuse a plaintext-only build clearly.
+            _audit("container_disabled")
+            return _api_error_response(
+                errors.StorageMigrationError(
+                    "container_disabled",
+                    "The encrypted container is not enabled on this install.",
+                    schema_version=schema_version,
+                )
+            )
+        # Foreground key+bundle creation (idempotent) on acceptance.
+        await asyncio.to_thread(_ensure_encrypt_bundle)
+        job = _encrypt_job(request.app)
+        snapshot = job.start(_build_encrypt_run_factory(request.app))
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(schema_version=schema_version, **snapshot.as_payload())
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+
+async def storage_encrypt_status(request: Request) -> JSONResponse:
+    """``GET /v0/storage.encrypt.status`` — privacy-safe migration snapshot (R9).
+
+    Read-only. Carries ONLY counts + run state + cutover phase + a non-identifying
+    pause reason — never a recording directory name. NOT in ``_ACTIVITY_PATHS``.
+    """
+    try:
+        job = _encrypt_job(request.app)
+        snapshot = job.status()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._STORAGE_ENCRYPT_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._STORAGE_ENCRYPT_API_VERSION, request=request
+        )
+
+
+async def storage_encrypt_cancel(request: Request) -> JSONResponse:
+    """``POST /v0/storage.encrypt.cancel`` — signal the in-flight migration to stop.
+
+    Resumable: the ledger records partial progress; a later ``encrypt.start``
+    continues. A no-op returning the current snapshot when no run is in flight.
+    Plaintext stays intact (deletion only runs post-cutover).
+    """
+    try:
+        await _encrypt_body(request)
+        job = _encrypt_job(request.app)
+        snapshot = job.cancel()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._STORAGE_ENCRYPT_API_VERSION,
+                **snapshot.as_payload(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._STORAGE_ENCRYPT_API_VERSION, request=request
+        )
+
+
 def _model_download_job(app: Starlette) -> Any:
     """Lazily attach the single model-download job holder to ``app.state`` (SCR-239)."""
     state = app.state
@@ -3179,6 +3671,19 @@ async def chat_answer(request: Request) -> JSONResponse:
     from screencap.daemon._name_validation import validate_recording_name
 
     try:
+        # SCR-258 U4: a locked / absent / error store degrades to a graceful
+        # refusal (the KTD8 fail-safe shape) carrying ``store_state`` — a 200 with
+        # ``refusal=true`` and ``store_unavailable`` coverage, never a 500 and
+        # never an answer conjured from an unreachable store.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._CHAT_ANSWER_API_VERSION,
+                    store_state=store_state,
+                    **_chat_answer_payload(_graceful_refusal()),
+                )
+            )
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
@@ -3292,6 +3797,84 @@ def _terminal_stage_active() -> bool:
     return False
 
 
+def _is_vault_migration_install() -> bool:
+    """True when ``storage.migrate`` must move the encrypted bundle (SCR-258 U11).
+
+    A vault install = the container is enabled AND a bundle exists. The
+    ``SCREENCAP_RECORDINGS_DIR`` env override is a documented plaintext bypass
+    (KTD-19, R16): when set the container is off, so the shipped SCR-228 rename
+    path applies unchanged. Legacy custom-dir (container off, no bundle) installs
+    likewise take the plaintext path — behavior is byte-identical to today.
+    """
+    from screencap import config
+    from screencap.daemon import store_lifecycle as _sl
+
+    if os.environ.get("SCREENCAP_RECORDINGS_DIR"):
+        return False
+    return config.get_container_enabled() and _sl.store_bundle_path().exists()
+
+
+async def _storage_migrate_bundle(
+    request: Request, parsed: Any, schema_version: int
+) -> JSONResponse:
+    """The vault arm of ``storage.migrate``: relocate the bundle (SCR-258 U11, KTD-19).
+
+    Refuses (typed reason, nothing moved) on a sealed store or a running encrypt
+    job, validates the target (SCR-228's cloud-synced-target preflight RETAINED),
+    then hands off to ``store_lifecycle.relocate_bundle`` — the quiescent, never-
+    force-detach detach → bundle move → config flip → remount cycle under
+    ``mount.lock``. The recordings mountpoint is unchanged; only the bundle moves.
+    The active-recording / terminal-stage refusals already ran in the caller, so a
+    move is never attempted while a recording is live.
+    """
+    from pathlib import Path
+
+    from screencap import storage_migration
+    from screencap.daemon import store_lifecycle as _sl
+
+    if await asyncio.to_thread(_sl.is_sealed):
+        raise errors.StorageMigrationError(
+            "store_sealed",
+            "Unlock the store before moving the storage location.",
+            schema_version=schema_version,
+        )
+
+    encrypt_job = getattr(request.app.state, "encrypt_job", None)
+    if encrypt_job is not None and encrypt_job.is_running():
+        raise errors.StorageMigrationError(
+            "encrypt_in_progress",
+            "An encryption upgrade is in progress. Try moving the storage "
+            "location again once it finishes.",
+            schema_version=schema_version,
+        )
+
+    current_bundle_dir = _sl.store_bundle_path().parent
+    target = Path(parsed.target).expanduser()
+
+    result = storage_migration.validate_bundle_target(current_bundle_dir, target)
+    if not result.ok:
+        raise errors.StorageMigrationError(
+            result.code or "invalid_target",
+            result.message or "The chosen folder can't be used.",
+            schema_version=schema_version,
+        )
+
+    outcome = await asyncio.to_thread(_sl.relocate_bundle, target)
+    if not outcome.ok:
+        raise errors.StorageMigrationError(
+            outcome.code or "invalid_target",
+            outcome.message or "The storage location could not be moved.",
+            schema_version=schema_version,
+        )
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema_version,
+            moved_from=outcome.moved_from,
+            moved_to=outcome.moved_to,
+        )
+    )
+
+
 async def storage_migrate(request: Request) -> JSONResponse:
     """``POST /v0/storage.migrate`` — relocate the recordings library (SCR-228).
 
@@ -3339,6 +3922,15 @@ async def storage_migrate(request: Request) -> JSONResponse:
                 schema_version=schema_version,
             )
 
+        # SCR-258 U11 (KTD-19): a vault install moves the encrypted BUNDLE (the
+        # mountpoint stays put), not the plaintext tree. The plaintext rename
+        # path below is unchanged for legacy custom-dir installs + the env
+        # override (the narrowed plaintext bypass).
+        if await asyncio.to_thread(_is_vault_migration_install):
+            return await _storage_migrate_bundle(
+                request, parsed, schema_version
+            )
+
         source = config.get_recordings_dir()
         target = Path(parsed.target).expanduser()
 
@@ -3381,6 +3973,356 @@ async def storage_migrate(request: Request) -> JSONResponse:
         supervisor.release_migration()
 
 
+async def _signal_background_jobs_to_pause(app: Starlette) -> None:
+    """Signal backfill / encrypt workers to pause at a ledger-safe boundary (U9).
+
+    Best-effort and bounded: each job's ``shutdown`` sets its cooperative stop flag
+    and awaits the worker within its own timeout, so a store lock never blocks
+    unbounded on a long OCR/copy run. A backfill run pauses (its ledger's PAUSED
+    state auto-resumes on unlock via ``should_auto_resume``); the encrypt job is
+    the reserved U6 hook (absent until U6 lands). Terminal-stage resumes are
+    quiesced separately by :meth:`Supervisor.quiesce_for_lock`.
+    """
+    for attr in ("backfill_job", "encrypt_job"):
+        job = getattr(app.state, attr, None)
+        if job is None:
+            continue
+        shutdown = getattr(job, "shutdown", None)
+        if shutdown is None:
+            continue
+        try:
+            await shutdown()
+        except Exception:  # noqa: BLE001 — pausing a job must never abort the lock
+            logger.warning("store lock: pausing %s raised", attr, exc_info=True)
+
+
+def _resume_after_unlock(app: Starlette) -> None:
+    """Re-arm start-time maintenance that a lock quiesced (U9 unlock reconcile).
+
+    The terminal-stage resume is driven by ``supervisor.start_reconcile`` in the
+    caller. Here we ensure the periodic retention sweep is running again and
+    best-effort auto-resume a paused backfill (the encrypt job's auto-resume is the
+    reserved U6 hook). Every step is guarded so a maintenance hiccup never breaks
+    unlock. Without this, F2's "surfaces return to normal" would silently exclude
+    pending index/retention work until an unrelated restart.
+    """
+    sweep = getattr(app.state, "retention_sweep", None)
+    if sweep is not None:
+        try:
+            sweep.start()  # idempotent — a no-op if already running
+        except Exception:  # noqa: BLE001
+            logger.debug("unlock: retention sweep restart skipped", exc_info=True)
+    job = getattr(app.state, "backfill_job", None)
+    if job is not None:
+        try:
+            from screencap.daemon.backfill_job import should_auto_resume
+
+            ledger = getattr(job, "_ledger", None)
+            if ledger is not None and should_auto_resume(ledger):
+                job.start()
+        except Exception:  # noqa: BLE001
+            logger.debug("unlock: backfill auto-resume skipped", exc_info=True)
+    # SCR-258 U6: auto-resume a migration a lock paused at its recording boundary
+    # (the encrypt job kept its run_factory from before the lock, so resume needs
+    # no re-plumbing). ``resume_if_pending`` no-ops on a cancelled / complete /
+    # never-started run.
+    encrypt_job = getattr(app.state, "encrypt_job", None)
+    if encrypt_job is not None:
+        try:
+            encrypt_job.resume_if_pending()
+        except Exception:  # noqa: BLE001
+            logger.debug("unlock: encrypt auto-resume skipped", exc_info=True)
+
+
+async def storage_lock(request: Request) -> JSONResponse:
+    """``POST /v0/storage.lock`` — seal the live store in bounded time (SCR-258 U9).
+
+    KTD-15 order, each phase heartbeat-reported on ``/v0/events``:
+
+    1. set the refusal flag FIRST (``supervisor.begin_lock`` → ``recording.start``
+       refused for the whole window, so a cron/MCP start during the stop window is
+       refused, never spawned-then-killed);
+    2. stop the active recording via ``Supervisor.stop()`` (30s budget,
+       ``EVENT_RECORDING_FINALIZED``) — the chunk is finalized, no partial loss;
+    3. emit ``store.locking`` (direct readers release handles) and signal
+       terminal-stage/backfill/encrypt workers to halt at their next ledger-safe
+       boundary within a bounded grace;
+    4. graceful-then-force detach (force is the backstop when the grace expires —
+       this deliberately differs from ``storage compact``, which never forces);
+    5. write the sealed sentinel, emit ``store.locked``.
+
+    On a FAILED detach the store stays MOUNTED and unlocked, ``_store_locked`` is
+    cleared, and a typed ``store_lock_failed`` error is returned — NEVER a
+    half-sealed state. Audit-logged with peer provenance + outcome (KTD-23). The
+    in-flight lock operation pins the idle watchdog (``begin_lock``); the sealed
+    steady state does not.
+    """
+    from screencap import config, container
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon import store_lifecycle as sl
+
+    schema_version = schema._STORAGE_LOCK_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.lock",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    supervisor = request.app.state.supervisor
+
+    # Refuse on a plaintext install: sealing a store the daemon won't honor (the
+    # container-disabled resolve ignores the sentinel) would be a dead seal.
+    if not config.get_container_enabled():
+        _audit("container_disabled")
+        return _api_error_response(
+            errors.StoreLockError(
+                "container_disabled",
+                "The encrypted container is not enabled; there is no store to lock.",
+                schema_version=schema_version,
+            )
+        )
+
+    # Idempotent: an already-sealed store no-ops with a clear message (never a
+    # second detach).
+    if _store_state_value(request) == StoreState.LOCKED.value or sl.is_sealed():
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                store_state=StoreState.LOCKED.value,
+                sealed=True,
+                already_locked=True,
+            )
+        )
+
+    # FIX 5 (fast path): if an encrypt cutover is in its non-interruptible swap
+    # window, refuse BEFORE stopping the recording — the lock's detach must never
+    # run ``hdiutil`` on the mountpoint concurrently with the cutover's swap. The
+    # user retries once the (seconds-long) cutover finishes. The airtight backstop
+    # after the pause signal below closes the check→enter-cutover race.
+    encrypt_job = getattr(request.app.state, "encrypt_job", None)
+    if encrypt_job is not None and encrypt_job.is_in_cutover():
+        _audit("encrypt_cutover_in_progress")
+        return _api_error_response(
+            errors.StoreLockError(
+                "encrypt_cutover_in_progress",
+                "An encryption cutover is finishing. Try locking again in a moment.",
+                schema_version=schema_version,
+                retryable=True,
+            )
+        )
+
+    # KTD-15 step 1: refuse flag FIRST, before anything else.
+    supervisor.begin_lock()
+    request.app.state.store_state = StoreState.LOCKED.value
+    await _emit_store_event(
+        request.app, EVENT_STORE_LOCK_PROGRESS, phase="refuse_set"
+    )
+
+    try:
+        # step 2: stop the active recording (finalizes the chunk; 30s budget).
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="stopping"
+        )
+        await supervisor.stop(force=False)
+
+        # step 3: emit the PRE-DETACH reader signal, pause background jobs, and
+        # quiesce in-flight terminal-stage resumes within the grace budget.
+        await _emit_store_event(request.app, EVENT_STORE_LOCKING)
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="signal_readers"
+        )
+        await _signal_background_jobs_to_pause(request.app)
+
+        # FIX 5 (airtight backstop): the pause signal above set the encrypt job's
+        # stop flag, which halts a NOT-yet-started cutover at its ledger-safe
+        # boundary (phase stays COPYING). If the phase still reads CUTTING_OVER
+        # here, the swap was already in flight and could not be halted — refuse
+        # rather than force-detach the mountpoint concurrently with it. This read
+        # happens AFTER the pause await, so it reflects whether the swap committed;
+        # combined with the engine's pre-swap stop check it closes the race.
+        if encrypt_job is not None and encrypt_job.is_in_cutover():
+            supervisor.abort_lock()
+            request.app.state.store_state = StoreState.MOUNTED.value
+            _audit("encrypt_cutover_in_progress")
+            return _api_error_response(
+                errors.StoreLockError(
+                    "encrypt_cutover_in_progress",
+                    "An encryption cutover is finishing. Try locking again in a "
+                    "moment.",
+                    schema_version=schema_version,
+                    retryable=True,
+                )
+            )
+
+        quiesced = await supervisor.quiesce_for_lock(grace=_LOCK_QUIESCE_GRACE_S)
+        await _emit_store_event(
+            request.app,
+            EVENT_STORE_LOCK_PROGRESS,
+            phase="quiescing",
+            quiesced=quiesced,
+        )
+
+        # step 4: graceful-then-force detach.
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="detaching"
+        )
+        mountpoint = str(config.get_recordings_dir())
+        try:
+            await asyncio.to_thread(container.detach, mountpoint, force=True)
+        except container.ContainerError as exc:
+            # KTD-15 step 6: a FAILED detach unwinds to MOUNTED+unlocked. The store
+            # stays usable, nothing is sealed — NEVER a half-sealed state.
+            supervisor.abort_lock()
+            request.app.state.store_state = StoreState.MOUNTED.value
+            logger.warning("store lock: detach failed for %s: %s", mountpoint, exc)
+            _audit("detach_failed")
+            return _api_error_response(
+                errors.StoreLockError(
+                    "detach_failed",
+                    "The store could not be unmounted (a reader may still hold it "
+                    "open). It stays mounted and unlocked; nothing was sealed. "
+                    "Close open recordings/finder windows and try again.",
+                    schema_version=schema_version,
+                    retryable=True,
+                )
+            )
+
+        # step 5: seal LAST (O_NOFOLLOW sentinel), finalize state, announce.
+        sl.write_sealed_sentinel()
+        supervisor.complete_lock()
+        request.app.state.store_state = StoreState.LOCKED.value
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCK_PROGRESS, phase="sealed"
+        )
+        await _emit_store_event(
+            request.app, EVENT_STORE_LOCKED, store_state=StoreState.LOCKED.value
+        )
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                store_state=StoreState.LOCKED.value,
+                sealed=True,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        # e.g. a ReconcilingError from stop(): unwind, never leave half-sealed.
+        supervisor.abort_lock()
+        request.app.state.store_state = StoreState.MOUNTED.value
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        supervisor.abort_lock()
+        request.app.state.store_state = StoreState.MOUNTED.value
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+
+async def storage_unlock(request: Request) -> JSONResponse:
+    """``POST /v0/storage.unlock`` — remount + resume a sealed store (SCR-258 U9).
+
+    The SURFACE (app PresenceGate / CLI LocalAuthentication) performs the
+    present-user (Touch ID) auth; the verb trusts its same-EUID caller (KTD-16,
+    documented in ``SECURITY.md``). It mounts FIRST (``store_lifecycle.mount_now``,
+    ignoring the sentinel) and only clears the sentinel on a successful mount, so a
+    remount that cannot read the key (a locked Keychain) returns a RETRYABLE in-band
+    error with the sentinel INTACT (never a daemon exit). On success it clears the
+    sentinel, re-runs the daemon start-time reconcile (terminal-stage resume via
+    ``start_reconcile``; retention sweep + backfill auto-resume via
+    ``_resume_after_unlock``), and emits ``store.unlocked``. Audit-logged (KTD-23).
+    Recording does NOT restart on its own.
+    """
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon import store_lifecycle as sl
+    from screencap.daemon.store_lifecycle import (
+        ERROR_KEYCHAIN_LOCKED,
+        StoreState,
+    )
+
+    schema_version = schema._STORAGE_UNLOCK_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "storage.unlock",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    supervisor = request.app.state.supervisor
+
+    # Idempotent: nothing sealed → already unlocked.
+    if not sl.is_sealed() and _store_state_value(request) != StoreState.LOCKED.value:
+        _audit("ok")
+        current = _store_state_value(request)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema_version,
+                store_state=current,
+                sealed=False,
+                already_unlocked=True,
+            )
+        )
+
+    # Mount FIRST (ignoring the sentinel); the sentinel is cleared only on success.
+    try:
+        resolution = await asyncio.to_thread(sl.mount_now)
+    except Exception as exc:  # ROGUE / corrupted bundle → operator hard stop
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc, schema_version=schema_version, request=request
+        )
+
+    if resolution.state is StoreState.ERROR:
+        # Retryable in-band; the sentinel stays INTACT (the store is still sealed).
+        reason = resolution.reason or ERROR_KEYCHAIN_LOCKED
+        retryable = reason == ERROR_KEYCHAIN_LOCKED
+        _audit(reason)
+        message = (
+            "The Keychain is locked; unlock your Mac and try again — the store "
+            "stays sealed."
+            if retryable
+            else "The store could not be mounted (the encryption key is "
+            "unreachable). The store stays sealed."
+        )
+        return _api_error_response(
+            errors.StoreLockError(
+                reason, message, schema_version=schema_version, retryable=retryable,
+            )
+        )
+
+    # Mounted (or, degenerately, absent): clear the sentinel and reconcile.
+    sl.clear_sealed_sentinel()
+    supervisor.set_store_state(resolution.state, resolution.reason)
+    supervisor.reset_quiesce()
+    request.app.state.store_state = resolution.state.value
+    request.app.state.store_reason = resolution.reason
+    # Re-run the start-time reconcile so quiesced terminal-stage work resumes.
+    supervisor.start_reconcile()
+    _resume_after_unlock(request.app)
+    await _emit_store_event(
+        request.app, EVENT_STORE_UNLOCKED, store_state=resolution.state.value
+    )
+    _audit("ok")
+    return JSONResponse(
+        schema.envelope(
+            schema_version=schema_version,
+            store_state=resolution.state.value,
+            sealed=False,
+        )
+    )
+
+
 def build_app() -> Starlette:
     app = Starlette(
         routes=[
@@ -3418,6 +4360,11 @@ def build_app() -> Starlette:
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
             Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),
             Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
+            Route("/v0/storage.lock", storage_lock, methods=["POST"]),
+            Route("/v0/storage.unlock", storage_unlock, methods=["POST"]),
+            Route("/v0/storage.encrypt.start", storage_encrypt_start, methods=["POST"]),
+            Route("/v0/storage.encrypt.status", storage_encrypt_status, methods=["GET"]),
+            Route("/v0/storage.encrypt.cancel", storage_encrypt_cancel, methods=["POST"]),
             Route("/v0/model.download.start", model_download_start, methods=["POST"]),
             Route("/v0/model.download.status", model_download_status, methods=["GET"]),
             Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),

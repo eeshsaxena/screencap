@@ -28,11 +28,17 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 BREADCRUMB_NAME = "migration.intent"
+
+# Staging suffix for a cross-volume bundle copy (SCR-258 U11). The copy lands at
+# ``<bundle>.partial`` and is atomically renamed to the final name only once
+# complete, so an interrupted copy is always distinguishable from a good one.
+BUNDLE_PARTIAL_SUFFIX = ".partial"
 
 
 class Reason:
@@ -358,6 +364,219 @@ def reconcile_pending(
     )
 
 
+def validate_bundle_target(
+    current_bundle_dir: Path, target: Path
+) -> ValidationResult:
+    """Preflight a **vault** bundle relocation (SCR-258 U11, KTD-19).
+
+    Unlike :func:`validate_target` (the plaintext tree move), a **cross-volume**
+    target is allowed — relocating the encrypted bundle to an external disk is
+    the whole point of the vault "Change storage location". SCR-228's
+    cloud-synced-target rejection is **RETAINED** (rationale: sparse-band-sync
+    corruption risk, not confidentiality — KTD-19). ``current_bundle_dir`` is the
+    directory that currently holds the bundle; ``target`` is the directory that
+    will hold it. Returns the first failing reason.
+    """
+    from screencap.container import BUNDLE_NAME
+
+    current_bundle_dir = current_bundle_dir.resolve()
+    target = Path(os.path.realpath(target))
+
+    if target == current_bundle_dir:
+        return ValidationResult.invalid(Reason.SAME_AS_SOURCE)
+
+    # Nesting either direction would move the bundle into/under itself.
+    if _is_relative_to(target, current_bundle_dir) or _is_relative_to(
+        current_bundle_dir, target
+    ):
+        return ValidationResult.invalid(Reason.NESTED)
+
+    if _is_cloud_synced(target):
+        return ValidationResult.invalid(Reason.CLOUD_SYNCED)
+
+    anchor = _nearest_existing(target)
+    if not os.access(anchor, os.W_OK):
+        return ValidationResult.invalid(Reason.NOT_WRITABLE)
+
+    # A completed bundle already sitting at the target is a conflict. A lone
+    # leftover ``.partial`` from a prior interrupted move is fine — migrate_bundle
+    # cleans it and re-copies (the "retry converges" contract).
+    partial_name = BUNDLE_NAME + BUNDLE_PARTIAL_SUFFIX
+    if (target / BUNDLE_NAME).exists():
+        return ValidationResult.invalid(Reason.TARGET_NOT_EMPTY)
+    if target.exists():
+        if not target.is_dir():
+            return ValidationResult.invalid(Reason.NOT_WRITABLE)
+        strays = [p for p in target.iterdir() if p.name != partial_name]
+        if strays:
+            return ValidationResult.invalid(Reason.TARGET_NOT_EMPTY)
+
+    return ValidationResult.valid()
+
+
+def migrate_bundle(
+    bundle_src: Path,
+    bundle_dst: Path,
+    commit_config: Callable[[Path], None],
+) -> MigrationOutcome:
+    """Move the encrypted bundle ``bundle_src`` → ``bundle_dst`` (SCR-258 U11).
+
+    The daemon-free, resumable data-movement core for the vault "Change storage
+    location" (the caller — ``store_lifecycle.relocate_bundle`` — owns the
+    quiescent detach, ``mount.lock``, and remount around it):
+
+    * **Same volume** → an atomic, O(1) ``os.rename`` of the bundle directory.
+    * **Cross volume** → copy the bundle to a ``<name>.partial`` staging dir,
+      atomically ``rename`` it to the final name, flip config (the single commit
+      point), then delete the source. The source stays authoritative until the
+      config flip, so an interrupted copy leaves the **original bundle intact**
+      and a later retry converges (a stale ``.partial`` is cleaned first).
+
+    ``commit_config`` receives the new bundle **directory** (``bundle_dst.parent``)
+    — the daemon passes ``config.set_store_bundle_dir``.
+    """
+    bundle_src = bundle_src.resolve()
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    bundle_dst = dst_dir / bundle_dst.name
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Drop any stale staging dir from a previously interrupted attempt so the
+    # copy below starts clean (idempotent retry).
+    partial = dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX)
+    _rmtree_quiet(partial)
+
+    try:
+        same_volume = _st_dev(bundle_src.parent) == _st_dev(dst_dir)
+    except OSError:
+        return MigrationOutcome(
+            ok=False,
+            code=Reason.NOT_WRITABLE,
+            message=MESSAGES[Reason.NOT_WRITABLE],
+        )
+
+    if same_volume:
+        os.rename(bundle_src, bundle_dst)
+        try:
+            commit_config(dst_dir)  # single commit point
+        except Exception:
+            os.rename(bundle_dst, bundle_src)  # roll back the atomic move
+            raise
+        return MigrationOutcome(
+            ok=True, moved_from=str(bundle_src), moved_to=str(bundle_dst)
+        )
+
+    # Cross-volume: copy-verify-commit-delete. Nothing is destructive until the
+    # config flip, and the copy only becomes "final" via the partial->final
+    # rename, so a crash at any point leaves the source authoritative.
+    shutil.copytree(bundle_src, partial)
+    _fsync_tree(partial)
+    os.rename(partial, bundle_dst)  # atomic within the dst volume: now complete
+    commit_config(dst_dir)  # single commit point — dst is now authoritative
+    _rmtree_quiet(bundle_src)  # old copy retired
+    return MigrationOutcome(
+        ok=True, moved_from=str(bundle_src), moved_to=str(bundle_dst)
+    )
+
+
+def bundle_move_is_same_volume(bundle_src: Path, target_dir: Path) -> bool:
+    """True iff ``bundle_src`` and ``target_dir`` are on the same filesystem.
+
+    Used by ``store_lifecycle.relocate_bundle`` to decide (BEFORE taking any lock)
+    whether the move is an O(1) same-volume rename or a long cross-volume copy —
+    so the copy can be staged OUTSIDE ``mount_lock`` (FIX 6). Creates ``target_dir``
+    (needed for the ``st_dev`` probe); a probe error conservatively returns False
+    (the cross-volume copy path is the safe superset).
+    """
+    bundle_src = bundle_src.resolve()
+    target_dir = Path(os.path.realpath(target_dir))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _st_dev(bundle_src.parent) == _st_dev(target_dir)
+    except OSError:
+        return False
+
+
+def stage_bundle_copy(bundle_src: Path, bundle_dst: Path) -> Path:
+    """Copy the bundle to a ``.partial`` staging dir NEXT TO ``bundle_dst`` (FIX 6).
+
+    Runs OUTSIDE any lock: nothing here is destructive and the source stays
+    authoritative, so a concurrent ``unlock`` / ``resolve_store_state`` is not
+    wedged for the copy's duration. Idempotent — a stale ``.partial`` from a prior
+    attempt is dropped first. Returns the staging path (promoted later under the
+    brief lock hold by :func:`promote_bundle_copy`).
+    """
+    bundle_src = bundle_src.resolve()
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    bundle_dst = dst_dir / bundle_dst.name
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    partial = dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX)
+    _rmtree_quiet(partial)
+    shutil.copytree(bundle_src, partial)
+    _fsync_tree(partial)
+    return partial
+
+
+def promote_bundle_copy(
+    bundle_src: Path,
+    bundle_dst: Path,
+    commit_config: Callable[[Path], None],
+) -> MigrationOutcome:
+    """Promote a pre-staged ``.partial`` copy to the final bundle + commit + retire
+    the source (FIX 6 cross-volume finalize).
+
+    Assumes :func:`stage_bundle_copy` already produced the ``.partial``. The
+    partial→final ``rename`` is atomic within the destination volume; the config
+    flip is the single commit point (nothing before it is destructive); only then
+    is the old source removed. Held under the caller's ``mount.lock`` — brief.
+    """
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    bundle_dst = dst_dir / bundle_dst.name
+    bundle_src = bundle_src.resolve()
+    partial = dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX)
+    os.rename(partial, bundle_dst)  # atomic within the dst volume: now complete
+    commit_config(dst_dir)  # single commit point — dst is now authoritative
+    _rmtree_quiet(bundle_src)  # old copy retired
+    return MigrationOutcome(
+        ok=True, moved_from=str(bundle_src), moved_to=str(bundle_dst)
+    )
+
+
+def discard_staged_bundle_copy(bundle_dst: Path) -> None:
+    """Remove a ``.partial`` staged copy (FIX 6 cleanup on a pre-promote abort)."""
+    dst_dir = Path(os.path.realpath(bundle_dst.parent))
+    _rmtree_quiet(dst_dir / (bundle_dst.name + BUNDLE_PARTIAL_SUFFIX))
+
+
+def _rmtree_quiet(path: Path) -> None:
+    """Best-effort recursive delete of ``path`` (a dir tree or a file)."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _fsync_tree(root: Path) -> None:
+    """Best-effort fsync of every file under ``root`` plus the dir entries.
+
+    Durability for the cross-volume copy before it is renamed into place — so a
+    power-loss right after the rename cannot surface a torn bundle.
+    """
+    for dirpath, _dirnames, filenames in os.walk(str(root)):
+        for name in filenames:
+            with contextlib.suppress(OSError):
+                fd = os.open(os.path.join(dirpath, name), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        _fsync_dir(Path(dirpath))
+
+
 def _harden_root(root: Path) -> None:
     """``chmod`` the new recordings root to ``0o700`` and verify it landed.
 
@@ -423,4 +642,11 @@ __all__ = [
     "validate_target",
     "migrate",
     "reconcile_pending",
+    "validate_bundle_target",
+    "migrate_bundle",
+    "bundle_move_is_same_volume",
+    "stage_bundle_copy",
+    "promote_bundle_copy",
+    "discard_staged_bundle_copy",
+    "BUNDLE_PARTIAL_SUFFIX",
 ]

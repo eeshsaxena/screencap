@@ -115,7 +115,7 @@ class TestAE12DecisionTimeRace:
         signed_url_calls: list[float] = []
         calls_lock = threading.Lock()
 
-        def _fake_route_cloud(recording_dir, *, ledger, console, force, result, remote_exists, policy=None, retention_override=None, on_progress=None):
+        def _fake_route_cloud(recording_dir, *, ledger, console, force, result, remote_exists, policy=None, retention_override=None, on_progress=None, stop_event=None):
             # This stands in for the reconcile→scrub→upload critical section.
             # The "request signed URLs" decision happens HERE, inside the lock.
             with calls_lock:

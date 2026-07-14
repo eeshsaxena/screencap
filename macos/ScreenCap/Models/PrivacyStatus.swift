@@ -61,6 +61,14 @@ struct SettingsEnvelope: Decodable {
         /// this Mac. Optional/tolerant — an older CLI omits it (→ the Privacy
         /// pane's E2EE row renders the locked stub state, KTD-8).
         let cloudE2EEEnabled: Bool?
+        /// SCR-258 U10: whether the on-disk encrypted container is enabled on this
+        /// install (KTD-19). Drives whether the Lock affordance and the encrypt
+        /// migration are offered at all. Optional/tolerant — an older CLI omits it.
+        let containerEnabled: Bool?
+        /// SCR-258 U10: whether an encrypted store bundle already exists (i.e. the
+        /// library is encrypted at rest). Distinguishes an already-migrated install
+        /// (hide the migration offer) from an eligible plaintext one. Optional.
+        let storeEncrypted: Bool?
 
         enum CodingKeys: String, CodingKey {
             case privacy
@@ -73,6 +81,8 @@ struct SettingsEnvelope: Decodable {
             case uploadDefault = "upload_default"
             case recordingsDir = "recordings_dir"
             case cloudE2EEEnabled = "cloud_e2ee_enabled"
+            case containerEnabled = "container_enabled"
+            case storeEncrypted = "store_encrypted"
         }
     }
 

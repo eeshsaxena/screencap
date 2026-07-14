@@ -167,6 +167,46 @@ def test_response_models_serialize_with_envelope_keys(model_type: type, payload:
     assert dumped["api_schema_version"] == schema.API_SCHEMA_VERSION
 
 
+def test_store_state_carrying_response_models_decode_the_field() -> None:
+    """SCR-258 U9 (KTD-20): the read-verb + daemon.info response models now DECLARE
+    ``store_state`` (and DaemonInfoResponse ``store_reason``), so a locked-store
+    envelope round-trips it as DATA instead of dropping it via extra=ignore. An
+    older-daemon envelope that omits it still defaults to ``mounted``."""
+    # A locked-store list envelope carries store_state -> the model preserves it.
+    locked = schema.ListResponse(
+        **schema.envelope(
+            schema_version=schema._LIST_API_VERSION,
+            recordings=[],
+            store_state="locked",
+        )
+    )
+    assert locked.model_dump()["store_state"] == "locked"
+
+    # daemon.info carries both store_state and the ERROR_* sub-cause reason.
+    info = schema.DaemonInfoResponse(
+        **schema.envelope(
+            schema_version=schema._DAEMON_INFO_API_VERSION,
+            build=None,
+            started_at=1778198400.0,
+            store_state="error",
+            store_reason="key_missing",
+        )
+    )
+    dumped = info.model_dump()
+    assert dumped["store_state"] == "error"
+    assert dumped["store_reason"] == "key_missing"
+
+    # An older-daemon envelope that omits store_state defaults to "mounted".
+    old = schema.ContentSearchResponse(
+        **schema.envelope(
+            schema_version=schema.API_SCHEMA_VERSION,
+            hits=[],
+            index_state="store_unavailable",
+        )
+    )
+    assert old.model_dump()["store_state"] == "mounted"
+
+
 def test_daemon_api_error_subclass_maps_to_symmetric_error_envelope() -> None:
     exc = errors.NotOwnedByDaemonError(
         claimant="cli",

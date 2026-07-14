@@ -13,6 +13,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -28,6 +29,7 @@ from screencap.pidfile import CLAIMANT_DAEMON
 if TYPE_CHECKING:
     from screencap.capture_gate import CaptureGateResult
     from screencap.daemon.schema import RecordingStartRequest
+    from screencap.daemon.store_lifecycle import StoreState
     from screencap.terminal_stage import TerminalResult
 
 logger = logging.getLogger(__name__)
@@ -435,6 +437,40 @@ class Supervisor:
         # SCR-228: set while a storage-location migration holds the daemon.
         # Guarded by `_operation_lock` so it serializes against spawn/stop.
         self._migration_active = False
+        # SCR-258 U4 (KTD-14): the resolved encrypted-store state. Set by
+        # ``server.serve`` -> lifespan via ``set_store_state`` after the socket is
+        # bound and the store is classified. Default MOUNTED so a lifespan-less
+        # test app (and a plaintext / container-disabled install) behaves exactly
+        # as today. ``spawn`` reads it as the refusal flag: recording.start while
+        # the store is not MOUNTED is refused with a typed error BEFORE any
+        # ``started`` signal and before any plaintext mountpoint dir is created.
+        # The idle-watchdog PIN is deliberately NOT wired here (that is the
+        # in-flight-lock-operation rule from KTD-15, landed in U9) — a locked
+        # daemon idle-exits normally and the next start re-enters sealed serving.
+        from screencap.daemon.store_lifecycle import StoreState
+
+        self._store_state: StoreState = StoreState.MOUNTED
+        # SCR-258 U4/U9 (KTD-14): the ERROR_* sub-cause (key_missing /
+        # entitlement_mismatch / keychain_locked / downgrade_unsupported) that
+        # accompanies an ERROR store_state, threaded into the recording.start
+        # refusal so the client can distinguish the cause. None for MOUNTED /
+        # LOCKED / ABSENT-without-cause.
+        self._store_reason: str | None = None
+
+        # SCR-258 U9 (KTD-15): the quiescence engine's cooperative stop flag, shared
+        # by reference into EVERY terminal-stage resume this supervisor launches
+        # (``resume_terminal_stage`` forwards it as ``run_terminal_stage``'s
+        # ``stop_event``). A ``storage.lock`` sets it via :meth:`quiesce_for_lock`
+        # so in-flight resumes halt at a ledger-safe boundary; it is replaced with a
+        # fresh (unset) Event once the lock op ends (:meth:`reset_quiesce`) so later
+        # resumes are not pre-halted. ``threading.Event`` (not asyncio) because the
+        # resume runs on an ``asyncio.to_thread`` worker.
+        self._quiesce_event = threading.Event()
+        # True only while a lock OPERATION is running its stop→quiesce→detach chain.
+        # Pins the idle watchdog (mirroring ``is_migrating``) so an auto-spawned
+        # daemon cannot idle-exit mid-quiescence; the sealed STEADY state does NOT
+        # pin (a locked daemon idle-exits normally, KTD-15).
+        self._lock_in_flight = False
 
         # SCR-214 U2/KTD8: supervised always-on ambient capture.
         # ``_start_gate`` (injected by the app) is the shared permission+paywall
@@ -605,9 +641,147 @@ class Supervisor:
         """
         return self._migration_active
 
+    def set_store_state(self, state: "StoreState", reason: str | None = None) -> None:
+        """Record the resolved encrypted-store state (SCR-258 U4, KTD-14).
+
+        Called by the daemon lifespan with the ``StoreResolution`` that
+        ``server.serve`` produced after binding the socket. ``spawn`` reads it as
+        the recording.start refusal flag. ``reason`` carries the ERROR_* sub-cause
+        (``resolution.reason``) so the refusal can name why the store is
+        unavailable; None for MOUNTED / LOCKED / cause-less ABSENT.
+        """
+        self._store_state = state
+        self._store_reason = reason
+
+    def is_locked(self) -> bool:
+        """True iff the store is sealed (SCR-258 U4).
+
+        The ``spawn`` refusal flag, mirroring :meth:`is_migrating`. Only the
+        sealed state is ``locked``; ABSENT and ERROR are separately refused by
+        ``spawn`` with their own typed errors. Deliberately NOT consulted by the
+        idle watchdog in U4 — a sealed steady state idle-exits normally (KTD-15).
+        """
+        from screencap.daemon.store_lifecycle import StoreState
+
+        return self._store_state is StoreState.LOCKED
+
+    # ------------------------------------------------------------------
+    # SCR-258 U9 (KTD-15): the lock/quiesce state machine primitives. The
+    # orchestration (stop → emit events → detach → seal) lives in the daemon
+    # ``storage.lock`` handler; these are the supervisor-owned pieces: the
+    # recording.start refusal flag, the idle-watchdog pin, and the terminal-stage
+    # quiescence wait.
+    # ------------------------------------------------------------------
+
+    def begin_lock(self) -> None:
+        """Flip the store to LOCKED and pin the idle watchdog (lock-op ENTRY).
+
+        Setting ``_store_state = LOCKED`` FIRST is the whole point of KTD-15 step
+        1: ``spawn`` (recording.start) is refused for the entire
+        stop→quiesce→detach window, so a cron/MCP start during the up-to-30s stop
+        window is refused (typed, before any ``started`` signal) rather than
+        spawned-then-killed mid-chunk (AE2 / the start-race).
+        """
+        from screencap.daemon.store_lifecycle import StoreState
+
+        self._store_state = StoreState.LOCKED
+        self._lock_in_flight = True
+
+    def abort_lock(self) -> None:
+        """Unwind a failed lock: back to MOUNTED+unlocked, clear pin + quiesce.
+
+        Called on a failed detach (KTD-15): the store stays mounted and usable,
+        ``_store_state`` returns to MOUNTED (so recording.start works again), and
+        the quiesce flag is reset so a future resume is not pre-halted. NEVER a
+        half-sealed state — the caller writes no sentinel on this path.
+        """
+        from screencap.daemon.store_lifecycle import StoreState
+
+        self._store_state = StoreState.MOUNTED
+        self._lock_in_flight = False
+        self.reset_quiesce()
+
+    def complete_lock(self) -> None:
+        """Finish a successful lock: stays LOCKED, unpin the watchdog, reset quiesce.
+
+        The steady sealed state does NOT pin the idle watchdog (a locked daemon
+        idle-exits normally, KTD-15), so clear ``_lock_in_flight``. The quiesce
+        Event is replaced so the NEXT daemon's resumes (or an unlock's reconcile)
+        start from a clean, unset flag.
+        """
+        self._lock_in_flight = False
+        self.reset_quiesce()
+
+    def reset_quiesce(self) -> None:
+        """Replace the quiesce flag with a fresh (unset) Event."""
+        self._quiesce_event = threading.Event()
+
+    def is_lock_in_flight(self) -> bool:
+        """True while a lock OPERATION runs (idle-watchdog pin; U9)."""
+        return self._lock_in_flight
+
+    async def quiesce_for_lock(
+        self,
+        *,
+        grace: float,
+        on_progress: "Callable[[str], None] | None" = None,
+        poll_interval: float = 0.05,
+    ) -> bool:
+        """Signal in-flight terminal-stage resumes to halt, bounded by ``grace``.
+
+        Sets the shared ``_quiesce_event`` (every resume forwards it as
+        ``run_terminal_stage``'s ``stop_event``, so each halts at its next
+        ledger-safe boundary and raises ``TerminalStageInterrupted``, swallowed by
+        ``_run_resume_safely``), then waits up to ``grace`` seconds for
+        :meth:`has_inflight_resume` to clear. Returns ``True`` if every resume
+        quiesced within the budget, ``False`` if the budget expired first (the
+        caller then relies on the graceful-then-force detach as the backstop —
+        force is safe precisely because every writer is ledger-disciplined). Does
+        NOT wait for a slow upload to *complete* (AE7): it waits for the workers to
+        reach a safe boundary and stop.
+        """
+        self._quiesce_event.set()
+        if on_progress is not None:
+            on_progress("quiescing")
+        deadline = time.monotonic() + max(0.0, grace)
+        while self.has_inflight_resume():
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "quiesce_for_lock: %d resume task(s) still in flight after "
+                    "%.1fs grace; proceeding to force detach",
+                    sum(1 for t in self._resume_tasks if not t.done()),
+                    grace,
+                )
+                return False
+            await asyncio.sleep(poll_interval)
+        return True
+
     async def spawn(self, request: "RecordingStartRequest") -> dict[str, Any]:
         """Claim the daemon lock, spawn the engine worker, and await started."""
         async with self._operation_lock:
+            # SCR-258 U4 (KTD-14): refuse a recording.start when the encrypted
+            # store is not available, BEFORE `_allocate_capture_dir` (which would
+            # `mkdir` a plaintext directory at the mountpoint via
+            # `get_recordings_dir`) and BEFORE any `started` signal — the
+            # typed-error-before-spawn convention. LOCKED -> unlock; ABSENT/ERROR
+            # -> the store was never initialized or is unmountable, so there is no
+            # store to write into (a plaintext write here would be the historic
+            # silent-fallback bug, R10).
+            from screencap.daemon.store_lifecycle import StoreState
+
+            if self._store_state is StoreState.LOCKED:
+                raise errors.StoreLockedError(
+                    schema_version=schema._RECORDING_START_API_VERSION,
+                    reason=self._store_reason,
+                )
+            if self._store_state is not StoreState.MOUNTED:
+                # ABSENT (pre-init) or ERROR (key missing / entitlement mismatch /
+                # keychain locked / downgrade unsupported): no usable store. The
+                # ERROR_* sub-cause (when known) rides along so the refusal names why.
+                raise errors.StoreAbsentError(
+                    schema_version=schema._RECORDING_START_API_VERSION,
+                    reason=self._store_reason,
+                )
             if self._migration_active:
                 # SCR-228 U4: a storage migration holds the daemon; refuse to
                 # start a recording rather than let it write into a directory
@@ -670,6 +844,16 @@ class Supervisor:
                 key_env = await self._stage_engine_cloud_key(request, capture_dir)
                 if key_env:
                     extra_env = {**(extra_env or {}), **key_env}
+                # SCR-258 U4 (KTD-13): when the container is active the capture dir
+                # sits inside the mounted volume, whose free space is the DECLARED
+                # (virtual, sparse) size — so tell the engine's disk policy to watch
+                # the HOST volume backing the bundle instead. Empty (no-op) on a
+                # plaintext install, so today's disk behavior is byte-identical.
+                from screencap.daemon.store_lifecycle import disk_host_env
+
+                host_env = disk_host_env()
+                if host_env:
+                    extra_env = {**(extra_env or {}), **host_env}
                 # Search U8: deliver the corpus key (via file) + RECORD_IMAGES_ENCRYPTED
                 # to the engine when the gate resolved encrypted stills ON.
                 corpus_env = await self._stage_corpus_key(request, capture_dir, gate=gate)
@@ -874,12 +1058,27 @@ class Supervisor:
         from screencap.terminal_stage import (
             PromotionRefused,
             TerminalStageBusy,
+            TerminalStageInterrupted,
             run_terminal_stage,
         )
 
+        # SCR-258 U9: thread the shared quiesce flag so a ``storage.lock`` in
+        # progress halts THIS resume at a ledger-safe boundary (AE7). All resume
+        # entry points (startup sweep, engine-exit safety net, unlock reconcile)
+        # land here, so every one is quiesceable without per-call-site wiring.
+        stop_event = self._quiesce_event
+
         def _run() -> Any:
             try:
-                return run_terminal_stage(Path(recording_dir), non_blocking=True)
+                return run_terminal_stage(
+                    Path(recording_dir), non_blocking=True, stop_event=stop_event,
+                )
+            except TerminalStageInterrupted:
+                logger.info(
+                    "resume_terminal_stage: %s halted at a ledger-safe boundary "
+                    "for a store lock; resumes on unlock", recording_dir,
+                )
+                return None
             except TerminalStageBusy:
                 logger.debug(
                     "resume_terminal_stage: %s busy (held by live finalize "

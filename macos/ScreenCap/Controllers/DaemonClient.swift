@@ -167,6 +167,14 @@ struct DaemonInfoResponse: Decodable {
     /// Additive (U2). Absent on older daemons; callers map nil to
     /// `.allIndeterminate`.
     let permissions: DaemonPermissionGrants?
+    /// SCR-258 U4 (KTD-14): the encrypted-store state — `"mounted"` / `"locked"` /
+    /// `"absent"` / `"error"`. Absent on older daemons → treated as `"mounted"`.
+    let storeState: String?
+    /// The `store_state=error` sub-cause (`key_missing` / `entitlement_mismatch` /
+    /// `keychain_locked` / `downgrade_unsupported`); nil otherwise. Only
+    /// `daemon.info` carries it — `recording.list` does not — so the app reads the
+    /// reason here when the list envelope reports `error`.
+    let storeReason: String?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -176,6 +184,13 @@ struct DaemonInfoResponse: Decodable {
         case build
         case startedAt = "started_at"
         case permissions
+        case storeState = "store_state"
+        case storeReason = "store_reason"
+    }
+
+    /// The typed store state, tolerant of an older daemon that omits the fields.
+    var resolvedStoreState: StoreState {
+        StoreState.from(state: storeState, reason: storeReason)
     }
 }
 
@@ -185,6 +200,12 @@ struct ListResponse: Decodable {
     let daemonVersion: String
     let apiSchemaVersion: Int
     let recordings: [RecordingSummary]
+    /// SCR-258 U4/U10 (KTD-20): the store state on the SUCCESS envelope. A locked /
+    /// absent / error store returns the normal envelope with an EMPTY `recordings`
+    /// list and this set — never a 500. Absent on an older daemon → `"mounted"`.
+    /// Note: `recording.list` does NOT carry `store_reason`; the caller enriches an
+    /// `error` state from `daemon.info`.
+    let storeState: String?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -192,6 +213,84 @@ struct ListResponse: Decodable {
         case daemonVersion = "daemon_version"
         case apiSchemaVersion = "api_schema_version"
         case recordings
+        case storeState = "store_state"
+    }
+
+    /// The typed store state, tolerant of an older daemon that omits the field.
+    var resolvedStoreState: StoreState {
+        StoreState.from(state: storeState)
+    }
+}
+
+// MARK: - SCR-258 storage lifecycle verbs (U9/U6, KTD-15/KTD-18)
+
+/// Response shape for `storage.lock` / `storage.unlock` — the standard envelope
+/// plus the resulting `store_state` and the `sealed` flag.
+struct StorageStateResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let storeState: String
+    let sealed: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case storeState = "store_state"
+        case sealed
+    }
+}
+
+/// Privacy-safe migration snapshot from `storage.encrypt.start|status|cancel`
+/// (R9 — counts + run state + cutover phase + a non-identifying pause reason, NEVER
+/// a recording name). `pausedReason == "insufficient_disk"` is the auto-resuming
+/// disk pause the app renders distinctly from `.failed` (KTD-18).
+struct StorageEncryptResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let state: String
+    let phase: String
+    let pending: Int
+    let copied: Int
+    let verified: Int
+    let deleted: Int
+    let total: Int
+    let pausedReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case state
+        case phase
+        case pending
+        case copied
+        case verified
+        case deleted
+        case total
+        case pausedReason = "paused_reason"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try c.decode(Bool.self, forKey: .ok)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        daemonVersion = try c.decode(String.self, forKey: .daemonVersion)
+        apiSchemaVersion = try c.decode(Int.self, forKey: .apiSchemaVersion)
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? "idle"
+        phase = try c.decodeIfPresent(String.self, forKey: .phase) ?? "not_started"
+        pending = try c.decodeIfPresent(Int.self, forKey: .pending) ?? 0
+        copied = try c.decodeIfPresent(Int.self, forKey: .copied) ?? 0
+        verified = try c.decodeIfPresent(Int.self, forKey: .verified) ?? 0
+        deleted = try c.decodeIfPresent(Int.self, forKey: .deleted) ?? 0
+        total = try c.decodeIfPresent(Int.self, forKey: .total) ?? 0
+        pausedReason = try c.decodeIfPresent(String.self, forKey: .pausedReason)
     }
 }
 
@@ -890,6 +989,52 @@ enum DaemonClient {
 
     static func sessionSnapshot() async throws -> SessionSnapshotResponse {
         try await request(method: "GET", path: "/v0/session.snapshot")
+    }
+
+    // MARK: - SCR-258 storage lifecycle verbs
+
+    /// Seal the store (SCR-258 U9). The daemon runs the bounded
+    /// stop→quiesce→detach→seal chain, which can take up to ~30s for an active
+    /// recording's chunk to finalize plus the quiesce grace — so the client budget
+    /// exceeds that ceiling (mirrors `recordingStop`). On a failed detach the
+    /// daemon returns a typed `store_lock_failed`/`detach_failed` envelope
+    /// (`.envelopeError`) with the store left mounted+unlocked.
+    static func storageLock() async throws -> StorageStateResponse {
+        try await request(
+            method: "POST", path: "/v0/storage.lock", body: Data("{}".utf8), timeout: 60
+        )
+    }
+
+    /// Unseal the store (SCR-258 U9). The SURFACE performs present-user auth first
+    /// (the app's store-scoped `PresenceGate`); this verb trusts its same-EUID
+    /// caller (KTD-16). A locked Keychain surfaces as a retryable
+    /// `.envelopeError(code: "keychain_locked", ...)` with the sentinel intact.
+    static func storageUnlock() async throws -> StorageStateResponse {
+        try await request(
+            method: "POST", path: "/v0/storage.unlock", body: Data("{}".utf8), timeout: 30
+        )
+    }
+
+    /// Begin (or resume) the plaintext→container upgrade migration (SCR-258 U6).
+    /// Idempotent daemon-side; refuses a custom-recordings install / plaintext-only
+    /// build with a typed `.envelopeError`.
+    static func storageEncryptStart() async throws -> StorageEncryptResponse {
+        try await request(
+            method: "POST", path: "/v0/storage.encrypt.start", body: Data("{}".utf8), timeout: 30
+        )
+    }
+
+    /// Privacy-safe migration snapshot (SCR-258 U6). Read-only; counts + state +
+    /// phase + a non-identifying pause reason.
+    static func storageEncryptStatus() async throws -> StorageEncryptResponse {
+        try await request(method: "GET", path: "/v0/storage.encrypt.status")
+    }
+
+    /// Signal the in-flight migration to stop (resumable; plaintext stays intact).
+    static func storageEncryptCancel() async throws -> StorageEncryptResponse {
+        try await request(
+            method: "POST", path: "/v0/storage.encrypt.cancel", body: Data("{}".utf8), timeout: 15
+        )
     }
 
     static func recordingStart(_ req: RecordingStartRequest) async throws -> RecordingStartResponse {

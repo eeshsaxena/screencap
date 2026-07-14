@@ -814,6 +814,14 @@ def list_recordings(recordings_dir: Path | None = None) -> list[RecordingInfo]:
     active_name = _active_recording_name()
 
     for d in sorted(recordings_dir.iterdir()):
+        # Skip dot-entries explicitly (SCR-236 U3): the reserved ``.store/``
+        # sidecar dir (KTD-2) lives inside the recordings mountpoint, and a
+        # coincidentally-named ``recording.db`` inside any dot-dir must never
+        # surface as a phantom recording. ``sorted()`` orders dot-entries first,
+        # so this guard runs before any real recording is considered. Mirrors
+        # ``upload.list_recording_files``, which already skips dot-prefixed names.
+        if d.name.startswith("."):
+            continue
         if not d.is_dir():
             continue
         db = find_db(d)
