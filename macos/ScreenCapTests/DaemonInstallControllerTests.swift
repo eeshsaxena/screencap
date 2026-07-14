@@ -230,6 +230,70 @@ final class DaemonInstallControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .installedAndRunning)
     }
 
+    // A registered + BTM-approved daemon whose process launchd never spawned —
+    // the login item's executable was replaced in place (a dev re-embed, or an
+    // app update where SMAppService does not restart the LoginItem), so the job
+    // sits `uninitialized` and no socket ever binds while `.status` still reads
+    // `.enabled` — is healed by a non-destructive `launchctl kickstart`, NOT the
+    // destructive registration refresh. Before this the poll-timeout path went
+    // straight to unregister+register, which re-registers the same (still valid)
+    // bundle path without respawning the wedged process, so the daemon stayed
+    // down and onboarding dead-ended at "daemon did not respond within 30s".
+    func testEnabledButUnspawnedDaemonHealsViaKickstartWithoutRefresh() async {
+        let registration = FakeDaemonRegistrationService(registerStatuses: [.enabled])
+        let probe = KickstartGatedProbe()
+        var kickstartCount = 0
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            sleep: { _ in },
+            kickstart: {
+                kickstartCount += 1
+                probe.daemonUp = true   // launchd finally spawns it
+                return true
+            }
+        )
+
+        await controller.install(timeoutSeconds: 0, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(kickstartCount, 1, "kickstart must be attempted before the destructive refresh")
+        XCTAssertEqual(
+            registration.refreshedPlistNames, [],
+            "a successful kickstart must not fall back to unregister+register"
+        )
+        XCTAssertEqual(controller.state, .installedAndRunning)
+    }
+
+    // Fail-through: when the kickstart does NOT bring the daemon up (the recorded
+    // bundle path is stale/gone, so respawning the same path can't help), the
+    // poll-timeout recovery still falls back to the destructive registration
+    // refresh — the historical repair for a moved/deleted bundle.
+    func testKickstartThatDoesNotHealFallsBackToRefresh() async {
+        let registration = FakeDaemonRegistrationService(
+            registerStatuses: [.enabled],
+            refreshStatuses: [.enabled]
+        )
+        // Unreachable before the kickstart AND on the kickstart re-poll; only the
+        // post-refresh probe answers, so recovery must fall through to refresh.
+        let probe = FakeDaemonProbe(results: [false, false, true])
+        var kickstartCount = 0
+        let controller = DaemonInstallController(
+            registrationService: registration,
+            probe: probe,
+            sleep: { _ in },
+            kickstart: { kickstartCount += 1; return true }   // "succeeds" but daemon still silent
+        )
+
+        await controller.install(timeoutSeconds: 0, probeIntervalSeconds: 0.01)
+
+        XCTAssertEqual(kickstartCount, 1)
+        XCTAssertEqual(
+            registration.refreshedPlistNames, [DaemonInstallController.plistName],
+            "an ineffective kickstart must fall back to the registration refresh"
+        )
+        XCTAssertEqual(controller.state, .installedAndRunning)
+    }
+
     func testProbeFailureKeepsPollingUntilTimeout() async {
         let probe = FakeDaemonProbe(results: [false, false, true])
         let controller = DaemonInstallController(
@@ -657,6 +721,22 @@ private final class FakeDaemonProbe: DaemonProbe {
         guard !results.isEmpty else { return sustained }
         sustained = results.removeFirst()
         return sustained
+    }
+}
+
+/// A probe that reports unreachable (`nil`) until `daemonUp` is flipped true —
+/// the injected kickstart flips it, modelling a registered daemon that launchd
+/// only spawns once kicked. Reports a placeholder version once up, so an
+/// unknown-expected-version controller adopts it as running.
+@MainActor
+private final class KickstartGatedProbe: DaemonProbe {
+    var daemonUp = false
+    private(set) var callCount = 0
+    let version: String
+    init(version: String = "0.0.0-test") { self.version = version }
+    func probe(timeout: TimeInterval) async -> String? {
+        callCount += 1
+        return daemonUp ? version : nil
     }
 }
 
