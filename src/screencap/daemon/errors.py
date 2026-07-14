@@ -525,6 +525,21 @@ class SchemaMismatchError(DaemonAPIError):
         )
 
 
+class InvalidRequestError(DaemonAPIError):
+    """A well-formed-but-invalid request body → HTTP 400 ``invalid_request``.
+
+    The typed counterpart to :func:`app._validation_error_response`: raising it
+    lets a handler funnel every malformed-input exit (bad pydantic body, a
+    zero-length / out-of-range task span, a split point outside the segment, a
+    merge of fewer than two segments) through the SAME ``except DaemonAPIError``
+    audit path the other typed errors use, so no validation exit skips the audit
+    line. Produces the identical envelope ``_validation_error_response`` builds.
+    """
+
+    error_code = INVALID_REQUEST
+    http_status = 400
+
+
 class SlowConsumerError(DaemonAPIError):
     error_code = SLOW_CONSUMER
     http_status = 429
@@ -805,6 +820,7 @@ __all__ = [
     "RecordingNotFoundError",
     "RecordingActiveError",
     "SchemaMismatchError",
+    "InvalidRequestError",
     "SlowConsumerError",
     "CursorUnknownError",
     "CatalogUnreadableError",

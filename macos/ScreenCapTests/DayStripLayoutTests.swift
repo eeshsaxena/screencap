@@ -121,10 +121,15 @@ final class DayStripLayoutTests: XCTestCase {
 
     func testAccessibilityLabelsNameSegmentBlockedAndPlayhead() {
         let segment = DayStripSegment(
+            recording: "rec-a", taskIndex: 0, name: "Payroll walkthrough", category: "finance",
+            startMs: dayStart, endMs: dayStart + hour
+        )
+        XCTAssertTrue(DayStripAccessibility.segmentLabel(segment).hasPrefix("Payroll walkthrough, task, "))
+        let base = DayStripBaseTrack(
             recording: "rec-a", title: "Payroll walkthrough",
             startMs: dayStart, endMs: dayStart + hour
         )
-        XCTAssertTrue(DayStripAccessibility.segmentLabel(segment).hasPrefix("Payroll walkthrough, "))
+        XCTAssertTrue(DayStripAccessibility.baseTrackLabel(base).contains("unsplit, still searchable"))
         let band = DayStripBlockedBand(startMs: dayStart, endMs: dayStart + hour)
         XCTAssertTrue(DayStripAccessibility.blockedLabel(band).hasPrefix("Blocked, nothing captured"))
         XCTAssertTrue(DayStripAccessibility.playheadLabel(ms: dayStart).hasPrefix("Playhead at "))

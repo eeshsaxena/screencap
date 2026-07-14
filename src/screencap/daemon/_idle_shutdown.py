@@ -53,6 +53,27 @@ _ACTIVITY_PATHS = frozenset(
     {
         "/v0/recording.start",
         "/v0/recording.stop",
+        # SCR-214 U4: pause/resume are mutating lifecycle verbs on a live
+        # recording (like start/stop), so they count as activity — a paused
+        # ambient recording is still an intentional, in-progress session.
+        "/v0/recording.pause",
+        "/v0/recording.resume",
+        # SCR-214 U7: the user task CRUD verbs mutate the local tasks store (like
+        # recording.stop, a genuine mutation), so they count as activity — a user
+        # curating the day's tasks must not let the daemon idle-shut mid-edit.
+        # (recording.mute is deliberately NOT here, but a task edit is a write.)
+        "/v0/tasks.create",
+        "/v0/tasks.update",
+        "/v0/tasks.delete",
+        "/v0/tasks.merge",
+        "/v0/tasks.split",
+        # SCR-214 U12: ambient.set is a lifecycle mutation — it starts or stops the
+        # always-on ambient recording (like recording.start / recording.stop), so it
+        # counts as activity. ambient.status is a READ (no body) and is deliberately
+        # EXCLUDED, mirroring tasks.list / session.snapshot: a status poll must not
+        # keep an auto-spawned daemon alive. (An enabled=true ambient.set is doubly
+        # covered — once here, and thereafter by the ambient supervision busy check.)
+        "/v0/ambient.set",
     }
 )
 
@@ -142,6 +163,13 @@ def _daemon_is_busy(app: Starlette) -> bool:
     # auto-spawned daemon could idle-exit mid-upload.
     if supervisor is not None and _has_inflight_resume(supervisor):
         return True
+    # SCR-214 U2: the always-on ambient stream is running OR a re-arm is pending
+    # in its backoff gap. ``current_session()`` covers the running case, but the
+    # backoff gap between an engine exit and its re-arm has no session — without
+    # this, an auto-spawned daemon could idle-exit mid-backoff and silently drop
+    # ambient capture. Mirrors ``_has_inflight_resume``.
+    if supervisor is not None and _ambient_supervision_active(supervisor):
+        return True
     # SCR-228: a storage-location migration holds the daemon. /v0/storage.migrate
     # is deliberately NOT in _ACTIVITY_PATHS, and its handler yields the loop
     # across an asyncio.to_thread move, so this busy check is what stops an
@@ -189,6 +217,16 @@ def _backfill_running(job: object) -> bool:
 
 def _has_inflight_resume(supervisor: object) -> bool:
     getter = getattr(supervisor, "has_inflight_resume", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except Exception:  # noqa: BLE001 — watchdog stays robust against test doubles
+        return False
+
+
+def _ambient_supervision_active(supervisor: object) -> bool:
+    getter = getattr(supervisor, "ambient_supervision_active", None)
     if getter is None:
         return False
     try:

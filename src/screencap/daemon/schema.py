@@ -16,6 +16,9 @@ _RECORDING_STOP_API_VERSION = 1
 # SCR-218 mid-recording mic mute. Additive (new verb) — no global
 # API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
 _RECORDING_MUTE_API_VERSION = 1
+# SCR-214 U4 capture-pause / resume. Additive (new verbs) — no global
+# API_SCHEMA_VERSION bump (mirrors the recording.mute precedent).
+_RECORDING_PAUSE_API_VERSION = 1
 # Editable titles (U3): the post-hoc recording.rename verb. Additive (new verb) —
 # no global API_SCHEMA_VERSION bump (mirrors the recording.mute / permission.request
 # precedent).
@@ -28,7 +31,11 @@ _PERMISSION_CLEANUP_API_VERSION = 1
 _CONTENT_SEARCH_API_VERSION = 1
 _TRANSCRIPT_SEARCH_API_VERSION = 1
 _TIMELINE_QUERY_API_VERSION = 1
-_TIMELINE_DAY_API_VERSION = 1
+# v2 (U9): additive ``tasks: [TaskSegment]`` band nested on each
+# ``DaySegmentRecording``. No global API_SCHEMA_VERSION bump — older clients
+# ignore the unknown key (mirrors the transcript.search / daemon.info additive
+# precedent); the verb const bump signals the new field to clients that read it.
+_TIMELINE_DAY_API_VERSION = 2
 # SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
 # gains nullable timing fields without an API bump (mirrors the additive
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
@@ -64,6 +71,15 @@ _STORAGE_ENCRYPT_API_VERSION = 1
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
 # additive precedent).
 _TASKS_LIST_API_VERSION = 1
+# SCR-214 U7 user task CRUD verbs (create/update/delete/merge/split). Each
+# mutates the LOCAL-only tasks store (never uploaded — R8). Additive (new verbs)
+# — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
+# precedent); one version const per verb so they can bump independently.
+_TASKS_CREATE_API_VERSION = 1
+_TASKS_UPDATE_API_VERSION = 1
+_TASKS_DELETE_API_VERSION = 1
+_TASKS_MERGE_API_VERSION = 1
+_TASKS_SPLIT_API_VERSION = 1
 # SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
 # global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
 _MODELS_API_VERSION = 1
@@ -72,6 +88,12 @@ _MODELS_API_VERSION = 1
 # precedent). Pointer-only response (answer prose + source POINTERS, no image
 # bytes / paths) — the same R8 boundary as every other query verb.
 _CHAT_ANSWER_API_VERSION = 1
+# SCR-214 U12: runtime ambient control for the macOS app — a READ (ambient.status)
+# + a MUTATE (ambient.set) verb. Additive (new verbs) — no global
+# API_SCHEMA_VERSION bump (mirrors the tasks.list / frame.nearest additive
+# precedent); one version const per verb so they can bump independently.
+_AMBIENT_STATUS_API_VERSION = 1
+_AMBIENT_SET_API_VERSION = 1
 
 
 @cache
@@ -105,6 +127,8 @@ _MODEL_NAMES = {
     "RecordingStopRequest",
     "RecordingMuteRequest",
     "RecordingMuteResponse",
+    "RecordingPauseRequest",
+    "RecordingPauseResponse",
     "RecordingRenameRequest",
     "RecordingRenameResponse",
     "RecordingStopResponse",
@@ -137,6 +161,16 @@ _MODEL_NAMES = {
     "TasksListRequest",
     "TaskSegment",
     "TasksListResponse",
+    "TasksCreateRequest",
+    "TasksCreateResponse",
+    "TasksUpdateRequest",
+    "TasksUpdateResponse",
+    "TasksDeleteRequest",
+    "TasksDeleteResponse",
+    "TasksMergeRequest",
+    "TasksMergeResponse",
+    "TasksSplitRequest",
+    "TasksSplitResponse",
     "ModelDownloadStartRequest",
     "ModelDownloadCancelRequest",
     "ModelDownloadStatusResponse",
@@ -147,6 +181,9 @@ _MODEL_NAMES = {
     "ChatSourcePointer",
     "ChatCoverage",
     "ChatAnswerResponse",
+    "AmbientStatusResponse",
+    "AmbientSetRequest",
+    "AmbientSetResponse",
 }
 _MODELS: dict[str, Any] | None = None
 
@@ -285,6 +322,11 @@ def _load_models() -> dict[str, Any]:
         # mute event (additive, back-compat) — a missing value means unmuted, so
         # a stale daemon and a pre-first-mute recording both read as audio-on.
         muted: bool = False
+        # SCR-214 U4: confirmed capture-pause state. Absent until the first
+        # confirmed pause event (additive, back-compat) — a missing value means
+        # running, so a stale daemon and a never-paused recording both read as
+        # not-paused.
+        paused: bool = False
         cursor: int
 
     class RecordingStartRequest(_DaemonModel):
@@ -319,6 +361,11 @@ def _load_models() -> dict[str, Any]:
         scrub_enabled: bool = True
         show_on_website: bool = True
         network: bool = False
+        # SCR-214 U1: opt-in always-on ambient capture. When true the supervisor
+        # allocates the deterministic per-day ``ambient-YYYYMMDD`` dir and the
+        # recording is frozen local-only + audio-forced-on. Additive/default-off
+        # so existing start callers are unaffected.
+        ambient: bool = False
 
     class RecordingStartResponse(EnvelopeResponse):
         session_id: str
@@ -360,6 +407,24 @@ def _load_models() -> dict[str, Any]:
         # Bus cursor captured BEFORE forwarding, so the app can subscribe to
         # /v0/events?since=<cursor> without missing the confirming audio_muted /
         # audio_unmuted event (late-listener-replay learning).
+        cursor: int
+
+    class RecordingPauseRequest(_DaemonModel):
+        # SCR-214 U4: absolute desired pause state (True=paused). Absolute rather
+        # than a toggle so a dropped/retried request can never desync app vs
+        # engine — mirrors RecordingMuteRequest. ``recording.pause`` sends
+        # ``paused=True`` and ``recording.resume`` sends ``paused=False``; a
+        # single model backs both verbs.
+        paused: bool
+
+    class RecordingPauseResponse(EnvelopeResponse):
+        # Echoes the REQUESTED state for transport bookkeeping only. The app must
+        # NOT treat this as confirmation — confirmed pause state arrives on the
+        # events stream / snapshot after the engine actually gates capture (KTD7).
+        paused: bool
+        # Bus cursor captured BEFORE forwarding, so the app can subscribe to
+        # /v0/events?since=<cursor> without missing the confirming
+        # recording_paused / recording_resumed event.
         cursor: int
 
     class RecordingRenameRequest(_DaemonModel):
@@ -535,12 +600,42 @@ def _load_models() -> dict[str, Any]:
         start_ms: int
         end_ms: int
 
+    class TaskSegment(_DaemonModel):
+        """One named task segment from a LOCAL recording's tasks store (U4).
+
+        Read from the ``pipeline_task_segments`` ledger table inside the
+        local-only ``recording.db`` (never uploaded — R4/R8), so these named
+        tasks stay on the Mac. ``start_ts`` / ``end_ts`` are Unix seconds (the
+        ledger's native units). ``category`` / ``confidence`` are optional
+        provider metadata; the idle-gap heuristic fallback (U7) emits neither.
+
+        Shared between ``tasks.list`` (per-recording) and the day-level ``tasks``
+        band nested on :class:`DaySegmentRecording` (U9) — one wire shape, so the
+        strip and the per-recording view can't drift. ``source`` / ``edited``
+        (KTD3) are deliberately NOT exposed: task ownership is an internal store
+        concern, not part of the read wire shape.
+        """
+
+        task_index: int
+        start_ts: float
+        end_ts: float
+        name: str
+        category: str | None = None
+        confidence: str | None = None
+
     class DaySegmentRecording(_DaemonModel):
         """One recording's day-clamped span + honest blocked-interval split (U3).
 
         ``blocked_proven`` is provable MASK/EXCLUDE masking (safe to label
         "blocked"); ``unverifiable`` is fail-closed coverage-gap / null-column
         ambiguity the UI must render as a neutral gap, never "blocked" (R7).
+
+        ``tasks`` (U9, additive) carries this recording's named task segments so
+        the Day-timeline gets every band for the day in ONE round-trip — no
+        second ``tasks.list`` call per recording. Empty (never absent) for a
+        recording with no tasks store / a legacy or cloud recording. Local-only:
+        it is read straight off the recording's local ``recording.db`` and adds
+        no new upload surface.
         """
 
         name: str
@@ -550,6 +645,7 @@ def _load_models() -> dict[str, Any]:
         end_ms: int
         blocked_proven: list[DayBlockedInterval]
         unverifiable: list[DayBlockedInterval]
+        tasks: list[TaskSegment] = []
 
     class TimelineDayResponse(EnvelopeResponse):
         date: str
@@ -750,23 +846,6 @@ def _load_models() -> dict[str, Any]:
 
         recording: str
 
-    class TaskSegment(_DaemonModel):
-        """One named task segment from a LOCAL recording's tasks store (U4).
-
-        Read from the ``pipeline_task_segments`` ledger table inside the
-        local-only ``recording.db`` (never uploaded — R4/R8), so these named
-        tasks stay on the Mac. ``start_ts`` / ``end_ts`` are Unix seconds (the
-        ledger's native units). ``category`` / ``confidence`` are optional
-        provider metadata; the idle-gap heuristic fallback (U7) emits neither.
-        """
-
-        task_index: int
-        start_ts: float
-        end_ts: float
-        name: str
-        category: str | None = None
-        confidence: str | None = None
-
     class TasksListResponse(EnvelopeResponse):
         """A recording's named-task segments, ordered by ``task_index``.
 
@@ -780,6 +859,159 @@ def _load_models() -> dict[str, Any]:
 
         recording: str
         tasks: list[TaskSegment]
+
+    class TasksCreateRequest(_DaemonModel):
+        """U7 ``tasks.create`` input: add a USER-authored task span.
+
+        ``recording`` is validated by the canonical name validator in the handler
+        (traversal-safe). ``name`` is validated as DISPLAY text
+        (``validate_recording_title`` — control chars rejected, <=200 chars) and
+        must be non-empty. ``start_ts`` / ``end_ts`` are Unix seconds; the handler
+        rejects a zero-length / inverted / out-of-range span with a 400
+        ``invalid_request``. The store forces ``source='user'`` at a disjoint
+        HIGH ``task_index`` (KTD3) — the caller does not choose the index.
+        """
+
+        recording: str
+        name: str
+        start_ts: float
+        end_ts: float
+        category: str | None = None
+
+    class TasksCreateResponse(EnvelopeResponse):
+        """The created user task, echoed as a full :class:`TaskSegment`.
+
+        ``task`` carries the store-allocated ``task_index`` (HIGH range) so the
+        app can address the new row for a later update/delete without a re-list.
+        """
+
+        recording: str
+        task: TaskSegment
+
+    class TasksUpdateRequest(_DaemonModel):
+        """U7 ``tasks.update`` input: rename / re-bound an existing task.
+
+        Addresses the row by ``task_index``. Every provided field is written; an
+        omitted field is left unchanged. Editing ANY row marks it curated
+        (``edited=1``) — an agent row is additionally RE-HOMED into the HIGH
+        range so the next scoped agent replace preserves it (KTD3). When both
+        ``start_ts`` and ``end_ts`` are provided the handler validates the new
+        span (400 ``invalid_request`` on inversion / zero-length).
+        """
+
+        recording: str
+        task_index: int
+        name: str | None = None
+        start_ts: float | None = None
+        end_ts: float | None = None
+        category: str | None = None
+
+    class TasksUpdateResponse(EnvelopeResponse):
+        """The row's (possibly re-homed) ``task_index`` after an update."""
+
+        recording: str
+        task_index: int
+
+    class TasksDeleteRequest(_DaemonModel):
+        """U7 ``tasks.delete`` input: remove one task by ``task_index``."""
+
+        recording: str
+        task_index: int
+
+    class TasksDeleteResponse(EnvelopeResponse):
+        """``deleted`` is True when a row went, False when none matched.
+
+        Deleting an already-absent task is idempotent (200 with ``deleted:false``),
+        not an error — a dropped/retried delete converges.
+        """
+
+        recording: str
+        deleted: bool
+
+    class TasksMergeRequest(_DaemonModel):
+        """U7 ``tasks.merge`` input: combine >=2 segments into one.
+
+        ``task_indices`` names the segments to merge (>=2 distinct); ``name`` is
+        the surviving label (validated display text, non-empty). The merge is one
+        atomic transaction: span = union, the originals are deleted and one
+        ``source='user'`` row is inserted in the HIGH range so it survives the
+        next agent replace (KTD3). Fewer than two resolvable rows → 400
+        ``invalid_request``.
+        """
+
+        recording: str
+        task_indices: list[int]
+        name: str
+        category: str | None = None
+
+    class TasksMergeResponse(EnvelopeResponse):
+        """The merged row's allocated ``task_index`` (HIGH range)."""
+
+        recording: str
+        task_index: int
+
+    class TasksSplitRequest(_DaemonModel):
+        """U7 ``tasks.split`` input: split one segment into two at ``split_ts``.
+
+        ``split_ts`` must lie STRICTLY within the segment's span (else 400
+        ``invalid_request``). Optional ``name_left`` / ``name_right`` label the
+        halves; each defaults to the original name. The split is one atomic
+        transaction producing two ``source='user'`` rows in the HIGH range.
+        """
+
+        recording: str
+        task_index: int
+        split_ts: float
+        name_left: str | None = None
+        name_right: str | None = None
+
+    class TasksSplitResponse(EnvelopeResponse):
+        """The two allocated ``task_index`` values, left-span first."""
+
+        recording: str
+        task_indices: list[int]
+
+    class AmbientStatusResponse(EnvelopeResponse):
+        """The app's runtime view of always-on ambient supervision (SCR-214 U12).
+
+        ``enabled`` / ``autostart`` are the persisted config toggles; ``active``
+        is a live ambient recording; ``paused`` is that recording's CONFIRMED
+        pause state (U4 — written only by the engine's ``recording_paused`` /
+        ``recording_resumed`` event), ``False`` when nothing ambient is live;
+        ``degraded`` is a human-readable blocked/ceiling reason (``None`` =
+        healthy) so the app can show WHY an enabled ambient is not recording
+        instead of a silent on-with-nothing-captured toggle; ``recording`` is the
+        live ambient recording's name so the app can target ``recording.pause`` /
+        ``.resume`` at it, or ``None`` when nothing ambient is live. Read-only —
+        deliberately NOT in ``_ACTIVITY_PATHS``.
+        """
+
+        enabled: bool
+        autostart: bool
+        active: bool
+        paused: bool
+        degraded: str | None = None
+        recording: str | None = None
+
+    class AmbientSetRequest(_DaemonModel):
+        """SCR-214 U12 ``ambient.set`` input: toggle ambient at runtime.
+
+        Both fields are OPTIONAL — a request applies only the keys it carries, so
+        the app can flip ``autostart`` without touching ``enabled`` (or vice
+        versa). ``enabled=True`` persists the opt-in and STARTS ambient now;
+        ``enabled=False`` persists the opt-out and STOPS the running ambient
+        recording now. ``autostart`` only persists config. A non-bool value for
+        either key is a 400 ``invalid_request`` at the handler boundary.
+        """
+
+        enabled: bool | None = None
+        autostart: bool | None = None
+
+    class AmbientSetResponse(AmbientStatusResponse):
+        """``ambient.set`` echoes the NEW :class:`AmbientStatusResponse` payload
+        after applying the change (``active`` may still be ``False`` on an
+        ``enabled=True`` request until the detached spawn completes — the app
+        confirms via ``/v0/events`` or a follow-up ``ambient.status``)."""
 
     class ModelDownloadStartRequest(_DaemonModel):
         """SCR-239 ``model.download.start`` input.
@@ -921,6 +1153,8 @@ def _load_models() -> dict[str, Any]:
         "RecordingStopResponse": RecordingStopResponse,
         "RecordingMuteRequest": RecordingMuteRequest,
         "RecordingMuteResponse": RecordingMuteResponse,
+        "RecordingPauseRequest": RecordingPauseRequest,
+        "RecordingPauseResponse": RecordingPauseResponse,
         "RecordingRenameRequest": RecordingRenameRequest,
         "RecordingRenameResponse": RecordingRenameResponse,
         "PermissionRequestRequest": PermissionRequestRequest,
@@ -952,6 +1186,16 @@ def _load_models() -> dict[str, Any]:
         "TasksListRequest": TasksListRequest,
         "TaskSegment": TaskSegment,
         "TasksListResponse": TasksListResponse,
+        "TasksCreateRequest": TasksCreateRequest,
+        "TasksCreateResponse": TasksCreateResponse,
+        "TasksUpdateRequest": TasksUpdateRequest,
+        "TasksUpdateResponse": TasksUpdateResponse,
+        "TasksDeleteRequest": TasksDeleteRequest,
+        "TasksDeleteResponse": TasksDeleteResponse,
+        "TasksMergeRequest": TasksMergeRequest,
+        "TasksMergeResponse": TasksMergeResponse,
+        "TasksSplitRequest": TasksSplitRequest,
+        "TasksSplitResponse": TasksSplitResponse,
         "ModelDownloadStartRequest": ModelDownloadStartRequest,
         "ModelDownloadCancelRequest": ModelDownloadCancelRequest,
         "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
@@ -962,6 +1206,9 @@ def _load_models() -> dict[str, Any]:
         "ChatSourcePointer": ChatSourcePointer,
         "ChatCoverage": ChatCoverage,
         "ChatAnswerResponse": ChatAnswerResponse,
+        "AmbientStatusResponse": AmbientStatusResponse,
+        "AmbientSetRequest": AmbientSetRequest,
+        "AmbientSetResponse": AmbientSetResponse,
     }
     # `__getattr__` below dispatches every documented model name through
     # `_MODELS`, so injecting them into `globals()` would just shadow that
@@ -999,6 +1246,11 @@ __all__ = [
     "_ENTITLEMENT_REFRESH_API_VERSION",
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
+    "_TASKS_CREATE_API_VERSION",
+    "_TASKS_UPDATE_API_VERSION",
+    "_TASKS_DELETE_API_VERSION",
+    "_TASKS_MERGE_API_VERSION",
+    "_TASKS_SPLIT_API_VERSION",
     "_MODELS_API_VERSION",
     "_CHAT_ANSWER_API_VERSION",
     "daemon_version",

@@ -99,7 +99,14 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     if not hasattr(app.state, "supervisor"):
         from screencap.daemon.supervisor import Supervisor
 
-        app.state.supervisor = Supervisor(app.state.event_bus)
+        # SCR-214 U2/KTD8: hand the supervisor the SAME start gate the HTTP
+        # recording.start path runs, so the internal ambient auto-start is held
+        # to the identical permission + paywall checks (a future gate can't be
+        # added to one path but missed on the other).
+        app.state.supervisor = Supervisor(
+            app.state.event_bus,
+            start_gate=lambda: enforce_recording_start_gate(app),
+        )
     # SCR-258 U4 (KTD-14): thread the store state ``server.serve`` resolved AFTER
     # binding the socket into the supervisor, so ``recording.start`` is refused
     # (typed, before any ``started`` signal) while the store is locked / absent /
@@ -440,6 +447,49 @@ async def _enforce_recording_subscription_gate() -> None:
         )
 
 
+async def enforce_recording_start_gate(app: Starlette) -> None:
+    """Shared pre-spawn gate for ``recording.start``: permission + paywall (KTD8).
+
+    Extracted from the ``recording.start`` HTTP handler so BOTH it and the
+    internal ambient auto-start (``Supervisor``) run the *exact same* gates —
+    a future gate added here can't be wired into one path and missed on the
+    other (SCR-214 U2 / KTD8). Raises the same typed errors as before.
+
+    Permission gate (U6): reuse U2's cached grant snapshot (no second fresh
+    spawn) and block BEFORE ``supervisor.spawn`` claims the pidfile lock — a
+    fresh spawn inside the lock would widen the lock-contended window and risk
+    the app's 10s ``recording.start`` timeout. This replaces the old daemon-path
+    behavior (200 OK, then the worker emits ``permission_lost`` and crashes): the
+    worker never spawns, so there is no ``EVENT_STARTED`` and no duplicate
+    ``permission_lost`` for this attempt. The block is TRIGGERED by a denied
+    Screen Recording grant ONLY (the one permission fatal to capture);
+    indeterminate defers to the engine preflight backstop, and Accessibility /
+    Input Monitoring denials warn-and-proceed (they never trigger the block).
+    Once triggered, the reported ``missing`` list includes every denied required
+    permission — not just Screen Recording — so the app can surface the full
+    picture.
+
+    Paywall gate (U8, KTD-4): a no-op unless ``SCREENCAP_LOCAL_PAYWALL_ENFORCE``
+    is on; raised BEFORE the spawn (typed-error-before-spawn) so a refused start
+    never spawns an engine worker.
+    """
+    from screencap.daemon import permission_probe
+
+    grants = await _current_grants(app)
+    if grants.get(permission_probe.PERMISSION_SCREEN_RECORDING) == "denied":
+        missing = [
+            perm
+            for perm in permission_probe.PERMISSION_KEYS
+            if grants.get(perm) == "denied"
+        ]
+        raise errors.PermissionRequiredError(
+            missing,
+            schema_version=schema._RECORDING_START_API_VERSION,
+        )
+
+    await _enforce_recording_subscription_gate()
+
+
 def _check_subscription_for_recall(*, schema_version: int) -> None:
     """U9: block a recall/search verb unless an unexpired entitled lease grants it.
 
@@ -639,7 +689,11 @@ async def session_snapshot(request: Request) -> JSONResponse:
             # first confirmed mute event, so an unmuted (or pre-first-mute)
             # recording omits it and the app defaults to unmuted — the additive,
             # back-compatible contract mirrored on the app decoder side.
-            for key in ("engine_pid", "frames_written", "started_by", "muted"):
+            # SCR-214 U4: ``paused`` rides the same additive overlay as ``muted``
+            # — absent until the first confirmed pause event, so a never-paused
+            # recording omits it and the app defaults to not-paused.
+            for key in ("engine_pid", "frames_written", "started_by", "muted",
+                        "paused"):
                 if current.get(key) is not None:
                     payload[key] = current[key]
     elif not daemon_owned:
@@ -763,41 +817,12 @@ async def recording_start(request: Request) -> JSONResponse:
             )
         parsed = parsed.model_copy(update={"started_by": peer.classification})
 
-        # Pre-spawn permission gate (U6). Reuse U2's cached grant snapshot (no
-        # second fresh spawn) and block BEFORE supervisor.spawn claims the
-        # pidfile lock — a fresh spawn inside the lock would widen the
-        # lock-contended window and risk the app's 10s recording.start timeout.
-        # This replaces the old daemon-path behavior (200 OK, then the worker
-        # emits permission_lost and crashes): the worker never spawns, so there
-        # is no EVENT_STARTED and no duplicate permission_lost for this attempt.
-        # The block is TRIGGERED by a denied Screen Recording grant ONLY (the one
-        # permission fatal to capture); indeterminate defers to the engine
-        # preflight backstop, and Accessibility / Input Monitoring denials
-        # warn-and-proceed (they never trigger the block). Once triggered, the
-        # reported `missing` list includes every denied required permission — not
-        # just Screen Recording — so the app can surface the full picture to the
-        # user (the client-side U4 block, which only knows to gate on Screen
-        # Recording, names just that one).
-        from screencap.daemon import permission_probe
-
-        grants = await _current_grants(request.app)
-        if grants.get(permission_probe.PERMISSION_SCREEN_RECORDING) == "denied":
-            missing = [
-                perm
-                for perm in permission_probe.PERMISSION_KEYS
-                if grants.get(perm) == "denied"
-            ]
-            raise errors.PermissionRequiredError(
-                missing,
-                schema_version=schema._RECORDING_START_API_VERSION,
-            )
-
-        # Local paywall gate (U8, KTD-4). Only when SCREENCAP_LOCAL_PAYWALL_ENFORCE
-        # is on — otherwise a no-op, byte-identical to today. Raised BEFORE the
-        # spawn (typed-error-before-spawn, like the permission gate) so a refused
-        # start never spawns an engine worker. This one daemon chokepoint covers
-        # CLI, MCP, and the app (all POST /v0/recording.start).
-        await _enforce_recording_subscription_gate()
+        # Pre-spawn permission + paywall gates (U6/U8), extracted into a single
+        # shared helper so this HTTP path and the internal ambient auto-start
+        # (SCR-214 U2) can never diverge — a future gate added to the helper is
+        # enforced on both (KTD8). Both raise typed-errors-before-spawn, so a
+        # refused start never spawns an engine worker.
+        await enforce_recording_start_gate(request.app)
 
         result = await request.app.state.supervisor.spawn(parsed)
         # U2 (prototype UI): echo the effective audio state so U6/U7 reflect what
@@ -923,6 +948,84 @@ async def recording_mute(request: Request) -> JSONResponse:
             schema_version=schema._RECORDING_MUTE_API_VERSION,
             request=request,
         )
+
+
+async def _recording_set_paused(
+    request: Request, *, paused: bool, verb: str
+) -> JSONResponse:
+    """Shared implementation for ``recording.pause`` / ``recording.resume``
+    (SCR-214 U4).
+
+    Mirrors ``recording.mute``'s trust-boundary posture end-to-end: it derives a
+    peer descriptor and audits every exit path (ok, typed error, unhandled),
+    validates ``RecordingPauseRequest``, captures the bus cursor BEFORE forwarding
+    (so a client subscribing to ``/v0/events?since=<cursor>`` never misses the
+    confirming event), and forwards to the engine via ``supervisor.set_paused``.
+    It does NOT set pause state itself — the engine's confirmed
+    ``recording_paused`` / ``recording_resumed`` event does (KTD7) — so the
+    response echoes only the *requested* state and the app must not treat it as
+    confirmation. Unlike mute (audio-only), pause gates the WHOLE capture surface,
+    so a paused span records nothing (AE1).
+
+    The request body's ``paused`` is ignored in favor of the verb-derived
+    ``paused`` argument, so ``recording.pause`` always pauses and
+    ``recording.resume`` always resumes regardless of a mismatched body.
+    """
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            verb,
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        # Validate the body so a malformed request is a typed 400, not a crash —
+        # even though the effective state comes from the verb, not the body.
+        schema.RecordingPauseRequest.model_validate(await request.json())
+        # Capture the cursor BEFORE forwarding so a client can subscribe to
+        # /v0/events?since=<cursor> and never miss the confirming event.
+        cursor = request.app.state.event_bus.current_cursor()
+        forwarded = await request.app.state.supervisor.set_paused(paused)
+        if not forwarded:
+            raise errors.NotRecordingError(
+                schema_version=schema._RECORDING_PAUSE_API_VERSION
+            )
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._RECORDING_PAUSE_API_VERSION,
+                paused=paused,
+                cursor=cursor,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_PAUSE_API_VERSION,
+            request=request,
+        )
+
+
+async def recording_pause(request: Request) -> JSONResponse:
+    """Pause capture (video + screenshots + audio) on the running recording
+    without ending it (SCR-214 U4). See :func:`_recording_set_paused`."""
+    return await _recording_set_paused(request, paused=True, verb="recording.pause")
+
+
+async def recording_resume(request: Request) -> JSONResponse:
+    """Resume capture on a paused recording (SCR-214 U4). See
+    :func:`_recording_set_paused`."""
+    return await _recording_set_paused(request, paused=False, verb="recording.resume")
 
 
 def _resolve_rename_target(selector: str) -> tuple[Path, Path, float | None] | None:
@@ -2207,40 +2310,10 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     upload rules are unchanged: this only reads rows the local pipeline already
     persisted; nothing leaves the Mac.
     """
-    import sqlite3
-
     from screencap.config import resolve_recording_dir
-    from screencap.pipeline_state import (
-        LedgerError,
-        PipelineLedger,
-        ensure_pipeline_state_schema,
-    )
+    from screencap.pipeline_state import read_task_segments_wire
 
-    rec_dir = resolve_recording_dir(recording)
-    db_path = rec_dir / "recording.db"
-    if not db_path.exists():
-        return []
-    try:
-        # Idempotent, read-tolerant: creates the table on an old DB (no-op on a
-        # current one), so reading a recording captured before U4 landed never
-        # raises "no such table".
-        ensure_pipeline_state_schema(db_path)
-        ledger = PipelineLedger(db_path)
-        segments = ledger.read_task_segments()
-    except (LedgerError, sqlite3.Error):
-        # No recording row / unreadable DB → treat as "no tasks" rather than 500.
-        return []
-    return [
-        {
-            "task_index": seg.task_index,
-            "start_ts": seg.start_ts,
-            "end_ts": seg.end_ts,
-            "name": seg.name,
-            "category": seg.category,
-            "confidence": seg.confidence,
-        }
-        for seg in segments
-    ]
+    return read_task_segments_wire(resolve_recording_dir(recording))
 
 
 async def tasks_list(request: Request) -> JSONResponse:
@@ -2292,6 +2365,604 @@ async def tasks_list(request: Request) -> JSONResponse:
             schema_version=schema._TASKS_LIST_API_VERSION,
             request=request,
         )
+
+
+# ---------------------------------------------------------------------------
+# tasks.create / update / delete / merge / split — U7 user task CRUD verbs.
+#
+# Post-hoc MUTATING verbs over the LOCAL-only ``pipeline_task_segments`` store
+# (inside ``recording.db`` — never uploaded, R8). Each mirrors ``recording.rename``
+# end-to-end: derive the peer descriptor, ``_audit`` on EVERY exit path (ok / typed
+# error / unhandled), a validated request model, and typed error responses. Unlike
+# ``recording.rename`` they do NOT refuse the live recording — for ambient the user
+# curates tasks WHILE the day records, and ``PipelineLedger`` is built to coexist
+# with the live engine writer (busy_timeout=10000 + BEGIN IMMEDIATE per write). The
+# five verbs ARE mutations, so they join the ``_ACTIVITY_PATHS`` set (like
+# recording.stop) in ``daemon/_idle_shutdown.py``.
+# ---------------------------------------------------------------------------
+
+
+def _validate_task_body(model: Any, body: Any, *, schema_version: int) -> Any:
+    """Validate a task-CRUD request body → a typed 400 on any malformed input.
+
+    A non-dict body or a pydantic ``ValidationError`` raises
+    :class:`errors.InvalidRequestError` (400 ``invalid_request``) so the single
+    ``except DaemonAPIError`` path audits the exit — no validation failure skips
+    the audit line.
+    """
+    from pydantic import ValidationError
+
+    if not isinstance(body, dict):
+        raise errors.InvalidRequestError(schema_version=schema_version)
+    try:
+        return model.model_validate(body)
+    except ValidationError as exc:
+        raise errors.InvalidRequestError(schema_version=schema_version) from exc
+
+
+def _validate_task_span(
+    start_ts: float, end_ts: float, *, schema_version: int
+) -> None:
+    """Reject a zero-length / inverted / out-of-range task span (400).
+
+    A valid span is two FINITE, non-negative Unix-second bounds with
+    ``end_ts > start_ts``. ``math.isfinite`` rejects the ``NaN`` / ``Infinity``
+    tokens Python's ``json`` decoder accepts by default, so a direct UDS caller
+    cannot smuggle a non-finite bound past the boundary.
+    """
+    import math
+
+    if not (math.isfinite(start_ts) and math.isfinite(end_ts)):
+        raise errors.InvalidRequestError(schema_version=schema_version)
+    if start_ts < 0 or end_ts <= start_ts:
+        raise errors.InvalidRequestError(schema_version=schema_version)
+
+
+def _validate_task_name(name: str, *, schema_version: int) -> str:
+    """Validate a task label as display text; require it non-empty.
+
+    Reuses ``validate_recording_title`` (control chars / bidi / length<=200
+    rejected → 400 ``invalid_name``), then rejects an empty/whitespace-only
+    label with 400 ``invalid_request`` (a task must carry a name). Returns the
+    stripped label.
+    """
+    from screencap.daemon._name_validation import validate_recording_title
+
+    validated = validate_recording_title(name)
+    stripped = validated.strip()
+    if not stripped:
+        raise errors.InvalidRequestError(schema_version=schema_version)
+    return stripped
+
+
+def _resolve_task_ledger(recording: str, schema_version: int):
+    """Resolve a recording name to its :class:`PipelineLedger` (off the loop).
+
+    Pure disk IO — the handlers run it via ``asyncio.to_thread``. The recording
+    name is validated by ``validate_recording_name`` at the handler boundary
+    BEFORE this runs, so ``resolve_recording_dir`` can only produce an in-root
+    path. A missing recording dir / ``recording.db`` / recording row raises
+    :class:`errors.RecordingNotFoundError` (404) — the mutating counterpart to
+    ``tasks.list``'s fail-soft empty list (a write has no empty-result to return).
+    """
+    import sqlite3
+
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import (
+        LedgerError,
+        PipelineLedger,
+        ensure_pipeline_state_schema,
+    )
+
+    try:
+        rec_dir = resolve_recording_dir(recording)
+    except ValueError as exc:  # defense-in-depth; name is pre-validated
+        raise errors.RecordingNotFoundError(schema_version=schema_version) from exc
+    db_path = rec_dir / "recording.db"
+    if not db_path.exists():
+        raise errors.RecordingNotFoundError(schema_version=schema_version)
+    try:
+        ensure_pipeline_state_schema(db_path)
+        return PipelineLedger(db_path)
+    except (LedgerError, sqlite3.Error) as exc:
+        raise errors.RecordingNotFoundError(schema_version=schema_version) from exc
+
+
+def _task_span_orphaned(recording: str, ledger, start_ts: float, end_ts: float) -> bool:
+    """SCR-214 U8 orphan guard: is ``[start_ts, end_ts)`` over EVICTED footage?
+
+    Resolves the recording dir (the ``recording`` name is pre-validated at the
+    handler boundary) and delegates to
+    :func:`screencap.retention.task_span_is_orphaned`, which refuses ONLY on
+    positive eviction evidence and otherwise fails open — so a task over live /
+    legacy footage is never blocked. Pure disk IO; the handler runs it off the
+    loop via ``asyncio.to_thread``.
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.retention import task_span_is_orphaned
+
+    try:
+        rec_dir = resolve_recording_dir(recording)
+    except ValueError:
+        return False  # defense-in-depth; name is pre-validated + ledger already resolved
+    return task_span_is_orphaned(rec_dir, ledger, start_ts, end_ts)
+
+
+def _find_task_segment(ledger, task_index: int):
+    """Return the stored task row at ``task_index`` (or ``None``) (SCR-214 U8).
+
+    The counterpart the ``tasks.update`` orphan guard reads to compute an update's
+    EFFECTIVE post-update span: a one-sided bound change combines the provided
+    bound with this row's stored bound. Pure disk IO; the handler runs it off the
+    loop via ``asyncio.to_thread``.
+    """
+    for row in ledger.read_task_segments():
+        if row.task_index == task_index:
+            return row
+    return None
+
+
+def _task_crud_peer_audit(request: Request, verb: str):
+    """Build the (peer, ``_audit``) pair shared by the five task CRUD handlers.
+
+    Mirrors ``recording.rename``: the peer descriptor is derived once so every
+    exit path records the same descriptor, and the audit line carries peer +
+    outcome ONLY — never the free-text task label (labels must not accrue in the
+    local audit log, same rule as editable titles).
+    """
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            verb,
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    return peer, _audit
+
+
+async def tasks_create(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.create`` — add a USER-authored task span (U7).
+
+    Writes one ``source='user'`` row at a disjoint HIGH ``task_index`` (KTD3) so
+    it never collides with the agent's low range and survives the next agent
+    re-segmentation. Rejects a zero-length / inverted / out-of-range span and an
+    empty/control-char label with a typed 400; a traversal recording name with
+    400 ``invalid_name``; an unknown recording with 404; and (U8 orphan guard) a
+    span pointing only at already-EVICTED footage with 400 ``invalid_request`` —
+    so no unplayable task is persisted. Local-only — the row lives in
+    ``recording.db`` and is never uploaded.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+    from screencap.pipeline_state import TaskSegmentRow
+
+    _v = schema._TASKS_CREATE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.create")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksCreateRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        name = _validate_task_name(parsed.name, schema_version=_v)
+        _validate_task_span(parsed.start_ts, parsed.end_ts, schema_version=_v)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+
+        # SCR-214 U8 orphan guard: refuse a task whose span points only at
+        # already-EVICTED footage — persisting it would leave an unplayable task.
+        # Fails open on live / legacy recordings with no eviction, so normal
+        # creation is never blocked.
+        if await asyncio.to_thread(
+            _task_span_orphaned, parsed.recording, ledger,
+            parsed.start_ts, parsed.end_ts,
+        ):
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        row = TaskSegmentRow(
+            task_index=0,  # ignored; insert_task_segment allocates the HIGH index
+            start_ts=parsed.start_ts,
+            end_ts=parsed.end_ts,
+            name=name,
+            category=parsed.category,
+        )
+        idx = await asyncio.to_thread(ledger.insert_task_segment, row)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task=schema.TaskSegment(
+                    task_index=idx,
+                    start_ts=parsed.start_ts,
+                    end_ts=parsed.end_ts,
+                    name=name,
+                    category=parsed.category,
+                    confidence=None,
+                ).model_dump(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_update(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.update`` — rename / re-bound an existing task (U7).
+
+    Every edit marks the row curated (``edited=1``); an agent row is additionally
+    RE-HOMED into the HIGH range so the next scoped agent replace preserves it
+    (KTD3). Only the provided fields are written. A missing ``task_index`` and a
+    provided-but-inverted span each return 400 ``invalid_request``; a traversal
+    name 400 ``invalid_name``; an unknown recording 404. Local-only.
+
+    SCR-214 U8 orphan guard (parity with ``tasks.create``): when the request
+    supplies a span bound, re-bounding the task onto already-EVICTED footage —
+    which ``mark_edited=True`` would then PROTECT as a kept span — is rejected with
+    the same 400 ``invalid_request``, so no unplayable task is persisted.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_UPDATE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.update")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksUpdateRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        name = (
+            _validate_task_name(parsed.name, schema_version=_v)
+            if parsed.name is not None
+            else None
+        )
+        # Only cross-validate the span when BOTH bounds are supplied — a partial
+        # bound update (one side) is left to the stored counterpart.
+        if parsed.start_ts is not None and parsed.end_ts is not None:
+            _validate_task_span(parsed.start_ts, parsed.end_ts, schema_version=_v)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+
+        # SCR-214 U8 orphan guard (parity with tasks.create): a span re-bound onto
+        # footage the 30-day ambient retention already rolled off would persist an
+        # unplayable task — and mark_edited=True below would then make that orphan a
+        # PROTECTED kept span. When the request supplies a span bound, run the SAME
+        # check create runs, over the EFFECTIVE post-update span (a one-sided bound
+        # combines with the stored counterpart). Skipped for a name-only edit (no
+        # span bound) and when the row is absent (update_task_segment returns None →
+        # invalid_request below); fails open on live / legacy footage exactly like
+        # create, so a normal re-bound onto surviving footage is never blocked.
+        if parsed.start_ts is not None or parsed.end_ts is not None:
+            existing = await asyncio.to_thread(
+                _find_task_segment, ledger, parsed.task_index
+            )
+            if existing is not None:
+                eff_start = (
+                    parsed.start_ts if parsed.start_ts is not None else existing.start_ts
+                )
+                eff_end = (
+                    parsed.end_ts if parsed.end_ts is not None else existing.end_ts
+                )
+                if await asyncio.to_thread(
+                    _task_span_orphaned, parsed.recording, ledger, eff_start, eff_end,
+                ):
+                    raise errors.InvalidRequestError(schema_version=_v)
+
+        # Always mark_edited: a user touch protects the row from the agent
+        # replace, and re-homes an agent row out of the clobbered low range.
+        new_index = await asyncio.to_thread(
+            lambda: ledger.update_task_segment(
+                parsed.task_index,
+                name=name,
+                start_ts=parsed.start_ts,
+                end_ts=parsed.end_ts,
+                category=parsed.category,
+                mark_edited=True,
+            )
+        )
+        if new_index is None:
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task_index=new_index,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_delete(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.delete`` — remove one task by ``task_index`` (U7).
+
+    Idempotent: deleting an already-absent task returns 200 ``deleted:false``
+    rather than an error, so a dropped/retried delete converges. A traversal name
+    returns 400 ``invalid_name``; an unknown recording 404. Local-only.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_DELETE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.delete")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksDeleteRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        deleted = await asyncio.to_thread(
+            ledger.delete_task_segment, parsed.task_index
+        )
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                deleted=bool(deleted),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_merge(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.merge`` — combine >=2 segments into one, atomically (U7).
+
+    The surviving label is the caller's choice, the span is the union, and the
+    result is one ``source='user'`` row (HIGH range) that survives the next agent
+    replace — all in a single ``BEGIN IMMEDIATE`` transaction, so a partial
+    failure never leaves a half-merge. Fewer than two resolvable segments returns
+    400 ``invalid_request``; a traversal name 400 ``invalid_name``; an unknown
+    recording 404. Local-only.
+    """
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_MERGE_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.merge")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksMergeRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        name = _validate_task_name(parsed.name, schema_version=_v)
+        # >=2 DISTINCT targets required — the ledger also re-checks against the
+        # rows that actually exist, so a stale index list can't half-merge.
+        if len(set(parsed.task_indices)) < 2:
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        new_index = await asyncio.to_thread(
+            lambda: ledger.merge_task_segments(
+                parsed.task_indices,
+                name=name,
+                category=parsed.category,
+            )
+        )
+        if new_index is None:
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task_index=new_index,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def tasks_split(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.split`` — split one segment into two at ``split_ts`` (U7).
+
+    ``split_ts`` must lie STRICTLY within the segment's span (validated against
+    the stored bounds inside the transaction); otherwise, or if the segment is
+    absent, returns 400 ``invalid_request``. Produces two ``source='user'`` rows
+    (HIGH range) in one atomic transaction — never a half-split. A traversal name
+    returns 400 ``invalid_name``; an unknown recording 404. Local-only.
+    """
+    import math
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._TASKS_SPLIT_API_VERSION
+    _peer, _audit = _task_crud_peer_audit(request, "tasks.split")
+    try:
+        parsed = _validate_task_body(
+            schema.TasksSplitRequest, await request.json(), schema_version=_v
+        )
+        validate_recording_name(parsed.recording)
+        if not math.isfinite(parsed.split_ts):
+            raise errors.InvalidRequestError(schema_version=_v)
+        name_left = (
+            _validate_task_name(parsed.name_left, schema_version=_v)
+            if parsed.name_left is not None
+            else None
+        )
+        name_right = (
+            _validate_task_name(parsed.name_right, schema_version=_v)
+            if parsed.name_right is not None
+            else None
+        )
+
+        ledger = await asyncio.to_thread(_resolve_task_ledger, parsed.recording, _v)
+        result = await asyncio.to_thread(
+            lambda: ledger.split_task_segment(
+                parsed.task_index,
+                parsed.split_ts,
+                name_left=name_left,
+                name_right=name_right,
+            )
+        )
+        if result is None:
+            # No such row, or split_ts not strictly inside the stored span.
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                recording=parsed.recording,
+                task_indices=list(result),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+# ---------------------------------------------------------------------------
+# ambient.status / ambient.set — SCR-214 U12 runtime ambient control (U12
+# prerequisite: the macOS app enables/disables + reads always-on ambient at
+# runtime). ``ambient.status`` is a READ snapshot (like session.snapshot /
+# tasks.list — deliberately NOT in ``_ACTIVITY_PATHS`` so polling it never resets
+# the idle-shutdown clock). ``ambient.set`` MUTATES persisted config AND drives the
+# supervisor to start/stop ambient NOW, so it mirrors recording.mute's audited
+# trust-boundary posture (peer descriptor + ``_audit`` on every exit path, a
+# validated model, typed errors) and joins ``_ACTIVITY_PATHS`` (a genuine
+# recording-lifecycle mutation, like recording.stop).
+# ---------------------------------------------------------------------------
+
+
+def _ambient_status_payload(supervisor: Any) -> dict[str, Any]:
+    """Map ``Supervisor.ambient_state()`` to the app-facing status wire fields.
+
+    Selects exactly the six ``AmbientStatusResponse`` fields (dropping the
+    internal ``retry_count`` diagnostic ``ambient_state`` also carries), so
+    ``ambient.status`` and ``ambient.set`` return one identical shape.
+    """
+    state = supervisor.ambient_state()
+    return {
+        "enabled": bool(state["enabled"]),
+        "autostart": bool(state["autostart"]),
+        "active": bool(state["active"]),
+        "paused": bool(state["paused"]),
+        "degraded": state["degraded"],
+        "recording": state["recording"],
+    }
+
+
+async def ambient_status(request: Request) -> JSONResponse:
+    """``GET /v0/ambient.status`` — the app's runtime view of ambient capture (U12).
+
+    A read-only snapshot of always-on ambient supervision: the persisted
+    enabled/autostart toggles plus the live active/paused/degraded state and the
+    ambient recording's name (so the app can target ``recording.pause`` /
+    ``.resume``). Reads only in-process supervisor state + cached config — no
+    recording data leaves the Mac. Deliberately NOT in ``_ACTIVITY_PATHS``: a
+    status poll must not keep an auto-spawned daemon alive.
+    """
+    try:
+        payload = _ambient_status_payload(request.app.state.supervisor)
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._AMBIENT_STATUS_API_VERSION,
+                **payload,
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._AMBIENT_STATUS_API_VERSION,
+            request=request,
+        )
+
+
+async def ambient_set(request: Request) -> JSONResponse:
+    """``POST /v0/ambient.set`` — enable/disable ambient (+ autostart) at runtime (U12).
+
+    Body ``{enabled?: bool, autostart?: bool}`` — each key is applied only when
+    present, so the app can flip ``autostart`` without touching ``enabled``.
+    ``enabled=True`` persists the opt-in then drives the supervisor to START
+    ambient NOW via the idempotent, gate-checked ``_maybe_autostart_ambient`` (a
+    no-op if ambient is already active). ``enabled=False`` persists the opt-out
+    FIRST then STOPS the running ambient recording via ``stop_ambient_now`` —
+    because config is now False, the engine-exit re-arm won't respawn it.
+    ``autostart`` only persists config. Returns the NEW ambient.status payload.
+
+    A MUTATING verb on the same trust boundary as recording.mute: the peer
+    descriptor is derived and every exit path (ok / typed error / unhandled) is
+    audited. A malformed body (non-dict, or a non-bool value) is a typed 400
+    ``invalid_request``. The config writes run off the event loop (tomlkit disk IO).
+    """
+    from screencap.config import set_ambient_autostart, set_ambient_enabled
+    from screencap.daemon import audit_log, provenance
+
+    _v = schema._AMBIENT_SET_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "ambient.set",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        parsed = _validate_task_body(
+            schema.AmbientSetRequest, await request.json(), schema_version=_v
+        )
+        supervisor = request.app.state.supervisor
+
+        if parsed.enabled is not None:
+            # Persist the opt-in/out FIRST (off-loop: tomlkit load/save is disk IO),
+            # so both the start/stop below AND the engine-exit re-arm observe the
+            # new config value.
+            await asyncio.to_thread(set_ambient_enabled, parsed.enabled)
+            if parsed.enabled:
+                # Idempotent + gate-checked: schedules a detached spawn only when
+                # ambient is not already active/pending/degraded (R2).
+                supervisor._maybe_autostart_ambient()
+            else:
+                # Config is already False, so the exit-funnel re-arm will NOT
+                # respawn what we stop here.
+                await supervisor.stop_ambient_now()
+
+        if parsed.autostart is not None:
+            await asyncio.to_thread(set_ambient_autostart, parsed.autostart)
+
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                **_ambient_status_payload(supervisor),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
 
 
 async def timeline_day(request: Request) -> JSONResponse:
@@ -3664,6 +4335,8 @@ def build_app() -> Starlette:
             Route("/v0/recording.start", recording_start, methods=["POST"]),
             Route("/v0/recording.stop", recording_stop, methods=["POST"]),
             Route("/v0/recording.mute", recording_mute, methods=["POST"]),
+            Route("/v0/recording.pause", recording_pause, methods=["POST"]),
+            Route("/v0/recording.resume", recording_resume, methods=["POST"]),
             Route("/v0/recording.rename", recording_rename, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
@@ -3674,6 +4347,13 @@ def build_app() -> Starlette:
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
             Route("/v0/frame.read", frame_read, methods=["POST"]),
             Route("/v0/tasks.list", tasks_list, methods=["POST"]),
+            Route("/v0/tasks.create", tasks_create, methods=["POST"]),
+            Route("/v0/tasks.update", tasks_update, methods=["POST"]),
+            Route("/v0/tasks.delete", tasks_delete, methods=["POST"]),
+            Route("/v0/tasks.merge", tasks_merge, methods=["POST"]),
+            Route("/v0/tasks.split", tasks_split, methods=["POST"]),
+            Route("/v0/ambient.status", ambient_status, methods=["GET"]),
+            Route("/v0/ambient.set", ambient_set, methods=["POST"]),
             Route("/v0/chat.answer", chat_answer, methods=["POST"]),
             Route("/v0/apps.list", apps_list, methods=["GET"]),
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),

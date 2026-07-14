@@ -87,6 +87,19 @@ EVENT_AUDIO_UNMUTED = "audio_unmuted"
 # recording keeps running muted. Carries ``reason`` (closed-set label) so it can
 # ride the daemon EventBus without leaking runtime text.
 EVENT_AUDIO_UNMUTE_FAILED = "audio_unmute_failed"
+# SCR-214 U4: capture-pause / resume. Distinct from mic-mute — pause stops the
+# WHOLE capture surface (video + screenshots + audio), so a paused span records
+# NOTHING and reads "nothing captured" (AE1), whereas a mic-muted span still
+# captures video and reads "unsplit — still searchable". Emitted by the ENGINE-
+# MAIN capture process AFTER the video/screenshot gate is actually set (the
+# deterministic half of pause — unlike the audio re-acquire it cannot fail), so
+# the daemon's session state / snapshot reflect confirmed-gated capture, never a
+# request that might have failed. Carries ``paused`` for symmetry. The audio
+# substream is gated in parallel over its own control queue and does NOT emit
+# these (a --no-audio / muted recording has no stream to toggle, yet pause must
+# still confirm because video stopped — so engine-main is the sole emitter).
+EVENT_RECORDING_PAUSED = "recording_paused"
+EVENT_RECORDING_RESUMED = "recording_resumed"
 # Closed set of ``audio_unmute_failed`` ``reason`` codes. Like the
 # capture_unhealthy reasons, these ride the daemon EventBus to any same-EUID
 # subscriber, so the field MUST be one of these constants — never interpolated
@@ -239,6 +252,8 @@ __all__ = [
     "EVENT_AUDIO_UNMUTE_FAILED",
     "AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE",
     "AUDIO_UNMUTE_FAILED_REASONS",
+    "EVENT_RECORDING_PAUSED",
+    "EVENT_RECORDING_RESUMED",
     "EVENT_PERMISSION_LOST",
     "EVENT_PERMISSION_REQUIRED",
     "EVENT_CAPTURE_UNHEALTHY",

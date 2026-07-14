@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 EngineCommandFactory = Callable[[str], list[str]]
+
+# SCR-214 U2/KTD8: the shared ``recording.start`` gate (permission + paywall),
+# injected by the daemon app so the internal ambient auto-start runs the exact
+# same checks as the HTTP path. Awaitable, raises the same typed errors.
+StartGate = Callable[[], Awaitable[None]]
 
 # Bound the best-effort ``whoami`` enrichment in ``_maybe_emit_account_mismatch``
 # so a slow Keychain/token-refresh I/O can't pace the serial startup sweep (each
@@ -196,6 +201,45 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _ambient_rearm_params() -> tuple[float, float, int, float]:
+    """Backoff/ceiling knobs for ambient re-arm (SCR-214 U2), env-overridable.
+
+    Returns ``(base_delay, max_delay, max_retries, quiescence)``:
+
+    * ``base_delay`` — first backoff after a rapid crash; doubles each retry.
+    * ``max_delay`` — cap on the exponential backoff.
+    * ``max_retries`` — consecutive rapid-failure ceiling; past it we surface a
+      degraded state instead of thrash-respawning.
+    * ``quiescence`` — a run lasting at least this long (or a clean rc==0 exit)
+      is treated as stable: it resets the crash budget and re-arms promptly.
+
+    Read fresh each time so tests can shrink the delays / ceiling via env.
+    """
+    base = _float_env("SCREENCAP_AMBIENT_REARM_BASE_DELAY", 2.0)
+    max_delay = _float_env("SCREENCAP_AMBIENT_REARM_MAX_DELAY", 300.0)
+    max_retries = int(_float_env("SCREENCAP_AMBIENT_REARM_MAX_RETRIES", 5))
+    quiescence = _float_env("SCREENCAP_AMBIENT_REARM_QUIESCENCE", 60.0)
+    return base, max_delay, max_retries, quiescence
+
+
+def _is_yyyymmdd(token: str) -> bool:
+    """Whether ``token`` is an 8-digit ``YYYYMMDD`` day stamp (SCR-214 U3)."""
+    return len(token) == 8 and token.isdigit()
+
+
+def _ambient_day_name(clock: Callable[[], float]) -> str:
+    """``ambient-YYYYMMDD`` for the LOCAL day of ``clock()`` (SCR-214 U3).
+
+    A module-level function (not just a method) so the deterministic per-day dir
+    naming and the day-roll change-detection share ONE definition of "what local
+    day is it", and so :meth:`Supervisor._allocate_ambient_capture_dir` can call it
+    with a graceful ``time.time`` fallback (the U1 ``_AllocOnly`` test double binds
+    only the alloc methods, with no ``_clock`` instance state). ``time.localtime``
+    collapses any DST / timezone shift to one unambiguous local day.
+    """
+    return time.strftime("ambient-%Y%m%d", time.localtime(clock()))
+
+
 def _default_engine_command(encoded_args: str) -> list[str]:
     override = os.environ.get("SCREENCAP_DAEMON_ENGINE_COMMAND")
     if override:
@@ -255,6 +299,47 @@ def build_engine_worker_args(
     return args
 
 
+def _ambient_dir_finalized(candidate: Path) -> bool:
+    """Whether an existing ``ambient-YYYYMMDD`` dir has already been finalized.
+
+    Reopening a finalized day and appending fresh chunks would push past the
+    frozen closed set (``chunks_expected``) and corrupt the ledger, so
+    :meth:`Supervisor._allocate_ambient_capture_dir` must NOT reopen one
+    (SCR-214 U1). A day is finalized when either:
+
+    * the terminal stage wrote the completeness sentinel
+      (``recording_complete.json`` — its last write), or
+    * ``recording.db``'s ``recording.chunks_expected`` is frozen (non-null),
+      which the final chunk rotation / terminal stage sets when the recording
+      closes. A local ambient recording never writes the cloud sentinel, so this
+      ledger check is the load-bearing signal for the common local case.
+
+    Fail-safe: a missing/unreadable DB, or a pre-U1 DB without the column, reads
+    as *not finalized* (the dir is treated as reopenable) — a fresh same-day dir
+    is only ever forked when finalization is positively proven.
+    """
+    if (candidate / "recording_complete.json").exists():
+        return True
+    db = candidate / "recording.db"
+    if not db.exists():
+        return False
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT chunks_expected FROM recording LIMIT 1"
+        ).fetchone()
+        return row is not None and row[0] is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
 class Supervisor:
     """Own daemon recording lifecycle, crash recovery, and stderr bridging."""
 
@@ -268,9 +353,34 @@ class Supervisor:
         startup_timeout: float | None = None,
         stop_timeout: float | None = None,
         reconcile_grace: float | None = None,
+        start_gate: StartGate | None = None,
+        clock: Callable[[], float] | None = None,
+        ambient_day_tick_interval: float | None = None,
+        ambient_seg_tick_interval: float | None = None,
     ) -> None:
         self._bus = event_bus
         self._engine_command_factory = engine_command_factory or _default_engine_command
+        # SCR-214 U3: injectable wall-clock so the day-boundary roll can be
+        # exercised deterministically (a test can cross local midnight without
+        # waiting). Defaults to ``time.time`` in production.
+        self._clock = clock or time.time
+        # SCR-214 U3: cadence of the day-roll watch. Cheap (a string compare), so
+        # a coarse default is fine; env/param-overridable so tests can tick fast.
+        self._ambient_day_tick_interval = (
+            ambient_day_tick_interval
+            if ambient_day_tick_interval is not None
+            else _float_env("SCREENCAP_AMBIENT_DAY_TICK_INTERVAL", 30.0)
+        )
+        # SCR-214 U6/KTD4: cadence of the incremental-segmentation sweep. Heavier
+        # than the day-roll watch (it re-runs the terminal-stage segmenter over the
+        # growing ambient day), so a coarser default; env/param-overridable so
+        # tests can tick fast. Consequence (KTD4): today's Journal labels refresh
+        # on this interval, not per closed chunk.
+        self._ambient_seg_tick_interval = (
+            ambient_seg_tick_interval
+            if ambient_seg_tick_interval is not None
+            else _float_env("SCREENCAP_AMBIENT_SEG_TICK_INTERVAL", 300.0)
+        )
         self._poll_interval = (
             poll_interval
             if poll_interval is not None
@@ -362,6 +472,44 @@ class Supervisor:
         # pin (a locked daemon idle-exits normally, KTD-15).
         self._lock_in_flight = False
 
+        # SCR-214 U2/KTD8: supervised always-on ambient capture.
+        # ``_start_gate`` (injected by the app) is the shared permission+paywall
+        # gate the internal ambient spawn runs — identical to the HTTP path.
+        self._start_gate = start_gate
+        # True while the current live ``_proc`` is the ambient stream (drives
+        # idle-shutdown + re-arm). ``_ambient_spawn_at`` is its monotonic start
+        # time, used to tell a stable run from a rapid crash.
+        self._ambient_active = False
+        self._ambient_spawn_at: float | None = None
+        # Surfaced blocked/degraded reason the app can read (None = healthy):
+        # permission/paywall denial, or the retry ceiling after repeated crashes.
+        self._ambient_degraded: str | None = None
+        # Consecutive rapid-failure count toward the re-arm ceiling.
+        self._ambient_retry_count = 0
+        # The pending auto-start / backoff re-arm task (keeps the daemon alive
+        # across the backoff gap so the always-on stream isn't idle-shut-down).
+        self._ambient_spawn_task: asyncio.Task[Any] | None = None
+        # SCR-214 U3: the long-lived day-boundary watch task (rolls ambient to the
+        # next per-day dir at local midnight / on the first post-wake tick), and a
+        # guard flag marking an in-progress roll so the engine-exit funnel treats
+        # the roll's intentional stop as a roll — NOT a crash to re-arm/back off.
+        self._ambient_day_task: asyncio.Task[Any] | None = None
+        self._ambient_rolling = False
+        # SCR-214 U6/KTD4: the long-lived incremental-segmentation watch task
+        # (re-runs the terminal-stage segmenter over the live ambient day so
+        # today's Journal fills before the stream stops). Persists across re-arms
+        # and day rolls; cancelled in ``shutdown``.
+        self._ambient_seg_task: asyncio.Task[Any] | None = None
+        # SCR-214 U6: change-detection key for the last segmentation sweep — a cheap
+        # fingerprint of the ambient day's completed-manifest set + kept-task count.
+        # The sweep SKIPS a tick whose fingerprint is unchanged (a no-op re-segment
+        # on an idle always-on recorder). ``None`` (no completed manifests yet /
+        # unreadable) fails OPEN — the pass runs — so we only skip on positive
+        # evidence nothing changed.
+        self._last_segmentation_key: tuple[Any, ...] | None = None
+        # Set at the top of ``shutdown`` so a torn-down daemon never re-arms.
+        self._shutting_down = False
+
         if reconcile_on_init:
             self.start_reconcile()
 
@@ -433,6 +581,18 @@ class Supervisor:
         failed at the actual ``stream.stop()``.
         """
         return await self.send_command({"type": "set_muted", "muted": bool(muted)})
+
+    async def set_paused(self, paused: bool) -> bool:
+        """Forward a pause/resume request to the running engine (SCR-214 U4).
+
+        A pass-through mirroring :meth:`set_muted`: returns ``True`` if forwarded,
+        ``False`` if there is no live engine. It deliberately does NOT write pause
+        state into ``_session_state`` — the engine's confirmed ``recording_paused``
+        / ``recording_resumed`` event (emitted only after capture is actually
+        gated, KTD7) is the sole writer, so the snapshot never reports a request
+        that may have raced engine teardown.
+        """
+        return await self.send_command({"type": "set_paused", "paused": bool(paused)})
 
     async def acquire_migration(self, *, schema_version: int) -> None:
         """Reserve the daemon for a storage-location migration (SCR-228 U3/U4).
@@ -1126,6 +1286,20 @@ class Supervisor:
 
     async def shutdown(self) -> None:
         """Stop any owned engine and release the daemon lock."""
+        # SCR-214 U2: mark the daemon as tearing down BEFORE the engine exit is
+        # handled, so `_handle_engine_exit` does not re-arm the ambient stream
+        # into a dying loop. Cancel any pending ambient re-arm for the same reason.
+        self._shutting_down = True
+        # Cancel the pending ambient re-arm (U2), the day-boundary watch (U3 — a
+        # torn-down daemon never rolls), and the incremental-segmentation watch (U6
+        # — never kicks off a new pass).
+        for _ambient_task in (
+            self._ambient_spawn_task,
+            self._ambient_day_task,
+            self._ambient_seg_task,
+        ):
+            if _ambient_task is not None and not _ambient_task.done():
+                _ambient_task.cancel()
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
@@ -1231,6 +1405,11 @@ class Supervisor:
             # never blocks request handling: _recovering is already cleared, and a
             # long backlog upload must not make `spawn`/`stop` raise Reconciling.
             self._track_resume(self._run_startup_sweep())
+            # SCR-214 U2: now that reconcile has cleared `_recovering`, auto-start
+            # the always-on ambient stream if the user enabled it. A no-op when
+            # ambient is disabled (the default); scheduled detached so a slow
+            # gate/spawn never blocks reconcile completion.
+            self._maybe_autostart_ambient()
 
     @staticmethod
     def _prune_stale_engine_token_files() -> None:
@@ -1355,6 +1534,14 @@ class Supervisor:
             # has the recording dir even if a concurrent stop/shutdown raced.
             capture_dir = (self._session_state or {}).get("capture_dir")
 
+            # SCR-214 U2: snapshot whether THIS exit was the ambient stream (and
+            # how long it ran) before teardown, so the re-arm decision below has
+            # it. The engine is gone → no longer "active"; re-arm (if any) revives.
+            was_ambient = self._ambient_active
+            ambient_spawn_at = self._ambient_spawn_at
+            if was_ambient:
+                self._ambient_active = False
+
             if not self._finalized_seen:
                 if rc != 0 and not self._stopping:
                     self._mark_catalog_terminated_unexpectedly(
@@ -1400,6 +1587,40 @@ class Supervisor:
             ):
                 self._track_resume(self._run_resume_safely(Path(capture_dir)))
 
+            # SCR-214 U2: re-arm the always-on ambient stream after its engine
+            # exits (unless the daemon is shutting down or ambient was disabled).
+            # A clean/long-lived exit re-arms promptly; a rapid crash loop backs
+            # off and surfaces a degraded state at the ceiling rather than thrash.
+            #
+            # SCR-214 U3: a DAY-BOUNDARY ROLL is an intentional stop, not a crash.
+            # ``_roll_ambient_day`` owns the respawn (into the next per-day dir), so
+            # skip the exit-funnel re-arm here — otherwise the roll would both
+            # re-arm the old day AND spawn the new one (double spawn), or a rc!=0
+            # force-stop of a short (test-clock) run would wrongly count toward the
+            # crash-loop backoff ceiling.
+            if was_ambient and not self._ambient_rolling:
+                run_duration = (
+                    time.monotonic() - ambient_spawn_at
+                    if ambient_spawn_at is not None
+                    else 0.0
+                )
+                self._schedule_ambient_rearm(rc, run_duration)
+            elif not was_ambient:
+                # SCR-214 reliability: a NON-ambient (explicit) recording just
+                # exited, FREEING the recording lock. If ambient is enabled but was
+                # DEFERRED by that held lock — ``_spawn_ambient`` swallowed a
+                # ``LockContendedError`` at reconcile / day-roll and never started —
+                # the ``was_ambient`` re-arm above would never fire for it, so
+                # ambient would stay silently down until the next daemon restart.
+                # Attempt the same gated auto-start now that the lock is free (the
+                # lock frees exactly when the explicit recording exits).
+                # ``_maybe_autostart_ambient`` is idempotent + self-guarding — a
+                # no-op when ambient is already active/pending, the daemon is
+                # shutting down, ambient is disabled, or it already hit its degraded
+                # ceiling — so this can never double-spawn and a persistent failure
+                # stays surfaced as degraded rather than retrying forever.
+                self._maybe_autostart_ambient()
+
     def _observe_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type == _stderr_events.EVENT_RECORDING_FINALIZED:
@@ -1417,6 +1638,14 @@ class Supervisor:
             self._session_state["muted"] = True
         elif event_type == _stderr_events.EVENT_AUDIO_UNMUTED:
             self._session_state["muted"] = False
+        # SCR-214 U4: the confirmed pause events are the SOLE writer of pause
+        # state. Engine-main emits them only after the video/screenshot capture
+        # gate is actually set (KTD7), so the snapshot / events reflect gated
+        # capture, never the pause request.
+        elif event_type == _stderr_events.EVENT_RECORDING_PAUSED:
+            self._session_state["paused"] = True
+        elif event_type == _stderr_events.EVENT_RECORDING_RESUMED:
+            self._session_state["paused"] = False
 
     async def _wait_on_subscription(
         self,
@@ -1484,6 +1713,13 @@ class Supervisor:
         # cron jobs). Re-validate so the gate is single-sourced.
         if requested_name is not None:
             validate_recording_name(requested_name)
+        # SCR-214 U1 / KTD1: ambient capture is a single continuous per-day
+        # recording. Resolve a DETERMINISTIC ``ambient-YYYYMMDD`` dir (local day)
+        # and reopen today's if it already exists and is not finalized, so a
+        # daemon restart or re-enable mid-day keeps ONE dir per day rather than
+        # forking ``ambient-YYYYMMDD-2`` through the collision-suffix loop below.
+        if getattr(request, "ambient", False):
+            return self._allocate_ambient_capture_dir(get_recordings_dir())
         base_name = requested_name or time.strftime("rec-%Y%m%dT%H%M%S")
         if requested_output:
             capture_dir = Path(requested_output).expanduser().resolve()
@@ -1508,6 +1744,566 @@ class Supervisor:
             if not candidate.exists():
                 return name, candidate
         raise RuntimeError(f"could not allocate capture dir for {base_name!r}")
+
+    def _allocate_ambient_capture_dir(
+        self, recordings_dir: Path
+    ) -> tuple[str, Path]:
+        """Resolve-or-reopen the deterministic per-day ambient dir (SCR-214 U1).
+
+        Returns ``ambient-YYYYMMDD`` for the local day. When today's dir already
+        exists and is NOT finalized it is reopened verbatim (no ``-2`` suffix), so
+        the day stays a single continuous container across a daemon restart or a
+        mid-day re-enable (KTD1). When it exists AND is finalized, reopening would
+        corrupt the frozen ledger (:func:`_ambient_dir_finalized`), so a fresh
+        suffixed dir is forked instead — the rare edge where a day was already
+        closed (e.g. a manual stop) but ambient restarts on the same calendar day.
+        """
+        # ``getattr`` fallback keeps the U1 ``_AllocOnly`` test double (which binds
+        # this method with no ``_clock`` instance state) working on real wall time.
+        day_name = _ambient_day_name(getattr(self, "_clock", time.time))
+        candidate = recordings_dir / day_name
+        if not candidate.exists():
+            return day_name, candidate
+        if not _ambient_dir_finalized(candidate):
+            return day_name, candidate
+        # Finalized: do not reopen. Fork a suffixed dir so capture still proceeds.
+        for index in range(2, 1000):
+            name = f"{day_name}-{index}"
+            candidate = recordings_dir / name
+            if not candidate.exists():
+                return name, candidate
+        raise RuntimeError(f"could not allocate capture dir for {day_name!r}")
+
+    # ------------------------------------------------------------------
+    # SCR-214 U2/KTD8: supervised always-on ambient capture
+    # ------------------------------------------------------------------
+
+    def ambient_supervision_active(self) -> bool:
+        """True while ambient capture is running OR a re-arm is pending.
+
+        Mirrors :meth:`has_inflight_resume` for the idle-shutdown watchdog: an
+        active always-on recording, or the backoff gap before its re-arm fires,
+        must keep the (auto-spawned) daemon alive so ambient is never silently
+        dropped. A degraded/ceiling'd ambient holds nothing pending, so it does
+        NOT keep the daemon alive (nothing left to supervise).
+        """
+        if self._ambient_active:
+            return True
+        task = self._ambient_spawn_task
+        return task is not None and not task.done()
+
+    def ambient_state(self) -> dict[str, Any]:
+        """Surfaced ambient supervision state for the app (SCR-214 U2/U12).
+
+        ``enabled`` / ``autostart`` reflect config; ``active`` is a live ambient
+        recording; ``paused`` is that recording's CONFIRMED pause state (U4);
+        ``recording`` is its name (so the app can target ``recording.pause`` /
+        ``.resume`` at it); ``degraded`` is a human-readable blocked/ceiling
+        reason (None = healthy) so the app can show *why* an enabled ambient is
+        not recording instead of a silent on-with-nothing-captured toggle.
+
+        ``paused`` / ``recording`` are read from the live session snapshot ONLY
+        while ``_ambient_active`` (the live ``_proc`` is the ambient stream), so an
+        explicit user recording is never mis-reported as the ambient one; both are
+        their inert defaults (``False`` / ``None``) whenever nothing ambient is
+        live. ``paused`` defaults to ``False`` until the engine's confirmed
+        ``recording_paused`` event first writes it (KTD7).
+        """
+        from screencap.config import get_ambient_autostart, get_ambient_enabled
+
+        recording: str | None = None
+        paused = False
+        session = self._session_state
+        if self._ambient_active and session is not None:
+            name = session.get("recording_name")
+            if isinstance(name, str):
+                recording = name
+            paused = bool(session.get("paused", False))
+
+        return {
+            "enabled": get_ambient_enabled(),
+            "autostart": get_ambient_autostart(),
+            "active": self._ambient_active,
+            "paused": paused,
+            "degraded": self._ambient_degraded,
+            "recording": recording,
+            "retry_count": self._ambient_retry_count,
+        }
+
+    def _maybe_autostart_ambient(self) -> None:
+        """Kick the ambient auto-start once the recording lock is free (SCR-214 U2/R2).
+
+        Called at TWO points: after reconcile clears (the daemon-boot auto-start),
+        and from the engine-exit funnel when a NON-ambient recording exits and
+        frees a lock that had DEFERRED ambient. A no-op when ambient is disabled
+        (``get_ambient_enabled() → False``, the default). Otherwise schedules the
+        gated spawn detached so a slow gate or engine startup never blocks the
+        caller. Tracked in ``_ambient_spawn_task`` so idle-shutdown + ``shutdown``
+        see it.
+
+        Idempotent + self-guarding so the exit-funnel caller can never double-spawn
+        onto a live ambient stream, over a spawn / backoff re-arm already pending,
+        or past the degraded ceiling — a persistently-failing ambient must stay
+        surfaced as degraded, never silently retried forever. (These guards are
+        inert at the reconcile call: at boot ambient is never active, pending, or
+        degraded.)
+        """
+        from screencap.config import get_ambient_enabled
+
+        if self._shutting_down or not get_ambient_enabled():
+            return
+        # Never double-spawn: ambient already live, or the retry ceiling already
+        # reached (surfaced as degraded — a persistent failure stays surfaced).
+        if self._ambient_active or self._ambient_degraded is not None:
+            return
+        # A spawn attempt / backoff re-arm is already pending — it will start (or
+        # re-defer) ambient on its own; scheduling another would double-spawn.
+        pending = self._ambient_spawn_task
+        if pending is not None and not pending.done():
+            return
+        self._ambient_spawn_task = asyncio.create_task(self._spawn_ambient())
+        # SCR-214 U3: start the day-boundary watch alongside auto-start so it is
+        # live for the whole ambient lifetime (it persists across re-arms and
+        # rolls). No-op if already running.
+        self._start_ambient_day_watch()
+        # SCR-214 U6: start the incremental-segmentation watch alongside auto-start
+        # so today's Journal fills as the day progresses (R7). Also persists across
+        # re-arms and rolls. No-op if already running.
+        self._start_ambient_segmentation_watch()
+
+    async def stop_ambient_now(self) -> bool:
+        """Stop the live ambient recording now, if one is running (SCR-214 U12).
+
+        The runtime counterpart to :meth:`_maybe_autostart_ambient` for the
+        ``ambient.set`` verb's ``enabled=False`` path. It stops ONLY the always-on
+        ambient stream — never an explicit user recording — by gating on
+        ``_ambient_active`` (True exactly while the live ``_proc`` is the ambient
+        stream). A no-op returning ``False`` when no ambient recording is live, so
+        an explicit recording or an idle daemon is left untouched.
+
+        The caller MUST have already flipped ``get_ambient_enabled()`` to False:
+        ``stop`` funnels through ``_handle_engine_exit`` whose ambient re-arm
+        (:meth:`_schedule_ambient_rearm`) re-reads that config and, seeing it
+        False, does NOT respawn — so this stop is final, not a bounce. Returns
+        True iff an ambient recording was actually stopped.
+        """
+        if not self._ambient_active:
+            return False
+        await self.stop()
+        return True
+
+    def _build_ambient_request(self) -> "RecordingStartRequest":
+        """Build the internal always-on ambient ``RecordingStartRequest`` (U2).
+
+        Hard-pins local-only (``cloud_intent=False``, no ``force_mode``)
+        regardless of ``get_upload_default()`` — KTD2: the always-on stream must
+        never upload; U1's intent freeze + the ``lock_policy`` assertion enforce
+        it downstream. ``ambient=True`` routes the deterministic per-day
+        ``ambient-YYYYMMDD`` dir and forces the audio substream on (R3).
+        """
+        from screencap.daemon.schema import RecordingStartRequest
+
+        return RecordingStartRequest(
+            ambient=True,
+            cloud_intent=False,
+            force_mode=None,
+        )
+
+    async def _spawn_ambient(self) -> None:
+        """Gate + spawn the internal ambient recording (SCR-214 U2/KTD8).
+
+        Runs the SHARED start gate (permission + paywall) first — the same gate
+        the HTTP ``recording.start`` path runs — so a future gate can't be added
+        there but missed here. A gate denial records a surfaced degraded state
+        and does NOT spawn. A ``LockContendedError`` means another recording
+        already holds the lock (an explicit start won the race); that is not a
+        failure — a later exit re-arm or the next boot retries. Any other spawn
+        error is treated as a rapid failure toward the backoff ceiling.
+        """
+        if self._shutting_down:
+            return
+        if self._start_gate is not None:
+            try:
+                await self._start_gate()
+            except errors.DaemonAPIError as exc:
+                self._set_ambient_degraded(f"blocked: {exc.error_code}")
+                return
+            except Exception:  # noqa: BLE001 — a gate error must not crash the supervisor
+                logger.warning("ambient start gate raised; not spawning", exc_info=True)
+                self._set_ambient_degraded("blocked: gate_error")
+                return
+
+        request = self._build_ambient_request()
+        try:
+            await self.spawn(request)
+        except errors.LockContendedError:
+            logger.info("ambient auto-start deferred: recording lock already held")
+            return
+        except errors.ReconcilingError:
+            logger.info("ambient auto-start deferred: still reconciling")
+            return
+        except Exception:  # noqa: BLE001 — never let a spawn error crash the supervisor
+            logger.warning("ambient auto-start spawn failed", exc_info=True)
+            self._backoff_and_reschedule(
+                ceiling_reason="ambient spawn repeatedly failed; "
+                "re-arm paused at the retry ceiling"
+            )
+            return
+
+        # Spawn succeeded — ambient is live and healthy.
+        self._ambient_active = True
+        self._ambient_spawn_at = time.monotonic()
+        self._ambient_degraded = None
+
+    def _schedule_ambient_rearm(self, rc: int, run_duration: float) -> None:
+        """Decide whether/how to re-arm ambient after its engine exited (U2).
+
+        A clean exit (``rc == 0``) or a run that lasted past the quiescence
+        window resets the crash budget and re-arms promptly. A rapid non-zero
+        exit engages exponential backoff and, past the retry ceiling, surfaces a
+        degraded state instead of thrash-respawning.
+        """
+        if self._shutting_down:
+            return
+        from screencap.config import get_ambient_enabled
+
+        if not get_ambient_enabled():
+            # The user turned ambient off — do not re-arm; clear the crash budget.
+            self._ambient_retry_count = 0
+            return
+
+        _base, _max_delay, _max_retries, quiescence = _ambient_rearm_params()
+        if rc == 0 or run_duration >= quiescence:
+            self._ambient_retry_count = 0
+            self._ambient_spawn_task = asyncio.create_task(
+                self._ambient_rearm_after(0.0)
+            )
+            return
+
+        self._backoff_and_reschedule(
+            ceiling_reason="engine exited rapidly and repeatedly; "
+            "ambient re-arm paused at the retry ceiling"
+        )
+
+    def _backoff_and_reschedule(self, *, ceiling_reason: str) -> None:
+        """Increment the crash budget and schedule a backed-off re-arm (U2).
+
+        Past ``max_retries`` consecutive rapid failures, stop re-arming and
+        surface ``ceiling_reason`` as the degraded state — the anti-thrash valve.
+        """
+        base, max_delay, max_retries, _quiescence = _ambient_rearm_params()
+        self._ambient_retry_count += 1
+        if self._ambient_retry_count > max_retries:
+            self._set_ambient_degraded(ceiling_reason)
+            return
+        delay = min(base * (2 ** (self._ambient_retry_count - 1)), max_delay)
+        self._ambient_spawn_task = asyncio.create_task(
+            self._ambient_rearm_after(delay)
+        )
+
+    async def _ambient_rearm_after(self, delay: float) -> None:
+        """Sleep ``delay`` then re-spawn ambient, unless torn down / disabled."""
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self._shutting_down:
+            return
+        from screencap.config import get_ambient_enabled
+
+        if not get_ambient_enabled():
+            return
+        await self._spawn_ambient()
+
+    def _set_ambient_degraded(self, reason: str) -> None:
+        """Record + log the surfaced ambient degraded/blocked reason (U2)."""
+        logger.warning("ambient capture degraded: %s", reason)
+        self._ambient_degraded = reason
+
+    # ------------------------------------------------------------------
+    # SCR-214 U3/KTD1/R5: day-boundary recording roll
+    # ------------------------------------------------------------------
+
+    def _local_day_name(self) -> str:
+        """Current local calendar day as the ambient dir name (SCR-214 U3).
+
+        ``ambient-YYYYMMDD`` for the local day of the injectable clock — the
+        day-roll watch's change-detection side of the shared :func:`_ambient_day_name`
+        definition (``_allocate_ambient_capture_dir`` is the naming side), so the
+        two can never disagree on "what day is it".
+        """
+        return _ambient_day_name(self._clock)
+
+    def _active_ambient_day(self) -> str | None:
+        """The day-container name of the live ambient recording, or ``None``.
+
+        Derives ``ambient-YYYYMMDD`` from the current session's recording name,
+        stripping any collision suffix (a forked ``ambient-YYYYMMDD-2`` still
+        compares by its DAY) so a same-day fork never triggers a spurious roll.
+        Returns ``None`` when nothing ambient is live.
+        """
+        session = self._session_state
+        if not self._ambient_active or not session:
+            return None
+        name = session.get("recording_name")
+        if not isinstance(name, str):
+            return None
+        parts = name.split("-")
+        if len(parts) >= 2 and parts[0] == "ambient" and _is_yyyymmdd(parts[1]):
+            return f"ambient-{parts[1]}"
+        return None
+
+    def _start_watch(
+        self, task_attr: str, coro_factory: "Callable[[], Any]"
+    ) -> None:
+        """Idempotently start a long-lived watch task stored on ``task_attr``.
+
+        Shared by the day-boundary (U3) and incremental-segmentation (U6) watches:
+        a no-op if the task on ``task_attr`` is still running, else create it from
+        ``coro_factory`` (a zero-arg callable returning the watch coroutine).
+        """
+        existing = getattr(self, task_attr)
+        if existing is not None and not existing.done():
+            return
+        setattr(self, task_attr, asyncio.create_task(coro_factory()))
+
+    async def _periodic_watch(
+        self,
+        interval: float,
+        tick: "Callable[[], Any]",
+        failure_msg: str,
+    ) -> None:
+        """Shared driver for the long-lived ambient watches (U3/U6).
+
+        Loops until shutdown: sleep ``interval`` (a cancel is a clean exit), then
+        run ``tick`` (a zero-arg coroutine factory) fail-open — a tick error is
+        logged with ``failure_msg`` and the watch keeps going. The distinct
+        per-watch work lives entirely in ``tick``; the sleep cadence, the
+        cancel/shutdown guards, and the fail-open belt are identical across watches.
+        """
+        while not self._shutting_down:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            if self._shutting_down:
+                return
+            try:
+                await tick()
+            except Exception:  # noqa: BLE001 — a tick error must not kill the watch
+                logger.warning(failure_msg, exc_info=True)
+
+    def _start_ambient_day_watch(self) -> None:
+        """Start the long-lived day-boundary watch task (idempotent)."""
+        self._start_watch(
+            "_ambient_day_task",
+            lambda: self._periodic_watch(
+                self._ambient_day_tick_interval,
+                self._ambient_day_watch_tick,
+                "ambient day-roll failed; will retry on the next tick",
+            ),
+        )
+
+    async def _ambient_day_watch_tick(self) -> None:
+        """Roll the ambient recording at the LOCAL day boundary (SCR-214 U3/R5).
+
+        Per-tick body of the day-boundary watch (driven by :meth:`_periodic_watch`).
+        Compares the live ambient recording's day (from its ``ambient-YYYYMMDD`` dir
+        name) against the current local day; on an advance it performs a stop→start
+        roll to the next per-day dir.
+
+        WAKE-SAFE by construction: the roll is driven by an *observed* date change,
+        NOT a fired-at-midnight timer. While the Mac sleeps the daemon (and this
+        watch) is suspended, so no tick fires at the real midnight; the FIRST tick
+        after wake sees the advanced date and rolls then. No macOS wake
+        notification is needed for correctness. The check is cheap (a string
+        compare) and rolls at most once per boundary — post-roll the live day
+        equals ``now`` again, so the next tick is a no-op.
+        """
+        active_day = self._active_ambient_day()
+        if active_day is None or active_day == self._local_day_name():
+            return
+        await self._roll_ambient_day()
+
+    async def _roll_ambient_day(self) -> None:
+        """Close today's ambient recording and open the next day's (U3/R5/KTD1).
+
+        A RECORDING-level roll (new per-day dir), not an unbounded single dir, so
+        day-grouping, ``timeline.day``, and per-day retention stay clean.
+
+        1. ``stop()`` drives the live ambient recording through its NORMAL terminal
+           path (finalize → final segmentation pass — NOT reimplemented here). That
+           stop force-closes the currently-open chunk via
+           ``ChunkedVideoWriter.close()``, so a chunk left open across midnight
+           (e.g. during sleep) is attributed to exactly ONE day: the day it STARTED
+           in (day N). The new day's dir opens only afterwards, so no chunk can
+           straddle two per-day dirs.
+        2. U2's ambient spawn path opens the fresh ``ambient-YYYYMMDD`` dir for the
+           now-current local day (day N+1), via the same shared start gate.
+
+        ``_ambient_rolling`` marks the stop as an INTENTIONAL roll so the
+        engine-exit funnel skips its own re-arm/backoff (this method owns the
+        respawn) — an intentional stop is not a crash.
+        """
+        if self._ambient_rolling or not self._ambient_active or self._shutting_down:
+            return
+        self._ambient_rolling = True
+        try:
+            await self.stop()
+            if self._shutting_down:
+                return
+            await self._spawn_ambient()
+        finally:
+            self._ambient_rolling = False
+
+    # ------------------------------------------------------------------
+    # SCR-214 U6/KTD4/R7: incremental segmentation of the live ambient day
+    # ------------------------------------------------------------------
+
+    def _active_ambient_dir(self) -> "Path | None":
+        """The on-disk dir of the live ambient recording, or ``None`` (U6).
+
+        Derives the recording dir from the current session's ``capture_dir`` when
+        an ambient stream is live, so the incremental segmenter targets exactly the
+        dir the engine is writing. Returns ``None`` when nothing ambient is live
+        (mirrors :meth:`_active_ambient_day`, but yields the path the segmenter
+        needs rather than the day name the roll watch compares).
+        """
+        session = self._session_state
+        if not self._ambient_active or not session:
+            return None
+        capture_dir = session.get("capture_dir")
+        if not isinstance(capture_dir, str):
+            return None
+        return Path(capture_dir)
+
+    def _start_ambient_segmentation_watch(self) -> None:
+        """Start the long-lived incremental-segmentation watch task (idempotent, U6)."""
+        self._start_watch(
+            "_ambient_seg_task",
+            lambda: self._periodic_watch(
+                self._ambient_seg_tick_interval,
+                self._ambient_segmentation_watch_tick,
+                "ambient incremental segmentation tick failed; will retry on "
+                "the next tick",
+            ),
+        )
+
+    async def _ambient_segmentation_watch_tick(self) -> None:
+        """Re-segment the live ambient day so today's Journal fills (U6/R7).
+
+        Per-tick body of the incremental-segmentation sweep (env
+        ``SCREENCAP_AMBIENT_SEG_TICK_INTERVAL``, default 300s), driven by
+        :meth:`_periodic_watch`. For the active ambient recording it runs one
+        incremental segmentation pass on a WORKER THREAD (mirroring
+        ``resume_terminal_stage``'s non-blocking pattern so the asyncio loop is never
+        blocked by the terminal-stage segmenter). Started alongside ambient
+        auto-start and cancelled in ``shutdown``; persists across re-arms and day
+        rolls (KTD4). A tick is a no-op when nothing ambient is live, or while a day
+        roll is in progress (the recording is mid stop→start).
+
+        CHANGE-DETECTION (U6): the pass SKIPS when the ambient day's fingerprint
+        (completed-manifest set + kept-task count) is unchanged since the last pass —
+        a full-day re-segment on an idle always-on recorder is a no-op that produces
+        identical output. An unknown fingerprint (no completed manifests yet /
+        unreadable) fails OPEN and runs the pass, so we skip only on positive
+        evidence nothing changed. The kept-task count is in the key so a user
+        curation edit still forces a re-carve even with no new footage.
+        """
+        # A roll is stopping/reopening the recording — let it settle rather than
+        # segmenting a dir mid-teardown (the finalize's own final pass covers it).
+        if self._ambient_rolling:
+            return
+        recording_dir = self._active_ambient_dir()
+        if recording_dir is None:
+            return
+        key = self._segmentation_fingerprint(recording_dir)
+        if key is not None and key == self._last_segmentation_key:
+            return
+        await self._run_incremental_segmentation(recording_dir)
+        self._last_segmentation_key = key
+
+    def _segmentation_fingerprint(
+        self, recording_dir: Path
+    ) -> "tuple[Any, ...] | None":
+        """A cheap change-key for the ambient day, or ``None`` to force a pass (U6).
+
+        Combines the completed-manifest set (``chunk_*_manifest.json`` count, highest
+        chunk index, max manifest mtime — statted, never re-read) with the kept
+        (user/edited) task-row count, plus the dir name so a day roll never aliases a
+        prior day's key. Returns ``None`` — meaning "run the pass" (fail-open) — when
+        there is no completed manifest yet or anything is unreadable, so a skip only
+        ever happens on positive evidence of an unchanged, non-empty state.
+        """
+        try:
+            manifests = list(recording_dir.glob("chunk_*_manifest.json"))
+        except OSError:
+            return None
+        if not manifests:
+            return None
+        try:
+            count = len(manifests)
+            highest_index = max(
+                int(m.name.split("_")[1]) for m in manifests
+            )
+            max_mtime = max(m.stat().st_mtime_ns for m in manifests)
+            kept = self._kept_task_row_count(recording_dir)
+        except (OSError, ValueError, IndexError):
+            return None
+        return (recording_dir.name, count, highest_index, max_mtime, kept)
+
+    def _kept_task_row_count(self, recording_dir: Path) -> int:
+        """Count the recording's KEPT (user/edited) task rows for the change-key (U6).
+
+        Reads the local-only ``recording.db`` task-segment store and counts the
+        protected (``source='user'`` OR edited) rows, so a user curation edit shifts
+        the segmentation fingerprint and forces a re-carve. A missing DB yields ``0``;
+        a read error propagates to the fingerprint's fail-open ``None``.
+        """
+        from screencap.pipeline_state import (
+            PipelineLedger,
+            task_row_is_protected,
+        )
+
+        db_path = recording_dir / "recording.db"
+        if not db_path.exists():
+            return 0
+        rows = PipelineLedger(db_path).read_task_segments()
+        return sum(1 for r in rows if task_row_is_protected(r))
+
+    async def _run_incremental_segmentation(self, recording_dir: Path) -> None:
+        """Run one incremental segmentation pass off-loop (U6/KTD4).
+
+        Mirrors ``resume_terminal_stage``'s worker-thread + non-blocking-flock
+        pattern: the terminal-stage segmenter is blocking work (DB reads, provider
+        call) that must not stall the event loop, so it runs in a worker thread; it
+        acquires the per-recording terminal flock NON-BLOCKING, so a concurrent
+        finalize that holds the flock makes this pass SKIP (``TerminalStageBusy``)
+        rather than race (AE12). Strictly fail-open — every error is swallowed so a
+        bad pass never crashes the watch or the daemon (the R11 privacy strip is
+        fail-closed INSIDE the segmenter, independent of this fail-open outer belt).
+        """
+        from screencap.terminal_stage import (
+            TerminalStageBusy,
+            run_incremental_segmentation,
+        )
+
+        def _run() -> None:
+            try:
+                run_incremental_segmentation(recording_dir, non_blocking=True)
+            except TerminalStageBusy:
+                logger.debug(
+                    "ambient incremental segmentation: %s busy (a finalize/upload "
+                    "holds the flock); skipping this tick", recording_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 — never propagate into the loop
+                logger.warning(
+                    "ambient incremental segmentation failed for %s (%s); fail-open",
+                    recording_dir, exc,
+                )
+
+        await asyncio.to_thread(_run)
 
     def _worker_args(
         self,

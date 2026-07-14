@@ -91,6 +91,7 @@ __all__ = [
     "PromotionRefused",
     "terminal_lock",
     "run_terminal_stage",
+    "run_incremental_segmentation",
     "detect_promotion_holes",
     "assert_promotable_to_cloud",
 ]
@@ -940,6 +941,58 @@ def _route_local(ledger: "PipelineLedger | None", result: TerminalResult) -> Non
 _LOCAL_TASKS_FILE = "tasks.json"
 
 
+def run_incremental_segmentation(
+    recording_dir: Path,
+    *,
+    non_blocking: bool = True,
+    lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+) -> TerminalResult:
+    """Incrementally segment a LIVE (still-recording) ambient day (U6, R6/R7/KTD4).
+
+    The daemon calls this on a timer for the active ambient recording so today's
+    Journal fills as the day progresses, not only when the stream stops (R7). It
+    runs the SAME segment→persist body the finalize path runs
+    (:func:`_run_local_segmentation`) over the recording's COMPLETED on-disk chunk
+    manifests + the live ``recording.db``, so the segmentation rules cannot drift
+    between the live and finalize paths. The currently-open chunk has no manifest
+    yet, so only completed spans are segmented — exactly R7's "fill for completed
+    spans without waiting for the stream to stop".
+
+    Concurrency (KTD4/AE12): acquires the per-recording terminal flock
+    NON-BLOCKING by default — if a concurrent terminal-stage FINALIZE (or a manual
+    upload) holds it, this pass raises :class:`TerminalStageBusy` and writes
+    nothing rather than racing the finalize's own segmentation. The daemon worker
+    treats that as "skip this tick".
+
+    Privacy (KTD4/R11): the shared body builds the activity summary with
+    ``blocked_source=recording_dir`` so the blocked-interval strip is re-derived
+    FAIL-CLOSED over the live, concurrently-written DB — a partial/ambiguous read
+    over-skips rather than under-blocks, so a masked interval can never reach the
+    provider or a surfaced task name.
+
+    Fail-open on the PROVIDER (R6): a provider miss/error leaves existing tasks
+    intact; the fail-closed posture applies ONLY to the R11 blocked-interval
+    derivation (privacy), never wiping tasks on a provider problem.
+
+    Returns a :class:`TerminalResult` (``destination='local'``); ``tasks_persisted``
+    is the agent-task count written this pass. Raises :class:`TerminalStageBusy`
+    when the flock is contended (per ``non_blocking`` / ``lock_timeout``).
+    """
+    recording_dir = Path(recording_dir)
+    name = recording_dir.name
+    result = TerminalResult(destination="local")
+    # Flock FIRST (AE12), exactly like run_terminal_stage — a concurrent finalize
+    # that holds it means this best-effort pass SKIPS (non_blocking) rather than
+    # double-writing the agent task set.
+    with terminal_lock(name, non_blocking=non_blocking, timeout=lock_timeout):
+        ledger = _open_ledger(recording_dir)
+        if ledger is not None:
+            result.n_expected = ledger.chunks_expected()
+        _run_local_segmentation(recording_dir, ledger, result)
+        result.routed = True
+    return result
+
+
 def _run_local_segmentation(
     recording_dir: Path,
     ledger: "PipelineLedger | None",
@@ -1036,6 +1089,13 @@ def _run_local_segmentation(
 
     if not tasks:
         return
+    # KTD3 carve-out — drop any fresh AGENT task overlapping a PROTECTED span
+    # (source='user' OR a user-edited agent row) so that, after the scoped agent
+    # replace, no source='agent' span overlaps a protected one (the "agent
+    # auto-splits, you curate" invariant, R8). A no-op when there are no protected
+    # rows (the common finalize case). This lives in the shared body so the
+    # finalize and incremental paths cannot drift on the invariant.
+    tasks = _carve_out_protected_spans(ledger, tasks)
     try:
         n = _persist_local_tasks(recording_dir, ledger, tasks)
     except Exception as exc:  # noqa: BLE001 — a persistence failure must not block
@@ -1045,6 +1105,71 @@ def _run_local_segmentation(
         )
         return
     result.tasks_persisted = n
+
+
+def _carve_out_protected_spans(
+    ledger: "PipelineLedger | None",
+    tasks: dict,
+) -> dict:
+    """Drop fresh AGENT tasks overlapping a protected user/edited span (KTD3, R8).
+
+    Reads the protected spans (``source='user'`` OR ``edited=1`` — the disjoint
+    HIGH-range rows the scoped agent replace preserves) from the ledger and removes
+    any agent task whose ``[start_ts, end_ts)`` overlaps one, so that after the
+    scoped replace NO ``source='agent'`` span overlaps a protected span. Dropping
+    (rather than trimming) keeps the agent set a clean partition and lets
+    :func:`_persist_local_tasks` re-index the survivors contiguously from 0.
+
+    Returns:
+
+    * ``tasks`` unchanged when the ledger is ``None`` or there are no protected
+      spans (the common finalize case — byte-identical to the pre-carve-out path);
+    * a copy with a filtered ``tasks`` list otherwise. The list may be EMPTY: an
+      empty agent set is still persisted (via the scoped replace) so a stale agent
+      row left by a prior pass — over a span the user has SINCE marked — is cleared
+      rather than surviving to overlap the protected span. Only when the input had
+      no agent task list at all is ``tasks`` returned unchanged.
+
+    Never raises: a ledger read error fails open (returns ``tasks`` unchanged) —
+    the carve-out is a curation-preservation refinement, not a privacy gate.
+    """
+    if ledger is None or not isinstance(tasks, dict):
+        return tasks
+    task_list = tasks.get("tasks")
+    if not isinstance(task_list, list) or not task_list:
+        return tasks
+
+    from screencap.pipeline_state import spans_overlap, task_row_is_protected
+
+    try:
+        rows = ledger.read_task_segments()
+    except Exception as exc:  # noqa: BLE001 — carve-out must never block segmentation
+        logger.debug(
+            "terminal_stage: reading protected spans failed (%s); skipping carve-out",
+            exc,
+        )
+        return tasks
+    protected = [
+        (r.start_ts, r.end_ts)
+        for r in rows
+        if task_row_is_protected(r)
+    ]
+    if not protected:
+        return tasks
+
+    def _overlaps_protected(t: dict) -> bool:
+        try:
+            start = float(t.get("start_ts", 0.0))
+            end = float(t.get("end_ts", 0.0))
+        except (TypeError, ValueError):
+            return False
+        # Half-open overlap: [start, end) intersects [p_start, p_end).
+        return any(spans_overlap(start, end, p_start, p_end) for p_start, p_end in protected)
+
+    kept = [
+        t for t in task_list if isinstance(t, dict) and not _overlaps_protected(t)
+    ]
+    return {**tasks, "tasks": kept}
 
 
 def _segment_local_tasks(
@@ -1241,25 +1366,63 @@ def _persist_local_tasks(
       (tmp + ``os.replace``) so a crash never leaves a torn file.
     * the ``pipeline_task_segments`` ledger table inside ``recording.db`` —
       queryable per-task rows (task_index, start/end, name, category,
-      confidence, metadata). ``replace_task_segments`` deletes-then-inserts in
-      one transaction, so re-running terminal REPLACES rather than duplicates.
+      confidence, metadata, source, edited). This is an AGENT re-segmentation
+      pass: ``replace_task_segments`` is SCOPED (U5, KTD3) — it refreshes only
+      unedited agent rows and PRESERVES ``source='user'`` / user-edited rows, so
+      a re-run never clobbers user work (R8).
+
+    Both sinks are source-aware: agent entries are written ``source='agent'`` and
+    any pre-existing user / edited entries in ``tasks.json`` are carried forward
+    (mirroring the ledger's scoped replace), so an agent pass never overwrites a
+    user-curated task in either store.
     """
     import json
 
-    from screencap.pipeline_state import TaskSegmentRow
+    from screencap.pipeline_state import (
+        TASK_SOURCE_AGENT,
+        TASK_SOURCE_USER,
+        TaskSegmentRow,
+    )
 
-    task_list = tasks.get("tasks", []) if isinstance(tasks, dict) else []
+    task_list = [
+        t for t in (tasks.get("tasks", []) if isinstance(tasks, dict) else [])
+        if isinstance(t, dict)
+    ]
+    final_path = recording_dir / _LOCAL_TASKS_FILE
+
+    # Preserve user-authored / user-edited entries from any existing tasks.json
+    # so this AGENT pass never clobbers user work (R8, KTD3) — the tasks.json
+    # mirror of the ledger's scoped replace. Best-effort: a torn / legacy file is
+    # ignored (the ledger remains the authoritative store).
+    preserved: list[dict] = []
+    if final_path.exists():
+        try:
+            prior = json.loads(final_path.read_text())
+            prior_tasks = prior.get("tasks", []) if isinstance(prior, dict) else []
+            preserved = [
+                t for t in prior_tasks
+                if isinstance(t, dict)
+                and (t.get("source") == TASK_SOURCE_USER or t.get("edited"))
+            ]
+        except (OSError, ValueError):
+            preserved = []
 
     # 1. tasks.json — atomic write (tmp + replace), local-only by upload rule.
-    payload = json.dumps(tasks, indent=2)
-    final_path = recording_dir / _LOCAL_TASKS_FILE
+    #    Agent entries carry an explicit source/edited marker so a later pass (or
+    #    the app) can tell them apart from preserved user / edited entries.
+    agent_json_tasks = [
+        {**t, "source": TASK_SOURCE_AGENT, "edited": False} for t in task_list
+    ]
+    merged = dict(tasks) if isinstance(tasks, dict) else {}
+    merged["tasks"] = agent_json_tasks + preserved
+    payload = json.dumps(merged, indent=2)
     tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
     tmp_path.write_text(payload)
     os.replace(tmp_path, final_path)
 
-    # 2. pipeline_task_segments ledger table (idempotent replace). Skipped for a
-    # legacy / no-ledger recording (no recording.db row to key on) — tasks.json
-    # still carries the tasks in that case.
+    # 2. pipeline_task_segments ledger table (SCOPED agent replace — preserves
+    # user / edited rows). Skipped for a legacy / no-ledger recording (no
+    # recording.db row to key on) — tasks.json still carries the tasks then.
     if ledger is not None:
         segments = [
             TaskSegmentRow(
@@ -1274,6 +1437,8 @@ def _persist_local_tasks(
                     for k in ("description", "apps_used", "derived_name")
                     if k in t
                 }) or None,
+                source=TASK_SOURCE_AGENT,
+                edited=False,
             )
             for i, t in enumerate(task_list)
         ]

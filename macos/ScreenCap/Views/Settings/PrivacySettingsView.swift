@@ -59,6 +59,10 @@ struct PrivacySettingsView: View {
                 .padding(.bottom, 20)
 
             VStack(alignment: .leading, spacing: 0) {
+                // SCR-214 U12: always-on ambient capture (opt-in, consent-gated,
+                // pause/auto-start). Self-contained — owns its own controller.
+                AmbientRecordingSection()
+                rowDivider
                 keepLocalRow
                 rowDivider
                 e2eeRow

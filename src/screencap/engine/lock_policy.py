@@ -47,7 +47,22 @@ def _write_identity_files(
     """
     (capture_dir / ".recording_id").write_text(request.name)
 
-    if request.cloud_intent and request.keep_local:
+    # SCR-214 KTD2: the ambient (always-on) stream is a HARD local-only invariant,
+    # not a coding convention. A user with ``upload_default=cloud/both`` must never
+    # upload the continuous per-day recording, so an ambient request carrying
+    # ``cloud_intent`` is rejected here (the freeze point) rather than silently
+    # downgraded — the assertion makes "local-only" enforced.
+    ambient = getattr(request, "ambient", False)
+    if ambient and request.cloud_intent:
+        raise ValueError(
+            "ambient recordings are local-only: cloud_intent must be False "
+            "(the always-on stream must never upload, regardless of upload_default)"
+        )
+
+    if ambient:
+        # Hard-pin destination=LOCAL for ambient regardless of get_upload_default().
+        destination = "local"
+    elif request.cloud_intent and request.keep_local:
         destination = "both"
     elif request.cloud_intent:
         destination = "cloud"
@@ -61,7 +76,9 @@ def _write_identity_files(
     # locally to keep the engine-subprocess import surface small.
     from screencap.pipeline_policy import resolve_policy
 
-    resolved = resolve_policy(destination=destination)
+    # SCR-214 U8/KTD5: an ambient recording resolves to DELETE_AFTER_DAYS (default
+    # 30d) so its raw footage rolls off; the window is frozen here per recording.
+    resolved = resolve_policy(destination=destination, ambient=ambient)
 
     if masked_video_upload is None:
         from screencap.config import get_masked_video_upload_enabled
@@ -90,6 +107,10 @@ def _write_identity_files(
         "cloud_e2ee": bool(get_cloud_e2ee_enabled()),
         "privacy_mode": privacy_mode,
         "show_on_website": request.show_on_website,
+        # SCR-214 U1: freeze the ambient flag so downstream consumers (catalog,
+        # incremental segmentation, retention) can identify the always-on per-day
+        # stream from disk. Schema-additive: older intents lack it → treated False.
+        "ambient": bool(ambient),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": request.intent_source,
     }

@@ -79,3 +79,25 @@ async def test_send_command_returns_false_on_broken_pipe() -> None:
     # A mute racing engine teardown must degrade to False, never raise.
     ok = await sup.send_command({"type": "set_muted", "muted": True})
     assert ok is False
+
+
+# --- SCR-214 U4: set_paused pass-through (mirrors set_muted) ------------------
+
+
+@pytest.mark.asyncio
+async def test_set_paused_forwards_command_to_live_engine() -> None:
+    sup = _supervisor()
+    proc = _FakeProc(alive=True)
+    sup._proc = proc  # type: ignore[assignment]
+
+    assert await sup.set_paused(True) is True
+    assert json.loads(proc.lines[0]) == {"type": "set_paused", "paused": True}
+    assert await sup.set_paused(False) is True
+    assert json.loads(proc.lines[1]) == {"type": "set_paused", "paused": False}
+
+
+@pytest.mark.asyncio
+async def test_set_paused_returns_false_when_no_engine() -> None:
+    sup = _supervisor()
+    # No live recording -> a pause that races a stop degrades to False, no raise.
+    assert await sup.set_paused(True) is False

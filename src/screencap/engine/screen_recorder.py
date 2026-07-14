@@ -232,6 +232,30 @@ class RecordingRequest:
     segmentation_mode: SegmentationMode = "llm"
     scrub_enabled: bool = True
     show_on_website: bool = True
+    # SCR-214 U1: opt-in always-on ambient capture. When true this recording is
+    # the continuous per-day ambient stream — frozen local-only into
+    # ``.recording_intent`` (``lock_policy._write_identity_files``) regardless of
+    # ``upload_default``, and it forces the audio substream on (R3). Default off:
+    # explicit start/stop recordings are unaffected.
+    ambient: bool = False
+
+
+def resolve_capture_audio(
+    *, ambient: bool, requested: bool | None, default: bool
+) -> bool:
+    """Resolve the effective audio-capture flag at recording start.
+
+    Ambient recordings force audio **on** (SCR-214 R3 — full-fidelity
+    screen + audio + transcript) regardless of the requested value or the
+    ``audio_default`` config, so the always-on stream is always transcribable.
+    Non-ambient recordings honor an explicit request, falling back to the
+    configured default when unset.
+    """
+    if ambient:
+        return True
+    if requested is not None:
+        return requested
+    return default
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,8 +403,12 @@ def _run_screen_recorder(rec: "ScreenRecorder") -> "RecordingResult":
     show_on_website = request.show_on_website
     network_handoff_ready = legacy.network_handoff_ready
 
-    if audio is None:
-        audio = get_audio_default()
+    # SCR-214 R3: ambient forces the audio substream on regardless of the
+    # requested value or ``audio_default``, so the always-on stream captures
+    # screen + audio + transcript. Non-ambient recordings keep today's behavior.
+    audio = resolve_capture_audio(
+        ambient=request.ambient, requested=audio, default=get_audio_default(),
+    )
     if wifi_metrics is None:
         wifi_metrics = get_wifi_metrics()
     if app_versions is None:

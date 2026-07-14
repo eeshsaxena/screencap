@@ -108,11 +108,49 @@ __all__ = [
     "ensure_pipeline_state_schema",
     "from_chunk_status",
     "reconcile_ledger_from_disk",
+    "read_task_segments_wire",
+    "spans_overlap",
+    "task_row_is_protected",
+    "USER_TASK_INDEX_BASE",
+    "TASK_SOURCE_AGENT",
+    "TASK_SOURCE_USER",
 ]
 
 # Match the engine writer's busy_timeout (privacy/scrub_worker.py:471) so a
 # long-running engine commit doesn't immediately fail a ledger transition.
 _BUSY_TIMEOUT_MS = 10000
+
+# Task-segment ownership (U5, KTD3). Agent- and user-authored task segments
+# coexist in ``pipeline_task_segments`` so re-segmentation never clobbers user
+# work (R8). Two axes:
+#
+#   * ``source`` — who authored the row: ``'agent'`` (on-device / provider
+#     segmentation) or ``'user'`` (created via the task CRUD verbs, U7).
+#   * ``edited`` — whether a user has curated an AGENT row (rename/merge/split).
+#     A user-edited agent row keeps ``source='agent'`` but is protected from the
+#     agent's scoped replace exactly like a ``'user'`` row.
+#
+# ``replace_task_segments`` (the agent sink) deletes ONLY unedited agent rows
+# and re-inserts the fresh agent set at contiguous LOW indices ``0..N``. Every
+# row that must SURVIVE a replace — ``'user'`` rows AND user-edited agent rows —
+# lives in the disjoint HIGH range at/above ``USER_TASK_INDEX_BASE``, so a fresh
+# ``0..N`` re-insert can never collide with a protected row on
+# ``UNIQUE(recording_id, task_index)``. This is the load-bearing invariant that
+# makes "agent auto-splits, you curate" hold.
+TASK_SOURCE_AGENT = "agent"
+TASK_SOURCE_USER = "user"
+USER_TASK_INDEX_BASE = 1_000_000
+
+
+def spans_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
+    """Half-open ``[a_start, a_end)`` ∩ ``[b_start, b_end)`` is non-empty.
+
+    The single canonical span-overlap predicate shared by capture-time retention
+    (task-span vs chunk-window protection) and the terminal-stage carve-out
+    (task-span vs kept-span). Symmetric in ``a``/``b``, so callers may pass the
+    task span as ``a`` and the protected/other span as ``b`` (or vice versa).
+    """
+    return a_start < b_end and b_start < a_end
 
 
 class Lifecycle(str, Enum):
@@ -218,6 +256,12 @@ class TaskSegmentRow:
     ``metadata`` is a free-text JSON blob for the extra per-task fields the
     provider emits (description, apps_used, derived_name, …) that do not need
     their own column.
+
+    ``source`` / ``edited`` (U5, KTD3) carry task ownership so agent- and
+    user-authored segments coexist across re-segmentation (R8). ``source`` is
+    ``'agent'`` or ``'user'``; ``edited`` marks a user-curated agent row. Both
+    default to the agent-unedited state so a row constructed the old way (or read
+    back from a pre-U5 DB migrated in place) reads as an agent row.
     """
 
     task_index: int
@@ -227,6 +271,21 @@ class TaskSegmentRow:
     category: str | None = None
     confidence: str | None = None
     metadata: str | None = None
+    source: str = TASK_SOURCE_AGENT
+    edited: bool = False
+
+
+def task_row_is_protected(row: TaskSegmentRow) -> bool:
+    """True iff ``row`` is a KEPT (user-curated) task row: user OR user-edited.
+
+    The single canonical "must survive an agent re-segmentation / pins its footage"
+    predicate (U5/KTD3): a ``source='user'`` row OR any user-edited agent row
+    (``edited=1``). Shared by the retention kept-span protector and the
+    terminal-stage carve-out so the two can never disagree on what counts as
+    protected. Only the predicate is shared — each caller keeps its own span
+    assembly.
+    """
+    return row.source == TASK_SOURCE_USER or bool(row.edited)
 
 
 def from_chunk_status(status: "ChunkStatus") -> UploadState:
@@ -264,10 +323,51 @@ CREATE TABLE IF NOT EXISTS pipeline_task_segments (
     category TEXT,
     confidence TEXT,
     metadata TEXT,
+    source TEXT NOT NULL DEFAULT 'agent',
+    edited INTEGER NOT NULL DEFAULT 0,
     updated_at REAL,
     UNIQUE (recording_id, task_index)
 )
 """
+
+# Guarded ALTER-ADD migration for the U5 source/edited columns. ``CREATE TABLE
+# IF NOT EXISTS`` above does NOT add columns to an already-existing raw-DDL
+# table, so an EXISTING recording.db captured before U5 keeps the old shape
+# unless we ALTER it here. Each entry is ``(column_name, column_ddl)``; existing
+# rows take the ``DEFAULT`` (agent/unedited), so a migrated DB reads back exactly
+# like a fresh one. Mirrors ``engine.db._migrate_schema``'s PRAGMA-check +
+# duplicate-column tolerance.
+_TASK_SEGMENTS_ADDED_COLUMNS = (
+    ("source", "source TEXT NOT NULL DEFAULT 'agent'"),
+    ("edited", "edited INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate_task_segments_columns(conn: sqlite3.Connection) -> None:
+    """ALTER-ADD the U5 ``source``/``edited`` columns to a pre-columns table.
+
+    Idempotent: reads ``PRAGMA table_info`` and only ALTER-adds a column that is
+    missing, tolerating a concurrent opener's duplicate-column race (same TOCTOU
+    window ``engine.db._migrate_schema`` handles). A read-only DB raises
+    ``OperationalError`` on the ALTER, which the caller catches — a read-only
+    open of an old recording never needs the write-path columns.
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(pipeline_task_segments)")
+    }
+    for col, ddl in _TASK_SEGMENTS_ADDED_COLUMNS:
+        if col in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE pipeline_task_segments ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as e:
+            # A concurrent first-open of the same recording.db can add the column
+            # between our PRAGMA read and this ALTER. The duplicate-column error
+            # is idempotent (the column now exists — the desired end state), so
+            # swallow it; any other OperationalError (e.g. read-only) propagates
+            # to the caller's read-only guard.
+            if "duplicate column name" not in str(e).lower():
+                raise
 
 
 def ensure_pipeline_state_schema(db_path: Path | str) -> None:
@@ -276,11 +376,14 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
     Idempotent. Delegates to ``engine.db._migrate_schema`` (which creates
     the ``pipeline_chunk_state`` table via ``checkfirst=True`` and
     ALTER-adds ``recording.chunks_expected``), then creates the U4
-    ``pipeline_task_segments`` table (raw ``CREATE TABLE IF NOT EXISTS``), so
-    there is a single schema-evolution code path. Safe to call on a fresh
-    ``create_db`` DB (no-op) or an old pre-U1 ``recording.db`` (creates the
+    ``pipeline_task_segments`` table (raw ``CREATE TABLE IF NOT EXISTS``) AND
+    ALTER-adds the U5 ``source``/``edited`` columns to an existing pre-U5 table
+    (``CREATE TABLE IF NOT EXISTS`` alone can not migrate an existing raw-DDL
+    table), so there is a single schema-evolution code path. Safe to call on a
+    fresh ``create_db`` DB (no-op) or an old pre-U1 ``recording.db`` (creates the
     missing tables). A read-only DB (chmod 444) is tolerated: the task-segments
-    create is best-effort so a read-only open of an old recording never crashes.
+    create + migration is best-effort so a read-only open of an old recording
+    never crashes.
     """
     from screencap.engine.db import _migrate_schema
 
@@ -290,6 +393,9 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
     try:
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute(_TASK_SEGMENTS_DDL)
+        # Migrate an EXISTING pre-U5 table (created before source/edited existed)
+        # — the DDL above is a no-op on it, so the columns are ALTER-added here.
+        _migrate_task_segments_columns(conn)
         conn.commit()
     except sqlite3.OperationalError:
         # Read-only DB (an old recording opened for read) — do not crash; the
@@ -301,6 +407,41 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
 
 def _now() -> float:
     return time.time()
+
+
+def _insert_user_task_row(
+    conn: sqlite3.Connection,
+    recording_id: int,
+    task_index: int,
+    *,
+    start_ts: float,
+    end_ts: float,
+    name: str,
+    category: str | None,
+    confidence: str | None,
+    metadata: str | None,
+    edited: int,
+    now: float,
+) -> None:
+    """Insert ONE ``source='user'`` task-segment row on ``conn`` (no commit).
+
+    The shared body behind the user-authored insert paths (``insert_task_segment``
+    / ``merge_task_segments`` / ``split_task_segment``): a single canonical INSERT
+    so the column list and value order can't drift. ``source`` is always
+    ``TASK_SOURCE_USER`` on these paths. The caller owns the surrounding
+    ``BEGIN IMMEDIATE`` transaction and commit.
+    """
+    conn.execute(
+        "INSERT INTO pipeline_task_segments "
+        "(recording_id, task_index, start_ts, end_ts, name, "
+        " category, confidence, metadata, source, edited, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            recording_id, task_index, start_ts, end_ts, name,
+            category, confidence, metadata,
+            TASK_SOURCE_USER, edited, now,
+        ),
+    )
 
 
 class PipelineLedger:
@@ -855,39 +996,81 @@ class PipelineLedger:
         )
 
     # ------------------------------------------------------------------
-    # U4 local tasks store — named task segments (LOCAL-only, never uploaded).
+    # U4/U5 local tasks store — named task segments (LOCAL-only, never uploaded).
     # ------------------------------------------------------------------
 
-    def replace_task_segments(self, segments: list[TaskSegmentRow]) -> None:
-        """Replace ALL task segments for this recording with ``segments``.
+    def _next_user_task_index(self, conn: sqlite3.Connection) -> int:
+        """Next free ``task_index`` in the reserved HIGH range (must hold a txn).
 
-        Idempotent by construction: the whole set is deleted and re-inserted
-        in ONE ``BEGIN IMMEDIATE`` transaction, so re-running the terminal
-        segmentation stage never duplicates rows — a second pass over the same
-        recording overwrites cleanly. ``task_index`` is taken from each row's
-        position in the list is NOT assumed; the caller supplies it (kept in
-        the row so the store is self-describing). An empty list clears the
-        store (a provider that returned tasks last time but none now).
+        Allocates ``MAX(task_index)+1`` above ``USER_TASK_INDEX_BASE`` (or the
+        base itself when the range is empty), so protected user / edited rows
+        never collide with the agent's contiguous LOW range (KTD3). Called under
+        the caller's ``BEGIN IMMEDIATE`` so the read + insert are one atom.
+        """
+        row = conn.execute(
+            "SELECT MAX(task_index) FROM pipeline_task_segments "
+            "WHERE recording_id=? AND task_index >= ?",
+            (self._recording_id, USER_TASK_INDEX_BASE),
+        ).fetchone()
+        cur_max = row[0] if row is not None else None
+        if cur_max is None:
+            return USER_TASK_INDEX_BASE
+        return int(cur_max) + 1
+
+    def allocate_user_task_index(self) -> int:
+        """Return the next free HIGH-range ``task_index`` for a user row (U7).
+
+        A standalone allocator the CRUD unit (U7) reuses when it needs an index
+        without inserting through :meth:`insert_task_segment` (e.g. splitting one
+        row into two). Opens its own short-lived connection.
+        """
+        conn = self._connect()
+        try:
+            return self._next_user_task_index(conn)
+        finally:
+            conn.close()
+
+    def replace_task_segments(self, segments: list[TaskSegmentRow]) -> None:
+        """Replace the AGENT-owned task segments for this recording (scoped, U5).
+
+        The agent re-segmentation sink (``terminal_stage`` + the incremental
+        daemon pass). SCOPED so it never clobbers user work (R8, KTD3): the
+        DELETE removes ONLY unedited agent rows (``source='agent' AND edited=0``,
+        i.e. exactly the LOW-range rows the agent owns), then re-inserts
+        ``segments`` as the fresh agent set. ``source='user'`` rows and
+        user-edited (``edited=1``) agent rows — all in the disjoint HIGH range —
+        are left INTACT, so a fresh ``0..N`` re-insert can never collide with a
+        protected row on ``UNIQUE(recording_id, task_index)``.
+
+        Idempotent for the agent set: delete-then-insert in ONE
+        ``BEGIN IMMEDIATE`` transaction, so re-running never duplicates agent
+        rows. ``task_index`` is supplied by the caller (kept in the row so the
+        store is self-describing) — the agent uses a contiguous ``0..N``. An
+        empty ``segments`` list clears the agent set only (a provider that
+        returned tasks last time but none now), leaving user / edited rows.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
-                    "DELETE FROM pipeline_task_segments WHERE recording_id=?",
-                    (self._recording_id,),
+                    "DELETE FROM pipeline_task_segments "
+                    "WHERE recording_id=? AND source=? AND edited=0",
+                    (self._recording_id, TASK_SOURCE_AGENT),
                 )
                 now = _now()
                 for seg in segments:
                     conn.execute(
                         "INSERT INTO pipeline_task_segments "
                         "(recording_id, task_index, start_ts, end_ts, name, "
-                        " category, confidence, metadata, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        " category, confidence, metadata, source, edited, "
+                        " updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             self._recording_id, seg.task_index,
                             seg.start_ts, seg.end_ts, seg.name,
-                            seg.category, seg.confidence, seg.metadata, now,
+                            seg.category, seg.confidence, seg.metadata,
+                            seg.source, int(seg.edited), now,
                         ),
                     )
                 conn.commit()
@@ -897,13 +1080,154 @@ class PipelineLedger:
             finally:
                 conn.close()
 
+    def insert_task_segment(self, seg: TaskSegmentRow) -> int:
+        """Insert one USER task segment; return its allocated ``task_index`` (U5/U7).
+
+        The row is always ``source='user'`` at a freshly-allocated HIGH-range
+        ``task_index`` (the passed ``task_index`` / ``source`` are ignored — the
+        store owns them so the disjoint-range invariant can't be violated by a
+        caller). ``edited`` defaults to the row's value (a user row is authored,
+        not edited). Used by the ``tasks.create`` verb (U7).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                idx = self._next_user_task_index(conn)
+                _insert_user_task_row(
+                    conn, self._recording_id, idx,
+                    start_ts=seg.start_ts, end_ts=seg.end_ts, name=seg.name,
+                    category=seg.category, confidence=seg.confidence,
+                    metadata=seg.metadata, edited=int(seg.edited), now=_now(),
+                )
+                conn.commit()
+                return idx
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def update_task_segment(
+        self,
+        task_index: int,
+        *,
+        name: str | None = None,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        category: str | None = None,
+        confidence: str | None = None,
+        metadata: str | None = None,
+        mark_edited: bool = False,
+    ) -> int | None:
+        """Update fields on one task segment; return its (possibly new) ``task_index``.
+
+        Only the provided fields are written. When ``mark_edited`` is set on an
+        unedited agent row that still lives in the LOW range, the row is RE-HOMED
+        into the reserved HIGH range (and flagged ``edited=1``) so the next
+        scoped agent replace preserves it WITHOUT a UNIQUE collision — an edited
+        agent row must never sit in the range the agent re-inserts over (KTD3).
+        A row already in the HIGH range (user rows, already-edited agent rows)
+        keeps its ``task_index``. Returns ``None`` if no such row exists (used by
+        the ``tasks.update`` verb, U7).
+        """
+        sets: list[str] = []
+        params: list[object] = []
+        if name is not None:
+            sets.append("name=?")
+            params.append(name)
+        if start_ts is not None:
+            sets.append("start_ts=?")
+            params.append(start_ts)
+        if end_ts is not None:
+            sets.append("end_ts=?")
+            params.append(end_ts)
+        if category is not None:
+            sets.append("category=?")
+            params.append(category)
+        if confidence is not None:
+            sets.append("confidence=?")
+            params.append(confidence)
+        if metadata is not None:
+            sets.append("metadata=?")
+            params.append(metadata)
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT source, edited FROM pipeline_task_segments "
+                    "WHERE recording_id=? AND task_index=?",
+                    (self._recording_id, task_index),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+
+                new_index = task_index
+                if mark_edited:
+                    sets.append("edited=?")
+                    params.append(1)
+                    # Re-home an unedited agent row out of the agent's LOW range
+                    # so a later scoped replace can't collide with it.
+                    already_edited = int(row["edited"]) == 1
+                    if (
+                        row["source"] == TASK_SOURCE_AGENT
+                        and not already_edited
+                        and task_index < USER_TASK_INDEX_BASE
+                    ):
+                        new_index = self._next_user_task_index(conn)
+                        sets.append("task_index=?")
+                        params.append(new_index)
+
+                sets.append("updated_at=?")
+                params.append(_now())
+                params.extend([self._recording_id, task_index])
+                conn.execute(
+                    "UPDATE pipeline_task_segments SET " + ", ".join(sets)
+                    + " WHERE recording_id=? AND task_index=?",
+                    params,
+                )
+                conn.commit()
+                return new_index
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def delete_task_segment(self, task_index: int) -> bool:
+        """Delete one task segment by ``task_index``; return True if a row went (U5/U7)."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    "WHERE recording_id=? AND task_index=?",
+                    (self._recording_id, task_index),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def read_task_segments(self) -> list[TaskSegmentRow]:
-        """Return this recording's task segments, ordered by ``task_index``."""
+        """Return this recording's task segments, ordered by ``task_index``.
+
+        Agent rows (LOW range) sort before user / edited rows (HIGH range), so
+        the natural ``task_index`` order interleaves nothing — the agent's
+        contiguous span comes first, curated rows after.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT task_index, start_ts, end_ts, name, category, "
-                "confidence, metadata FROM pipeline_task_segments "
+                "confidence, metadata, source, edited FROM pipeline_task_segments "
                 "WHERE recording_id=? ORDER BY task_index",
                 (self._recording_id,),
             ).fetchall()
@@ -916,11 +1240,200 @@ class PipelineLedger:
                     category=r["category"],
                     confidence=r["confidence"],
                     metadata=r["metadata"],
+                    source=r["source"] if r["source"] is not None else TASK_SOURCE_AGENT,
+                    edited=bool(r["edited"]),
                 )
                 for r in rows
             ]
         finally:
             conn.close()
+
+    def merge_task_segments(
+        self,
+        task_indices: list[int],
+        *,
+        name: str,
+        category: str | None = None,
+        confidence: str | None = None,
+        metadata: str | None = None,
+    ) -> int | None:
+        """Merge >=2 task segments into ONE user-owned row, atomically (U7).
+
+        Reads the rows named by ``task_indices`` under a SINGLE
+        ``BEGIN IMMEDIATE`` transaction, unions their spans (min ``start_ts`` /
+        max ``end_ts``), deletes them ALL, and inserts one ``source='user'`` row
+        at a freshly-allocated HIGH-range ``task_index`` carrying the caller's
+        ``name`` — the surviving label of the merge. Because the survivor is a
+        user row in the disjoint high range, it survives the next scoped agent
+        replace (KTD3): a merge is a curation act. Returns the new ``task_index``;
+        returns ``None`` (rolling back) when fewer than two of the named rows
+        exist — nothing to merge. Any failure between the delete and the insert
+        rolls the WHOLE transaction back, so a partial failure never leaves a
+        half-merge (the originals are deleted only if the survivor commits).
+        """
+        # De-dup while preserving order; a merge needs >=2 DISTINCT targets.
+        wanted = list(dict.fromkeys(int(i) for i in task_indices))
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if len(wanted) < 2:
+                    conn.rollback()
+                    return None
+                placeholders = ",".join("?" for _ in wanted)
+                rows = conn.execute(
+                    "SELECT task_index, start_ts, end_ts FROM pipeline_task_segments "
+                    f"WHERE recording_id=? AND task_index IN ({placeholders})",
+                    (self._recording_id, *wanted),
+                ).fetchall()
+                if len(rows) < 2:
+                    # Fewer than two of the named rows exist — nothing to merge.
+                    conn.rollback()
+                    return None
+                union_start = min(float(r["start_ts"]) for r in rows)
+                union_end = max(float(r["end_ts"]) for r in rows)
+                conn.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    f"WHERE recording_id=? AND task_index IN ({placeholders})",
+                    (self._recording_id, *wanted),
+                )
+                new_index = self._next_user_task_index(conn)
+                _insert_user_task_row(
+                    conn, self._recording_id, new_index,
+                    start_ts=union_start, end_ts=union_end, name=name,
+                    category=category, confidence=confidence, metadata=metadata,
+                    edited=0, now=_now(),
+                )
+                conn.commit()
+                return new_index
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def split_task_segment(
+        self,
+        task_index: int,
+        split_ts: float,
+        *,
+        name_left: str | None = None,
+        name_right: str | None = None,
+    ) -> tuple[int, int] | None:
+        """Split one task segment into TWO at ``split_ts``, atomically (U7).
+
+        Reads the row at ``task_index`` under a SINGLE ``BEGIN IMMEDIATE``
+        transaction; ``split_ts`` must lie STRICTLY within the row's span
+        (``start_ts < split_ts < end_ts``). Deletes the original and inserts two
+        ``source='user'`` rows — ``[start_ts, split_ts]`` and
+        ``[split_ts, end_ts]`` — at freshly-allocated HIGH-range indices, so both
+        halves survive the next scoped agent replace (KTD3). Each half inherits
+        the original's ``category`` / ``confidence`` / ``metadata`` and, unless
+        overridden by ``name_left`` / ``name_right``, its ``name``. Returns
+        ``(left_index, right_index)``; returns ``None`` (rolling back) when the
+        row is absent OR ``split_ts`` is not strictly inside the span. Any failure
+        rolls the whole transaction back — never a half-split.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT start_ts, end_ts, name, category, confidence, metadata "
+                    "FROM pipeline_task_segments WHERE recording_id=? AND task_index=?",
+                    (self._recording_id, task_index),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                start = float(row["start_ts"])
+                end = float(row["end_ts"])
+                if not (start < split_ts < end):
+                    conn.rollback()
+                    return None
+                base_name = row["name"]
+                category = row["category"]
+                confidence = row["confidence"]
+                metadata = row["metadata"]
+                conn.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    "WHERE recording_id=? AND task_index=?",
+                    (self._recording_id, task_index),
+                )
+                now = _now()
+                left_index = self._next_user_task_index(conn)
+                _insert_user_task_row(
+                    conn, self._recording_id, left_index,
+                    start_ts=start, end_ts=split_ts,
+                    name=name_left if name_left is not None else base_name,
+                    category=category, confidence=confidence, metadata=metadata,
+                    edited=0, now=now,
+                )
+                # The just-inserted left row is visible on this connection, so the
+                # second allocation returns left_index+1 — the two halves never
+                # collide on UNIQUE(recording_id, task_index).
+                right_index = self._next_user_task_index(conn)
+                _insert_user_task_row(
+                    conn, self._recording_id, right_index,
+                    start_ts=split_ts, end_ts=end,
+                    name=name_right if name_right is not None else base_name,
+                    category=category, confidence=confidence, metadata=metadata,
+                    edited=0, now=now,
+                )
+                conn.commit()
+                return (left_index, right_index)
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+
+def read_task_segments_wire(rec_dir: Path) -> list[dict]:
+    """Read a recording's named task segments as the 6-field ``TaskSegment`` wire shape.
+
+    The single shared read path behind ``tasks.list`` (daemon) and the day-level
+    ``tasks`` band (``day_segments``): reads ``read_task_segments`` off the
+    recording's local-only ``recording.db`` (never uploaded — R4/R8) and projects
+    each row to ``{task_index, start_ts, end_ts, name, category, confidence}`` — the
+    store's ``source`` / ``edited`` ownership columns stay internal.
+
+    READ-FIRST: reads directly and only migrates
+    (``ensure_pipeline_state_schema``) on a missing-table / missing-column
+    ``sqlite3.OperationalError``, so an already-migrated DB never runs DDL per call
+    while a legacy DB still migrates once and retries. Returns ``[]`` on any
+    legitimate absence — a missing ``recording.db`` (legacy / pre-U1 recording), a
+    DB with no ``recording`` row, an unreadable DB, or a recording whose
+    segmentation produced no tasks — never raising for those (fail-open read
+    surface). Local-only: nothing new leaves the machine.
+    """
+    db_path = rec_dir / "recording.db"
+    if not db_path.exists():
+        return []
+    try:
+        segments = PipelineLedger(db_path).read_task_segments()
+    except sqlite3.OperationalError:
+        # Legacy DB missing the task table / pre-U5 source/edited columns → migrate
+        # once (idempotent, creates the table on an old DB), then retry the read.
+        try:
+            ensure_pipeline_state_schema(db_path)
+            segments = PipelineLedger(db_path).read_task_segments()
+        except (LedgerError, sqlite3.Error):
+            return []
+    except (LedgerError, sqlite3.Error):
+        # No recording row / unreadable DB → treat as "no tasks" rather than raise.
+        return []
+    return [
+        {
+            "task_index": seg.task_index,
+            "start_ts": seg.start_ts,
+            "end_ts": seg.end_ts,
+            "name": seg.name,
+            "category": seg.category,
+            "confidence": seg.confidence,
+        }
+        for seg in segments
+    ]
 
 
 # ---------------------------------------------------------------------------

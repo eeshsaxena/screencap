@@ -24,7 +24,12 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from screencap._stderr_events import EVENT_AUDIO_MUTED, EVENT_AUDIO_UNMUTED
+from screencap._stderr_events import (
+    EVENT_AUDIO_MUTED,
+    EVENT_AUDIO_UNMUTED,
+    EVENT_RECORDING_PAUSED,
+    EVENT_RECORDING_RESUMED,
+)
 
 StreamFactory = Callable[[], Any]
 
@@ -32,6 +37,13 @@ StreamFactory = Callable[[], Any]
 # rename-in-one-place constants); a local literal would reintroduce the drift.
 EVENT_MUTED = EVENT_AUDIO_MUTED
 EVENT_UNMUTED = EVENT_AUDIO_UNMUTED
+# SCR-214 U4: transition markers returned by ``apply_paused``. The audio child
+# does NOT emit these on the event stream (engine-main is the sole emitter, since
+# a muted/audio-off recording has no stream to toggle yet must still confirm
+# pause because video stopped). They exist so ``apply_paused``'s confirmed-
+# transition contract is unit-testable, mirroring EVENT_MUTED / EVENT_UNMUTED.
+EVENT_PAUSED = EVENT_RECORDING_PAUSED
+EVENT_RESUMED = EVENT_RECORDING_RESUMED
 
 
 class AudioStreamController:
@@ -40,6 +52,12 @@ class AudioStreamController:
         self._stream: Any | None = None
         self._capturing = False
         self._muted = bool(initially_muted)
+        # SCR-214 U4: pause is a SECOND, independent suppression axis. Capture
+        # runs only when NEITHER muted NOR paused, so pause and mute compose
+        # (resuming a paused-then-unmuted stream must not start capture while the
+        # other axis still suppresses it). Constructed unpaused, so a recording
+        # that is never paused behaves exactly as before (R16).
+        self._paused = False
 
     @property
     def capturing(self) -> bool:
@@ -47,8 +65,9 @@ class AudioStreamController:
 
     def start_initial(self) -> None:
         """Acquire and start the device at process start *only* if the recording
-        started with audio on. If it started muted, acquire nothing."""
-        if not self._muted:
+        started with audio on (and is not paused). If it started muted or paused,
+        acquire nothing."""
+        if not self._muted and not self._paused:
             self._stream = self._make_stream()
             self._stream.start()
             self._capturing = True
@@ -74,7 +93,12 @@ class AudioStreamController:
                 return EVENT_MUTED
             self._muted = True
             return None
-        # Unmute: acquire lazily on first use, then start. If _make_stream raises,
+        # Unmute. If the recording is ALSO paused, capture must stay off — clear
+        # only the mute intent so a later resume starts the stream (SCR-214 U4).
+        if self._paused:
+            self._muted = False
+            return None
+        # Acquire lazily on first use, then start. If _make_stream raises,
         # _muted is left unchanged (still muted) — no partial "unmuted" state.
         if not self._capturing:
             if self._stream is None:
@@ -84,6 +108,40 @@ class AudioStreamController:
             self._muted = False
             return EVENT_UNMUTED
         self._muted = False
+        return None
+
+    def apply_paused(self, paused: bool) -> str | None:
+        """Idempotently drive the stream toward ``paused`` (SCR-214 U4).
+
+        Pause is independent of mute: capture runs only when neither muted nor
+        paused. Returns ``EVENT_PAUSED`` / ``EVENT_RESUMED`` when capture actually
+        changed, or ``None`` when the stream was already in the requested state
+        (e.g. resuming a recording that is still mic-muted is a no-op). Raises if
+        re-acquiring the device on resume fails; ``_paused`` is left True so the
+        stream stays off — mirroring ``apply_muted``'s no-partial-state contract.
+        """
+        paused = bool(paused)
+        if paused:
+            if self._capturing:
+                self._stream.stop()
+                self._capturing = False
+                self._paused = True
+                return EVENT_PAUSED
+            self._paused = True
+            return None
+        # Resume. If the recording is ALSO mic-muted, capture must stay off —
+        # clear only the pause intent so a later unmute starts the stream.
+        if self._muted:
+            self._paused = False
+            return None
+        if not self._capturing:
+            if self._stream is None:
+                self._stream = self._make_stream()  # opens the device (may raise)
+            self._stream.start()
+            self._capturing = True
+            self._paused = False
+            return EVENT_RESUMED
+        self._paused = False
         return None
 
     def shutdown(self) -> None:

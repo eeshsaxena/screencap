@@ -224,6 +224,7 @@ def process_events(
     num_video_events: multiprocessing.Value,
     screen_filter: Any | None = None,
     dead_queues: set[str] | None = None,
+    pause_state: "_CapturePauseState | None" = None,
 ) -> None:
     """Process events from the event queue and write them to write queues.
 
@@ -358,6 +359,11 @@ def process_events(
         try:
             event = event_q.get(timeout=_eq_timeout)
         except queue.Empty:
+            # SCR-214 U4: while paused, capture nothing — skip the settle-frame
+            # save and the cloud-intent placeholder push so the paused span holds
+            # no frames at all (AE1).
+            if pause_state is not None and pause_state.paused:
+                continue
             # Check settle deadline — force-save current screen as settle frame
             if (retention_filter is not None
                     and prev_screen_event is not None
@@ -402,6 +408,13 @@ def process_events(
         if not started:
             started_event.set()
             started = True
+        # SCR-214 U4: while paused, drop the event unprocessed — no writer sees
+        # it, so the paused span records NOTHING (a genuine capture gap → "nothing
+        # captured", AE1). This is the AUTHORITATIVE gate: it also discards any
+        # frames queued before the pause landed and prevents action-gated video
+        # from saving the last screen frame while paused.
+        if pause_state is not None and pause_state.paused:
+            continue
         logger.trace(f"{event=}")
         assert event.type in EVENT_TYPES, event
         # Drain the override queue on EVERY event (not just window
@@ -1574,11 +1587,18 @@ def read_screen_events(
     recording: Recording,
     started_event: threading.Event,
     _screen_timing: list | None = None,
+    pause_state: "_CapturePauseState | None" = None,
 ) -> None:
     """Read screen events and add them to the event queue.
 
     Captures at most ``config.SCREEN_CAPTURE_FPS`` frames per second.
     Set to 0 for unlimited (legacy behaviour).
+
+    While ``pause_state`` reports paused (SCR-214 U4), the screenshot grab is
+    skipped entirely — no frame is captured, so the paused span records nothing
+    (AE1). ``process_events`` is the authoritative gate (it also drops any in-
+    flight frames), but skipping the capture here avoids taking a screenshot only
+    to discard it, and keeps the health counters honest (no attempt is counted).
 
     Args:
         event_q: A queue for adding screen events.
@@ -1610,6 +1630,14 @@ def read_screen_events(
     started = False
     _geom_slow_count = 0
     while not terminate_processing.is_set():
+        # Capture-pause (SCR-214 U4): while paused, capture nothing — skip the
+        # screenshot grab (and its health-attempt count) so the paused span is a
+        # genuine gap, not discarded footage. ``started_event`` is set on the
+        # first UNPAUSED frame; a recording paused before its first frame simply
+        # idles here until resumed.
+        if pause_state is not None and pause_state.paused:
+            terminate_processing.wait(timeout=max(min_interval, 0.1))
+            continue
         # Capture-health (SCR-76): count every attempt before the capture
         # call; count output only for a non-None frame. A None/exception is
         # the only robust "screen reader is broken" content signal — denial
@@ -2775,6 +2803,119 @@ def _make_set_muted_handler(mute_control_q):
     return _handler
 
 
+class _CapturePauseState:
+    """Shared video/screenshot pause flag for the engine-main capture threads
+    (SCR-214 U4).
+
+    Set by the ``set_paused`` control handler; read by ``process_events`` (the
+    write fan-out — the authoritative gate) and ``read_screen_events`` (skips the
+    screenshot grab entirely). All three run as THREADS in the engine-main
+    process, so a plain bool under a lock is GIL-safe and sufficient — no
+    multiprocessing primitive is needed (the audio child, a separate process, is
+    gated independently over ``pause_control_q``).
+
+    Pause is distinct from mic-mute: while paused, capture is fully gated so the
+    span records NOTHING (a genuine gap → "nothing captured", AE1), whereas a
+    mic-muted span still captures video.
+    """
+
+    def __init__(self) -> None:
+        self._paused = False
+        self._lock = threading.Lock()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def apply(self, paused: bool) -> bool:
+        """Set the flag; return True iff it changed.
+
+        The changed/unchanged result drives the handler's idempotency: a pause
+        while already paused (or resume while running) is a no-op that neither
+        forwards to the audio child nor emits a duplicate confirmed event.
+        """
+        paused = bool(paused)
+        with self._lock:
+            if self._paused == paused:
+                return False
+            self._paused = paused
+            return True
+
+
+def _apply_audio_pause_command(controller: "audio_mute.AudioStreamController",
+                               command: dict) -> str | None:
+    """Apply one ``set_paused`` command inside ``record_audio`` (SCR-214 U4).
+
+    Pausing stops the mic stream (nothing captured for the span); resuming
+    restarts it unless the recording is independently mic-muted. Unlike mute, no
+    ``muted_intervals`` row is written — a paused span has NO frames at all
+    (video is gated too), so the absence of audio is the signal; there is no
+    "muted but video-captured" span to mark.
+
+    Returns the controller's transition marker (for testability). The audio child
+    does NOT emit the confirmed ``recording_paused`` / ``recording_resumed``
+    event — engine-main is the sole emitter (see ``_make_set_paused_handler``). A
+    failed device re-acquire on resume is swallowed and logged: the recording is
+    still "resumed" (video resumed) and audio staying off is a non-fatal degraded
+    state, matching the recorder's fail-open capture posture.
+    """
+    paused = bool(command.get("paused"))
+    try:
+        return controller.apply_paused(paused)
+    except Exception as exc:  # noqa: BLE001 — a denied mic must not crash audio.
+        logger.error(f"Audio resume could not re-acquire the mic: {exc}")
+        return None
+
+
+def _make_set_paused_handler(pause_state: "_CapturePauseState", pause_control_q):
+    """Build the engine-main ``set_paused`` control-channel handler (SCR-214 U4).
+
+    Registered in the ENGINE-MAIN process (where the control-channel reader +
+    handler registry live), mirroring ``_make_set_muted_handler``, but extended
+    beyond audio: it gates the WHOLE capture surface. On a state change it
+
+    1. flips ``pause_state`` — the in-process gate the ``process_events`` /
+       ``read_screen_events`` threads read to stop video + screenshots;
+    2. forwards ``{paused, ts}`` to the audio child over ``pause_control_q`` so
+       the mic stream stops/starts too;
+    3. emits the confirmed ``recording_paused`` / ``recording_resumed`` event.
+
+    Engine-main is the authoritative emitter because the video/screenshot gate in
+    step 1 is deterministic (setting a flag cannot fail), unlike the audio
+    re-acquire — and because a --no-audio / muted recording has no stream to
+    toggle yet must still confirm pause (video stopped). A pause while already
+    paused (or resume while running) is an idempotent no-op: no forward, no
+    duplicate event.
+    """
+    from screencap._stderr_events import (
+        EVENT_RECORDING_PAUSED,
+        EVENT_RECORDING_RESUMED,
+        emit_event,
+    )
+
+    def _handler(command: dict) -> None:
+        paused = bool(command.get("paused"))
+        ts = utils.get_timestamp()
+        if not pause_state.apply(paused):
+            return  # idempotent no-op — capture already in the requested state
+        # Forward to the audio child so the mic stream is gated in parallel.
+        if pause_control_q is not None:
+            try:
+                pause_control_q.put({"paused": paused, "ts": ts}, timeout=5)
+            except Exception:  # noqa: BLE001
+                logger.error("set_paused: pause control queue full or dead")
+        else:
+            logger.warning("set_paused received but no pause control queue")
+        # Confirmed event (engine-main is the sole emitter): drives the daemon's
+        # session_state["paused"], so the app reflects gated capture, not the echo.
+        emit_event(
+            EVENT_RECORDING_PAUSED if paused else EVENT_RECORDING_RESUMED,
+            paused=paused,
+        )
+
+    return _handler
+
+
 def record_audio(
     recording: Recording,
     db_path: str,
@@ -2783,6 +2924,7 @@ def record_audio(
     audio_rotate_q=None,
     audio_ack_q=None,
     mute_control_q=None,
+    pause_control_q=None,
     initially_muted: bool = False,
 ) -> None:
     """Record audio narration during the recording and store data in database.
@@ -2808,6 +2950,10 @@ def record_audio(
         audio_ack_q: Chunk-rotation ack queue (chunked mode only).
         mute_control_q: Mute/unmute command queue from the engine-main handler
             (SCR-218 U2). Each message is ``{"muted": bool, "ts": float}``.
+        pause_control_q: Pause/resume command queue from the engine-main handler
+            (SCR-214 U4). Each message is ``{"paused": bool, "ts": float}``.
+            Pause stops the mic stream for the span (nothing captured); resume
+            restarts it unless the recording is independently mic-muted.
         initially_muted: When True the recording started with audio off; no
             device is acquired until the first unmute.
     """
@@ -2993,46 +3139,57 @@ def record_audio(
             _mute_session_ref[0] = get_session_for_path(db_path)
         return _mute_session_ref[0]
 
-    # Main thread: poll the mute-control queue for sub-second toggle latency
-    # (Risk R-D) while staying responsive to teardown. Replaces the old
-    # blocking ``terminate_processing.wait()``.
+    # Main thread: poll the mute + pause control queues for sub-second toggle
+    # latency (Risk R-D) while staying responsive to teardown. Replaces the old
+    # blocking ``terminate_processing.wait()``. Both queues carry rare, tiny
+    # command lines, so a non-blocking drain + a bounded wait when idle keeps the
+    # ~100 ms toggle latency without spinning.
     MUTE_POLL_SECS = 0.1
     _mute_used = False
-    while not terminate_processing.is_set():
-        if mute_control_q is None:
-            terminate_processing.wait(timeout=MUTE_POLL_SECS)
-            continue
-        try:
-            msg = mute_control_q.get(timeout=MUTE_POLL_SECS)
-        except Exception:
-            continue  # queue.Empty on timeout — re-check terminate
-        _mute_used = True
-        try:
-            _apply_audio_mute_command(
-                controller, msg, session=_mute_session(), recording=recording,
-            )
-        except Exception:  # noqa: BLE001 — a bad toggle must not crash audio.
-            logger.exception("record_audio: mute command failed")
 
-    # Teardown: a mute forwarded as we were leaving the poll loop may still be
-    # sitting in the queue (the engine-main handler can enqueue right up to the
-    # moment the daemon tears the engine down). Drain and apply it BEFORE
-    # shutting the stream, so audio between the mute press and shutdown is still
-    # recorded as muted rather than captured unmarked (the muted-spans-hold-no-
-    # audio invariant; a bare terminate check would drop the queued command).
-    if mute_control_q is not None:
-        while True:
-            try:
-                msg = mute_control_q.get_nowait()
-            except Exception:
-                break
-            _mute_used = True
-            try:
-                _apply_audio_mute_command(
-                    controller, msg, session=_mute_session(), recording=recording,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("record_audio: draining mute command on teardown failed")
+    def _drain_control_queues() -> bool:
+        """Apply all pending mute/pause commands; return True if any were seen."""
+        nonlocal _mute_used
+        handled = False
+        if mute_control_q is not None:
+            while True:
+                try:
+                    msg = mute_control_q.get_nowait()
+                except Exception:
+                    break
+                _mute_used = True
+                handled = True
+                try:
+                    _apply_audio_mute_command(
+                        controller, msg, session=_mute_session(), recording=recording,
+                    )
+                except Exception:  # noqa: BLE001 — a bad toggle must not crash audio.
+                    logger.exception("record_audio: mute command failed")
+        if pause_control_q is not None:
+            while True:
+                try:
+                    msg = pause_control_q.get_nowait()
+                except Exception:
+                    break
+                handled = True
+                try:
+                    _apply_audio_pause_command(controller, msg)
+                except Exception:  # noqa: BLE001 — a bad toggle must not crash audio.
+                    logger.exception("record_audio: pause command failed")
+        return handled
+
+    while not terminate_processing.is_set():
+        if not _drain_control_queues():
+            terminate_processing.wait(timeout=MUTE_POLL_SECS)
+
+    # Teardown: a command forwarded as we were leaving the poll loop may still be
+    # sitting in a queue (the engine-main handler can enqueue right up to the
+    # moment the daemon tears the engine down). Drain and apply BEFORE shutting
+    # the stream, so audio between the last toggle and shutdown is recorded with
+    # the right mute/pause state rather than captured unmarked (the muted-spans-
+    # hold-no-audio invariant; a bare terminate check would drop the queued
+    # command).
+    _drain_control_queues()
 
     # Stop/close the stream and close any span left open by a teardown-while-
     # muted (U3). ``close_muted_interval`` is a no-op when nothing is open, so
@@ -3698,6 +3855,7 @@ def record(
     audio_rotate_q=None,
     audio_ack_q=None,
     mute_control_q=None,
+    pause_control_q=None,
     screen_filter: Any | None = None,
     # --- network proxy capture (V1) ---
     network: bool = False,
@@ -3778,6 +3936,16 @@ def record(
     control_channel.register_handler(
         "set_muted", _make_set_muted_handler(mute_control_q)
     )
+    # Capture-pause (SCR-214 U4): the ``set_paused`` handler flips this in-process
+    # gate — read by the ``process_events`` + ``read_screen_events`` threads to
+    # stop video/screenshots — and forwards to the audio child over
+    # ``pause_control_q``. Registered here (engine-main owns the reader) and
+    # unregistered in the teardown block below. Distinct from mute: pause gates
+    # the WHOLE capture surface, so a paused span records nothing (AE1).
+    pause_state = _CapturePauseState()
+    control_channel.register_handler(
+        "set_paused", _make_set_paused_handler(pause_state, pause_control_q)
+    )
 
     # Pre-import pyobjc symbols on the main thread — pyobjc's lazy-loading
     # bridge is not thread-safe for first-time resolution.
@@ -3856,6 +4024,7 @@ def record(
             recording,
             task_started_events.setdefault("screen_event_reader", threading.Event()),
             _screen_timing,
+            pause_state,
         ),
     )
     screen_event_reader.start()
@@ -3933,6 +4102,7 @@ def record(
             num_video_events,
             screen_filter,
             dead_queues,
+            pause_state,
         ),
     )
     event_processor.start()
@@ -4103,6 +4273,7 @@ def record(
             "audio_rotate_q": audio_rotate_q,
             "audio_ack_q": audio_ack_q,
             "mute_control_q": mute_control_q,
+            "pause_control_q": pause_control_q,
             "initially_muted": not config.RECORD_AUDIO,
         },
     )
@@ -4268,11 +4439,13 @@ def record(
     except KeyboardInterrupt:
         terminate_processing.set()
 
-    # Stop routing mute commands once the recording is winding down (SCR-218 U2).
+    # Stop routing mute/pause commands once the recording is winding down
+    # (SCR-218 U2 mute, SCR-214 U4 pause).
     try:
         from screencap.engine import control_channel
 
         control_channel.unregister_handler("set_muted")
+        control_channel.unregister_handler("set_paused")
     except Exception:  # noqa: BLE001
         pass
 
@@ -4605,6 +4778,7 @@ class Recorder:
         self._audio_ack_q = None
         self._chunk_process_q = None
         self._mute_control_q = None
+        self._pause_control_q = None
         self._flush_requested = None
         self._flush_ack_counter = None
 
@@ -4708,6 +4882,7 @@ class Recorder:
                 audio_rotate_q=self._audio_rotate_q,
                 audio_ack_q=self._audio_ack_q,
                 mute_control_q=self._mute_control_q,
+                pause_control_q=self._pause_control_q,
                 screen_filter=self._screen_filter,
                 network=self._network,
                 network_handoff_ready=self._network_handoff_ready,
@@ -4754,6 +4929,11 @@ class Recorder:
         # work regardless of chunking) and handed to the always-spawned audio
         # process; the engine-main ``set_muted`` handler feeds it.
         self._mute_control_q = multiprocessing.Queue(maxsize=100)
+        # Pause-control queue (SCR-214 U4): the engine-main ``set_paused`` handler
+        # forwards pause/resume to the audio child over this queue (video +
+        # screenshots are gated in-process via the shared pause flag). Created
+        # unconditionally, mirroring the mute queue.
+        self._pause_control_q = multiprocessing.Queue(maxsize=100)
         # Set up chunking primitives if chunking enabled
         chunk_duration = getattr(self._recording_config, 'video_chunk_duration', None)
         if chunk_duration is None:
@@ -4819,7 +4999,8 @@ class Recorder:
 
         # Clean up multiprocessing queues to prevent feeder-thread hangs at exit.
         for q in (self._chunk_rotate_q, self._audio_rotate_q,
-                  self._audio_ack_q, self._chunk_process_q, self._mute_control_q):
+                  self._audio_ack_q, self._chunk_process_q, self._mute_control_q,
+                  self._pause_control_q):
             if q is not None:
                 try:
                     q.cancel_join_thread()

@@ -468,6 +468,47 @@ struct RecordingMuteResponse: Decodable {
     }
 }
 
+/// Body for the mid-recording capture-pause verb (SCR-214 U4). `paused` is the
+/// ABSOLUTE desired state (true = paused), not a toggle, so a dropped/retried
+/// request can never desync app vs engine (mirrors `RecordingMuteRequest`). A
+/// single model backs both verbs: `recording.pause` posts `paused: true` and
+/// `recording.resume` posts `paused: false`. The daemon validates the body but
+/// derives the effective state from the verb, so the field is required-but-echoed.
+struct RecordingPauseRequest: Encodable {
+    let paused: Bool
+
+    init(paused: Bool) {
+        self.paused = paused
+    }
+}
+
+struct RecordingPauseResponse: Decodable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    /// ECHO of the REQUESTED state for transport bookkeeping only. The app must
+    /// NOT treat this as confirmation — unlike mute (audio-only), pause gates the
+    /// WHOLE capture surface, and the CONFIRMED pause state arrives on the events
+    /// stream / `ambient.status` after the engine actually gates capture (KTD7).
+    /// `AmbientController` deliberately re-reads `ambient.status` rather than
+    /// trusting this echo.
+    let paused: Bool
+    /// Bus cursor captured BEFORE the command was forwarded — a fresh subscriber
+    /// could `/v0/events?since=<cursor>` without missing the confirming
+    /// `recording_paused` / `recording_resumed` event. Decoded for completeness.
+    let cursor: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case paused
+        case cursor
+    }
+}
+
 /// Ack for the SCR-200 decoy-cleanup verb. The envelope carries no payload
 /// beyond the standard fields — the sweep is fire-and-forget on the daemon.
 struct CleanupDecoysResponse: Decodable {
@@ -641,6 +682,15 @@ struct DayBlockedInterval: Decodable, Sendable, Hashable {
 /// One recording's day-clamped span + honest blocked-interval split (U3).
 /// `blockedProven` may be hatched "blocked"; `unverifiable` must render as a
 /// neutral gap, never labelled "blocked" (R7).
+///
+/// `tasks` (U9/SCR-214, additive) carries this recording's named task segments
+/// so the Day-timeline gets every band for the day in ONE `timeline.day`
+/// round-trip — no second `tasks.list` per recording. It reuses the shared
+/// `RecordingTask` wire shape (`tasks.list` and the nested day band are one
+/// model, so the strip and the per-recording view can't drift). Empty (never
+/// absent) for a recording with no tasks store, a legacy recording, or an older
+/// daemon that predates the field — decoded via `decodeIfPresent`, so the app
+/// stays compatible with a daemon that never emits `tasks`.
 struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let name: String
     let recordingId: String?
@@ -649,11 +699,13 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let endMs: Int
     let blockedProven: [DayBlockedInterval]
     let unverifiable: [DayBlockedInterval]
+    let tasks: [RecordingTask]
 
     init(
         name: String, recordingId: String? = nil, state: String = "ready",
         startMs: Int, endMs: Int,
-        blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = []
+        blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = [],
+        tasks: [RecordingTask] = []
     ) {
         self.name = name
         self.recordingId = recordingId
@@ -662,6 +714,20 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         self.endMs = endMs
         self.blockedProven = blockedProven
         self.unverifiable = unverifiable
+        self.tasks = tasks
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        recordingId = try c.decodeIfPresent(String.self, forKey: .recordingId)
+        state = try c.decode(String.self, forKey: .state)
+        startMs = try c.decode(Int.self, forKey: .startMs)
+        endMs = try c.decode(Int.self, forKey: .endMs)
+        blockedProven = try c.decode([DayBlockedInterval].self, forKey: .blockedProven)
+        unverifiable = try c.decode([DayBlockedInterval].self, forKey: .unverifiable)
+        // Older daemon (pre-U9 `timeline.day` v2) omits `tasks` entirely.
+        tasks = try c.decodeIfPresent([RecordingTask].self, forKey: .tasks) ?? []
     }
 
     enum CodingKeys: String, CodingKey {
@@ -672,6 +738,7 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         case endMs = "end_ms"
         case blockedProven = "blocked_proven"
         case unverifiable
+        case tasks
     }
 }
 
@@ -1001,6 +1068,49 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/recording.mute", body: body)
     }
 
+    // MARK: - SCR-214 U4/U12 ambient runtime control
+
+    /// Pause capture on the running recording (SCR-214 U4). Forwards to the engine
+    /// over the daemon's stdin control channel; the response echoes only the
+    /// REQUESTED state (not confirmation — the confirmed pause settles on
+    /// `ambient.status` / the events stream). A `not_recording` envelope error
+    /// (nothing live to pause) surfaces through the existing typed-error seam. The
+    /// body carries `paused: true` even though the daemon derives the state from
+    /// the verb — the required field keeps a malformed body a typed 400.
+    @discardableResult
+    static func recordingPause() async throws -> RecordingPauseResponse {
+        let body = try JSONEncoder().encode(RecordingPauseRequest(paused: true))
+        return try await request(method: "POST", path: "/v0/recording.pause", body: body)
+    }
+
+    /// Resume capture on a paused recording (SCR-214 U4). See `recordingPause()`.
+    @discardableResult
+    static func recordingResume() async throws -> RecordingPauseResponse {
+        let body = try JSONEncoder().encode(RecordingPauseRequest(paused: false))
+        return try await request(method: "POST", path: "/v0/recording.resume", body: body)
+    }
+
+    /// Read the runtime ambient-supervision snapshot (SCR-214 U12). Read-only —
+    /// the daemon deliberately keeps it out of `_ACTIVITY_PATHS`, so polling it
+    /// never resets an auto-spawned daemon's idle-shutdown clock. On
+    /// `socketUnavailable`/`connectionFailed` the caller surfaces a daemon-down
+    /// state rather than guessing at a default.
+    static func ambientStatus() async throws -> AmbientStatus {
+        try await request(method: "GET", path: "/v0/ambient.status")
+    }
+
+    /// Toggle ambient (and/or its auto-start-on-login) at runtime (SCR-214 U12).
+    /// `enabled == true` persists the opt-in and starts ambient now; `enabled ==
+    /// false` persists the opt-out and stops the running ambient recording now;
+    /// `autostart` only persists config. A nil argument omits that key so the verb
+    /// applies only what changed. Returns the NEW `ambient.status` payload (which
+    /// may still report `active == false` on an enable until the detached spawn
+    /// completes — the app confirms via a follow-up `ambientStatus()`).
+    static func ambientSet(enabled: Bool? = nil, autostart: Bool? = nil) async throws -> AmbientStatus {
+        let body = try JSONEncoder().encode(AmbientSetRequest(enabled: enabled, autostart: autostart))
+        return try await request(method: "POST", path: "/v0/ambient.set", body: body)
+    }
+
     /// On-demand daemon-driven TCC registration (U8). The daemon runs the
     /// matching request mechanism in *its own* process so the Settings entry is
     /// attributed to the daemon identity, not the app. The app awaits this ack
@@ -1092,6 +1202,52 @@ enum DaemonClient {
     static func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse {
         let body = try JSONEncoder().encode(req)
         return try await request(method: "POST", path: "/v0/tasks.list", body: body)
+    }
+
+    // MARK: - SCR-214 U7 task CRUD write verbs
+
+    /// Add a USER-authored task span (U7). Local-only mutating verb over the
+    /// recording's `pipeline_task_segments` store (never uploaded — R4/R8). The
+    /// daemon rejects a traversal recording name (400 `invalid_name`), a
+    /// zero-length / inverted / out-of-range / evicted-footage span (400
+    /// `invalid_request`), and an unknown recording (404 `recording_not_found`) —
+    /// all surfaced through `DaemonClientError.envelopeError(code:_)` unchanged.
+    /// The store forces `source='user'` at a disjoint HIGH `task_index` (KTD3).
+    static func tasksCreate(_ req: TasksCreateRequest) async throws -> TasksCreateResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.create", body: body)
+    }
+
+    /// Rename / re-bound an existing task by `task_index` (U7). Every edit marks
+    /// the row curated (`edited=1`) server-side and re-homes an agent row into the
+    /// HIGH range so the next agent re-segmentation preserves it (KTD3). A missing
+    /// row or an inverted span returns 400 `invalid_request`.
+    static func tasksUpdate(_ req: TasksUpdateRequest) async throws -> TasksUpdateResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.update", body: body)
+    }
+
+    /// Remove one task by `task_index` (U7). Idempotent: an already-absent task
+    /// returns 200 with `deleted:false`, so a dropped/retried delete converges.
+    static func tasksDelete(_ req: TasksDeleteRequest) async throws -> TasksDeleteResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.delete", body: body)
+    }
+
+    /// Combine >=2 segments into one atomic `source='user'` row (U7). The span is
+    /// the union and `name` is the surviving label. Fewer than two resolvable
+    /// segments returns 400 `invalid_request`.
+    static func tasksMerge(_ req: TasksMergeRequest) async throws -> TasksMergeResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.merge", body: body)
+    }
+
+    /// Split one segment into two at `split_ts` (U7). `split_ts` must lie strictly
+    /// within the segment's span (else 400 `invalid_request`). Produces two
+    /// `source='user'` rows in one atomic transaction — never a half-split.
+    static func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/tasks.split", body: body)
     }
 
     /// Conversational-recall answer (conversational-recall U5). Daemon-only,

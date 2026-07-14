@@ -781,3 +781,161 @@ class TestMaskedVideoUploadFlag:
         cfg._config_cache = {"masked_video_upload": False}
         with mock.patch.dict(os.environ, {"SCREENCAP_MASKED_VIDEO_UPLOAD": "yes"}):
             assert get_masked_video_upload_enabled() is True
+
+
+# --- ambient (always-on) capture config tests (SCR-214 U1) ---
+
+
+def _env_without_ambient():
+    drop = {"SCREENCAP_AMBIENT_ENABLED", "SCREENCAP_AMBIENT_AUTOSTART"}
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+class TestAmbientEnabled:
+    """Tests for get_ambient_enabled() — opt-in, default OFF (R1)."""
+
+    def test_default_false(self):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_enabled
+
+        with mock.patch.dict(os.environ, _env_without_ambient(), clear=True):
+            cfg._config_cache = {}
+            assert get_ambient_enabled() is False
+
+    def test_env_var_true(self):
+        from screencap.config import get_ambient_enabled
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_AMBIENT_ENABLED": "1"}):
+            assert get_ambient_enabled() is True
+        with mock.patch.dict(os.environ, {"SCREENCAP_AMBIENT_ENABLED": "true"}):
+            assert get_ambient_enabled() is True
+
+    def test_env_var_false(self):
+        from screencap.config import get_ambient_enabled
+
+        with mock.patch.dict(os.environ, {"SCREENCAP_AMBIENT_ENABLED": "false"}):
+            assert get_ambient_enabled() is False
+
+    def test_toml_value(self):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_enabled
+
+        with mock.patch.dict(os.environ, _env_without_ambient(), clear=True):
+            cfg._config_cache = {"ambient": {"enabled": True}}
+            assert get_ambient_enabled() is True
+
+    def test_env_beats_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_enabled
+
+        # env override wins over the config.toml [ambient] block.
+        cfg._config_cache = {"ambient": {"enabled": True}}
+        with mock.patch.dict(os.environ, {"SCREENCAP_AMBIENT_ENABLED": "no"}):
+            assert get_ambient_enabled() is False
+
+        cfg._config_cache = {"ambient": {"enabled": False}}
+        with mock.patch.dict(os.environ, {"SCREENCAP_AMBIENT_ENABLED": "yes"}):
+            assert get_ambient_enabled() is True
+
+
+class TestAmbientAutostart:
+    """Tests for get_ambient_autostart() — default ON when ambient is enabled (R2)."""
+
+    def test_default_true(self):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_autostart
+
+        with mock.patch.dict(os.environ, _env_without_ambient(), clear=True):
+            cfg._config_cache = {}
+            assert get_ambient_autostart() is True
+
+    def test_toml_can_disable(self):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_autostart
+
+        with mock.patch.dict(os.environ, _env_without_ambient(), clear=True):
+            cfg._config_cache = {"ambient": {"autostart": False}}
+            assert get_ambient_autostart() is False
+
+    def test_env_beats_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_autostart
+
+        cfg._config_cache = {"ambient": {"autostart": True}}
+        with mock.patch.dict(os.environ, {"SCREENCAP_AMBIENT_AUTOSTART": "0"}):
+            assert get_ambient_autostart() is False
+
+    def test_autostart_independent_of_enabled(self):
+        """Autostart defaults ON even when enabled is off in the same block."""
+        import screencap.config as cfg
+        from screencap.config import get_ambient_autostart, get_ambient_enabled
+
+        with mock.patch.dict(os.environ, _env_without_ambient(), clear=True):
+            cfg._config_cache = {"ambient": {"enabled": False}}
+            assert get_ambient_enabled() is False
+            assert get_ambient_autostart() is True
+
+
+class TestAmbientSetters:
+    """Round-trip tests for set_ambient_enabled / set_ambient_autostart."""
+
+    def test_set_enabled_round_trip(self, tmp_path):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_enabled, set_ambient_enabled
+
+        cfg_path = tmp_path / "config.toml"
+        cfg_path.write_text("# header comment\naudio_default = true\n")
+
+        with (
+            mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+            mock.patch.dict(os.environ, _env_without_ambient(), clear=True),
+        ):
+            cfg._config_cache = None
+            assert get_ambient_enabled() is False  # default before any write
+
+            set_ambient_enabled(True)
+            # Cache invalidated on write → fresh read observes it.
+            assert get_ambient_enabled() is True
+
+            text = cfg_path.read_text()
+            assert "# header comment" in text  # tomlkit preserved the comment
+            assert "audio_default = true" in text  # unrelated key untouched
+            assert "[ambient]" in text
+
+            set_ambient_enabled(False)
+            assert get_ambient_enabled() is False
+
+    def test_set_enabled_creates_file(self, tmp_path):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_enabled, set_ambient_enabled
+
+        cfg_path = tmp_path / "config.toml"
+        assert not cfg_path.exists()
+
+        with (
+            mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+            mock.patch.dict(os.environ, _env_without_ambient(), clear=True),
+        ):
+            cfg._config_cache = None
+            set_ambient_enabled(True)
+            assert cfg_path.exists()
+            assert get_ambient_enabled() is True
+
+    def test_set_autostart_round_trip(self, tmp_path):
+        import screencap.config as cfg
+        from screencap.config import get_ambient_autostart, set_ambient_autostart
+
+        cfg_path = tmp_path / "config.toml"
+
+        with (
+            mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+            mock.patch.dict(os.environ, _env_without_ambient(), clear=True),
+        ):
+            cfg._config_cache = None
+            assert get_ambient_autostart() is True  # default
+
+            set_ambient_autostart(False)
+            assert get_ambient_autostart() is False
+
+            set_ambient_autostart(True)
+            assert get_ambient_autostart() is True
