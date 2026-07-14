@@ -207,6 +207,30 @@ enum OnboardingStepPolicy {
         case .teamCloud: return "Continue — set up your team"
         }
     }
+
+    // MARK: - Account step exit affordance
+
+    /// The account step's bottom wizard-chrome affordance.
+    enum AccountStepExit: Equatable {
+        /// Signed out — the account step is genuinely being skipped.
+        case skip
+        /// Signed in — the account part is done and the plan choice is *deferred*
+        /// (choosable later), not skipped. A deliberate "Continue" primary that
+        /// routes forward exactly like a resolved entitlement would.
+        case continueDeferringPlan
+    }
+
+    /// Which exit affordance the account step shows below the plan sheet.
+    ///
+    /// Under the paid-only launch the wizard soft-gates this step on a paid
+    /// entitlement, so signing in alone never advances (`mustStayForEntitlement`).
+    /// Leaving the only forward affordance a muted "Skip for now" mislabels the
+    /// legitimate defer-the-plan action as skipping — the user just *completed*
+    /// sign-in, so "Skip" reads as throwing that away. Once signed in, the
+    /// affordance becomes a plain "Continue": the plan is deferred, not skipped.
+    static func accountStepExit(isSignedIn: Bool) -> AccountStepExit {
+        isSignedIn ? .continueDeferringPlan : .skip
+    }
 }
 
 /// The single source of paid-tier prices (KTD-7). Every priced surface — the
@@ -373,6 +397,16 @@ enum OnboardingCopy {
     // `AccountSheetCopy` (pinned by `AccountSheetPolicyTests`). The step-local
     // account/upgrade/lapsed strings that used to live here were retired with
     // the bespoke panel.
+    //
+    // The wizard-chrome exit affordance below the sheet stays step-owned:
+    // signed out → a muted "Skip for now" link (the account step is skipped);
+    // signed in → a deliberate "Continue" primary (the plan is deferred, not
+    // skipped — see `OnboardingStepPolicy.accountStepExit`). The defer note is
+    // truthful: the same plan picker lives in Settings → Account (the
+    // `.account` AccountSheet context).
+    static let accountSkipLink = "Skip for now"
+    static let accountContinueButton = "Continue"
+    static let accountDeferPlanNote = "You can choose a plan anytime in Settings."
 
     // Step 5 — team setup (design 264–288). The design's "one shared,
     // encrypted library" is SCR-221/SCR-220; the fields render per the design
