@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.26.0] - 2026-07-14
+
+### Added
+
+- **ambient:** Always-on ambient recording — opt-in config with local-only intent freeze and per-day identity, supervised daemon task with shared gate + backoff, day-boundary wake-safe recording roll, capture-pause control (`recording.pause`/`resume`), incremental segmentation daemon sweep, 30-day retention window with kept-task chunk protection, first-run consent + enable/pause/auto-start controls, `ambient.status`/`ambient.set` daemon verbs (SCR-214)
+- **tasks:** Agent/user task segmentation — source/edited coexistence in `pipeline_task_segments`, additive per-day task bands on `timeline.day`, user task CRUD verbs (create/update/delete/merge/split), Journal task cards with manual create + edit write-through, day-timeline agent/user task bands
+
+### Fixed
+
+- **ambient:** Two P2 gaps from the SCR-214 code review
+
+### Changed
+
+- **ambient:** Consolidated cross-unit duplication in the SCR-214 backend
+
 ## [0.25.0] - 2026-07-13
 
 ### Added
