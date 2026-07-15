@@ -84,13 +84,13 @@ def serve(
 
         # SCR-258 U4 (KTD-14): the daemon binds FIRST, then resolves the
         # encrypted-store state. A sealed (locked) / not-yet-initialized (absent) /
-        # key-error store is a HEALTHY serving state — the daemon serves
-        # ``store_state`` on ``daemon.info`` + read verbs so a locked store is
-        # distinguishable from a dead daemon (never a launchd crash-loop). Only a
-        # ROGUE mountpoint or a corrupted bundle is a fatal operator stop; those
-        # carry the right exit code (operator -> 1, retryable -> EX_TEMPFAIL) on the
-        # container exception. This runs AFTER bind so the ordering is observable
-        # (the bind-before-mount amendment).
+        # key-error / occupied-mountpoint store is a HEALTHY serving state — the
+        # daemon serves ``store_state`` on ``daemon.info`` + read verbs so a locked
+        # store is distinguishable from a dead daemon (never a launchd crash-loop).
+        # Only attach-time operator failures (corrupted bundle, auth failure) are
+        # fatal operator stops; those carry the right exit code (operator -> 1,
+        # retryable -> EX_TEMPFAIL) on the container exception. This runs AFTER
+        # bind so the ordering is observable (the bind-before-mount amendment).
         from screencap.container import ContainerError
         from screencap.daemon import store_lifecycle
 

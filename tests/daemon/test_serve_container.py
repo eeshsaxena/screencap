@@ -255,7 +255,16 @@ def test_keychain_locked_is_retryable_in_band(container_base, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_rogue_mountpoint_raises_operator_stop(container_base, monkeypatch):
+def test_rogue_mountpoint_serves_error_not_exit(container_base, monkeypatch):
+    """An occupied mountpoint is a typed serving ERROR, never a daemon exit (KTD-14).
+
+    A bundle created while a plaintext library still occupies the recordings
+    mountpoint (a bare ``storage init`` on an upgrader install) previously raised
+    ``RogueMountpointError`` out of the resolver, so ``serve`` exited 1 on every
+    start — the daemon crash-looped and onboarding dead-ended at "daemon did not
+    respond". The occupied mountpoint must never be attached over (unchanged),
+    but the daemon serves ``error/mountpoint_occupied`` so the app can surface it
+    and the encrypt-migration verbs stay reachable (they are the cure)."""
     _make_bundle(container_base)
     monkeypatch.setattr(container, "require_container_key", lambda: b"k" * 32)
     monkeypatch.setattr(container, "attach", lambda *a, **k: pytest.fail("attached over rogue"))
@@ -264,8 +273,12 @@ def test_rogue_mountpoint_raises_operator_stop(container_base, monkeypatch):
 
     (get_recordings_dir() / "leftover.txt").write_text("plaintext leftover")
 
-    with pytest.raises(container.RogueMountpointError):
-        resolve_store_state()
+    resolution = resolve_store_state()  # must NOT raise
+
+    assert resolution.state is StoreState.ERROR
+    assert resolution.reason == sl.ERROR_MOUNTPOINT_OCCUPIED
+    # The unlock-verb sibling resolves the same way (typed error, not a 500).
+    assert sl.mount_now().reason == sl.ERROR_MOUNTPOINT_OCCUPIED
 
 
 def test_migration_in_progress_serves_plaintext_not_rogue(
@@ -358,7 +371,7 @@ def test_serve_binds_socket_before_resolving_store(tmp_path, monkeypatch):
 
     def _fake_resolve(**kwargs):
         order.append("resolve")
-        raise container.RogueMountpointError("rogue mountpoint")
+        raise container.ContainerCorruptError("corrupted bundle")
 
     monkeypatch.setattr(socket_mod, "bind_unix_socket", _fake_bind)
     monkeypatch.setattr(socket_mod, "cleanup_socket", lambda p: order.append("cleanup"))
@@ -366,7 +379,7 @@ def test_serve_binds_socket_before_resolving_store(tmp_path, monkeypatch):
 
     rc = server.serve(socket_path=tmp_path / "api.sock")
 
-    assert rc == 1  # RogueMountpointError.exit_code (operator hard-stop)
+    assert rc == 1  # ContainerCorruptError.exit_code (operator hard-stop)
     assert order[0] == "bind"
     assert order.index("bind") < order.index("resolve")
 
@@ -634,6 +647,34 @@ async def test_storage_mount_key_missing_is_typed_error_unmounted(
     assert body["reason"] == sl.ERROR_KEY_MISSING
     assert body["retryable"] is False
     # The store was NOT mounted; the daemon still serves absent.
+    assert app.state.store_state == "absent"
+
+
+@pytest.mark.asyncio
+async def test_storage_mount_occupied_is_typed_error_unmounted(
+    container_base, monkeypatch
+):
+    """``mount_now`` returning ERROR/mountpoint_occupied surfaces the accurate
+    typed reason + migration guidance — not the false 'key unreachable' (data
+    loss) diagnosis — and the store stays unmounted."""
+    _make_bundle(container_base)
+    monkeypatch.setattr(container, "require_container_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        container, "attach", lambda *a, **k: pytest.fail("must not attach")
+    )
+    from screencap.config import get_recordings_dir
+
+    (get_recordings_dir() / "leftover.txt").write_text("plaintext leftover")
+
+    app = _absent_app()
+    async with _client(app) as client:
+        r = await client.post("/v0/storage.mount")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"] == errors.STORE_LOCK_FAILED
+    assert body["reason"] == sl.ERROR_MOUNTPOINT_OCCUPIED
+    assert body["retryable"] is False
+    assert "encrypt" in body["message"]  # points at the migration, not key loss
     assert app.state.store_state == "absent"
 
 

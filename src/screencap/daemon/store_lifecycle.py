@@ -19,13 +19,15 @@ state:
   the next step.
 * :attr:`StoreState.ERROR`     — the store exists but cannot be served: the key is
   genuinely missing, the running binary is not entitled to read the key
-  (KTD-22), the Keychain is locked (retryable), or the container was disabled on a
-  bundle-present install (KTD-19 "downgrade unsupported"). Never a plaintext
-  fallback.
+  (KTD-22), the Keychain is locked (retryable), the container was disabled on a
+  bundle-present install (KTD-19 "downgrade unsupported"), or a non-empty plain
+  directory occupies the recordings mountpoint ("mountpoint occupied" — never
+  attached over, never auto-cleaned). Never a plaintext fallback.
 
-Only a ROGUE mountpoint or a corrupted bundle remain operator hard-stops
-(:func:`resolve_store_state` re-raises the container operator exception so
-``serve`` can exit 1); every other condition is a healthy serving state.
+Only attach-time operator failures (a corrupted bundle, an auth failure) remain
+operator hard-stops (:func:`resolve_store_state` re-raises the container operator
+exception so ``serve`` can exit 1); every other condition — including the
+occupied mountpoint — is a healthy serving state.
 
 Nothing here runs ``hdiutil`` unless the store is genuinely healthy (container
 enabled, not sealed, bundle present, key readable, mountpoint not already a live
@@ -80,6 +82,13 @@ ERROR_KEY_MISSING = "key_missing"
 ERROR_ENTITLEMENT_MISMATCH = "entitlement_mismatch"
 ERROR_KEYCHAIN_LOCKED = "keychain_locked"
 ERROR_DOWNGRADE_UNSUPPORTED = "downgrade_unsupported"
+# A non-empty plain directory (not a mounted volume) occupies the recordings
+# mountpoint while a bundle exists — e.g. a bare ``storage init`` ran on an
+# install with an existing plaintext library, which needs the encrypt-migration
+# flow. Never attached over, never auto-cleaned; serving this as a typed error
+# (instead of exiting 1) keeps the daemon up so onboarding and the migration
+# verbs — the cure for this state — stay reachable.
+ERROR_MOUNTPOINT_OCCUPIED = "mountpoint_occupied"
 
 
 @dataclass(frozen=True)
@@ -198,6 +207,20 @@ def _bundle_exists() -> bool:
     return store_bundle_path().exists()
 
 
+def mountpoint_is_occupied(mountpoint: Path) -> bool:
+    """True iff ``mountpoint`` is a non-empty plain directory, not a mounted volume.
+
+    The single occupancy predicate shared by ``_attempt_mount``'s refuse-to-attach
+    check and the CLI ``storage init`` guard, so the two can never drift: whatever
+    the resolver would refuse to attach over, init refuses to create a bundle over.
+    """
+    return (
+        not os.path.ismount(str(mountpoint))
+        and mountpoint.is_dir()
+        and any(mountpoint.iterdir())
+    )
+
+
 def _migration_holds_mountpoint() -> bool:
     """True iff an upgrade migration is mid-flight with plaintext still at the
     recordings mountpoint (FIX 3, SCR-258 U6).
@@ -296,8 +319,9 @@ def _attempt_mount(bundle: Path, mountpoint: Path, key: bytes) -> StoreResolutio
     3. otherwise attach the bundle and harden the mount.
 
     Raises the container operator exceptions (``RogueMountpointError`` /
-    ``ContainerCorruptError`` / ``ContainerAuthError``) unchanged so ``serve`` can
-    map them to exit 1.
+    ``ContainerCorruptError`` / ``ContainerAuthError``) unchanged; the resolver
+    callers map ``RogueMountpointError`` to the ``mountpoint_occupied`` typed
+    serving error and let the rest reach ``serve`` (exit 1).
     """
     from screencap import container
 
@@ -306,7 +330,7 @@ def _attempt_mount(bundle: Path, mountpoint: Path, key: bytes) -> StoreResolutio
         # mount outlives the daemon, base KTD-4). Reuse it.
         return StoreResolution(StoreState.MOUNTED, mountpoint=str(mountpoint))
 
-    if mountpoint.exists() and mountpoint.is_dir() and any(mountpoint.iterdir()):
+    if mountpoint_is_occupied(mountpoint):
         raise container.RogueMountpointError(
             f"{mountpoint} is a non-empty directory but not a mounted volume; "
             "refusing to attach over it (rogue mountpoint, never auto-cleaned)"
@@ -327,8 +351,9 @@ def _attempt_mount(bundle: Path, mountpoint: Path, key: bytes) -> StoreResolutio
 def resolve_store_state(*, attempt_mount: bool = True) -> StoreResolution:
     """Classify the store into a healthy serving state (KTD-14, KTD-19, KTD-22).
 
-    Called by ``server.serve`` AFTER the socket is bound. Only ROGUE / corrupted
-    bundle raise (the caller exits 1); every other condition returns a
+    Called by ``server.serve`` AFTER the socket is bound. Only attach-time
+    operator failures (corrupted bundle, auth failure) raise (the caller exits
+    1); every other condition — including an occupied mountpoint — returns a
     :class:`StoreResolution`.
 
     ``attempt_mount=False`` resolves state without ever running ``hdiutil`` (the
@@ -400,7 +425,16 @@ def resolve_store_state(*, attempt_mount: bool = True) -> StoreResolution:
                 "cutover (not a rogue mountpoint)"
             )
             return StoreResolution(StoreState.MOUNTED, mountpoint=str(mountpoint))
-        return _attempt_mount(bundle, Path(mountpoint), key)
+        try:
+            return _attempt_mount(bundle, Path(mountpoint), key)
+        except container.RogueMountpointError as exc:
+            # An occupied mountpoint is a typed serving error, NOT a daemon exit
+            # (KTD-14): exiting here crash-looped the daemon on installs where a
+            # bare ``storage init`` created the bundle over an existing plaintext
+            # library, dead-ending onboarding — while the encrypt-migration verbs
+            # that cure the state need a live daemon. Never attached over.
+            logger.warning("mountpoint occupied; serving store_state=error: %s", exc)
+            return StoreResolution(StoreState.ERROR, reason=ERROR_MOUNTPOINT_OCCUPIED)
 
 
 def mount_now() -> StoreResolution:
@@ -415,7 +449,8 @@ def mount_now() -> StoreResolution:
     KTD-14); only on ``MOUNTED`` does the caller clear the sentinel and reconcile.
 
     Container-disabled → ``MOUNTED`` (nothing to mount; a plaintext install has no
-    sentinel to reach here). ROGUE / corrupted bundle re-raise the container
+    sentinel to reach here). An occupied mountpoint resolves to the typed
+    ``mountpoint_occupied`` error; a corrupted bundle re-raises the container
     operator exception unchanged, matching :func:`resolve_store_state`.
     """
     from screencap import config, container
@@ -439,7 +474,13 @@ def mount_now() -> StoreResolution:
             return StoreResolution(StoreState.ERROR, reason=ERROR_KEYCHAIN_LOCKED)
 
         mountpoint = config.get_recordings_dir()
-        return _attempt_mount(bundle, Path(mountpoint), key)
+        try:
+            return _attempt_mount(bundle, Path(mountpoint), key)
+        except container.RogueMountpointError as exc:
+            # Same typed error as resolve_store_state — the unlock verb surfaces
+            # it in-band instead of a 500 (never attached over).
+            logger.warning("mountpoint occupied; unlock cannot mount: %s", exc)
+            return StoreResolution(StoreState.ERROR, reason=ERROR_MOUNTPOINT_OCCUPIED)
 
 
 def relocate_bundle(target_dir: Path) -> "Any":
@@ -537,10 +578,12 @@ __all__ = [
     "ERROR_ENTITLEMENT_MISMATCH",
     "ERROR_KEYCHAIN_LOCKED",
     "ERROR_DOWNGRADE_UNSUPPORTED",
+    "ERROR_MOUNTPOINT_OCCUPIED",
     "store_bundle_path",
     "sealed_sentinel_path",
     "mount_lock_path",
     "is_sealed",
+    "mountpoint_is_occupied",
     "write_sealed_sentinel",
     "clear_sealed_sentinel",
     "host_disk_path",

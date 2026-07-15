@@ -4100,6 +4100,25 @@ async def storage_lock(request: Request) -> JSONResponse:
             )
         )
 
+    # Locking is defined over a MOUNTED store: sealing detaches a live volume.
+    # An ABSENT / ERROR store has nothing to detach, and entering the lock flow
+    # from those states is actively dangerous — the failed-detach unwind below
+    # restores MOUNTED (KTD-15 step 6), which would flip an unavailable store
+    # into one the ``recording.start`` gate trusts (a plaintext-capture hole for
+    # the alive ``mountpoint_occupied`` / key-error states). Refuse upfront so
+    # the unwind's MOUNTED restore is always correct (entry was MOUNTED).
+    entry_state = _store_state_value(request)
+    if entry_state != StoreState.MOUNTED.value:
+        _audit("store_not_mounted")
+        return _api_error_response(
+            errors.StoreLockError(
+                "store_not_mounted",
+                f"The store is not mounted (state: {entry_state}); there is "
+                "nothing to lock.",
+                schema_version=schema_version,
+            )
+        )
+
     # FIX 5 (fast path): if an encrypt cutover is in its non-interruptible swap
     # window, refuse BEFORE stopping the recording — the lock's detach must never
     # run ``hdiutil`` on the mountpoint concurrently with the cutover's swap. The
@@ -4277,7 +4296,7 @@ async def storage_unlock(request: Request) -> JSONResponse:
     # Mount FIRST (ignoring the sentinel); the sentinel is cleared only on success.
     try:
         resolution = await asyncio.to_thread(sl.mount_now)
-    except Exception as exc:  # ROGUE / corrupted bundle → operator hard stop
+    except Exception as exc:  # corrupted bundle / auth failure → operator hard stop
         _audit(errors.ERROR_CODE_INTERNAL)
         return _internal_error_response(
             exc, schema_version=schema_version, request=request
@@ -4288,13 +4307,23 @@ async def storage_unlock(request: Request) -> JSONResponse:
         reason = resolution.reason or ERROR_KEYCHAIN_LOCKED
         retryable = reason == ERROR_KEYCHAIN_LOCKED
         _audit(reason)
-        message = (
-            "The Keychain is locked; unlock your Mac and try again — the store "
-            "stays sealed."
-            if retryable
-            else "The store could not be mounted (the encryption key is "
-            "unreachable). The store stays sealed."
-        )
+        if reason == sl.ERROR_MOUNTPOINT_OCCUPIED:
+            message = (
+                "Existing recordings occupy the recordings directory, so the "
+                "encrypted store can't be mounted over them. The store stays "
+                "sealed; migrate the library into the encrypted store first "
+                "(run: screencap storage encrypt start)."
+            )
+        elif retryable:
+            message = (
+                "The Keychain is locked; unlock your Mac and try again — the "
+                "store stays sealed."
+            )
+        else:
+            message = (
+                "The store could not be mounted (the encryption key is "
+                "unreachable). The store stays sealed."
+            )
         return _api_error_response(
             errors.StoreLockError(
                 reason, message, schema_version=schema_version, retryable=retryable,
@@ -4382,11 +4411,12 @@ async def storage_mount(request: Request) -> JSONResponse:
             )
         )
 
-    # Mount (idempotent). ROGUE / corrupted bundle -> operator hard stop (500),
-    # matching ``storage.unlock``'s ``mount_now`` failure handling.
+    # Mount (idempotent). Corrupted bundle / auth failure -> operator hard stop
+    # (500), matching ``storage.unlock``'s ``mount_now`` failure handling; an
+    # occupied mountpoint comes back as a typed ERROR resolution instead.
     try:
         resolution = await asyncio.to_thread(sl.mount_now)
-    except Exception as exc:  # noqa: BLE001 — ROGUE / corrupted bundle re-raised
+    except Exception as exc:  # noqa: BLE001 — corrupted bundle / auth re-raised
         _audit(errors.ERROR_CODE_INTERNAL)
         return _internal_error_response(
             exc, schema_version=schema_version, request=request
@@ -4394,17 +4424,26 @@ async def storage_mount(request: Request) -> JSONResponse:
 
     if resolution.state is StoreState.ERROR:
         # The key is unreachable (a locked Keychain is retryable; a missing key or
-        # entitlement mismatch is terminal). The store stays unmounted; the surface
-        # shows the typed reason. Mirrors ``storage.unlock``'s ERROR arm.
+        # entitlement mismatch is terminal), or a plaintext library occupies the
+        # mountpoint (needs the encrypt migration). The store stays unmounted; the
+        # surface shows the typed reason. Mirrors ``storage.unlock``'s ERROR arm.
         reason = resolution.reason or ERROR_KEYCHAIN_LOCKED
         retryable = reason == ERROR_KEYCHAIN_LOCKED
         _audit(reason)
-        message = (
-            "The Keychain is locked; unlock your Mac and try again."
-            if retryable
-            else "The encrypted store could not be mounted (the encryption key is "
-            "unreachable)."
-        )
+        if reason == sl.ERROR_MOUNTPOINT_OCCUPIED:
+            message = (
+                "Existing recordings occupy the recordings directory, so the "
+                "encrypted store can't be mounted over them. Migrate the library "
+                "into the encrypted store first (run: screencap storage encrypt "
+                "start)."
+            )
+        elif retryable:
+            message = "The Keychain is locked; unlock your Mac and try again."
+        else:
+            message = (
+                "The encrypted store could not be mounted (the encryption key is "
+                "unreachable)."
+            )
         return _api_error_response(
             errors.StoreLockError(
                 reason,

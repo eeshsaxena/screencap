@@ -144,6 +144,31 @@ def test_init_absent_creates_key_and_bundle(store_env, monkeypatch):
     assert "created" in result.output.lower()
 
 
+def test_init_refuses_plaintext_library_at_mountpoint(store_env, monkeypatch):
+    """A non-empty plaintext recordings dir refuses a bare init (needs migration).
+
+    Creating the bundle while a plaintext library occupies the mountpoint wedges
+    every subsequent daemon start into the occupied-mountpoint error — the
+    library must go through the encrypt-migration flow instead. ``storage init``
+    is the single creation path (KTD-5), so this one guard also covers the app's
+    onboarding auto-init and its "Set up encrypted storage" action."""
+    (store_env.mountpoint / "rec-a").mkdir(parents=True)
+    (store_env.mountpoint / "rec-a" / "recording.db").write_bytes(b"AAA")
+
+    def _boom(*a, **k):
+        raise AssertionError("must not create a bundle over a plaintext library")
+
+    monkeypatch.setattr(container, "create_container_key", _boom)
+    monkeypatch.setattr(container, "create_bundle", _boom)
+
+    result = CliRunner().invoke(cli, ["storage", "init"])
+
+    assert result.exit_code == 1
+    assert not _bundle_path().exists()
+    assert "existing recordings" in _norm(result.output)
+    assert "storage encrypt start" in _norm(result.output)
+
+
 def test_init_idempotent_noop_on_existing_store(store_env, monkeypatch):
     """An already-initialized store is a no-op — no key/bundle creation."""
     _make_bundle()
