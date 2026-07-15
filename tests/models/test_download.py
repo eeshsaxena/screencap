@@ -153,12 +153,35 @@ class TestFailClosed:
 
 
 class TestPinningAndResolution:
-    def test_unpinned_variant_raises(self, tmp_path):
-        # The shipped default model is PLACEHOLDER-pinned until release QA.
+    def test_unpinned_variant_raises(self, tmp_path, monkeypatch):
+        # An unpinned variant (PLACEHOLDER revision, no file hashes) is refused.
+        unpinned = ModelSpec(
+            id="unpinned-model",
+            display_name="Unpinned",
+            license="Apache-2.0",
+            variants={_RUNTIME: Variant(
+                repo="acme/unpinned", revision=registry.PLACEHOLDER,
+                allowed_format="gguf", files=(),
+            )},
+        )
+        monkeypatch.setitem(registry.MODELS, "unpinned-model", unpinned)
         with pytest.raises(ModelNotPinnedError):
             download_model(
-                registry.DEFAULT_MODEL_ID, runtime="llamacpp", models_dir=tmp_path,
+                "unpinned-model", runtime=_RUNTIME, models_dir=tmp_path,
                 snapshot_fn=_good_snapshot,
+            )
+
+    def test_shipped_default_model_is_release_pinned(self):
+        # Regression guard: the shipped manifest must carry real revision SHAs and
+        # per-file sha256 pins for every variant — a PLACEHOLDER here means every
+        # user's onboarding download fails with "not-release-pinned".
+        spec = registry.get_model(registry.DEFAULT_MODEL_ID)
+        assert spec is not None
+        assert spec.variants, "default model has no variants"
+        for runtime, variant in spec.variants.items():
+            assert variant.is_pinned(), (
+                f"variant {runtime!r} of {registry.DEFAULT_MODEL_ID!r} is not "
+                "release-pinned (PLACEHOLDER revision or missing file hashes)"
             )
 
     def test_not_installed_returns_none(self, tmp_path, test_model):
