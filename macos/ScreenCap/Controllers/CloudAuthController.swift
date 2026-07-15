@@ -271,13 +271,15 @@ final class CloudAuthController: ObservableObject {
     /// Cloud-paywall entitlement (billing U8). Display/UX only — the signer's
     /// hard gate is the real enforcement. Read from the `whoami` envelope's
     /// `subscribed` field; false when signed out or absent. Under the two-tier
-    /// split it is the DERIVED cloud signal (`tier == .cloud`) — kept for
-    /// compatibility with the existing upload / onboarding gates.
+    /// split it is the DERIVED cloud signal (`tier == .cloud`) — with the sole
+    /// legacy exception that `subscribed=true` plus an absent tier resolves to
+    /// Cloud — and is kept for the existing upload / onboarding gates.
     @Published private(set) var isSubscribed: Bool = false
     /// Two-tier entitlement (paid-only launch, U11 / KTD-1). Resolved from the
-    /// `whoami` envelope's open `tier` string; `.none` when signed out, absent,
-    /// or offline-stale (the picker reads `status`'s `stale` to avoid a spurious
-    /// "lapsed" — never `tier` presence alone, per KTD-4).
+    /// `whoami` envelope's open `tier` string; a legacy `subscribed=true` claim
+    /// with no tier resolves to Cloud. Otherwise absent means `.none` when signed
+    /// out or fresh, while offline-stale remains distinguishable through
+    /// `status` so the picker avoids a spurious "lapsed" state (KTD-4).
     @Published private(set) var tier: EntitlementTier = .none
     /// The trial → convert → lapse lifecycle position (U11), derived from `tier`,
     /// the envelope's `trial_end`, and whether `status` is stale. Drives the
@@ -464,15 +466,21 @@ final class CloudAuthController: ObservableObject {
     /// from a decoded envelope and the resolved `AuthStatus`. Single seam so the
     /// three read paths (`refresh`, `refreshEntitlement`, post-`login`) stay in
     /// sync. `isSubscribed` stays the derived cloud signal (`tier == .cloud`),
-    /// falling back to the envelope's own `subscribed` for compatibility. The
-    /// `stale` bit is sourced from the resolved status so an offline payer's
+    /// after the legacy missing-tier fallback is resolved. The `stale` bit is
+    /// sourced from the resolved status so an offline payer's
     /// trial state is `.indeterminate` (KTD-4 grace), never a spurious "lapsed".
     private func applyEntitlement(from envelope: AuthWhoAmIEnvelope?, status: AuthStatus) {
-        let resolvedTier = EntitlementTier.from(claim: envelope?.tier)
+        // Legacy subscribers may report `subscribed=true` without a tier until
+        // the grandfather backfill completes. Infer Cloud only for a resolved
+        // signed-in account with no tier; explicit tiers remain authoritative.
+        let resolvedTier: EntitlementTier
+        if status.isSignedIn, envelope?.tier == nil, envelope?.subscribed == true {
+            resolvedTier = .cloud
+        } else {
+            resolvedTier = EntitlementTier.from(claim: envelope?.tier)
+        }
         tier = resolvedTier
-        // Prefer the derived signal; fall back to the raw claim so an older CLI
-        // that sends `subscribed` without `tier` still reads as subscribed.
-        isSubscribed = resolvedTier == .cloud || (envelope?.subscribed ?? false)
+        isSubscribed = resolvedTier == .cloud
         let isStale: Bool
         if case .signedIn(_, _, let stale) = status { isStale = stale } else { isStale = false }
         let previous = trialState
