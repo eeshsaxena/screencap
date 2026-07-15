@@ -80,10 +80,9 @@ class ModelSpec:
         return self.variants.get(runtime)
 
 
-#: The default (and, in v1, only) downloadable model. Revisions + hashes are
-#: PLACEHOLDER until release QA pins them (see module docstring); the download
-#: engine refuses an unpinned variant, so the plumbing ships without shipping an
-#: unverified model.
+#: The default (and, in v1, only) downloadable model. Revisions + per-file
+#: sha256 were recorded 2026-07-15 from a known-good download of each pinned
+#: commit, cross-checked against the Hub's LFS metadata for the weight files.
 DEFAULT_MODEL_ID = "qwen2.5-3b-instruct"
 
 MODELS: dict[str, ModelSpec] = {
@@ -94,15 +93,67 @@ MODELS: dict[str, ModelSpec] = {
         variants={
             RUNTIME_MLX: Variant(
                 repo="mlx-community/Qwen2.5-3B-Instruct-4bit",
-                revision=PLACEHOLDER,
+                revision="4f83f8f146fdf28b512a06562b671d7af4fab457",
                 allowed_format="safetensors",
-                files=(),  # pinned at release QA (name/sha256/size per file)
+                files=(
+                    FileSpec(
+                        name="added_tokens.json",
+                        sha256="58b54bbe36fc752f79a24a271ef66a0a0830054b4dfad94bde757d851968060b",
+                        size_bytes=605,
+                    ),
+                    FileSpec(
+                        name="config.json",
+                        sha256="ceb97c46fe17f523ac42c0f0254fd18d9589f8725f0bbbe0bef541f8ef84547a",
+                        size_bytes=785,
+                    ),
+                    FileSpec(
+                        name="merges.txt",
+                        sha256="8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+                        size_bytes=1_671_853,
+                    ),
+                    FileSpec(
+                        name="model.safetensors",
+                        sha256="f212cf6fb9923281a09c135e05d43a052ee5ef7121f5b1dc0b0fb2de80f97cfd",
+                        size_bytes=1_736_293_090,
+                    ),
+                    FileSpec(
+                        name="model.safetensors.index.json",
+                        sha256="7edb73f1af3c860b1344ece4abe04b258246afdfeba4cb39d3b84a0459890bee",
+                        size_bytes=66_290,
+                    ),
+                    FileSpec(
+                        name="special_tokens_map.json",
+                        sha256="76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd",
+                        size_bytes=613,
+                    ),
+                    FileSpec(
+                        name="tokenizer.json",
+                        sha256="a8506e7111b80c6d8635951a02eab0f4e1a8e4e5772da83846579e97b16f61bf",
+                        size_bytes=7_031_673,
+                    ),
+                    FileSpec(
+                        name="tokenizer_config.json",
+                        sha256="f7c61e32b7a17d19bf8e7037dcb74079a833e53ea9801f24008cac68458f03b7",
+                        size_bytes=7_308,
+                    ),
+                    FileSpec(
+                        name="vocab.json",
+                        sha256="ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+                        size_bytes=2_776_833,
+                    ),
+                ),
             ),
             RUNTIME_LLAMACPP: Variant(
                 repo="bartowski/Qwen2.5-3B-Instruct-GGUF",
-                revision=PLACEHOLDER,
+                revision="f302c64a2269a69fb27b2f9473b362f5bb8e78d8",
                 allowed_format="gguf",
-                files=(),
+                files=(
+                    FileSpec(
+                        name="Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+                        sha256="9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94",
+                        size_bytes=1_929_903_264,
+                    ),
+                ),
             ),
         },
     ),
