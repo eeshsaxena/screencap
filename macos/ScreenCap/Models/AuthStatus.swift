@@ -22,7 +22,9 @@ struct AuthWhoAmIEnvelope: Decodable, Equatable {
     /// hard gate is the real enforcement. Additive/optional, so an older CLI that
     /// omits it decodes fine and resolves to "not subscribed". Kept for
     /// compatibility; under the two-tier split it is the DERIVED cloud signal
-    /// (`subscribed == (tier == "cloud")`), never read independently of `tier`.
+    /// (`subscribed == (tier == "cloud")`). Legacy envelopes may carry
+    /// `subscribed=true` without `tier`; the controller resolves that sole
+    /// compatibility shape as Cloud before deriving its public state.
     let subscribed: Bool?
     /// Two-tier entitlement (paid-only launch, KTD-1/U6): the OPEN `tier` claim
     /// the webhook resolves from the paid price — `"local"` (Local Pro) or

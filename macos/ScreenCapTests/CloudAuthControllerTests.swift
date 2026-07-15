@@ -712,6 +712,57 @@ final class CloudAuthControllerTests: XCTestCase {
         XCTAssertEqual(controller.trialState, .lapsed, "signed-in, no tier, no trial → lapsed/not-entitled")
     }
 
+    func testLegacySubscribedClaimIsCloudAndNotGatedForLapse() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+
+        XCTAssertTrue(controller.isSubscribed)
+        XCTAssertEqual(controller.tier, .cloud)
+        XCTAssertEqual(controller.trialState, .subscribed)
+        XCTAssertFalse(controller.isGatedForLapse)
+    }
+
+    func testExplicitLocalTierOverridesLegacySubscribedClaim() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"local","paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+
+        XCTAssertFalse(controller.isSubscribed)
+        XCTAssertEqual(controller.tier, .localPro)
+        XCTAssertEqual(controller.trialState, .subscribed)
+        XCTAssertFalse(controller.isGatedForLapse)
+    }
+
+    func testUnknownExplicitTierDoesNotUseLegacySubscribedFallback() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":true,"uid":"u","email":"e@x.io","subscribed":true,"tier":"future","paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+
+        XCTAssertFalse(controller.isSubscribed)
+        XCTAssertEqual(controller.tier, .none)
+        XCTAssertEqual(controller.trialState, .lapsed)
+        XCTAssertTrue(controller.isGatedForLapse)
+    }
+
+    func testSignedOutEnvelopeDoesNotUseLegacySubscribedFallback() async {
+        let service = FakeCloudAuthService()
+        service.whoamiData = Data(#"{"ok":true,"schema_version":2,"signed_in":false,"subscribed":true,"paywall_enabled":true}"#.utf8)
+        let controller = CloudAuthController(service: service)
+
+        await controller.refresh()
+
+        XCTAssertEqual(controller.status, .signedOut)
+        XCTAssertFalse(controller.isSubscribed)
+        XCTAssertEqual(controller.tier, .none)
+    }
+
     /// Offline-stale must NOT read as "lapsed/expired" (KTD-4 grace): `tier` is
     /// nil WITH `stale=true`, so the trial state is `.indeterminate` and no
     /// spurious paywall surfaces for an offline payer.
