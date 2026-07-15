@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.26.2] - 2026-07-15
+
+### Fixed
+
+- **daemon:** Occupied recordings mountpoint (a plaintext library still present when a bare `storage init` runs on an install with existing recordings) now serves a typed `mountpoint_occupied` error state instead of crash-looping the daemon on every start
+
 ## [0.26.1] - 2026-07-14
 
 ### Fixed
