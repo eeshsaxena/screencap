@@ -990,6 +990,26 @@ async def test_encrypt_start_refuses_custom_recordings_install(
     assert "classification" in rec and "peer_pid" in rec
 
 
+async def test_encrypt_start_refuses_immutable_env_disabled_install(
+    tmp_path, monkeypatch, audit_at
+):
+    """An env-forced plaintext process cannot be enabled by migration cutover."""
+    monkeypatch.delenv("SCREENCAP_RECORDINGS_DIR", raising=False)
+    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "0")
+    import screencap.config as cfg
+
+    cfg.invalidate_config_cache()
+    app = _build_app(monkeypatch, tmp_path)
+    async with _asgi(app) as client:
+        resp = await client.post("/v0/storage.encrypt.start")
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["reason"] == "container_disabled"
+    rec = __import__("json").loads(audit_at.read_text().splitlines()[-1])
+    assert rec["outcome"] == "container_disabled"
+
+
 async def test_encrypt_status_payload_is_name_free(tmp_path, monkeypatch):
     app = _build_app(monkeypatch, tmp_path)
     async with _asgi(app) as client:
@@ -1001,19 +1021,25 @@ async def test_encrypt_status_payload_is_name_free(tmp_path, monkeypatch):
     assert set(body) >= {"state", "phase", "verified", "deleted", "total"}
 
 
+@pytest.mark.parametrize("container_enabled", [False, True])
 async def test_encrypt_start_success_audits_ok_and_starts_job(
-    tmp_path, monkeypatch, audit_at
+    tmp_path, monkeypatch, audit_at, container_enabled
 ):
-    """A non-custom, container-enabled install: encrypt.start creates the bundle
-    (mocked), starts the job, and audits ``ok`` with peer provenance."""
+    """A non-custom install can opt in from plaintext or resume when enabled.
+
+    ``container_enabled=false`` in mutable config is the upgrade case: clicking
+    Encrypt is the explicit opt-in, and migration flips it only at safe cutover.
+    """
     monkeypatch.delenv("SCREENCAP_RECORDINGS_DIR", raising=False)
-    monkeypatch.setenv("SCREENCAP_CONTAINER_ENABLED", "1")
+    monkeypatch.delenv("SCREENCAP_CONTAINER_ENABLED", raising=False)
     import screencap.config as cfg
 
     # Force a NON-custom recordings dir: default resolution, no config override.
     recs = tmp_path / "recordings"
     monkeypatch.setattr(cfg, "_DEFAULT_RECORDINGS", recs)
-    monkeypatch.setattr(cfg, "_load_toml", lambda: {})
+    monkeypatch.setattr(
+        cfg, "_load_toml", lambda: {"container_enabled": container_enabled}
+    )
     cfg.invalidate_config_cache()
 
     import screencap.daemon.app as app_module

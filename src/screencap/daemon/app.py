@@ -3372,15 +3372,18 @@ async def storage_encrypt_start(request: Request) -> JSONResponse:
                     schema_version=schema_version,
                 )
             )
-        if not config.get_container_enabled():
-            # Migration is what turns the container on; the engine flips the flag
-            # at cutover. But the daemon must be container-capable to serve the
-            # migrated store afterward — refuse a plaintext-only build clearly.
+        if (
+            "SCREENCAP_CONTAINER_ENABLED" in os.environ
+            and not config.get_container_enabled()
+        ):
+            # A config.toml false is mutable: clicking Encrypt explicitly opts in,
+            # and migration flips it at cutover. An env false is immutable inside
+            # this process, so cutover could not make the container authoritative.
             _audit("container_disabled")
             return _api_error_response(
                 errors.StorageMigrationError(
                     "container_disabled",
-                    "The encrypted container is not enabled on this install.",
+                    "The encrypted container is disabled by this process environment.",
                     schema_version=schema_version,
                 )
             )
