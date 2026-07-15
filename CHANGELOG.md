@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.26.4] - 2026-07-15
+
+### Fixed
+
+- **storage:** Encrypt opt-in is no longer refused just because `config.toml`'s container flag is off — a config-level false is mutable (clicking Encrypt explicitly opts in, and migration flips it at cutover), so only an explicit `SCREENCAP_CONTAINER_ENABLED` environment override now blocks the request
+
 ## [0.26.3] - 2026-07-15
 
 ### Fixed
