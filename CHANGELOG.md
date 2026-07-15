@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.26.3] - 2026-07-15
+
+### Fixed
+
+- **models:** Release-pinned the default model manifest (`qwen2.5-3b-instruct`, both mlx and llamacpp variants) with real revisions and per-file sha256 hashes — the shipped manifest previously carried placeholder revisions and no hashes, so the download engine's fail-closed pin gate refused every download, failing onboarding's model step for all users
+
 ## [0.26.2] - 2026-07-15
 
 ### Fixed
