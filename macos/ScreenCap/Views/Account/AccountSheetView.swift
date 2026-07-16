@@ -131,6 +131,10 @@ struct AccountSheetView: View {
     }
 
     private var headerSymbol: String {
+        // The gate success moment reads as confirmation, not a lock.
+        if context == .gate, AccountSheetPolicy.isEntitledSuccess(sheetState) {
+            return "checkmark.circle"
+        }
         switch context {
         case .gate: return "lock.circle"
         case .upload: return "icloud.and.arrow.up"
@@ -159,9 +163,8 @@ struct AccountSheetView: View {
             accountActionsSection
         case .trial, .subscribed:
             identitySection
-            planStatusSection
-            plansSection
-            accountActionsSection
+            entitledPlanCard
+            entitledActions
         case .lapsed:
             identitySection
             plansSection
@@ -209,6 +212,151 @@ struct AccountSheetView: View {
                     .frame(maxWidth: 380)
             }
         }
+    }
+
+    // MARK: - Entitled success rendering (R3/R4/R7/R8/R11)
+
+    /// The consolidated plan card (R3): plan name, current-plan badge, price,
+    /// and — trialing only — the days-left banner, in one grouped element. R11:
+    /// when the held tier is unresolved (`.none`), fall back to today's
+    /// plan-status + buyable rows rather than an empty "No plan" card.
+    @ViewBuilder
+    private var entitledPlanCard: some View {
+        if auth.tier != .none {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(AccountSheetCopy.planName(auth.tier))
+                        .font(.callout.weight(.semibold))
+                    Spacer()
+                    Text(AccountSheetCopy.currentPlanBadge)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                if let price = AccountSheetCopy.planPriceLine(auth.tier) {
+                    Text(price)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                // R4: trialing shows days-left; a paid subscription omits it
+                // (`trialBanner` returns nil for `.subscribed`). The
+                // cancel-before-charge caveat lives in the header subcopy (R1),
+                // not here, so it is not duplicated.
+                if let banner = OnboardingCopy.trialBanner(for: auth.trialState) {
+                    Text(banner)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: 360, alignment: .leading)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(.quaternary)
+            )
+            // R8/AE4 parity + accessibility: the card reads as one VoiceOver
+            // stop, mirroring `tierRow(.currentPlan)` / `checkoutPendingSection`.
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(entitledCardAccessibilityLabel)
+        } else {
+            // R11 fallback: unresolved held tier — keep today's rendering.
+            planStatusSection
+            plansSection
+        }
+    }
+
+    private var entitledCardAccessibilityLabel: String {
+        var parts = [AccountSheetCopy.planName(auth.tier), AccountSheetCopy.currentPlanBadge]
+        if let price = AccountSheetCopy.planPriceLine(auth.tier) { parts.append(price) }
+        if let banner = OnboardingCopy.trialBanner(for: auth.trialState) { parts.append(banner) }
+        return parts.joined(separator: ". ")
+    }
+
+    /// Done (primary, gate only) above the cross-tier switch, then the quiet
+    /// account links (R2/R5/R6/R7). Done owns dismissal in the gate success
+    /// moment, so `dismissFooter` is suppressed for that state.
+    @ViewBuilder
+    private var entitledActions: some View {
+        VStack(spacing: 10) {
+            if context == .gate, let onDismiss {
+                Button(AccountSheetCopy.done) { onDismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: 360)
+            }
+
+            // R5/R6: prominent Switch only when the switch is an upgrade.
+            if auth.tier != .none, let other = otherTier,
+               AccountSheetPolicy.switchIsProminent(heldTier: auth.tier) {
+                switchButton(other, prominent: true)
+                    .frame(maxWidth: 360)
+            }
+
+            // R7: the demoted account links — a quiet downgrade switch (when
+            // applicable), Manage Subscription, and Sign Out.
+            VStack(spacing: 6) {
+                if auth.tier != .none, let other = otherTier,
+                   !AccountSheetPolicy.switchIsProminent(heldTier: auth.tier) {
+                    switchButton(other, prominent: false)
+                }
+                if AccountSheetPolicy.showsManageSubscription(state: sheetState) {
+                    quietLink(AccountSheetCopy.manageSubscription) { beginManage() }
+                        .accessibilityHint("Opens your subscription management page in your browser.")
+                }
+                if AccountSheetPolicy.showsSignOut(state: sheetState) {
+                    quietLink("Sign Out") { showingSignOutConfirm = true }
+                        .disabled(!auth.isSignedIn || uploads.isUploadInFlight)
+                    if auth.isSignedIn && uploads.isUploadInFlight {
+                        Text(AccountSheetCopy.signOutDisabledUploadInFlight)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: 360)
+    }
+
+    /// The tier a held subscription can switch to (the other tier), or nil when
+    /// no confident held tier exists.
+    private var otherTier: EntitlementTier? {
+        switch auth.tier {
+        case .localPro: return .cloud
+        case .cloud: return .localPro
+        case .none: return nil
+        }
+    }
+
+    @ViewBuilder
+    private func switchButton(_ tier: EntitlementTier, prominent: Bool) -> some View {
+        if prominent {
+            Button {
+                beginManage()
+            } label: {
+                Text(AccountSheetCopy.switchPlanButtonTitle(tier) ?? "")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityHint(
+                "Opens your subscription management page in your browser to switch plans."
+            )
+        } else {
+            quietLink(AccountSheetCopy.switchPlanButtonTitle(tier) ?? "") { beginManage() }
+                .accessibilityHint(
+                    "Opens your subscription management page in your browser to switch plans."
+                )
+        }
+    }
+
+    /// A low-emphasis text-link affordance for the demoted account actions (R7),
+    /// visually subordinate to the Done and Switch buttons above.
+    private func quietLink(
+        _ title: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.link)
+            .font(.callout)
     }
 
     // MARK: - Plans (R4/R6/R9)
@@ -467,8 +615,12 @@ struct AccountSheetView: View {
 
     @ViewBuilder
     private var dismissFooter: some View {
-        if let onDismiss {
-            Button(AccountSheetPolicy.dismissTitle(context: context)) {
+        // R2: in the gate success moment the prominent Done in `entitledActions`
+        // owns dismissal, so the bottom footer is suppressed to avoid a
+        // duplicate dismiss. Every other presented state keeps its footer.
+        if let onDismiss,
+           !(context == .gate && AccountSheetPolicy.isEntitledSuccess(sheetState)) {
+            Button(AccountSheetPolicy.dismissTitle(context: context, state: sheetState)) {
                 onDismiss()
             }
             .keyboardShortcut(.cancelAction)

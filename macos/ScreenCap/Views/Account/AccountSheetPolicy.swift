@@ -151,6 +151,25 @@ enum AccountSheetPolicy {
         state != .signedOut
     }
 
+    /// The gate-context success rendering: an already-entitled account (active
+    /// trial or paid subscription) is looking at the gate. KTD-1: the gate only
+    /// *opens* for an unentitled account, so gate+entitled is the
+    /// just-subscribed-in-place (or out-of-band-resolved) success moment. The
+    /// safety property holds — this only ever renders for an entitled account —
+    /// but it is not exclusively an in-place subscribe, so the copy that keys on
+    /// it must be state-asserting, never event-asserting (R1).
+    static func isEntitledSuccess(_ state: AccountSheetState) -> Bool {
+        state == .trial || state == .subscribed
+    }
+
+    /// R5/R6/R11: the cross-tier switch is the prominent upsell only when it is
+    /// an upgrade (held Local Pro → Cloud). A Cloud holder's switch to Local Pro
+    /// is a downgrade and renders quiet, as does an unresolved held tier
+    /// (`.none` — no confident upgrade to push).
+    static func switchIsProminent(heldTier: EntitlementTier) -> Bool {
+        heldTier == .localPro
+    }
+
     // MARK: - Tier buttons
 
     /// How one tier row renders in a given state.
@@ -251,7 +270,9 @@ enum AccountSheetPolicy {
         guard state != .neutral else { return AccountSheetCopy.accountHeadline }
         switch context {
         case .gate:
-            return AccountSheetCopy.gateHeadline
+            return isEntitledSuccess(state)
+                ? AccountSheetCopy.successHeadline
+                : AccountSheetCopy.gateHeadline
         case .upload:
             return state == .signedOut
                 ? AccountSheetCopy.uploadSignInHeadline
@@ -269,6 +290,11 @@ enum AccountSheetPolicy {
         guard state != .neutral else { return AccountSheetCopy.accountSub }
         switch context {
         case .gate:
+            if isEntitledSuccess(state) {
+                return state == .trial
+                    ? AccountSheetCopy.successSubTrial
+                    : AccountSheetCopy.successSubSubscribed
+            }
             return AccountSheetCopy.gateReassurance
         case .upload:
             return state == .signedOut
@@ -279,12 +305,17 @@ enum AccountSheetPolicy {
         }
     }
 
-    /// The dismiss affordance title. The gate context keeps an explicit
-    /// "Not now" (R3 — dismissible while unresolved); other presented contexts
-    /// use a plain Close. Embedded wrappers (Settings pane, onboarding chrome)
-    /// simply omit the affordance by passing no `onDismiss`.
-    static func dismissTitle(context: AccountSheetContext) -> String {
-        context == .gate ? AccountSheetCopy.notNow : AccountSheetCopy.close
+    /// The dismiss affordance title. In gate context an already-entitled
+    /// account (the success moment) gets "Done"; an unentitled account keeps the
+    /// explicit "Not now" (R3 — dismissible while unresolved). Other presented
+    /// contexts use a plain Close. Embedded wrappers (Settings pane, onboarding
+    /// chrome) simply omit the affordance by passing no `onDismiss`.
+    static func dismissTitle(
+        context: AccountSheetContext,
+        state: AccountSheetState
+    ) -> String {
+        guard context == .gate else { return AccountSheetCopy.close }
+        return isEntitledSuccess(state) ? AccountSheetCopy.done : AccountSheetCopy.notNow
     }
 }
 
@@ -303,6 +334,24 @@ enum AccountSheetCopy {
         "Recording and search need an active subscription. Your existing "
         + "recordings are safe on this Mac — you can still browse and export "
         + "them anytime."
+
+    // MARK: - Success framing (gate + entitled, R1)
+
+    /// Shown when an already-entitled account reaches the gate — the
+    /// just-subscribed-in-place success moment. State-asserting, never
+    /// event-asserting: gate+entitled is not exclusively an in-place subscribe
+    /// (see AccountSheetPolicy KTD-1), so no "you just subscribed" phrasing.
+    static let successHeadline = "You're all set"
+    /// Paid-subscription success subcopy.
+    static let successSubSubscribed =
+        "Your subscription is active — recording and search stay unlocked."
+    /// Trial success subcopy: keeps the cancel-before-charge caveat in the
+    /// PRIMARY framing (R1 honesty), not the card line alone, so a not-yet-charged
+    /// trial user is never told they are simply "all set".
+    static let successSubTrial =
+        "Your free trial is active — cancel before it ends in Manage "
+        + "Subscription and you won't be charged."
+    static let done = "Done"
 
     // MARK: - Account framing
 
@@ -382,6 +431,17 @@ enum AccountSheetCopy {
         }
     }
 
+    /// The bare price line for the consolidated plan card. The card renders the
+    /// plan name separately, so this omits the tier name that `tierButtonTitle`
+    /// prepends.
+    static func planPriceLine(_ tier: EntitlementTier) -> String? {
+        switch tier {
+        case .localPro: return PricingCatalog.localProPriceLine
+        case .cloud: return PricingCatalog.cloudPriceLine
+        case .none: return nil
+        }
+    }
+
     /// Plan display name for the signed-in plan line.
     static func planName(_ tier: EntitlementTier) -> String {
         switch tier {
@@ -433,6 +493,7 @@ enum AccountSheetCopy {
     static var renderedStrings: [String] {
         [
             gateHeadline, gateReassurance,
+            successHeadline, successSubSubscribed, successSubTrial, done,
             accountHeadline, accountSub, neutralPlanNote,
             uploadSignInHeadline, uploadSignInSub,
             uploadUpgradeHeadline, uploadUpgradeSub,
