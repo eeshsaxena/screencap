@@ -32,6 +32,12 @@ struct OnboardingDownloadModelStep: View {
         .padding(.horizontal, 100)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task { await download.refreshStatus() }
+        .onAppear {
+            // U7 catch-up (honest status): reaching the onboarding intelligence step
+            // counts as having made/seen the choice, so the first-recording beat does
+            // not re-ask a user who went through the wizard.
+            HUDHintStore().markIntelligenceChoiceSeen()
+        }
     }
 
     @ViewBuilder
