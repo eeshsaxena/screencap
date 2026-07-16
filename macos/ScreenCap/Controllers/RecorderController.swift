@@ -181,6 +181,16 @@ final class RecorderController: ObservableObject {
         "Couldn't turn the microphone on — it may be in use by another app. The "
         + "recording is still running, muted."
 
+    /// Non-terminal advisory when the engine confirmed the MUTE toggle FAILED
+    /// mid-recording (`audio_mute_failed`, SCR-271) — a DB write faulted or the
+    /// stream stop raised, so capture did NOT reliably stop. A failed stop means
+    /// the mic is still live, so the mic state reads unchanged and the user can
+    /// retry; surfaced so the failure is never silent. Distinct from
+    /// `muteRequestFailedAdvisory`, which is the TRANSPORT verb never landing.
+    static let microphoneMuteFailedAdvisory =
+        "Couldn't turn the microphone off. The recording is still running — try "
+        + "again."
+
     /// Non-terminal advisory when the app's own mic permission is denied, so an
     /// unmute never reached the daemon (SCR-254 U9/R3). Paired with the modal for
     /// the menu-bar / HUD-hidden surfaces so the denial is always visible.
@@ -1144,6 +1154,19 @@ final class RecorderController: ObservableObject {
             muted = true
             if case .recording = state {
                 captureAdvisory = Self.microphoneUnmuteFailedAdvisory
+            }
+        case "audio_mute_failed":
+            // ADVISORY, NON-terminal (SCR-271): a raise DURING the mute toggle (a
+            // faulting DB write or a stream-stop PortAudioError) — symmetric to
+            // `audio_unmute_failed`. Without this terminal event the `muteInFlight`
+            // guard, cleared ONLY here, would strand on "Muting…" until the
+            // recording ends. A failed stop means the stream is still capturing, so
+            // keep `muted = false` and surface a non-terminal advisory. Emitted by
+            // recorder.py _apply_audio_mute_command -> audio_mute_failed.
+            muteInFlight = false
+            muted = false
+            if case .recording = state {
+                captureAdvisory = Self.microphoneMuteFailedAdvisory
             }
         default:
             break

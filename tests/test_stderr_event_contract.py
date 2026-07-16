@@ -29,6 +29,7 @@ import pytest
         ("EVENT_CAPTURE_RECOVERED", "capture_recovered"),
         ("EVENT_AUDIO_MUTED", "audio_muted"),
         ("EVENT_AUDIO_UNMUTED", "audio_unmuted"),
+        ("EVENT_AUDIO_MUTE_FAILED", "audio_mute_failed"),
     ],
 )
 def test_daemon_bus_event_type_constants_are_exported(name: str, expected: str) -> None:

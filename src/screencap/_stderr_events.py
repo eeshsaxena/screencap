@@ -87,6 +87,18 @@ EVENT_AUDIO_UNMUTED = "audio_unmuted"
 # recording keeps running muted. Carries ``reason`` (closed-set label) so it can
 # ride the daemon EventBus without leaking runtime text.
 EVENT_AUDIO_UNMUTE_FAILED = "audio_unmute_failed"
+# SCR-271: the MUTE toggle itself FAILED mid-recording — a step raised before the
+# confirming ``audio_muted`` could fire (the ``muted_intervals`` DB write faulted,
+# or ``stream.stop()`` raised a PortAudioError on a device unplug). Symmetric to
+# ``audio_unmute_failed``: ADVISORY, no exit code, NEVER terminal — a failed mute
+# must not tear the recording down. The app clears its "Muting…" in-flight guard
+# ONLY on a confirming/failed event, so without this a raised toggle strands the
+# control forever (the exact strand PR #400 fixed, but on the failure path). A
+# failed stop means the stream is still capturing, so the app keeps ``muted=false``
+# and surfaces a non-terminal advisory. Carries no ``reason`` — the causes are
+# heterogeneous (SQLite vs PortAudio) with no useful closed set, and the app's
+# advisory does not read one.
+EVENT_AUDIO_MUTE_FAILED = "audio_mute_failed"
 # SCR-214 U4: capture-pause / resume. Distinct from mic-mute — pause stops the
 # WHOLE capture surface (video + screenshots + audio), so a paused span records
 # NOTHING and reads "nothing captured" (AE1), whereas a mic-muted span still
@@ -250,6 +262,7 @@ __all__ = [
     "EVENT_AUDIO_MUTED",
     "EVENT_AUDIO_UNMUTED",
     "EVENT_AUDIO_UNMUTE_FAILED",
+    "EVENT_AUDIO_MUTE_FAILED",
     "AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE",
     "AUDIO_UNMUTE_FAILED_REASONS",
     "EVENT_RECORDING_PAUSED",
