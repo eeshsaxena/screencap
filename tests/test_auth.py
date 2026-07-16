@@ -572,6 +572,26 @@ def test_loopback_handler_ignores_non_oauth_probe_then_accepts_callback():
         server.server_close()
 
 
+def test_callback_page_success_vs_error_are_distinct_and_self_contained():
+    # The loopback page must render an honest per-outcome state (a declined
+    # callback is NOT a success screen) and stay fully self-contained — no
+    # external font/script/style/image request from a privacy-focused tool.
+    from screencap.auth_pages import render_callback_page
+
+    ok = render_callback_page(success=True).decode("utf-8")
+    fail = render_callback_page(success=False).decode("utf-8")
+
+    assert "SIGNED IN" in ok and "all set" in ok
+    assert "SIGN-IN FAILED" in fail and "didn" in fail
+    assert "SIGNED IN" not in fail
+
+    for page in (ok, fail):
+        assert page.lstrip().startswith("<!doctype html>")
+        # No off-machine fetches: no absolute URLs and no <script>/<link> tags.
+        assert "http://" not in page and "https://" not in page
+        assert "<script" not in page and "<link" not in page
+
+
 def test_logout_returns_true_when_delete_fails_but_token_present(fake_keyring, monkeypatch):
     # #11: a Keychain delete failure (locked / backend error, not "nothing
     # stored") must still report that a credential existed, never "already signed
