@@ -259,9 +259,11 @@ struct AccountSheetView: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(entitledCardAccessibilityLabel)
         } else {
-            // R11 fallback: unresolved held tier — keep today's rendering.
+            // R11 fallback: unresolved held tier (a forward-compat tier the app
+            // doesn't recognize yet). Show the trial status but NOT the buyable
+            // plan rows — offering "Buy" under a success header to an already-
+            // entitled account would be a billing-honesty contradiction.
             planStatusSection
-            plansSection
         }
     }
 
@@ -286,7 +288,8 @@ struct AccountSheetView: View {
             }
 
             // R5/R6: prominent Switch only when the switch is an upgrade.
-            if auth.tier != .none, let other = otherTier,
+            // `otherTier` is already nil for `.none`, so the binding guards it.
+            if let other = otherTier,
                AccountSheetPolicy.switchIsProminent(heldTier: auth.tier) {
                 switchButton(other, prominent: true)
                     .frame(maxWidth: 360)
@@ -295,7 +298,7 @@ struct AccountSheetView: View {
             // R7: the demoted account links — a quiet downgrade switch (when
             // applicable), Manage Subscription, and Sign Out.
             VStack(spacing: 6) {
-                if auth.tier != .none, let other = otherTier,
+                if let other = otherTier,
                    !AccountSheetPolicy.switchIsProminent(heldTier: auth.tier) {
                     switchButton(other, prominent: false)
                 }

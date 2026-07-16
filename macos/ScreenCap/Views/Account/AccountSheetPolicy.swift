@@ -509,6 +509,7 @@ enum AccountSheetCopy {
         + [EntitlementTier.localPro, .cloud].compactMap(tierButtonTitle)
         + [EntitlementTier.localPro, .cloud].compactMap(switchPlanButtonTitle)
         + [EntitlementTier.localPro, .cloud].compactMap(tierDetail)
+        + [EntitlementTier.localPro, .cloud].compactMap(planPriceLine)
         + [EntitlementTier.localPro, .cloud, .none].map(planName)
     }
 }
