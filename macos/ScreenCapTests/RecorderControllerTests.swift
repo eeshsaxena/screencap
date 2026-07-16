@@ -335,6 +335,24 @@ final class RecorderControllerTests: XCTestCase {
         )
     }
 
+    func testForceStoppedLocalRecordingSurfacesProcessingWarningNotUpload() {
+        let recorder = RecorderController()
+
+        recorder._testSetPresentation(state: .stopping(quitting: false))
+        // A local recording's finalized event carries destination "local" — the
+        // banner must not mention uploads (nothing was uploaded). Exercises the
+        // full stderr-JSON decode path (the `destination` CodingKey).
+        recorder._testHandleStderrLine(
+            #"{"type":"recording_finalized","schema_version":1,"force_stopped":true,"destination":"local"}"#
+        )
+        recorder._testHandleProcessTerminated(exitCode: 0)
+
+        XCTAssertEqual(
+            recorder.lastError,
+            "Recording stopped before it finished processing. Open the recording to finish it."
+        )
+    }
+
     func testRecorderErrorMessageCarriesSharedRecorderWarningText() {
         let view = RecorderErrorMessage(message: "Disk is full — recording stopped.")
 

@@ -151,6 +151,9 @@ class ChunkProcessor:
         self._flush_ack_counter = flush_ack_counter
         self._flush_lock = flush_lock
         self._cloud_intent = cloud_intent
+        # Cached "is this recording's frozen destination local-only?" — resolved
+        # once from ``.recording_intent`` on first use (see _recording_is_local).
+        self._is_local_recording: bool | None = None
         self._privacy_mode = privacy_mode
         # SCR-35: manifest production (mode selection + blocked_intervals +
         # partial-file cleanup) is owned by the ChunkManifest seam, injected as
@@ -538,6 +541,34 @@ class ChunkProcessor:
             return None
         return self._ledger
 
+    def _recording_is_local(self) -> bool:
+        """Whether this recording's FROZEN destination is local-only (no upload).
+
+        Read once from ``.recording_intent`` — the same single source of truth
+        the terminal stage routes on (``catalog.read_intent_policy`` /
+        ``terminal_stage._route_local``) — and cached. Keyed on the frozen
+        destination, NOT ``cloud_intent``/``_upload_enabled``: a cloud recording
+        started with ``--no-live-upload`` has ``_upload_enabled=False`` yet is
+        still uploaded by the terminal stage, so only the destination reliably
+        separates "never uploaded" from "uploaded later".
+
+        Fail-safe to False (the cloud / mark_uploaded path — the pre-existing
+        behavior) when the intent is missing or unreadable, so a read failure can
+        never mislabel a cloud recording as local. A live recording always has a
+        frozen ``.recording_intent`` (written at start, before any chunk rotates).
+        """
+        if self._is_local_recording is None:
+            is_local = False
+            try:
+                intent_path = self._capture_dir / ".recording_intent"
+                if intent_path.exists():
+                    dest = json.loads(intent_path.read_text() or "{}").get("destination")
+                    is_local = dest == "local"
+            except Exception:
+                is_local = False
+            self._is_local_recording = is_local
+        return self._is_local_recording
+
     def _mirror_status_to_ledger(self, idx: int, status: "ChunkStatus") -> None:
         """Project a settled ``ChunkStatus`` onto the U1 ledger upload-state.
 
@@ -557,7 +588,17 @@ class ChunkProcessor:
         try:
             upload_state = from_chunk_status(status)
             if upload_state == UploadState.UPLOADED:
-                ledger.mark_uploaded(idx)
+                if self._recording_is_local():
+                    # A LOCAL recording still settles its chunks to EMITTED so the
+                    # sentinel gate reads "complete" — but EMITTED here means
+                    # "processing done", NOT "uploaded". Record LOCAL_DONE (matching
+                    # terminal_stage._route_local) so the ledger — and the catalog
+                    # `uploaded` flag / Library badge derived from
+                    # `upload_state='uploaded'` — never claims a local recording was
+                    # uploaded.
+                    ledger.mark_local_done(idx)
+                else:
+                    ledger.mark_uploaded(idx)
             elif upload_state == UploadState.SKIPPED:
                 ledger.mark_skipped(idx)
             elif upload_state == UploadState.FAILED:

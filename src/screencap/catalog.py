@@ -584,10 +584,17 @@ def _ledger_probe(db_path: Path) -> _LedgerProbe | None:
     try:
         if not has_table(conn, "pipeline_chunk_state"):
             return None  # no ledger — fall back to file-presence heuristics.
+        # A LOCAL_DONE chunk is local-only by definition (terminal_stage._route_local
+        # marks it and never uploads), so it must never count as "uploaded" even if
+        # a stale ``upload_state='uploaded'`` lingers on it. Gating on lifecycle here
+        # keeps the catalog `uploaded` flag / Library badge honest and repairs any
+        # recording whose live path mislabeled a local chunk before the write-path fix.
+        # Genuinely-uploaded chunks are lifecycle 'uploaded'/'evicted' (an EVICTED
+        # chunk keeps its UPLOADED upload_state), so they still count.
         has_uploaded = (
             conn.execute(
                 "SELECT 1 FROM pipeline_chunk_state "
-                "WHERE upload_state='uploaded' LIMIT 1"
+                "WHERE upload_state='uploaded' AND lifecycle != 'local_done' LIMIT 1"
             ).fetchone()
             is not None
         )
