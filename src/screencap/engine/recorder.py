@@ -2726,8 +2726,11 @@ def _apply_audio_mute_command(
     closures so the confirmed-state ordering is unit-testable with a fake
     controller + in-memory DB.
 
-    Returns the emitted event name, or ``None`` when the stream was already in
-    the requested state (idempotent no-op).
+    Returns the emitted event name. A confirming ``audio_muted`` /
+    ``audio_unmuted`` event fires for EVERY (non-failed) request — including an
+    idempotent no-op where the stream was already in the requested capture state
+    — because the app clears its transitional "Muting…"/"Unmuting…" guard ONLY on
+    that event; a swallowed no-op would strand the control forever.
     """
     from screencap._stderr_events import (
         AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE,
@@ -2750,13 +2753,19 @@ def _apply_audio_mute_command(
         # durable at command receipt and over-covers the stop latency even if a
         # later step fails — we must never stop capture leaving the over-cover
         # audio with no interval to drop it. Only when actually capturing;
-        # otherwise this is an idempotent no-op with no interval.
+        # otherwise there is no captured audio to mark, so no interval.
         if controller.capturing:
             crud.open_muted_interval(session, recording, ts)
-            event = controller.apply_muted(True)
-            emit(EVENT_AUDIO_MUTED, muted=True)
-            return event
-        return controller.apply_muted(True)  # already muted — no-op, no interval
+        controller.apply_muted(True)
+        # One-verb-one-event (KTD4): confirm EVERY mute request with exactly one
+        # audio_muted event — including the idempotent no-op where the stream was
+        # not capturing (an audio-on recording whose mic stream never started, or
+        # a paused recording). The app arms an in-flight guard on dispatch and
+        # clears it ONLY on this event, so a swallowed no-op strands the control
+        # on "Muting…" until the recording ends. A not-capturing stream is
+        # already effectively muted, so muted=True is truthful.
+        emit(EVENT_AUDIO_MUTED, muted=True)
+        return EVENT_AUDIO_MUTED
 
     # Unmute may (re)acquire the device, which can fail (denied / unavailable).
     try:
@@ -2769,10 +2778,15 @@ def _apply_audio_mute_command(
         )
         return EVENT_AUDIO_UNMUTE_FAILED
     if event is not None:
-        # Capture genuinely resumed: close the span and confirm.
+        # Capture genuinely resumed: close the span (the mute axis no longer
+        # suppresses audio). A no-op unmute leaves the DB untouched.
         crud.close_muted_interval(session, recording, ts)
-        emit(EVENT_AUDIO_UNMUTED, muted=False)
-    return event
+    # One-verb-one-event (KTD4): confirm EVERY non-failed unmute request too,
+    # including the idempotent no-op (capture already running, or still
+    # suppressed by an independent pause) — without this the in-flight guard
+    # strands on "Unmuting…" exactly as the mute path did.
+    emit(EVENT_AUDIO_UNMUTED, muted=False)
+    return event or EVENT_AUDIO_UNMUTED
 
 
 def _make_set_muted_handler(mute_control_q):

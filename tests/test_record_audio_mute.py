@@ -115,8 +115,12 @@ def test_mute_while_capturing_opens_interval_and_emits_confirmed(recording_db):
     assert events == [(EVENT_AUDIO_MUTED, {"muted": True})]
 
 
-def test_mute_when_already_muted_is_noop(recording_db):
-    # Audio-off recording never unmuted: not capturing, already muted.
+def test_mute_when_not_capturing_still_confirms(recording_db):
+    # Not capturing but requested to mute (here: an already-muted, audio-off
+    # recording). The stream toggle is an idempotent no-op — no device, no
+    # interval — but the confirming audio_muted event MUST still fire. The app
+    # arms an in-flight guard on dispatch and clears it ONLY on this event, so a
+    # swallowed no-op strands the control on "Muting…" (one-verb-one-event).
     ctrl, made = _controller(initially_muted=True)
     ctrl.start_initial()  # acquires nothing
     events, emit = _emit_recorder()
@@ -129,10 +133,42 @@ def test_mute_when_already_muted_is_noop(recording_db):
         emit=emit,
     )
 
-    assert result is None
+    assert result == EVENT_AUDIO_MUTED
     assert made == []  # no device ever constructed
-    assert _all_intervals(recording_db) == []  # no interval for a no-op mute
-    assert events == []  # no confirmed event for a no-op
+    assert _all_intervals(recording_db) == []  # no interval — nothing was captured
+    # Confirmed even though nothing toggled: a not-capturing stream is already
+    # effectively muted, so muted=True is truthful.
+    assert events == [(EVENT_AUDIO_MUTED, {"muted": True})]
+
+
+def test_mute_confirms_even_when_audio_stream_never_started(recording_db):
+    # The reported bug: a recording started with audio ON but whose mic stream
+    # failed to start (device busy / transient CoreAudio error). record_audio
+    # swallows the start_initial() failure and keeps recording NOT capturing,
+    # while the daemon still echoes audio=on, so the app shows "Mic on" and lets
+    # the user tap mute. With capturing False the toggle is a no-op — but the
+    # confirming audio_muted event must still fire or the control hangs on
+    # "Muting…" until the recording ends.
+    ctrl, made = _controller(initially_muted=False, construct_raises=True)
+    try:
+        ctrl.start_initial()  # opens the device → raises; record_audio swallows it
+    except Exception:  # noqa: BLE001 — mirror record_audio's swallow of the failure
+        pass
+    assert ctrl.capturing is False  # audio-on, but the mic never came up
+    events, emit = _emit_recorder()
+
+    result = _apply_audio_mute_command(
+        ctrl,
+        {"muted": True, "ts": 1010.0},
+        session=recording_db.session,
+        recording=recording_db.recording,
+        emit=emit,
+    )
+
+    assert result == EVENT_AUDIO_MUTED
+    assert made == []  # the device open raised — nothing constructed
+    assert _all_intervals(recording_db) == []  # no interval — nothing was captured
+    assert events == [(EVENT_AUDIO_MUTED, {"muted": True})]
 
 
 def test_unmute_closes_interval_and_emits_confirmed(recording_db):
@@ -157,6 +193,54 @@ def test_unmute_closes_interval_and_emits_confirmed(recording_db):
     assert rows[0].start_ts == 1010.0
     assert rows[0].end_ts == 1025.0
     assert events[-1] == (EVENT_AUDIO_UNMUTED, {"muted": False})
+
+
+def test_unmute_when_already_capturing_still_confirms(recording_db):
+    # Symmetric to the mute no-op: an unmute whose stream is already capturing is
+    # an idempotent no-op (no interval to close), but the confirming audio_unmuted
+    # event MUST still fire or the app's in-flight guard strands on "Unmuting…".
+    ctrl, _made = _controller(initially_muted=False)
+    ctrl.start_initial()  # capturing (already unmuted)
+    events, emit = _emit_recorder()
+
+    result = _apply_audio_mute_command(
+        ctrl,
+        {"muted": False, "ts": 1025.0},
+        session=recording_db.session,
+        recording=recording_db.recording,
+        emit=emit,
+    )
+
+    assert result == EVENT_AUDIO_UNMUTED
+    assert ctrl.capturing is True
+    assert _all_intervals(recording_db) == []  # nothing opened, nothing to close
+    assert events == [(EVENT_AUDIO_UNMUTED, {"muted": False})]
+
+
+def test_unmute_while_paused_still_confirms(recording_db):
+    # Unmute while ALSO paused: apply_muted(False) clears the mute intent but
+    # capture stays OFF (pause is an independent suppression axis). No interval to
+    # close, yet the confirming audio_unmuted MUST still fire — else the control
+    # strands on "Unmuting…". Distinct from the already-capturing no-op above: this
+    # exercises the _paused branch (capture off), guarding against a future gate on
+    # controller.capturing that would re-introduce the mute bug symmetrically.
+    ctrl, _made = _controller(initially_muted=True)
+    ctrl.start_initial()  # audio-off: nothing acquired
+    ctrl.apply_paused(True)  # now paused too; capturing stays False
+    events, emit = _emit_recorder()
+
+    result = _apply_audio_mute_command(
+        ctrl,
+        {"muted": False, "ts": 1040.0},
+        session=recording_db.session,
+        recording=recording_db.recording,
+        emit=emit,
+    )
+
+    assert result == EVENT_AUDIO_UNMUTED
+    assert ctrl.capturing is False  # still suppressed by pause
+    assert _all_intervals(recording_db) == []
+    assert events == [(EVENT_AUDIO_UNMUTED, {"muted": False})]
 
 
 def test_unmute_denied_emits_advisory_and_stays_muted(recording_db):
