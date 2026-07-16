@@ -522,43 +522,6 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(r.affordance, .hidden)
     }
 
-    // MARK: - Consent nudge (AE1)
-
-    /// The standing nudge renders while a cloud row is the rendered selection
-    /// and any relevant toggle (summary/recall) is off; both on → no nudge.
-    /// With both off it is the AE1 surface explaining why nothing is sent.
-    func testNudgeVisibleForCloudSelectionUnlessBothConsentsOn() {
-        let cases: [(summary: Bool, recall: Bool, expected: Bool)] = [
-            (false, false, true),   // AE1 — nothing is sent; the nudge explains why
-            (true, false, true),
-            (false, true, true),
-            (true, true, false),
-        ]
-        for c in cases {
-            XCTAssertEqual(
-                IntelligenceSelectionModel.consentNudgeVisible(
-                    selectedRowID: "openai",
-                    summaryCloudConsent: c.summary, recallCloudConsent: c.recall
-                ),
-                c.expected,
-                "summary=\(c.summary) recall=\(c.recall)"
-            )
-        }
-    }
-
-    /// Local rows never nudge — nothing leaves regardless of the toggles.
-    func testNudgeNeverForLocalRows() {
-        for rowID in ["on-device", "local-server"] {
-            XCTAssertFalse(
-                IntelligenceSelectionModel.consentNudgeVisible(
-                    selectedRowID: rowID,
-                    summaryCloudConsent: false, recallCloudConsent: false
-                ),
-                "\(rowID) is local — no consent nudge"
-            )
-        }
-    }
-
     // MARK: - Just-added highlight (R8)
 
     func testHighlightSetsOnFlowCompletion() {

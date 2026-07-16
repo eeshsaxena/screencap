@@ -16,7 +16,7 @@ import Foundation
 /// - Write routing by row kind + the persisted-value tap guard (KTD1/KTD2).
 /// - REMOTE-endpoint rows render but are not selectable (R9 / AE3).
 /// - The merged on-device row's state matrix (KTD3).
-/// - The standing consent nudge and just-added highlight predicates (KTD4/KTD7).
+/// - The just-added highlight predicate (KTD4/KTD7).
 
 // MARK: - Rows and groups
 
@@ -192,10 +192,6 @@ enum IntelligenceSelectionModel {
     /// mapped render-only; tapping a row performs the healing write-through.
     static let reconcileNeededCopy =
         "Saved model setting is from an earlier version — pick a model to update it."
-    /// AE1 — the standing consent nudge while a cloud row is the rendered
-    /// selection and a relevant task toggle is off (fallback-honest: off = not sent).
-    static let consentNudgeCopy =
-        "Your cloud model only handles the tasks you turn on below — while a task is off, nothing is sent for it."
     /// R8 — the just-added chip rendered (with an accent border) on the row the
     /// flow reported, until `JustAddedHighlight`'s predicate clears it.
     static let justAddedChipLabel = "JUST ADDED"
@@ -212,26 +208,29 @@ enum IntelligenceSelectionModel {
 
     // MARK: Consent section copy (U5 — R10 plain per-row language)
 
-    /// The consent section header.
+    /// The section header. Since the per-task toggles were removed (KTD1 —
+    /// connecting a cloud provider is the consent), this section is a
+    /// transparency panel describing what a connected cloud model does, not a
+    /// control panel.
     static let cloudTasksSectionTitle = "WHAT CLOUD MODELS MAY DO"
-    /// R8 — the summaries/titles toggle (`summary_cloud_consent`). The cloud
-    /// fallback receives the recording's already-stripped activity summary —
-    /// text only (app names, window titles, transcript snippets), never frames.
+    /// R8/KTD1 — summaries/titles. When they run on a connected cloud model
+    /// (as the on-device-unavailable fallback), the model receives the
+    /// recording's already-stripped activity summary — text only (app names,
+    /// window titles, transcript snippets), never frames. Informational, no toggle.
     static let summaryConsentRowTitle = "Summaries & titles"
     static let summaryConsentRowCaption =
         "Sends text from that one recording — app and window titles plus the transcript. Never screen images or video."
-    /// R10 — the recall-answers toggle (`recall_cloud_consent`). The recall
-    /// path sends the question plus the retrieved ALLOW-only text snippets;
-    /// the egress guard rejects frame bytes.
+    /// R10/KTD1 — recall-answers. The recall path sends the question plus the
+    /// retrieved ALLOW-only text snippets; the egress guard rejects frame bytes.
     static let recallConsentRowTitle = "Answers about your recordings"
     static let recallConsentRowCaption =
         "Sends your question and the matching text snippets from your recordings. Never screen images or video."
-    /// R7 — day-split/label is a fixed on-device rule (degrades to a local
-    /// heuristic, never cloud), shown as a chip, not a toggle.
+    /// R7/KTD1 — day-split/label runs on your connected model: on-device when
+    /// available, the configured cloud model when there isn't one (over the
+    /// ALLOW-only stripped text summary — never frames). Informational, no toggle.
     static let daySplitRowTitle = "Splitting & labeling the day"
     static let daySplitRowCaption =
-        "Stays on this Mac — never a cloud task, even with a cloud model connected."
-    static let daySplitChipLabel = "On-device"
+        "Runs on your connected model — on-device when available, your cloud model when there isn't one. Sends text only, never screen images."
     /// R9 — the consent-governed Intelligence tasks never send frames; a fixed
     /// rule, not a toggle. Scoped to the named tasks: the legacy auto-namer
     /// (`src/screencap/namer.py`, tracked as a follow-up) has vendor-API paths
@@ -266,7 +265,6 @@ enum IntelligenceSelectionModel {
         startDaemonDownloadReason,
         modelSectionTitle, addProviderRowTitle,
         reconcileNeededCopy,
-        consentNudgeCopy,
         justAddedChipLabel,
         manageAccessoryTitle, setUpAccessoryTitle, connectAccessoryTitle,
         onDeviceReadyAppleCopy, onDeviceReadyDownloadedCopy,
@@ -275,7 +273,7 @@ enum IntelligenceSelectionModel {
         cloudTasksSectionTitle,
         summaryConsentRowTitle, summaryConsentRowCaption,
         recallConsentRowTitle, recallConsentRowCaption,
-        daySplitRowTitle, daySplitRowCaption, daySplitChipLabel,
+        daySplitRowTitle, daySplitRowCaption,
         framesRowTitle, framesRowCaption, framesChipLabel,
         consentTrustFooter,
     ]
@@ -566,18 +564,4 @@ enum IntelligenceSelectionModel {
         }
     }
 
-    // MARK: Consent nudge (AE1)
-
-    /// The standing nudge renders while a cloud (BYO) row is the rendered
-    /// selection and any relevant consent toggle is off — with both off it
-    /// explains why nothing is sent anywhere (AE1); with both on, no nudge.
-    /// Local rows never nudge (nothing leaves regardless of toggles).
-    static func consentNudgeVisible(
-        selectedRowID: String,
-        summaryCloudConsent: Bool,
-        recallCloudConsent: Bool
-    ) -> Bool {
-        guard ConnectProviderModel.isBYOProvider(selectedRowID) else { return false }
-        return !(summaryCloudConsent && recallCloudConsent)
-    }
 }
