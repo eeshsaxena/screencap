@@ -372,8 +372,20 @@ struct JournalCard: View {
 
     @State private var hovering = false
     @State private var renamingTask: RecordingTask?
+    /// App-wide intelligence settings — combined with the fresh on-device probe to
+    /// compose the honest verdict (U5) the empty-state resolves against (U6).
+    @EnvironmentObject private var intelligence: IntelligenceController
 
     private var badge: LibraryBadge { LibraryBadge.forRecording(recording) }
+
+    /// The live "usable" verdict (nil while settings are still loading → "unknown").
+    private var verdict: IntelligenceVerdict? {
+        IntelligenceVerdict.compose(probe: OnDeviceModelStatus.probe(), settings: intelligence.settings)
+    }
+    /// The honest state for this recording's task display (R7 / KTD3 / KTD6).
+    private var honestState: RecordingHonestState {
+        RecordingHonestState.resolve(reason: journalTasks.reason(for: recording), verdict: verdict)
+    }
 
     /// The recording's locally-named task segments, ordered by task index.
     private var tasks: [RecordingTask] { journalTasks.tasks(for: recording) }
@@ -462,6 +474,12 @@ struct JournalCard: View {
     private var taskBreakdown: some View {
         if !breakdown.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
+                // U6: `mechanicalOnly` HAS tasks (heuristic-named) — a banner ABOVE the
+                // populated list, not an empty-state string, so it reads distinctly from
+                // AI-named `produced` tasks (R7d).
+                if honestState == .mechanicalOnly {
+                    honestLabel("Mechanical names — set up intelligence for real task names", tone: .attention)
+                }
                 ForEach(breakdown) { task in
                     taskRow(task)
                 }
@@ -473,14 +491,40 @@ struct JournalCard: View {
             }
             .padding(.top, 5)
         } else if resolved {
-            // Graceful empty state (R10): footage exists and is searchable, it
-            // just hasn't been carved into a task yet.
+            honestEmptyState
+                .padding(.top, 5)
+        }
+    }
+
+    /// The honest empty-state message for a recording with no AI-named tasks (R7).
+    /// Distinct copy per state so no empty recording is ambiguous (KTD3 / KTD6).
+    @ViewBuilder
+    private var honestEmptyState: some View {
+        switch honestState {
+        case .notSetUp:
+            honestLabel("No tasks — intelligence isn't set up", tone: .attention)
+        case .couldntRun:
+            honestLabel("Couldn't name this recording", tone: .attention)
+        case .inProgress:
+            honestLabel("Still processing…", tone: .quiet)
+        case .nothingToName:
+            honestLabel("Nothing to name in this recording", tone: .quiet)
+        case .producedTasks, .mechanicalOnly, .unknown:
+            // producedTasks/mechanicalOnly never reach here (tasks are present); unknown
+            // = legacy recording / older daemon → the neutral, searchable-footage copy.
             Text("unsplit — still searchable")
                 .font(SCTypography.mono(size: 10.5))
                 .foregroundStyle(Color.scInkMuted)
-                .padding(.top, 5)
                 .accessibilityLabel("Unsplit, still searchable")
         }
+    }
+
+    private enum HonestTone { case attention, quiet }
+    private func honestLabel(_ text: String, tone: HonestTone) -> some View {
+        Text(text)
+            .font(SCTypography.mono(size: 10.5))
+            .foregroundStyle(tone == .attention ? Color.scInkSecondary : Color.scInkMuted)
+            .accessibilityLabel(text)
     }
 
     private func taskRow(_ task: RecordingTask) -> some View {
