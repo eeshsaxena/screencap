@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.27.0] - 2026-07-16
+
+### Added
+
+- **segmentation:** Masked-frame evidence channel for cloud intelligence providers — fail-closed masked-still egress producer, frames attached at cloud-bound egress points, Gemini multimodal frame support with graceful omission when a provider can't accept them (SCR-272)
+- **consent:** Default-off `frames_cloud_consent` gate governing whether masked frames are sent to cloud providers (SCR-272)
+- **daemon:** `intelligence.status` verb exposing usable-verdict config facts; per-recording segmentation outcome reason persisted and surfaced on `tasks.list`
+- **auth:** Branded loopback sign-in page with an honest failure state
+
+### Changed
+
+- **intelligence:** Cloud-task consent is on by default — connecting a provider is treated as the consent
+
+### Fixed
+
+- **pipeline:** Stop marking local recordings as uploaded
+- **engine:** Confirm every mute toggle so the HUD can't strand on "Muting…"
+- **review:** Harden segmentation-outcome read to fail-safe with a code-owned mechanical flag
+
 ## [0.26.4] - 2026-07-15
 
 ### Fixed
