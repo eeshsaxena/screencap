@@ -1129,20 +1129,28 @@ class PipelineLedger:
         ``None`` for a legacy recording captured before U2 (no row, or the table
         absent) — the app renders that as the neutral "unknown" state (KTD6), never
         a false "not set up".
+
+        Fail-safe: **any** SQLite error (missing table on a pre-U2 db, a lock/IO
+        error under concurrent write, or a corrupt page) resolves to ``None``, not a
+        raise. This method is also the authority the terminal-stage monotonic row
+        guard consults, so it must never propagate out of the strictly-fail-open
+        segmentation path — ``None`` degrades to the neutral "unknown"/not-produced
+        direction on every caller.
         """
-        conn = self._connect()
+        conn = None
         try:
-            try:
-                row = conn.execute(
-                    "SELECT reason FROM pipeline_recording_outcome "
-                    "WHERE recording_id=?",
-                    (self._recording_id,),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                return None  # table absent on a pre-U2 recording.db
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT reason FROM pipeline_recording_outcome "
+                "WHERE recording_id=?",
+                (self._recording_id,),
+            ).fetchone()
             return None if row is None else str(row[0])
+        except sqlite3.Error:
+            return None
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def insert_task_segment(self, seg: TaskSegmentRow) -> int:
         """Insert one USER task segment; return its allocated ``task_index`` (U5/U7).

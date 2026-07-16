@@ -1078,6 +1078,7 @@ def _run_local_segmentation(
         _record(Branch.FAILED)
         return
 
+    from_heuristic = False
     if decision.action is DegradeAction.USE_PROVIDER:
         tasks = decision.tasks
     elif decision.action is DegradeAction.HEURISTIC:
@@ -1102,6 +1103,7 @@ def _run_local_segmentation(
         if not tasks:
             try:
                 tasks = _heuristic_local_tasks(recording_dir)
+                from_heuristic = True
             except Exception as exc:  # noqa: BLE001 — heuristic must never block terminal
                 logger.debug(
                     "terminal_stage: idle-gap heuristic failed open for %s (%s)",
@@ -1121,16 +1123,12 @@ def _run_local_segmentation(
         _record(Branch.FAILED)
         return
 
-    # Classify the outcome by the idle-gap tell: the heuristic labels its envelope
-    # ``source: idle_gap_heuristic`` (mechanical names); a real provider or consented
-    # cloud naming does not. ``mechanical_only`` keys off THIS tell, never off
-    # DegradeAction.HEURISTIC alone (the cloud fallback in that branch is produced).
-    is_mechanical = (
-        isinstance(tasks, dict)
-        and isinstance(tasks.get("summary"), dict)
-        and tasks["summary"].get("source") == "idle_gap_heuristic"
-    )
-    branch = Branch.MECHANICAL if is_mechanical else Branch.PRODUCED
+    # Classify by a code-owned flag, not by introspecting the tasks dict: only the
+    # idle-gap heuristic path sets ``from_heuristic``. The cloud fallback in the
+    # HEURISTIC branch is a real (cloud-named) result → produced. Keying off a
+    # model-emittable ``summary.source`` value would let a provider that echoed
+    # "idle_gap_heuristic" be misclassified as mechanical (correctness/adversarial).
+    branch = Branch.MECHANICAL if from_heuristic else Branch.PRODUCED
 
     # Monotonic task-row gating (R7 / KTD2): once a recording produced real AI tasks,
     # a later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
