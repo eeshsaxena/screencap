@@ -14,9 +14,13 @@ a change elsewhere.
 Resolved product decision (authoritative)
 -----------------------------------------
 Summary/title **prefers on-device**. The cloud provider is used only as a
-**fallback when on-device is unavailable AND the summary consent row is
-enabled** — the consent row grants fallback permission, not always-cloud. The
-same preference order applies to recall-answering (R10).
+**fallback when on-device is unavailable AND a cloud provider is configured** —
+connecting a provider is the consent (KTD1), so the per-task consent rows default
+**on** and the Intelligence pane no longer shows a toggle. The rows survive as a
+CLI/env override to disable cloud fallback. The consent still grants only
+fallback permission, not always-cloud. The same preference order applies to
+recall-answering (R10). This module's ``resolve`` logic is unchanged by the
+default flip: it already gates ``CLOUD`` on ``cloud_provider is not None``.
 
 Fixed guards (checked before the cloud row)
 -------------------------------------------
@@ -90,12 +94,18 @@ class ConsentPolicy:
         is configured. A task can only resolve to :attr:`ExecutionTarget.CLOUD`
         when this is set.
     summary_cloud_consent:
-        Whether the summary/title cloud-consent row is enabled (R8).
+        Whether summaries/titles may use the cloud fallback (R8). Defaults on in
+        config (KTD1); the field default here stays ``False`` because this is the
+        explicit value object — the product default is applied in
+        :meth:`from_config` via ``config.get_summary_cloud_consent``.
     recall_cloud_consent:
-        Whether the recall-answer cloud-consent row is enabled (R10).
+        Whether recall-answers may use the cloud fallback (R10). Same default
+        split as ``summary_cloud_consent``.
     """
 
     cloud_provider: str | None = None
+    # Field defaults stay False (explicit "unset" value object); the shipped
+    # product default (on) is applied by `from_config` via the config getters.
     summary_cloud_consent: bool = False
     recall_cloud_consent: bool = False
 

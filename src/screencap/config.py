@@ -907,33 +907,42 @@ def get_llm_cloud_provider() -> str | None:
 
 
 def get_summary_cloud_consent() -> bool:
-    """Return whether the summary/title cloud-consent row is enabled. Default **False**.
+    """Return whether summaries/titles may use the configured cloud provider. Default **True**.
 
-    When on (R8), an on-demand summary/title may fall back to the configured
-    cloud provider — but only when on-device is unavailable (the row grants
-    fallback permission, not always-cloud; the policy in
-    ``screencap.segmentation.consent`` enforces the preference order).
+    Connecting a cloud provider is the consent (KTD1): once one is configured, an
+    on-demand summary/title may fall back to it — but only when on-device is
+    unavailable (this grants fallback permission, not always-cloud; the policy in
+    ``screencap.segmentation.consent`` still prefers on-device whenever available,
+    and only the ALLOW-only stripped text summary is ever sent, never frames).
+
+    The default flipped ``False → True`` so the Intelligence pane no longer needs a
+    per-task toggle; the row survives as a power-user override to disable cloud
+    fallback from the CLI.
 
     Env ``SCREENCAP_SUMMARY_CLOUD_CONSENT`` > ``[intelligence].summary_cloud_consent``
-    > default ``False``.
+    > default ``True``.
     """
     return _parse_intelligence_bool(
-        "SCREENCAP_SUMMARY_CLOUD_CONSENT", "summary_cloud_consent", False,
+        "SCREENCAP_SUMMARY_CLOUD_CONSENT", "summary_cloud_consent", True,
     )
 
 
 def get_recall_cloud_consent() -> bool:
-    """Return whether the recall-answer cloud-consent row is enabled. Default **False**.
+    """Return whether recall-answers may use the configured cloud provider. Default **True**.
 
-    Recall-answering runs on-device by default and becomes cloud-eligible only
-    when this opt-in row is added (R10). Even when on, the policy in
-    ``screencap.segmentation.consent`` prefers on-device whenever available.
+    Recall-answering runs on-device whenever available; when on-device is
+    unavailable it falls back to the configured cloud provider (R10). Connecting a
+    cloud provider is the consent (KTD1) — no per-task toggle. Only the stripped
+    question + ALLOW-only evidence snippets are sent, never frames.
+
+    The default flipped ``False → True``; the row survives as a power-user override
+    to disable cloud fallback from the CLI.
 
     Env ``SCREENCAP_RECALL_CLOUD_CONSENT`` > ``[intelligence].recall_cloud_consent``
-    > default ``False``.
+    > default ``True``.
     """
     return _parse_intelligence_bool(
-        "SCREENCAP_RECALL_CLOUD_CONSENT", "recall_cloud_consent", False,
+        "SCREENCAP_RECALL_CLOUD_CONSENT", "recall_cloud_consent", True,
     )
 
 
