@@ -57,6 +57,22 @@ def _white_jpeg(path: Path, *, size: int = 64) -> None:
     Image.new("RGB", (size, size), (255, 255, 255)).save(path, "JPEG", quality=85)
 
 
+def _white_jpeg_bytes(*, size: int = 64) -> bytes:
+    """Return white JPEG bytes (the plaintext we encrypt into a ``*.jpg.enc``)."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (size, size), (255, 255, 255)).save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
+# A 32-byte AES-256 test corpus key. ``still_io.write_encrypted_still`` /
+# ``produce_egress_frames(corpus_key=...)`` take the key bytes directly, so the
+# encrypted-still path is exercised end-to-end with no Keychain/entitlement infra.
+_TEST_CORPUS_KEY = b"corpus-key-for-frame-egress-test"
+assert len(_TEST_CORPUS_KEY) == 32
+
+
 def _avg_brightness(data: bytes) -> float:
     from PIL import Image
 
@@ -382,3 +398,93 @@ def test_only_timestamps_selects_only_nearest_not_all_within_tolerance(tmp_path,
         only_timestamps_tolerance_s=2.0,
     )
     assert [f.timestamp_ms for f in frames] == [250_000]
+
+
+# ---------------------------------------------------------------------------
+# Encrypted-still egress: the ``*.jpg.enc`` / corpus_key branch
+# ---------------------------------------------------------------------------
+
+
+def _write_encrypted_still(shots: Path, name: str, plaintext: bytes, key: bytes) -> Path:
+    """Write a real ``*.jpg.enc`` still via the project's own encrypt-at-rest seam
+    (``still_io.write_encrypted_still``) so the producer's decrypt path is exercised
+    against a genuine corpus ciphertext, not a hand-rolled one."""
+    from screencap import still_io
+
+    enc_path = shots / name
+    still_io.write_encrypted_still(enc_path, plaintext, key)
+    return enc_path
+
+
+def test_encrypted_still_globbed_masked_and_original_unchanged(tmp_path, monkeypatch):
+    """With a valid ``corpus_key`` the producer globs the ``*.jpg.enc`` still,
+    decrypts it to RAM, masks it (returns a masked=True MaskedFrame), and the
+    on-disk encrypted still is byte-identical afterward (never mutated, R9)."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    plaintext = _white_jpeg_bytes()
+    enc_path = _write_encrypted_still(shots, "300.0.jpg.enc", plaintext, _TEST_CORPUS_KEY)
+    enc_bytes_before = enc_path.read_bytes()
+    original_brightness = _avg_brightness(plaintext)
+
+    # Residual OCR "detects" the whole frame as sensitive -> full mask.
+    def _full_mask(_img_bytes: bytes) -> list[MaskRegion]:
+        return [MaskRegion(x=0, y=0, width=64, height=64, label="residual")]
+
+    frames = produce_egress_frames(
+        rec, 0.0, 1000.0, corpus_key=_TEST_CORPUS_KEY, detect_regions=_full_mask
+    )
+
+    assert len(frames) == 1
+    assert isinstance(frames[0], MaskedFrame)
+    assert frames[0].masked is True
+    assert frames[0].timestamp_ms == 300_000
+    # The decrypted-then-masked bytes are darker than the white plaintext.
+    assert _avg_brightness(frames[0].jpeg_bytes) < original_brightness * 0.3
+    # The on-disk encrypted still is byte-for-byte unchanged (no decrypt-in-place,
+    # no plaintext ever written next to it).
+    assert enc_path.read_bytes() == enc_bytes_before
+    assert not (shots / "300.0.jpg").exists()
+
+
+def test_encrypted_still_not_globbed_without_key(tmp_path, monkeypatch):
+    """Fail-closed: with ``corpus_key=None`` the encrypted-only recording yields
+    zero frames — the ``*.jpg.enc`` is never globbed, so its bytes cannot leave."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    enc_path = _write_encrypted_still(
+        shots, "300.0.jpg.enc", _white_jpeg_bytes(), _TEST_CORPUS_KEY
+    )
+
+    frames = produce_egress_frames(rec, 0.0, 1000.0, detect_regions=lambda b: [])
+    assert frames == []
+    assert enc_path.exists()  # still on disk, simply not selected
+
+
+def test_encrypted_still_wrong_key_dropped_not_emitted_raw(tmp_path, monkeypatch):
+    """Fail-closed: a wrong corpus key makes ``open_still`` raise on decrypt, so the
+    still is dropped per-frame — never emitted (raw ciphertext or otherwise)."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    enc_path = _write_encrypted_still(
+        shots, "300.0.jpg.enc", _white_jpeg_bytes(), _TEST_CORPUS_KEY
+    )
+    enc_bytes_before = enc_path.read_bytes()
+
+    wrong_key = b"x" * 32
+    assert len(wrong_key) == 32 and wrong_key != _TEST_CORPUS_KEY
+
+    frames = produce_egress_frames(
+        rec, 0.0, 1000.0, corpus_key=wrong_key, detect_regions=lambda b: []
+    )
+    assert frames == []
+    assert enc_path.read_bytes() == enc_bytes_before

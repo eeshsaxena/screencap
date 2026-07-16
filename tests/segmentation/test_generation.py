@@ -53,16 +53,19 @@ def test_evidence_rejects_non_str_text():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.privacy
 def test_evidence_defaults_to_no_masked_frames():
     # A text-only Evidence carries no frames.
     assert Evidence(text="hi", stripped=True).masked_frames == ()
 
 
+@pytest.mark.privacy
 def test_masked_frame_defaults_unmasked():
     # masked defaults False so an un-set provenance marker fails closed.
     assert MaskedFrame(jpeg_bytes=b"j", timestamp_ms=1).masked is False
 
 
+@pytest.mark.privacy
 def test_evidence_rejects_unmasked_frame():
     # masked-only invariant: an unmarked/raw frame structurally cannot ride.
     raw = MaskedFrame(jpeg_bytes=b"j", timestamp_ms=1, masked=False)
@@ -70,6 +73,7 @@ def test_evidence_rejects_unmasked_frame():
         Evidence(text="hi", stripped=True, masked_frames=(raw,))
 
 
+@pytest.mark.privacy
 def test_evidence_carries_masked_frames_and_text():
     # A masked=True frame + text carries both, side by side, text still str.
     frame = MaskedFrame(jpeg_bytes=b"jpegbytes", timestamp_ms=300_000, masked=True)
@@ -79,6 +83,7 @@ def test_evidence_carries_masked_frames_and_text():
     assert ev.masked_frames[0].jpeg_bytes == b"jpegbytes"
 
 
+@pytest.mark.privacy
 def test_verify_masked_frames_rejects_unmasked():
     # The SEGMENT path (which does not use Evidence) runs the same guard: a
     # MaskedFrame(masked=False) passed as a segment input raises.
@@ -87,6 +92,7 @@ def test_verify_masked_frames_rejects_unmasked():
         verify_masked_frames((raw,))
 
 
+@pytest.mark.privacy
 def test_verify_masked_frames_rejects_non_maskedframe():
     # Only MaskedFrame values may travel the channel — a bare bytes tuple is
     # rejected, so raw bytes cannot be smuggled past the type.
@@ -94,6 +100,7 @@ def test_verify_masked_frames_rejects_non_maskedframe():
         verify_masked_frames((b"raw-bytes",))  # type: ignore[arg-type]
 
 
+@pytest.mark.privacy
 def test_verify_masked_frames_passes_masked_and_returns_unchanged():
     frames = (
         MaskedFrame(jpeg_bytes=b"a", timestamp_ms=1, masked=True),
@@ -102,6 +109,7 @@ def test_verify_masked_frames_passes_masked_and_returns_unchanged():
     assert verify_masked_frames(frames) is frames
 
 
+@pytest.mark.privacy
 def test_verify_masked_frames_empty_is_ok():
     assert verify_masked_frames(()) == ()
 

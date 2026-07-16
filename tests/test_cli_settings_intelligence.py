@@ -213,6 +213,7 @@ class TestFramesConsentRow:
         config.invalidate_config_cache()
         assert config.get_frames_cloud_consent() is True
 
+    @pytest.mark.privacy
     def test_frames_consent_default_off_in_json(self):
         """Fresh config → the LIVE frames value is false (SCR-272 default off),
         emitted from the config getter, not hard-coded."""
@@ -220,17 +221,20 @@ class TestFramesConsentRow:
         payload = _last_json_line(r.output)["intelligence"]
         assert payload["frames_cloud_consent"] is False
 
+    @pytest.mark.privacy
     def test_frames_consent_true_reflected_in_json(self):
         _invoke("frames_cloud_consent", "set", "true")
         r = _invoke(as_json=True)
         payload = _last_json_line(r.output)["intelligence"]
         assert payload["frames_cloud_consent"] is True
 
+    @pytest.mark.privacy
     def test_frames_consent_false_persists(self):
         _invoke("frames_cloud_consent", "set", "true")
         _invoke("frames_cloud_consent", "set", "false")
         assert _read_cfg()["intelligence"]["frames_cloud_consent"] is False
 
+    @pytest.mark.privacy
     def test_frames_write_emits_ok_envelope(self):
         r = _invoke("frames_cloud_consent", "set", "true", as_json=True)
         assert r.exit_code == 0, r.output
