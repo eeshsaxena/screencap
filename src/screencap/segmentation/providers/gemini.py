@@ -301,9 +301,12 @@ class GeminiProvider:
         wins when both carry frames; either is verified before egress and, when
         :attr:`supports_frames` is on, attached as inline image parts.
         """
-        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
-        # within the size caps (KTD10). The cloud path is the only off-box
-        # egress, so it self-caps here rather than trusting the dispatcher.
+        # Fail-closed gate on TEXT: stripped marker (R11), str text/prompt (R12),
+        # size caps (KTD10) covering prompt + evidence.text only — NOT the frame
+        # bytes (frames are marker-verified below; their volume is bounded upstream
+        # by the producer's per-recording frame cap, not by this text gate). The
+        # cloud path is the only off-box egress, so it self-caps the text here
+        # rather than trusting the dispatcher.
         if not evidence_gate_ok(prompt, evidence):
             log.warning("GeminiProvider.answer refused the request (gate); unavailable")
             return PROVIDER_UNAVAILABLE
