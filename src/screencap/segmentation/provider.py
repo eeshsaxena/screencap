@@ -45,7 +45,14 @@ Two failure shapes, deliberately distinct
 
 from __future__ import annotations
 
-from typing import Protocol, Union, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Union, runtime_checkable
+
+if TYPE_CHECKING:
+    # Type-only edge to the sibling generation seam: importing it at runtime would
+    # cycle (generation imports PROVIDER_UNAVAILABLE from here). ``from __future__
+    # import annotations`` keeps the signature annotation a string, so no runtime
+    # import is needed — this module stays cloud-free and import-light.
+    from screencap.segmentation.generation import MaskedFrame
 
 
 class ProviderUnavailable:
@@ -87,9 +94,22 @@ class LLMProvider(Protocol):
     returns a validated tasks dict, ``None`` (ran, no usable output), or
     :data:`PROVIDER_UNAVAILABLE` (could not run). It never raises for an
     ordinary model/API error.
+
+    ``masked_frames`` is the optional typed multimodal channel (SCR-272): the
+    segment path (summary/day-split) does NOT use :class:`Evidence`, so masked
+    frame bytes ride here as
+    :class:`~screencap.segmentation.generation.MaskedFrame` values rather than
+    inside the untyped ``activity_summary`` dict. A backend clears them through
+    :func:`~screencap.segmentation.generation.verify_masked_frames` before egress;
+    it defaults empty (text-only segmentation).
     """
 
-    def segment(self, activity_summary: dict) -> SegmentResult:
+    def segment(
+        self,
+        activity_summary: dict,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> SegmentResult:
         ...
 
 

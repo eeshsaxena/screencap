@@ -3,7 +3,17 @@
 Given a recording directory and a ``[start_ts, end_ts)`` window, produce the set
 of masked frame bytes that are eligible to leave the machine (e.g. as multimodal
 evidence attached to a cloud-bound Intelligence task). Downstream units (U3/U5)
-call :func:`produce_egress_frames` and attach the returned bytes.
+call :func:`produce_egress_frames` and attach the returned
+:class:`~screencap.segmentation.generation.MaskedFrame` values.
+
+This module is the SOLE blessed constructor of a
+:class:`~screencap.segmentation.generation.MaskedFrame` marked ``masked=True`` —
+the one type allowed to carry frame bytes to a provider (SCR-272, R12). Because
+every frame here has passed the structural ALLOW gate and the best-effort residual
+mask, minting them with ``masked=True`` is the provenance stamp the provider seam's
+:func:`~screencap.segmentation.generation.verify_masked_frames` fail-closed guard
+checks. An AST guard in ``tests/segmentation/test_generation.py`` pins that no
+other module mints a ``MaskedFrame(masked=True)`` (mirroring KTD11).
 
 Guarantee model (from the plan)
 -------------------------------
@@ -47,9 +57,10 @@ deferred into :func:`produce_egress_frames`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+
+from screencap.segmentation.generation import MaskedFrame
 
 if TYPE_CHECKING:
     from screencap.privacy.mask_primitives import MaskRegion
@@ -64,21 +75,6 @@ _EGRESS_MAX_FRAMES = 240
 # (``index_core._INDEX_DHASH_THRESHOLD``): a false dup only costs a dropped
 # near-identical frame, so the tight value is intentional.
 _EGRESS_DHASH_THRESHOLD = 5
-
-
-@dataclass(frozen=True)
-class EgressFrame:
-    """One masked still eligible to leave the machine.
-
-    ``timestamp_ms`` is the frame's epoch time in milliseconds
-    (``int(round(ts * 1000))``, matching ``IndexFrame``), so it is resolvable
-    against the same pointers the content index / ``frame.nearest`` use.
-    ``jpeg_bytes`` is the masked, metadata-stripped JPEG — the on-disk original is
-    never mutated to produce it.
-    """
-
-    timestamp_ms: int
-    jpeg_bytes: bytes
 
 
 class _BytesOcrAdapter:
@@ -142,7 +138,7 @@ def produce_egress_frames(
     detect_regions: "Callable[[bytes], list[MaskRegion]] | None" = None,
     max_frames: int = _EGRESS_MAX_FRAMES,
     dhash_threshold: int = _EGRESS_DHASH_THRESHOLD,
-) -> list[EgressFrame]:
+) -> list[MaskedFrame]:
     """Return the masked stills in ``[start_ts, end_ts)`` eligible to leave.
 
     ``recording_dir`` is a ``~/.screencap/recordings/<name>/`` directory; the flat
@@ -219,7 +215,7 @@ def produce_egress_frames(
     if detector is None:
         detector = _build_default_detector() or (lambda _b: [])
 
-    out: list[EgressFrame] = []
+    out: list[MaskedFrame] = []
     prev_hash: int | None = None
     for ts, img_path in allow:
         # Load the still (decrypt to RAM for *.jpg.enc). An unreadable/undecryptable
@@ -262,8 +258,14 @@ def produce_egress_frames(
             )
             continue
 
+        # SOLE blessed mint of a masked=True frame — this is the provenance stamp
+        # verify_masked_frames checks before any frame reaches a provider (R12).
         out.append(
-            EgressFrame(timestamp_ms=int(round(ts * 1000)), jpeg_bytes=masked)
+            MaskedFrame(
+                jpeg_bytes=masked,
+                timestamp_ms=int(round(ts * 1000)),
+                masked=True,
+            )
         )
 
     return out

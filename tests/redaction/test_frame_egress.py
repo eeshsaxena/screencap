@@ -27,7 +27,8 @@ import pytest
 
 from screencap.privacy.mask_primitives import MaskRegion
 from screencap.privacy.policy import PrivacyMode
-from screencap.segmentation.frame_egress import EgressFrame, produce_egress_frames
+from screencap.segmentation.frame_egress import produce_egress_frames
+from screencap.segmentation.generation import MaskedFrame
 
 pytestmark = pytest.mark.privacy
 
@@ -223,7 +224,10 @@ def test_allow_frame_masked_and_original_unchanged(tmp_path, monkeypatch):
     frames = produce_egress_frames(rec, 0.0, 1000.0, detect_regions=_full_mask)
 
     assert len(frames) == 1
-    assert isinstance(frames[0], EgressFrame)
+    assert isinstance(frames[0], MaskedFrame)
+    # The producer is the sole blessed mint of masked=True (the provenance stamp
+    # verify_masked_frames trusts before a frame reaches a provider).
+    assert frames[0].masked is True
     assert frames[0].timestamp_ms == 300_000
     # Masked bytes are darker than the white original (residual paint applied).
     assert _avg_brightness(frames[0].jpeg_bytes) < original_brightness * 0.3
