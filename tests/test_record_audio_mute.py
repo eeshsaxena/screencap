@@ -23,6 +23,7 @@ import pytest
 
 from screencap._stderr_events import (
     AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE,
+    EVENT_AUDIO_MUTE_FAILED,
     EVENT_AUDIO_MUTED,
     EVENT_AUDIO_UNMUTE_FAILED,
     EVENT_AUDIO_UNMUTED,
@@ -169,6 +170,52 @@ def test_mute_confirms_even_when_audio_stream_never_started(recording_db):
     assert made == []  # the device open raised — nothing constructed
     assert _all_intervals(recording_db) == []  # no interval — nothing was captured
     assert events == [(EVENT_AUDIO_MUTED, {"muted": True})]
+
+
+def test_mute_stream_stop_failure_emits_terminal_advisory(recording_db):
+    # SCR-271: a raise DURING the mute toggle (here stream.stop() faulting mid-
+    # recording — a PortAudioError on device unplug) must still fire a terminal
+    # event. Without the guard, emit() is skipped and the exception is only
+    # logged by _drain_control_queues, so the app's muteInFlight guard — cleared
+    # ONLY on a confirming/failed event — strands on "Muting…" until the
+    # recording ends. Mirror the unmute path: emit the advisory audio_mute_failed.
+    class _StopRaisesStream:
+        def __init__(self) -> None:
+            self.started = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+        def stop(self) -> None:
+            raise OSError("device disappeared")  # PortAudioError analogue
+
+        def close(self) -> None:
+            pass
+
+    ctrl = AudioStreamController(lambda: _StopRaisesStream(), initially_muted=False)
+    ctrl.start_initial()  # capturing
+    events, emit = _emit_recorder()
+
+    result = _apply_audio_mute_command(
+        ctrl,
+        {"muted": True, "ts": 1010.0},
+        session=recording_db.session,
+        recording=recording_db.recording,
+        emit=emit,
+    )
+
+    # Terminal event still fires — the exception is caught, not propagated.
+    assert result == EVENT_AUDIO_MUTE_FAILED
+    names = [n for n, _ in events]
+    assert EVENT_AUDIO_MUTED not in names  # never confirm a mute that failed
+    assert events == [(EVENT_AUDIO_MUTE_FAILED, {})]
+    # The stop failed, so the stream is still capturing — muted=False is truthful.
+    assert ctrl.capturing is True
+    # The interval opened before the stop (KTD3) stays open: the over-covered span
+    # is dropped as muted — the privacy-safe direction — not reopened as audio.
+    rows = _all_intervals(recording_db)
+    assert len(rows) == 1
+    assert rows[0].end_ts is None
 
 
 def test_unmute_closes_interval_and_emits_confirmed(recording_db):

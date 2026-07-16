@@ -2717,7 +2717,11 @@ def _apply_audio_mute_command(
     ``audio_muted`` / ``audio_unmuted`` event emitted ONLY after the stream
     actually toggled — never on the mere request. A denied / unavailable device
     on unmute emits the advisory ``audio_unmute_failed`` and stays muted (R3:
-    unmute never silently fails), leaving any open interval open.
+    unmute never silently fails), leaving any open interval open. Symmetrically
+    (SCR-271), a raise DURING the mute toggle (a faulting DB write or a
+    ``stream.stop()`` ``PortAudioError``) emits the advisory ``audio_mute_failed``
+    rather than propagating — every non-crashing request yields exactly one
+    terminal event, so the app's in-flight guard can never strand on "Muting…".
 
     ``command['ts']`` is the recording-relative timestamp captured at command
     *receipt* in the engine-main handler (before the queue hop), so the interval
@@ -2734,6 +2738,7 @@ def _apply_audio_mute_command(
     """
     from screencap._stderr_events import (
         AUDIO_UNMUTE_FAILED_REASON_MIC_UNAVAILABLE,
+        EVENT_AUDIO_MUTE_FAILED,
         EVENT_AUDIO_MUTED,
         EVENT_AUDIO_UNMUTE_FAILED,
         EVENT_AUDIO_UNMUTED,
@@ -2754,9 +2759,23 @@ def _apply_audio_mute_command(
         # later step fails — we must never stop capture leaving the over-cover
         # audio with no interval to drop it. Only when actually capturing;
         # otherwise there is no captured audio to mark, so no interval.
-        if controller.capturing:
-            crud.open_muted_interval(session, recording, ts)
-        controller.apply_muted(True)
+        # SCR-271: guard the toggle so a raise still yields a terminal event.
+        # open_muted_interval (a SQLite write — "database is locked", disk-full)
+        # or apply_muted (stream.stop() → PortAudioError on a device fault) can
+        # raise; without this the confirming emit below is skipped and the app's
+        # "Muting…" in-flight guard — cleared ONLY on a confirming/failed event —
+        # strands until the recording ends. Mirror the unmute path: emit the
+        # advisory audio_mute_failed. The interval opened before the stop is left
+        # open BY DESIGN (KTD3 over-cover) — if the stop failed the stream is still
+        # capturing, so the span is dropped as muted, the privacy-safe direction.
+        try:
+            if controller.capturing:
+                crud.open_muted_interval(session, recording, ts)
+            controller.apply_muted(True)
+        except Exception as exc:  # noqa: BLE001 — a failed mute must not strand the HUD.
+            logger.error(f"Audio mute toggle failed: {exc}")
+            emit(EVENT_AUDIO_MUTE_FAILED)
+            return EVENT_AUDIO_MUTE_FAILED
         # One-verb-one-event (KTD4): confirm EVERY mute request with exactly one
         # audio_muted event — including the idempotent no-op where the stream was
         # not capturing (an audio-on recording whose mic stream never started, or

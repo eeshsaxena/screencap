@@ -1037,6 +1037,31 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertFalse(recorder.muteInFlight, "and clears the pending flag")
     }
 
+    /// SCR-271: the engine-emitted `audio_mute_failed` (a raise DURING the toggle)
+    /// is a terminal event that clears `muteInFlight` so the control can't strand
+    /// on "Muting…". A failed stop means the stream is still capturing, so `muted`
+    /// stays false and a non-terminal advisory is surfaced — symmetric to the
+    /// `audio_unmute_failed` path.
+    func testAudioMuteFailedEventClearsInFlightKeepsUnmutedAndAdvises() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        let recorder = RecorderController(daemonService: daemon)
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder.toggleMute()
+        await waitUntil { daemon.setMutedCalled }
+        XCTAssertTrue(recorder.muteInFlight)
+
+        recorder._testHandleStderrLine(#"{"type":"audio_mute_failed","schema_version":1}"#)
+
+        XCTAssertFalse(recorder.muteInFlight, "the terminal failure clears the pending flag")
+        XCTAssertFalse(recorder.muted, "a failed stop means the stream is still capturing")
+        XCTAssertTrue(recorder.state.isRecording, "a failed mute must not end the recording")
+        XCTAssertEqual(recorder.captureAdvisory, RecorderController.microphoneMuteFailedAdvisory)
+        XCTAssertNil(recorder.lastError, "the failure is advisory, not terminal")
+    }
+
     /// A mute-verb failure must NOT tear down the recording (contrast
     /// `handleDaemonOperationFailure`, which idles). It reverts to the prior
     /// confirmed `muted`, clears the pending flag, and surfaces a non-terminal
