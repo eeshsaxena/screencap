@@ -205,6 +205,58 @@ final class AccountSheetPolicyTests: XCTestCase {
         )
     }
 
+    // MARK: - Gate success framing (R1, R2)
+
+    /// R1: an already-entitled account at the gate gets success framing, not the
+    /// "Subscribe to keep recording" gate copy. Trial and paid get DISTINCT
+    /// subcopy; the trial variant keeps the cancel-before-charge caveat in the
+    /// primary subcopy; the copy is state-asserting, never event-asserting.
+    func testGateEntitledShowsSuccessFraming() {
+        XCTAssertEqual(
+            AccountSheetPolicy.headline(context: .gate, state: .trial),
+            AccountSheetCopy.successHeadline
+        )
+        XCTAssertEqual(
+            AccountSheetPolicy.headline(context: .gate, state: .subscribed),
+            AccountSheetCopy.successHeadline
+        )
+        // Non-entitled gate states keep the subscribe framing (R9).
+        XCTAssertEqual(
+            AccountSheetPolicy.headline(context: .gate, state: .lapsed),
+            AccountSheetCopy.gateHeadline
+        )
+
+        let trialSub = AccountSheetPolicy.subcopy(context: .gate, state: .trial)
+        let paidSub = AccountSheetPolicy.subcopy(context: .gate, state: .subscribed)
+        XCTAssertEqual(trialSub, AccountSheetCopy.successSubTrial)
+        XCTAssertEqual(paidSub, AccountSheetCopy.successSubSubscribed)
+        XCTAssertNotEqual(trialSub, paidSub)
+        // Trial keeps the pre-charge caveat in the PRIMARY subcopy (R1).
+        XCTAssertTrue(trialSub.lowercased().contains("cancel"))
+        XCTAssertTrue(trialSub.lowercased().contains("charged"))
+        // State-asserting, never event-asserting.
+        for copy in [AccountSheetCopy.successHeadline, trialSub, paidSub] {
+            XCTAssertFalse(copy.lowercased().contains("just subscribed"))
+            XCTAssertFalse(copy.lowercased().contains("thanks for subscribing"))
+        }
+        // Non-entitled subcopy unchanged.
+        XCTAssertEqual(
+            AccountSheetPolicy.subcopy(context: .gate, state: .lapsed),
+            AccountSheetCopy.gateReassurance
+        )
+    }
+
+    // MARK: - Switch prominence (R5, R6, R11)
+
+    /// R5/R6/R11: the cross-tier switch is prominent only for an upgrade (held
+    /// Local Pro → Cloud); a Cloud holder's downgrade to Local Pro and an
+    /// unresolved held tier are both quiet.
+    func testSwitchProminenceIsUpgradeOnly() {
+        XCTAssertTrue(AccountSheetPolicy.switchIsProminent(heldTier: .localPro))
+        XCTAssertFalse(AccountSheetPolicy.switchIsProminent(heldTier: .cloud))
+        XCTAssertFalse(AccountSheetPolicy.switchIsProminent(heldTier: .none))
+    }
+
     // MARK: - Upload entry decision (R14, U5)
 
     /// The review window's Upload tap: signed out → the sheet (sign-in
@@ -277,12 +329,16 @@ final class AccountSheetPolicyTests: XCTestCase {
         )
     }
 
-    /// R3: the gate keeps an explicit dismiss affordance ("Not now") — the
-    /// sheet frames, it does not trap.
-    func testGateDismissTitleIsNotNow() {
-        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .gate), "Not now")
-        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .account), "Close")
-        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .upload), "Close")
+    /// R2/R3: the gate keeps "Not now" while unresolved but flips to "Done" for
+    /// an already-entitled account (the success moment); other contexts use
+    /// "Close". The sheet frames, it does not trap.
+    func testGateDismissTitleByState() {
+        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .gate, state: .lapsed), "Not now")
+        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .gate, state: .signedOut), "Not now")
+        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .gate, state: .trial), "Done")
+        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .gate, state: .subscribed), "Done")
+        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .account, state: .subscribed), "Close")
+        XCTAssertEqual(AccountSheetPolicy.dismissTitle(context: .upload, state: .signedOut), "Close")
     }
 
     // MARK: - Sign-out confirmation copy (R8 / AE5)
