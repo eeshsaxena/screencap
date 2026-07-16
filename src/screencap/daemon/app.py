@@ -2316,6 +2316,26 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     return read_task_segments_wire(resolve_recording_dir(recording))
 
 
+def _run_recording_outcome(recording: str) -> str | None:
+    """Read a LOCAL recording's segmentation OUTCOME reason, off the event loop (U3).
+
+    ``None`` for a missing recording dir / ``recording.db`` (legacy / pre-U2), a DB
+    with no recorded outcome, or any read error — the app renders that as the neutral
+    "unknown" state (KTD6). Never raises: an outcome read must not fail the read verb.
+    Local-only read (never leaves the Mac — R4/R8).
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = resolve_recording_dir(recording) / "recording.db"
+    if not db_path.exists():
+        return None
+    try:
+        return PipelineLedger(db_path).get_recording_outcome()
+    except Exception:  # noqa: BLE001 — an outcome read must never fail tasks.list
+        return None
+
+
 async def tasks_list(request: Request) -> JSONResponse:
     """``POST /v0/tasks.list`` — a LOCAL recording's named task segments (U10).
 
@@ -2349,12 +2369,14 @@ async def tasks_list(request: Request) -> JSONResponse:
             )
         validate_recording_name(parsed.recording)
         rows = await asyncio.to_thread(_run_tasks_list, parsed.recording)
+        reason = await asyncio.to_thread(_run_recording_outcome, parsed.recording)
         tasks = [schema.TaskSegment(**row).model_dump() for row in rows]
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._TASKS_LIST_API_VERSION,
                 recording=parsed.recording,
                 tasks=tasks,
+                reason=reason,
             )
         )
     except errors.DaemonAPIError as exc:

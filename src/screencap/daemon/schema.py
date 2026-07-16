@@ -863,6 +863,12 @@ def _load_models() -> dict[str, Any]:
 
         recording: str
         tasks: list[TaskSegment]
+        # U2/U3 (honest status): why this recording has (or lacks) AI-named tasks —
+        # ``produced_tasks`` / ``mechanical_only`` / ``nothing_to_name`` /
+        # ``couldnt_run`` / ``in_progress``. ``None`` for a legacy recording with no
+        # recorded outcome; the app renders that as the neutral "unknown" state (KTD6),
+        # and an older daemon omits the field entirely (also decoded as unknown).
+        reason: str | None = None
 
     class TasksCreateRequest(_DaemonModel):
         """U7 ``tasks.create`` input: add a USER-authored task span.
