@@ -495,10 +495,10 @@ final class IntelligenceSettingsTests: XCTestCase {
 
     // MARK: - U5 consent-row copy (R10) + trust footer (R12)
 
-    /// R10 — each of the four consent rows has a pure title/caption static (the
-    /// exact strings the view renders), captioned in plain language: the two
-    /// send rows state what is sent AND what never leaves; the two fixed rows
-    /// state that nothing reaches a cloud model.
+    /// R10/KTD1 — each of the four transparency-panel rows has a pure
+    /// title/caption static (the exact strings the view renders), captioned in
+    /// plain language: the three task rows state what is sent AND that frames
+    /// never leave; the fixed frames row states screen images are never sent.
     func testConsentRowCopyStaticsExistPerRow() {
         typealias M = IntelligenceSelectionModel
         let rows: [(title: String, caption: String)] = [
@@ -515,7 +515,12 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertTrue(M.summaryConsentRowCaption.contains("Never screen images"))
         XCTAssertTrue(M.recallConsentRowCaption.hasPrefix("Sends"))
         XCTAssertTrue(M.recallConsentRowCaption.contains("Never screen images"))
-        XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("never a cloud task"))
+        // KTD1 — day-split now runs on the connected model (cloud when there is
+        // no on-device one); it must NOT claim to be a never-cloud task, and it
+        // preserves the frames guarantee.
+        XCTAssertFalse(M.daySplitRowCaption.lowercased().contains("never a cloud task"))
+        XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("connected model"))
+        XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("never screen images"))
         // Scoped to the consent-governed tasks — an unscoped "any cloud model"
         // claim is falsified by the legacy auto-namer path (follow-up).
         XCTAssertTrue(M.framesRowCaption.lowercased().contains("never send screen images"))
@@ -1148,12 +1153,11 @@ final class IntelligenceSettingsTests: XCTestCase {
         ])
     }
 
-    // MARK: - U4/F2 — completion returns the row id; highlight + nudge
+    // MARK: - U4/F2 — completion returns the row id; highlight
 
     /// F2/R8 — completion returns the added row id; the highlight sets from it
-    /// and survives the flow's own auto-select of that row; the standing nudge
-    /// fires for the newly selected cloud row exactly while its toggles are off.
-    func testFlowCompletionReportsRowIDHighlightAndNudgeFollowToggles() {
+    /// and survives the flow's own auto-select of that row.
+    func testFlowCompletionReportsRowIDAndHighlight() {
         let completion = ConnectProviderStepPolicy.completion(afterKeyStored: .anthropic)
         XCTAssertEqual(completion.addedRowID, "anthropic")
 
@@ -1163,15 +1167,6 @@ final class IntelligenceSettingsTests: XCTestCase {
         // chip it just set must survive.
         highlight.selectionChanged(to: completion.addedRowID)
         XCTAssertTrue(highlight.isHighlighted("anthropic"))
-
-        XCTAssertTrue(IntelligenceSelectionModel.consentNudgeVisible(
-            selectedRowID: completion.addedRowID,
-            summaryCloudConsent: false, recallCloudConsent: false
-        ), "off toggles → the standing nudge points at the consent section")
-        XCTAssertFalse(IntelligenceSelectionModel.consentNudgeVisible(
-            selectedRowID: completion.addedRowID,
-            summaryCloudConsent: true, recallCloudConsent: true
-        ), "no nudge when the toggles are already on")
     }
 
     // MARK: - U4 honest copy (KTD5 / AE3)

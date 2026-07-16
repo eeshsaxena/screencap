@@ -8,9 +8,12 @@ Covers the full task x config matrix and the fixed privacy guards:
   unavailable AND its consent row is on AND a cloud provider is configured
   (R8, the resolved decision).
 - Frames/images are never-cloud for every configuration (R9, AE3).
-- Recall-answer runs on-device by default and is cloud-eligible only when its
-  opt-in row is added (R10).
-- The config consent getters resolve env > toml > default (default off).
+- Recall-answer runs on-device whenever available; it is cloud-eligible as the
+  fallback when on-device is unavailable and a cloud provider is configured (R10).
+- The config consent getters resolve env > toml > default. The default is now
+  **on**: connecting a cloud provider is the consent (KTD1), so summaries/answers
+  use it automatically as the on-device-unavailable fallback. The per-task rows
+  remain as an env/toml override (e.g. ``SCREENCAP_SUMMARY_CLOUD_CONSENT=0``).
 
 These tests are self-contained; the shared ``_fixtures.py`` is off-limits.
 """
@@ -20,11 +23,16 @@ from __future__ import annotations
 import os
 from unittest import mock
 
+import pytest
+
 from screencap.segmentation.consent import (
     ConsentPolicy,
     ExecutionTarget,
     TaskKind,
 )
+
+# Consent is the privacy matrix — run in CI's privacy lane (Vision-free).
+pytestmark = pytest.mark.privacy
 
 # ---------------------------------------------------------------------------
 # Day-split / label — on-device only, never cloud (R7 / KTD6, AE2)
@@ -206,7 +214,9 @@ class TestFromConfig:
             is ExecutionTarget.CLOUD
         )
 
-    def test_from_config_default_all_off(self):
+    def test_from_config_default_consent_on_no_provider(self):
+        """Default config: consent on by default, but with no cloud provider
+        configured there is nothing to fall back to (KTD1)."""
         import screencap.config as cfg
 
         env = {
@@ -218,12 +228,51 @@ class TestFromConfig:
             cfg._config_cache = {}
             policy = ConsentPolicy.from_config()
         assert policy.cloud_provider is None
-        assert policy.summary_cloud_consent is False
-        assert policy.recall_cloud_consent is False
+        assert policy.summary_cloud_consent is True
+        assert policy.recall_cloud_consent is True
+        # Consent on, but no provider → still NONE (nothing to fall back to).
+        assert (
+            policy.resolve(TaskKind.SUMMARY, on_device_available=False)
+            is ExecutionTarget.NONE
+        )
+
+    def test_from_config_default_reaches_cloud_when_provider_configured(self):
+        """Point 1/2 (KTD1): with the shipped default and only a cloud provider
+        configured (no explicit per-task consent), summaries/answers resolve to
+        the cloud fallback when on-device is unavailable."""
+        import screencap.config as cfg
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("SCREENCAP_")
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {"intelligence": {"cloud_provider": "gemini"}}
+            policy = ConsentPolicy.from_config()
+        assert policy.cloud_provider == "gemini"
+        for kind in (TaskKind.SUMMARY, TaskKind.RECALL_ANSWER):
+            assert (
+                policy.resolve(kind, on_device_available=True)
+                is ExecutionTarget.ON_DEVICE  # on-device still preferred
+            )
+            assert (
+                policy.resolve(kind, on_device_available=False)
+                is ExecutionTarget.CLOUD  # fallback fires with no toggle set
+            )
+        # Fixed guards hold regardless of the default flip.
+        assert (
+            policy.resolve(TaskKind.DAY_SPLIT, on_device_available=False)
+            is ExecutionTarget.HEURISTIC
+        )
+        assert (
+            policy.resolve(TaskKind.FRAMES, on_device_available=False)
+            is ExecutionTarget.NEVER
+        )
 
 
 # ---------------------------------------------------------------------------
-# Config consent getters — env > toml > default (default off)
+# Config consent getters — env > toml > default (summary/recall default on, KTD1)
 # ---------------------------------------------------------------------------
 
 class TestConsentGetters:
@@ -268,39 +317,48 @@ class TestConsentGetters:
             cfg._config_cache = {"intelligence": {"cloud_provider": "gemini"}}
             assert get_llm_cloud_provider() is None
 
-    def test_summary_consent_default_off(self):
+    def test_summary_consent_default_on(self):
+        """KTD1: default is now on — connecting a cloud provider is the consent."""
         import screencap.config as cfg
         from screencap.config import get_summary_cloud_consent
 
         with mock.patch.dict(os.environ, self._clean_env(), clear=True):
             cfg._config_cache = {}
-            assert get_summary_cloud_consent() is False
+            assert get_summary_cloud_consent() is True
 
-    def test_summary_consent_toml(self):
+    def test_summary_consent_toml_override_off(self):
+        """The per-task row survives as a toml override that can disable cloud."""
         import screencap.config as cfg
         from screencap.config import get_summary_cloud_consent
 
         with mock.patch.dict(os.environ, self._clean_env(), clear=True):
-            cfg._config_cache = {"intelligence": {"summary_cloud_consent": True}}
-            assert get_summary_cloud_consent() is True
+            cfg._config_cache = {"intelligence": {"summary_cloud_consent": False}}
+            assert get_summary_cloud_consent() is False
 
     def test_summary_consent_env_overrides_toml(self):
         import screencap.config as cfg
         from screencap.config import get_summary_cloud_consent
 
+        # Env override wins both ways: off over a toml on, and on over a toml off.
+        with mock.patch.dict(
+            os.environ, {"SCREENCAP_SUMMARY_CLOUD_CONSENT": "0"}
+        ):
+            cfg._config_cache = {"intelligence": {"summary_cloud_consent": True}}
+            assert get_summary_cloud_consent() is False
         with mock.patch.dict(
             os.environ, {"SCREENCAP_SUMMARY_CLOUD_CONSENT": "1"}
         ):
             cfg._config_cache = {"intelligence": {"summary_cloud_consent": False}}
             assert get_summary_cloud_consent() is True
 
-    def test_recall_consent_default_off(self):
+    def test_recall_consent_default_on(self):
+        """KTD1: default is now on — connecting a cloud provider is the consent."""
         import screencap.config as cfg
         from screencap.config import get_recall_cloud_consent
 
         with mock.patch.dict(os.environ, self._clean_env(), clear=True):
             cfg._config_cache = {}
-            assert get_recall_cloud_consent() is False
+            assert get_recall_cloud_consent() is True
 
     def test_recall_consent_toml_and_env(self):
         import screencap.config as cfg

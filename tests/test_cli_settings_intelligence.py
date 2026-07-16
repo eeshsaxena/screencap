@@ -184,7 +184,10 @@ class TestConsentRows:
         assert "must be true or false" in r.output
 
     def test_json_read_back_reflects_consent(self):
+        # Set the two rows independently (override defaults) and confirm read-back
+        # reflects each — the rows survive as CLI overrides after the default flip.
         _invoke("summary_cloud_consent", "set", "true")
+        _invoke("recall_cloud_consent", "set", "false")
         r = _invoke(as_json=True)
         payload = _last_json_line(r.output)["intelligence"]
         assert payload["summary_cloud_consent"] is True

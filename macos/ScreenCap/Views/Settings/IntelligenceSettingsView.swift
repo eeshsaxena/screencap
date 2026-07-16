@@ -18,22 +18,22 @@ import SwiftUI
 ///    seams. Empty writes = no-op; re-tap deselection is removed (radio
 ///    semantics). A legacy persisted value renders the on-device row with the
 ///    reconcile treatment prompting a re-pick.
-/// 2. **WHAT CLOUD MODELS MAY DO** — the per-task cloud-consent matrix (U5 —
-///    all copy lives in `IntelligenceSelectionModel` statics, KTD7):
-///    - Summaries & titles (R8) — a real toggle wired to `summary_cloud_consent`.
-///    - Answers about your recordings — a real toggle (`recall_cloud_consent`).
-///    - Splitting & labeling the day (R7) — shown as ON-DEVICE, *not* a cloud
-///      toggle. It never leaves the Mac even with a cloud provider configured.
-///    - Screen frames or images (R9-frames) — a FIXED "always off".
-///    A standing nudge renders by the section header exactly when
-///    `consentNudgeVisible(...)` says so (AE1) — it is the consent pointer.
+/// 2. **WHAT CLOUD MODELS MAY DO** — a transparency panel (not a control panel)
+///    describing what a connected cloud model does with your data (U5 — all copy
+///    lives in `IntelligenceSelectionModel` statics, KTD7). Since connecting a
+///    cloud provider is the consent (KTD1), there are no per-task toggles:
+///    - Summaries & titles (R8) — runs on your connected model; text only.
+///    - Answers about your recordings (R10) — text only.
+///    - Splitting & labeling the day (R7/KTD1) — runs on your connected model:
+///      on-device when available, your cloud model when there isn't one.
+///    - Screen frames or images (R9-frames) — a FIXED "always off" chip, the one
+///      guarantee (revisiting it is tracked in SCR-272).
 ///    The trust footer (R12) states masked/blocked apps are stripped before
 ///    any model — local or cloud — sees content.
 ///
-/// Consent + provider writes flow through the CLI settings layer via
+/// Provider writes flow through the CLI settings layer via
 /// `IntelligenceController`; BYO keys are stored daemon-side (Keychain-class,
-/// R3) and the key value never enters this process on read-back. The consent
-/// toggles reuse the `AppRulesView` optimistic pending-state pattern.
+/// R3) and the key value never enters this process on read-back.
 struct IntelligenceSettingsView: View {
     @EnvironmentObject private var intelligence: IntelligenceController
 
@@ -48,11 +48,6 @@ struct IntelligenceSettingsView: View {
     /// for a write that actually succeeded. (Documented double guard — the
     /// controller keeps its own quiet in-flight guard, KTD6.)
     @State private var providerWriteInFlight = false
-
-    /// Consent rows with a write in flight (the `pendingSegments` analogue):
-    /// while set, the toggle renders its optimistic position and locks so a
-    /// second tap can't race the CLI round-trip. Cleared when the write settles.
-    @State private var pendingConsentRows: Set<String> = []
 
     /// Inline error under the affected section after a failed CLI write (the
     /// optimistic flip has already been reverted by the controller).
@@ -143,7 +138,7 @@ struct IntelligenceSettingsView: View {
         if let settings = intelligence.settings {
             VStack(alignment: .leading, spacing: 28) {
                 modelSection(settings)
-                cloudTasksSection(settings)
+                cloudTasksSection()
                 if let writeError {
                     Text("Couldn't save: \(writeError)")
                         .font(SCTypography.sans(size: 12))
@@ -609,52 +604,31 @@ struct IntelligenceSettingsView: View {
 
     /// U5 — every rendered string here is a pure copy static on
     /// `IntelligenceSelectionModel` (KTD7) so the honest-copy audit reaches it.
-    private func cloudTasksSection(_ settings: IntelligenceSettings) -> some View {
+    private func cloudTasksSection() -> some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionHeader(IntelligenceSelectionModel.cloudTasksSectionTitle)
-            // AE1 — the standing nudge: rendered exactly when the pure predicate
-            // says so (a cloud row is the rendered selection and a relevant
-            // toggle is off). This IS the consent pointer — no auto-scroll.
-            if IntelligenceSelectionModel.consentNudgeVisible(
-                selectedRowID: IntelligenceSelectionModel.renderedSelection(settings).rowID,
-                summaryCloudConsent: settings.summaryCloudConsent,
-                recallCloudConsent: settings.recallCloudConsent
-            ) {
-                Text(IntelligenceSelectionModel.consentNudgeCopy)
-                    .font(SCTypography.sans(size: 12))
-                    .foregroundStyle(Color.scAmberText)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 2)
-                    .padding(.bottom, 2)
-            }
             VStack(alignment: .leading, spacing: 0) {
-                // R8 — summaries/titles: a real cloud toggle.
-                consentToggleRow(
+                // KTD1 — connecting a cloud provider is the consent; these tasks
+                // run on your connected model automatically. Informational rows,
+                // not toggles: this section is a transparency panel.
+                infoRow(
                     title: IntelligenceSelectionModel.summaryConsentRowTitle,
-                    subtitle: IntelligenceSelectionModel.summaryConsentRowCaption,
-                    row: "summary_cloud_consent",
-                    on: settings.summaryCloudConsent
+                    subtitle: IntelligenceSelectionModel.summaryConsentRowCaption
                 )
                 rowDivider
-                // R10 — recall answers: also a real cloud toggle (Chat depends
-                // on it — the design's three rows predate Chat).
-                consentToggleRow(
+                infoRow(
                     title: IntelligenceSelectionModel.recallConsentRowTitle,
-                    subtitle: IntelligenceSelectionModel.recallConsentRowCaption,
-                    row: "recall_cloud_consent",
-                    on: settings.recallCloudConsent
+                    subtitle: IntelligenceSelectionModel.recallConsentRowCaption
                 )
                 rowDivider
-                // R7 — day-splitting/labeling: NOT a cloud toggle. Stays on the
-                // Mac even with a cloud provider configured; shown as a fixed
-                // "On-device" chip, no toggle.
-                fixedRow(
+                // R7/KTD1 — day-split/label runs on your connected model (the
+                // cloud model when there's no on-device one); no chip.
+                infoRow(
                     title: IntelligenceSelectionModel.daySplitRowTitle,
-                    subtitle: IntelligenceSelectionModel.daySplitRowCaption,
-                    badge: (IntelligenceSelectionModel.daySplitChipLabel, Color.scTeal)
+                    subtitle: IntelligenceSelectionModel.daySplitRowCaption
                 )
                 rowDivider
-                // R9 — frames/images: fixed "always off", non-interactive.
+                // R9 — frames/images: fixed "always off", the one guarantee.
                 fixedRow(
                     title: IntelligenceSelectionModel.framesRowTitle,
                     subtitle: IntelligenceSelectionModel.framesRowCaption,
@@ -665,10 +639,8 @@ struct IntelligenceSettingsView: View {
                 RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
                     .strokeBorder(Color.scBorderWarm, lineWidth: 1)
             )
-            // R12 — the trust footer. (The earlier "Cloud tasks only run when
-            // the active model above is a cloud provider" line was removed as
-            // false: the consent toggles gate the cloud *fallback*, which can
-            // run while a local row is the rendered selection.)
+            // R12 — the trust footer: masked/blocked apps are stripped before any
+            // model — local or cloud — sees content.
             Text(IntelligenceSelectionModel.consentTrustFooter)
                 .font(SCTypography.sans(size: 12))
                 .foregroundStyle(Color.scInkMuted)
@@ -677,11 +649,10 @@ struct IntelligenceSettingsView: View {
         }
     }
 
-    /// A settable cloud-consent row (R8/R10) — a real toggle with the
-    /// optimistic pending-state discipline.
-    private func consentToggleRow(title: String, subtitle: String, row: String, on: Bool) -> some View {
-        let pending = pendingConsentRows.contains(row)
-        return HStack(alignment: .center, spacing: 12) {
+    /// An informational, non-interactive row (title + caption, no control) — the
+    /// transparency-panel row for a task that runs on your connected model (KTD1).
+    private func infoRow(title: String, subtitle: String) -> some View {
+        HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(SCTypography.sans(size: 14, weight: .semibold))
@@ -689,28 +660,16 @@ struct IntelligenceSettingsView: View {
                 Text(subtitle)
                     .font(SCTypography.sans(size: 12.5))
                     .foregroundStyle(Color.scInkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
-            SettingsToggle(on: on) { toggleConsent(row: row, currentlyOn: on) }
-                .disabled(pending)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 16)
     }
 
-    private func toggleConsent(row: String, currentlyOn: Bool) {
-        guard !pendingConsentRows.contains(row) else { return }
-        writeError = nil
-        pendingConsentRows.insert(row)
-        Task {
-            let ok = await intelligence.setConsent(row: row, enabled: !currentlyOn)
-            pendingConsentRows.remove(row)
-            if !ok { writeError = intelligence.lastError ?? "the consent change." }
-        }
-    }
-
-    /// A fixed, non-interactive row (R7 day-split / R9 frames) — a state badge,
-    /// no toggle. It displays a rule the user cannot change.
+    /// A fixed, non-interactive row (R9 frames) — a state badge, no toggle.
+    /// It displays a rule the user cannot change.
     private func fixedRow(title: String, subtitle: String, badge: (label: String, color: Color)) -> some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
