@@ -869,7 +869,8 @@ def _parse_intelligence_bool(env_name: str, cfg_key: str, default: bool) -> bool
     A section-scoped twin of :func:`_parse_bool_env` for the per-task cloud
     consent rows (U6). The default is the caller-supplied ``default`` argument —
     the summary/recall getters now pass ``True`` (connecting a cloud provider is
-    the consent, KTD1); ``day_split``/``frames`` remain fixed-off guards.
+    the consent, KTD1); ``frames`` passes ``False`` (independent opt-in, SCR-272);
+    ``day_split`` remains a fixed-off guard.
     """
     env = os.environ.get(env_name)
     if env is not None:
@@ -944,6 +945,27 @@ def get_recall_cloud_consent() -> bool:
     """
     return _parse_intelligence_bool(
         "SCREENCAP_RECALL_CLOUD_CONSENT", "recall_cloud_consent", True,
+    )
+
+
+def get_frames_cloud_consent() -> bool:
+    """Return whether masked screen frames may be attached to a cloud task. Default **False**.
+
+    An independent, opt-in consent gate (SCR-272): unlike summary/recall (which
+    default ``True`` because connecting a cloud provider is the consent, KTD1),
+    frames stay **off by default** — connecting a cloud model and turning cloud
+    tasks on does NOT enable frame egress. Only an explicit opt-in flips it.
+
+    This gate is *layered on top of* an already-cloud-resolved summary/recall
+    task; it never changes the ``TaskKind.FRAMES → ExecutionTarget.NEVER`` guard
+    (that guard is a separate mechanism — frames are never a standalone cloud
+    task). See ``screencap.segmentation.consent.frames_may_attach``.
+
+    Env ``SCREENCAP_FRAMES_CLOUD_CONSENT`` > ``[intelligence].frames_cloud_consent``
+    > default ``False``.
+    """
+    return _parse_intelligence_bool(
+        "SCREENCAP_FRAMES_CLOUD_CONSENT", "frames_cloud_consent", False,
     )
 
 
@@ -1025,11 +1047,18 @@ _VALID_CLOUD_PROVIDERS = (
 )
 
 #: The cloud-consent rows, keyed by their CLI/`[intelligence]` name → the
-#: getter that reads them back. Only summary/title and recall-answer may be
-#: consented to cloud (R8/R10); day-split/label and frames rows are **never**
-#: cloud-settable (R7/R9) and are deliberately absent here — the CLI rejects
-#: them with a clear message rather than persisting a forbidden row.
-_CLOUD_CONSENT_ROWS = ("summary_cloud_consent", "recall_cloud_consent")
+#: getter that reads them back. Summary/title and recall-answer may be consented
+#: to cloud (R8/R10); ``frames_cloud_consent`` (SCR-272) is an independent,
+#: default-off opt-in that lets masked frames ride along on an already-cloud
+#: summary/recall task — settable, but it never flips the fixed
+#: ``TaskKind.FRAMES → NEVER`` guard. Only the day-split/label row is **never**
+#: cloud-settable (R7) and is deliberately absent here — the CLI rejects it with
+#: a clear message rather than persisting a forbidden row.
+_CLOUD_CONSENT_ROWS = (
+    "summary_cloud_consent",
+    "recall_cloud_consent",
+    "frames_cloud_consent",
+)
 
 
 def set_intelligence_provider(value: str) -> None:
@@ -1080,7 +1109,7 @@ def set_intelligence_consent(row: str, value: bool) -> None:
     """Persist a cloud-consent row to ``[intelligence].<row>``.
 
     ``row`` must be one of :data:`_CLOUD_CONSENT_ROWS`; the caller enforces that
-    (the day-split/label and frames rows can never be cloud-consented, R7/R9).
+    (the day-split/label row can never be cloud-consented, R7).
     """
     _write_intelligence_key(row, bool(value))
 
