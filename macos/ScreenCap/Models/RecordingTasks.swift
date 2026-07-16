@@ -75,6 +75,12 @@ struct TasksListResponse: Decodable, Sendable {
     let apiSchemaVersion: Int
     let recording: String
     let tasks: [RecordingTask]
+    /// U2/U3 (honest status): why this recording has (or lacks) AI-named tasks —
+    /// `produced_tasks` / `mechanical_only` / `nothing_to_name` / `couldnt_run` /
+    /// `in_progress`. `nil` for a legacy recording with no recorded outcome, or an
+    /// older daemon that omits the field — both render as the neutral "unknown"
+    /// state (KTD6), never a false "not set up".
+    let reason: String?
 
     init(
         ok: Bool = true,
@@ -82,7 +88,8 @@ struct TasksListResponse: Decodable, Sendable {
         daemonVersion: String = "test",
         apiSchemaVersion: Int = 1,
         recording: String,
-        tasks: [RecordingTask]
+        tasks: [RecordingTask],
+        reason: String? = nil
     ) {
         self.ok = ok
         self.schemaVersion = schemaVersion
@@ -90,6 +97,7 @@ struct TasksListResponse: Decodable, Sendable {
         self.apiSchemaVersion = apiSchemaVersion
         self.recording = recording
         self.tasks = tasks
+        self.reason = reason
     }
 
     enum CodingKeys: String, CodingKey {
@@ -99,6 +107,7 @@ struct TasksListResponse: Decodable, Sendable {
         case apiSchemaVersion = "api_schema_version"
         case recording
         case tasks
+        case reason
     }
 }
 
