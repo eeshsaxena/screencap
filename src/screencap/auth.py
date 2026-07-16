@@ -52,6 +52,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
+from screencap.auth_pages import render_callback_page
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
@@ -554,15 +556,13 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.server.callback_state = params.get("state", [None])[0]
         self.server.callback_error = error
         self.server.callback_received = True
+        # Honest per-outcome page: a declined/failed callback (error present, no
+        # code) must NOT show a success screen — the flow raises downstream.
+        success = error is None and code is not None
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(
-            b"<html><body style='font-family:sans-serif'>"
-            b"<h2>Sign-in complete.</h2>"
-            b"<p>You can close this tab and return to ScreenCap.</p>"
-            b"</body></html>"
-        )
+        self.wfile.write(render_callback_page(success=success))
 
     def log_message(self, *args):  # silence default stderr logging
         pass
