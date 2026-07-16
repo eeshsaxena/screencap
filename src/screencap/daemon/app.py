@@ -3549,6 +3549,30 @@ async def model_status(request: Request) -> JSONResponse:
         )
 
 
+async def intelligence_status(request: Request) -> JSONResponse:
+    """``GET /v0/intelligence.status`` — daemon-observable inputs to the "usable" verdict.
+
+    Read-only. Reports the config facts the app combines with its own fresh
+    Apple-Intelligence availability probe to compose the live verdict; the daemon
+    never probes availability itself (that fact is Swift-only). An older daemon
+    without this route returns 404, which the app treats as "unknown". Deliberately
+    NOT in ``_ACTIVITY_PATHS`` — a settings read must not keep the daemon alive.
+    """
+    try:
+        from screencap.segmentation.availability import intelligence_verdict_inputs
+
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._MODELS_API_VERSION,
+                verdict_inputs=intelligence_verdict_inputs(),
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._MODELS_API_VERSION, request=request
+        )
+
+
 def _graceful_refusal(kind: QuestionKind = QuestionKind.POINT) -> ChatAnswer:
     """A fail-safe refusal :class:`ChatAnswer` for a downstream miss (KTD8).
 
@@ -4518,6 +4542,7 @@ def build_app() -> Starlette:
             Route("/v0/model.download.status", model_download_status, methods=["GET"]),
             Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),
             Route("/v0/model.status", model_status, methods=["GET"]),
+            Route("/v0/intelligence.status", intelligence_status, methods=["GET"]),
         ],
         lifespan=lifespan,
     )
