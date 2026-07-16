@@ -27,7 +27,7 @@ import logging
 from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
-from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation import Evidence, MaskedFrame
 from screencap.segmentation.generation_finish import (
     build_answer_prompt,
     evidence_gate_ok,
@@ -59,7 +59,13 @@ class LocalServerProvider:
 
     ``endpoint`` and ``raw_call`` are injectable for tests; production resolves the
     endpoint from config and posts via the default ``requests`` call.
+
+    ``supports_frames`` is ``False``: this BYO text-completion backend never sends
+    images, so any ``masked_frames`` handed to :meth:`segment` / :meth:`answer`
+    are ignored — graceful omission, never a raise (SCR-272, U4).
     """
+
+    supports_frames: bool = False
 
     def __init__(
         self,
@@ -97,8 +103,14 @@ class LocalServerProvider:
             return None
         return endpoint
 
-    def segment(self, activity_summary: dict) -> dict | None | ProviderUnavailable:
+    def segment(
+        self,
+        activity_summary: dict,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> dict | None | ProviderUnavailable:
         # Fail-closed privacy gate (R10): refuse unmarked input.
+        # ``masked_frames`` is accepted but ignored (graceful omission, text-only).
         if activity_summary.get("stripped") is not True:
             log.warning("LocalServerProvider refused an unmarked summary; unavailable")
             return PROVIDER_UNAVAILABLE
@@ -186,13 +198,20 @@ class LocalServerProvider:
 
     # -- Free-form generation path (SCR-243, U9) ---------------------------
 
-    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+    def answer(
+        self,
+        prompt: str,
+        evidence: Evidence,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> str | ProviderUnavailable:
         """Answer ``prompt`` grounded in ``evidence`` via a plain BYO completion.
 
         Same connect-time hardening as :meth:`segment` (LOCAL re-assert,
         localhost pin, redirects off, response size cap), but a **free-form**
         chat completion (no JSON response format). Returns the sanitized answer
-        string or :data:`PROVIDER_UNAVAILABLE`. Never raises.
+        string or :data:`PROVIDER_UNAVAILABLE`. Never raises. ``masked_frames``
+        is accepted but ignored (graceful omission).
         """
         # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
         # within the size caps (KTD10).

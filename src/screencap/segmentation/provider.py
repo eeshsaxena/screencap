@@ -102,7 +102,20 @@ class LLMProvider(Protocol):
     inside the untyped ``activity_summary`` dict. A backend clears them through
     :func:`~screencap.segmentation.generation.verify_masked_frames` before egress;
     it defaults empty (text-only segmentation).
+
+    ``supports_frames`` is the vision-capability signal (SCR-272, U4): a backend
+    that can send images to its model sets it ``True`` (only the Gemini backend
+    does today); every other backend leaves it ``False`` and simply **ignores**
+    any ``masked_frames`` handed to it — graceful omission, never a raise. A
+    dispatcher reads it via ``getattr(provider, "supports_frames", False)`` to
+    decide whether attaching frames is worthwhile. It is declared under
+    ``TYPE_CHECKING`` only (a type-visible signal, not a ``runtime_checkable``
+    member) so the runtime ``isinstance(x, LLMProvider)`` gates
+    (``terminal_stage`` / ``recall``) still duck-type on ``segment`` alone.
     """
+
+    if TYPE_CHECKING:
+        supports_frames: bool
 
     def segment(
         self,

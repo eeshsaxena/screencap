@@ -56,7 +56,7 @@ KTD11, so an unmarked/raw frame structurally cannot reach a model.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Union, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Union, runtime_checkable
 
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 
@@ -170,7 +170,19 @@ class GenerationProvider(Protocol):
     backend must clear through :func:`verify_masked_frames` before egress. It
     defaults empty; frames also ride inside :attr:`Evidence.masked_frames` on the
     recall path, and both carriers are verified by the same guard.
+
+    ``supports_frames`` is the vision-capability signal (SCR-272, U4): mirrors
+    :attr:`~screencap.segmentation.provider.LLMProvider.supports_frames`. A
+    vision-capable backend sets it ``True`` (only Gemini today); every other
+    backend leaves it ``False`` and ignores any frames it is handed (graceful
+    omission, never a raise). Declared under ``TYPE_CHECKING`` only so it is a
+    type-visible signal, not a ``runtime_checkable`` member — the runtime
+    ``isinstance(x, GenerationProvider)`` gate still duck-types on ``answer``
+    alone.
     """
+
+    if TYPE_CHECKING:
+        supports_frames: bool
 
     def answer(
         self,

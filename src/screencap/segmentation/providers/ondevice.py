@@ -59,7 +59,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation import Evidence, MaskedFrame
 from screencap.segmentation.generation_finish import evidence_gate_ok, sanitize_answer
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.validate import validate_llm_tasks
@@ -162,12 +162,24 @@ class OnDeviceProvider:
 
     See the module docstring for the discovery, IPC envelope, and the
     fail-closed privacy contract. Stateless; safe to construct per call.
+
+    ``supports_frames`` is ``False``: the on-device helper takes text only, so
+    any ``masked_frames`` handed to :meth:`segment` / :meth:`answer` are ignored
+    — graceful omission, never a raise (SCR-272, U4).
     """
 
-    def segment(self, activity_summary: dict) -> dict | None | ProviderUnavailable:
+    supports_frames: bool = False
+
+    def segment(
+        self,
+        activity_summary: dict,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> dict | None | ProviderUnavailable:
         """Segment the session on-device via the Swift helper.
 
         See :mod:`screencap.segmentation.provider` for the tri-state return.
+        ``masked_frames`` is accepted but ignored (graceful omission).
         """
         # Fail-closed privacy gate (R11): refuse anything not explicitly marked
         # as privacy-stripped. Do NOT spawn the helper on unmarked input.
@@ -280,13 +292,20 @@ class OnDeviceProvider:
 
     # -- Free-form generation path (SCR-243, U4) ---------------------------
 
-    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+    def answer(
+        self,
+        prompt: str,
+        evidence: Evidence,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> str | ProviderUnavailable:
         """Answer ``prompt`` grounded in ``evidence`` on-device via the Swift helper.
 
         See :mod:`screencap.segmentation.generation` for the two-state
         (``str`` | :data:`PROVIDER_UNAVAILABLE`) return. Never raises for an
         ordinary error. The grounding instructions live in the helper (KTD3);
-        this side passes the raw prompt + stripped evidence text.
+        this side passes the raw prompt + stripped evidence text. ``masked_frames``
+        is accepted but ignored (graceful omission).
         """
         # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
         # within the size caps (KTD10). No helper spawn on refusal.
