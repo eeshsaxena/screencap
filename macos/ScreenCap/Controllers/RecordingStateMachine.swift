@@ -275,7 +275,18 @@ struct RecordingStateMachine {
             // Both stop policies care about this; the in-app path resolves on it.
             var effects: [Effect] = [.resolveAwaiting(.finalized, success: true)]
             if event.forceStopped == true {
-                effects.append(.surfaceError("Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."))
+                // A local-only recording has nothing to upload, so the generic
+                // "may not have uploaded" copy is wrong for it — a force-stop just
+                // means its processing may be incomplete. Only a cloud/both (or
+                // unknown-destination, e.g. the crash-synthesized finalize) recording
+                // gets the upload-retry copy.
+                let message: String
+                if event.destination == "local" {
+                    message = "Recording stopped before it finished processing. Open the recording to finish it."
+                } else {
+                    message = "Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."
+                }
+                effects.append(.surfaceError(message))
             }
             effects.append(.refreshIndex)
             return effects

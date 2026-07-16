@@ -67,6 +67,12 @@ struct RecorderEventLine: Decodable {
     /// `capture_recovered` (SCR-100) event: "screen" / "window" / "action".
     /// Absent on every other event type.
     let reader: String?
+    /// The recording's frozen routing destination ("local" / "cloud" / "both")
+    /// on a `recording_finalized` event, so the force-stop banner can tailor its
+    /// copy — a local recording has nothing to upload. Absent (nil) on other
+    /// events and on the daemon's crash-synthesized finalize, where the banner
+    /// falls back to the upload-oriented copy (the conservative default).
+    let destination: String?
     let ts: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -80,6 +86,7 @@ struct RecorderEventLine: Decodable {
         case cursor
         case reason
         case reader
+        case destination
         case ts
     }
 }

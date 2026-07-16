@@ -609,6 +609,35 @@ def test_locally_evicted_recording_is_not_a_stub(recordings_dir):
     assert info.state == "ready", "all frozen chunks terminal (LOCAL_DONE->EVICTED) -> ready"
 
 
+def test_local_done_chunk_with_stale_uploaded_state_is_not_uploaded(recordings_dir):
+    """A local recording must never read as uploaded even if a chunk carries a
+    stale ``upload_state='uploaded'`` under a LOCAL_DONE lifecycle.
+
+    This reproduces the mislabel a local recording's LIVE path used to leave: it
+    marked chunks UPLOADED (EMITTED -> UPLOADED), then the terminal stage's
+    ``_route_local`` flipped lifecycle to LOCAL_DONE without clearing the stale
+    ``upload_state``. The catalog `uploaded` flag (and the Library badge derived
+    from it) must gate on lifecycle so such a chunk never counts as uploaded.
+    """
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    d = _make_recording(recordings_dir, "local-stale-uploaded", duration=30)
+    _add_chunks(d, 1)
+    db_path = d / "recording.db"
+    ensure_pipeline_state_schema(db_path)
+    led = PipelineLedger(db_path)
+    led.seed_chunk(0)
+    led.freeze_chunks_expected(1)
+    # The exact stale sequence: UPLOADED first, then LOCAL_DONE (which leaves
+    # upload_state untouched -> a lingering 'uploaded' under a local_done row).
+    led.mark_uploaded(0)
+    led.mark_local_done(0)
+
+    info = list_recordings(recordings_dir)[0]
+    assert info.uploaded is False, "a LOCAL_DONE chunk is never uploaded (stale upload_state ignored)"
+    assert info.is_stub is False, "local media present -> not a stub"
+
+
 def test_pre_u1_recording_without_ledger_table_classifies_via_files(recordings_dir):
     """Backward-compat (R14): a genuinely pre-U1 recording.db (no
     ``pipeline_chunk_state`` table at all) falls back to the file-presence

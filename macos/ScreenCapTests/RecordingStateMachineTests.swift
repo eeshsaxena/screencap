@@ -194,11 +194,43 @@ final class RecordingStateMachineTests: XCTestCase {
     func testRecordingFinalizedWithForceStoppedSurfacesUploadRetryWarning() {
         var machine = RecordingStateMachine()
 
+        // No destination (nil) — e.g. the daemon's crash-synthesized finalize:
+        // fall back to the upload-oriented copy (the conservative default).
         let effects = machine.handle(event: event(type: "recording_finalized", forceStopped: true))
 
         XCTAssertEqual(effects, [
             .resolveAwaiting(.finalized, success: true),
             .surfaceError("Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."),
+            .refreshIndex,
+        ])
+    }
+
+    func testRecordingFinalizedWithForceStoppedCloudDestinationSurfacesUploadRetryWarning() {
+        var machine = RecordingStateMachine()
+
+        let effects = machine.handle(
+            event: event(type: "recording_finalized", forceStopped: true, destination: "cloud")
+        )
+
+        XCTAssertEqual(effects, [
+            .resolveAwaiting(.finalized, success: true),
+            .surfaceError("Recording stopped, but some data may not have uploaded. Open the recording to retry the upload."),
+            .refreshIndex,
+        ])
+    }
+
+    func testRecordingFinalizedWithForceStoppedLocalDestinationSurfacesProcessingWarning() {
+        var machine = RecordingStateMachine()
+
+        // A local recording has nothing to upload — the banner must not mention
+        // uploads, only that processing may be incomplete.
+        let effects = machine.handle(
+            event: event(type: "recording_finalized", forceStopped: true, destination: "local")
+        )
+
+        XCTAssertEqual(effects, [
+            .resolveAwaiting(.finalized, success: true),
+            .surfaceError("Recording stopped before it finished processing. Open the recording to finish it."),
             .refreshIndex,
         ])
     }
@@ -628,6 +660,7 @@ final class RecordingStateMachineTests: XCTestCase {
         cursor: Int? = nil,
         reason: String? = nil,
         reader: String? = nil,
+        destination: String? = nil,
         ts: Double? = nil
     ) -> RecorderEventLine {
         RecorderEventLine(
@@ -641,6 +674,7 @@ final class RecordingStateMachineTests: XCTestCase {
             cursor: cursor,
             reason: reason,
             reader: reader,
+            destination: destination,
             ts: ts
         )
     }

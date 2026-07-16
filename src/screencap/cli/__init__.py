@@ -349,6 +349,7 @@ def _engine_worker_cmd(encoded_args: str) -> None:
     run_recording_worker(args)
 
     ready_meta: dict[str, Any] = {}
+    destination: str | None = None
     capture_dir = args.get("capture_dir_hint") or args.get("output_dir")
     if capture_dir:
         try:
@@ -357,12 +358,26 @@ def _engine_worker_cmd(encoded_args: str) -> None:
                 ready_meta = json.loads(ready_path.read_text() or "{}")
         except Exception:
             ready_meta = {}
+        # The frozen routing destination lets the app tailor the force-stop
+        # banner: a local recording has nothing to upload, so the generic
+        # "some data may not have uploaded" copy is wrong for it. Read the bare
+        # string (light, no catalog import); None on any error so the app falls
+        # back to the upload-oriented copy (the conservative default for cloud).
+        try:
+            intent_path = Path(str(capture_dir)) / ".recording_intent"
+            if intent_path.exists():
+                dest = json.loads(intent_path.read_text() or "{}").get("destination")
+                if isinstance(dest, str):
+                    destination = dest
+        except Exception:
+            destination = None
     emit_event(
         EVENT_RECORDING_FINALIZED,
         name=args.get("name"),
         duration_seconds=float(ready_meta.get("elapsed", 0.0)),
         force_stopped=bool(ready_meta.get("force_stopped", False)),
         disk_full=bool(ready_meta.get("disk_full", False)),
+        destination=destination,
     )
 
 

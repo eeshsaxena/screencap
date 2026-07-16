@@ -102,6 +102,98 @@ def test_was_force_stopped_reflects_stop_event(capture_dir):
     assert cp.was_force_stopped is True
 
 
+def _write_intent(capture_dir, destination: str) -> None:
+    """Freeze a minimal ``.recording_intent`` with the given routing destination."""
+    (capture_dir / ".recording_intent").write_text(json.dumps({
+        "version": 2, "destination": destination,
+        "retention_policy": "keep_forever", "retention_params": {},
+    }))
+
+
+def test_mirror_emitted_marks_local_done_for_local_recording(capture_dir):
+    """A LOCAL recording (destination=local) mirrors EMITTED to LOCAL_DONE, NOT UPLOADED.
+
+    Regression: a local recording's chunks still settle to ``EMITTED`` to satisfy
+    the sentinel gate, but EMITTED there means "processing done", not "uploaded".
+    Mapping it to the ledger's UPLOADED state mislabeled local recordings as
+    uploaded (Library badge "uploaded"). A local recording must read LOCAL_DONE,
+    matching terminal_stage._route_local.
+    """
+    from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+    from screencap.pipeline_state import Lifecycle, UploadState
+
+    _write_intent(capture_dir, "local")
+    q = multiprocessing.Queue()
+    ack_q = multiprocessing.Queue()
+    cp = ChunkProcessor(
+        capture_dir, q, ack_q, recording_name="test",
+        upload_enabled=False, auto_delete=False, cloud_intent=False,
+    )
+    ledger = cp._get_ledger()
+    ledger.seed_chunk(0)
+
+    cp._mirror_status_to_ledger(0, ChunkStatus.EMITTED)
+
+    row = ledger.get_chunk(0)
+    assert row.lifecycle == Lifecycle.LOCAL_DONE, "local recording -> LOCAL_DONE, never UPLOADED"
+    assert row.upload_state != UploadState.UPLOADED, "a never-uploaded local chunk must not read as uploaded"
+
+
+def test_mirror_emitted_marks_uploaded_for_cloud_recording(capture_dir):
+    """A CLOUD recording (destination=cloud) still mirrors EMITTED -> UPLOADED.
+
+    Guards the other side of the write-path branch so the local-done fix does not
+    regress genuine cloud uploads.
+    """
+    from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+    from screencap.pipeline_state import Lifecycle, UploadState
+
+    _write_intent(capture_dir, "cloud")
+    q = multiprocessing.Queue()
+    ack_q = multiprocessing.Queue()
+    cp = ChunkProcessor(
+        capture_dir, q, ack_q, recording_name="test",
+        upload_enabled=True, auto_delete=False, cloud_intent=True,
+    )
+    ledger = cp._get_ledger()
+    ledger.seed_chunk(0)
+
+    cp._mirror_status_to_ledger(0, ChunkStatus.EMITTED)
+
+    row = ledger.get_chunk(0)
+    assert row.lifecycle == Lifecycle.UPLOADED
+    assert row.upload_state == UploadState.UPLOADED
+
+
+def test_mirror_emitted_marks_uploaded_for_cloud_recording_without_live_upload(capture_dir):
+    """A CLOUD recording started with --no-live-upload (``upload_enabled=False``)
+    must still take the mark_uploaded path — the terminal stage uploads it.
+
+    The local-done branch keys on the FROZEN destination, NOT ``_upload_enabled``:
+    a cloud recording with live upload disabled also has ``_upload_enabled=False``,
+    and marking its chunks LOCAL_DONE would wrongly divert them from the cloud
+    routing. This pins the discriminator so that regression can't slip back in.
+    """
+    from screencap.chunk_processor import ChunkProcessor, ChunkStatus
+    from screencap.pipeline_state import Lifecycle, UploadState
+
+    _write_intent(capture_dir, "cloud")
+    q = multiprocessing.Queue()
+    ack_q = multiprocessing.Queue()
+    cp = ChunkProcessor(
+        capture_dir, q, ack_q, recording_name="test",
+        upload_enabled=False, auto_delete=False, cloud_intent=True,
+    )
+    ledger = cp._get_ledger()
+    ledger.seed_chunk(0)
+
+    cp._mirror_status_to_ledger(0, ChunkStatus.EMITTED)
+
+    row = ledger.get_chunk(0)
+    assert row.lifecycle == Lifecycle.UPLOADED, "cloud recording keeps mark_uploaded even without live upload"
+    assert row.upload_state == UploadState.UPLOADED
+
+
 # ---------------------------------------------------------------------------
 # Cloud-intent scrubbing tests
 # ---------------------------------------------------------------------------
