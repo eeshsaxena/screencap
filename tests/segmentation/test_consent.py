@@ -272,7 +272,7 @@ class TestFromConfig:
 
 
 # ---------------------------------------------------------------------------
-# Config consent getters — env > toml > default (default off)
+# Config consent getters — env > toml > default (summary/recall default on, KTD1)
 # ---------------------------------------------------------------------------
 
 class TestConsentGetters:

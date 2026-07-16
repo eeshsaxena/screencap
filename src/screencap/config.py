@@ -867,8 +867,9 @@ def _parse_intelligence_bool(env_name: str, cfg_key: str, default: bool) -> bool
     """Env var (truthy → bool) > ``[intelligence].<cfg_key>`` > default.
 
     A section-scoped twin of :func:`_parse_bool_env` for the per-task cloud
-    consent rows (U6). Consent defaults **OFF** — cloud never runs a task
-    unless its row is explicitly enabled.
+    consent rows (U6). The default is the caller-supplied ``default`` argument —
+    the summary/recall getters now pass ``True`` (connecting a cloud provider is
+    the consent, KTD1); ``day_split``/``frames`` remain fixed-off guards.
     """
     env = os.environ.get(env_name)
     if env is not None:
