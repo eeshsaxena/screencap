@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 
     from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
+    from screencap.segmentation.consent import ConsentPolicy, ExecutionTarget
     from screencap.segmentation.provider import SegmentResult
     from screencap.upload import FileInfo
 
@@ -1093,7 +1094,11 @@ def _run_local_segmentation(
         # Both are strictly fail-open and never block terminal / never upload.
         tasks = None
         try:
-            tasks = _summary_cloud_fallback(summary)
+            tasks = _summary_cloud_fallback(
+                summary,
+                recording_dir=recording_dir,
+                session_window=_session_window(summary),
+            )
         except Exception as exc:  # noqa: BLE001 — the cloud fallback must never block
             logger.debug(
                 "terminal_stage: summary cloud fallback failed open for %s (%s)",
@@ -1286,8 +1291,75 @@ def _segment_local_tasks(
     return summary, provider.segment(summary)
 
 
+def _session_window(summary: dict | None) -> "tuple[float, float] | None":
+    """The recording's ``(session_start, session_end)`` in epoch seconds, or ``None``.
+
+    Read off the activity summary (:func:`build_activity_summary` writes both as the
+    min chunk_start / max chunk_end). Returns ``None`` when either is missing or
+    non-numeric so the SUMMARY cloud fallback simply attaches no frames."""
+    if not isinstance(summary, dict):
+        return None
+    start = summary.get("session_start")
+    end = summary.get("session_end")
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    return (float(start), float(end))
+
+
+def _summary_cloud_frames(
+    recording_dir: "Path | None",
+    session_window: "tuple[float, float] | None",
+    provider: object,
+    policy: "ConsentPolicy",
+    target: "ExecutionTarget",
+) -> tuple:
+    """U1 masked frames for the SUMMARY cloud fallback's session window (SCR-272 U5).
+
+    Frames ride ONLY when ALL hold: the SUMMARY task resolved
+    :attr:`ExecutionTarget.CLOUD`, the independent frames opt-in is on and a cloud
+    provider is configured (:func:`frames_may_attach`), and the resolved provider is
+    vision-capable (``supports_frames``). The window is the whole session
+    ``[session_start, session_end)`` — the SUMMARY task is a session-level task, so
+    its frames span the session (unlike recall's per-snippet scoping). Strictly
+    fail-open: any error → ``()`` (text-only), so a frame-egress problem never loses
+    the cloud naming. Returns an empty tuple when frames must not attach."""
+    from screencap.segmentation.consent import frames_may_attach
+
+    if session_window is None or recording_dir is None:
+        return ()
+    if not frames_may_attach(policy, target):
+        return ()
+    if not getattr(provider, "supports_frames", False):
+        return ()
+    try:
+        from screencap import config
+        from screencap.segmentation.frame_egress import produce_egress_frames
+
+        corpus_key = None
+        if config.get_corpus_encrypted():
+            from screencap import corpus_crypto
+
+            corpus_key = corpus_crypto.load_corpus_key()
+
+        start, end = session_window
+        return tuple(
+            produce_egress_frames(
+                Path(recording_dir), start, end, corpus_key=corpus_key
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — frame egress must never block naming
+        logger.debug(
+            "terminal_stage: SUMMARY masked-frame egress failed open (%s); text-only",
+            exc,
+        )
+        return ()
+
+
 def _summary_cloud_fallback(
     summary: dict | None,
+    *,
+    recording_dir: "Path | None" = None,
+    session_window: "tuple[float, float] | None" = None,
 ) -> dict | None:
     """Consented SUMMARY cloud fallback over the ALREADY-stripped summary (U5, R6/R8).
 
@@ -1303,10 +1375,16 @@ def _summary_cloud_fallback(
     ``on_device_available=False``; a target other than ``CLOUD`` (no cloud provider
     configured, or the consent explicitly overridden off) returns ``None`` (leave
     unnamed). Consent is on by default now (KTD1), so this fires whenever a cloud
-    provider is configured. On ``CLOUD``, hand the
-    resolved cloud provider the SAME ``stripped=True``-marked summary the
-    on-device path built (never frames — the backends fail-close on unmarked
-    input and only ever receive the ALLOW-only text summary, R7/R8/KTD4).
+    provider is configured. On ``CLOUD``, hand the resolved cloud provider the SAME
+    ``stripped=True``-marked summary the on-device path built.
+
+    **Masked frames (SCR-272 U5).** When ``recording_dir`` + ``session_window`` are
+    threaded in, the independent frames opt-in is on (:func:`frames_may_attach`), and
+    the resolved cloud provider is vision-capable, U1's ALLOW-only masked frames for
+    the session window ride along via the typed ``masked_frames`` kwarg (never inside
+    the untyped summary dict, R12). With the opt-in off (the default) or a non-vision
+    provider, the call stays text-only — the exact ``provider.segment(summary)`` of
+    before — so the summary text still never carries frames.
 
     Strictly fail-open (R5): missing provider, unknown name, a provider that
     doesn't implement ``segment``, ``None`` / ``PROVIDER_UNAVAILABLE``, or any
@@ -1327,9 +1405,8 @@ def _summary_cloud_fallback(
     )
     from screencap.segmentation.provider import LLMProvider, get_provider
 
-    target = ConsentPolicy.from_config().resolve(
-        TaskKind.SUMMARY, on_device_available=False
-    )
+    policy = ConsentPolicy.from_config()
+    target = policy.resolve(TaskKind.SUMMARY, on_device_available=False)
     if target is not ExecutionTarget.CLOUD:
         return None  # consent off / no provider → leave unnamed (never cloud).
 
@@ -1351,11 +1428,21 @@ def _summary_cloud_fallback(
     if not isinstance(provider, LLMProvider):
         return None
 
+    # Attach masked frames ONLY at this already-cloud point, gated on the frames
+    # opt-in + a vision-capable provider (SCR-272 U5). Empty → the text-only call
+    # of before, so non-vision backends never receive the kwarg.
+    masked_frames = _summary_cloud_frames(
+        recording_dir, session_window, provider, policy, target
+    )
+
     # segment() returns a validated tasks dict, None (ran, no usable tasks), or
     # PROVIDER_UNAVAILABLE (could not run). Only a real dict is usable; the
     # sentinel is a distinct non-dict class, so the isinstance check excludes it —
     # every other outcome leaves the recording to the caller's heuristic fallback.
-    result = provider.segment(summary)
+    if masked_frames:
+        result = provider.segment(summary, masked_frames=masked_frames)
+    else:
+        result = provider.segment(summary)
     return result if isinstance(result, dict) else None
 
 

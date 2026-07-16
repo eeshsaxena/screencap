@@ -38,6 +38,7 @@ def _isolate_config(tmp_path, monkeypatch):
         "SCREENCAP_LLM_CLOUD_PROVIDER",
         "SCREENCAP_SUMMARY_CLOUD_CONSENT",
         "SCREENCAP_RECALL_CLOUD_CONSENT",
+        "SCREENCAP_FRAMES_CLOUD_CONSENT",
         "SCREENCAP_LOCAL_SERVER_ENDPOINT",
         "SCREENCAP_BYO_KEY_FILE",
     ):
@@ -195,6 +196,56 @@ class TestConsentRows:
 
 
 # ---------------------------------------------------------------------------
+# Frames consent row (SCR-272) — a settable, default-off opt-in. The CLI no
+# longer hard-rejects it; it routes through the same consent-write path.
+# ---------------------------------------------------------------------------
+
+
+class TestFramesConsentRow:
+    @pytest.mark.privacy
+    def test_frames_consent_persists_and_reads_back(self):
+        w = _invoke("frames_cloud_consent", "set", "true")
+        assert w.exit_code == 0, w.output
+        assert _read_cfg()["intelligence"]["frames_cloud_consent"] is True
+
+        from screencap import config
+
+        config.invalidate_config_cache()
+        assert config.get_frames_cloud_consent() is True
+
+    @pytest.mark.privacy
+    def test_frames_consent_default_off_in_json(self):
+        """Fresh config → the LIVE frames value is false (SCR-272 default off),
+        emitted from the config getter, not hard-coded."""
+        r = _invoke(as_json=True)
+        payload = _last_json_line(r.output)["intelligence"]
+        assert payload["frames_cloud_consent"] is False
+
+    @pytest.mark.privacy
+    def test_frames_consent_true_reflected_in_json(self):
+        _invoke("frames_cloud_consent", "set", "true")
+        r = _invoke(as_json=True)
+        payload = _last_json_line(r.output)["intelligence"]
+        assert payload["frames_cloud_consent"] is True
+
+    @pytest.mark.privacy
+    def test_frames_consent_false_persists(self):
+        _invoke("frames_cloud_consent", "set", "true")
+        _invoke("frames_cloud_consent", "set", "false")
+        assert _read_cfg()["intelligence"]["frames_cloud_consent"] is False
+
+    @pytest.mark.privacy
+    def test_frames_write_emits_ok_envelope(self):
+        r = _invoke("frames_cloud_consent", "set", "true", as_json=True)
+        assert r.exit_code == 0, r.output
+        payload = _last_json_line(r.output)
+        assert payload["ok"] is True
+        assert payload["row"] == "frames_cloud_consent"
+        assert payload["value"] is True
+        assert payload["error"] is None
+
+
+# ---------------------------------------------------------------------------
 # Rejection edges — the fixed never-cloud rows (R7 / R9)
 # ---------------------------------------------------------------------------
 
@@ -207,22 +258,16 @@ class TestNeverCloudRows:
         # Nothing persisted.
         assert "day_split_cloud_consent" not in _read_cfg().get("intelligence", {})
 
-    def test_frames_row_rejected_when_set_cloud_on(self):
-        r = _invoke("frames_cloud_consent", "set", "true")
-        assert r.exit_code != 0
-        assert "never sent" in r.output
-        assert "frames_cloud_consent" not in _read_cfg().get("intelligence", {})
-
     def test_day_split_row_rejected_even_when_set_false(self):
         """The row is not a settable knob at all — reject regardless of value,
         so it can never be persisted into the [intelligence] section."""
         r = _invoke("day_split_cloud_consent", "set", "false")
         assert r.exit_code != 0
 
-    def test_frames_row_reported_fixed_off_in_json(self):
+    def test_day_split_row_reported_fixed_off_in_json(self):
+        """Day-split stays the only fixed-off (never-cloud) row after SCR-272."""
         r = _invoke(as_json=True)
         payload = _last_json_line(r.output)["intelligence"]
-        assert payload["frames_cloud_consent"] is False
         assert payload["day_split_cloud_consent"] is False
 
     def test_unknown_row_rejected(self):
@@ -254,7 +299,9 @@ class TestJsonWriteEnvelope:
         assert "error" in payload
 
     def test_never_cloud_row_emits_ok_false(self):
-        r = _invoke("frames_cloud_consent", "set", "true", as_json=True)
+        # Day-split is the remaining fixed never-cloud row (frames became settable
+        # in SCR-272).
+        r = _invoke("day_split_cloud_consent", "set", "true", as_json=True)
         assert r.exit_code != 0
         payload = _last_json_line(r.output)
         assert payload["ok"] is False
@@ -373,17 +420,39 @@ class TestBYOCloudProviders:
 
 @pytest.mark.privacy
 class TestBYONeverCloudInvariant:
-    """The frames/day-split never-cloud guards (R7) hold after the
-    cloud-provider enum is widened for BYO providers."""
+    """The day-split never-cloud guard (R7) and the FRAMES→NEVER resolve guard
+    (R9) hold after the cloud-provider enum is widened for BYO providers."""
 
     @pytest.mark.parametrize("byo", ("openai", "anthropic", "gemini-cli"))
-    def test_frames_row_still_rejected_with_byo_configured(self, byo):
+    def test_frames_row_settable_but_resolve_still_never_cloud(self, byo):
+        """SCR-272: turning the frames opt-in ON via the CLI (with a BYO provider
+        configured) persists the row, yet it must NOT weaken the fixed guard —
+        ``resolve(TaskKind.FRAMES)`` stays NEVER. The opt-in only lets frames
+        *attach* to an already-cloud task (``frames_may_attach``)."""
+        from screencap import config
+        from screencap.segmentation.consent import (
+            ConsentPolicy,
+            ExecutionTarget,
+            TaskKind,
+            frames_may_attach,
+        )
+
         _invoke("cloud_provider", "set", byo)
         _invoke("summary_cloud_consent", "set", "true")
         r = _invoke("frames_cloud_consent", "set", "true")
-        assert r.exit_code != 0
-        assert "never sent" in r.output
-        assert "frames_cloud_consent" not in _read_cfg().get("intelligence", {})
+        assert r.exit_code == 0, r.output
+        assert _read_cfg()["intelligence"]["frames_cloud_consent"] is True
+
+        config.invalidate_config_cache()
+        policy = ConsentPolicy.from_config()
+        # The fixed guard does not weaken — frames are never a standalone cloud task.
+        for on_device in (True, False):
+            assert (
+                policy.resolve(TaskKind.FRAMES, on_device_available=on_device)
+                is ExecutionTarget.NEVER
+            )
+        # But the separate attach gate is now open for an already-cloud task.
+        assert frames_may_attach(policy, ExecutionTarget.CLOUD) is True
 
     @pytest.mark.parametrize("byo", ("openai", "anthropic", "gemini-cli"))
     def test_day_split_row_still_rejected_with_byo_configured(self, byo):

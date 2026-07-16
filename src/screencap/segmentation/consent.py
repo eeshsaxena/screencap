@@ -28,9 +28,13 @@ Fixed guards (checked before the cloud row)
   When on-device is unavailable it degrades to the local idle-gap heuristic,
   **never** cloud (KTD6). It is the caller's (U7) job to run that heuristic;
   the policy only names the target.
-- **Frames / images** are never sent to any cloud provider — a fixed rule, not
-  a toggle (R9). They resolve to :attr:`ExecutionTarget.NEVER` for every
-  configuration.
+- **Frames / images** are never a standalone cloud task — a fixed rule, not a
+  toggle (R9). :meth:`ConsentPolicy.resolve` returns
+  :attr:`ExecutionTarget.NEVER` for ``TaskKind.FRAMES`` in every configuration.
+  Frames may only ever *ride along* on a task that has already resolved to
+  cloud, and only with the independent, default-off ``frames_cloud_consent``
+  opt-in — that layered decision lives in :func:`frames_may_attach`, never in
+  :meth:`resolve` (SCR-272).
 
 Only summary/title and recall-answer can ever resolve to cloud, and only as
 the consented fallback described above.
@@ -101,6 +105,13 @@ class ConsentPolicy:
     recall_cloud_consent:
         Whether recall-answers may use the cloud fallback (R10). Same default
         split as ``summary_cloud_consent``.
+    frames_cloud_consent:
+        Whether masked screen frames may be *attached* to an already-cloud
+        summary/recall task (SCR-272). An independent, default-**off** opt-in:
+        it is consulted only by :func:`frames_may_attach`, layered on top of a
+        task that has already resolved to :attr:`ExecutionTarget.CLOUD`. It
+        **never** changes :meth:`resolve` — ``TaskKind.FRAMES`` stays
+        :attr:`ExecutionTarget.NEVER` for every configuration (R9).
     """
 
     cloud_provider: str | None = None
@@ -108,6 +119,8 @@ class ConsentPolicy:
     # product default (on) is applied by `from_config` via the config getters.
     summary_cloud_consent: bool = False
     recall_cloud_consent: bool = False
+    # Frames stay off by default in config too (SCR-272) — independent opt-in.
+    frames_cloud_consent: bool = False
 
     @classmethod
     def from_config(cls) -> ConsentPolicy:
@@ -122,6 +135,7 @@ class ConsentPolicy:
             cloud_provider=config.get_llm_cloud_provider(),
             summary_cloud_consent=config.get_summary_cloud_consent(),
             recall_cloud_consent=config.get_recall_cloud_consent(),
+            frames_cloud_consent=config.get_frames_cloud_consent(),
         )
 
     def resolve(
@@ -173,3 +187,33 @@ class ConsentPolicy:
         if consented and self.cloud_provider is not None:
             return ExecutionTarget.CLOUD  # Consented fallback only.
         return ExecutionTarget.NONE
+
+
+def frames_may_attach(
+    policy: ConsentPolicy, resolved_target: ExecutionTarget
+) -> bool:
+    """Return whether masked frames may ride along on an already-cloud task (SCR-272).
+
+    This is the frame-egress gate, deliberately **separate** from
+    :meth:`ConsentPolicy.resolve`: frames are never a standalone cloud task
+    (``resolve(TaskKind.FRAMES)`` is always :attr:`ExecutionTarget.NEVER`, R9).
+    Instead, a summary/recall task that has *already* resolved to
+    :attr:`ExecutionTarget.CLOUD` may — only with explicit opt-in — carry masked
+    frames as multimodal evidence.
+
+    Returns ``True`` only when **all** hold:
+
+    - ``resolved_target is ExecutionTarget.CLOUD`` — the host task is actually
+      cloud-bound (an ``ON_DEVICE`` / ``NEVER`` / ``NONE`` task never attaches
+      frames);
+    - ``policy.frames_cloud_consent`` — the independent, default-off frames
+      opt-in is set (connecting a provider + cloud-tasks-on does **not** imply
+      it, AE1);
+    - ``policy.cloud_provider is not None`` — there is a configured backend to
+      send them to.
+    """
+    return (
+        resolved_target is ExecutionTarget.CLOUD
+        and policy.frames_cloud_consent
+        and policy.cloud_provider is not None
+    )

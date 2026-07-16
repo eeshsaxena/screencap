@@ -3918,8 +3918,10 @@ def _build_intelligence_settings_block() -> dict:
     """Return the current ``[intelligence]`` settings, via the config getters.
 
     Pointer-only, secret-free: the active provider, the configured cloud
-    provider (or ``None``), and each cloud-consent row. The frames/images row
-    is reported as a fixed ``false`` (never-cloud, R9) so the Swift pane can
+    provider (or ``None``), and each cloud-consent row. ``frames_cloud_consent``
+    (SCR-272) is reported LIVE from the config getter — it is an independent,
+    default-off opt-in, not a fixed guard. Only the day-split/label row is still
+    reported as a fixed ``false`` (on-device-only, R7) so the Swift pane can
     render it as a non-interactive "always off" without a special case.
     """
     from screencap import config
@@ -3938,9 +3940,11 @@ def _build_intelligence_settings_block() -> dict:
         "cloud_provider": config.get_llm_cloud_provider(),
         "summary_cloud_consent": config.get_summary_cloud_consent(),
         "recall_cloud_consent": config.get_recall_cloud_consent(),
-        # Fixed guards (R7/R9) — surfaced so the pane needn't hard-code them.
+        # Independent, default-off frames opt-in (SCR-272) — surfaced LIVE so the
+        # pane renders the real state, not a hard-coded false.
+        "frames_cloud_consent": config.get_frames_cloud_consent(),
+        # Fixed guard (R7) — surfaced so the pane needn't hard-code it.
         "day_split_cloud_consent": False,
-        "frames_cloud_consent": False,
         # SCR-239 BYO endpoint (redacted — never echo userinfo/query) + its
         # LOCAL/REMOTE classification, and the downloaded-model install state.
         "local_server_endpoint": _redact_url(endpoint),
@@ -4149,8 +4153,8 @@ def settings_intelligence(row, op, value, as_json, set_key_vendor, clear_key_ven
         console.print(f"  Cloud provider:        {payload['cloud_provider'] or 'none'}")
         console.print(f"  Summaries & titles:    {'cloud-consented' if payload['summary_cloud_consent'] else 'on-device only'}")
         console.print(f"  Recall answers:        {'cloud-consented' if payload['recall_cloud_consent'] else 'on-device only'}")
+        console.print(f"  Screen frames/images:  {'cloud-consented' if payload['frames_cloud_consent'] else 'not sent to cloud'} [dim](opt-in, default off)[/dim]")
         console.print("  Day-splitting/labels:  on-device only [dim](fixed)[/dim]")
-        console.print("  Screen frames/images:  never sent to cloud [dim](fixed)[/dim]")
         console.print()
         return
 
@@ -4180,9 +4184,11 @@ def settings_intelligence(row, op, value, as_json, set_key_vendor, clear_key_ven
 
     value = value.strip()
 
-    # The forbidden cloud rows: day-split/label and frames. Rejected before
-    # anything is written — defense in depth over U6's policy (R7/R9).
-    _FORBIDDEN_CLOUD_ROWS = ("day_split_cloud_consent", "frames_cloud_consent")
+    # The forbidden cloud row: day-split/label. Rejected before anything is
+    # written — defense in depth over U6's policy (R7). Frames are NOT here
+    # (SCR-272): ``frames_cloud_consent`` is a settable, default-off opt-in in
+    # ``_CLOUD_CONSENT_ROWS`` — it never flips the fixed FRAMES→NEVER guard.
+    _FORBIDDEN_CLOUD_ROWS = ("day_split_cloud_consent",)
 
     if row == "provider":
         if value not in config._VALID_LLM_PROVIDERS:
@@ -4262,11 +4268,11 @@ def settings_intelligence(row, op, value, as_json, set_key_vendor, clear_key_ven
             err_console.print(f"  [bold]intelligence.cloud_provider[/bold] set {escape(str(value))}")
 
     elif row in _FORBIDDEN_CLOUD_ROWS:
-        # R7 (day-split/label) / R9 (frames) — on-device / never-cloud, fixed.
+        # R7 (day-split/label) — on-device only, fixed. (Frames are settable via
+        # the default-off ``frames_cloud_consent`` opt-in, handled below.)
         err_console.print(
             f"[red]Error:[/red] {escape(str(row))} cannot be consented to "
-            "cloud — day-splitting/labeling stays on-device and screen "
-            "frames/images are never sent to any cloud provider."
+            "cloud — day-splitting/labeling stays on-device."
         )
         _emit_error(f"row_never_cloud:{row}")
 

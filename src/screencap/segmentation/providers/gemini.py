@@ -30,7 +30,11 @@ from typing import Callable
 #: ``cloud_provider`` value that maps to this backend (R10 — one Gemini entry).
 _VENDOR = "gemini"
 
-from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation import (
+    Evidence,
+    MaskedFrame,
+    verify_masked_frames,
+)
 from screencap.segmentation.generation_finish import (
     build_answer_prompt,
     evidence_gate_ok,
@@ -64,6 +68,28 @@ def _load_gemini_key() -> str | None:
     if key:
         return key
     return os.environ.get("GOOGLE_GENAI_API_KEY") or None
+
+
+def _build_contents(types, prompt: str, masked_frames: "tuple[MaskedFrame, ...]"):
+    """Assemble the ``generate_content`` ``contents`` argument (SCR-272, U4).
+
+    With no frames this returns the bare ``prompt`` string — the exact text-only
+    shape used before multimodal support, so a text-only call is byte-for-byte
+    unchanged. With masked frames it returns ``[prompt, <image part per frame>]``,
+    each image part built the way the google-genai SDK expects for inline JPEG
+    bytes: ``types.Part.from_bytes(data=..., mime_type="image/jpeg")``. Frames are
+    already verified (``verify_masked_frames``) by the caller before they reach
+    here, so this is a pure assembly step.
+    """
+    if not masked_frames:
+        return prompt
+    contents: list = [prompt]
+    for frame in masked_frames:
+        contents.append(
+            types.Part.from_bytes(data=frame.jpeg_bytes, mime_type="image/jpeg")
+        )
+    return contents
+
 
 # Prompt lifted verbatim from the Cloud Run processor so cloud output is
 # unchanged when the LLM call is routed through this backend.
@@ -125,7 +151,15 @@ class GeminiProvider:
     the cloud processor route the raw call through its own mock seam without
     changing this backend, and lets tests exercise the format→validate flow on
     a fixed model response.
+
+    ``supports_frames`` is ``True``: Gemini is the one vision-capable backend, so
+    masked frames handed to :meth:`segment` / :meth:`answer` are attached as
+    inline image parts (SCR-272, U4). Every other backend leaves this ``False``
+    and omits frames. It is a plain class attribute so a test can force it off
+    per instance (frames then dropped, text-only).
     """
+
+    supports_frames: bool = True
 
     def __init__(
         self,
@@ -142,7 +176,12 @@ class GeminiProvider:
         # already-server-side, un-stripped activity data still segments.
         self._require_stripped = require_stripped
 
-    def segment(self, activity_summary: dict) -> dict | None:
+    def segment(
+        self,
+        activity_summary: dict,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> dict | None:
         """Segment the session into named tasks via Gemini.
 
         ``activity_summary`` is the full activity-data dict from
@@ -150,6 +189,12 @@ class GeminiProvider:
         ``session_end`` / ``time_map``). Returns the **validated** tasks dict,
         or ``None`` if the model is unavailable/fails or its output does not
         validate. Never raises for an ordinary model/API failure.
+
+        ``masked_frames`` is the optional multimodal channel (SCR-272): when
+        present AND :attr:`supports_frames` is on, the frames are verified and
+        attached as inline image parts to the model call (see
+        :func:`_build_contents`); otherwise the call is text-only exactly as
+        before.
         """
         # Fail-closed privacy gate (R7/R8), enabled only on the LOCAL BYO path:
         # refuse anything not explicitly marked privacy-stripped WITHOUT making a
@@ -166,7 +211,20 @@ class GeminiProvider:
         prompt = _LLM_PROMPT.format(
             activity_json=json.dumps(activity_summary["summary"], indent=2),
         )
-        raw = self._raw_call(prompt)
+        # Attach frames only when vision-capable; verify (R12) at this single
+        # checkpoint before they can reach the model. Route them through the raw
+        # seam only when present so an injected text-only ``raw_call`` (cloud
+        # processor / tests) keeps its one-arg contract.
+        frames = (
+            verify_masked_frames(masked_frames)
+            if masked_frames and self.supports_frames
+            else ()
+        )
+        raw = (
+            self._raw_call(prompt, masked_frames=frames)
+            if frames
+            else self._raw_call(prompt)
+        )
         if raw is None:
             return None
 
@@ -181,11 +239,15 @@ class GeminiProvider:
             log.warning("Gemini output failed validation", exc_info=True)
             return None
 
-    def _call_gemini(self, prompt: str) -> dict | None:
+    def _call_gemini(
+        self, prompt: str, *, masked_frames: "tuple[MaskedFrame, ...]" = ()
+    ) -> dict | None:
         """Call Gemini Flash via the Google AI API. Returns parsed JSON or None.
 
         ``google.genai`` is imported lazily here so this module stays cloud-free
-        at import time.
+        at import time. ``masked_frames`` (already verified by :meth:`segment`)
+        are attached as inline image parts via :func:`_build_contents`; with no
+        frames the ``contents`` is the bare prompt str (text-only, unchanged).
         """
         try:
             from google import genai
@@ -200,7 +262,7 @@ class GeminiProvider:
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model=_MODEL,
-                contents=prompt,
+                contents=_build_contents(types, prompt, masked_frames),
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=_RESPONSE_SCHEMA,
@@ -221,21 +283,46 @@ class GeminiProvider:
 
     # -- Free-form generation path (SCR-243, U5) ---------------------------
 
-    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+    def answer(
+        self,
+        prompt: str,
+        evidence: Evidence,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> str | ProviderUnavailable:
         """Answer ``prompt`` grounded in ``evidence`` via a free-form Gemini call.
 
         Unlike :meth:`segment`, this uses NO structured response schema. Returns
         the sanitized answer string, or :data:`PROVIDER_UNAVAILABLE` when the
         model is unavailable/fails or produces empty output. Never raises.
+
+        Frames may arrive two ways (SCR-272): the explicit ``masked_frames``
+        kwarg or, on the recall path, :attr:`Evidence.masked_frames`. The kwarg
+        wins when both carry frames; either is verified before egress and, when
+        :attr:`supports_frames` is on, attached as inline image parts.
         """
-        # Single fail-closed gate: stripped marker (R11), str text/prompt (R12),
-        # within the size caps (KTD10). The cloud path is the only off-box
-        # egress, so it self-caps here rather than trusting the dispatcher.
+        # Fail-closed gate on TEXT: stripped marker (R11), str text/prompt (R12),
+        # size caps (KTD10) covering prompt + evidence.text only — NOT the frame
+        # bytes (frames are marker-verified below; their volume is bounded upstream
+        # by the producer's per-recording frame cap, not by this text gate). The
+        # cloud path is the only off-box egress, so it self-caps the text here
+        # rather than trusting the dispatcher.
         if not evidence_gate_ok(prompt, evidence):
             log.warning("GeminiProvider.answer refused the request (gate); unavailable")
             return PROVIDER_UNAVAILABLE
 
-        raw = self._answer_raw_call(build_answer_prompt(prompt, evidence))
+        candidate = masked_frames or evidence.masked_frames
+        frames = (
+            verify_masked_frames(candidate)
+            if candidate and self.supports_frames
+            else ()
+        )
+        built = build_answer_prompt(prompt, evidence)
+        raw = (
+            self._answer_raw_call(built, masked_frames=frames)
+            if frames
+            else self._answer_raw_call(built)
+        )
         if raw is None:
             return PROVIDER_UNAVAILABLE
         cleaned = sanitize_answer(raw)
@@ -243,11 +330,15 @@ class GeminiProvider:
             return PROVIDER_UNAVAILABLE
         return cleaned
 
-    def _answer_gemini(self, prompt: str) -> str | None:
+    def _answer_gemini(
+        self, prompt: str, *, masked_frames: "tuple[MaskedFrame, ...]" = ()
+    ) -> str | None:
         """Free-form Gemini call (no response schema). Returns text or None.
 
         ``google.genai`` is imported lazily here so this module stays cloud-free
-        at import time.
+        at import time. ``masked_frames`` (already verified by :meth:`answer`)
+        ride as inline image parts via :func:`_build_contents`; with no frames
+        the ``contents`` is the bare prompt str (text-only, unchanged).
         """
         try:
             from google import genai
@@ -262,7 +353,7 @@ class GeminiProvider:
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
                 model=_MODEL,
-                contents=prompt,
+                contents=_build_contents(types, prompt, masked_frames),
                 config=types.GenerateContentConfig(temperature=0.2),
             )
             return response.text

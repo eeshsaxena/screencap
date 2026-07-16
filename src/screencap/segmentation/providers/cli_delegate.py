@@ -65,7 +65,7 @@ import threading
 import time
 from pathlib import Path
 
-from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation import Evidence, MaskedFrame
 from screencap.segmentation.generation_finish import (
     build_answer_prompt,
     evidence_gate_ok,
@@ -271,7 +271,13 @@ class CliDelegateProvider:
     (defaults to the real subprocess call) so tests exercise the parse/validate
     flow against a fake CLI without spawning a real binary. Stateless otherwise;
     safe to construct per call.
+
+    ``supports_frames`` is ``False``: the vendor CLIs are driven text-only here,
+    so any ``masked_frames`` handed to :meth:`segment` / :meth:`answer` are
+    ignored — graceful omission, never a raise (SCR-272, U4).
     """
+
+    supports_frames: bool = False
 
     def __init__(self, vendor: str, run_cli=None) -> None:
         specs = _vendor_specs()
@@ -300,11 +306,17 @@ class CliDelegateProvider:
 
     # -- Segmentation ------------------------------------------------------
 
-    def segment(self, activity_summary: dict) -> dict | None | ProviderUnavailable:
+    def segment(
+        self,
+        activity_summary: dict,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> dict | None | ProviderUnavailable:
         """Segment the session by delegating to the vendor CLI.
 
         See :mod:`screencap.segmentation.provider` for the tri-state return.
-        Never raises for an ordinary CLI failure.
+        Never raises for an ordinary CLI failure. ``masked_frames`` is accepted
+        but ignored — the CLI is driven text-only (graceful omission).
         """
         # Fail-closed privacy gate (R7/R8): refuse anything not explicitly marked
         # privacy-stripped. Do NOT spawn the CLI on unmarked input.
@@ -342,11 +354,18 @@ class CliDelegateProvider:
 
     # -- Free-form generation ----------------------------------------------
 
-    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+    def answer(
+        self,
+        prompt: str,
+        evidence: Evidence,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> str | ProviderUnavailable:
         """Answer ``prompt`` grounded in ``evidence`` by delegating to the vendor CLI.
 
         See :mod:`screencap.segmentation.generation` for the two-state return.
-        Never raises for an ordinary CLI failure.
+        Never raises for an ordinary CLI failure. ``masked_frames`` is accepted
+        but ignored (graceful omission).
         """
         # Single fail-closed gate: stripped marker (R7), str text/prompt (R7),
         # within the size caps (KTD10). No CLI spawn on refusal.

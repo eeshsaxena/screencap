@@ -38,7 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation import Evidence, MaskedFrame
 from screencap.segmentation.generation_finish import (
     build_answer_prompt,
     evidence_gate_ok,
@@ -148,9 +148,21 @@ def _worker_command() -> list[str]:
 
 
 class DownloadedProvider:
-    """Downloaded local model via a hardened subprocess worker. See module docs."""
+    """Downloaded local model via a hardened subprocess worker. See module docs.
 
-    def segment(self, activity_summary: dict) -> dict | None | ProviderUnavailable:
+    ``supports_frames`` is ``False``: the local worker takes text only, so any
+    ``masked_frames`` handed to :meth:`segment` / :meth:`answer` are ignored —
+    graceful omission, never a raise (SCR-272, U4).
+    """
+
+    supports_frames: bool = False
+
+    def segment(
+        self,
+        activity_summary: dict,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> dict | None | ProviderUnavailable:
         # Fail-closed privacy gate (R10): refuse unmarked input, no worker spawn.
         if activity_summary.get("stripped") is not True:
             log.warning(
@@ -271,7 +283,13 @@ class DownloadedProvider:
 
     # -- Free-form generation path (SCR-243, U10) --------------------------
 
-    def answer(self, prompt: str, evidence: Evidence) -> str | ProviderUnavailable:
+    def answer(
+        self,
+        prompt: str,
+        evidence: Evidence,
+        *,
+        masked_frames: "tuple[MaskedFrame, ...]" = (),
+    ) -> str | ProviderUnavailable:
         """Answer ``prompt`` grounded in ``evidence`` via the downloaded model's
         free-form text mode.
 
@@ -279,7 +297,8 @@ class DownloadedProvider:
         RAM precheck, ``nice``, size caps) but a **grammar-free** worker mode
         (``mode="generate_text"``, KTD8) that returns raw text — not the JSON
         tasks envelope. Returns the sanitized answer or
-        :data:`PROVIDER_UNAVAILABLE`. Never raises.
+        :data:`PROVIDER_UNAVAILABLE`. Never raises. ``masked_frames`` is accepted
+        but ignored (graceful omission).
         """
         # Single fail-closed gate: stripped marker (R10/R11), str text/prompt
         # (R12), within the size caps (KTD10). No worker spawn on refusal.

@@ -29,6 +29,7 @@ from screencap.segmentation.consent import (
     ConsentPolicy,
     ExecutionTarget,
     TaskKind,
+    frames_may_attach,
 )
 
 # Consent is the privacy matrix — run in CI's privacy lane (Vision-free).
@@ -128,6 +129,14 @@ class TestFramesNeverCloud:
                 summary_cloud_consent=True,
                 recall_cloud_consent=True,
             ),
+            # SCR-272: even with the frames opt-in ON, resolve() must not weaken —
+            # frames are never a standalone cloud task (that gate is separate).
+            ConsentPolicy(
+                cloud_provider="gemini",
+                summary_cloud_consent=True,
+                recall_cloud_consent=True,
+                frames_cloud_consent=True,
+            ),
         ]
         for policy in configs:
             for on_device in (True, False):
@@ -135,6 +144,47 @@ class TestFramesNeverCloud:
                     policy.resolve(TaskKind.FRAMES, on_device_available=on_device)
                     is ExecutionTarget.NEVER
                 )
+
+
+# ---------------------------------------------------------------------------
+# frames_may_attach — the SEPARATE frame-egress gate, layered on an already
+# cloud-resolved task (SCR-272). Never touches resolve()/the FRAMES→NEVER guard.
+# ---------------------------------------------------------------------------
+
+class TestFramesMayAttach:
+    def test_true_only_with_cloud_and_consent_and_provider(self):
+        policy = ConsentPolicy(cloud_provider="gemini", frames_cloud_consent=True)
+        assert frames_may_attach(policy, ExecutionTarget.CLOUD) is True
+
+    def test_false_when_host_task_not_cloud(self):
+        """A non-cloud host task never attaches frames, even fully consented."""
+        policy = ConsentPolicy(cloud_provider="gemini", frames_cloud_consent=True)
+        for target in (
+            ExecutionTarget.ON_DEVICE,
+            ExecutionTarget.NEVER,
+            ExecutionTarget.HEURISTIC,
+            ExecutionTarget.NONE,
+        ):
+            assert frames_may_attach(policy, target) is False
+
+    def test_ae1_false_without_frames_consent_even_with_provider(self):
+        """AE1 (privacy): connecting a cloud provider + cloud-tasks-default-on does
+        NOT enable frames. With ``frames_cloud_consent`` off, no attach — even with
+        a provider set and the summary/recall rows consented."""
+        policy = ConsentPolicy(
+            cloud_provider="gemini",
+            summary_cloud_consent=True,
+            recall_cloud_consent=True,
+            frames_cloud_consent=False,
+        )
+        assert frames_may_attach(policy, ExecutionTarget.CLOUD) is False
+
+    def test_false_when_consent_on_but_no_provider(self):
+        policy = ConsentPolicy(cloud_provider=None, frames_cloud_consent=True)
+        assert frames_may_attach(policy, ExecutionTarget.CLOUD) is False
+
+    def test_default_policy_never_attaches(self):
+        assert frames_may_attach(ConsentPolicy(), ExecutionTarget.CLOUD) is False
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +244,7 @@ class TestFromConfig:
                 "SCREENCAP_LLM_CLOUD_PROVIDER",
                 "SCREENCAP_SUMMARY_CLOUD_CONSENT",
                 "SCREENCAP_RECALL_CLOUD_CONSENT",
+                "SCREENCAP_FRAMES_CLOUD_CONSENT",
             )
         }
         with mock.patch.dict(os.environ, env, clear=True):
@@ -202,12 +253,16 @@ class TestFromConfig:
                     "cloud_provider": "gemini",
                     "summary_cloud_consent": True,
                     "recall_cloud_consent": False,
+                    "frames_cloud_consent": True,
                 }
             }
             policy = ConsentPolicy.from_config()
         assert policy.cloud_provider == "gemini"
         assert policy.summary_cloud_consent is True
         assert policy.recall_cloud_consent is False
+        # SCR-272: frames opt-in wires through from_config too.
+        assert policy.frames_cloud_consent is True
+        assert frames_may_attach(policy, ExecutionTarget.CLOUD) is True
         # And it wires straight through to the resolver.
         assert (
             policy.resolve(TaskKind.SUMMARY, on_device_available=False)
@@ -230,6 +285,8 @@ class TestFromConfig:
         assert policy.cloud_provider is None
         assert policy.summary_cloud_consent is True
         assert policy.recall_cloud_consent is True
+        # SCR-272: frames stay OFF by default even when summary/recall default on.
+        assert policy.frames_cloud_consent is False
         # Consent on, but no provider → still NONE (nothing to fall back to).
         assert (
             policy.resolve(TaskKind.SUMMARY, on_device_available=False)
@@ -373,3 +430,37 @@ class TestConsentGetters:
         ):
             cfg._config_cache = {"intelligence": {"recall_cloud_consent": True}}
             assert get_recall_cloud_consent() is False
+
+    def test_frames_consent_default_off(self):
+        """SCR-272: unlike summary/recall, frames default OFF — connecting a cloud
+        provider + cloud-tasks-on does NOT enable frame egress."""
+        import screencap.config as cfg
+        from screencap.config import get_frames_cloud_consent
+
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True):
+            cfg._config_cache = {}
+            assert get_frames_cloud_consent() is False
+
+    def test_frames_consent_toml_override_on(self):
+        import screencap.config as cfg
+        from screencap.config import get_frames_cloud_consent
+
+        with mock.patch.dict(os.environ, self._clean_env(), clear=True):
+            cfg._config_cache = {"intelligence": {"frames_cloud_consent": True}}
+            assert get_frames_cloud_consent() is True
+
+    def test_frames_consent_env_overrides_toml(self):
+        import screencap.config as cfg
+        from screencap.config import get_frames_cloud_consent
+
+        # Env wins both ways over toml.
+        with mock.patch.dict(
+            os.environ, {"SCREENCAP_FRAMES_CLOUD_CONSENT": "1"}
+        ):
+            cfg._config_cache = {"intelligence": {"frames_cloud_consent": False}}
+            assert get_frames_cloud_consent() is True
+        with mock.patch.dict(
+            os.environ, {"SCREENCAP_FRAMES_CLOUD_CONSENT": "0"}
+        ):
+            cfg._config_cache = {"intelligence": {"frames_cloud_consent": True}}
+            assert get_frames_cloud_consent() is False

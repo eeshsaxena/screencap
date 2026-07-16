@@ -176,9 +176,15 @@ enum ReviewTimingStatus: Equatable {
 /// envelope; absent fields fall back to safe defaults so the panes can
 /// still render something usable.
 ///
-/// `videoURL` is the LOCAL navigation video (never uploaded); `eventsURLs`
-/// and `screenshotURLs` point at the scrubbed copy — the bytes that actually
-/// upload (R15). `redaction`/`coverage` drive the transparency UI (U8).
+/// `videoURL` is the LOCAL navigation video (never uploaded, and never a
+/// frame-egress candidate — the masked-frames-to-connected-model path reads the
+/// flat `screenshots/*.jpg`, not this `.mp4`, SCR-272); `eventsURLs` and
+/// `screenshotURLs` point at the scrubbed copy — the bytes that actually upload
+/// (R15). The masked screenshots are the class of pixels the frames opt-in may
+/// send to a connected Intelligence model; the state-keyed disclosure lives in
+/// the Intelligence pane, so the "local-only, not uploaded" video label here
+/// stays accurate whether or not `frames_cloud_consent` is on.
+/// `redaction`/`coverage` drive the transparency UI (U8).
 struct ReviewData: Equatable {
     let videoURL: URL
     /// The full scrubbed event file set (per-chunk when chunked) — what

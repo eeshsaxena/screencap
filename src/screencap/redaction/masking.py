@@ -33,6 +33,7 @@ __all__ = [
     "MaskStrategy",
     "get_mask_strategy",
     "mask_screenshot",
+    "mask_regions_to_bytes",
 ]
 
 
@@ -73,6 +74,40 @@ def get_mask_strategy(context_class: ContextClass) -> MaskStrategy | None:
 # ---------------------------------------------------------------------------
 # Strategy-driven screenshot masking
 # ---------------------------------------------------------------------------
+
+
+def mask_regions_to_bytes(
+    image_bytes: bytes,
+    regions: list[MaskRegion],
+) -> bytes:
+    """Return JPEG bytes of ``image_bytes`` with ``regions`` painted out.
+
+    Sibling of :func:`mask_screenshot` for the frame-egress producer
+    (``screencap.segmentation.frame_egress``): it uses the SAME fully-opaque
+    :func:`_apply_mask_to_image` paint, but renders to an in-memory buffer and
+    returns the bytes — it NEVER opens, reads, or rewrites any file, so the
+    on-disk original is guaranteed untouched (R9). Re-encoding through Pillow
+    also strips EXIF/metadata from the emitted copy.
+
+    ``regions`` may be empty — the image is re-encoded unchanged (an ALLOW frame
+    with no residual PII still leaves as a metadata-stripped copy). Raises on
+    undecodable input (the caller fails closed by dropping that frame rather than
+    emitting it raw).
+    """
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as probe:
+        converted = probe.convert("RGB")
+    try:
+        if regions:
+            _apply_mask_to_image(converted, regions)
+        buf = io.BytesIO()
+        converted.save(buf, "JPEG", quality=85, exif=b"")
+        return buf.getvalue()
+    finally:
+        converted.close()
 
 
 def mask_screenshot(
