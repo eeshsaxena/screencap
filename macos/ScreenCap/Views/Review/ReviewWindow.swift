@@ -416,6 +416,14 @@ struct ReviewWindow: View {
     /// persistent "not uploaded" label so the operator never mistakes it for the
     /// payload (R15). For a CLIP export (KTD4) that label is FALSE — the video is
     /// exactly what leaves — so it is overridden to name the clip as the payload.
+    ///
+    /// SCR-272 scope: the "not uploaded" label is about THIS navigation video,
+    /// which is never a frame-egress candidate — the masked-frames-to-connected-
+    /// model path reads the flat `screenshots/*.jpg` (see the ScreenshotTruthPane
+    /// "what actually uploads" surface and SECURITY.md's "masked frames to a
+    /// connected Intelligence model" section), not this `.mp4`. So the label
+    /// stays accurate whether or not `frames_cloud_consent` is on; the masked-
+    /// frames disclosure lives in the Intelligence pane, where the opt-in is.
     private func localVideoPane(_ videoModel: VideoPlayerPaneModel, isClipExport: Bool) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {

@@ -75,6 +75,15 @@ enum ScreenshotTruth {
 /// screenshot from the scrubbed copy that is nearest-prior to the current
 /// timeline position, with a staleness label. The local video pane beside it
 /// is the secondary navigation aid, labeled local-only.
+///
+/// SCR-272 note: masked screenshots are also the *class* of pixels the frames
+/// opt-in (`frames_cloud_consent`, default off) may send to a connected
+/// Intelligence model — a separate, best-effort-masked egress of ALLOW-only
+/// frames (see SECURITY.md's "masked frames to a connected Intelligence model"
+/// section), not these exact scrubbed bytes. The video pane's "local-only"
+/// label is unaffected: the navigation video is never a frame-egress candidate.
+/// The state-keyed "what leaves" disclosure lives in the Intelligence pane,
+/// where the opt-in is set.
 struct ScreenshotTruthPane: View {
     let screenshots: [ReviewScreenshot]
     let currentTime: Double

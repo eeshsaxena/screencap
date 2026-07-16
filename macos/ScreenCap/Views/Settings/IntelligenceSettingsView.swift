@@ -26,8 +26,12 @@ import SwiftUI
 ///    - Answers about your recordings (R10) — text only.
 ///    - Splitting & labeling the day (R7/KTD1) — runs on your connected model:
 ///      on-device when available, your cloud model when there isn't one.
-///    - Screen frames or images (R9-frames) — a FIXED "always off" chip, the one
-///      guarantee (revisiting it is tracked in SCR-272).
+///    - Screen frames or images (R9-frames / SCR-272) — an interactive,
+///      default-off opt-in toggle: enabling it (gated behind a decision-time
+///      disclosure) lets best-effort masked frames of ALLOW-only activity ride
+///      along on a cloud-bound summary/answer. The per-task captions, this row's
+///      caption, and the trust footer are state-keyed on the toggle (U7) so no
+///      surface claims frames "never" leave once it is on.
 ///    The trust footer (R12) states masked/blocked apps are stripped before
 ///    any model — local or cloud — sees content.
 ///
@@ -52,6 +56,16 @@ struct IntelligenceSettingsView: View {
     /// Inline error under the affected section after a failed CLI write (the
     /// optimistic flip has already been reverted by the controller).
     @State private var writeError: String?
+
+    /// SCR-272 — serializes the frames-consent write so a double-tap mid
+    /// round-trip can't race two writes (mirrors the controller's own per-row
+    /// guard; disables the toggle while a write is in flight).
+    @State private var framesConsentPending = false
+
+    /// SCR-272 — drives the decision-time disclosure shown before the FIRST
+    /// enable of frame sharing (the app-picker `confirmationDialog` pattern):
+    /// enabling only proceeds after the user accepts the "what leaves" sheet.
+    @State private var confirmingFramesConsent = false
 
     /// U4 — the add-provider flow presentation. nil when closed; `.addNew`
     /// opens at the pick step, `.manage(choice)` enters at configure with the
@@ -126,6 +140,22 @@ struct IntelligenceSettingsView: View {
             justAdded.selectionChanged(to: newRowID)
         }
         .onDisappear { justAdded.paneDisappeared() }
+        // SCR-272 — the decision-time disclosure before the first enable of
+        // frame sharing (the AppRulesView consequences-dialog pattern): the
+        // write only fires when the user accepts. Cancelling leaves the toggle
+        // off. Disabling frame sharing never routes through here (unconsequential).
+        .confirmationDialog(
+            IntelligenceSelectionModel.framesConsentConfirmTitle,
+            isPresented: $confirmingFramesConsent,
+            titleVisibility: .visible
+        ) {
+            Button(IntelligenceSelectionModel.framesConsentConfirmAccept) {
+                writeFramesConsent(enabled: true)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(IntelligenceSelectionModel.framesConsentDisclosure)
+        }
     }
 
     /// The rendered selection's row id, for the highlight's clearing edge.
@@ -138,7 +168,7 @@ struct IntelligenceSettingsView: View {
         if let settings = intelligence.settings {
             VStack(alignment: .leading, spacing: 28) {
                 modelSection(settings)
-                cloudTasksSection()
+                cloudTasksSection(settings)
                 if let writeError {
                     Text("Couldn't save: \(writeError)")
                         .font(SCTypography.sans(size: 12))
@@ -604,8 +634,12 @@ struct IntelligenceSettingsView: View {
 
     /// U5 — every rendered string here is a pure copy static on
     /// `IntelligenceSelectionModel` (KTD7) so the honest-copy audit reaches it.
-    private func cloudTasksSection() -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    /// The per-task captions, the frames row, and the trust footer are all
+    /// state-keyed on `settings.framesCloudConsent` (SCR-272 / U7) so no surface
+    /// claims frames "never" leave once the frames opt-in is on.
+    private func cloudTasksSection(_ settings: IntelligenceSettings) -> some View {
+        let framesOn = settings.framesCloudConsent
+        return VStack(alignment: .leading, spacing: 10) {
             sectionHeader(IntelligenceSelectionModel.cloudTasksSectionTitle)
             VStack(alignment: .leading, spacing: 0) {
                 // KTD1 — connecting a cloud provider is the consent; these tasks
@@ -613,39 +647,93 @@ struct IntelligenceSettingsView: View {
                 // not toggles: this section is a transparency panel.
                 infoRow(
                     title: IntelligenceSelectionModel.summaryConsentRowTitle,
-                    subtitle: IntelligenceSelectionModel.summaryConsentRowCaption
+                    subtitle: IntelligenceSelectionModel.summaryConsentRowCaption(framesOn: framesOn)
                 )
                 rowDivider
                 infoRow(
                     title: IntelligenceSelectionModel.recallConsentRowTitle,
-                    subtitle: IntelligenceSelectionModel.recallConsentRowCaption
+                    subtitle: IntelligenceSelectionModel.recallConsentRowCaption(framesOn: framesOn)
                 )
                 rowDivider
                 // R7/KTD1 — day-split/label runs on your connected model (the
-                // cloud model when there's no on-device one); no chip.
+                // cloud model when there's no on-device one); never attaches
+                // frames (it is never cloud-*bound*), stated in the ON caption.
                 infoRow(
                     title: IntelligenceSelectionModel.daySplitRowTitle,
-                    subtitle: IntelligenceSelectionModel.daySplitRowCaption
+                    subtitle: IntelligenceSelectionModel.daySplitRowCaption(framesOn: framesOn)
                 )
                 rowDivider
-                // R9 — frames/images: fixed "always off", the one guarantee.
-                fixedRow(
-                    title: IntelligenceSelectionModel.framesRowTitle,
-                    subtitle: IntelligenceSelectionModel.framesRowCaption,
-                    badge: (IntelligenceSelectionModel.framesChipLabel, Color.scInkMuted)
-                )
+                // SCR-272 — frames/images: an interactive, default-off opt-in
+                // (no longer a fixed "always off" row).
+                framesConsentRow(settings)
             }
             .overlay(
                 RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
                     .strokeBorder(Color.scBorderWarm, lineWidth: 1)
             )
-            // R12 — the trust footer: masked/blocked apps are stripped before any
-            // model — local or cloud — sees content.
-            Text(IntelligenceSelectionModel.consentTrustFooter)
+            // R12 — the trust footer, state-keyed: masked/blocked apps are
+            // stripped before any model — local or cloud — sees content, and
+            // (when frames are on) only best-effort masked frames ride along.
+            Text(IntelligenceSelectionModel.consentTrustFooter(framesOn: framesOn))
                 .font(SCTypography.sans(size: 12))
                 .foregroundStyle(Color.scInkMuted)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 2)
+        }
+    }
+
+    /// SCR-272 — the frames-consent row: an interactive, default-off toggle
+    /// bound to `settings.framesCloudConsent`. Turning it ON routes through the
+    /// decision-time disclosure (`toggleFramesConsent`); a loud teal "Sharing"
+    /// chip renders when it is on so the consequential state reads at a glance.
+    private func framesConsentRow(_ settings: IntelligenceSettings) -> some View {
+        let on = settings.framesCloudConsent
+        return HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(IntelligenceSelectionModel.framesRowTitle)
+                    .font(SCTypography.sans(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.scInk)
+                Text(IntelligenceSelectionModel.framesRowCaption(on: on))
+                    .font(SCTypography.sans(size: 12.5))
+                    .foregroundStyle(Color.scInkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if on {
+                chip(IntelligenceSelectionModel.framesChipLabel(on: true), color: Color.scTeal)
+            }
+            SettingsToggle(on: on) { toggleFramesConsent(currentlyOn: on) }
+                .disabled(framesConsentPending)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 16)
+    }
+
+    /// A frames-toggle tap. Turning ON is consequential (masked frames may
+    /// leave), so it opens the decision-time disclosure first and defers the
+    /// write to the accept action; turning OFF writes immediately.
+    private func toggleFramesConsent(currentlyOn: Bool) {
+        guard !framesConsentPending else { return }
+        if currentlyOn {
+            writeFramesConsent(enabled: false)
+        } else {
+            confirmingFramesConsent = true
+        }
+    }
+
+    /// Persist the frames-consent flip through the existing consent write seam,
+    /// with the pane's optimistic pending discipline (the controller owns the
+    /// optimistic flip + revert-on-failure).
+    private func writeFramesConsent(enabled: Bool) {
+        guard !framesConsentPending else { return }
+        writeError = nil
+        framesConsentPending = true
+        Task {
+            let ok = await intelligence.setConsent(
+                row: "frames_cloud_consent", enabled: enabled
+            )
+            framesConsentPending = false
+            if !ok { writeError = intelligence.lastError ?? "the frame-sharing change." }
         }
     }
 
@@ -666,26 +754,6 @@ struct IntelligenceSettingsView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 16)
-    }
-
-    /// A fixed, non-interactive row (R9 frames) — a state badge, no toggle.
-    /// It displays a rule the user cannot change.
-    private func fixedRow(title: String, subtitle: String, badge: (label: String, color: Color)) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(SCTypography.sans(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.scInk)
-                Text(subtitle)
-                    .font(SCTypography.sans(size: 12.5))
-                    .foregroundStyle(Color.scInkMuted)
-            }
-            Spacer(minLength: 8)
-            chip(badge.label, color: badge.color)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 16)
-        .opacity(0.9)
     }
 
     // MARK: - States

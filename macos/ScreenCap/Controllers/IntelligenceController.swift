@@ -5,11 +5,13 @@ import Foundation
 /// (U8). Drives the Intelligence settings pane (U9): the model picker (active
 /// provider + configured cloud provider) and the per-task cloud-consent matrix.
 ///
-/// The two fixed guards — `daySplitCloudConsent` (R7) and `framesCloudConsent`
-/// (R9) — are surfaced by the CLI as constant `false` so the pane renders them
-/// as non-interactive "on-device"/"always off" rows without hard-coding the
-/// rule. They are decoded here for symmetry and asserted-fixed in tests, but
-/// never written (the CLI rejects a cloud write to either — defense in depth).
+/// One fixed guard remains — `daySplitCloudConsent` (R7) — surfaced by the CLI
+/// as constant `false` so the pane renders it as a non-interactive "on-device"
+/// row without hard-coding the rule; it is decoded here for symmetry and
+/// asserted-fixed in tests, but never written (the CLI rejects a cloud write to
+/// it — defense in depth). `framesCloudConsent` (R9) is no longer fixed: SCR-272
+/// made it a settable, default-off opt-in, surfaced as an interactive toggle
+/// gated behind a decision-time disclosure.
 struct IntelligenceSettings: Decodable, Equatable {
     /// The active provider — `on-device` (default) or a configured cloud
     /// provider id (e.g. `gemini`).
@@ -22,7 +24,9 @@ struct IntelligenceSettings: Decodable, Equatable {
     let recallCloudConsent: Bool
     /// R7 — day-splitting/labeling stays on-device; always false.
     let daySplitCloudConsent: Bool
-    /// R9 — screen frames/images are never sent to any cloud; always false.
+    /// R9/SCR-272 — whether best-effort masked frames may ride along on a
+    /// cloud-bound summary/answer. A settable, default-off opt-in (no longer a
+    /// fixed guard); the pane surfaces it as an interactive toggle.
     let framesCloudConsent: Bool
     /// SCR-239 — the configured bring-your-own endpoint (redacted; no token), or
     /// nil. `decodeIfPresent` so an older CLI that omits it still decodes.
@@ -216,11 +220,13 @@ final class IntelligenceController: ObservableObject {
         }
     }
 
-    /// Toggle a cloud-consent row (`summary_cloud_consent` / `recall_cloud_consent`).
-    /// Optimistic flip + revert-on-failure, serialized per row. The forbidden rows
-    /// (day-split, frames) are never written from here — the pane renders them as
-    /// non-interactive and the CLI hard-rejects a cloud write to either anyway.
-    /// Returns success so the pane can show an inline error and snap the toggle back.
+    /// Toggle a cloud-consent row (`summary_cloud_consent` / `recall_cloud_consent`
+    /// / `frames_cloud_consent`). Optimistic flip + revert-on-failure, serialized
+    /// per row. Frames (SCR-272) is a settable, default-off opt-in written the same
+    /// way; the one remaining forbidden row (`day_split_cloud_consent`, R7) is never
+    /// written from here — the pane renders it as non-interactive and the CLI
+    /// hard-rejects a cloud write to it anyway. Returns success so the pane can show
+    /// an inline error and snap the toggle back.
     @discardableResult
     func setConsent(row: String, enabled: Bool) async -> Bool {
         guard !pendingRows.contains(row) else { return false }
@@ -511,8 +517,9 @@ extension IntelligenceSettings {
         )
     }
 
-    /// A copy with one consent row replaced (optimistic toggle flip). Only the
-    /// two settable rows are handled; the fixed rows are never mutated here.
+    /// A copy with one consent row replaced (optimistic toggle flip). The three
+    /// settable rows (summary, recall, and — since SCR-272 — frames) are handled;
+    /// the one remaining fixed row (day-split, R7) is never mutated here.
     func with(consentRow row: String, enabled: Bool) -> IntelligenceSettings {
         IntelligenceSettings(
             provider: provider,
@@ -520,7 +527,7 @@ extension IntelligenceSettings {
             summaryCloudConsent: row == "summary_cloud_consent" ? enabled : summaryCloudConsent,
             recallCloudConsent: row == "recall_cloud_consent" ? enabled : recallCloudConsent,
             daySplitCloudConsent: daySplitCloudConsent,
-            framesCloudConsent: framesCloudConsent,
+            framesCloudConsent: row == "frames_cloud_consent" ? enabled : framesCloudConsent,
             localServerEndpoint: localServerEndpoint,
             endpointClassification: endpointClassification,
             downloadedModelInstalled: downloadedModelInstalled,

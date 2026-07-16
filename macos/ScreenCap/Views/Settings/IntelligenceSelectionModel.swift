@@ -213,42 +213,76 @@ enum IntelligenceSelectionModel {
     /// transparency panel describing what a connected cloud model does, not a
     /// control panel.
     static let cloudTasksSectionTitle = "WHAT CLOUD MODELS MAY DO"
-    /// R8/KTD1 — summaries/titles. When they run on a connected cloud model
-    /// (as the on-device-unavailable fallback), the model receives the
-    /// recording's already-stripped activity summary — text only (app names,
-    /// window titles, transcript snippets), never frames. Informational, no toggle.
+    /// R8/KTD1 — summaries/titles. State-keyed on the frames opt-in (SCR-272):
+    /// when frames are OFF the model receives text only (app names, window
+    /// titles, transcript snippets), never frames; when ON, a summary that runs
+    /// on the connected cloud model may additionally carry best-effort masked
+    /// frames of that activity. The absolute "Never screen images" claim is kept
+    /// only in the OFF state, where it is true.
     static let summaryConsentRowTitle = "Summaries & titles"
-    static let summaryConsentRowCaption =
-        "Sends text from that one recording — app and window titles plus the transcript. Never screen images or video."
-    /// R10/KTD1 — recall-answers. The recall path sends the question plus the
-    /// retrieved ALLOW-only text snippets; the egress guard rejects frame bytes.
+    static func summaryConsentRowCaption(framesOn: Bool) -> String {
+        framesOn
+            ? "Sends text from that one recording — app and window titles plus the transcript — and, when it runs on your connected cloud model, best-effort masked frames of that activity. Never raw pixels."
+            : "Sends text from that one recording — app and window titles plus the transcript. Never screen images or video."
+    }
+    /// R10/KTD1 — recall-answers. State-keyed on the frames opt-in (SCR-272):
+    /// OFF sends the question plus the retrieved ALLOW-only text snippets only;
+    /// ON may additionally carry best-effort masked frames of the matching
+    /// moments when the answer runs on the connected cloud model.
     static let recallConsentRowTitle = "Answers about your recordings"
-    static let recallConsentRowCaption =
-        "Sends your question and the matching text snippets from your recordings. Never screen images or video."
+    static func recallConsentRowCaption(framesOn: Bool) -> String {
+        framesOn
+            ? "Sends your question and the matching text snippets from your recordings — and, when answered by your connected cloud model, best-effort masked frames of the matching moments. Never raw pixels."
+            : "Sends your question and the matching text snippets from your recordings. Never screen images or video."
+    }
     /// R7/KTD1 — day-split/label runs on your connected model: on-device when
-    /// available, the configured cloud model when there isn't one (over the
-    /// ALLOW-only stripped text summary — never frames). Informational, no toggle.
+    /// available, the configured cloud model when there isn't one. Day-split is
+    /// never a cloud-*bound* task in the frame-egress sense (frames ride only on
+    /// summary/recall that resolve to CLOUD — `frames_may_attach`), so it never
+    /// attaches frames even with the opt-in on; the ON caption states that
+    /// explicitly so the "never screen images" claim stays true in both states
+    /// (SCR-272).
     static let daySplitRowTitle = "Splitting & labeling the day"
-    static let daySplitRowCaption =
-        "Runs on your connected model — on-device when available, your cloud model when there isn't one. Sends text only, never screen images."
-    /// R9 — the consent-governed Intelligence tasks never send frames; a fixed
-    /// rule, not a toggle. Scoped to the named tasks: the legacy auto-namer
-    /// (`src/screencap/namer.py`, tracked as a follow-up) has vendor-API paths
-    /// that attach screenshots, so an unscoped "never sent to any cloud model"
-    /// claim would be false.
+    static func daySplitRowCaption(framesOn: Bool) -> String {
+        framesOn
+            ? "Runs on your connected model — on-device when available, your cloud model when there isn't one. Sends text only, never screen images — day-splitting never attaches frames, even with frame sharing on."
+            : "Runs on your connected model — on-device when available, your cloud model when there isn't one. Sends text only, never screen images."
+    }
+    /// SCR-272 — screen frames/images are now an interactive, default-off
+    /// opt-in (no longer a fixed rule). The caption is state-keyed: OFF states
+    /// plainly that no frames leave; ON names that best-effort masked frames of
+    /// ALLOW-only activity ride along on a cloud-bound summary/answer. The
+    /// scoping stays honest — frames ride only on the consent-governed
+    /// summary/recall tasks, and only in their cloud-fallback case.
     static let framesRowTitle = "Screen frames or images"
-    static let framesRowCaption =
-        "Summaries, answers, and day-splitting never send screen images — a fixed rule, not a toggle."
-    static let framesChipLabel = "Always off"
-    /// R12 — the trust footer under the consent card. Scoped to the
-    /// consent-governed tasks: the segmentation privacy strip (the single
-    /// chokepoint in `activity_summary.py` / the recall evidence bundle,
-    /// fail-closed) removes masked and blocked apps' content before those
-    /// providers run. It deliberately claims nothing about uploads, and not
-    /// "any model" — the legacy auto-namer path (follow-up) sits outside the
-    /// strip.
-    static let consentTrustFooter =
-        "Masked and blocked apps are stripped before summaries, answers, and day-splitting run — local or cloud."
+    static func framesRowCaption(on: Bool) -> String {
+        on
+            ? "On — best-effort masked frames of your allowed activity ride along on summaries and answers that run on your connected cloud model. Never raw pixels; blocked apps are stripped first."
+            : "Off — summaries and answers send no screen images. Turn on to also send best-effort masked frames of your allowed activity to your connected cloud model."
+    }
+    /// SCR-272 — the state chip on the frames row: a loud teal "Sharing" chip
+    /// when the opt-in is on, a muted "Off" otherwise.
+    static func framesChipLabel(on: Bool) -> String {
+        on ? "Sharing" : "Off"
+    }
+    /// SCR-272 — the decision-time disclosure shown before the FIRST enable
+    /// (mirrors the app-picker consequences dialog): names exactly what leaves,
+    /// and that the blocked-app boundary is structural while within-frame
+    /// masking is best-effort.
+    static let framesConsentConfirmTitle = "Send masked frames to your connected model?"
+    static let framesConsentConfirmAccept = "Turn on frame sharing"
+    static let framesConsentDisclosure =
+        "When on, summaries and answers that run on your connected cloud model may include best-effort masked frames of your ALLOW-only activity — never raw pixels. Frames from blocked or masked apps are never eligible and are stripped first, but within-frame masking is best-effort OCR, not a guarantee. Nothing is sent while a task runs on-device, or while no cloud model is connected."
+    /// R12 — the trust footer under the consent card, state-keyed on the frames
+    /// opt-in (SCR-272). Both states keep the strip scope honest (masked/blocked
+    /// apps stripped before summaries, answers, and day-splitting; nothing about
+    /// uploads; not "any model"). The ON state additionally names that only
+    /// best-effort masked frames of allowed activity ride along on cloud tasks.
+    static func consentTrustFooter(framesOn: Bool) -> String {
+        framesOn
+            ? "Masked and blocked apps are stripped before summaries, answers, and day-splitting run — local or cloud. With frame sharing on, only best-effort masked frames of allowed activity ride along on cloud summaries and answers; blocked apps are never eligible."
+            : "Masked and blocked apps are stripped before summaries, answers, and day-splitting run — local or cloud."
+    }
 
     // MARK: Honest-copy audit corpus (KTD7)
 
@@ -271,11 +305,17 @@ enum IntelligenceSelectionModel {
         onDeviceAppleModelDownloadingCopy, onDeviceCheckingCopy,
         onDeviceUnavailableCopy,
         cloudTasksSectionTitle,
-        summaryConsentRowTitle, summaryConsentRowCaption,
-        recallConsentRowTitle, recallConsentRowCaption,
-        daySplitRowTitle, daySplitRowCaption,
-        framesRowTitle, framesRowCaption, framesChipLabel,
-        consentTrustFooter,
+        summaryConsentRowTitle,
+        summaryConsentRowCaption(framesOn: false), summaryConsentRowCaption(framesOn: true),
+        recallConsentRowTitle,
+        recallConsentRowCaption(framesOn: false), recallConsentRowCaption(framesOn: true),
+        daySplitRowTitle,
+        daySplitRowCaption(framesOn: false), daySplitRowCaption(framesOn: true),
+        framesRowTitle,
+        framesRowCaption(on: false), framesRowCaption(on: true),
+        framesChipLabel(on: false), framesChipLabel(on: true),
+        framesConsentConfirmTitle, framesConsentConfirmAccept, framesConsentDisclosure,
+        consentTrustFooter(framesOn: false), consentTrustFooter(framesOn: true),
     ]
 
     // MARK: Grouped options (R1/R5)

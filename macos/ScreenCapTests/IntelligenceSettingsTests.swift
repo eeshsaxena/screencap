@@ -147,6 +147,27 @@ final class IntelligenceSettingsTests: XCTestCase {
         )
     }
 
+    /// SCR-272 — frames is now a settable, default-off row: toggling it ON
+    /// ships the same settable-row write shape and lands the optimistic flip
+    /// (the `with(consentRow:)` frames branch).
+    func testSetConsentFramesIssuesTrueArgvAndFlips() async {
+        let fake = FakeInvoker()
+        let controller = IntelligenceController(invoke: fake.invoker())
+        await controller.refresh()
+        XCTAssertEqual(controller.settings?.framesCloudConsent, false,
+                       "frames defaults off")
+
+        let ok = await controller.setConsent(row: "frames_cloud_consent", enabled: true)
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(
+            fake.calls.last,
+            ["settings", "intelligence", "frames_cloud_consent", "set", "true", "--json"]
+        )
+        XCTAssertEqual(controller.settings?.framesCloudConsent, true,
+                       "optimistic flip lands immediately (SCR-272)")
+    }
+
     /// The optimistic flip reverts on a failed consent write.
     func testSetConsentRevertsOnFailure() async {
         let fake = FakeInvoker()
@@ -225,19 +246,22 @@ final class IntelligenceSettingsTests: XCTestCase {
         ]))
     }
 
-    // MARK: - Fixed-row rules (R7 day-split not a cloud toggle; R9 frames off)
+    // MARK: - Settable vs fixed rows (R7 day-split fixed; SCR-272 frames settable)
 
-    /// The fixed guards surfaced by the CLI are never among the settable rows
-    /// the pane wires a toggle to. This is the pane's promise that day-split
-    /// stays on-device (R7) and frames are always off (R9) — encoded as: the
-    /// two forbidden CLI row names are absent from the settable set.
-    func testFixedRowsAreNotSettableRows() {
-        // The two rows the pane exposes as real toggles.
-        let settableRows = ["summary_cloud_consent", "recall_cloud_consent"]
+    /// The one remaining fixed guard (day-split, R7) is never among the settable
+    /// rows the pane wires a toggle to; frames (SCR-272) now IS a settable,
+    /// default-off opt-in. This is the pane's promise that day-split stays
+    /// on-device — encoded as: the forbidden CLI row name is absent from the
+    /// settable set, and the frames row name is present.
+    func testSettableAndFixedConsentRows() {
+        // The three rows the pane exposes as real toggles (SCR-272 added frames).
+        let settableRows = [
+            "summary_cloud_consent", "recall_cloud_consent", "frames_cloud_consent",
+        ]
+        XCTAssertTrue(settableRows.contains("frames_cloud_consent"),
+                      "frames is now a settable, default-off opt-in (SCR-272)")
         XCTAssertFalse(settableRows.contains("day_split_cloud_consent"),
                        "day-splitting is presented on-device, not a cloud toggle (R7)")
-        XCTAssertFalse(settableRows.contains("frames_cloud_consent"),
-                       "frames/images is a fixed always-off row, not a toggle (R9)")
     }
 
     // MARK: - Sidebar nav registration (U9 wiring)
@@ -442,11 +466,18 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertFalse(IntelligenceSelectionModel.allAuditedCopy.isEmpty)
         // Enumeration completeness: the U5 consent copy, the trust footer, the
         // flow copy, and the per-vendor copy are all reachable via the corpus.
-        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.summaryConsentRowCaption))
-        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.recallConsentRowCaption))
-        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.daySplitRowCaption))
-        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.framesRowCaption))
-        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.consentTrustFooter))
+        // Both toggle states of each state-keyed caption are enumerated (SCR-272).
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.summaryConsentRowCaption(framesOn: false)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.summaryConsentRowCaption(framesOn: true)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.recallConsentRowCaption(framesOn: false)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.recallConsentRowCaption(framesOn: true)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.daySplitRowCaption(framesOn: false)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.daySplitRowCaption(framesOn: true)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.framesRowCaption(on: false)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.framesRowCaption(on: true)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.framesConsentDisclosure))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.consentTrustFooter(framesOn: false)))
+        XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.consentTrustFooter(framesOn: true)))
         XCTAssertTrue(corpus.contains(ConnectProviderModel.flowPickCaption))
         XCTAssertTrue(corpus.contains(BYOVendor.gemini.cliLimitsCopy))
 
@@ -495,36 +526,54 @@ final class IntelligenceSettingsTests: XCTestCase {
 
     // MARK: - U5 consent-row copy (R10) + trust footer (R12)
 
-    /// R10/KTD1 — each of the four transparency-panel rows has a pure
-    /// title/caption static (the exact strings the view renders), captioned in
-    /// plain language: the three task rows state what is sent AND that frames
-    /// never leave; the fixed frames row states screen images are never sent.
+    /// R10/KTD1/SCR-272 — each transparency-panel row's caption is a pure,
+    /// state-keyed static (the exact strings the view renders). The honesty gate
+    /// is bound to the frames toggle: the absolute "Never screen images" claim
+    /// holds ONLY in the toggle-OFF state; the ON state discloses that masked
+    /// frames may be sent to the connected model. Day-split keeps "never screen
+    /// images" in BOTH states (it is never cloud-bound, so frames never ride on
+    /// it — it states the exemption explicitly when frames are on).
     func testConsentRowCopyStaticsExistPerRow() {
         typealias M = IntelligenceSelectionModel
-        let rows: [(title: String, caption: String)] = [
-            (M.summaryConsentRowTitle, M.summaryConsentRowCaption),
-            (M.recallConsentRowTitle, M.recallConsentRowCaption),
-            (M.daySplitRowTitle, M.daySplitRowCaption),
-            (M.framesRowTitle, M.framesRowCaption),
-        ]
-        for row in rows {
-            XCTAssertFalse(row.title.isEmpty)
-            XCTAssertFalse(row.caption.isEmpty)
+        // Non-empty in both states.
+        for framesOn in [false, true] {
+            XCTAssertFalse(M.summaryConsentRowCaption(framesOn: framesOn).isEmpty)
+            XCTAssertFalse(M.recallConsentRowCaption(framesOn: framesOn).isEmpty)
+            XCTAssertFalse(M.daySplitRowCaption(framesOn: framesOn).isEmpty)
+            XCTAssertFalse(M.framesRowCaption(on: framesOn).isEmpty)
         }
-        XCTAssertTrue(M.summaryConsentRowCaption.hasPrefix("Sends"))
-        XCTAssertTrue(M.summaryConsentRowCaption.contains("Never screen images"))
-        XCTAssertTrue(M.recallConsentRowCaption.hasPrefix("Sends"))
-        XCTAssertTrue(M.recallConsentRowCaption.contains("Never screen images"))
-        // KTD1 — day-split now runs on the connected model (cloud when there is
-        // no on-device one); it must NOT claim to be a never-cloud task, and it
-        // preserves the frames guarantee.
-        XCTAssertFalse(M.daySplitRowCaption.lowercased().contains("never a cloud task"))
-        XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("connected model"))
-        XCTAssertTrue(M.daySplitRowCaption.lowercased().contains("never screen images"))
-        // Scoped to the consent-governed tasks — an unscoped "any cloud model"
-        // claim is falsified by the legacy auto-namer path (follow-up).
-        XCTAssertTrue(M.framesRowCaption.lowercased().contains("never send screen images"))
-        XCTAssertFalse(M.framesRowCaption.lowercased().contains("any cloud model"))
+        XCTAssertFalse(M.summaryConsentRowTitle.isEmpty)
+        XCTAssertFalse(M.framesRowTitle.isEmpty)
+
+        // --- OFF state: the "Never screen images" claim is present + true. -----
+        XCTAssertTrue(M.summaryConsentRowCaption(framesOn: false).hasPrefix("Sends"))
+        XCTAssertTrue(M.summaryConsentRowCaption(framesOn: false).contains("Never screen images"))
+        XCTAssertTrue(M.recallConsentRowCaption(framesOn: false).hasPrefix("Sends"))
+        XCTAssertTrue(M.recallConsentRowCaption(framesOn: false).contains("Never screen images"))
+        XCTAssertTrue(M.daySplitRowCaption(framesOn: false).lowercased().contains("connected model"))
+        XCTAssertTrue(M.daySplitRowCaption(framesOn: false).lowercased().contains("never screen images"))
+        XCTAssertTrue(M.framesRowCaption(on: false).lowercased().contains("no screen images"))
+
+        // --- ON state: no absolute "never screen images" that becomes false;
+        //     summary/recall/frames disclose masked frames may be sent. --------
+        XCTAssertFalse(M.summaryConsentRowCaption(framesOn: true).contains("Never screen images"),
+                       "the OFF-only absolute claim must not survive into the ON state")
+        XCTAssertTrue(M.summaryConsentRowCaption(framesOn: true).lowercased().contains("masked frames"))
+        XCTAssertFalse(M.recallConsentRowCaption(framesOn: true).contains("Never screen images"))
+        XCTAssertTrue(M.recallConsentRowCaption(framesOn: true).lowercased().contains("masked frames"))
+        XCTAssertTrue(M.framesRowCaption(on: true).lowercased().contains("masked frames"))
+        // Frames caption stays scoped — no unscoped "any cloud model" claim.
+        XCTAssertFalse(M.framesRowCaption(on: true).lowercased().contains("any cloud model"))
+        // Day-split never sends frames, so it keeps "never screen images" even ON
+        // — and states the exemption explicitly.
+        XCTAssertTrue(M.daySplitRowCaption(framesOn: true).lowercased().contains("never screen images"))
+        XCTAssertTrue(M.daySplitRowCaption(framesOn: true).lowercased().contains("never attaches frames"))
+
+        // The decision-time disclosure names what leaves + the guarantee split.
+        let disclosure = M.framesConsentDisclosure.lowercased()
+        XCTAssertTrue(disclosure.contains("masked frames"))
+        XCTAssertTrue(disclosure.contains("never raw pixels"))
+        XCTAssertTrue(disclosure.contains("best-effort"))
     }
 
     /// R12 — the trust footer states the strip scope honestly, scoped to the
@@ -533,16 +582,24 @@ final class IntelligenceSettingsTests: XCTestCase {
     /// (tracked as a follow-up), so the broader claim would be false. It
     /// claims nothing about uploads.
     func testTrustFooterScopesStripToConsentGovernedTasks() {
-        let footer = IntelligenceSelectionModel.consentTrustFooter.lowercased()
-        XCTAssertTrue(footer.contains("masked"))
-        XCTAssertTrue(footer.contains("blocked"))
-        XCTAssertTrue(footer.contains("summaries"))
-        XCTAssertTrue(footer.contains("day-splitting"))
-        XCTAssertTrue(footer.contains("local or cloud"))
-        XCTAssertFalse(footer.contains("any model"),
-                       "unscoped claim — falsified by the legacy auto-namer path")
-        XCTAssertFalse(footer.contains("upload"),
-                       "the footer is scoped to models seeing content, not uploads")
+        // The scope + forbidden claims hold in BOTH toggle states (SCR-272).
+        for framesOn in [false, true] {
+            let footer = IntelligenceSelectionModel.consentTrustFooter(framesOn: framesOn).lowercased()
+            XCTAssertTrue(footer.contains("masked"))
+            XCTAssertTrue(footer.contains("blocked"))
+            XCTAssertTrue(footer.contains("summaries"))
+            XCTAssertTrue(footer.contains("day-splitting"))
+            XCTAssertTrue(footer.contains("local or cloud"))
+            XCTAssertFalse(footer.contains("any model"),
+                           "unscoped claim — falsified by the legacy auto-namer path")
+            XCTAssertFalse(footer.contains("upload"),
+                           "the footer is scoped to models seeing content, not uploads")
+        }
+        // The ON state additionally names that only best-effort masked frames of
+        // allowed activity ride along on cloud tasks (SCR-272 / U7).
+        let footerOn = IntelligenceSelectionModel.consentTrustFooter(framesOn: true).lowercased()
+        XCTAssertTrue(footerOn.contains("masked frames"))
+        XCTAssertTrue(footerOn.contains("frame sharing on"))
     }
 
     // MARK: - U2 fixtures — suspension gate + call counter
