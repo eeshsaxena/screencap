@@ -297,3 +297,88 @@ def test_dedup_collapses_near_identical(tmp_path, monkeypatch):
         rec, 0.0, 1000.0, detect_regions=lambda b: []
     )
     assert [f.timestamp_ms for f in frames] == [250_000, 252_000]
+
+
+# ---------------------------------------------------------------------------
+# only_timestamps — recall egress scoping to INDIVIDUAL retrieved timestamps
+# ---------------------------------------------------------------------------
+
+
+def test_only_timestamps_scopes_to_individual_targets(tmp_path, monkeypatch):
+    """``only_timestamps`` keeps only stills near a target; a still inside the
+    ``[min, max]`` span that matches NO target (an un-retrieved moment) is dropped."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    # Three distinct stills; 275 is an un-retrieved moment between the two targets.
+    _gradient_jpeg(shots / "250.0.jpg", vertical=False)
+    _gradient_jpeg(shots / "275.0.jpg", vertical=True)
+    _white_jpeg(shots / "300.0.jpg")
+
+    frames = produce_egress_frames(
+        rec, 0.0, 1000.0,
+        detect_regions=lambda b: [],
+        only_timestamps=[250.0, 300.0],
+    )
+    # Only the two retrieved timestamps ship — 275 (inside the span) does NOT.
+    assert [f.timestamp_ms for f in frames] == [250_000, 300_000]
+
+
+def test_only_timestamps_empty_selects_nothing(tmp_path, monkeypatch):
+    """An empty ``only_timestamps`` iterable ships zero frames (no targets)."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    _white_jpeg(shots / "250.0.jpg")
+
+    frames = produce_egress_frames(
+        rec, 0.0, 1000.0, detect_regions=lambda b: [], only_timestamps=[]
+    )
+    assert frames == []
+
+
+def test_only_timestamps_matches_nearest_within_tolerance(tmp_path, monkeypatch):
+    """A target a little off a still (e.g. a window_event / chunk-start time) matches
+    the nearest still within the tolerance; a still with no nearby target is dropped."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    _gradient_jpeg(shots / "250.0.jpg", vertical=False)  # target 251.0 is 1s away -> kept
+    _white_jpeg(shots / "400.0.jpg")                     # no target near -> dropped
+
+    frames = produce_egress_frames(
+        rec, 0.0, 1000.0,
+        detect_regions=lambda b: [],
+        only_timestamps=[251.0],
+        only_timestamps_tolerance_s=2.0,
+    )
+    assert [f.timestamp_ms for f in frames] == [250_000]
+
+
+def test_only_timestamps_selects_only_nearest_not_all_within_tolerance(tmp_path, monkeypatch):
+    """Only the single NEAREST still per target ships — an adjacent still that is
+    within tolerance of the target but is not the closest match is NOT emitted (so a
+    dense burst around a retrieved moment cannot smuggle un-retrieved neighbours)."""
+    _stub_all_allow(monkeypatch)
+
+    rec = tmp_path / "rec"
+    shots = rec / "screenshots"
+    shots.mkdir(parents=True)
+    # Target 250.0 sits exactly on the 250 still; 250.5 is 0.5s away (within the 2s
+    # tolerance) but is NOT the nearest — it must NOT ship.
+    _gradient_jpeg(shots / "250.0.jpg", vertical=False)
+    _gradient_jpeg(shots / "250.5.jpg", vertical=True)
+
+    frames = produce_egress_frames(
+        rec, 0.0, 1000.0,
+        detect_regions=lambda b: [],
+        only_timestamps=[250.0],
+        only_timestamps_tolerance_s=2.0,
+    )
+    assert [f.timestamp_ms for f in frames] == [250_000]

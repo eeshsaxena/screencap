@@ -56,9 +56,10 @@ deferred into :func:`produce_egress_frames`.
 
 from __future__ import annotations
 
+import bisect
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from screencap.segmentation.generation import MaskedFrame
 
@@ -75,6 +76,14 @@ _EGRESS_MAX_FRAMES = 240
 # (``index_core._INDEX_DHASH_THRESHOLD``): a false dup only costs a dropped
 # near-identical frame, so the tight value is intentional.
 _EGRESS_DHASH_THRESHOLD = 5
+
+# Default half-window (seconds) an ``only_timestamps`` target is matched to the
+# nearest on-disk still. Recall passes the retrieved snippets' individual pointer
+# timestamps — content-index hits land exactly on a still, but timeline/transcript
+# pointers are ``window_event`` / chunk-start times a couple seconds off the nearest
+# still. Kept small so a still that is NOT near any retrieved timestamp (an
+# un-retrieved moment inside the [min,max] span) is never selected.
+_EGRESS_ONLY_TS_TOLERANCE_S = 2.0
 
 
 class _BytesOcrAdapter:
@@ -129,6 +138,23 @@ def _build_default_detector() -> "Callable[[bytes], list[MaskRegion]] | None":
     return _detect
 
 
+def _nearest_index(sorted_ts: list[float], target: float) -> "int | None":
+    """Index of the value in ascending ``sorted_ts`` closest to ``target``.
+
+    Only the two neighbours bracketing ``target`` can be the minimum, so a bisect
+    suffices. Returns ``None`` for an empty list.
+    """
+    if not sorted_ts:
+        return None
+    i = bisect.bisect_left(sorted_ts, target)
+    best: "int | None" = None
+    for j in (i - 1, i):
+        if 0 <= j < len(sorted_ts):
+            if best is None or abs(sorted_ts[j] - target) < abs(sorted_ts[best] - target):
+                best = j
+    return best
+
+
 def produce_egress_frames(
     recording_dir: Path | str,
     start_ts: float,
@@ -138,6 +164,8 @@ def produce_egress_frames(
     detect_regions: "Callable[[bytes], list[MaskRegion]] | None" = None,
     max_frames: int = _EGRESS_MAX_FRAMES,
     dhash_threshold: int = _EGRESS_DHASH_THRESHOLD,
+    only_timestamps: "Iterable[float] | None" = None,
+    only_timestamps_tolerance_s: float = _EGRESS_ONLY_TS_TOLERANCE_S,
 ) -> list[MaskedFrame]:
     """Return the masked stills in ``[start_ts, end_ts)`` eligible to leave.
 
@@ -162,6 +190,14 @@ def produce_egress_frames(
     the residual detector. Default: Apple Vision OCR + the PII pipeline via
     :func:`scrubber.ocr_mask_screenshot`; skipped (no residual regions) when that
     pipeline is unavailable. A detector that raises drops the frame (fail-closed).
+
+    ``only_timestamps`` (recall egress scoping): when given, a still is a candidate
+    ONLY if it lands within ``only_timestamps_tolerance_s`` seconds of one of these
+    epoch-second targets — the *individual* retrieved-snippet timestamps, NOT their
+    ``[min, max]`` span. This is applied BEFORE the structural ALLOW gate so a
+    moment inside the window that was never retrieved (a still with no nearby
+    target) is excluded up front and never even OCR-tested. An empty iterable
+    selects nothing (``[]``). ``None`` (the default) keeps every windowed still.
     """
     import io
 
@@ -193,6 +229,27 @@ def produce_egress_frames(
     candidates = [(ts, p) for ts, p in parsed if start_ts <= ts < end_ts]
     if not candidates:
         return []
+
+    # Explicit-timestamps filter (recall): keep ONLY the single still NEAREST each
+    # retrieved target (within tolerance), so a moment inside the span that was never
+    # retrieved never ships — and an adjacent still that is not the closest match to
+    # any target is dropped too. Applied before the structural gate: a target with no
+    # still within tolerance simply contributes no frame. ``candidates`` is already
+    # ascending by ts (parsed.sort + the window filter preserve order).
+    if only_timestamps is not None:
+        targets = [float(t) for t in only_timestamps]
+        if not targets:
+            return []
+        tol = only_timestamps_tolerance_s
+        cand_ts = [ts for ts, _ in candidates]
+        keep: set[int] = set()
+        for t in targets:
+            j = _nearest_index(cand_ts, t)
+            if j is not None and abs(cand_ts[j] - t) <= tol:
+                keep.add(j)
+        candidates = [candidates[i] for i in sorted(keep)]
+        if not candidates:
+            return []
 
     # Structural, fail-closed ALLOW gate. build_is_blocked re-derives the same
     # ALLOW-only skip set frame.nearest uses (screenshot_residuals=True — these ARE

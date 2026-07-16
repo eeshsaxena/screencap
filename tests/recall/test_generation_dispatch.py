@@ -46,7 +46,7 @@ from screencap.recall.orchestrator import (
     Stream,
 )
 from screencap.segmentation.consent import ConsentPolicy, ExecutionTarget
-from screencap.segmentation.generation import Evidence
+from screencap.segmentation.generation import Evidence, MaskedFrame
 from screencap.segmentation.generation_finish import build_answer_prompt
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE
 
@@ -421,3 +421,191 @@ def test_aggregate_figure_answer_passes_with_verbatim_number():
     )
     assert result.refusal is False
     assert "90 minutes" in result.answer
+
+
+# ===========================================================================
+# SCR-272 U5 — masked frames ride ONLY at the cloud-bound recall point
+# ===========================================================================
+
+# Recall consent ON + a vision-capable provider (Gemini) + the independent frames
+# opt-in ON: the ONE configuration where masked frames attach.
+_CLOUD_FRAMES_ON = ConsentPolicy(
+    cloud_provider="gemini", recall_cloud_consent=True, frames_cloud_consent=True
+)
+# Same cloud path, but the frames opt-in OFF (the default) → no frames.
+_CLOUD_FRAMES_OFF = ConsentPolicy(
+    cloud_provider="gemini", recall_cloud_consent=True, frames_cloud_consent=False
+)
+# Frames opt-in ON but the provider is NON-vision (OpenAI) → no frames.
+_CLOUD_NONVISION_FRAMES_ON = ConsentPolicy(
+    cloud_provider="openai", recall_cloud_consent=True, frames_cloud_consent=True
+)
+
+
+def _gradient_jpeg(path, *, vertical: bool, size: int = 32) -> None:
+    from PIL import Image
+
+    img = Image.new("RGB", (size, size))
+    px = img.load()
+    for x in range(size):
+        for y in range(size):
+            v = int(255 * (y / size if vertical else x / size))
+            px[x, y] = (v, v, v)
+    img.save(path, "JPEG", quality=85)
+
+
+def _white_jpeg(path, *, size: int = 32) -> None:
+    from PIL import Image
+
+    Image.new("RGB", (size, size), (255, 255, 255)).save(path, "JPEG", quality=85)
+
+
+def _make_recording(root, name: str) -> None:
+    """A recording dir with three DISTINCT stills at 250/275/300 seconds.
+
+    No recording.db is needed: ``_stub_frame_egress`` neutralizes the structural
+    ALLOW gate (all-allow) so the frames flow purely on the ``only_timestamps``
+    scoping under test."""
+    shots = root / name / "screenshots"
+    shots.mkdir(parents=True)
+    _gradient_jpeg(shots / "250.0.jpg", vertical=False)   # retrieved
+    _gradient_jpeg(shots / "275.0.jpg", vertical=True)    # UN-retrieved (mid-span)
+    _white_jpeg(shots / "300.0.jpg")                      # retrieved
+
+
+def _stub_frame_egress(monkeypatch) -> None:
+    """Make masked-frame egress Vision-free + deterministic.
+
+    * The structural ALLOW gate is neutralized to all-allow (no recording.db read).
+    * The default OCR residual detector is a no-op (no Apple Vision).
+    * Corpus encryption off → plaintext stills, ``corpus_key=None``.
+    """
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.build_classifier_evaluator",
+        lambda *a, **k: (None, None),
+    )
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.derive_skip_intervals",
+        lambda *a, **k: [],
+    )
+    monkeypatch.setattr(
+        "screencap.segmentation.frame_egress._build_default_detector",
+        lambda: (lambda _b: []),
+    )
+    import screencap.config as config
+
+    monkeypatch.setattr(config, "get_corpus_encrypted", lambda: False)
+
+
+def test_gate_on_gemini_attaches_frames_scoped_to_timestamps(tmp_path, monkeypatch):
+    """Gate ON + Gemini (supports_frames) + a recording with ALLOW frames → the
+    delegated provider call carries masked frames scoped to the retrieved snippets'
+    INDIVIDUAL timestamps (250 & 300), NOT the un-retrieved 275 inside their span."""
+    _stub_frame_egress(monkeypatch)
+    _make_recording(tmp_path, "rec-1")
+    bundle = _bundle([
+        _item("snippet at 250", recording="rec-1", ts=250_000),
+        _item("snippet at 300", recording="rec-1", ts=300_000),
+    ])
+    fn = FakeAnswerFn(answer_text="snippet at 250 and snippet at 300")
+
+    result = answer_from_bundle(
+        bundle,
+        question="what happened?",
+        policy=_CLOUD_FRAMES_ON,
+        answer_fn=fn,
+        recordings_dir=tmp_path,
+    )
+
+    assert result.target is ExecutionTarget.CLOUD
+    _q, evidence = fn.calls[-1]
+    frames = evidence.masked_frames
+    assert frames, "gate ON + vision provider must attach masked frames"
+    # Every attached frame carries the fail-closed provenance marker.
+    assert all(isinstance(f, MaskedFrame) and f.masked is True for f in frames)
+    # Scoped to the retrieved timestamps only — the un-retrieved 275 never ships.
+    assert sorted(f.timestamp_ms for f in frames) == [250_000, 300_000]
+
+
+def test_recall_frames_cover_only_retrieved_not_span(tmp_path, monkeypatch):
+    """A single retrieved snippet ships a single frame at its own timestamp — the
+    other stills inside the recording (un-retrieved moments) are never attached."""
+    _stub_frame_egress(monkeypatch)
+    _make_recording(tmp_path, "rec-1")
+    bundle = _bundle([_item("just the 300 moment", recording="rec-1", ts=300_000)])
+    fn = FakeAnswerFn()
+
+    answer_from_bundle(
+        bundle,
+        question="q",
+        policy=_CLOUD_FRAMES_ON,
+        answer_fn=fn,
+        recordings_dir=tmp_path,
+    )
+
+    _q, evidence = fn.calls[-1]
+    assert [f.timestamp_ms for f in evidence.masked_frames] == [300_000]
+
+
+def test_gate_off_attaches_zero_frames(tmp_path, monkeypatch):
+    """Frames opt-in OFF (the default) + a cloud provider + CLOUD target → the
+    delegated call carries ZERO frames (connecting a provider is NOT frames consent)."""
+    _stub_frame_egress(monkeypatch)
+    _make_recording(tmp_path, "rec-1")
+    bundle = _bundle([_item("snippet at 250", recording="rec-1", ts=250_000)])
+    fn = FakeAnswerFn()
+
+    result = answer_from_bundle(
+        bundle,
+        question="q",
+        policy=_CLOUD_FRAMES_OFF,
+        answer_fn=fn,
+        recordings_dir=tmp_path,
+    )
+
+    assert result.target is ExecutionTarget.CLOUD
+    _q, evidence = fn.calls[-1]
+    assert evidence.masked_frames == ()
+
+
+def test_non_vision_provider_is_text_only(tmp_path, monkeypatch):
+    """Gate ON + a NON-vision cloud provider (OpenAI) → text only, no frames, no
+    error (the provider capability gate drops them before any egress)."""
+    _stub_frame_egress(monkeypatch)
+    _make_recording(tmp_path, "rec-1")
+    bundle = _bundle([_item("snippet at 250", recording="rec-1", ts=250_000)])
+    fn = FakeAnswerFn()
+
+    result = answer_from_bundle(
+        bundle,
+        question="q",
+        policy=_CLOUD_NONVISION_FRAMES_ON,
+        answer_fn=fn,
+        recordings_dir=tmp_path,
+    )
+
+    assert result.target is ExecutionTarget.CLOUD
+    _q, evidence = fn.calls[-1]
+    assert evidence.masked_frames == ()
+
+
+def test_payload_guard_rejects_frame_lacking_masked_marker():
+    """The whole-payload bound now VETS the frame channel: an attached frame that is
+    not a masked=True MaskedFrame is rejected (EgressViolation)."""
+    bundle = _bundle([_item("a snippet")])
+    evidence = Evidence(text="a snippet", stripped=True)
+    payload = build_answer_prompt("q", evidence)
+
+    good = MaskedFrame(jpeg_bytes=b"x", timestamp_ms=1, masked=True)
+    # A properly-marked frame passes the vet (containment still holds).
+    assert_cloud_payload_bounded(payload, bundle, question="q", masked_frames=(good,))
+
+    unmarked = MaskedFrame(jpeg_bytes=b"y", timestamp_ms=2, masked=False)
+    with pytest.raises(EgressViolation):
+        assert_cloud_payload_bounded(payload, bundle, question="q", masked_frames=(unmarked,))
+
+    # A non-MaskedFrame object in the frame channel is also rejected.
+    with pytest.raises(EgressViolation):
+        assert_cloud_payload_bounded(
+            payload, bundle, question="q", masked_frames=(object(),)
+        )

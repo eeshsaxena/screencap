@@ -55,6 +55,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from screencap.recall.attribution import validate_attribution
@@ -64,8 +65,18 @@ from screencap.recall.orchestrator import (
     EvidencePointer,
     QuestionKind,
 )
-from screencap.segmentation.consent import ConsentPolicy, ExecutionTarget, TaskKind
-from screencap.segmentation.generation import Evidence, ProviderUnavailable
+from screencap.segmentation.consent import (
+    ConsentPolicy,
+    ExecutionTarget,
+    TaskKind,
+    frames_may_attach,
+)
+from screencap.segmentation.generation import (
+    Evidence,
+    MaskedFrame,
+    ProviderUnavailable,
+    verify_masked_frames,
+)
 from screencap.segmentation.generation_finish import (
     _GROUNDING_INSTRUCTIONS,
     build_answer_prompt,
@@ -250,13 +261,23 @@ def _bundle_tokens(bundle: EvidenceBundle) -> set[str]:
 
 
 def assert_cloud_payload_bounded(
-    payload: str, bundle: EvidenceBundle, *, question: str = ""
+    payload: str,
+    bundle: EvidenceBundle,
+    *,
+    question: str = "",
+    masked_frames: "tuple[MaskedFrame, ...]" = (),
 ) -> None:
     """Assert the WHOLE payload is bounded to the re-derived bundle (R8/R10).
 
     Checks, in order:
 
-    * **No frame bytes** — a text prompt must never carry image magic bytes.
+    * **No frame bytes in the TEXT channel** — a text prompt must never carry image
+      magic bytes (a frame smuggled in as raw text).
+    * **Vetted frame channel (SCR-272)** — every attached :class:`MaskedFrame` must
+      carry the masked-verified provenance marker: the frames ride to the provider
+      through the typed multimodal channel, so the whole-payload bound now covers
+      them too, not only the text. A frame that is not a ``MaskedFrame(masked=True)``
+      (the U1 producer's blessed mint) → :class:`EgressViolation`.
     * **Whole-payload containment** — every substantive token in ``payload`` must be
       either (a) part of the fixed grounding scaffold / labels, (b) a token of the
       bundle's snippet/figure text, or (c) a token of the user's own ``question``. A
@@ -265,11 +286,23 @@ def assert_cloud_payload_bounded(
 
     Raises :class:`EgressViolation` on any breach. The dispatch calls this on every
     turn BEFORE the delegated model call; the tests call it directly. This bounds the
-    ENTIRE outbound string, not just the server-resolved snippet list.
+    ENTIRE outbound payload — the text string AND the frame channel — not just the
+    server-resolved snippet list.
     """
     for marker in _FRAME_BYTE_MARKERS:
         if marker in payload:
             raise EgressViolation("cloud payload carries frame/image bytes")
+
+    # Vet the typed multimodal channel: the same fail-closed checkpoint both
+    # provider paths run, hoisted here so recall's whole-payload bound rejects an
+    # unmarked/raw frame BEFORE the delegated model call. A TypeError from the
+    # verifier is a bound breach → refuse (fail-closed), never egress.
+    try:
+        verify_masked_frames(tuple(masked_frames))
+    except TypeError as exc:
+        raise EgressViolation(
+            f"cloud payload carries an unverified frame ({exc})"
+        ) from exc
 
     # The user's own question is legitimate payload content (the operator's words,
     # not captured history). It reaches the guard either explicitly (``question``) or
@@ -353,12 +386,128 @@ def _answered_target(reporting_target: ExecutionTarget) -> ExecutionTarget:
     return ExecutionTarget.ON_DEVICE
 
 
+# ---------------------------------------------------------------------------
+# Masked-frame egress (SCR-272 U5) — attach frames ONLY at the cloud-bound point
+# ---------------------------------------------------------------------------
+
+
+def _load_corpus_key() -> "bytes | None":
+    """The recording corpus key when stills are stored encrypted, else ``None``.
+
+    Mirrors the chunk-processor / index pass: only when ``corpus_encrypted`` is on
+    are stills ``*.jpg.enc`` and a key needed; plaintext stills read fine with
+    ``None`` (:func:`produce_egress_frames` globs ``*.jpg.enc`` only when a key is
+    supplied). Best-effort — a missing key returns ``None`` (the encrypted stills
+    are then simply not globbed, so no frame leaves unreadable)."""
+    from screencap import config
+
+    if not config.get_corpus_encrypted():
+        return None
+    from screencap import corpus_crypto
+
+    return corpus_crypto.load_corpus_key()
+
+
+def _cloud_provider_supports_frames(policy: ConsentPolicy) -> bool:
+    """Whether the policy's configured cloud provider is vision-capable (U4).
+
+    Resolves the provider by its configured name and reads the ``supports_frames``
+    capability (only Gemini is ``True`` today). Fail-closed: an unset / unknown
+    provider, or any resolution error, means "no frames" (``False``)."""
+    name = policy.cloud_provider
+    if not name:
+        return False
+    try:
+        from screencap.segmentation.provider import get_provider
+
+        provider = get_provider(name)
+    except Exception:
+        return False
+    return bool(getattr(provider, "supports_frames", False))
+
+
+def _build_recall_frames(
+    bundle: EvidenceBundle, recordings_dir: "Path | None"
+) -> "tuple[MaskedFrame, ...]":
+    """Build U1's masked frames for the retrieved snippets' INDIVIDUAL timestamps.
+
+    Each surviving evidence item carries a ``(recording, timestamp_ms)`` pointer.
+    We group by recording and hand :func:`produce_egress_frames` the exact snippet
+    timestamps via ``only_timestamps`` (NOT the ``[min, max]`` span), so a moment
+    inside the span that was never retrieved never ships. The ALLOW-only /
+    fail-closed structural gate inside the producer is untouched. Returns the
+    provenance-marked frames (masked=True) across all recordings."""
+    from screencap.recall.orchestrator import _resolve_recording_dir
+    from screencap.segmentation.frame_egress import (
+        _EGRESS_ONLY_TS_TOLERANCE_S,
+        produce_egress_frames,
+    )
+
+    by_recording: dict[str, list[float]] = {}
+    for item in bundle.evidence:
+        by_recording.setdefault(item.recording, []).append(item.timestamp_ms / 1000.0)
+
+    corpus_key = _load_corpus_key()
+    tol = _EGRESS_ONLY_TS_TOLERANCE_S
+    frames: list[MaskedFrame] = []
+    for recording, tss in by_recording.items():
+        rec_dir = _resolve_recording_dir(recording, recordings_dir)
+        if rec_dir is None:
+            # Unresolvable recording name (traversal / gone) → no frames for it.
+            continue
+        # A tight window bounds the still glob to the retrieved timestamps ± the
+        # match tolerance; ``only_timestamps`` then keeps only the near-target
+        # stills. ``end`` is exclusive, so pad it past the furthest target+tol.
+        start = min(tss) - tol
+        end = max(tss) + tol + 1e-3
+        frames.extend(
+            produce_egress_frames(
+                rec_dir,
+                start,
+                end,
+                corpus_key=corpus_key,
+                only_timestamps=tss,
+            )
+        )
+    return tuple(frames)
+
+
+def _maybe_build_recall_frames(
+    bundle: EvidenceBundle,
+    policy: ConsentPolicy,
+    target: ExecutionTarget,
+    recordings_dir: "Path | None",
+) -> "tuple[MaskedFrame, ...]":
+    """Masked frames for this turn, or ``()`` when frames must not attach.
+
+    Frames ride ONLY when ALL hold (SCR-272 U5): the task resolved to
+    :attr:`ExecutionTarget.CLOUD`, the independent frames opt-in is on and a cloud
+    provider is configured (:func:`frames_may_attach`), and that provider is
+    vision-capable (:func:`_cloud_provider_supports_frames`). Any false → ``()`` and
+    the turn stays text-only, unchanged. Frame-building is fail-open: an egress
+    error degrades to text-only rather than failing the answer (the structural
+    ALLOW gate inside the producer is the privacy guarantee, not this build)."""
+    if not frames_may_attach(policy, target):
+        return ()
+    if not _cloud_provider_supports_frames(policy):
+        return ()
+    try:
+        return _build_recall_frames(bundle, recordings_dir)
+    except Exception:
+        logger.warning(
+            "recall dispatch: masked-frame egress failed; sending text-only",
+            exc_info=True,
+        )
+        return ()
+
+
 def answer_from_bundle(
     bundle: EvidenceBundle,
     *,
     question: str = "",
     policy: ConsentPolicy | None = None,
     answer_fn: AnswerFn | None = None,
+    recordings_dir: "Path | None" = None,
 ) -> ChatAnswer:
     """Turn a stripped :class:`EvidenceBundle` into a grounded :class:`ChatAnswer`.
 
@@ -374,6 +523,9 @@ def answer_from_bundle(
         answer_fn: the delegated ``(question, evidence) -> str | PROVIDER_UNAVAILABLE``
             model call. Defaults to :func:`screencap.segmentation.recall.answer_recall`
             (the single recall entry point); tests inject a fake so no real model runs.
+        recordings_dir: recordings root for the masked-frame egress (SCR-272 U5);
+            defaults to the configured dir. Passed by tests over a ``tmp_path``
+            library so no real recording tree is touched.
 
     Returns a :class:`ChatAnswer`. Never raises for an ordinary model/API error or an
     egress breach — it degrades to a refusal (fail-closed, R8).
@@ -394,21 +546,37 @@ def answer_from_bundle(
     if not bundle.evidence and bundle.figures is None:
         return _refusal(bundle, reporting_target, reason=REASON_NO_EVIDENCE)
 
-    # --- 3. Build the evidence text (bundle-derived only) + the stripped Evidence.
-    # The dispatch is the CONSUMER (outside segmentation/), so it is allowed to mint
-    # stripped=True — the terminal ALLOW-only strip already ran in U3.
-    evidence = Evidence(text=_evidence_text(bundle), stripped=True)
+    # --- 3. Build masked frames ONLY at the cloud-bound point (SCR-272 U5). ------
+    # When the task resolved CLOUD, the frames opt-in is on, and the cloud provider
+    # is vision-capable, attach U1's masked frames for the retrieved snippets'
+    # INDIVIDUAL timestamps (never their span). Otherwise this is () and the turn is
+    # text-only, unchanged. The frames ride inside Evidence.masked_frames — the
+    # recall carrier answer_recall passes straight through to the provider.
+    masked_frames = _maybe_build_recall_frames(
+        bundle, policy, reporting_target, recordings_dir
+    )
 
-    # --- 4. Whole-payload egress guard (defense-in-depth, every turn). ----------
-    # Compute the EXACT payload main will build and bound it to the bundle + question.
+    # --- 4. Build the evidence text (bundle-derived only) + the stripped Evidence.
+    # The dispatch is the CONSUMER (outside segmentation/), so it is allowed to mint
+    # stripped=True — the terminal ALLOW-only strip already ran in U3. Evidence's
+    # __post_init__ re-verifies the frame provenance markers (fail-closed).
+    evidence = Evidence(
+        text=_evidence_text(bundle), stripped=True, masked_frames=masked_frames
+    )
+
+    # --- 5. Whole-payload egress guard (defense-in-depth, every turn). ----------
+    # Compute the EXACT payload main will build and bound it to the bundle + question
+    # AND vet the frame channel (every attached frame must carry the masked marker).
     payload = build_answer_prompt(question, evidence)
     try:
-        assert_cloud_payload_bounded(payload, bundle, question=question)
+        assert_cloud_payload_bounded(
+            payload, bundle, question=question, masked_frames=masked_frames
+        )
     except EgressViolation:
         logger.warning("recall dispatch: payload failed the egress guard; refusing")
         return _refusal(bundle, reporting_target, reason=REASON_BLOCKED)
 
-    # --- 5. Delegate the model call to answer_recall (on-device, then cloud). ----
+    # --- 6. Delegate the model call to answer_recall (on-device, then cloud). ----
     try:
         result = (answer_fn or _default_answer_fn)(question, evidence)
     except Exception:
@@ -421,7 +589,7 @@ def answer_from_bundle(
 
     model_answer = result
 
-    # --- 6. Answer-side attribution: a failing verdict is a safe refusal. -------
+    # --- 7. Answer-side attribution: a failing verdict is a safe refusal. -------
     verdict = validate_attribution(model_answer, bundle, question=question)
     if not verdict.ok:
         logger.info("recall dispatch: attribution rejected the answer (%s); refusing",
@@ -432,7 +600,7 @@ def answer_from_bundle(
     if _is_refusal_text(model_answer):
         return _refusal(bundle, reporting_target, reason=REASON_NO_EVIDENCE)
 
-    # --- 7. Answered: report a target that reflects success, never NONE (KTD5). --
+    # --- 8. Answered: report a target that reflects success, never NONE (KTD5). --
     return ChatAnswer(
         answer=model_answer,
         sources=list(verdict.sources),

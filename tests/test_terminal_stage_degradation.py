@@ -665,3 +665,216 @@ def test_heuristic_fallback_never_uploads(tmp_path, monkeypatch):
     assert result.tasks_persisted == 2  # heuristic still produced tasks.
     assert result.sentinel_uploaded is False
     assert result.n_uploaded == 0
+
+
+# ---------------------------------------------------------------------------
+# SCR-272 U5 — masked frames ride ONLY on the consented SUMMARY cloud task,
+# gated on the frames opt-in AND a vision-capable provider.
+# ---------------------------------------------------------------------------
+
+
+class _FramesCloudProvider:
+    """A VISION-capable canned cloud provider that records the frames it is handed.
+
+    ``supports_frames`` True (the Gemini shape); ``segment`` accepts the typed
+    ``masked_frames`` kwarg and records it, so a test can assert exactly which
+    frames rode along (or that none did)."""
+
+    supports_frames = True
+
+    def __init__(self, result) -> None:  # noqa: ANN001
+        self._result = result
+        self.calls: list[dict] = []
+        self.masked_frames_seen: tuple = ()
+
+    def segment(self, activity_summary: dict, *, masked_frames: tuple = ()):  # noqa: ANN201
+        self.calls.append(activity_summary)
+        self.masked_frames_seen = tuple(masked_frames)
+        return self._result
+
+
+def _write_stills(rec_dir: Path, tss) -> None:
+    """Write DISTINCT gradient JPEGs at the given epoch-second timestamps.
+
+    Distinct phases keep the frame-egress dedup from collapsing them; each ts also
+    matches a ``screenshot`` row seeded by ``_make_local_recording`` at ``cs+off``
+    so the structural orphan cross-check sees on-disk coverage."""
+    from PIL import Image
+
+    shots = rec_dir / "screenshots"
+    shots.mkdir(parents=True, exist_ok=True)
+    for i, ts in enumerate(tss):
+        size = 32
+        img = Image.new("RGB", (size, size))
+        px = img.load()
+        for x in range(size):
+            for y in range(size):
+                v = int(255 * (((x + i * 6) % size) / size))
+                px[x, y] = (v, v, v)
+        img.save(shots / f"{ts}.jpg", "JPEG", quality=85)
+
+
+def _stub_vision(monkeypatch) -> None:
+    """Vision-free residual detector + plaintext stills (no corpus key needed)."""
+    monkeypatch.setattr(
+        "screencap.segmentation.frame_egress._build_default_detector",
+        lambda: (lambda _b: []),
+    )
+    import screencap.config as config
+
+    monkeypatch.setattr(config, "get_corpus_encrypted", lambda: False)
+
+
+# The three in-window screenshot timestamps ``_make_local_recording`` seeds a row
+# for (chunk_start=1000 + event_offsets 10/20/30); the session window is
+# [1000, 4600). 5000 is deliberately AFTER session_end to prove window scoping.
+_IN_WINDOW_STILLS = [1010.0, 1020.0, 1030.0]
+_OUT_OF_WINDOW_STILL = 5000.0
+
+
+@pytest.mark.privacy
+def test_summary_cloud_gate_on_vision_attaches_scoped_frames(tmp_path, monkeypatch):
+    """Gate ON + a vision-capable cloud provider + on-disk ALLOW frames → the SUMMARY
+    cloud provider's segment() is handed masked frames scoped to the SESSION WINDOW
+    (a still after session_end never ships), each carrying the masked marker."""
+    rec_dir = _make_local_recording(tmp_path)
+    _write_stills(rec_dir, [*_IN_WINDOW_STILLS, _OUT_OF_WINDOW_STILL])
+    _stub_vision(monkeypatch)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="gemini", summary_cloud_consent=True, frames_cloud_consent=True,
+    ))
+    cloud = _FramesCloudProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    _run_terminal(rec_dir)
+
+    assert len(cloud.calls) == 1  # the cloud provider named the session
+    frames = cloud.masked_frames_seen
+    assert frames, "gate ON + vision provider must attach masked frames"
+    assert all(f.masked is True for f in frames)
+    tss = {f.timestamp_ms for f in frames}
+    # Every attached frame is inside the session window; the out-of-window still
+    # (5000s, after session_end) is NEVER attached.
+    assert tss <= {1_010_000, 1_020_000, 1_030_000}
+    assert 5_000_000 not in tss
+
+
+@pytest.mark.privacy
+def test_summary_cloud_gate_off_carries_zero_frames(tmp_path, monkeypatch):
+    """AE1: frames opt-in OFF + a vision-capable cloud provider + SUMMARY resolves
+    CLOUD → the cloud provider names the session but rides ZERO frames (connecting a
+    provider / cloud-tasks-on is NOT the frames consent)."""
+    rec_dir = _make_local_recording(tmp_path)
+    _write_stills(rec_dir, _IN_WINDOW_STILLS)
+    _stub_vision(monkeypatch)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="gemini", summary_cloud_consent=True, frames_cloud_consent=False,
+    ))
+    cloud = _FramesCloudProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    _run_terminal(rec_dir)
+
+    assert len(cloud.calls) == 1  # the session WAS named by cloud...
+    assert cloud.masked_frames_seen == ()  # ...but with ZERO frames (AE1).
+
+
+@pytest.mark.privacy
+def test_summary_cloud_nonvision_provider_is_text_only(tmp_path, monkeypatch):
+    """Gate ON + a NON-vision cloud provider → text only, no frames, no error: the
+    frame egress is never even attempted (trip-wired) and naming still succeeds."""
+    rec_dir = _make_local_recording(tmp_path)
+    _write_stills(rec_dir, _IN_WINDOW_STILLS)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True, frames_cloud_consent=True,
+    ))
+    # A plain _FakeProvider has no supports_frames attr → getattr False.
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("frame egress attempted for a non-vision provider")
+
+    monkeypatch.setattr(
+        "screencap.segmentation.frame_egress.produce_egress_frames", _boom
+    )
+
+    _run_terminal(rec_dir)
+
+    assert len(cloud.calls) == 1
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Cloud-named session"]
+
+
+@pytest.mark.privacy
+def test_day_split_heuristic_builds_no_frames(tmp_path, monkeypatch):
+    """Regression: the DAY_SPLIT boundary path (idle-gap heuristic, no cloud) builds
+    NO frame evidence — frames ride ONLY on the consented SUMMARY cloud task."""
+    rec_dir = _make_local_recording(tmp_path)
+    _write_stills(rec_dir, _IN_WINDOW_STILLS)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    _install_consent(monkeypatch, ConsentPolicy())  # no cloud → heuristic boundaries.
+
+    def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("frame egress attempted on the day-split/heuristic path")
+
+    monkeypatch.setattr(
+        "screencap.segmentation.frame_egress.produce_egress_frames", _boom
+    )
+
+    _run_terminal(rec_dir)
+
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+
+
+@pytest.mark.privacy
+def test_on_device_available_builds_no_frames(tmp_path, monkeypatch):
+    """AE3: an on-device model produced day-split tasks (USE_PROVIDER) → the SUMMARY
+    cloud fallback is never reached, so NO masked frames are built at all — even with
+    the frames opt-in on and a vision provider configured."""
+    rec_dir = _make_local_recording(tmp_path)
+    _write_stills(rec_dir, _IN_WINDOW_STILLS)
+    _install_provider(monkeypatch, _FakeProvider(_canned_tasks()))  # on-device RAN
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="gemini", summary_cloud_consent=True, frames_cloud_consent=True,
+    ))
+
+    def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("frame egress attempted while on-device produced tasks")
+
+    monkeypatch.setattr(
+        "screencap.segmentation.frame_egress.produce_egress_frames", _boom
+    )
+
+    _run_terminal(rec_dir)
+
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Implement auth module"]
+
+
+@pytest.mark.privacy
+def test_summary_cloud_frames_on_device_target_builds_nothing(monkeypatch):
+    """AE3 (unit): ``_summary_cloud_frames`` for a NON-cloud target returns () and
+    never attempts frame egress — ``frames_may_attach`` is false off the CLOUD row."""
+    import screencap.terminal_stage as ts
+    from screencap.segmentation.consent import ExecutionTarget
+
+    def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("produce_egress_frames called for a non-CLOUD target")
+
+    monkeypatch.setattr(
+        "screencap.segmentation.frame_egress.produce_egress_frames", _boom
+    )
+
+    class _Vision:
+        supports_frames = True
+
+    policy = ConsentPolicy(cloud_provider="gemini", frames_cloud_consent=True)
+    frames = ts._summary_cloud_frames(
+        Path("/nonexistent"), (0.0, 10.0), _Vision(), policy, ExecutionTarget.ON_DEVICE
+    )
+    assert frames == ()
