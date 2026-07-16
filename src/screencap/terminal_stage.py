@@ -812,7 +812,7 @@ def _run_locked(
         # leaves the recording unnamed but NEVER blocks terminal completion,
         # and never triggers an upload (AE1 — the LOCAL branch has no upload
         # seam and the tasks store is excluded from upload by rule).
-        _run_local_segmentation(recording_dir, ledger, result)
+        _run_local_segmentation(recording_dir, ledger, result, is_live=False)
         # Retention is UNIVERSAL (R11): a local recording with a size/time cap
         # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
         # no-op. No remote precondition for local eviction.
@@ -988,7 +988,7 @@ def run_incremental_segmentation(
         ledger = _open_ledger(recording_dir)
         if ledger is not None:
             result.n_expected = ledger.chunks_expected()
-        _run_local_segmentation(recording_dir, ledger, result)
+        _run_local_segmentation(recording_dir, ledger, result, is_live=True)
         result.routed = True
     return result
 
@@ -997,6 +997,8 @@ def _run_local_segmentation(
     recording_dir: Path,
     ledger: "PipelineLedger | None",
     result: TerminalResult,
+    *,
+    is_live: bool = False,
 ) -> None:
     """Segment a LOCAL recording into named tasks; persist to the local store (U4/U7).
 
@@ -1036,6 +1038,25 @@ def _run_local_segmentation(
     """
     from screencap.segmentation.consent import ConsentPolicy
     from screencap.segmentation.degrade import DegradeAction, resolve_day_split
+    from screencap.segmentation.outcome import PRODUCED_TASKS, Branch, pick_reason
+
+    def _record(branch: "Branch") -> None:
+        # Record WHY this recording has (or lacks) AI-named tasks (U2). Reads the
+        # prior reason so pick_reason stays monotonic (a live degrade never
+        # downgrades a recording that already produced tasks). Strictly fail-open:
+        # outcome bookkeeping must never block terminal completion.
+        if ledger is None:
+            return
+        try:
+            prior = ledger.get_recording_outcome()
+            ledger.set_recording_outcome(
+                pick_reason(branch=branch, is_live=is_live, prior=prior)
+            )
+        except Exception as exc:  # noqa: BLE001 — outcome record must never block terminal
+            logger.debug(
+                "terminal_stage: recording outcome record failed open for %s (%s)",
+                recording_dir.name, exc,
+            )
 
     try:
         summary, provider_result = _segment_local_tasks(recording_dir)
@@ -1044,6 +1065,7 @@ def _run_local_segmentation(
             "terminal_stage: local segmentation failed open for %s (%s)",
             recording_dir.name, exc,
         )
+        _record(Branch.FAILED)
         return
 
     try:
@@ -1053,8 +1075,10 @@ def _run_local_segmentation(
             "terminal_stage: degradation resolve failed open for %s (%s)",
             recording_dir.name, exc,
         )
+        _record(Branch.FAILED)
         return
 
+    from_heuristic = False
     if decision.action is DegradeAction.USE_PROVIDER:
         tasks = decision.tasks
     elif decision.action is DegradeAction.HEURISTIC:
@@ -1079,19 +1103,44 @@ def _run_local_segmentation(
         if not tasks:
             try:
                 tasks = _heuristic_local_tasks(recording_dir)
+                from_heuristic = True
             except Exception as exc:  # noqa: BLE001 — heuristic must never block terminal
                 logger.debug(
                     "terminal_stage: idle-gap heuristic failed open for %s (%s)",
                     recording_dir.name, exc,
                 )
+                _record(Branch.FAILED)
                 return
     else:
         # NONE (provider ran, no tasks) or CLOUD (never reachable for day-split)
         # → fail open, nothing to persist.
+        _record(Branch.NOTHING)
         return
 
     if not tasks:
+        # HEURISTIC path with neither a consented cloud naming nor heuristic output
+        # → the attempt produced nothing at all (couldn't run, on finalize).
+        _record(Branch.FAILED)
         return
+
+    # Classify by a code-owned flag, not by introspecting the tasks dict: only the
+    # idle-gap heuristic path sets ``from_heuristic``. The cloud fallback in the
+    # HEURISTIC branch is a real (cloud-named) result → produced. Keying off a
+    # model-emittable ``summary.source`` value would let a provider that echoed
+    # "idle_gap_heuristic" be misclassified as mechanical (correctness/adversarial).
+    branch = Branch.MECHANICAL if from_heuristic else Branch.PRODUCED
+
+    # Monotonic task-row gating (R7 / KTD2): once a recording produced real AI tasks,
+    # a later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
+    # "AI-named" above a mechanical list). Skip persistence and keep produced_tasks.
+    if (
+        branch is Branch.MECHANICAL
+        and ledger is not None
+        and ledger.get_recording_outcome() == PRODUCED_TASKS
+    ):
+        _record(Branch.MECHANICAL)  # pick_reason keeps produced_tasks; rows untouched
+        return
+
     # KTD3 carve-out — drop any fresh AGENT task overlapping a PROTECTED span
     # (source='user' OR a user-edited agent row) so that, after the scoped agent
     # replace, no source='agent' span overlaps a protected one (the "agent
@@ -1106,8 +1155,10 @@ def _run_local_segmentation(
             "terminal_stage: persisting local tasks failed for %s (%s)",
             recording_dir.name, exc,
         )
+        _record(Branch.FAILED)
         return
     result.tasks_persisted = n
+    _record(branch)
 
 
 def _carve_out_protected_spans(

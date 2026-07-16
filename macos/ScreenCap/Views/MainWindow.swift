@@ -369,8 +369,19 @@ struct MainWindow: View {
             // U6: New-recording sheet as an in-window overlay (KTD-4), layered
             // over the whole shell like the prototype's z-41 overlay.
             if showingNewRecording {
-                NewRecordingSheet(isPresented: $showingNewRecording)
+                NewRecordingSheet(
+                    isPresented: $showingNewRecording,
+                    onOpenIntelligence: { showingNewRecording = false; route = .intelligence }
+                )
             }
+        }
+        .sheet(isPresented: $recorder.showFirstRecordingBeat) {
+            // U7 (honest status): the one-time first-recording beat, presented over
+            // the shell after the record action fires (non-blocking).
+            FirstRecordingBeatSheet(
+                isPresented: $recorder.showFirstRecordingBeat,
+                onOpenIntelligence: { route = .intelligence }
+            )
         }
         .sheet(item: $presentedAccountContext, onDismiss: {
             // Every dismissal route — "Not now", Esc, and the system's

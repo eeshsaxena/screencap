@@ -111,10 +111,17 @@ enum ShellSidebarModel {
         provider: String?,
         cloudProvider: String?,
         downloadedInstalled: Bool,
-        dismissed: Bool
+        dismissed: Bool,
+        verdictUsable: Bool = false
     ) -> Bool {
         let cloudUnset = IntelligenceSelectionModel.normalizedCloudProvider(cloudProvider) == nil
-        return provider == "on-device" && cloudUnset && !downloadedInstalled && !dismissed
+        // `verdictUsable` (U5/U8): the composed live verdict, which also folds in the
+        // fresh Apple-Intelligence probe. When intelligence is genuinely usable the
+        // hint must NOT nag — the pre-U8 predicate was probe-blind and false-positived
+        // when Apple Intelligence was on. Defaults false so existing callers/tests
+        // keep their behaviour; the real caller passes the composed verdict.
+        return provider == "on-device" && cloudUnset && !downloadedInstalled
+            && !dismissed && !verdictUsable
     }
 
     /// Format a byte total the design's way ("4.2 GB"), stepping down to MB/KB for
@@ -211,7 +218,10 @@ struct ShellSidebarView: View {
             provider: intelligence.settings?.provider,
             cloudProvider: intelligence.settings?.cloudProvider,
             downloadedInstalled: intelligence.settings?.downloadedModelInstalled ?? false,
-            dismissed: hintDismissed
+            dismissed: hintDismissed,
+            verdictUsable: IntelligenceVerdict.compose(
+                probe: OnDeviceModelStatus.probe(), settings: intelligence.settings
+            )?.usable ?? false
         )
         if show {
             HStack(alignment: .top, spacing: 8) {

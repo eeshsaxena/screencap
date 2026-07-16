@@ -342,6 +342,19 @@ _TASK_SEGMENTS_ADDED_COLUMNS = (
     ("edited", "edited INTEGER NOT NULL DEFAULT 0"),
 )
 
+# U2 (honest status). One row per recording holding the segmentation OUTCOME
+# reason — why the recording has, or lacks, AI-named tasks. Captured at the
+# terminal_stage branch points BEFORE _persist_local_tasks rewrites task-row
+# ``source``, so ``mechanical_only`` (idle-gap heuristic) stays distinct from
+# ``produced_tasks``. Local-only, in ``recording.db`` (never uploaded — R8).
+_RECORDING_OUTCOME_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_recording_outcome (
+    recording_id INTEGER PRIMARY KEY,
+    reason TEXT NOT NULL,
+    updated_at REAL
+)
+"""
+
 
 def _migrate_task_segments_columns(conn: sqlite3.Connection) -> None:
     """ALTER-ADD the U5 ``source``/``edited`` columns to a pre-columns table.
@@ -396,6 +409,8 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         # Migrate an EXISTING pre-U5 table (created before source/edited existed)
         # — the DDL above is a no-op on it, so the columns are ALTER-added here.
         _migrate_task_segments_columns(conn)
+        # U2: per-recording segmentation outcome (idempotent create).
+        conn.execute(_RECORDING_OUTCOME_DDL)
         conn.commit()
     except sqlite3.OperationalError:
         # Read-only DB (an old recording opened for read) — do not crash; the
@@ -1078,6 +1093,63 @@ class PipelineLedger:
                 conn.rollback()
                 raise
             finally:
+                conn.close()
+
+    def set_recording_outcome(self, reason: str) -> None:
+        """Record this recording's segmentation OUTCOME reason (U2, honest status).
+
+        One row per recording (upsert on the PK). Captured at the terminal_stage
+        branch BEFORE the task rows are rewritten, so ``mechanical_only`` (idle-gap
+        heuristic) stays distinct from ``produced_tasks``. Defensively creates the
+        table so a ``recording.db`` that predates U2 still writes. Local-only — the
+        table lives in ``recording.db`` and is never uploaded (R8).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_RECORDING_OUTCOME_DDL)
+                conn.execute(
+                    "INSERT INTO pipeline_recording_outcome "
+                    "(recording_id, reason, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(recording_id) DO UPDATE SET "
+                    "reason=excluded.reason, updated_at=excluded.updated_at",
+                    (self._recording_id, reason, _now()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_recording_outcome(self) -> str | None:
+        """Return this recording's stored outcome reason, or ``None`` if unrecorded.
+
+        ``None`` for a legacy recording captured before U2 (no row, or the table
+        absent) — the app renders that as the neutral "unknown" state (KTD6), never
+        a false "not set up".
+
+        Fail-safe: **any** SQLite error (missing table on a pre-U2 db, a lock/IO
+        error under concurrent write, or a corrupt page) resolves to ``None``, not a
+        raise. This method is also the authority the terminal-stage monotonic row
+        guard consults, so it must never propagate out of the strictly-fail-open
+        segmentation path — ``None`` degrades to the neutral "unknown"/not-produced
+        direction on every caller.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT reason FROM pipeline_recording_outcome "
+                "WHERE recording_id=?",
+                (self._recording_id,),
+            ).fetchone()
+            return None if row is None else str(row[0])
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
                 conn.close()
 
     def insert_task_segment(self, seg: TaskSegmentRow) -> int:

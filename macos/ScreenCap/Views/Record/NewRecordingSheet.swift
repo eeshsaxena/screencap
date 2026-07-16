@@ -11,13 +11,19 @@ import SwiftUI
 struct NewRecordingSheet: View {
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var auth: CloudAuthController
+    @EnvironmentObject private var intelligence: IntelligenceController
     @Binding var isPresented: Bool
+    /// Deep-link to the Intelligence pane for the dead-state banner's "Set up" (U8, R5).
+    var onOpenIntelligence: () -> Void = {}
 
     @StateObject private var meter = MicLevelMeter()
     @State private var audioOn = true
     @State private var micGranted = false
     @State private var uploadDefault: String?
     @State private var startError: String?
+    /// U8: the dead-state banner, dismissed for this recording (per-recording — the
+    /// sheet is recreated per presentation, so this naturally scopes to one recording).
+    @State private var bannerDismissed = false
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -87,6 +93,7 @@ struct NewRecordingSheet: View {
         VStack(spacing: 20) {
             modeCards
             optionRows
+            intelligenceBanner
             startRow
         }
         .padding(.horizontal, 24)
@@ -179,6 +186,51 @@ struct NewRecordingSheet: View {
         .optionRowChrome()
         .opacity(0.7)
         .help("Coming soon — SCR-227")
+    }
+
+    // MARK: - U8 dead-state banner
+
+    private var verdict: IntelligenceVerdict? {
+        IntelligenceVerdict.compose(probe: OnDeviceModelStatus.probe(), settings: intelligence.settings)
+    }
+    /// On the very first recording the beat (U7) owns the ask, so the banner suppresses
+    /// itself (no double-ask, R4). On later recordings the beat won't fire, so the
+    /// banner nudges when the verdict is not usable.
+    private var firstBeatWillFire: Bool {
+        let hints = HUDHintStore()
+        return !hints.hasRecordedOnce && !hints.intelligenceChoiceSeen
+    }
+
+    @ViewBuilder
+    private var intelligenceBanner: some View {
+        if IntelligenceSurfacePolicy.shouldShowDeadStateBanner(
+            verdict: verdict, suppressedThisRecording: firstBeatWillFire || bannerDismissed
+        ) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Intelligence isn't set up")
+                        .font(SCTypography.sans(size: 12.5, weight: .semibold))
+                        .foregroundStyle(Color.scInk)
+                    Text("This recording won't get named tasks or a summary.")
+                        .font(SCTypography.sans(size: 11.5))
+                        .foregroundStyle(Color.scInkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Button("Set up") { onOpenIntelligence() }
+                    .buttonStyle(.plain)
+                    .font(SCTypography.sans(size: 12, weight: .medium))
+                    .foregroundStyle(Color.scTeal)
+                Button { bannerDismissed = true } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.scInkMuted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(11)
+            .background(Color.scTeal.opacity(0.08), in: RoundedRectangle(cornerRadius: SCMetrics.radiusInner))
+        }
     }
 
     private var startRow: some View {

@@ -534,6 +534,11 @@ final class RecorderController: ObservableObject {
     /// the persisted `audio_default` (the plain toolbar / menu-bar path), `false`
     /// forces audio off (daemon `audio:false` / CLI `--no-audio`), `true` forces
     /// it on via the daemon body.
+    /// Honest status U7 — set true when the first-ever recording starts so the
+    /// one-time first-recording beat presents. Public set so the presenting sheet
+    /// binds and resets it on dismiss.
+    @Published var showFirstRecordingBeat = false
+
     func start(name: String? = nil, audio: Bool? = nil) {
         guard !state.isRecording else { return }
         // A staleness-defeating daemon kickstart is in flight: the daemon is mid
@@ -568,6 +573,21 @@ final class RecorderController: ObservableObject {
             return
         }
         apply(machine.enterStarting())
+
+        // U7 (honest status): fire the one-time first-recording beat as catch-up,
+        // NON-BLOCKING — the recording proceeds regardless below. Marks the first
+        // recording so the beat fires at most once; it only shows when the
+        // intelligence choice wasn't already made/seen in onboarding (existing users
+        // and skippers), never for someone who chose in the wizard.
+        let hints = HUDHintStore()
+        if !hints.hasRecordedOnce {
+            if IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
+                hasRecordedOnce: false, onboardingChoiceSeen: hints.intelligenceChoiceSeen
+            ) {
+                showFirstRecordingBeat = true
+            }
+            hints.markRecordedOnce()
+        }
 
         switch transport {
         case .daemon:

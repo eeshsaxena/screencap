@@ -2316,6 +2316,26 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     return read_task_segments_wire(resolve_recording_dir(recording))
 
 
+def _run_recording_outcome(recording: str) -> str | None:
+    """Read a LOCAL recording's segmentation OUTCOME reason, off the event loop (U3).
+
+    ``None`` for a missing recording dir / ``recording.db`` (legacy / pre-U2), a DB
+    with no recorded outcome, or any read error — the app renders that as the neutral
+    "unknown" state (KTD6). Never raises: an outcome read must not fail the read verb.
+    Local-only read (never leaves the Mac — R4/R8).
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = resolve_recording_dir(recording) / "recording.db"
+    if not db_path.exists():
+        return None
+    try:
+        return PipelineLedger(db_path).get_recording_outcome()
+    except Exception:  # noqa: BLE001 — an outcome read must never fail tasks.list
+        return None
+
+
 async def tasks_list(request: Request) -> JSONResponse:
     """``POST /v0/tasks.list`` — a LOCAL recording's named task segments (U10).
 
@@ -2349,12 +2369,14 @@ async def tasks_list(request: Request) -> JSONResponse:
             )
         validate_recording_name(parsed.recording)
         rows = await asyncio.to_thread(_run_tasks_list, parsed.recording)
+        reason = await asyncio.to_thread(_run_recording_outcome, parsed.recording)
         tasks = [schema.TaskSegment(**row).model_dump() for row in rows]
         return JSONResponse(
             schema.envelope(
                 schema_version=schema._TASKS_LIST_API_VERSION,
                 recording=parsed.recording,
                 tasks=tasks,
+                reason=reason,
             )
         )
     except errors.DaemonAPIError as exc:
@@ -3549,6 +3571,30 @@ async def model_status(request: Request) -> JSONResponse:
         )
 
 
+async def intelligence_status(request: Request) -> JSONResponse:
+    """``GET /v0/intelligence.status`` — daemon-observable inputs to the "usable" verdict.
+
+    Read-only. Reports the config facts the app combines with its own fresh
+    Apple-Intelligence availability probe to compose the live verdict; the daemon
+    never probes availability itself (that fact is Swift-only). An older daemon
+    without this route returns 404, which the app treats as "unknown". Deliberately
+    NOT in ``_ACTIVITY_PATHS`` — a settings read must not keep the daemon alive.
+    """
+    try:
+        from screencap.segmentation.availability import intelligence_verdict_inputs
+
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._MODELS_API_VERSION,
+                verdict_inputs=intelligence_verdict_inputs(),
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._MODELS_API_VERSION, request=request
+        )
+
+
 def _graceful_refusal(kind: QuestionKind = QuestionKind.POINT) -> ChatAnswer:
     """A fail-safe refusal :class:`ChatAnswer` for a downstream miss (KTD8).
 
@@ -4518,6 +4564,7 @@ def build_app() -> Starlette:
             Route("/v0/model.download.status", model_download_status, methods=["GET"]),
             Route("/v0/model.download.cancel", model_download_cancel, methods=["POST"]),
             Route("/v0/model.status", model_status, methods=["GET"]),
+            Route("/v0/intelligence.status", intelligence_status, methods=["GET"]),
         ],
         lifespan=lifespan,
     )

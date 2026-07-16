@@ -22,6 +22,8 @@ final class JournalTasks: ObservableObject {
     /// that actually have tasks appear here (an empty result stores nothing, so
     /// `tasks(for:)` returns `[]`).
     @Published private(set) var tasksByRecording: [String: [RecordingTask]] = [:]
+    /// The per-recording honest-status outcome reason (U2/U3), keyed by recording name.
+    @Published private(set) var reasonByRecording: [String: String] = [:]
     /// A surfaced write failure (R8): the last CRUD verb that threw. Non-nil
     /// drives a visible retry/error affordance; the optimistic state has already
     /// been reverted, so the day still reflects the store. `Identifiable` so a
@@ -70,6 +72,13 @@ final class JournalTasks: ObservableObject {
         tasksByRecording[recording.name] ?? []
     }
 
+    /// The daemon's per-recording segmentation outcome reason (U2/U3), or `nil` when
+    /// none was recorded (legacy recording / older daemon) — the card resolves that to
+    /// the neutral "unknown" state (KTD6), never a false "not set up".
+    func reason(for recording: RecordingSummary) -> String? {
+        reasonByRecording[recording.name]
+    }
+
     /// Whether `recording` has been queried at least once. The card gates its
     /// "unsplit — still searchable" empty-state placeholder on this so the
     /// placeholder shows only after a confirmed empty result, not during the
@@ -98,6 +107,9 @@ final class JournalTasks: ObservableObject {
         } else {
             tasksByRecording[recording] = response.tasks
         }
+        // U2/U3 honest status: the per-recording outcome reason (nil for a legacy
+        // recording / older daemon → the card renders the neutral "unknown" state).
+        reasonByRecording[recording] = response.reason
     }
 
     // MARK: - Write-through (R8)
