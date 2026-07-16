@@ -1017,13 +1017,16 @@ def _run_local_segmentation(
     * ``PROVIDER_UNAVAILABLE`` (could not run — e.g. no on-device model on a
       CLI-only / pre-macOS-26 install) → the day-split **boundaries** fall back to
       the **local idle-gap heuristic** (``task_manifest._segment_tasks`` over the
-      recording's local events). Day-split is on-device/heuristic only — cloud is
-      **never** a day-split fallback (R7 over R5, KTD6). BUT the on-device-
-      unavailable state ALSO unlocks the consented **SUMMARY cloud fallback** (U5,
-      R6/R8): if ``summary_cloud_consent`` is on and a cloud provider is
-      configured, the recording is first named/summarized by that BYO cloud
+      recording's local events). The DAY_SPLIT task-kind is on-device/heuristic
+      only — cloud is **never** its degrade target (R7 over R5, KTD6). BUT the
+      on-device-unavailable state ALSO unlocks the **SUMMARY cloud fallback** (U5,
+      R6/R8), whose ``segment()`` returns full day boundaries *and* labels: when a
+      cloud provider is configured (consent on by default — connecting a provider
+      is the consent, KTD1), the recording is split and named by that cloud
       provider over the SAME already-stripped summary; only if it declines do we
-      fall to the mechanically-named idle-gap heuristic;
+      fall to the mechanically-named idle-gap heuristic. So with no on-device model
+      but a cloud provider connected, the day is still split and labeled — by the
+      cloud model — rather than lost to mechanical names;
     * ``None`` (ran, produced nothing) → left unnamed (fail-open); neither cloud
       nor the heuristic is run for a genuine empty result.
 
@@ -1246,8 +1249,10 @@ def _summary_cloud_fallback(
 
     Resolution mirrors ``recall._cloud_fallback`` — the ONLY sanctioned
     consented-cloud dispatch pattern: resolve ``TaskKind.SUMMARY`` with
-    ``on_device_available=False``; a target other than ``CLOUD`` (consent off, no
-    provider configured) returns ``None`` (leave unnamed). On ``CLOUD``, hand the
+    ``on_device_available=False``; a target other than ``CLOUD`` (no cloud provider
+    configured, or the consent explicitly overridden off) returns ``None`` (leave
+    unnamed). Consent is on by default now (KTD1), so this fires whenever a cloud
+    provider is configured. On ``CLOUD``, hand the
     resolved cloud provider the SAME ``stripped=True``-marked summary the
     on-device path built (never frames — the backends fail-close on unmarked
     input and only ever receive the ALLOW-only text summary, R7/R8/KTD4).

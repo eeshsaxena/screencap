@@ -462,6 +462,67 @@ def test_summary_cloud_fallback_invoked_with_stripped_summary_no_frames(
     assert result.sentinel_uploaded is False
 
 
+def _cloud_split_tasks() -> dict:
+    """A validated cloud tasks dict that SPLITS the day into two named segments."""
+    return {
+        "tasks": [
+            {"start_ts": 1000.0, "end_ts": 1600.0,
+             "name": "Morning research", "derived_name": "morning-research",
+             "description": "Reading docs", "category": "research",
+             "apps_used": ["Safari"], "confidence": "high"},
+            {"start_ts": 2200.0, "end_ts": 2800.0,
+             "name": "Afternoon build", "derived_name": "afternoon-build",
+             "description": "Writing code", "category": "development",
+             "apps_used": ["VS Code"], "confidence": "high"},
+        ],
+        "summary": {"overview": "A cloud-split day.", "primary_focus": "development",
+                    "time_breakdown": {}, "key_accomplishments": []},
+        "tags": ["cloud"],
+    }
+
+
+@pytest.mark.privacy
+def test_no_on_device_cloud_splits_and_labels_the_day(tmp_path, monkeypatch):
+    """Point 2 / R2: with no on-device model but a cloud provider configured
+    (consent on by default — KTD1), the day is SPLIT INTO MULTIPLE cloud-labeled
+    tasks by the cloud model, not collapsed to the mechanical idle-gap heuristic.
+
+    The default-on gate itself is proven at the policy level in
+    ``tests/segmentation/test_consent.py``; this proves the terminal wiring turns a
+    cloud segmentation into persisted multi-segment day tasks (boundaries + labels),
+    over the ALLOW-only stripped summary, with no upload."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
+    # A policy mirroring the shipped default: cloud configured, consent on.
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_split_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    result = _run_terminal(rec_dir)
+
+    # The cloud model split the day into its own multiple named segments...
+    assert len(cloud.calls) == 1
+    assert cloud.calls[0].get("stripped") is True  # ALLOW-only text, never frames
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    names = [t["name"] for t in persisted["tasks"]]
+    assert names == ["Morning research", "Afternoon build"]
+    # ...NOT the mechanical idle-gap heuristic.
+    assert persisted["summary"].get("source") != "idle_gap_heuristic"
+    assert names != ["task_1", "task_2"]
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert [s.name for s in ledger.read_task_segments()] == [
+        "Morning research", "Afternoon build",
+    ]
+    assert result.tasks_persisted == 2
+    # LOCAL recording: cloud splitting never triggers an upload.
+    assert result.destination == "local"
+    assert result.n_uploaded == 0
+
+
 @pytest.mark.privacy
 def test_summary_cloud_declines_falls_through_to_heuristic(tmp_path, monkeypatch):
     """Fail-open: consent on + cloud configured, but the cloud provider returns
