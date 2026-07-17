@@ -264,6 +264,7 @@ def derive_skip_intervals(
     evaluator,
     time_range: tuple[float, float],
     screenshot_timestamps: list[float] | None = None,
+    coverage_timestamps: list[float] | None = None,
     require_canonical: bool = False,
 ) -> list[BlockedInterval]:
     """Return the merged/sorted union of skip intervals for ``[start, end)``.
@@ -273,9 +274,10 @@ def derive_skip_intervals(
     1. **Canonical** ``SCRUB_BLOCK_ACTIONS`` intervals from
        ``build_scrub_context`` (already includes secure-field intervals).
     2. **Uncovered-gap** intervals — for each timestamp in
-       ``screenshot_timestamps`` with no covering ``window_event`` (fail-closed).
-       Omit ``screenshot_timestamps`` (or pass ``None``) to skip this pass — the
-       backfill engine (U4) supplies the flat ``screenshots/*.jpg`` timestamps.
+       ``screenshot_timestamps`` / ``coverage_timestamps`` with no covering
+       ``window_event`` (fail-closed). Omit both (or pass ``None``) to skip
+       this pass — the backfill engine (U4) supplies the flat
+       ``screenshots/*.jpg`` timestamps.
     3. **Ambiguity** intervals — NULL ``browser_url`` / ``title`` / ``element_state``
        spans whose classification genuinely depends on the null column
        (fail-closed; detected via raw SQL on the columns).
@@ -287,6 +289,15 @@ def derive_skip_intervals(
        ALLOW window's open-ended span (the uncovered-gap pass only catches frames
        *before the first* surviving window) and be indexed. Each orphan is skipped
        with a TIGHT interval so legitimately-indexable neighbours are untouched.
+
+    ``coverage_timestamps`` are timestamps that want the fail-closed
+    uncovered-gap protection (pass 2) but are NOT flat-screenshot frame
+    timestamps — the R11 activity-summary strip forwards its event/transcript
+    timestamps here. They are deliberately EXCLUDED from the orphan-screenshot
+    cross-check (pass 4): that pass set-matches against the ``screenshot``
+    table's frame rows, and an event timestamp never coincides with a frame
+    timestamp, so routing events through it would flag every event as an
+    orphan and strip the whole recording's activity.
 
     Always a superset of the live block set; by default never raises on a legacy
     schema or a missing/locked DB (returns whatever it could derive, fail-closed
@@ -315,7 +326,8 @@ def derive_skip_intervals(
         # A missing/unreadable recording.db is the most extreme canonical failure:
         # build_scrub_context is never even called below. Fail-closed callers must
         # see that as a raise at this seam, not depend on the uncovered-gap pass
-        # (which only fires when screenshot_timestamps is supplied) (SCR-198).
+        # (which only fires when screenshot/coverage timestamps are supplied)
+        # (SCR-198).
         raise CanonicalDerivationError(
             "recording.db missing/unreadable; canonical block set is underivable"
         )
@@ -374,14 +386,17 @@ def derive_skip_intervals(
                 "orphan cross-check skipped", exc_info=True,
             )
 
-    # 2. Uncovered-gap intervals (orphan screenshots with no covering window).
+    # 2. Uncovered-gap intervals (timestamps with no covering window). Frame
+    # AND coverage timestamps both get this fail-closed protection.
     gaps: list[BlockedInterval] = []
     orphans: list[BlockedInterval] = []
+    gap_tss = list(screenshot_timestamps or []) + list(coverage_timestamps or [])
+    if gap_tss:
+        gaps = _derive_uncovered_gaps(gap_tss, window_starts, start, end)
     if screenshot_timestamps:
-        gaps = _derive_uncovered_gaps(
-            screenshot_timestamps, window_starts, start, end,
-        )
         # 4. Orphan-screenshot intervals (flat file with no surviving DB row).
+        # FRAME timestamps only — coverage timestamps are events, which never
+        # match a ``screenshot`` row and would all be falsely flagged orphan.
         orphans = _derive_orphan_screenshot_intervals(
             screenshot_timestamps, surviving_screenshot_ts, start, end,
         )

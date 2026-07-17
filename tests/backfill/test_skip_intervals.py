@@ -694,6 +694,41 @@ def test_orphan_check_tight_pad_spares_neighbours(tmp_path):
     assert find_blocked_interval(201.0, intervals) is None
 
 
+def test_coverage_timestamps_gap_protected_but_not_orphan_checked(tmp_path):
+    """``coverage_timestamps`` (events) get the gap residual, never the orphan check.
+
+    The R11 activity-summary strip forwards EVENT/transcript timestamps, which
+    never coincide with a ``screenshot`` row's frame timestamp — routing them
+    through ``screenshot_timestamps`` falsely orphan-flagged every event and
+    stripped the whole recording's activity (the bug the parameter split
+    fixes). Frames passed via ``screenshot_timestamps`` in the SAME call keep
+    the orphan cross-check unchanged.
+    """
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 200.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])
+    # One surviving frame row at 300; the frame at 350 lost its row (purged).
+    _add_screenshot_table(db, rows=[{"ts": 300.0}])
+    classifier, evaluator = _public()
+
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        screenshot_timestamps=[300.0, 350.0],
+        coverage_timestamps=[100.0, 250.0],
+    )
+
+    # A coverage ts before the earliest surviving window → uncovered-gap skip.
+    gap = _blocked_at(100.0, intervals)
+    assert gap is not None and gap.reason == UNCOVERED_GAP
+    # A covered coverage ts matches NO screenshot row yet is NOT orphan-flagged.
+    assert _blocked_at(250.0, intervals) is None
+    # The frame path is unchanged: surviving row allowed, purged row orphaned.
+    assert _blocked_at(300.0, intervals) is None
+    orphan = _blocked_at(350.0, intervals)
+    assert orphan is not None and orphan.reason == ORPHAN_SCREENSHOT
+
+
 def test_null_image_path_row_still_covers_frame(tmp_path):
     """A surviving row with NULL image_path still covers its frame by timestamp."""
     db = tmp_path / "recording.db"
