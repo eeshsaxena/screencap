@@ -95,6 +95,83 @@ final class DayStripLayoutTests: XCTestCase {
         )
     }
 
+    // MARK: - Task-label placement
+
+    /// Greedy left-to-right: a label whose band starts within 8pt of the
+    /// previous label's end is skipped (nil), later bands still place.
+    func testTaskLabelFramesSkipOverlapsGreedily() {
+        let frames = DayStripLayout.taskLabelFrames(
+            bands: [(minX: 0, width: 100), (minX: 30, width: 100), (minX: 200, width: 60)],
+            measuredWidths: [50, 50, 40]
+        )
+        XCTAssertEqual(frames.count, 3, "output stays aligned with the input bands")
+        XCTAssertEqual(frames[0], DayStripLayout.TaskLabelFrame(minX: 0, width: 50, truncated: false))
+        XCTAssertNil(frames[1], "band starting inside the previous label + 8pt spacing is skipped")
+        XCTAssertEqual(frames[2], DayStripLayout.TaskLabelFrame(minX: 200, width: 40, truncated: false))
+    }
+
+    /// A very narrow band truncates its label but never below the 44pt hint
+    /// width — the label shrinks, it doesn't disappear.
+    func testNarrowBandLabelTruncatesButKeepsMinimumHintWidth() {
+        let frames = DayStripLayout.taskLabelFrames(
+            bands: [(minX: 0, width: 10)],
+            measuredWidths: [80]
+        )
+        XCTAssertEqual(
+            frames[0], DayStripLayout.TaskLabelFrame(minX: 0, width: 44, truncated: true),
+            "10pt band still yields the 44pt one-word hint"
+        )
+    }
+
+    /// `truncated` is set exactly when the measured name doesn't fit the
+    /// allowed width — a fitting label is never flagged.
+    func testTruncatedFlagSetExactlyWhenNameDoesNotFit() {
+        let frames = DayStripLayout.taskLabelFrames(
+            bands: [(minX: 0, width: 100), (minX: 300, width: 100)],
+            measuredWidths: [60, 120]
+        )
+        XCTAssertEqual(frames[0], DayStripLayout.TaskLabelFrame(minX: 0, width: 60, truncated: false))
+        XCTAssertEqual(frames[1], DayStripLayout.TaskLabelFrame(minX: 300, width: 100, truncated: true))
+    }
+
+    // MARK: - Caption clustering
+
+    /// Two blocked bands within the 50pt caption width coalesce to ONE caption
+    /// (the old per-band draw overprinted them); far-apart bands keep two.
+    func testNearbyBlockedCaptionsCoalesceFarOnesStaySeparate() {
+        let near = DayStripLayout.captionClusters([(x: 10, cls: .blocked), (x: 40, cls: .blocked)])
+        XCTAssertEqual(near, [DayStripLayout.Caption(x: 25, classes: [.blocked])],
+                       "chained neighbors collapse to their mean x, one caption")
+        let far = DayStripLayout.captionClusters([(x: 10, cls: .blocked), (x: 200, cls: .blocked)])
+        XCTAssertEqual(far.count, 2, "bands beyond the caption width keep separate captions")
+    }
+
+    /// The overlap guard runs across ALL caption classes: a blocked band and a
+    /// purged band within caption width coalesce into a single mixed-class
+    /// caption, so their texts can never overprint (purged arrives in a later
+    /// unit — the geometry supports it now).
+    func testMixedClassCaptionsWithinThresholdCoalesce() {
+        let captions = DayStripLayout.captionClusters([(x: 10, cls: .blocked), (x: 30, cls: .purged)])
+        XCTAssertEqual(captions, [DayStripLayout.Caption(x: 20, classes: [.blocked, .purged])])
+    }
+
+    // MARK: - Tick label positions
+
+    /// Hour-tick labels center on their tick from the measured width (replaces
+    /// the fixed -14pt offset, wrong for any other label width).
+    func testTickLabelsCenterOnTheirTick() {
+        XCTAssertEqual(DayStripLayout.tickLabelMinX(tickX: 250, labelWidth: 28, stripWidth: 600), 236)
+    }
+
+    /// The first/last labels clamp inside the strip bounds instead of spilling
+    /// past the edges.
+    func testEdgeTickLabelsClampInsideStripBounds() {
+        XCTAssertEqual(DayStripLayout.tickLabelMinX(tickX: 0, labelWidth: 28, stripWidth: 600), 0,
+                       "first label clamps to the leading edge")
+        XCTAssertEqual(DayStripLayout.tickLabelMinX(tickX: 600, labelWidth: 28, stripWidth: 600), 572,
+                       "last label clamps to the trailing edge")
+    }
+
     // MARK: - R7: blocked bands
 
     /// Hatching may claim "blocked" only for `blocked_proven` intervals —

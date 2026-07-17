@@ -168,6 +168,102 @@ enum DayStripLayout {
         return clusters
     }
 
+    /// A placed task label above its band (design 451–453). `truncated` is true
+    /// exactly when the measured name doesn't fit the allowed width, so the
+    /// draw site knows to render an ellipsized string instead of hard-clipping
+    /// mid-glyph (the full name stays reachable via the overlay's `.help` +
+    /// accessibility label).
+    struct TaskLabelFrame: Equatable {
+        let minX: CGFloat
+        let width: CGFloat
+        let truncated: Bool
+    }
+
+    /// Greedy left-to-right task-label placement over the sorted bands: a label
+    /// is skipped (nil, position-aligned with the input) when its band starts
+    /// within `spacingPx` of the previous placed label's end — adjacent narrow
+    /// tasks would otherwise paint on top of each other. A placed label gets
+    /// `min(measured, max(bandWidth, minHintWidth))`: it truncates to the band
+    /// but never below the 44pt one-word hint, so a narrow band's label shrinks
+    /// rather than disappears. Bands must be sorted by `minX`.
+    static func taskLabelFrames(
+        bands: [(minX: CGFloat, width: CGFloat)],
+        measuredWidths: [CGFloat],
+        minHintWidth: CGFloat = 44,
+        spacingPx: CGFloat = 8
+    ) -> [TaskLabelFrame?] {
+        var frames: [TaskLabelFrame?] = []
+        var lastLabelEndX = -CGFloat.greatestFiniteMagnitude
+        for (band, measured) in zip(bands, measuredWidths) {
+            guard band.minX >= lastLabelEndX + spacingPx else {
+                frames.append(nil)
+                continue
+            }
+            let width = min(measured, max(band.width, minHintWidth))
+            frames.append(TaskLabelFrame(minX: band.minX, width: width, truncated: measured > width))
+            lastLabelEndX = band.minX + width
+        }
+        return frames
+    }
+
+    /// A caption band's class. Only `blocked` renders today; `purged`
+    /// (retroactively purged app spans) arrives in a later unit — the tag is
+    /// modeled now so the mixed-class overlap guard can't drift when it does.
+    enum CaptionClass: Hashable {
+        case blocked
+        case purged
+    }
+
+    /// One caption per single-linkage cluster: the cluster's mean leading x +
+    /// the union of the member bands' classes.
+    struct Caption: Equatable {
+        let x: CGFloat
+        let classes: Set<CaptionClass>
+    }
+
+    /// Collapse per-band captions to one per cluster by single-linkage chaining
+    /// (the `clusterXs` contract; the default threshold is the 50pt caption
+    /// width). The guard runs across ALL caption classes in one pass, so two
+    /// nearby blocked bands — or a blocked band next to a purged one — coalesce
+    /// into a single mixed-class caption instead of overprinting.
+    static func captionClusters(
+        _ bands: [(x: CGFloat, cls: CaptionClass)],
+        thresholdPx: CGFloat = 50
+    ) -> [Caption] {
+        let sorted = bands.sorted { $0.x < $1.x }
+        guard let first = sorted.first else { return [] }
+        guard thresholdPx > 0 else { return sorted.map { Caption(x: $0.x, classes: [$0.cls]) } }
+        var clusters: [Caption] = []
+        var bucketXs: [CGFloat] = [first.x]
+        var bucketClasses: Set<CaptionClass> = [first.cls]
+        func flush() {
+            clusters.append(
+                Caption(x: bucketXs.reduce(0, +) / CGFloat(bucketXs.count), classes: bucketClasses)
+            )
+        }
+        for band in sorted.dropFirst() {
+            if band.x - bucketXs[bucketXs.count - 1] <= thresholdPx {
+                bucketXs.append(band.x)
+                bucketClasses.insert(band.cls)
+            } else {
+                flush()
+                bucketXs = [band.x]
+                bucketClasses = [band.cls]
+            }
+        }
+        flush()
+        return clusters
+    }
+
+    /// An hour-tick label's leading x: centered on its tick from the *measured*
+    /// label width (the old fixed -14pt offset assumed one width and let the
+    /// edge labels spill outside the strip), with the first/last labels clamped
+    /// inside `[0, stripWidth]`.
+    static func tickLabelMinX(tickX: CGFloat, labelWidth: CGFloat, stripWidth: CGFloat) -> CGFloat {
+        let centered = tickX - labelWidth / 2
+        return min(max(0, centered), max(0, stripWidth - labelWidth))
+    }
+
     /// The "nothing captured" complement: the axis span minus the union of the
     /// day's recording base tracks. These are the between-recording gaps where
     /// the neutral track shows through with no footage (R7) — announced to
@@ -301,39 +397,49 @@ struct DayStripView: View {
                 ctx.stroke(path, with: .color(.scTealSoft.opacity(0.30)), lineWidth: 1)
             }
 
-            // Greedy left-to-right label placement: a label is skipped when it
-            // would overlap the previously drawn one (adjacent narrow tasks would
-            // otherwise paint on top of each other). Every band still exposes its
-            // task name via the accessibility overlay + hover tooltip. The label
-            // is clipped to the band width so a very narrow band truncates (the
-            // full name stays reachable via the overlay's `.help`).
-            var lastLabelEndX = -CGFloat.greatestFiniteMagnitude
-            for segment in segments.sorted(by: { $0.startMs < $1.startMs }) {
-                let rect = bandRect(startMs: segment.startMs, endMs: segment.endMs, width: width)
+            // Task labels above the bands (design 451–453): placement comes
+            // from the pure `taskLabelFrames` (greedy left-to-right, skip on
+            // overlap, 44pt minimum hint), so it's unit-testable without a
+            // render. A truncated label draws an ellipsized string instead of
+            // hard-clipping mid-glyph; every band still exposes its full task
+            // name via the accessibility overlay + hover tooltip.
+            let sortedSegments = segments.sorted { $0.startMs < $1.startMs }
+            let segmentRects = sortedSegments.map {
+                bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width)
+            }
+            let resolvedLabels = sortedSegments.map { resolveTaskLabel($0.name, ctx: ctx) }
+            let labelFrames = DayStripLayout.taskLabelFrames(
+                bands: segmentRects.map { (minX: $0.minX, width: $0.width) },
+                measuredWidths: resolvedLabels.map { $0.measure(in: taskLabelMaxSize).width }
+            )
+            for (index, rect) in segmentRects.enumerated() {
                 let path = Path(roundedRect: rect, cornerRadius: 4)
                 ctx.fill(path, with: .color(.scTeal.opacity(0.25)))
                 ctx.stroke(path, with: .color(.scTeal.opacity(0.40)), lineWidth: 1)
-                // Task label above the band (design 451–453).
-                let label = ctx.resolve(
-                    Text(segment.name).font(SCTypography.mono(size: 9.5)).foregroundColor(.scTeal)
-                )
-                let measured = label.measure(in: CGSize(width: 220, height: 14))
-                if rect.minX >= lastLabelEndX + 8 {
-                    // Truncate the drawn label to the band width (min 44pt so a
-                    // one-word hint survives); the overlay tooltip carries the
-                    // full name.
-                    let drawWidth = min(measured.width, max(rect.width, 44))
-                    ctx.draw(label, in: CGRect(x: rect.minX, y: 0, width: drawWidth, height: 14))
-                    lastLabelEndX = rect.minX + drawWidth
-                }
+                guard let frame = labelFrames[index] else { continue }
+                let label = frame.truncated
+                    ? ellipsizedTaskLabel(sortedSegments[index].name, maxWidth: frame.width, ctx: ctx)
+                    : resolvedLabels[index]
+                let drawWidth = min(frame.width, label.measure(in: taskLabelMaxSize).width)
+                ctx.draw(label, in: CGRect(x: frame.minX, y: 0, width: drawWidth, height: 14))
             }
 
             for band in blockedBands {
-                let rect = bandRect(startMs: band.startMs, endMs: band.endMs, width: width)
-                hatch(ctx: ctx, rect: rect)
+                hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width))
+            }
+            // One caption per cluster (pure `captionClusters` — single overlap
+            // guard across all caption classes), not one per band: nearby
+            // blocked bands share a caption instead of overprinting. Only
+            // `.blocked` bands feed it today; purged joins in a later unit.
+            let captions = DayStripLayout.captionClusters(
+                blockedBands.map {
+                    (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .blocked)
+                }
+            )
+            for caption in captions {
                 ctx.draw(
                     Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust),
-                    in: CGRect(x: rect.minX, y: trackTop + trackHeight + 8, width: max(rect.width, 50), height: 12)
+                    in: CGRect(x: caption.x, y: trackTop + trackHeight + 8, width: 50, height: 12)
                 )
             }
 
@@ -365,6 +471,31 @@ struct DayStripView: View {
                 ctx.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(.scAmber))
             }
         }
+    }
+
+    /// The task-label measurement box (one 14pt line, 220pt name cap).
+    private let taskLabelMaxSize = CGSize(width: 220, height: 14)
+
+    private func resolveTaskLabel(_ name: String, ctx: GraphicsContext) -> GraphicsContext.ResolvedText {
+        ctx.resolve(Text(name).font(SCTypography.mono(size: 9.5)).foregroundColor(.scTeal))
+    }
+
+    /// Ellipsize a task name to `maxWidth`: drop trailing characters until the
+    /// name + "…" measures within the width, so a truncated label ends in a
+    /// visible ellipsis instead of a hard clip. Worst case falls back to a bare
+    /// "…" (the 44pt hint floor makes that practically unreachable).
+    private func ellipsizedTaskLabel(
+        _ name: String, maxWidth: CGFloat, ctx: GraphicsContext
+    ) -> GraphicsContext.ResolvedText {
+        var characters = Array(name)
+        while !characters.isEmpty {
+            let candidate = resolveTaskLabel(String(characters) + "…", ctx: ctx)
+            if candidate.measure(in: taskLabelMaxSize).width <= maxWidth {
+                return candidate
+            }
+            characters.removeLast()
+        }
+        return resolveTaskLabel("…", ctx: ctx)
     }
 
     private func bandRect(startMs: Int, endMs: Int, width: CGFloat) -> CGRect {
@@ -470,14 +601,32 @@ struct DayStripView: View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 ForEach(DayStripLayout.hourTicks(bounds: bounds), id: \.self) { ms in
-                    Text(DayStripAccessibility.hourText(ms: ms))
+                    let text = DayStripAccessibility.hourText(ms: ms)
+                    // Centered on the tick from the measured width via the pure
+                    // `tickLabelMinX` (the old fixed -14pt offset assumed one
+                    // width and pushed the edge labels outside the strip).
+                    Text(text)
                         .font(SCTypography.mono(size: 10))
                         .foregroundStyle(Color.scInkMuted)
-                        .offset(x: DayStripLayout.x(forMs: ms, bounds: bounds, width: geo.size.width) - 14)
+                        .offset(x: DayStripLayout.tickLabelMinX(
+                            tickX: DayStripLayout.x(forMs: ms, bounds: bounds, width: geo.size.width),
+                            labelWidth: Self.hourLabelWidth(text),
+                            stripWidth: geo.size.width
+                        ))
                 }
             }
         }
         .frame(height: 14)
+    }
+
+    /// Measure an hour label ("HH:mm") in the row's mono face — the width the
+    /// pure `tickLabelMinX` centers/clamps with. Falls back to the monospaced
+    /// system font if the bundled face is somehow unregistered, mirroring
+    /// `Font.custom`'s own fallback.
+    private static func hourLabelWidth(_ text: String) -> CGFloat {
+        let font = NSFont(name: SCFonts.IBMPlexMono.regular, size: 10)
+            ?? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        return (text as NSString).size(withAttributes: [.font: font]).width
     }
 
     private var legend: some View {
