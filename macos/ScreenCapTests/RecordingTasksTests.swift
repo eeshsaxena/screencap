@@ -42,6 +42,23 @@ final class RecordingTasksTests: XCTestCase {
         let resp = try JSONDecoder().decode(TasksListResponse.self, from: Data(json.utf8))
         XCTAssertEqual(resp.recording, "empty")
         XCTAssertTrue(resp.tasks.isEmpty)
+        // Legacy daemon envelope: both honest-status fields absent → nil, never a throw.
+        XCTAssertNil(resp.reason)
+        XCTAssertNil(resp.detail)
+    }
+
+    /// SCR-275 U6/U7: the additive `reason` + `detail` pair decodes off the same
+    /// envelope — `detail` is the distinct degradation reason (`context-window` =
+    /// "session too long for the on-device model").
+    func testDecodesReasonAndDetailAdditively() throws {
+        let json = """
+        {"ok": true, "schema_version": 1, "daemon_version": "0.0.0",
+         "api_schema_version": 1, "recording": "r", "tasks": [],
+         "reason": "produced_tasks_partial", "detail": "context-window"}
+        """
+        let resp = try JSONDecoder().decode(TasksListResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(resp.reason, "produced_tasks_partial")
+        XCTAssertEqual(resp.detail, "context-window")
     }
 
     // MARK: - displayTitle

@@ -382,9 +382,15 @@ struct JournalCard: View {
     private var verdict: IntelligenceVerdict? {
         IntelligenceVerdict.compose(probe: OnDeviceModelStatus.probe(), settings: intelligence.settings)
     }
-    /// The honest state for this recording's task display (R7 / KTD3 / KTD6).
+    /// The honest state for this recording's task display (R7 / KTD3 / KTD6). The
+    /// degradation `detail` (SCR-275 U7) rides along so a too-long-session day reads
+    /// differently from intelligence-off (R9).
     private var honestState: RecordingHonestState {
-        RecordingHonestState.resolve(reason: journalTasks.reason(for: recording), verdict: verdict)
+        RecordingHonestState.resolve(
+            reason: journalTasks.reason(for: recording),
+            detail: journalTasks.detail(for: recording),
+            verdict: verdict
+        )
     }
 
     /// The recording's locally-named task segments, ordered by task index.
@@ -474,11 +480,26 @@ struct JournalCard: View {
     private var taskBreakdown: some View {
         if !breakdown.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
-                // U6: `mechanicalOnly` HAS tasks (heuristic-named) — a banner ABOVE the
-                // populated list, not an empty-state string, so it reads distinctly from
-                // AI-named `produced` tasks (R7d).
-                if honestState == .mechanicalOnly {
-                    honestLabel("Mechanical names — set up intelligence for real task names", tone: .attention)
+                // U6: `mechanicalOnly` (and SCR-275 U7's partial mix) HAS tasks — a
+                // banner ABOVE the populated list, not an empty-state string, so it
+                // reads distinctly from AI-named `produced` tasks (R7d). The banner
+                // says WHY naming degraded (R9): a `context-window` detail means the
+                // session was too long for the on-device model, so "set up
+                // intelligence" would be a false diagnosis.
+                if case .mechanicalOnly(let sessionTooLong) = honestState {
+                    honestLabel(
+                        sessionTooLong
+                            ? "Session too long for the on-device model — names are mechanical"
+                            : "Mechanical names — set up intelligence for real task names",
+                        tone: .attention
+                    )
+                } else if case .producedTasksPartial(let sessionTooLong) = honestState {
+                    honestLabel(
+                        sessionTooLong
+                            ? "Session too long for the on-device model — some tasks kept mechanical names"
+                            : "Some tasks named — the rest kept mechanical names",
+                        tone: .quiet
+                    )
                 }
                 ForEach(breakdown) { task in
                     taskRow(task)
@@ -509,9 +530,10 @@ struct JournalCard: View {
             honestLabel("Still processing…", tone: .quiet)
         case .nothingToName:
             honestLabel("Nothing to name in this recording", tone: .quiet)
-        case .producedTasks, .mechanicalOnly, .unknown:
-            // producedTasks/mechanicalOnly never reach here (tasks are present); unknown
-            // = legacy recording / older daemon → the neutral, searchable-footage copy.
+        case .producedTasks, .producedTasksPartial, .mechanicalOnly, .unknown:
+            // producedTasks/producedTasksPartial/mechanicalOnly never reach here (tasks
+            // are present); unknown = legacy recording / older daemon → the neutral,
+            // searchable-footage copy.
             Text("unsplit — still searchable")
                 .font(SCTypography.mono(size: 10.5))
                 .foregroundStyle(Color.scInkMuted)

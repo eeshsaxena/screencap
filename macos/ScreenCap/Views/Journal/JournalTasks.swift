@@ -24,6 +24,11 @@ final class JournalTasks: ObservableObject {
     @Published private(set) var tasksByRecording: [String: [RecordingTask]] = [:]
     /// The per-recording honest-status outcome reason (U2/U3), keyed by recording name.
     @Published private(set) var reasonByRecording: [String: String] = [:]
+    /// The per-recording degradation-reason detail (SCR-275 U6/U7) recorded alongside
+    /// the outcome reason — e.g. `context-window` ("session too long for the on-device
+    /// model"), keyed by recording name. Absent for non-degraded outcomes, legacy
+    /// rows, and older daemons.
+    @Published private(set) var detailByRecording: [String: String] = [:]
     /// A surfaced write failure (R8): the last CRUD verb that threw. Non-nil
     /// drives a visible retry/error affordance; the optimistic state has already
     /// been reverted, so the day still reflects the store. `Identifiable` so a
@@ -79,6 +84,14 @@ final class JournalTasks: ObservableObject {
         reasonByRecording[recording.name]
     }
 
+    /// The distinct degradation detail recorded alongside `reason(for:)` (SCR-275
+    /// U6/U7) — e.g. `context-window` ("session too long for the on-device model") vs
+    /// `respond-failed`. `nil` when none was recorded (non-degraded outcome / legacy
+    /// recording / older daemon); the card then renders the generic degraded copy.
+    func detail(for recording: RecordingSummary) -> String? {
+        detailByRecording[recording.name]
+    }
+
     /// Whether `recording` has been queried at least once. The card gates its
     /// "unsplit — still searchable" empty-state placeholder on this so the
     /// placeholder shows only after a confirmed empty result, not during the
@@ -108,8 +121,11 @@ final class JournalTasks: ObservableObject {
             tasksByRecording[recording] = response.tasks
         }
         // U2/U3 honest status: the per-recording outcome reason (nil for a legacy
-        // recording / older daemon → the card renders the neutral "unknown" state).
+        // recording / older daemon → the card renders the neutral "unknown" state),
+        // plus the SCR-275 U6/U7 degradation detail (nil assignment clears a stale
+        // entry, so an upgraded outcome drops its old detail).
         reasonByRecording[recording] = response.reason
+        detailByRecording[recording] = response.detail
     }
 
     // MARK: - Write-through (R8)

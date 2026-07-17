@@ -42,11 +42,19 @@ struct IntelligenceVerdict: Equatable, Sendable {
 /// verdict-derived `notSetUp`, and an unresolved/usable verdict yields `unknown`
 /// (never a false `notSetUp`).
 ///
-/// `mechanicalOnly` is special: the recording HAS tasks (heuristic-named), so its UI
-/// is a banner above the populated list, not an empty-state string (U6).
+/// `mechanicalOnly` and `producedTasksPartial` are special: the recording HAS tasks
+/// (heuristic-named, or a model/mechanical mix — SCR-275 U7), so their UI is a
+/// banner above the populated list, not an empty-state string (U6). Both carry
+/// `sessionTooLong`: true when the daemon's degradation `detail` was
+/// `context-window` — the session was too long for the on-device model — so the
+/// banner can say WHY naming degraded (R9/KTD-8) instead of implying intelligence
+/// isn't set up.
 enum RecordingHonestState: Equatable, Sendable {
     case producedTasks    // AI-named tasks — normal
-    case mechanicalOnly   // tasks exist but heuristic-named → "mechanical names" banner
+    /// SCR-275 U7: some tasks model-named, the rest mechanical → honest-mix banner.
+    case producedTasksPartial(sessionTooLong: Bool)
+    /// Tasks exist but ALL heuristic-named → "mechanical names" banner.
+    case mechanicalOnly(sessionTooLong: Bool)
     case inProgress       // live/incremental segmentation not finished yet — transient
     case nothingToName    // a model ran and found nothing — quiet, no action
     case couldntRun       // the attempt failed and no fallback produced anything — retry
@@ -55,11 +63,19 @@ enum RecordingHonestState: Equatable, Sendable {
 
     /// - Parameters:
     ///   - reason: the daemon's per-recording outcome string (`nil` = none recorded).
+    ///   - detail: the daemon's distinct degradation reason (SCR-275 U6, additive —
+    ///     `nil` on legacy rows / older daemons). Only `context-window` changes the
+    ///     surface ("session too long for the on-device model"); any other value —
+    ///     including future vocabulary — reads as a generic degradation.
     ///   - verdict: the composed live verdict (`nil` = unresolved → `unknown`).
-    static func resolve(reason: String?, verdict: IntelligenceVerdict?) -> RecordingHonestState {
+    static func resolve(
+        reason: String?, detail: String? = nil, verdict: IntelligenceVerdict?
+    ) -> RecordingHonestState {
+        let sessionTooLong = detail == "context-window"
         switch reason {
         case "produced_tasks": return .producedTasks
-        case "mechanical_only": return .mechanicalOnly
+        case "produced_tasks_partial": return .producedTasksPartial(sessionTooLong: sessionTooLong)
+        case "mechanical_only": return .mechanicalOnly(sessionTooLong: sessionTooLong)
         case "in_progress": return .inProgress
         case "nothing_to_name": return .nothingToName
         case "couldnt_run": return .couldntRun
@@ -71,15 +87,28 @@ enum RecordingHonestState: Equatable, Sendable {
         }
     }
 
-    /// Whether this state carries a populated task list (only `mechanicalOnly`), so
-    /// the view attaches a banner above the list rather than replacing an empty state.
-    var hasPopulatedTasks: Bool { self == .mechanicalOnly }
+    /// Whether this state carries a populated task list (`mechanicalOnly` and the
+    /// SCR-275 partial mix), so the view attaches a banner above the list rather
+    /// than replacing an empty state.
+    var hasPopulatedTasks: Bool {
+        switch self {
+        case .mechanicalOnly, .producedTasksPartial: return true
+        case .producedTasks, .inProgress, .nothingToName, .couldntRun, .notSetUp, .unknown:
+            return false
+        }
+    }
 
-    /// Whether this state offers a set-up / finish-setup affordance (R7).
+    /// Whether this state offers a set-up / finish-setup affordance (R7). A
+    /// `sessionTooLong` degradation does NOT: intelligence ran and hit the model's
+    /// context window, so "set up" would be a false diagnosis (R9). The partial mix
+    /// never does — the model demonstrably named some tasks.
     var offersSetup: Bool {
         switch self {
-        case .notSetUp, .mechanicalOnly: return true
-        case .producedTasks, .inProgress, .nothingToName, .couldntRun, .unknown: return false
+        case .notSetUp: return true
+        case .mechanicalOnly(let sessionTooLong): return !sessionTooLong
+        case .producedTasks, .producedTasksPartial, .inProgress, .nothingToName,
+             .couldntRun, .unknown:
+            return false
         }
     }
 }
