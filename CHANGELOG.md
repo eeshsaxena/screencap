@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.28.0] - 2026-07-17
+
+### Added
+
+- **segmentation:** Heuristic-first on-device naming pipeline — candidate-window generation with per-window digests, reason-bearing helper envelopes for the on-device arbitrate/name-window/day-summary verbs, a persistent naming cache, and a partial-outcome reason with degradation detail surfaced on `tasks.list` (SCR-275)
+
+### Fixed
+
+- **daemon:** Let a stopping engine finish its finalize drain instead of SIGKILLing at the stop deadline (SCR-273)
+- **daemon:** Carry the frozen destination on a crash-synthesized `recording_finalized` event
+- **segmentation:** Stop falsely orphan-flagging event timestamps in the R11 strip and recall aggregate
+
 ## [0.27.0] - 2026-07-16
 
 ### Added
