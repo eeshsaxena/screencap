@@ -284,6 +284,47 @@ final class DayStripLayoutTests: XCTestCase {
         )
     }
 
+    /// With several same-day recordings before the gap, the *latest-ending*
+    /// one owns the attribution: an interrupted later recording makes the gap
+    /// read "cut short" anchored at ITS end, even when an earlier recording
+    /// ended clean.
+    func testGapCauseAttributesToLatestEndingPredecessor() {
+        let earlier = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 7 * hour, endMs: dayStart + 8 * hour, endStatus: "clean"
+        )
+        let later = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "interrupted"
+        )
+        XCTAssertEqual(
+            DayStripLayout.gapCause(
+                gapStartMs: dayStart + 10 * hour, gapEndMs: dayStart + 11 * hour,
+                spans: [earlier, later], storeMounted: true, provenanceReady: true,
+                nowMs: dayStart + 20 * hour
+            ),
+            DayStripLayout.GapCause.interrupted(aroundMs: dayStart + 10 * hour)
+        )
+    }
+
+    /// The reverse: a clean latest-ending predecessor makes the gap an honest
+    /// "nothing on file" even though an EARLIER same-day recording was
+    /// interrupted — old interruptions never leak forward past a clean end.
+    func testGapCauseCleanLatestPredecessorMasksEarlierInterruption() {
+        let earlier = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 7 * hour, endMs: dayStart + 8 * hour, endStatus: "interrupted"
+        )
+        let later = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "clean"
+        )
+        XCTAssertEqual(
+            DayStripLayout.gapCause(
+                gapStartMs: dayStart + 10 * hour, gapEndMs: dayStart + 11 * hour,
+                spans: [earlier, later], storeMounted: true, provenanceReady: true,
+                nowMs: dayStart + 20 * hour
+            ),
+            DayStripLayout.GapCause.nothingOnFile
+        )
+    }
+
     /// A gap straddling now splits so the pre-now part can carry a cause while
     /// the future part claims nothing (R11 — "still recording" is bounded to
     /// now). Fully-past and fully-future gaps pass through unsplit.

@@ -146,8 +146,10 @@ def resolve_end_status(rec_dir: Path, state: str) -> str:
       Checked FIRST: a live recording carries the start-phase marker with a null
       ``end`` (the interrupted signature) by construction.
     * ``interrupted`` — stop metadata records abnormal termination
-      (``terminated_reason`` non-null / ``force_stopped`` in the ready payload or
-      stop-meta sidecar), OR the start-phase ``system_metrics.json`` exists with
+      (``terminated_reason`` non-null / ``force_stopped`` / ``disk_full`` in the
+      ready payload or stop-meta sidecar — session.py sets ``disk_full`` on its
+      own detection path independent of the engine's ``terminated_reason``), OR
+      the start-phase ``system_metrics.json`` exists with
       ``"end": null`` and no ready sentinel — the recorder started and never
       reached its end phase.
     * ``clean`` — clean-stop artifacts present and normal.
@@ -169,6 +171,7 @@ def resolve_end_status(rec_dir: Path, state: str) -> str:
         if payload is not None and (
             payload.get("terminated_reason") is not None
             or payload.get("force_stopped")
+            or payload.get("disk_full")
         ):
             return "interrupted"
     if ready is not None or stop_meta is not None:
@@ -212,9 +215,9 @@ def _disable_log_targets(rec_dir: Path) -> dict[float, dict[str, Any] | None]:
         target = entry.get("target")
         target = target if isinstance(target, dict) else {}
         ident = {
-            k: target.get(k)
+            k: target[k]
             for k in ("bundle_id", "app_name", "root_domain")
-            if target.get(k) is not None
+            if isinstance(target.get(k), str)  # non-str values never reach the wire
         }
         targets[ts] = ident or None
     return targets
@@ -263,7 +266,10 @@ def _purge_identity_map(
     for key, disabled_at in spans.items():
         if disabled_at is None:
             continue
-        ident = log_targets.get(float(disabled_at))
+        try:
+            ident = log_targets.get(float(disabled_at))
+        except (TypeError, ValueError):
+            continue  # corrupt disabled_at (TEXT/BLOB) → identity-free, never a 500
         if ident:
             out[key] = ident
     return out

@@ -203,9 +203,11 @@ enum DayStripLayout {
         return frames
     }
 
-    /// A caption band's class. Only `blocked` renders today; `purged`
-    /// (retroactively purged app spans) arrives in a later unit — the tag is
-    /// modeled now so the mixed-class overlap guard can't drift when it does.
+    /// A caption band's class. Both `blocked` and `purged` (retroactively
+    /// purged app spans) render today — `captionClusters` is fed both band
+    /// sets. A mixed cluster keeps the "blocked" wording (the hard-stop claim
+    /// dominates the shared slot); the class tag exists so the single
+    /// overlap guard covers both classes in one pass.
     enum CaptionClass: Hashable {
         case blocked
         case purged
@@ -418,7 +420,7 @@ enum DayStripLegend {
     static let items: [Item] = [
         Item(text: "task", swatch: .task),
         Item(text: "recorded — searchable", swatch: .unsplit),
-        Item(text: "nothing on file — hover for why", swatch: .nothingCaptured),
+        Item(text: "empty — hover for why", swatch: .nothingCaptured),
         Item(text: "search match", swatch: .searchMatch),
         Item(text: "blocked at capture", swatch: .blocked),
         Item(text: "removed by your rules", swatch: .purged),

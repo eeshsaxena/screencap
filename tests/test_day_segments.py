@@ -281,6 +281,61 @@ def test_terminated_reason_in_ready_is_interrupted(tmp_path):
     assert entry["end_status"] == "interrupted"
 
 
+def test_disk_full_alone_in_ready_is_interrupted(tmp_path):
+    """session.py sets `disk_full` on its OWN detection path, independent of the
+    engine's `terminated_reason` — a disk-full death must never classify clean."""
+    rec = tmp_path / "diskfull-only"
+    _make_recording_db(
+        rec, started=_DAY_START + 3600, end=_DAY_START + 4200,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    _write_start_metrics(rec, end={"ts": 2})
+    # disk_full=True with terminated_reason null and force_stopped absent.
+    (rec / ".recording_ready").write_text(json.dumps({
+        "elapsed": 600.0,
+        "completed_at": _DAY_START + 4200,
+        "disk_full": True,
+        "terminated_reason": None,
+    }))
+    entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "diskfull-only")
+    assert entry is not None
+    assert entry["end_status"] == "interrupted"
+
+
+def _write_stop_meta(rec_dir: Path, **payload) -> None:
+    """Write the engine's `.recording_stop_meta.json` sidecar (no ready sentinel)."""
+    (rec_dir / ".recording_stop_meta.json").write_text(json.dumps(payload))
+
+
+def test_stop_meta_terminated_reason_without_ready_is_interrupted(tmp_path):
+    """Stop-meta-only path: `.recording_stop_meta.json` records an abnormal
+    termination and no `.recording_ready` exists — still `interrupted` (and for
+    the right reason: the start marker is complete, so it isn't the null-end path)."""
+    rec = tmp_path / "stopmeta-sigterm"
+    _make_recording_db(
+        rec, started=_DAY_START + 3600, end=_DAY_START + 4200,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    _write_start_metrics(rec, end={"ts": 2})
+    _write_stop_meta(rec, terminated_reason="sigterm")
+    entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "stopmeta-sigterm")
+    assert entry is not None
+    assert entry["end_status"] == "interrupted"
+
+
+def test_stop_meta_force_stopped_without_ready_is_interrupted(tmp_path):
+    rec = tmp_path / "stopmeta-forced"
+    _make_recording_db(
+        rec, started=_DAY_START + 3600, end=_DAY_START + 4200,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    _write_start_metrics(rec, end={"ts": 2})
+    _write_stop_meta(rec, terminated_reason=None, force_stopped=True)
+    entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "stopmeta-forced")
+    assert entry is not None
+    assert entry["end_status"] == "interrupted"
+
+
 def test_live_recording_is_live_never_interrupted(tmp_path, monkeypatch):
     """A live recording has the start-phase marker with `end: null` and no ready
     sentinel — exactly the interrupted signature — but `state == "recording"`
@@ -407,7 +462,7 @@ def test_locked_store_signalled_and_yields_no_recordings(tmp_path):
 
 
 def _add_purged_interval(rec_dir: Path, start: float, end: float | None,
-                         disabled_at: float | None) -> None:
+                         disabled_at: float | str | None) -> None:
     with contextlib.closing(sqlite3.connect(str(rec_dir / "recording.db"))) as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS purged_interval ("
@@ -516,6 +571,44 @@ def test_unreadable_disable_log_yields_identity_free_purges(tmp_path):
     assert len(entry["purged"]) == 1
     p = entry["purged"][0]
     assert "bundle_id" not in p and "app_name" not in p
+
+
+def test_text_disabled_at_yields_identity_free_purge_never_500(tmp_path):
+    """SQLite REAL affinity can store TEXT in `disabled_at`; a corrupt value must
+    degrade the span to identity-free — never raise out of the read surface."""
+    rec = tmp_path / "purged-text-ts"
+    _make_recording_db(
+        rec, started=_DAY_START + 3600, end=_DAY_START + 4800,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    _add_purged_interval(rec, _DAY_START + 3700, _DAY_START + 3900, "corrupt")
+    _write_disable_log(rec, [_disable_entry(_DAY_START + 5000.0)])
+
+    entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "purged-text-ts")
+    assert entry is not None
+    assert len(entry["purged"]) == 1
+    p = entry["purged"][0]
+    assert "bundle_id" not in p and "app_name" not in p and "root_domain" not in p
+
+
+def test_non_string_identity_values_are_dropped(tmp_path):
+    """A valid log line whose target carries a non-string value keeps only the
+    string fields — a non-str identity value must never reach the wire payload."""
+    rec = tmp_path / "purged-nonstr"
+    disabled_at = _DAY_START + 5000.0
+    _make_recording_db(
+        rec, started=_DAY_START + 3600, end=_DAY_START + 4800,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    _add_purged_interval(rec, _DAY_START + 3700, _DAY_START + 3900, disabled_at)
+    _write_disable_log(rec, [_disable_entry(disabled_at, bundle_id="com.x", app_name=42)])
+
+    entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "purged-nonstr")
+    assert entry is not None
+    assert len(entry["purged"]) == 1
+    p = entry["purged"][0]
+    assert p["bundle_id"] == "com.x"
+    assert "app_name" not in p
 
 
 # --- daemon verb -----------------------------------------------------------

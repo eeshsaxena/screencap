@@ -219,7 +219,7 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         XCTAssertTrue(items.contains { $0.swatch == .task && $0.text == "task" })
         XCTAssertTrue(items.contains { $0.swatch == .unsplit && $0.text == "recorded — searchable" })
         XCTAssertTrue(items.contains {
-            $0.swatch == .nothingCaptured && $0.text == "nothing on file — hover for why"
+            $0.swatch == .nothingCaptured && $0.text == "empty — hover for why"
         })
         XCTAssertTrue(items.contains { $0.swatch == .searchMatch && $0.text == "search match" })
         XCTAssertTrue(items.contains { $0.swatch == .blocked && $0.text == "blocked at capture" })
