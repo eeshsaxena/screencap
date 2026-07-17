@@ -68,6 +68,86 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         XCTAssertTrue(resp.recordings[0].tasks.isEmpty, "absent `tasks` → empty, not an error")
     }
 
+    // MARK: - Decoding the additive provenance fields (v3)
+
+    /// A v3 `timeline.day` recording carries `end_status` + `purged` spans, and
+    /// the envelope carries `store_mounted`.
+    func testTimelineDayDecodesProvenanceFields() throws {
+        let json = """
+        {
+          "ok": true, "schema_version": 1, "daemon_version": "0.0.0",
+          "api_schema_version": 3, "date": "2026-07-13",
+          "store_mounted": false,
+          "recordings": [
+            {
+              "name": "rec-a", "recording_id": "id-a", "state": "ready",
+              "start_ms": 100000, "end_ms": 400000,
+              "blocked_proven": [], "unverifiable": [],
+              "end_status": "interrupted",
+              "purged": [
+                {"start_ms": 120000, "end_ms": 150000,
+                 "bundle_id": "com.1password.1password", "app_name": "1Password",
+                 "root_domain": null},
+                {"start_ms": 200000, "end_ms": 210000,
+                 "bundle_id": null, "app_name": null, "root_domain": "chase.com"}
+              ]
+            }
+          ]
+        }
+        """
+        let resp = try JSONDecoder().decode(TimelineDayResponse.self, from: Data(json.utf8))
+        XCTAssertFalse(resp.storeMounted)
+        let rec = resp.recordings[0]
+        XCTAssertEqual(rec.endStatus, "interrupted")
+        XCTAssertEqual(rec.purged.count, 2)
+        XCTAssertEqual(rec.purged[0].startMs, 120_000)
+        XCTAssertEqual(rec.purged[0].endMs, 150_000)
+        XCTAssertEqual(rec.purged[0].bundleId, "com.1password.1password")
+        XCTAssertEqual(rec.purged[0].appName, "1Password")
+        XCTAssertNil(rec.purged[0].rootDomain)
+        XCTAssertNil(rec.purged[1].bundleId)
+        XCTAssertEqual(rec.purged[1].rootDomain, "chase.com")
+    }
+
+    /// An older daemon (pre-v3 `timeline.day`) omits `end_status`, `purged`,
+    /// and `store_mounted` entirely — absence is unknown provenance, never a
+    /// decode error: nil endStatus, empty purged, storeMounted true.
+    func testTimelineDayDecodesWithoutProvenanceFieldsFromOlderDaemon() throws {
+        let json = """
+        {
+          "ok": true, "schema_version": 1, "daemon_version": "0.0.0",
+          "api_schema_version": 2, "date": "2026-07-13",
+          "recordings": [
+            {
+              "name": "rec-legacy", "recording_id": null, "state": "ready",
+              "start_ms": 100000, "end_ms": 200000,
+              "blocked_proven": [], "unverifiable": []
+            }
+          ]
+        }
+        """
+        let resp = try JSONDecoder().decode(TimelineDayResponse.self, from: Data(json.utf8))
+        XCTAssertTrue(resp.storeMounted, "absent `store_mounted` → true, not an error")
+        let rec = resp.recordings[0]
+        XCTAssertNil(rec.endStatus, "absent `end_status` → nil (unknown), not an error")
+        XCTAssertTrue(rec.purged.isEmpty, "absent `purged` → empty, not an error")
+    }
+
+    /// A purged span whose identity keys are all explicit JSON null decodes
+    /// identity-free rather than failing.
+    func testPurgedIntervalWithNullIdentityKeysDecodesIdentityFree() throws {
+        let json = """
+        {"start_ms": 1000, "end_ms": 2000,
+         "bundle_id": null, "app_name": null, "root_domain": null}
+        """
+        let span = try JSONDecoder().decode(DayPurgedInterval.self, from: Data(json.utf8))
+        XCTAssertEqual(span.startMs, 1000)
+        XCTAssertEqual(span.endMs, 2000)
+        XCTAssertNil(span.bundleId)
+        XCTAssertNil(span.appName)
+        XCTAssertNil(span.rootDomain)
+    }
+
     // MARK: - N tasks → N bands over the base track
 
     /// Each recording contributes one band per task, with `start_ts`/`end_ts`
