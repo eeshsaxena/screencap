@@ -216,6 +216,10 @@ def run_heuristic_pipeline(
                 # only the tail digests need rebuilding.
                 digests = digests[: len(prefix)] + _digests(tail)
 
+    # SCR-278 (R10): the prior COMMITTED names, for carrying a halt-degraded
+    # uncached window's shown name forward instead of flapping it to task_N.
+    committed = _committed_named_spans(recording_dir)
+
     # Per-window loop: cache lookup → naming call (with context-window
     # halving) → cache write; budget + stop checks between calls (KTD-7).
     n_windows = len(all_windows)
@@ -231,6 +235,7 @@ def run_heuristic_pipeline(
 
         name: str | None = None
         category: str | None = None
+        carried: tuple[str, str | None] | None = None
         if digest.usable and ledger is not None:
             hit = ledger.lookup_window_name(
                 w.start_ts, w.end_ts, digest.digest_hash,
@@ -245,6 +250,12 @@ def run_heuristic_pipeline(
             halt = _halt_reason(stop_event, deadline)
             if halt is not None:
                 failure_reasons.append(halt)
+                # SCR-278 (R10): a halt (quiesce / budget) blocked the model
+                # call for this uncached window THIS pass. If a prior committed
+                # pass already named the span, carry that shown name forward
+                # instead of flapping it to task_N; the next unhalted tick
+                # re-names it fresh (cache miss → model call).
+                carried = _carried_committed_name(committed, w.start_ts, w.end_ts)
             else:
                 log.info(
                     "ondevice pipeline: naming window %d/%d", i + 1, n_windows,
@@ -271,6 +282,8 @@ def run_heuristic_pipeline(
         if name is not None:
             model_named += 1
             tasks.append(_model_task(w, digest, name, category))
+        elif carried is not None:
+            tasks.append(_carried_task(w, carried[0], carried[1]))
         else:
             tasks.append(_mechanical_task(w, i))
 
@@ -356,8 +369,17 @@ def _split_pinned(
     return prefix, tail
 
 
-def _committed_agent_spans(recording_dir: Path) -> list[tuple[float, float]]:
-    """The recording's committed unedited-agent task spans, sorted (KTD-6)."""
+def _committed_named_spans(
+    recording_dir: Path,
+) -> list[tuple[float, float, str, str | None]]:
+    """Committed unedited-agent ``(start, end, name, category)``, sorted (KTD-6).
+
+    The spans a prior pass persisted and the user has not curated — the memo the
+    SCR-278 carry-forward reuses so a halt never flaps a shown name to
+    ``task_N`` (R10), and the source :func:`_committed_agent_spans` projects for
+    live-pass pinning. Fails open (``[]``) on any read error: no pinning and no
+    carry-forward is the safe direction (the naming cache still stabilizes).
+    """
     try:
         from screencap.pipeline_state import TASK_SOURCE_AGENT, PipelineLedger
 
@@ -366,13 +388,48 @@ def _committed_agent_spans(recording_dir: Path) -> list[tuple[float, float]]:
             return []
         rows = PipelineLedger(db_path).read_task_segments()
         return sorted(
-            (r.start_ts, r.end_ts)
-            for r in rows
-            if r.source == TASK_SOURCE_AGENT and not r.edited
+            (
+                (r.start_ts, r.end_ts, r.name, r.category)
+                for r in rows
+                if r.source == TASK_SOURCE_AGENT and not r.edited
+            ),
+            key=lambda s: (s[0], s[1]),
         )
-    except Exception:  # noqa: BLE001 — pinning must fail open, never gate
-        log.debug("_committed_agent_spans failed open", exc_info=True)
+    except Exception:  # noqa: BLE001 — pinning/carry-forward must fail open, never gate
+        log.debug("_committed_named_spans failed open", exc_info=True)
         return []
+
+
+def _committed_agent_spans(recording_dir: Path) -> list[tuple[float, float]]:
+    """The recording's committed unedited-agent task spans, sorted (KTD-6)."""
+    return [(s, e) for s, e, _name, _category in _committed_named_spans(recording_dir)]
+
+
+def _carried_committed_name(
+    committed: list[tuple[float, float, str, str | None]],
+    start_ts: float,
+    end_ts: float,
+) -> tuple[str, str | None] | None:
+    """The committed ``(name, category)`` whose span best overlaps a window (SCR-278).
+
+    ``None`` when no committed span overlaps ``[start_ts, end_ts]`` — a
+    genuinely new window keeps its mechanical ``task_N`` name. Otherwise the
+    max-overlap committed row wins (the grown trailing window overlaps the prior
+    committed span it extends), so a halt-degraded uncached window reuses the
+    name it already showed instead of flapping to ``task_N`` (R10). A row with
+    an empty name (a corrupt / legacy write) is skipped so the fallback stays
+    ``task_N`` rather than a blank label.
+    """
+    best: tuple[str, str | None] | None = None
+    best_overlap = 0.0
+    for s, e, name, category in committed:
+        if not name:
+            continue
+        overlap = min(end_ts, e) - max(start_ts, s)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = (name, category)
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +610,33 @@ def _mechanical_task(w: CandidateWindow, i: int) -> dict:
         "event_count": w.event_count,
         "source": SOURCE_MECHANICAL,
     }
+
+
+def _carried_task(
+    w: CandidateWindow, name: str, category: str | None,
+) -> dict:
+    """A halt-degraded window reusing its committed name (SCR-278 / R10).
+
+    A window that a prior COMMITTED pass named but that is uncached (the live
+    trailing window) and went mechanical THIS pass ONLY because a halt (quiesce
+    / budget) blocked the model call reuses its shown name instead of flapping
+    to ``task_N``. Provenance stays :data:`SOURCE_MECHANICAL` — no model call
+    ran this pass, and the ledger does not record whether the carried name was
+    itself model- or mechanically-derived — so the U6 honesty seam never
+    over-claims a model naming it cannot verify. The next unhalted tick re-names
+    the window fresh (cache miss → model call).
+    """
+    task = {
+        "start_ts": float(w.start_ts),
+        "end_ts": float(w.end_ts),
+        "name": name,
+        "derived_name": _slugify(name),
+        "event_count": w.event_count,
+        "source": SOURCE_MECHANICAL,
+    }
+    if category:
+        task["category"] = category
+    return task
 
 
 def _day_summary(
