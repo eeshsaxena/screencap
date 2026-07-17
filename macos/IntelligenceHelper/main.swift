@@ -132,11 +132,18 @@ lowercase-hyphenated tags for the whole session.
 // `segmentation/generation_finish.py` (KTD3) — the two copies drive on-device
 // and cloud answers with the same "answer only from the evidence" framing, and
 // there is no shared validator to mask drift, so keep them in sync.
+// Mirror of generation_finish._GROUNDING_INSTRUCTIONS (Python). Keep the two in
+// sync — there is no shared validator to mask drift. The recap steering (SCR:
+// timeline-title day-recaps) is the primary faithfulness lever now that the recap
+// path has no runtime attribution gate.
 let answerInstructions = """
 You are answering a question about the user's own recorded computer activity, \
 using ONLY the evidence provided. Ground every claim in that evidence. If the \
 evidence does not contain enough to answer, say so plainly and briefly — do not \
-guess, invent, or draw on outside knowledge. Keep the answer concise.
+guess, invent, or draw on outside knowledge. When the evidence is a timeline of \
+apps and window titles, summarize what the user was doing in your own words, but \
+name only the apps, sites, and durations that appear in the evidence — never \
+invent an app, site, or number. Keep the answer concise.
 """
 
 // Short verb-specific instructions for the window-scoped verbs (SCR-275,

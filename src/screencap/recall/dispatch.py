@@ -59,11 +59,13 @@ from pathlib import Path
 from typing import Callable
 
 from screencap.recall.attribution import validate_attribution
+from screencap.content_index import IndexState
 from screencap.recall.orchestrator import (
     CoverageDescriptor,
     EvidenceBundle,
     EvidencePointer,
     QuestionKind,
+    Stream,
 )
 from screencap.segmentation.consent import (
     ConsentPolicy,
@@ -90,6 +92,16 @@ logger = logging.getLogger(__name__)
 # model's answer. Its phrasing is a refusal marker (see attribution.is_refusal) so a
 # re-validation of the refusal itself passes.
 REFUSAL_TEXT = "I don't have that in your recorded history."
+
+# The refusal surfaced when evidence WAS found but no answer could be produced (an
+# attribution rejection on the strict path, a model self-refusal over a non-empty
+# bundle, or no backend with evidence present). Distinct from REFUSAL_TEXT so the
+# user is never told their history is missing when activity was actually found
+# (KTD3/R5). Its phrasing is a refusal marker (attribution._REFUSAL_MARKERS carries
+# "put together an answer") so a re-validation of it passes.
+REFUSAL_TEXT_FOUND_NO_ANSWER = (
+    "I found activity from that time but couldn't put together an answer for it."
+)
 
 # Refusal reasons (U2) — a distinct code per refusal BRANCH so the client can render
 # the honest state instead of collapsing every refusal into "not in your history":
@@ -349,15 +361,62 @@ def _default_answer_fn(question: str, evidence: Evidence) -> str | ProviderUnava
 def _refusal(
     bundle: EvidenceBundle, target: ExecutionTarget, *, reason: str
 ) -> ChatAnswer:
-    """A canonical refusal ChatAnswer — no sources, no leak, tagged with WHY."""
+    """A canonical refusal ChatAnswer — no sources, no leak, tagged with WHY.
+
+    The message is chosen on whether evidence was actually found, NOT on ``reason``
+    (KTD3/R5). ``REASON_NO_EVIDENCE`` is overloaded — it fires both for a genuinely
+    empty bundle (step 2) and for a model self-refusal over a NON-empty bundle
+    (step 8) — so keying the empty-history string on the reason code alone would
+    wrongly tell the user "not in your recorded history" after activity WAS found.
+    The empty-history string is reserved for a genuinely empty bundle; every other
+    refusal surfaces the found-but-unanswerable string.
+    """
+    bundle_empty = not bundle.evidence and bundle.figures is None
+    answer = REFUSAL_TEXT if bundle_empty else REFUSAL_TEXT_FOUND_NO_ANSWER
     return ChatAnswer(
-        answer=REFUSAL_TEXT,
+        answer=answer,
         sources=[],
         coverage=bundle.coverage,
         target=target,
         refusal=True,
         question_kind=bundle.question_kind,
         reason=reason,
+    )
+
+
+# The IndexState per-stream values that mean a stream ACTUALLY served results (ran a
+# search and either matched or honestly returned nothing) — as opposed to
+# not_indexed / store_unavailable / index_degraded, which mean the stream could not
+# be served. Load-bearing for the recap predicate below (content_index defaults OFF).
+_STREAM_SERVED = frozenset({IndexState.OK.value, IndexState.NO_MATCH.value})
+
+
+def _is_recap_bundle(bundle: EvidenceBundle) -> bool:
+    """True when ``bundle`` is a day-recap that gets the SOFTENED attribution gate
+    (KTD1). Two shapes qualify:
+
+    * an AGGREGATE bundle carrying no content/transcript evidence items (its figures
+      are a timeline summary), or
+    * a non-empty bundle whose every evidence item is ``Stream.TIMELINE`` AND whose
+      content AND transcript streams were actually searched (coverage ``ok`` /
+      ``no_match``), not merely un-indexed.
+
+    The coverage guard is load-bearing: ``content_index_enabled`` defaults OFF, so a
+    timeline-only bundle usually means "content was never searched", not "this is a
+    recap". Without the guard the softened gate would swallow ordinary point lookups
+    and silently disable the strict validator (R2/AE2). Genuine recaps whose content
+    stream is un-indexed are still routed here by the AGGREGATE classifier arm.
+    """
+    evidence = bundle.evidence
+    has_non_timeline = any(item.stream is not Stream.TIMELINE for item in evidence)
+    if bundle.question_kind is QuestionKind.AGGREGATE:
+        return not has_non_timeline
+    if not evidence or has_non_timeline:
+        return False
+    per_stream = bundle.coverage.per_stream
+    return all(
+        per_stream.get(stream) in _STREAM_SERVED
+        for stream in (Stream.CONTENT.value, Stream.TRANSCRIPT.value)
     )
 
 
@@ -589,9 +648,14 @@ def answer_from_bundle(
 
     model_answer = result
 
-    # --- 7. Answer-side attribution: a failing verdict is a safe refusal. -------
+    # --- 7. Answer-side attribution: a failing verdict is a safe refusal on the
+    # strict (content-lookup) path. On a recap bundle the gate is SOFTENED (KTD2):
+    # the model's grounded-but-paraphrased narrative is surfaced even when the v1
+    # heuristics (verbatim-number, token-overlap) reject it — those heuristics are
+    # unsatisfiable for a day-recap over sparse timeline titles. verdict.sources
+    # still backs the answer, and the model-refusal passthrough below still fires.
     verdict = validate_attribution(model_answer, bundle, question=question)
-    if not verdict.ok:
+    if not verdict.ok and not _is_recap_bundle(bundle):
         logger.info("recall dispatch: attribution rejected the answer (%s); refusing",
                     verdict.reason)
         return _refusal(bundle, reporting_target, reason=REASON_UNSUPPORTED)

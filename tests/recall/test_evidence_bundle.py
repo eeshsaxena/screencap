@@ -146,6 +146,16 @@ def _make_recording_with_masked_window(
         "what did I do yesterday",
         "what did I work on this week",
         "walk me through my afternoon",
+        # "what I did" word order (the phrasing the original cue set missed — the
+        # user's reported bug) and everyday recap openers.
+        "what I did today?",
+        "what I did today",
+        "what have I done today",
+        "what did I get done",
+        "what was I working on",
+        "my day",
+        "catch me up",
+        "today's summary",
     ],
 )
 def test_aggregate_questions_classify_aggregate(question):

@@ -67,6 +67,7 @@ _REFUSAL_MARKERS = (
     "can't answer that",
     "cannot answer that",
     "unable to answer",
+    "put together an answer",  # the found-but-unanswerable refusal (dispatch KTD3/R5)
 )
 
 
