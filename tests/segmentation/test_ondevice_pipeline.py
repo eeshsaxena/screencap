@@ -714,6 +714,111 @@ def test_scrub_fails_open_when_cache_tables_absent(tmp_path):
     assert entry["scrub_status"] == "completed"
 
 
+def _seed_spotify_target(db_path: Path) -> None:
+    """Insert benign → Spotify → benign window events → target interval [1300, 1400)."""
+    conn = sqlite3.connect(str(db_path))
+    for ts, bundle in ((1200.0, "com.apple.dt.Xcode"),
+                       (1300.0, "com.spotify.client"),
+                       (1400.0, "com.apple.dt.Xcode")):
+        conn.execute(
+            "INSERT INTO window_event (recording_id, timestamp, "
+            "recording_timestamp, app_bundle_id, app_name, title) "
+            "VALUES (1, ?, ?, ?, ?, ?)",
+            (ts, ts, bundle, bundle.split(".")[-1], "t"),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _segment_rows(db_path: Path) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT name, source, edited FROM pipeline_task_segments "
+            "ORDER BY start_ts"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_scrub_purges_overlapping_task_segments_preserving_user_and_edited(tmp_path):
+    """SCR-280: a retroactive disable drops AGENT task rows (and tasks.json
+    entries) whose span overlaps the scrubbed interval, but PRESERVES
+    ``source='user'`` and user-edited rows — the ledger's protection predicate."""
+    from screencap.enforcement.scrub_worker import ScrubWorker
+    from screencap.pipeline_state import TaskSegmentRow
+
+    rec = _make_rec(tmp_path)
+    ledger = rec.ledger()
+    # Three agent rows: before / overlapping / after the target interval, plus a
+    # fourth agent row we will mark edited so it moves into the protected range.
+    ledger.replace_task_segments([
+        TaskSegmentRow(task_index=0, start_ts=1000.0, end_ts=1100.0, name="Before"),
+        TaskSegmentRow(task_index=1, start_ts=1290.0, end_ts=1350.0, name="Overlapping"),
+        TaskSegmentRow(task_index=2, start_ts=1500.0, end_ts=1600.0, name="After"),
+        TaskSegmentRow(task_index=3, start_ts=1310.0, end_ts=1330.0, name="Edited"),
+    ])
+    # A user row overlapping the target — must survive.
+    ledger.insert_task_segment(
+        TaskSegmentRow(task_index=0, start_ts=1300.0, end_ts=1400.0, name="User Task")
+    )
+    # Re-home the "Edited" agent row into the protected HIGH range (edited=1).
+    ledger.update_task_segment(3, mark_edited=True)
+
+    # tasks.json mirror: agent Overlapping (dropped) + agent Before (kept) +
+    # a user entry overlapping the target (kept).
+    (rec.dir / "tasks.json").write_text(json.dumps({"tasks": [
+        {"name": "Before", "start_ts": 1000.0, "end_ts": 1100.0,
+         "source": "agent", "edited": False},
+        {"name": "Overlapping", "start_ts": 1290.0, "end_ts": 1350.0,
+         "source": "agent", "edited": False},
+        {"name": "User Task", "start_ts": 1300.0, "end_ts": 1400.0,
+         "source": "user", "edited": False},
+    ]}))
+
+    _seed_spotify_target(rec.db_path)
+
+    worker = ScrubWorker(
+        disable_q=None, recording_db_path=rec.db_path, capture_dir=rec.dir,
+    )
+    entry = worker._handle({
+        "kind": "app", "bundle_id": "com.spotify.client", "app_name": "Spotify",
+        "root_domain": None, "ts_unix": 2000.0, "source": "menubar",
+    })
+    assert entry["scrub_status"] == "completed"
+
+    # Ledger: only the unedited agent "Overlapping" row is gone.
+    names = {name for name, _, _ in _segment_rows(rec.db_path)}
+    assert names == {"Before", "After", "Edited", "User Task"}
+
+    # tasks.json: the overlapping agent entry is dropped; the agent Before entry
+    # and the protected user entry survive.
+    kept = json.loads((rec.dir / "tasks.json").read_text())["tasks"]
+    assert [t["name"] for t in kept] == ["Before", "User Task"]
+
+
+def test_scrub_task_segment_purge_fails_open_when_table_absent(tmp_path):
+    """SCR-280: a pre-U4 recording.db with no pipeline_task_segments table still
+    completes the scrub (fail-open, mirroring the on-device cache purge)."""
+    from screencap.enforcement.scrub_worker import ScrubWorker
+
+    rec = _make_rec(tmp_path)
+    conn = sqlite3.connect(str(rec.db_path))
+    conn.execute("DROP TABLE pipeline_task_segments")
+    conn.commit()
+    conn.close()
+    _seed_spotify_target(rec.db_path)
+
+    worker = ScrubWorker(
+        disable_q=None, recording_db_path=rec.db_path, capture_dir=rec.dir,
+    )
+    entry = worker._handle({
+        "kind": "app", "bundle_id": "com.spotify.client", "app_name": "Spotify",
+        "root_domain": None, "ts_unix": 2000.0, "source": "menubar",
+    })
+    assert entry["scrub_status"] == "completed"
+
+
 def _bump_generation(db_path: Path) -> None:
     """Simulate a concurrent scrub committing between naming calls."""
     from screencap.pipeline_state import bump_scrub_generation

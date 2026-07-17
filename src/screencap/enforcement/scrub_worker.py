@@ -82,6 +82,8 @@ _EMPTY_COUNTS: dict[str, int] = {
     "matched_timestamps": 0,
     "orphan_action_events": 0,
     "ondevice_window_names": 0,
+    "task_segments": 0,
+    "tasks_json_entries": 0,
 }
 
 
@@ -140,6 +142,59 @@ def _purge_ondevice_window_names(
     except Exception:
         logger.warning(
             "on-device name-cache purge failed (non-fatal)", exc_info=True
+        )
+        return 0
+
+
+def _purge_task_segments(
+    cur: sqlite3.Cursor,
+    conn: sqlite3.Connection,
+    intervals: list[tuple[float, float]],
+) -> int:
+    """Purge AGENT-owned ``pipeline_task_segments`` rows overlapping ``intervals``
+    (SCR-280) — INSIDE the caller's transaction.
+
+    A task ``name`` derives from the window titles this scrub deletes, so a task
+    whose ``[start_ts, end_ts]`` span overlaps a scrubbed interval is a derived
+    artifact under the same R7 lifecycle rule as the on-device name cache and the
+    content index. Deletes ONLY agent-owned rows (``source='agent' AND edited=0``
+    — the LOW range) so ``source='user'`` and user-edited rows are PRESERVED,
+    mirroring ``PipelineLedger.replace_task_segments``'s protection predicate; the
+    next segmentation pass regenerates names from the post-scrub rows.
+
+    Runs on the scrub's OWN connection/cursor inside its existing
+    ``BEGIN IMMEDIATE`` transaction (same ``recording.db``), so the source-row
+    deletes and this purge commit as one atom. Bounds are second-widened (floor
+    start / ceil end; ``inf`` end → open-ended), matching the on-device cache
+    purge, so a task whose span was rounded can't survive at a sub-second
+    boundary. Existence-guarded (a pre-U4 ``recording.db`` has no table) and any
+    failure is swallowed per the worker's fail-open discipline.
+    """
+    try:
+        from screencap.recording_db import has_table
+
+        if not has_table(conn, "pipeline_task_segments"):
+            return 0
+        before = conn.total_changes
+        for start, end in intervals:
+            lo = math.floor(start)
+            if end == float("inf"):
+                cur.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    "WHERE source='agent' AND edited=0 AND end_ts > ?",
+                    (lo,),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM pipeline_task_segments "
+                    "WHERE source='agent' AND edited=0 "
+                    "AND end_ts > ? AND start_ts < ?",
+                    (lo, math.ceil(end)),
+                )
+        return conn.total_changes - before
+    except Exception:
+        logger.warning(
+            "task-segment purge failed (non-fatal)", exc_info=True
         )
         return 0
 
@@ -654,6 +709,15 @@ class ScrubWorker:
                     cur, conn, intervals,
                 )
 
+                # SCR-280: purge AGENT task-segment rows (in tasks.json's
+                # structured sibling) whose spans overlap the scrubbed intervals,
+                # in this SAME transaction — a name derived from a now-deleted
+                # window title must not survive in the Journal. User / edited rows
+                # are preserved (the ledger's protection predicate).
+                counts["task_segments"] = _purge_task_segments(
+                    cur, conn, intervals,
+                )
+
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -680,6 +744,14 @@ class ScrubWorker:
             # retroactively-disabled on-screen text can no longer be found via
             # search (the R7 lifecycle hole reached through the async path).
             self._purge_content_index_intervals(intervals)
+
+            # SCR-280: mirror the ledger task-segment purge in the human-readable
+            # tasks.json file (post-commit, fail-open — it is a file, not part of
+            # the DB transaction). The ledger row purge above is authoritative for
+            # the Journal; this keeps the co-located JSON artifact consistent.
+            counts["tasks_json_entries"] = self._purge_tasks_json_intervals(
+                intervals,
+            )
 
             return counts
         finally:
@@ -732,3 +804,81 @@ class ScrubWorker:
             logger.warning(
                 "content-index interval purge failed (non-fatal)", exc_info=True
             )
+
+    def _purge_tasks_json_intervals(
+        self, intervals: list[tuple[float, float]],
+    ) -> int:
+        """Drop AGENT ``tasks.json`` entries overlapping ``intervals`` (SCR-280).
+
+        The ``tasks.json`` mirror of the ledger task-segment purge: a rewrite that
+        drops agent-derived entries whose ``[start_ts, end_ts]`` overlaps a
+        scrubbed interval while carrying forward ``source='user'`` / edited
+        entries — the same protection ``terminal_stage._persist_local_tasks``
+        applies when it re-writes the file. ``tasks.json`` is local-only (excluded
+        from ``upload.list_recording_files``), so this is at-rest remanence, not a
+        cloud exposure.
+
+        Intervals are second-widened (floor start / ceil end; ``inf`` →
+        open-ended) to match the ledger + content-index purges. Best-effort: a
+        missing / torn / legacy or non-dict file is left untouched (the ledger row
+        purge is authoritative), the write is atomic (tmp + replace), and any
+        failure is swallowed — it must never raise into the disable job.
+        Returns the number of entries removed.
+        """
+        if not intervals:
+            return 0
+        path = self._capture_dir / "tasks.json"
+        if not path.exists():
+            return 0
+        try:
+            import json
+
+            # Same protection predicate the terminal-stage writer uses, imported
+            # (not re-spelled) so the two can't drift on what "user-owned" means.
+            from screencap.pipeline_state import TASK_SOURCE_USER
+
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                return 0
+            tasks = data.get("tasks")
+            if not isinstance(tasks, list):
+                return 0
+
+            # Pre-widen the intervals once (floor start / ceil end).
+            widened = [
+                (math.floor(s), None if e == float("inf") else math.ceil(e))
+                for s, e in intervals
+            ]
+
+            def _overlaps_scrubbed(t: dict) -> bool:
+                try:
+                    start = float(t.get("start_ts", 0.0))
+                    end = float(t.get("end_ts", 0.0))
+                except (TypeError, ValueError):
+                    return False  # malformed span → don't treat as overlapping
+                return any(
+                    end > lo and (hi is None or start < hi)
+                    for lo, hi in widened
+                )
+
+            kept = [
+                t for t in tasks
+                if not isinstance(t, dict)
+                # Preserve user / edited entries (the ledger's predicate).
+                or t.get("source") == TASK_SOURCE_USER
+                or t.get("edited")
+                or not _overlaps_scrubbed(t)
+            ]
+            removed = len(tasks) - len(kept)
+            if removed == 0:
+                return 0
+            data["tasks"] = kept
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(data, indent=2))
+            tmp_path.replace(path)
+            return removed
+        except Exception:
+            logger.warning(
+                "tasks.json interval purge failed (non-fatal)", exc_info=True
+            )
+            return 0
