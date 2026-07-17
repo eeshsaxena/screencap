@@ -5,17 +5,34 @@
 // Contract (must match the Python side's IPC envelope):
 //   • stdin  — one JSON object. A top-level `"task"` key selects the path
 //     (absent / "segment" → segmentation; "answer" → free-form recall-answer,
-//     SCR-243). For segmentation the object IS the privacy-STRIPPED activity
-//     summary (`build_activity_summary`'s `summary` sub-dict; ALLOW-only). For
-//     the answer path it is `{"task":"answer","prompt":…,"evidence":…}` where
-//     `evidence` is already privacy-stripped text.
+//     SCR-243; "arbitrate" / "name-window" / "day-summary" → the window-scoped
+//     verbs, SCR-275). For segmentation the object IS the privacy-STRIPPED
+//     activity summary (`build_activity_summary`'s `summary` sub-dict;
+//     ALLOW-only). For the answer path it is
+//     `{"task":"answer","prompt":…,"evidence":…}` where `evidence` is already
+//     privacy-stripped text. The windowed verbs take
+//     `{"task":"arbitrate","windows":[{"i":0,"line":…},…]}`,
+//     `{"task":"name-window","digest":{…}}`, and
+//     `{"task":"day-summary","tasks":[{"name":…,"category":…,"minutes":…},…]}`
+//     — every payload string privacy-stripped by Python before it reaches
+//     stdin.
 //   • stdout — exactly one JSON object:
 //        {"status":"ok","result":{ tasks…, summary…, tags… }}   (segmentation)
 //        {"status":"ok","result":"<answer text>"}                (recall-answer)
+//        {"status":"ok","result":{"merges":[[…],…]}}             (arbitrate)
+//        {"status":"ok","result":{"name":…,"category":…}}        (name-window)
+//        {"status":"ok","result":{"overview":…,"tags":[…]}}      (day-summary)
 //        {"status":"unavailable","reason":"<why>"}
-//     The `result` shape mirrors `segmentation/schema.py::_RESPONSE_SCHEMA`;
-//     Python runs it through the shared `validate_llm_tasks` repair/reject net,
-//     so this helper does not need to clamp/validate timestamps itself.
+//     The segmentation `result` shape mirrors
+//     `segmentation/schema.py::_RESPONSE_SCHEMA`; Python runs it through the
+//     shared `validate_llm_tasks` repair/reject net, so this helper does not
+//     need to clamp/validate timestamps itself.
+//     Unavailable reasons are semantic (KTD-3): `model-unavailable-*` for the
+//     availability gate; `context-window` / `guardrail` / `refusal` /
+//     `rate-limited` / `decoding-failure` / `unsupported` / `respond-failed`
+//     for a failed respond call on any guided verb; `bad-request` for a
+//     malformed windowed-verb payload (missing fields / wrong types — never a
+//     crash).
 //   • exit 0 in both the ok and unavailable cases (Python routes on the
 //     envelope `status`, not the exit code). A non-zero exit / crash / hang is
 //     ALSO treated as unavailable by Python — so any unexpected failure here
@@ -122,6 +139,31 @@ evidence does not contain enough to answer, say so plainly and briefly — do no
 guess, invent, or draw on outside knowledge. Keep the answer concise.
 """
 
+// Short verb-specific instructions for the window-scoped verbs (SCR-275,
+// KTD-2/KTD-9): each spawn is one fresh session + one respond call, so each
+// instruction covers exactly one bounded decision.
+
+let arbitrateInstructions = """
+You are reviewing candidate activity windows from a screen recording, listed \
+one per line as "index: digest". Adjacent windows that belong to the same \
+unit of work should be merged. Return groups of contiguous window indices to \
+merge, each group in ascending order; return no groups if every boundary is a \
+genuine task switch.
+"""
+
+let nameWindowInstructions = """
+You are naming one window of computer activity from a screen recording. From \
+the digest, give the task a 2-3 word name capturing the user's intent (not \
+the app name) and a category: development, communication, research, admin, \
+creative, or other.
+"""
+
+let daySummaryInstructions = """
+You are summarizing a day of computer activity. Given the tasks the user \
+performed with their categories and durations, write a 1-2 sentence overview \
+of the session and 3-8 lowercase-hyphenated tags.
+"""
+
 // MARK: - Foundation Models path (macOS 26+, guided generation)
 
 #if canImport(FoundationModels)
@@ -193,6 +235,36 @@ func resultDict(from seg: GenSegmentation) -> [String: Any] {
     return ["tasks": tasks, "summary": summary, "tags": seg.tags]
 }
 
+/// Map a failed respond call to the KTD-3 semantic reason taxonomy. The
+/// categories are chosen to map from `LanguageModelSession.GenerationError`
+/// (macOS 26) and to survive its OS-27 successor: anything unrecognized
+/// degrades to the generic `respond-failed`. Applied to every guided verb,
+/// including the legacy `segment` path (envelope shape unchanged — only the
+/// reason string is more specific).
+@available(macOS 26.0, *)
+func unavailableReason(for error: Error) -> String {
+    guard let generationError = error as? LanguageModelSession.GenerationError else {
+        return "respond-failed"
+    }
+    switch generationError {
+    case .exceededContextWindowSize:
+        return "context-window"
+    case .guardrailViolation:
+        return "guardrail"
+    case .refusal:
+        return "refusal"
+    case .rateLimited:
+        return "rate-limited"
+    case .decodingFailure:
+        return "decoding-failure"
+    case .unsupportedGuide, .unsupportedLanguageOrLocale:
+        return "unsupported"
+    default:
+        // concurrentRequests, assetsUnavailable, and any future cases.
+        return "respond-failed"
+    }
+}
+
 @available(macOS 26.0, *)
 func runOnDevice(summary: [String: Any]) async -> Never {
     // Runtime availability: Apple Intelligence must be enabled and the model
@@ -218,8 +290,9 @@ func runOnDevice(summary: [String: Any]) async -> Never {
     } catch {
         // A model error mid-generation degrades to unavailable rather than
         // crashing the helper (Python would treat a crash as unavailable too,
-        // but an explicit envelope is cleaner).
-        emitUnavailable("respond-failed")
+        // but an explicit envelope is cleaner). The reason carries the KTD-3
+        // semantic taxonomy so Python's retry policy can route on it.
+        emitUnavailable(unavailableReason(for: error))
     }
 }
 
@@ -252,6 +325,143 @@ func runAnswer(prompt: String, evidence: String) async -> Never {
     }
 }
 
+// MARK: - Window-scoped verbs (SCR-275, U2): arbitrate / name-window / day-summary
+//
+// Slim @Generable schemas (KTD-9) with a per-verb `maximumResponseTokens` cap.
+// The cap is a runaway guard, not a formatting tool — a genuinely truncated
+// generation surfaces as `decoding-failure` and Python's retry taxonomy
+// (KTD-3) handles it.
+
+/// Merge decisions over the heuristic candidate windows: groups of contiguous
+/// window indices that belong to one task. Python validates contiguity and
+/// range; an empty list keeps every heuristic boundary.
+@available(macOS 26.0, *)
+@Generable
+struct GenMerges {
+    @Guide(description: "Groups of contiguous window indices to merge into one task; empty when every boundary is a real task switch", .maximumCount(24))
+    var merges: [[Int]]
+}
+
+@available(macOS 26.0, *)
+@Generable
+struct GenWindowName {
+    @Guide(description: "2-3 word task name capturing intent, not the app")
+    var name: String
+    @Guide(description: "One of: development, communication, research, admin, creative, other")
+    var category: String
+}
+
+@available(macOS 26.0, *)
+@Generable
+struct GenDaySummary {
+    @Guide(description: "1-2 sentence overview of what the user accomplished")
+    var overview: String
+    @Guide(description: "3-8 lowercase-hyphenated session tags", .maximumCount(8))
+    var tags: [String]
+}
+
+/// Gate on runtime model availability, exactly like the legacy verbs do.
+@available(macOS 26.0, *)
+func requireAvailableModel() {
+    switch SystemLanguageModel.default.availability {
+    case .available:
+        break
+    case .unavailable(let reason):
+        emitUnavailable("model-unavailable-\(reason)")
+    }
+}
+
+/// One-shot guided respond (KTD-2): fresh session, one call, semantic-reason
+/// failure mapping. Shared by the three window-scoped verbs.
+@available(macOS 26.0, *)
+func respondGuided<Content: Generable>(
+    instructions: String,
+    prompt: String,
+    generating type: Content.Type,
+    maximumResponseTokens: Int
+) async -> Content {
+    requireAvailableModel()
+    let session = LanguageModelSession(instructions: instructions)
+    do {
+        let response = try await session.respond(
+            to: prompt,
+            generating: type,
+            options: GenerationOptions(
+                temperature: 0.1,
+                maximumResponseTokens: maximumResponseTokens
+            )
+        )
+        return response.content
+    } catch {
+        emitUnavailable(unavailableReason(for: error))
+    }
+}
+
+/// `{"task":"arbitrate","windows":[{"i":0,"line":"…"},…]}` → which contiguous
+/// candidate windows to merge. Result: `{"merges":[[…],…]}`.
+@available(macOS 26.0, *)
+func runArbitrate(request: [String: Any]) async -> Never {
+    guard let rawWindows = request["windows"] as? [[String: Any]], !rawWindows.isEmpty else {
+        emitUnavailable("bad-request")
+    }
+    var lines: [String] = []
+    for window in rawWindows {
+        guard let index = window["i"] as? Int, let line = window["line"] as? String else {
+            emitUnavailable("bad-request")
+        }
+        lines.append("\(index): \(line)")
+    }
+    let decision = await respondGuided(
+        instructions: arbitrateInstructions,
+        prompt: "CANDIDATE WINDOWS:\n" + lines.joined(separator: "\n"),
+        generating: GenMerges.self,
+        maximumResponseTokens: 512
+    )
+    emitOK(result: ["merges": decision.merges])
+}
+
+/// `{"task":"name-window","digest":{…}}` → a 2-3 word intent name plus a
+/// category for one window. Result: `{"name":"…","category":"…"}`.
+@available(macOS 26.0, *)
+func runNameWindow(request: [String: Any]) async -> Never {
+    guard let digest = request["digest"] as? [String: Any] else {
+        emitUnavailable("bad-request")
+    }
+    let named = await respondGuided(
+        instructions: nameWindowInstructions,
+        prompt: "WINDOW DIGEST:\n" + summaryJSONString(digest),
+        generating: GenWindowName.self,
+        maximumResponseTokens: 256
+    )
+    emitOK(result: ["name": named.name, "category": named.category])
+}
+
+/// `{"task":"day-summary","tasks":[{"name":"…","category":"…","minutes":N},…]}`
+/// → a short session overview + tags. Result: `{"overview":"…","tags":[…]}`.
+@available(macOS 26.0, *)
+func runDaySummary(request: [String: Any]) async -> Never {
+    guard let rawTasks = request["tasks"] as? [[String: Any]], !rawTasks.isEmpty else {
+        emitUnavailable("bad-request")
+    }
+    var lines: [String] = []
+    for entry in rawTasks {
+        guard let name = entry["name"] as? String,
+              let category = entry["category"] as? String,
+              let minutes = entry["minutes"] as? Double
+        else {
+            emitUnavailable("bad-request")
+        }
+        lines.append("- \(name) [\(category)] \(Int(minutes)) min")
+    }
+    let summary = await respondGuided(
+        instructions: daySummaryInstructions,
+        prompt: "TASKS PERFORMED:\n" + lines.joined(separator: "\n"),
+        generating: GenDaySummary.self,
+        maximumResponseTokens: 512
+    )
+    emitOK(result: ["overview": summary.overview, "tags": summary.tags])
+}
+
 #endif
 
 // MARK: - Entry point (top-level async — Swift 5.7+ in `main.swift`)
@@ -260,19 +470,27 @@ guard let request = readSummary() else {
     emitUnavailable("no-input")
 }
 
-// Task discriminator (SCR-243): absent / "segment" → the existing segmentation
-// path (the bare summary dict is passed through unchanged); "answer" → the
-// free-form recall-answer path. Keeping the default as segment leaves the
-// existing stdin shape byte-compatible.
+// Task discriminator (SCR-243, extended by SCR-275): absent / "segment" → the
+// existing segmentation path (the bare summary dict is passed through
+// unchanged); "answer" → the free-form recall-answer path; "arbitrate" /
+// "name-window" / "day-summary" → the window-scoped verbs. Keeping the default
+// as segment leaves the existing stdin shape byte-compatible.
 let task = (request["task"] as? String) ?? "segment"
 
 #if canImport(FoundationModels)
 if #available(macOS 26.0, *) {
-    if task == "answer" {
+    switch task {
+    case "answer":
         let prompt = request["prompt"] as? String ?? ""
         let evidence = request["evidence"] as? String ?? ""
         await runAnswer(prompt: prompt, evidence: evidence)
-    } else {
+    case "arbitrate":
+        await runArbitrate(request: request)
+    case "name-window":
+        await runNameWindow(request: request)
+    case "day-summary":
+        await runDaySummary(request: request)
+    default:
         await runOnDevice(summary: request)
     }
 } else {
