@@ -83,6 +83,38 @@ final class RecordingTasksTests: XCTestCase {
         XCTAssertEqual(title, "2026-07-06_10-00-00", "no tasks + no distinct title → directory name, no crash")
     }
 
+    /// Regression: the REAL daemon sends a distinct date/time default plus
+    /// `title_is_user_set == false` for an un-named recording, so the borrow can't
+    /// key off `title != name` — that heuristic only holds for a legacy daemon that
+    /// omits `title`. A named on-device task must win over the derived default.
+    func testDisplayTitleBorrowsTaskWhenTitleIsDerivedDefault() {
+        let rec = recording(name: "rec-20260717T172042",
+                            title: "Recording · Jul 17, 5:20 PM",
+                            titleIsUserSet: false)
+        let title = JournalModel.displayTitle(rec, tasks: [task(0, "Seedj Browsing")])
+        XCTAssertEqual(title, "Seedj Browsing",
+                       "a derived date default (title_is_user_set == false) yields to a named task")
+    }
+
+    /// A user rename (`title_is_user_set == true`) is authoritative even when the
+    /// title differs from the directory name and named tasks exist.
+    func testDisplayTitleKeepsUserSetTitleOverTasks() {
+        let rec = recording(name: "rec-20260717T172042",
+                            title: "Quarterly close",
+                            titleIsUserSet: true)
+        let title = JournalModel.displayTitle(rec, tasks: [task(0, "Seedj Browsing")])
+        XCTAssertEqual(title, "Quarterly close",
+                       "a user-set title is never overridden by a task name")
+    }
+
+    /// A derived default with no tasks keeps the default (no crash, no borrow).
+    func testDisplayTitleKeepsDerivedDefaultWhenNoTasks() {
+        let rec = recording(name: "rec-20260717T172042",
+                            title: "Recording · Jul 17, 5:20 PM",
+                            titleIsUserSet: false)
+        XCTAssertEqual(JournalModel.displayTitle(rec, tasks: []), "Recording · Jul 17, 5:20 PM")
+    }
+
     // MARK: - summaryLine (task-aware overload)
 
     func testSummaryLinePrefersNamerSummary() {
@@ -298,15 +330,18 @@ final class RecordingTasksTests: XCTestCase {
         RecordingTask(taskIndex: index, startTs: 0, endTs: 1, name: name)
     }
 
-    private func recording(name: String, title: String?, summary: String? = nil) -> RecordingSummary {
+    private func recording(name: String, title: String?, summary: String? = nil,
+                           titleIsUserSet: Bool? = nil) -> RecordingSummary {
         let titleJSON = title.map { "\"\($0)\"" } ?? "null"
         let summaryJSON = summary.map { "\"\($0)\"" } ?? "null"
+        let userSetJSON = titleIsUserSet.map { $0 ? "true" : "false" } ?? "null"
         let json = """
         {"name":"\(name)","date":"2026-07-06","duration":"0:10","size_mb":"x",
          "has_audio":false,"transcribed":false,"uploaded":false,"is_stub":false,
          "chunks_total":0,"chunks_uploaded":0,"intent":null,
          "started_at":null,"duration_seconds":10,"drops":null,
-         "size_bytes":0,"summary":\(summaryJSON),"title":\(titleJSON)}
+         "size_bytes":0,"summary":\(summaryJSON),"title":\(titleJSON),
+         "title_is_user_set":\(userSetJSON)}
         """
         return try! JSONDecoder().decode(RecordingSummary.self, from: Data(json.utf8))
     }
