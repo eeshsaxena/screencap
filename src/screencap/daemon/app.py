@@ -2335,11 +2335,7 @@ def _run_recording_outcome(recording: str) -> "tuple[str | None, str | None]":
     if not db_path.exists():
         return None, None
     try:
-        ledger = PipelineLedger(db_path)
-        return (
-            ledger.get_recording_outcome(),
-            ledger.get_recording_outcome_detail(),
-        )
+        return PipelineLedger(db_path).get_recording_outcome_with_detail()
     except Exception:  # noqa: BLE001 — an outcome read must never fail tasks.list
         return None, None
 

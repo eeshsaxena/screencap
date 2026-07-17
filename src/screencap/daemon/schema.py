@@ -869,6 +869,11 @@ def _load_models() -> dict[str, Any]:
         # recorded outcome; the app renders that as the neutral "unknown" state (KTD6),
         # and an older daemon omits the field entirely (also decoded as unknown).
         reason: str | None = None
+        # SCR-275 U6 (additive): the distinct degradation reason recorded alongside
+        # ``reason`` (e.g. ``context-window`` on a partial pass). ``None`` for a
+        # pre-U6 row, an unrecorded outcome, or a detail-less write; an older daemon
+        # omits the field entirely (clients decode that as absent).
+        detail: str | None = None
 
     class TasksCreateRequest(_DaemonModel):
         """U7 ``tasks.create`` input: add a USER-authored task span.

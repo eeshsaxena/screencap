@@ -334,6 +334,7 @@ class OnDeviceProvider:
         recording_dir: "Path | str | None" = None,
         stop_event: "object | None" = None,
         is_live: bool = False,
+        manifests: "list[dict] | None" = None,
     ) -> None:
         #: Out-of-band diagnostic (KTD-1): WHY the most recent ``segment`` /
         #: ``answer`` / ``call_*`` invocation was unavailable; ``None`` after
@@ -349,11 +350,14 @@ class OnDeviceProvider:
         # ``recording_dir`` is present (the terminal stage supplies it at call
         # time via ``build_day_split_provider``) AND the recording has chunk
         # manifests, ``segment`` runs the heuristic-first windowed pipeline
-        # instead of the legacy whole-day helper call. Legacy callers that
-        # construct the provider bare keep the old behavior unchanged.
+        # instead of the legacy whole-day helper call. ``manifests`` are the
+        # caller's already-loaded chunk manifests (``None`` → ``segment``
+        # loads its own from disk). Legacy callers that construct the provider
+        # bare keep the old behavior unchanged.
         self._recording_dir = Path(recording_dir) if recording_dir else None
         self._stop_event = stop_event
         self._is_live = is_live
+        self._manifests = manifests
 
     def segment(
         self,
@@ -387,7 +391,10 @@ class OnDeviceProvider:
         # whole-day call — same tri-state exterior. No manifests (legacy /
         # single-file recording) → fall through to the whole-day path.
         if self._recording_dir is not None:
-            manifests = self._load_manifests()
+            manifests = (
+                self._manifests if self._manifests is not None
+                else self._load_manifests()
+            )
             if manifests:
                 return self._segment_windowed(activity_summary, manifests)
 

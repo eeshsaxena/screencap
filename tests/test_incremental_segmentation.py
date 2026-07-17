@@ -549,9 +549,10 @@ def test_incremental_pass_threads_recording_context(tmp_path, monkeypatch):
     captured: dict = {}
     provider = _FakeProvider(_canned_tasks())
 
-    def _build(recording_dir=None, stop_event=None, is_live=False):
+    def _build(recording_dir=None, stop_event=None, is_live=False, manifests=None):
         captured.update(
             recording_dir=recording_dir, stop_event=stop_event, is_live=is_live,
+            manifests=manifests,
         )
         return provider
 
@@ -564,6 +565,8 @@ def test_incremental_pass_threads_recording_context(tmp_path, monkeypatch):
     assert captured["recording_dir"] == rec_dir
     assert captured["stop_event"] is ev
     assert captured["is_live"] is True
+    # The already-loaded chunk manifests ride the same transport (no re-glob).
+    assert captured["manifests"]
 
 
 @pytest.mark.privacy
@@ -575,7 +578,7 @@ def test_finalize_threads_context_with_is_live_false(tmp_path, monkeypatch):
     captured: dict = {}
     provider = _FakeProvider(_canned_tasks())
 
-    def _build(recording_dir=None, stop_event=None, is_live=False):
+    def _build(recording_dir=None, stop_event=None, is_live=False, manifests=None):
         captured.update(recording_dir=recording_dir, is_live=is_live)
         return provider
 

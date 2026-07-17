@@ -55,12 +55,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE
-from screencap.segmentation.validate import _slugify, _validate_tags, _VALID_CATEGORIES
+from screencap.segmentation.validate import _VALID_CATEGORIES, _slugify, _validate_tags
 from screencap.segmentation.windows import (
     CandidateWindow,
     WindowDigest,
     build_candidate_windows,
     build_window_digests,
+    strip_entry_detail,
 )
 
 if TYPE_CHECKING:
@@ -78,9 +79,9 @@ FINALIZE_PASS_BUDGET_S = 480.0
 # KTD-3: bounded caller-side recovery for a context-window naming failure.
 MAX_DIGEST_HALVINGS = 3
 
-# Per-task provenance markers (KTD-1/KTD-8). SOURCE_MECHANICAL deliberately
-# matches ``terminal_stage._heuristic_local_tasks``'s marker so every sink and
-# classifier sees ONE mechanical vocabulary.
+# Per-task provenance markers (KTD-1/KTD-8). SOURCE_MECHANICAL is deliberately
+# shared with ``terminal_stage._heuristic_local_tasks`` (which imports it) so
+# every sink and classifier sees ONE mechanical vocabulary.
 SOURCE_MODEL = "ondevice_model"
 SOURCE_MECHANICAL = "idle_gap_heuristic"
 
@@ -99,27 +100,15 @@ _monotonic = time.monotonic
 def compute_pinned_before_ts(recording_dir: Path | str) -> float | None:
     """The last COMMITTED task boundary for live-pass pinning (KTD-6).
 
-    Max ``end_ts`` over the recording's unedited agent task rows — the spans a
-    prior pass persisted and the user has not curated. ``None`` when there are
-    none (first live pass → whole-tail arbitration) or on any read error
-    (fail-open: no pinning is the safe direction; the cache still stabilizes
-    names).
+    Max ``end_ts`` over the recording's unedited agent task rows (read via
+    :func:`_committed_agent_spans`) — the spans a prior pass persisted and the
+    user has not curated. ``None`` when there are none (first live pass →
+    whole-tail arbitration) or on any read error (fail-open: the spans read
+    returns ``[]``; no pinning is the safe direction; the cache still
+    stabilizes names).
     """
-    try:
-        from screencap.pipeline_state import PipelineLedger, TASK_SOURCE_AGENT
-
-        db_path = Path(recording_dir) / "recording.db"
-        if not db_path.exists():
-            return None
-        rows = PipelineLedger(db_path).read_task_segments()
-        ends = [
-            r.end_ts for r in rows
-            if r.source == TASK_SOURCE_AGENT and not r.edited
-        ]
-        return max(ends) if ends else None
-    except Exception:  # noqa: BLE001 — pinning is an optimization, never a gate
-        log.debug("compute_pinned_before_ts failed open", exc_info=True)
-        return None
+    spans = _committed_agent_spans(Path(recording_dir))
+    return max((end for _start, end in spans), default=None)
 
 
 def run_heuristic_pipeline(
@@ -214,7 +203,9 @@ def run_heuristic_pipeline(
             elif groups:
                 tail = _apply_merges(tail, groups)
                 all_windows = prefix + tail
-                digests = _digests(all_windows)
+                # A tail-scoped merge leaves the prefix windows untouched, so
+                # only the tail digests need rebuilding.
+                digests = digests[: len(prefix)] + _digests(tail)
 
     # Per-window loop: cache lookup → naming call (with context-window
     # halving) → cache write; budget + stop checks between calls (KTD-7).
@@ -348,7 +339,7 @@ def _split_pinned(
 def _committed_agent_spans(recording_dir: Path) -> list[tuple[float, float]]:
     """The recording's committed unedited-agent task spans, sorted (KTD-6)."""
     try:
-        from screencap.pipeline_state import PipelineLedger, TASK_SOURCE_AGENT
+        from screencap.pipeline_state import TASK_SOURCE_AGENT, PipelineLedger
 
         db_path = Path(recording_dir) / "recording.db"
         if not db_path.exists():
@@ -472,7 +463,8 @@ def _halve_payload(payload: dict) -> dict | None:
     """Halve the digest's timeline/transcript content; ``None`` when minimal.
 
     Drop order mirrors ``windows._trim_to_budget``: transcript first, then
-    timeline entries, then per-entry detail on a lone surviving entry.
+    timeline entries, then per-entry detail on a lone surviving entry (the
+    shared ``windows.strip_entry_detail`` vocabulary).
     """
     p = dict(payload)
     transcript = list(p.get("transcript") or [])
@@ -487,18 +479,9 @@ def _halve_payload(payload: dict) -> dict | None:
     if len(timeline) > 1:
         p["timeline"] = timeline[: max(1, len(timeline) // 2)]
         return p
-    if timeline:
-        entry = timeline[0]
-        extras = [f for f in ("typed", "shortcuts", "clicks", "domain") if f in entry]
-        if extras:
-            for f in extras:
-                del entry[f]
-            p["timeline"] = timeline
-            return p
-        if len(entry.get("title", "")) > 40:
-            entry["title"] = entry["title"][:40]
-            p["timeline"] = timeline
-            return p
+    if timeline and strip_entry_detail(timeline[0]):
+        p["timeline"] = timeline
+        return p
     return None
 
 

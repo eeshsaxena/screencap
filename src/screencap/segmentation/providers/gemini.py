@@ -26,10 +26,6 @@ import logging
 import os
 from typing import Callable
 
-#: The BYO-key vendor id for Gemini (its Keychain-store key, U2). Also the config
-#: ``cloud_provider`` value that maps to this backend (R10 — one Gemini entry).
-_VENDOR = "gemini"
-
 from screencap.segmentation.generation import (
     Evidence,
     MaskedFrame,
@@ -43,6 +39,10 @@ from screencap.segmentation.generation_finish import (
 from screencap.segmentation.provider import PROVIDER_UNAVAILABLE, ProviderUnavailable
 from screencap.segmentation.schema import _RESPONSE_SCHEMA
 from screencap.segmentation.validate import validate_llm_tasks
+
+#: The BYO-key vendor id for Gemini (its Keychain-store key, U2). Also the config
+#: ``cloud_provider`` value that maps to this backend (R10 — one Gemini entry).
+_VENDOR = "gemini"
 
 log = logging.getLogger(__name__)
 

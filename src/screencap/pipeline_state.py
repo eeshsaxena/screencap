@@ -1272,6 +1272,43 @@ class PipelineLedger:
             if conn is not None:
                 conn.close()
 
+    def get_recording_outcome_with_detail(self) -> "tuple[str | None, str | None]":
+        """Return ``(reason, detail)`` in ONE read; ``(None, None)`` if unrecorded.
+
+        The combined form of :meth:`get_recording_outcome` +
+        :meth:`get_recording_outcome_detail` for callers that want both (the
+        ``tasks.list`` verb), with the same fail-safe discipline: any SQLite
+        error resolves to ``(None, None)``. A pre-U6 table without the
+        ``detail`` column still yields ``(reason, None)`` — exactly what the
+        paired accessors return there.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT reason, detail FROM pipeline_recording_outcome "
+                    "WHERE recording_id=?",
+                    (self._recording_id,),
+                ).fetchone()
+                if row is None:
+                    return None, None
+                return str(row[0]), (None if row[1] is None else str(row[1]))
+            except sqlite3.OperationalError:
+                # Pre-U6 schema (no ``detail`` column): fall back to a
+                # reason-only read so the reason is not lost with the detail.
+                row = conn.execute(
+                    "SELECT reason FROM pipeline_recording_outcome "
+                    "WHERE recording_id=?",
+                    (self._recording_id,),
+                ).fetchone()
+                return (None if row is None else str(row[0])), None
+        except sqlite3.Error:
+            return None, None
+        finally:
+            if conn is not None:
+                conn.close()
+
     # ------------------------------------------------------------------
     # SCR-275 U4 — per-window on-device naming cache (memo, never task truth)
     # + the KTD-10 scrub-generation staleness guard.
@@ -1334,35 +1371,6 @@ class PipelineLedger:
                      _now()),
                 )
                 conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
-
-    def delete_window_names_overlapping(self, start: float, end: float) -> int:
-        """Delete cache rows overlapping ``(start, end)``; return the count.
-
-        Overlap is ``window_end > start AND window_start < end`` — the same
-        predicate the scrub worker's in-transaction purge uses (which is the
-        production purge path; this accessor is for callers that own no open
-        transaction). Missing table → 0 (fail-open).
-        """
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                cur = conn.execute(
-                    "DELETE FROM ondevice_window_names "
-                    "WHERE window_end > ? AND window_start < ?",
-                    (start, end),
-                )
-                n = cur.rowcount
-                conn.commit()
-                return max(0, n)
-            except sqlite3.OperationalError:
-                conn.rollback()
-                return 0
             except Exception:
                 conn.rollback()
                 raise

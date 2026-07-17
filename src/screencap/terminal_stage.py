@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
     from screencap.segmentation.consent import ConsentPolicy, ExecutionTarget
+    from screencap.segmentation.outcome import Branch
     from screencap.segmentation.provider import SegmentResult
     from screencap.upload import FileInfo
 
@@ -1389,6 +1390,9 @@ def _segment_local_tasks(
     # boundary pinning on live passes) instead of the legacy whole-day call.
     provider = build_day_split_provider(
         recording_dir=recording_dir, stop_event=stop_event, is_live=is_live,
+        # Reuse the manifests already loaded above so the on-device windowed
+        # path doesn't re-glob/re-parse them from disk.
+        manifests=manifests,
     )
     provider_result = provider.segment(summary)
     return (
@@ -1570,6 +1574,7 @@ def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
     """
     from screencap import config
     from screencap.recording_db import Row, open_recording_db
+    from screencap.segmentation.ondevice_pipeline import SOURCE_MECHANICAL
     from screencap.task_manifest import _segment_tasks
 
     db_path = recording_dir / "recording.db"
@@ -1594,11 +1599,11 @@ def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
             "name": f"task_{i + 1}",
             "derived_name": f"task-{i + 1}",
             "event_count": count,
-            "source": "idle_gap_heuristic",
+            "source": SOURCE_MECHANICAL,
         }
         for i, (start, end, count) in enumerate(segments)
     ]
-    return {"tasks": tasks, "summary": {"source": "idle_gap_heuristic"}, "tags": []}
+    return {"tasks": tasks, "summary": {"source": SOURCE_MECHANICAL}, "tags": []}
 
 
 def _persist_local_tasks(

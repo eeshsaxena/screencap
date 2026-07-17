@@ -27,6 +27,7 @@ def build_day_split_provider(
     recording_dir: "Path | str | None" = None,
     stop_event: "object | None" = None,
     is_live: bool = False,
+    manifests: "list[dict] | None" = None,
 ) -> LLMProvider:
     """Return the provider to call for day-split, per the configured active provider.
 
@@ -34,8 +35,11 @@ def build_day_split_provider(
     per-recording context (KTD-1 transport): the terminal stage supplies them
     at call time so the on-device backend can run the heuristic-first windowed
     pipeline (with cooperative stop checks) instead of the legacy whole-day
-    call. Callers that pass none (legacy callers) get the old behavior; the
-    downloaded / BYO backends ignore the context entirely.
+    call. ``manifests`` optionally rides the same context: the caller's
+    already-loaded chunk manifests, so the on-device backend need not re-read
+    them from disk (``None`` → the backend loads its own). Callers that pass
+    none (legacy callers) get the old behavior; the downloaded / BYO backends
+    ignore the context entirely.
     """
     from screencap import config
     from screencap.segmentation.endpoint import LOCAL, classify_endpoint
@@ -53,6 +57,7 @@ def build_day_split_provider(
             recording_dir=recording_dir,
             stop_event=stop_event,
             is_live=is_live,
+            manifests=manifests,
         )]
         if _downloaded_model_installed():
             from screencap.segmentation.providers.downloaded import DownloadedProvider

@@ -107,14 +107,12 @@ def _purge_ondevice_window_names(
     any failure is swallowed per the worker's fail-open discipline.
     """
     try:
-        def _has_table(name: str) -> bool:
-            return cur.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (name,),
-            ).fetchone() is not None
+        # Lazy import (like bump_scrub_generation below) so the enforcement
+        # package's import surface stays light.
+        from screencap.recording_db import has_table
 
         deleted = 0
-        if _has_table("ondevice_window_names"):
+        if has_table(conn, "ondevice_window_names"):
             before = conn.total_changes
             for start, end in intervals:
                 lo = math.floor(start)
@@ -130,7 +128,7 @@ def _purge_ondevice_window_names(
                         (lo, math.ceil(end)),
                     )
             deleted = conn.total_changes - before
-        if _has_table("scrub_generation"):
+        if has_table(conn, "scrub_generation"):
             # Signal a concurrently-running naming pass that its pre-scrub
             # snapshot is stale (KTD-10b) — bumped whenever source rows were
             # deleted, even if no cache row overlapped. Lazy import: light

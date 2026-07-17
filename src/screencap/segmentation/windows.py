@@ -44,10 +44,14 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from screencap.pipeline_state import spans_overlap
 from screencap.segmentation.activity_summary import (
     ActivitySource,
+    BlockedPredicate,
     BlockedSource,
+    _always_blocked,
     _duration_human,
+    _resolve_blocked_predicate,
     build_activity_summary,
 )
 from screencap.task_manifest import _segment_tasks
@@ -70,6 +74,12 @@ BUDGET_HEADROOM = 0.10  # always keep >=10% of the budget free
 _ARBITRATION_LINE_MAX_CHARS = 100
 _ARBITRATION_MAX_KEYWORDS = 4
 _ARBITRATION_MAX_APPS = 2
+
+# Per-entry detail fields dropped (all at once, in this order) when a lone
+# surviving timeline entry must shrink further. Shared with
+# ``ondevice_pipeline._halve_payload`` via :func:`strip_entry_detail` so the
+# trim vocabulary cannot drift between the two.
+TRIMMABLE_ENTRY_FIELDS = ("typed", "shortcuts", "clicks", "domain")
 
 
 @dataclass(frozen=True)
@@ -256,7 +266,25 @@ def build_window_digests(
         (e for e in source.iter_events() if (e.get("timestamp", 0) or 0) > 0),
         key=lambda e: e["timestamp"],
     )
+    event_ts = [e["timestamp"] for e in events]
     window_starts = {w.start_ts for w in windows}
+
+    if blocked_source is not None and not callable(blocked_source) and manifests:
+        # Resolve the R11 strip predicate ONCE per pass: a recording-dir source
+        # re-derives the blocked intervals from its local ``recording.db``
+        # (domain index + skip-interval derivation) — far too heavy to repeat
+        # for every window. Each per-window ``build_activity_summary`` call
+        # below then takes the callable fast path. A resolution failure keeps
+        # today's per-window outcome: the predicate fails closed to
+        # all-blocked, every window strips empty → summary ``None`` →
+        # unusable digest, mechanical name, no model call.
+        blocked_source = _resolve_pass_predicate(blocked_source, manifests, source, events)
+
+    # Merge/sort the settled coverage ONCE; containment per window is then a
+    # scan of the (small) disjoint union instead of a re-sort per window.
+    settled_union = (
+        _merged_union(settled_intervals) if settled_intervals is not None else None
+    )
 
     digests: list[WindowDigest] = []
     for i, window in enumerate(windows):
@@ -266,7 +294,8 @@ def build_window_digests(
             # segment-final window includes its own end event.
             include_end = window.end_ts not in window_starts
             summary = _build_span_summary(
-                window, include_end, manifests, events, source, blocked_source,
+                window, include_end, manifests, events, event_ts, source,
+                blocked_source,
             )
         usable = summary is not None and summary.get("stripped") is True
 
@@ -277,8 +306,8 @@ def build_window_digests(
 
         if not usable:
             cacheable = False
-        elif settled_intervals is not None:
-            cacheable = _covered(window.start_ts, window.end_ts, settled_intervals)
+        elif settled_union is not None:
+            cacheable = _covered(window.start_ts, window.end_ts, settled_union)
         else:
             cacheable = i < len(windows) - 1  # trailing window never caches
 
@@ -350,20 +379,66 @@ class _SpanSource:
         return {"segments": segments} if segments else None
 
 
+def _resolve_pass_predicate(
+    blocked_source: BlockedSource,
+    manifests: list[dict],
+    source: ActivitySource,
+    events: list[dict],
+) -> BlockedPredicate:
+    """Resolve a recording-dir ``blocked_source`` into a predicate, ONCE per pass.
+
+    Mirrors ``build_activity_summary``'s own resolution over the whole day:
+    the window is the manifests' full span, and the forwarded strip timestamps
+    are every event timestamp plus every transcript-segment absolute timestamp
+    — so the per-window calls (handed the returned callable) keep the same
+    fail-closed uncovered-gap protection. ANY failure returns the all-blocked
+    sentinel (ERROR logged): every window then strips empty and fails closed —
+    unusable digest, mechanical name, no model call — exactly as a per-window
+    resolution failure does.
+    """
+    try:
+        session_start = min(m["chunk_start"] for m in manifests)
+        session_end = max(m["chunk_end"] for m in manifests)
+        strip_tss = [e["timestamp"] for e in events]
+        for manifest in sorted(manifests, key=lambda m: m["chunk_index"]):
+            transcript = source.read_transcript(manifest["chunk_index"])
+            if transcript is None:
+                continue
+            chunk_start = manifest["chunk_start"]
+            for seg in transcript.get("segments", [])[:20]:
+                strip_tss.append(chunk_start + seg.get("start", 0))
+        return _resolve_blocked_predicate(
+            blocked_source, (session_start, session_end), strip_tss,
+        )
+    except Exception:  # noqa: BLE001 — privacy fail-closed must win over surfacing
+        log.error(
+            "window-digest privacy strip: pass-level predicate resolution "
+            "failed; failing closed (all window digests unusable)",
+            exc_info=True,
+        )
+        return _always_blocked
+
+
 def _build_span_summary(
     window: CandidateWindow,
     include_end: bool,
     manifests: list[dict],
     events: list[dict],
+    event_ts: list[float],
     source: ActivitySource,
     blocked_source: BlockedSource,
 ) -> dict | None:
-    """Run ``build_activity_summary`` scoped to one window span."""
+    """Run ``build_activity_summary`` scoped to one window span.
+
+    ``events`` are the pass's timestamp-sorted event rows and ``event_ts``
+    their parallel timestamp list, so the span slice and the carry-in lookup
+    bisect instead of scanning the whole day per window.
+    """
     start, end = window.start_ts, window.end_ts
 
     overlapping = [
         m for m in manifests
-        if m["chunk_start"] < end and m["chunk_end"] > start
+        if spans_overlap(m["chunk_start"], m["chunk_end"], start, end)
     ]
     if not overlapping:
         return None
@@ -376,11 +451,11 @@ def _build_span_summary(
         for m in overlapping
     ]
 
-    span_events = [
-        e for e in events
-        if start <= e["timestamp"] < end
-        or (include_end and e["timestamp"] == end)
-    ]
+    # Span slice via bisect over the sorted timestamps: [start, end) — plus the
+    # end event itself for a segment-final window (include_end).
+    lo = bisect_left(event_ts, start)
+    hi = bisect_right(event_ts, end) if include_end else bisect_left(event_ts, end)
+    span_events = events[lo:hi]
 
     # Carry-in: activity with no leading window.switch in-span inherits the
     # last-known window at the span start (task_manifest prev_window
@@ -391,12 +466,12 @@ def _build_span_summary(
         (e for e in span_events if e.get("type") == "window.switch"), None,
     )
     if first_switch is None or first_switch["timestamp"] > start:
+        # The last window.switch strictly before the span start (events[:lo]).
         carry = None
-        for e in events:
-            if e["timestamp"] >= start:
+        for j in range(lo - 1, -1, -1):
+            if events[j].get("type") == "window.switch":
+                carry = events[j]
                 break
-            if e.get("type") == "window.switch":
-                carry = e
         if carry is not None:
             synthesized = {
                 "type": "window.switch",
@@ -496,18 +571,31 @@ def _trim_to_budget(
             del timeline[k]
             del durations[k]
         else:
-            entry = timeline[0]
-            extras = [f for f in ("typed", "shortcuts", "clicks", "domain") if f in entry]
-            if extras:
-                for f in extras:
-                    del entry[f]
-            elif len(entry.get("title", "")) > 40:
-                entry["title"] = entry["title"][:40]
-            else:
+            if not strip_entry_detail(timeline[0]):
                 break  # minimal single entry; nothing left to trim
         text = _serialize(_payload())
 
     return _payload(), text, math.ceil(len(text) / cpt)
+
+
+def strip_entry_detail(entry: dict) -> bool:
+    """Trim a lone timeline entry in place; ``True`` iff anything was trimmed.
+
+    The shared last-resort trim vocabulary: drop every present
+    :data:`TRIMMABLE_ENTRY_FIELDS` field first; once none remain, truncate an
+    over-40-char title. ``False`` means the entry is already minimal. Used by
+    ``_trim_to_budget``'s tail and ``ondevice_pipeline._halve_payload`` so the
+    drop order cannot drift between them.
+    """
+    extras = [f for f in TRIMMABLE_ENTRY_FIELDS if f in entry]
+    if extras:
+        for f in extras:
+            del entry[f]
+        return True
+    if len(entry.get("title", "")) > 40:
+        entry["title"] = entry["title"][:40]
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -524,16 +612,21 @@ def _digest_hash(window: CandidateWindow, payload: dict | None) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _covered(
-    start: float, end: float, intervals: Sequence[tuple[float, float]],
-) -> bool:
-    """True if ``[start, end]`` is fully covered by the intervals' union."""
+def _merged_union(
+    intervals: Sequence[tuple[float, float]],
+) -> list[list[float]]:
+    """Sort + merge ``intervals`` into a disjoint union (computed once per pass)."""
     merged: list[list[float]] = []
     for a, b in sorted((float(a), float(b)) for a, b in intervals if b > a):
         if merged and a <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
+    return merged
+
+
+def _covered(start: float, end: float, merged: list[list[float]]) -> bool:
+    """True if ``[start, end]`` is fully covered by a :func:`_merged_union` list."""
     return any(a <= start and b >= end for a, b in merged)
 
 
