@@ -93,6 +93,25 @@ def _make_recording_db(
                 "VALUES (?, 1, ?, ?, 'normal')",
                 (j, a.get("name", "click"), a["ts"]),
             )
+        # A real recording.db ALWAYS carries a ``screenshot`` table (the engine's
+        # metadata create_all makes every table), with one row per captured
+        # frame. Its presence enables the SCR-191 orphan cross-check inside
+        # derive_skip_intervals — a table-less fixture silently disables that
+        # pass and hides orphan-flagging bugs (the divergence that let action
+        # events be falsely orphan-flagged in production while these tests
+        # stayed green).
+        conn.execute(
+            """CREATE TABLE screenshot (
+                id INTEGER PRIMARY KEY, recording_id INTEGER,
+                timestamp REAL, image_path TEXT
+            )"""
+        )
+        for k, ts in enumerate(screenshots or [], start=1):
+            conn.execute(
+                "INSERT INTO screenshot (id, recording_id, timestamp, image_path) "
+                "VALUES (?, 1, ?, ?)",
+                (k, ts, f"screenshots/{ts}.jpg"),
+            )
         conn.commit()
 
     if screenshots:
@@ -281,6 +300,21 @@ def _make_masked_recording_db(
                 "INSERT INTO action_event (id, recording_id, name, timestamp, element_state) "
                 "VALUES (?, 1, ?, ?, 'normal')",
                 (j, a.get("name", "click"), a["ts"]),
+            )
+        # Real schema: the ``screenshot`` table always exists (see
+        # _make_recording_db) — its absence would silently disable the SCR-191
+        # orphan cross-check for this fixture.
+        conn.execute(
+            """CREATE TABLE screenshot (
+                id INTEGER PRIMARY KEY, recording_id INTEGER,
+                timestamp REAL, image_path TEXT
+            )"""
+        )
+        for k, ts in enumerate(screenshots or [], start=1):
+            conn.execute(
+                "INSERT INTO screenshot (id, recording_id, timestamp, image_path) "
+                "VALUES (?, 1, ?, ?)",
+                (k, ts, f"screenshots/{ts}.jpg"),
             )
         conn.commit()
     if screenshots:

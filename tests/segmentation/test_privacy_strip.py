@@ -100,7 +100,9 @@ def _blocks_email(ts: float) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _make_db(path: Path, windows: list[dict]) -> None:
+def _make_db(
+    path: Path, windows: list[dict], screenshots: list[float] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.closing(sqlite3.connect(str(path))) as db:
         db.execute(
@@ -127,6 +129,28 @@ def _make_db(path: Path, windows: list[dict]) -> None:
                 "state, app_name, browser_url) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?)",
                 (i, w["ts"], w.get("bundle"), w.get("window_id", f"w{i}"),
                  w.get("title"), w.get("app_name"), w.get("url")),
+            )
+        # A real recording.db always carries a ``screenshot`` table; its
+        # presence enables the SCR-191 orphan cross-check in
+        # ``derive_skip_intervals``. Create it unconditionally so every strip
+        # test runs against the real schema — a table-less fixture silently
+        # disables the orphan pass, the exact divergence that kept these tests
+        # green while production orphan-flagged every event. Frame timestamps
+        # never coincide with event timestamps, which is what the orphan-flag
+        # regression test relies on.
+        db.execute(
+            """CREATE TABLE screenshot (
+                id INTEGER PRIMARY KEY,
+                recording_id INTEGER,
+                timestamp REAL,
+                image_path TEXT
+            )"""
+        )
+        for i, ts in enumerate(screenshots or [], start=1):
+            db.execute(
+                "INSERT INTO screenshot (id, recording_id, timestamp, "
+                "image_path) VALUES (?, 1, ?, NULL)",
+                (i, ts),
             )
         db.commit()
 
@@ -265,6 +289,41 @@ def test_real_db_blocks_sensitive_app_span(tmp_path):
     titles = _apps(result) if result else []
     assert "Gmail" not in titles, "sensitive [2000,3000) span did not strip Gmail"
     assert "main.py" in titles    # benign window in the [1100,2000) span survives
+
+
+def test_event_timestamps_not_orphan_flagged(tmp_path):
+    """Event timestamps must NOT enter the orphan-screenshot cross-check.
+
+    A real ``recording.db`` always has a ``screenshot`` table, and frame
+    timestamps never coincide with event timestamps. The strip forwards its
+    event/transcript timestamps for the fail-closed uncovered-gap residual —
+    but the SCR-191 orphan pass set-matches forwarded timestamps against the
+    ``screenshot`` table's frame rows, so routing events through it flags
+    EVERY event as an orphan, strips all activity, and the recording silently
+    loses naming/segmentation entirely (summary ``None`` → no tasks, not even
+    the heuristic). Events get the uncovered-gap protection only.
+    """
+    rec_dir = tmp_path / "rec-frames"
+    rec_dir.mkdir()
+    # One benign window covering the whole session; frame rows at timestamps
+    # that (realistically) match no event timestamp.
+    _make_db(
+        rec_dir / "recording.db",
+        windows=[
+            {"ts": 1000.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+        ],
+        screenshots=[1000.5, 1500.5, 4800.5],
+    )
+    result = build_activity_summary(
+        "rec", _MANIFESTS, _source(), blocked_source=rec_dir,
+    )
+    assert result is not None, (
+        "every event was orphan-flagged by the screenshot cross-check and "
+        "stripped — the summary must survive an all-ALLOW recording"
+    )
+    titles = _apps(result)
+    assert "main.py" in titles
+    assert "#dev — Slack" in titles
 
 
 # ===========================================================================
