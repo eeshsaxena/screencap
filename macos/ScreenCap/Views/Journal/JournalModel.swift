@@ -90,16 +90,20 @@ enum JournalModel {
     /// title (editable titles U2): the user's rename when set, else the catalog's
     /// date/time default — this view never re-derives its own default, so a
     /// user-set or cleared title from `recording.rename` (U6) shows through
-    /// verbatim once the list refreshes. The task-name borrow only kicks in when
-    /// the recording has no distinct title at all — the raw directory `name` is
-    /// the placeholder `RecordingSummary` supplies (an older daemon that omits
-    /// `title`) — and on-device segmentation named at least one task, which reads
-    /// far better than the directory slug. Uploaded/cloud-named recordings keep
-    /// the recording title unchanged; only the un-named local case borrows a task
-    /// name. Returns `rec.title` (never empty) in every other case, so the card
-    /// title is always populated.
+    /// verbatim once the list refreshes. The task-name borrow kicks in only when
+    /// the recording has NO user-set title — determined by the daemon's
+    /// authoritative `title_is_user_set` flag, not by comparing `title` to `name`:
+    /// the modern daemon always sends a distinct date/time default (≠ the directory
+    /// slug), so a `title != name` check would never see an un-named recording and
+    /// the borrow would be dead. We fall back to the `title != name` heuristic only
+    /// for a legacy daemon that omits the flag (and omits `title`, so it collapses
+    /// to `name`). When un-named and on-device segmentation named at least one task,
+    /// that name reads far better than the date default. Uploaded/cloud-named
+    /// recordings keep the recording title unchanged. Returns `rec.title` (never
+    /// empty) in every other case, so the card title is always populated.
     static func displayTitle(_ rec: RecordingSummary, tasks: [RecordingTask]) -> String {
-        if rec.title != rec.name { return rec.title }
+        let hasUserTitle = rec.titleIsUserSet ?? (rec.title != rec.name)
+        if hasUserTitle { return rec.title }
         if let first = tasks.first?.name.trimmingCharacters(in: .whitespacesAndNewlines),
            !first.isEmpty {
             return first
