@@ -32,10 +32,13 @@ Key behaviors (see the SCR-275 plan for the KTD numbering):
   day-summary tags through its tag regex/count cap — all BEFORE any cache
   write or sink assembly. Zero model names → the unavailable sentinel with
   the dominant failure reason recorded on the provider.
-- **KTD-10** — the scrub generation is snapshotted before digest computation
-  and re-checked in one commit transaction at the end; a mismatch (a
-  retroactive scrub landed mid-pass) deletes this pass's cache writes and
-  returns ``None`` (nothing reaches the sinks).
+- **KTD-10** — the scrub generation is snapshotted before digest computation,
+  re-checked inside EVERY cache write (a mismatched store commits nothing and
+  the window stays named-but-uncached this pass), and re-checked once more in
+  one commit transaction at the end; a mismatch there (a retroactive scrub
+  landed mid-pass) deletes this pass's cache writes and returns the
+  unavailable sentinel with :data:`REASON_STALE_SCRUB` recorded on the
+  provider (nothing reaches the sinks).
 
 Seam for U6: per-task provenance rides ``task["source"]``
 (:data:`SOURCE_MODEL` vs :data:`SOURCE_MECHANICAL`) on the returned dict —
@@ -89,6 +92,11 @@ SOURCE_MECHANICAL = "idle_gap_heuristic"
 REASON_BUDGET_EXHAUSTED = "budget-exhausted"
 REASON_STOPPED = "stopped"
 REASON_DIGEST_UNUSABLE = "digest-unusable"
+# KTD-10: the end-of-pass staleness guard tripped (a retroactive scrub landed
+# mid-pass). Like REASON_STOPPED this is NOT a real unavailability — the
+# terminal stage short-circuits on it (with one finalize retry) and the
+# chained provider must not cascade past it.
+REASON_STALE_SCRUB = "stale-scrub"
 
 _MAX_NAME_CHARS = 80
 _MAX_OVERVIEW_CHARS = 600
@@ -137,9 +145,10 @@ def run_heuristic_pipeline(
     injection seam ``build_window_digests`` exposes (tests pass a predicate).
 
     Returns a ``{"tasks", "summary", "tags"}`` dict (per-task ``source`` marks
-    model vs mechanical), ``None`` (nothing to segment, or the KTD-10
-    staleness guard tripped), or :data:`PROVIDER_UNAVAILABLE` when ZERO
-    windows were model-named (dominant reason on the provider).
+    model vs mechanical), ``None`` (nothing to segment), or
+    :data:`PROVIDER_UNAVAILABLE` when ZERO windows were model-named (dominant
+    reason on the provider) or the KTD-10 staleness guard tripped
+    (:data:`REASON_STALE_SCRUB` on the provider — nothing reaches the sinks).
     """
     recording_dir = Path(recording_dir)
     if budget_s is None:
@@ -240,17 +249,24 @@ def run_heuristic_pipeline(
                 log.info(
                     "ondevice pipeline: naming window %d/%d", i + 1, n_windows,
                 )
-                name, category, reason = _name_window(provider, digest)
+                name, category, reason = _name_window(
+                    provider, digest, stop_event, deadline,
+                )
                 if name is None:
                     failure_reasons.append(reason)
                 elif cacheable and ledger is not None:
-                    ledger.store_window_name(
+                    # KTD-10 per-write half: the store re-checks the scrub
+                    # generation inside its own transaction; a skipped store
+                    # (a scrub landed mid-pass) leaves the window named but
+                    # uncached this pass.
+                    if ledger.store_window_name(
                         w.start_ts, w.end_ts, digest.digest_hash,
                         name, category,
-                    )
-                    written_keys.append(
-                        (w.start_ts, w.end_ts, digest.digest_hash)
-                    )
+                        expected_generation=generation,
+                    ):
+                        written_keys.append(
+                            (w.start_ts, w.end_ts, digest.digest_hash)
+                        )
 
         if name is not None:
             model_named += 1
@@ -273,14 +289,18 @@ def run_heuristic_pipeline(
 
     # KTD-10: re-check the scrub generation inside one commit transaction; on
     # a mismatch delete this pass's cache rows and hand nothing to the sinks.
+    # The distinct REASON_STALE_SCRUB rides the sentinel (mirroring how
+    # REASON_STOPPED flows) so the terminal stage can retry once at finalize
+    # and otherwise record the pass as provisional — never a real
+    # unavailability, never a fallback.
     if ledger is not None and generation is not None:
         if not ledger.finalize_window_names(written_keys, generation):
             log.warning(
                 "ondevice pipeline: a retroactive scrub landed mid-pass; "
                 "discarding this pass (staleness guard)"
             )
-            provider.last_unavailable_reason = None
-            return None
+            provider.last_unavailable_reason = REASON_STALE_SCRUB
+            return PROVIDER_UNAVAILABLE
 
     # None after a fully-model pass; the dominant per-window failure reason
     # after a partial one (the U6 honesty seam, KTD-8).
@@ -418,7 +438,7 @@ def _apply_merges(
 
 
 def _name_window(
-    provider, digest: WindowDigest,
+    provider, digest: WindowDigest, stop_event, deadline: float,
 ) -> tuple[str | None, str | None, str | None]:
     """One window's naming call(s) → ``(name, category, failure_reason)``.
 
@@ -427,12 +447,20 @@ def _name_window(
     marker) at most :data:`MAX_DIGEST_HALVINGS` times, then gives up (the
     window goes mechanical). Output hygiene (KTD-9) applies HERE, before the
     result reaches the cache or assembly.
+
+    KTD-7 inside the halving loop: EVERY iteration re-checks
+    :func:`_halt_reason` first, so a stop signal (or budget exhaustion) landing
+    mid-halving exits promptly with the halt pseudo-reason — the window goes
+    mechanical this pass instead of burning further model calls.
     """
     from screencap.segmentation.activity_summary import attest_derived_stripped
 
     payload = dict(digest.payload or {})
     halvings_left = MAX_DIGEST_HALVINGS
     while True:
+        halt = _halt_reason(stop_event, deadline)
+        if halt is not None:
+            return None, None, halt
         # Re-attest via the builder module's sanctioned helper (the stripped-
         # marker guard pins the write there); ``digest.stripped`` is the
         # derivation chain's own flag, so an unstripped digest attests False
@@ -594,27 +622,14 @@ def _dominant(reasons: list[str]) -> str | None:
 def _open_cache_ledger(recording_dir: Path) -> "PipelineLedger | None":
     """Open the recording's ledger for the naming cache; ``None`` fails open.
 
-    Ensures the SCR-275 schema first (creates the cache + generation tables on
-    an old ``recording.db``). A missing/unreadable DB → no cache and no
-    staleness guard this pass — every window is a miss (memo-not-truth).
+    Delegates to the shared :func:`screencap.pipeline_state.open_ledger_or_none`
+    (schema ensured first — creates the cache + generation tables on an old
+    ``recording.db``). A missing/unreadable DB → no cache and no staleness
+    guard this pass — every window is a miss (memo-not-truth).
     """
-    try:
-        from screencap.pipeline_state import (
-            PipelineLedger,
-            ensure_pipeline_state_schema,
-        )
+    from screencap.pipeline_state import open_ledger_or_none
 
-        db_path = recording_dir / "recording.db"
-        if not db_path.exists():
-            return None
-        ensure_pipeline_state_schema(db_path)
-        return PipelineLedger(db_path)
-    except Exception:  # noqa: BLE001 — the cache is an optimization, never a gate
-        log.warning(
-            "ondevice pipeline: naming cache unavailable for %s; "
-            "running uncached", recording_dir.name, exc_info=True,
-        )
-        return None
+    return open_ledger_or_none(recording_dir)
 
 
 def _settled_intervals(

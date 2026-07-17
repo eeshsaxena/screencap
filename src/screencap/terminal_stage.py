@@ -867,24 +867,14 @@ def _resolve_destination(recording_dir: Path, policy: "ResolvedPolicy | None"):
 def _open_ledger(recording_dir: Path) -> "PipelineLedger | None":
     """Open the U1 ledger over ``recording.db``, or ``None`` for legacy dirs.
 
+    Delegates to the shared :func:`screencap.pipeline_state.open_ledger_or_none`.
     A missing ``recording.db`` (legacy single-file recording) or a DB with no
     recording row yields ``None`` — the terminal stage still routes/uploads via
     the whole-dir scrub path; only the per-chunk ledger bookkeeping is skipped.
     """
-    db_path = recording_dir / "recording.db"
-    if not db_path.exists():
-        return None
-    try:
-        from screencap.pipeline_state import (
-            PipelineLedger,
-            ensure_pipeline_state_schema,
-        )
+    from screencap.pipeline_state import open_ledger_or_none
 
-        ensure_pipeline_state_schema(db_path)
-        return PipelineLedger(db_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("terminal_stage: ledger unavailable (%s); proceeding without it", exc)
-        return None
+    return open_ledger_or_none(recording_dir)
 
 
 def _open_ledger_readonly(recording_dir: Path) -> "PipelineLedger | None":
@@ -1054,7 +1044,10 @@ def _run_local_segmentation(
     """
     from screencap.segmentation.consent import ConsentPolicy
     from screencap.segmentation.degrade import DegradeAction, resolve_day_split
-    from screencap.segmentation.ondevice_pipeline import REASON_STOPPED
+    from screencap.segmentation.ondevice_pipeline import (
+        REASON_STALE_SCRUB,
+        REASON_STOPPED,
+    )
     from screencap.segmentation.outcome import (
         PRODUCED_TASKS,
         PRODUCED_TASKS_PARTIAL,
@@ -1087,6 +1080,17 @@ def _run_local_segmentation(
                 detail = None
             if picked == prior and detail is None:
                 return  # nothing new — keep the prior record (and its detail).
+            if (
+                picked == prior
+                and picked in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
+                and branch not in (Branch.PRODUCED, Branch.PARTIAL)
+            ):
+                # The picker KEPT a sticky produced/partial prior on a
+                # degraded (mechanical/nothing/failed) pass: the STORED detail
+                # explains the recorded reason — this pass's fresh failure
+                # detail describes an outcome that was never recorded, so it
+                # must not replace it.
+                return
             ledger.set_recording_outcome(picked, detail=detail)
         except Exception as exc:  # noqa: BLE001 — outcome record must never block terminal
             logger.debug(
@@ -1098,6 +1102,24 @@ def _run_local_segmentation(
         summary, provider_result, unavailable_reason = _segment_local_tasks(
             recording_dir, stop_event=stop_event, is_live=is_live,
         )
+        if (
+            provider_result is PROVIDER_UNAVAILABLE
+            and unavailable_reason == REASON_STALE_SCRUB
+            and not is_live
+        ):
+            # SCR-275 KTD-10 at FINALIZE: a retroactive scrub landed mid-pass
+            # and the staleness guard discarded it. The scrub has committed,
+            # so the post-scrub rows are now settled — run ONE immediate
+            # same-call retry. This is a single sequential retry (no
+            # recursion): a second trip falls through to the provisional
+            # short-circuit below, exactly like a live-tick trip.
+            logger.info(
+                "terminal_stage: stale-scrub trip for %s at finalize; "
+                "retrying once over the settled rows", recording_dir.name,
+            )
+            summary, provider_result, unavailable_reason = _segment_local_tasks(
+                recording_dir, stop_event=stop_event, is_live=is_live,
+            )
     except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
         logger.debug(
             "terminal_stage: local segmentation failed open for %s (%s)",
@@ -1106,15 +1128,19 @@ def _run_local_segmentation(
         _record(Branch.FAILED)
         return
 
-    if provider_result is PROVIDER_UNAVAILABLE and unavailable_reason == REASON_STOPPED:
-        # SCR-275 U6: a fully-stopped pre-work pass — the storage.lock quiesce
-        # (or a stop signal) tripped before any model work ran. This is NOT a
-        # real unavailability, so it must consult NEITHER the cloud-summary
-        # fallback nor the heuristic (nothing is persisted, mirroring
-        # TerminalStageInterrupted, which records nothing at all). The outcome
-        # maps through the picker's provisional live branch — ``in_progress``
-        # (or a kept produced/partial prior) — because the pass re-runs: a live
-        # tick retries next tick, and an interrupted finalize resumes via the
+    if provider_result is PROVIDER_UNAVAILABLE and unavailable_reason in (
+        REASON_STOPPED, REASON_STALE_SCRUB,
+    ):
+        # SCR-275 U6: a halted pass — the storage.lock quiesce (or a stop
+        # signal) tripped before any model work ran, or a retroactive scrub
+        # landed mid-pass and the staleness guard discarded the pass (after
+        # the one finalize retry above). Neither is a real unavailability, so
+        # it must consult NEITHER the cloud-summary fallback nor the heuristic
+        # (nothing is persisted, mirroring TerminalStageInterrupted, which
+        # records nothing at all). The outcome maps through the picker's
+        # provisional live branch — ``in_progress`` (or a kept
+        # produced/partial prior) — because the pass re-runs: a live tick
+        # retries next tick, and an interrupted finalize resumes via the
         # unlock/startup reconcile.
         _record(Branch.NOTHING, provisional=True)
         return
@@ -1193,15 +1219,24 @@ def _run_local_segmentation(
     # AI tasks — fully (produced_tasks) or partially (produced_tasks_partial) — a
     # later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
     # "AI-named" above a mechanical list). Skip persistence and keep the reason.
+    # The same gate covers a PARTIAL pass at FINALIZE over a produced_tasks
+    # prior: pick_reason keeps produced there (strict finalize monotonicity),
+    # so the rows must stay the produced pass's too — rows and reason in
+    # agreement. A live PARTIAL keeps persisting (the deliberate recompute).
+    prior_outcome = (
+        ledger.get_recording_outcome() if ledger is not None else None
+    )
     if (
         branch is Branch.MECHANICAL
-        and ledger is not None
-        and ledger.get_recording_outcome()
-        in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
+        and prior_outcome in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
+    ) or (
+        branch is Branch.PARTIAL
+        and not is_live
+        and prior_outcome == PRODUCED_TASKS
     ):
         # pick_reason keeps produced/partial; rows untouched — and no detail is
         # passed, so the prior pass's stored detail is preserved too.
-        _record(Branch.MECHANICAL)
+        _record(branch)
         return
 
     # KTD3 carve-out — drop any fresh AGENT task overlapping a PROTECTED span

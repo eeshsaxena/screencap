@@ -143,6 +143,10 @@ REASON_PIPELINE_FAILED = "pipeline-failed"
 _RETRY_REASONS = frozenset({"decoding-failure", "rate-limited"})
 _RATE_LIMIT_BACKOFF_S = 2.0
 
+# Floor for a deadline-clamped verb timeout (KTD-7): never hand the helper a
+# window so short that every call near the deadline is a guaranteed timeout.
+_MIN_VERB_TIMEOUT_S = 5.0
+
 # Module-level seam so tests can patch the rate-limit backoff.
 _sleep = time.sleep
 
@@ -650,13 +654,21 @@ class OnDeviceProvider:
         self.last_unavailable_reason = None
         return CallResult({"overview": overview.strip(), "tags": list(tags)}, None)
 
-    def _call_verb(self, request: dict) -> tuple[dict | None, str | None]:
+    def _call_verb(
+        self, request: dict, *, deadline: "float | None" = None,
+    ) -> tuple[dict | None, str | None]:
         """Spawn the helper for one window-scoped verb → ``(result, reason)``.
 
         Shares the legacy spawn path (discovery, scrubbed env, stdout cap)
         with the shorter per-verb timeout, and applies the KTD-3 retry
         taxonomy: one fresh-spawn retry for ``decoding-failure``, one
         post-backoff retry for ``rate-limited``; nothing else retries.
+
+        ``deadline`` (KTD-7, optional): a ``time.monotonic()`` timestamp — the
+        caller's pass budget. Past the deadline the retry (and its backoff
+        sleep) is skipped, and each spawn's timeout is clamped to the
+        remaining budget (floored at :data:`_MIN_VERB_TIMEOUT_S`) so one slow
+        verb cannot blow far past the pass budget.
         """
         helper = _resolve_helper()
         if helper is None:
@@ -664,21 +676,33 @@ class OnDeviceProvider:
             return None, REASON_HELPER_MISSING
 
         payload = json.dumps(request)
-        result, reason = self._spawn_and_parse(helper, payload)
+        result, reason = self._spawn_and_parse(helper, payload, deadline=deadline)
         if reason in _RETRY_REASONS:
+            if deadline is not None and time.monotonic() > deadline:
+                log.info(
+                    "On-device helper %s failed (%s) past the pass deadline; "
+                    "not retrying", request.get("task"), reason,
+                )
+                return result, reason
             if reason == "rate-limited":
                 _sleep(_RATE_LIMIT_BACKOFF_S)
             log.info(
                 "On-device helper %s failed (%s); retrying once",
                 request.get("task"), reason,
             )
-            result, reason = self._spawn_and_parse(helper, payload)
+            result, reason = self._spawn_and_parse(
+                helper, payload, deadline=deadline,
+            )
         return result, reason
 
     def _spawn_and_parse(
-        self, helper: Path, payload: str,
+        self, helper: Path, payload: str, *, deadline: "float | None" = None,
     ) -> tuple[dict | None, str | None]:
-        stdout, reason = _spawn_helper(helper, payload, _verb_timeout_s())
+        timeout_s = _verb_timeout_s()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            timeout_s = min(timeout_s, max(_MIN_VERB_TIMEOUT_S, remaining))
+        stdout, reason = _spawn_helper(helper, payload, timeout_s)
         if stdout is None:
             return None, reason
         if len(stdout) > _MAX_ANSWER_STDOUT_BYTES:

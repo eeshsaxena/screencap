@@ -83,6 +83,7 @@ coexistence story) for the same reason ``scrub_worker`` does.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -93,6 +94,8 @@ from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from screencap.chunk_processor import ChunkStatus
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "Lifecycle",
@@ -106,6 +109,7 @@ __all__ = [
     "LedgerError",
     "EvictionRefused",
     "ensure_pipeline_state_schema",
+    "open_ledger_or_none",
     "bump_scrub_generation",
     "from_chunk_status",
     "reconcile_ledger_from_disk",
@@ -507,6 +511,29 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         pass
     finally:
         conn.close()
+
+
+def open_ledger_or_none(recording_dir: "Path | str") -> "PipelineLedger | None":
+    """Open ``recording_dir``'s ledger with the schema ensured; ``None`` fails open.
+
+    The shared opener behind ``terminal_stage._open_ledger`` and
+    ``ondevice_pipeline._open_cache_ledger``: a missing ``recording.db`` (legacy
+    single-file recording) or ANY open/migration error yields ``None`` — callers
+    proceed without ledger bookkeeping (and without the naming cache /
+    staleness guard) rather than failing the pass.
+    """
+    try:
+        db_path = Path(recording_dir) / "recording.db"
+        if not db_path.exists():
+            return None
+        ensure_pipeline_state_schema(db_path)
+        return PipelineLedger(db_path)
+    except Exception as exc:  # noqa: BLE001 — the ledger is bookkeeping, never a gate
+        log.debug(
+            "pipeline_state: ledger unavailable for %s (%s); proceeding without it",
+            recording_dir, exc,
+        )
+        return None
 
 
 def _now() -> float:
@@ -1344,7 +1371,9 @@ class PipelineLedger:
         digest_hash: str,
         name: str,
         category: "str | None",
-    ) -> None:
+        *,
+        expected_generation: "int | None" = None,
+    ) -> bool:
         """Persist one completed naming call (delete-then-insert, idempotent).
 
         Written under the terminal-stage flock as each call completes (KTD-6),
@@ -1352,12 +1381,31 @@ class PipelineLedger:
         span-scoped (any prior digest for the same span goes), so a span holds
         exactly its CURRENT digest's name and a re-run never duplicates.
         Defensively creates the table so an old DB caches on first use.
+
+        ``expected_generation`` (KTD-10, per-write half): when given, the scrub
+        generation is re-read INSIDE the transaction and a mismatch — a
+        retroactive scrub landed since the pass snapshotted it — skips the
+        write entirely and returns ``False`` (the window stays named-but-
+        uncached this pass). Returns ``True`` when the row was written. The
+        end-of-pass :meth:`finalize_window_names` guard is unchanged and still
+        owns the hand-nothing-to-sinks decision.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(_ONDEVICE_NAMES_DDL)
+                if expected_generation is not None:
+                    try:
+                        row = conn.execute(
+                            "SELECT generation FROM scrub_generation WHERE id=1"
+                        ).fetchone()
+                        gen = int(row[0]) if row is not None else 0
+                    except sqlite3.OperationalError:
+                        gen = 0
+                    if gen != int(expected_generation):
+                        conn.commit()
+                        return False
                 conn.execute(
                     "DELETE FROM ondevice_window_names "
                     "WHERE window_start=? AND window_end=?",
@@ -1371,6 +1419,7 @@ class PipelineLedger:
                      _now()),
                 )
                 conn.commit()
+                return True
             except Exception:
                 conn.rollback()
                 raise

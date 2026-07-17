@@ -166,6 +166,35 @@ def test_sub_60s_fragments_forward_merge():
     assert _spans(windows2) == [(1000.0, 1340.0)]
 
 
+def test_floor_never_merges_across_idle_gaps():
+    # A sub-60s tail fragment merges backward WITHIN its segment — never
+    # forward across the idle gap into the next segment.
+    events = [
+        _switch(1000.0, _VSCODE, "a"),
+        _type(1090.0, "x"),
+        _type(1180.0, "y"),
+        _switch(1230.0, _CHROME, "b"),  # 30s fragment at the segment tail
+        _click(1260.0),
+        _switch(1700.0, _SLACK, "c"),   # 440s idle gap → a new segment
+        _type(1800.0, "z"),
+        _click(1900.0),
+    ]
+    windows = build_candidate_windows(events, rest_threshold=120.0)
+    assert _spans(windows) == [(1000.0, 1260.0), (1700.0, 1900.0)]
+
+    # A lone under-floor segment stays its own window rather than swallowing
+    # the far side of the gap.
+    events2 = [
+        _switch(1000.0, _VSCODE, "a"),
+        _click(1030.0),                 # a lone 30s segment
+        _switch(2000.0, _SLACK, "c"),
+        _type(2100.0, "z"),
+        _click(2200.0),
+    ]
+    windows2 = build_candidate_windows(events2, rest_threshold=120.0)
+    assert _spans(windows2) == [(1000.0, 1030.0), (2000.0, 2200.0)]
+
+
 def _capped_day() -> list[dict]:
     """Six same-app bursts (durations 240,60,60,240,240,240) split by 400s gaps."""
     events: list[dict] = []
@@ -389,6 +418,38 @@ def test_blocked_overlap_stripped_and_full_block_fails_closed():
     # Unblocked windows keep their content.
     assert digests[0].usable
     assert digests[0].payload["timeline"][0]["typed"] == ["def foo():", "return 1"]
+
+
+def test_pass_predicate_forwards_all_transcript_timestamps(monkeypatch):
+    """The strip-coverage forwarding must include EVERY transcript segment's
+    absolute timestamp — not just the first 20 per chunk — so a late segment
+    inside a span window keeps its fail-closed coverage protection."""
+    from screencap.segmentation import windows as windows_mod
+
+    segs = [
+        {"start": 10.0 * k, "end": 10.0 * k + 5.0, "text": f"seg {k}"}
+        for k in range(30)
+    ]
+    manifests = [{"chunk_index": 0, "chunk_start": 1000.0, "chunk_end": 2000.0}]
+    source = _fixtures.InMemorySource(
+        events_by_chunk={0: []}, transcripts_by_chunk={0: {"segments": segs}},
+    )
+    forwarded: dict = {}
+
+    def _spy(blocked_source, window, strip_tss):
+        forwarded["window"] = window
+        forwarded["tss"] = list(strip_tss)
+        return _never_blocked
+
+    monkeypatch.setattr(windows_mod, "_resolve_blocked_predicate", _spy)
+    events = [{"timestamp": 1005.0}]
+    windows_mod._resolve_pass_predicate(object(), manifests, source, events)
+
+    # Segment 25 (abs 1000 + 250) is forwarded — beyond the old [:20] cap.
+    assert 1000.0 + segs[25]["start"] in forwarded["tss"]
+    transcript_tss = [t for t in forwarded["tss"] if t != 1005.0]
+    assert len(transcript_tss) == 30  # every segment, none capped away
+    assert forwarded["window"] == (1000.0, 2000.0)
 
 
 def test_unstrippable_window_fails_closed(tmp_path):

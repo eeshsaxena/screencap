@@ -25,6 +25,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -903,6 +904,26 @@ class TestRetryTaxonomy:
         assert res.reason == reason
         assert _calls(cf) == 1  # single attempt — never retried
         assert naps == []
+
+    @pytest.mark.parametrize("reason", ["rate-limited", "decoding-failure"])
+    def test_past_deadline_skips_retry_and_backoff(
+        self, tmp_path, helper_env, naps, reason
+    ):
+        """KTD-7: past the caller's pass deadline the retryable reasons are
+        NOT retried (and the rate-limit backoff sleep is skipped) — the halt
+        must not burn further model calls."""
+        cf = tmp_path / "count"
+        helper_env(_verb_helper(tmp_path, [_unavailable(reason)], count_file=cf))
+        provider = OnDeviceProvider()
+
+        result, got = provider._call_verb(
+            {"task": "day-summary", "tasks": []},
+            deadline=time.monotonic() - 1.0,  # already past the budget
+        )
+
+        assert result is None and got == reason
+        assert _calls(cf) == 1  # no retry past the deadline
+        assert naps == []       # and no backoff sleep either
 
 
 class TestLegacyReasonRecording:

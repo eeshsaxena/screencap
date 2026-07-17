@@ -19,6 +19,15 @@ from screencap.segmentation.provider import (
     SegmentResult,
 )
 
+# Halt pseudo-reasons that must STOP the chain (SCR-275 KTD-7/KTD-10): a
+# quiesce stop or a mid-pass retroactive scrub cancelled the pass — cascading
+# to the next backend would immediately re-run the very pass the halt just
+# cancelled. String literals deliberately mirror ``ondevice_pipeline.
+# REASON_STOPPED`` / ``REASON_STALE_SCRUB`` (pinned by tests) rather than
+# importing them: this module stays import-light, and ``ondevice_pipeline``
+# pulls the whole windows/pipeline_state surface at import time.
+_HALT_REASONS = ("stopped", "stale-scrub")
+
 
 class ChainedOnDeviceProvider:
     """Try each on-device backend in order; cascade only on ``PROVIDER_UNAVAILABLE``.
@@ -44,6 +53,13 @@ class ChainedOnDeviceProvider:
         for backend in self._backends:
             result = backend.segment(activity_summary)
             if result is PROVIDER_UNAVAILABLE:
+                reason = getattr(backend, "last_unavailable_reason", None)
+                if reason in _HALT_REASONS:
+                    # A halted pass (quiesce stop / mid-pass scrub) is NOT a
+                    # real unavailability — do not try the next backend;
+                    # forward the halt so the terminal stage short-circuits.
+                    self.last_unavailable_reason = reason
+                    return result
                 continue  # this backend could not run — try the next
             # A tasks dict (use it) OR None (ran, declined — fail-open) stops here.
             self.last_unavailable_reason = getattr(

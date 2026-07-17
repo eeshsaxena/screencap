@@ -714,27 +714,61 @@ def test_scrub_fails_open_when_cache_tables_absent(tmp_path):
     assert entry["scrub_status"] == "completed"
 
 
+def _bump_generation(db_path: Path) -> None:
+    """Simulate a concurrent scrub committing between naming calls."""
+    from screencap.pipeline_state import bump_scrub_generation
+
+    conn = sqlite3.connect(str(db_path))
+    bump_scrub_generation(conn)
+    conn.commit()
+    conn.close()
+
+
 def test_mid_pass_scrub_trips_staleness_guard(tmp_path):
-    """A scrub landing mid-pass → zero pre-scrub cache writes survive, no result."""
+    """A scrub landing mid-pass → zero pre-scrub cache writes survive, and the
+    pass returns the unavailable sentinel with the distinct ``stale-scrub``
+    reason (not a real unavailability — the terminal stage short-circuits)."""
     rec = _make_rec(tmp_path)
 
     def _name(_payload):
         n = len(provider.name_calls)
         if n == 1:
-            # Simulate a concurrent scrub committing between naming calls.
-            conn = sqlite3.connect(str(rec.db_path))
-            from screencap.pipeline_state import bump_scrub_generation
-
-            bump_scrub_generation(conn)
-            conn.commit()
-            conn.close()
+            _bump_generation(rec.db_path)
         return CallResult((f"Named {n}", "development"), None)
 
     provider = _ScriptedProvider(name_fn=_name)
     result = _run(provider, rec)
 
-    assert result is None  # commit nothing further, no result to sinks
+    assert result is PROVIDER_UNAVAILABLE  # nothing reaches the sinks
+    assert provider.last_unavailable_reason == "stale-scrub"
     assert rec.cache_rows() == []  # this pass's rows were deleted
+
+
+def test_mid_pass_generation_bump_gates_subsequent_cache_writes(tmp_path):
+    """Each store re-checks the scrub generation AT WRITE TIME: a bump landing
+    mid-pass means every later store commits nothing (the window stays
+    named-but-uncached), not merely that finalize cleans up afterwards."""
+    rec = _make_rec(tmp_path)
+    rows_seen_by_third_call: list[int] = []
+
+    def _name(_payload):
+        n = len(provider.name_calls)
+        if n == 2:
+            # Bump BETWEEN window 1's committed store and window 2's store.
+            _bump_generation(rec.db_path)
+        if n == 3:
+            # Window 2's store was gated at write time — only window 1's row
+            # exists while the pass is still running.
+            rows_seen_by_third_call.append(len(rec.cache_rows()))
+        return CallResult((f"Named {n}", "development"), None)
+
+    provider = _ScriptedProvider(name_fn=_name)
+    result = _run(provider, rec)
+
+    assert rows_seen_by_third_call == [1]
+    assert result is PROVIDER_UNAVAILABLE  # the end-of-pass guard still trips
+    assert provider.last_unavailable_reason == "stale-scrub"
+    assert rec.cache_rows() == []  # window 1's pre-bump row was deleted
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +824,31 @@ def test_context_window_failure_halves_digest_then_retries(tmp_path):
     assert result["tasks"][0]["name"] == "Fits now"
     assert len(sizes) == 3
     assert sizes[1] < sizes[0]  # each retry shrank the payload
+
+
+def test_stop_mid_halving_loop_exits_promptly(tmp_path):
+    """KTD-7 inside the halving loop: a stop landing between context-window
+    retries halts the loop at its next iteration — no further model calls,
+    the window goes mechanical with the ``stopped`` pseudo-reason."""
+    rec = _make_rec(tmp_path, {0: [1010.0]})
+    # A transcript-heavy window so halving has plenty of retries left.
+    rec.transcripts_by_chunk[0] = {"segments": [
+        {"start": 15.0 + k * 15.0, "end": 20.0 + k * 15.0,
+         "text": f"talking about part {k} of the work"}
+        for k in range(4)
+    ]}
+    stop = threading.Event()
+
+    def _name(_payload):
+        stop.set()  # the stop lands mid-loop, after the first naming call
+        return CallResult(None, "context-window")
+
+    provider = _ScriptedProvider(name_fn=_name)
+    result = _run(provider, rec, stop_event=stop)
+
+    assert result is PROVIDER_UNAVAILABLE  # sole window went mechanical
+    assert len(provider.name_calls) == 1  # NO halving retry after the stop
+    assert provider.last_unavailable_reason == "stopped"
 
 
 def test_context_window_exhausts_halvings_then_mechanical(tmp_path):

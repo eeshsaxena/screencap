@@ -176,15 +176,19 @@ def build_candidate_windows(
         points = [seg_start]
         points += [b for b in shift_bounds if seg_start < b < seg_end]
         points.append(seg_end)
+        seg_windows: list[CandidateWindow] = []
         for k in range(len(points) - 1):
             lo, hi = points[k], points[k + 1]
             if k == len(points) - 2:  # segment-final: end inclusive
                 n = bisect_right(action_ts, hi) - bisect_left(action_ts, lo)
             else:  # boundary event belongs to the next window
                 n = bisect_left(action_ts, hi) - bisect_left(action_ts, lo)
-            windows.append(CandidateWindow(lo, hi, n))
+            seg_windows.append(CandidateWindow(lo, hi, n))
+        # The floor is enforced PER idle-gap segment: a tiny fragment merges
+        # only within its own segment (a lone under-floor segment stands), so
+        # a floor merge can never span an idle gap and swallow the far side.
+        windows.extend(_enforce_floor(seg_windows, min_window_secs))
 
-    windows = _enforce_floor(windows, min_window_secs)
     windows = _enforce_cap(windows, max_windows)
     return windows
 
@@ -405,7 +409,10 @@ def _resolve_pass_predicate(
             if transcript is None:
                 continue
             chunk_start = manifest["chunk_start"]
-            for seg in transcript.get("segments", [])[:20]:
+            # EVERY transcript segment's absolute timestamp is forwarded — a
+            # cap here would leave late segments outside the strip coverage
+            # and fail-close whole windows that include them.
+            for seg in transcript.get("segments", []):
                 strip_tss.append(chunk_start + seg.get("start", 0))
         return _resolve_blocked_predicate(
             blocked_source, (session_start, session_end), strip_tss,

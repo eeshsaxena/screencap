@@ -144,10 +144,12 @@ class _SegRecorder:
 
     def __init__(self, *, raises: Exception | None = None) -> None:
         self.calls: list[str] = []
+        self.stop_events: list = []
         self._raises = raises
 
     def __call__(self, recording_dir, *, non_blocking: bool = True, **kw):  # noqa: ANN001
         self.calls.append(str(recording_dir))
+        self.stop_events.append(kw.get("stop_event"))
         # The daemon always passes non_blocking=True for the best-effort sweep.
         assert non_blocking is True
         if self._raises is not None:
@@ -238,6 +240,43 @@ async def test_segmentation_watch_swallows_a_busy_pass(
     # The watch task is still alive and the ambient stream is still active.
     assert sup._ambient_seg_task is not None and not sup._ambient_seg_task.done()
     assert sup.ambient_state()["active"] is True
+
+    await sup.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# A store-lock interrupt is swallowed too — and every pass carries the shared
+# quiesce flag as its stop_event (SCR-275 U4 / KTD-7).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_segmentation_watch_swallows_interrupt_and_threads_quiesce_event(
+    fake_engine_script: Path, isolated_lock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass halted for a store lock raises ``TerminalStageInterrupted``; the
+    worker logs it and the watch keeps ticking (it resumes on a later tick).
+    Every pass must also receive the Supervisor's shared ``_quiesce_event`` as
+    ``stop_event`` — the channel a ``storage.lock`` uses to halt the windowed
+    naming pass at its next safe boundary."""
+    from screencap.terminal_stage import TerminalStageInterrupted
+
+    monkeypatch.setenv("SCREENCAP_AMBIENT_ENABLED", "1")
+    recorder = _SegRecorder(raises=TerminalStageInterrupted("store lock"))
+    _install_recorder(monkeypatch, recorder)
+
+    sup = _make_supervisor(fake_engine_script)
+    await sup.reconcile_orphans()
+    await _wait_until(lambda: sup.ambient_state()["active"] is True)
+
+    # Despite every pass raising the interrupt, the watch keeps firing.
+    await _wait_until(lambda: len(recorder.calls) >= 3)
+    assert sup._ambient_seg_task is not None and not sup._ambient_seg_task.done()
+    assert sup.ambient_state()["active"] is True
+    # Each pass received the SAME shared quiesce flag, by identity.
+    assert recorder.stop_events
+    assert all(ev is sup._quiesce_event for ev in recorder.stop_events)
 
     await sup.shutdown()
 

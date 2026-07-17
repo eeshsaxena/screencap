@@ -282,6 +282,30 @@ def test_detail_read_failsafe_on_missing_table(tmp_path):
     assert ps.PipelineLedger(p).get_recording_outcome_detail() is None
 
 
+@pytest.mark.privacy
+def test_with_detail_tolerates_pre_u6_table(tmp_path):
+    """A hand-created pre-U6 table (reason, no ``detail`` column) with a stored
+    row: the paired accessor falls back to a reason-only read → (reason, None),
+    never an error."""
+    p = tmp_path / "recording.db"
+    _make_recording_db(p)
+    conn = sqlite3.connect(str(p))
+    conn.execute(
+        "CREATE TABLE pipeline_recording_outcome ("
+        " recording_id INTEGER PRIMARY KEY, reason TEXT NOT NULL, updated_at REAL)"
+    )
+    conn.execute(
+        "INSERT INTO pipeline_recording_outcome (recording_id, reason, updated_at) "
+        "VALUES (1, 'mechanical_only', 0.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    assert ps.PipelineLedger(p).get_recording_outcome_with_detail() == (
+        "mechanical_only", None,
+    )
+
+
 # --- SCR-275 U6 — wiring: detail + the stopped special-case -----------------
 
 
@@ -318,6 +342,22 @@ def test_wiring_produced_forces_detail_null(ledger, monkeypatch, tmp_path):
                  reason="decoding-failure")
     assert out == "produced_tasks"
     assert ledger.get_recording_outcome_detail() is None
+
+
+@pytest.mark.privacy
+def test_wiring_sticky_keep_preserves_prior_detail(ledger, monkeypatch, tmp_path):
+    """A degraded pass whose pick KEEPS a sticky produced/partial prior must
+    not clobber the stored detail with its own fresh failure reason — the
+    stored detail explains the RECORDED reason, not this pass's."""
+    ledger.set_recording_outcome("produced_tasks_partial", detail="context-window")
+
+    # A FAILED finalize pass (both fallbacks empty) carrying a fresh reason.
+    out = _drive(ledger, monkeypatch, tmp_path,
+                 decision=_Dec(DegradeAction.HEURISTIC), cloud=None, heuristic=None,
+                 is_live=False, reason="respond-failed")
+
+    assert out == "produced_tasks_partial"  # sticky keep
+    assert ledger.get_recording_outcome_detail() == "context-window"
 
 
 @pytest.mark.privacy

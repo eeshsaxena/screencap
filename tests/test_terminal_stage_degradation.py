@@ -178,6 +178,29 @@ class _ReasonProvider(_FakeProvider):
         self.last_unavailable_reason = reason
 
 
+class _SequenceProvider:
+    """A provider whose ``segment`` walks scripted ``(result, reason)`` pairs.
+
+    The retry-observing seam for the stale-scrub finalize tests: each call
+    consumes the next pair (the last repeats) and records the reason on the
+    ``last_unavailable_reason`` attribute like the real on-device provider.
+    """
+
+    def __init__(self, script: "list[tuple]") -> None:
+        self._script = list(script)
+        self.calls: list[dict] = []
+        self.last_unavailable_reason: str | None = None
+
+    def segment(self, activity_summary: dict):  # noqa: ANN201
+        self.calls.append(activity_summary)
+        if len(self._script) > 1:
+            result, reason = self._script.pop(0)
+        else:
+            result, reason = self._script[0]
+        self.last_unavailable_reason = reason
+        return result
+
+
 @pytest.fixture(autouse=True)
 def _isolate_run_dir(tmp_path, monkeypatch):
     """Point the terminal-stage lock dir at a per-test tmp dir."""
@@ -1113,3 +1136,98 @@ def test_mechanical_pass_never_overwrites_partial_rows(tmp_path, monkeypatch):
 
     assert [s.name for s in ledger.read_task_segments()] == rows_before
     assert ledger.get_recording_outcome() == "produced_tasks_partial"
+    # The stored detail explains the RECORDED partial — the mechanical pass's
+    # fresh failure reason must not have replaced it.
+    assert ledger.get_recording_outcome_detail() == "context-window"
+
+
+@pytest.mark.privacy
+def test_finalize_partial_pass_never_overwrites_produced_rows(tmp_path, monkeypatch):
+    """Finalize is strictly monotonic (partial never downgrades produced) — so
+    a finalize PARTIAL pass over a ``produced_tasks`` prior must ALSO skip
+    persisting its rows: the recorded reason and the stored rows stay in
+    agreement (no produced label above a partly-mechanical list). A LIVE
+    partial pass keeps persisting (the deliberate recompute — covered by
+    ``test_live_sequence_produced_then_mixed_recomputes_to_partial``)."""
+    from screencap import terminal_stage as ts
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_consent(monkeypatch, ConsentPolicy())
+    ledger = PipelineLedger(rec_dir / "recording.db")
+
+    _install_provider(monkeypatch, _ReasonProvider(_all_model_tasks(), reason=None))
+    ts.run_incremental_segmentation(rec_dir)
+    assert ledger.get_recording_outcome() == "produced_tasks"
+    rows_before = [s.name for s in ledger.read_task_segments()]
+    assert rows_before == ["Write design doc"]
+
+    _install_provider(
+        monkeypatch, _ReasonProvider(_mixed_source_tasks(), reason="decoding-failure"),
+    )
+    _run_terminal(rec_dir)  # finalize with a mixed-source provider result
+
+    assert [s.name for s in ledger.read_task_segments()] == rows_before
+    assert ledger.get_recording_outcome() == "produced_tasks"
+    assert ledger.get_recording_outcome_detail() is None
+
+
+# ---------------------------------------------------------------------------
+# SCR-275 KTD-10 — the distinct ``stale-scrub`` halt at finalize.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_stale_scrub_at_finalize_retries_once_over_settled_rows(
+    tmp_path, monkeypatch,
+):
+    """A staleness-guard trip at finalize gets ONE immediate same-call retry:
+    the scrub that tripped it has committed, so the post-scrub rows are
+    settled and the retry succeeds without waiting for a resume."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    provider = _SequenceProvider([
+        (PROVIDER_UNAVAILABLE, "stale-scrub"),
+        (_all_model_tasks(), None),
+    ])
+    _install_provider(monkeypatch, provider)
+    _install_consent(monkeypatch, ConsentPolicy())
+
+    _run_terminal(rec_dir)
+
+    assert len(provider.calls) == 2  # exactly one same-call retry
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Write design doc"]
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "produced_tasks"
+
+
+@pytest.mark.privacy
+def test_stale_scrub_second_trip_stays_provisional(tmp_path, monkeypatch):
+    """A second staleness trip takes the provisional path: no further retry,
+    neither the cloud-summary fallback nor the heuristic runs, nothing is
+    persisted, and the outcome settles as ``in_progress`` (re-runs on the
+    startup/unlock reconcile) — never ``nothing_to_name``."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    provider = _SequenceProvider([
+        (PROVIDER_UNAVAILABLE, "stale-scrub"),
+        (PROVIDER_UNAVAILABLE, "stale-scrub"),
+    ])
+    _install_provider(monkeypatch, provider)
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    _run_terminal(rec_dir)
+
+    assert len(provider.calls) == 2  # one retry, then the provisional path
+    assert cloud.calls == []  # a halted pass never consults cloud
+    assert not (rec_dir / "tasks.json").exists()  # no mechanical fallback either
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "in_progress"
+    assert ledger.get_recording_outcome_detail() is None
