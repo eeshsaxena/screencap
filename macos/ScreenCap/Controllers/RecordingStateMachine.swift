@@ -278,8 +278,10 @@ struct RecordingStateMachine {
                 // A local-only recording has nothing to upload, so the generic
                 // "may not have uploaded" copy is wrong for it — a force-stop just
                 // means its processing may be incomplete. Only a cloud/both (or
-                // unknown-destination, e.g. the crash-synthesized finalize) recording
-                // gets the upload-retry copy.
+                // unknown-destination, e.g. an unreadable `.recording_intent`)
+                // recording gets the upload-retry copy. Both the engine's own
+                // finalize and the daemon's crash-synthesized one carry the
+                // frozen intent destination.
                 let message: String
                 if event.destination == "local" {
                     message = "Recording stopped before it finished processing. Open the recording to finish it."

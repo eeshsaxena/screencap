@@ -208,8 +208,17 @@ async def test_worker_nonzero_exit_publishes_crash_and_finalized(
     )
     sub = await bus.subscribe()
 
+    # A crashed engine never emits its own `recording_finalized`, so the
+    # synthesized one must carry the frozen intent's destination — otherwise
+    # the app shows the upload-retry banner for local-only recordings.
+    capture_dir = tmp_path / "crash"
+    capture_dir.mkdir()
+    (capture_dir / ".recording_intent").write_text(
+        json.dumps({"version": 2, "destination": "local"})
+    )
+
     await supervisor.spawn(
-        schema.RecordingStartRequest(name="crash", output_dir=str(tmp_path / "crash"))
+        schema.RecordingStartRequest(name="crash", output_dir=str(capture_dir))
     )
 
     seen = [await asyncio.wait_for(sub.queue.get(), timeout=3.0) for _ in range(3)]
@@ -218,7 +227,9 @@ async def test_worker_nonzero_exit_publishes_crash_and_finalized(
     assert types.index(_stderr_events.EVENT_ENGINE_CRASHED) < types.index(
         _stderr_events.EVENT_RECORDING_FINALIZED
     )
-    assert seen[types.index(_stderr_events.EVENT_RECORDING_FINALIZED)]["force_stopped"] is True
+    finalized = seen[types.index(_stderr_events.EVENT_RECORDING_FINALIZED)]
+    assert finalized["force_stopped"] is True
+    assert finalized["destination"] == "local"
     await _wait_until(lambda: not isolated_lock.lock_is_active())
     await supervisor.shutdown()
 

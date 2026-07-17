@@ -1554,6 +1554,20 @@ class Supervisor:
                 started_at = (self._session_state or {}).get(
                     "started_at", time.time()
                 )
+                # The frozen routing destination lets the app tailor the
+                # force-stop banner: a `local` recording has nothing to upload,
+                # so without this field the app falls back to the
+                # upload-oriented "some data may not have uploaded" copy even
+                # for local-only recordings. Best-effort: None on any error
+                # keeps the conservative cloud fallback.
+                destination: str | None = None
+                if isinstance(capture_dir, str) and capture_dir:
+                    try:
+                        from screencap.catalog import read_intent
+
+                        destination = read_intent(Path(capture_dir))
+                    except Exception:  # noqa: BLE001
+                        destination = None
                 await self._publish_daemon_event(
                     _stderr_events.EVENT_RECORDING_FINALIZED,
                     name=(self._session_state or {}).get("recording_name"),
@@ -1564,6 +1578,7 @@ class Supervisor:
                     # synthesized event here is purely the crash signal.
                     force_stopped=(rc != 0),
                     disk_full=False,
+                    destination=destination,
                 )
                 self._finalized_seen = True
 
