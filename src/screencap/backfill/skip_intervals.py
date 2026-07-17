@@ -130,6 +130,17 @@ ORPHAN_SCREENSHOT = "orphan_screenshot"
 AMBIGUOUS_BROWSER_URL = "ambiguous_browser_url"
 AMBIGUOUS_TITLE = "ambiguous_title"
 AMBIGUOUS_SECURE_FIELD = "ambiguous_secure_field"
+# SCR-277: the persisted retroactive-disable purge spans. Unlike the residuals
+# above, these are NOT a re-derivation artifact — they are the ground truth
+# ``scrub_worker`` recorded when it deleted the disabled app's rows, the ONLY
+# surviving trace of a purged span (its window/action/screenshot rows are gone,
+# so canonical + uncovered-gap + ambiguity are all blind to it).
+RETROACTIVE_PURGE = "retroactive_purge"
+
+# The local-only table ``enforcement/scrub_worker.py`` writes its purge spans to,
+# in the SAME transaction as the row deletes (crash-consistent). recording.db is
+# never uploaded (R8), so these never leave the machine.
+_PURGED_INTERVAL_TABLE = "purged_interval"
 
 # How far OUTWARD a single-screenshot uncovered gap is padded so an adjacent
 # ALLOW window's classification cannot leak across the boundary, and so a frame
@@ -289,6 +300,12 @@ def derive_skip_intervals(
        ALLOW window's open-ended span (the uncovered-gap pass only catches frames
        *before the first* surviving window) and be indexed. Each orphan is skipped
        with a TIGHT interval so legitimately-indexable neighbours are untouched.
+    5. **Retroactive-purge** intervals (SCR-277) — the absolute spans
+       ``scrub_worker`` persisted into the ``purged_interval`` table when it
+       deleted a disabled app's rows. These are the only surviving trace of a
+       purged span (its rows are gone, so passes 1–4 are blind to a purged span a
+       benign window encloses), applied to EVERY timestamp — events, transcripts,
+       AND frames — not just the supplied ones.
 
     ``coverage_timestamps`` are timestamps that want the fail-closed
     uncovered-gap protection (pass 2) but are NOT flat-screenshot frame
@@ -318,6 +335,7 @@ def derive_skip_intervals(
 
     canonical: list[BlockedInterval] = []
     ambiguity: list[BlockedInterval] = []
+    purged: list[BlockedInterval] = []
     window_starts: list[float] = []
     surviving_screenshot_ts: set[float] | None = None
 
@@ -374,6 +392,25 @@ def derive_skip_intervals(
                 "derive_skip_intervals: ambiguity derivation failed", exc_info=True,
             )
 
+        # 3b. Retroactive-purge intervals (SCR-277). These are the ONLY surviving
+        # trace of a disabled app's span — its rows are deleted, so the canonical
+        # and uncovered-gap passes are blind to a purged span that a benign window
+        # encloses. Fail-*closed* like canonical (not fail-open like the residuals
+        # above): a genuine read error while the table exists is an under-block of
+        # the authoritative purge set, so under ``require_canonical`` it must raise
+        # rather than silently drop protection. A missing table (no disable ever
+        # ran / legacy schema) is NOT an error — it yields an empty list.
+        try:
+            purged = _read_purged_intervals(db_path)
+        except Exception:
+            logger.warning(
+                "derive_skip_intervals: purged-interval read failed", exc_info=True,
+            )
+            if require_canonical:
+                raise CanonicalDerivationError(
+                    "purged_interval read did not succeed"
+                )
+
         # 4. Surviving ``screenshot`` rows for the orphan cross-check (SCR-191).
         # Fail-open on read error: None disables the cross-check (the
         # uncovered-gap + canonical passes still apply) rather than over-skipping
@@ -401,7 +438,7 @@ def derive_skip_intervals(
             screenshot_timestamps, surviving_screenshot_ts, start, end,
         )
 
-    return merge_intervals(canonical, ambiguity, gaps, orphans)
+    return merge_intervals(canonical, ambiguity, purged, gaps, orphans)
 
 
 def _derive_uncovered_gaps(
@@ -515,6 +552,49 @@ def _derive_orphan_screenshot_intervals(
             end=ts + _ORPHAN_PAD_SECONDS,
             action=PrivacyAction.EXCLUDE,
             reason=ORPHAN_SCREENSHOT,
+        ))
+    return out
+
+
+def _read_purged_intervals(db_path: Path) -> list[BlockedInterval]:
+    """Return the persisted retroactive-disable purge spans (SCR-277).
+
+    When a user retroactively "disables this app", ``enforcement/scrub_worker.py``
+    deletes that app's ``window_event`` / ``action_event`` / ``screenshot`` rows
+    and unlinks the frames — but the app's window titles, typed text, and
+    transcript segments still survive in the flat ``events_NNNN.jsonl`` /
+    ``transcript_NNNN.json`` the exporter wrote once and never rewrites. With the
+    rows gone, the canonical, ambiguity, and uncovered-gap passes are all blind to
+    a purged span that a surviving benign window ENCLOSES, so those stale flat
+    events would flow into the activity summary handed to a model.
+
+    ``scrub_worker`` therefore persists the active-span intervals it deletes into a
+    local-only ``purged_interval`` table, in the SAME transaction as the row
+    deletes (crash-consistent). We union them here as absolute EXCLUDE spans so any
+    event/transcript/frame timestamp inside a purged span is blocked. A NULL
+    ``end_ts`` means the target was active at recording end → +inf.
+
+    Returns ``[]`` when the table is absent — no disable ever ran, or a legacy
+    schema predating this table (either way there is no purged span to protect).
+    Intervals are NOT clipped to a caller's ``time_range``: an out-of-range span
+    matches no in-range timestamp anyway, and clipping an open-ended span would
+    silently shorten its protection.
+    """
+    with open_recording_db(db_path) as conn:
+        if not has_table(conn, _PURGED_INTERVAL_TABLE):
+            return []
+        rows = conn.execute(
+            f"SELECT start_ts, end_ts FROM {_PURGED_INTERVAL_TABLE} "
+            "WHERE start_ts IS NOT NULL"
+        ).fetchall()
+
+    out: list[BlockedInterval] = []
+    for start_ts, end_ts in rows:
+        out.append(BlockedInterval(
+            start=float(start_ts),
+            end=float(end_ts) if end_ts is not None else float("inf"),
+            action=PrivacyAction.EXCLUDE,
+            reason=RETROACTIVE_PURGE,
         ))
     return out
 

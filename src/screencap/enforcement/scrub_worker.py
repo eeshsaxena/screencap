@@ -84,7 +84,15 @@ _EMPTY_COUNTS: dict[str, int] = {
     "ondevice_window_names": 0,
     "task_segments": 0,
     "tasks_json_entries": 0,
+    "purged_intervals": 0,
 }
+
+# SCR-277: the local-only table this worker persists its retroactive-disable
+# purge spans to, read back by ``backfill.skip_intervals.derive_skip_intervals``
+# to block the disabled app's stale flat-file events/transcripts before a model.
+# The name is a schema contract shared by-literal with that reader (enforcement
+# must not import backfill — the privacy-package DAG guard pins the boundary).
+_PURGED_INTERVAL_TABLE = "purged_interval"
 
 
 def _purge_ondevice_window_names(
@@ -577,6 +585,55 @@ class ScrubWorker:
         )
         return conn.total_changes - before
 
+    def _persist_purged_intervals(
+        self,
+        cur: sqlite3.Cursor,
+        intervals: list[tuple[float, float]],
+        disabled_at: float | None,
+    ) -> int:
+        """Persist the purge ``intervals`` into ``purged_interval`` (SCR-277).
+
+        Called INSIDE the caller's ``BEGIN IMMEDIATE`` transaction, alongside the
+        row deletes, so the intervals are crash-consistent with them: a crash can
+        never leave the disabled app's rows deleted but its blocking span
+        unrecorded — which would reopen the hole where the purged span's stale
+        flat-file events/transcripts (the purge does NOT rewrite them) reach the
+        segmentation model, because the deletes leave the R11 re-derivation blind
+        to a span a surviving benign window encloses.
+
+        ``derive_skip_intervals`` (``backfill/skip_intervals.py``) reads this table
+        and unions the spans as absolute ``EXCLUDE`` blocks. The trailing
+        open-ended interval (``float('inf')`` end — target active at recording end)
+        is stored as ``end_ts = NULL``; the reader maps NULL → +inf.
+
+        The table is local-only: ``recording.db`` is never uploaded (R8), so the
+        spans never leave the machine. Created on demand (``IF NOT EXISTS``) so a
+        recording that never had a disable carries no table.
+        """
+        if not intervals:
+            return 0
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {_PURGED_INTERVAL_TABLE} ("
+            "  id INTEGER PRIMARY KEY,"
+            "  start_ts REAL NOT NULL,"
+            "  end_ts REAL,"
+            "  disabled_at REAL"
+            ")"
+        )
+        written = 0
+        for start_ts, end_ts in intervals:
+            cur.execute(
+                f"INSERT INTO {_PURGED_INTERVAL_TABLE} "
+                "(start_ts, end_ts, disabled_at) VALUES (?, ?, ?)",
+                (
+                    float(start_ts),
+                    None if end_ts == float("inf") else float(end_ts),
+                    float(disabled_at) if disabled_at is not None else None,
+                ),
+            )
+            written += 1
+        return written
+
     def _scrub_target(self, msg: dict[str, Any]) -> dict[str, int]:
         """Run the cascade delete for one disable target.
 
@@ -716,6 +773,17 @@ class ScrubWorker:
                 # are preserved (the ledger's protection predicate).
                 counts["task_segments"] = _purge_task_segments(
                     cur, conn, intervals,
+                )
+
+                # SCR-277: persist the purge spans in this SAME transaction as the
+                # row deletes, so the disabled app's stale flat-file events /
+                # transcripts (which the purge does NOT rewrite) can still be
+                # blocked before the segmentation model — the deletes leave the
+                # re-derivation blind to a span a benign window encloses. Written
+                # atomically with the deletes so a crash can't leave rows gone but
+                # the interval unrecorded (which would reopen the hole).
+                counts["purged_intervals"] = self._persist_purged_intervals(
+                    cur, intervals, msg.get("ts_unix"),
                 )
 
                 conn.commit()

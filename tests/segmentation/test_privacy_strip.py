@@ -102,6 +102,7 @@ def _blocks_email(ts: float) -> bool:
 
 def _make_db(
     path: Path, windows: list[dict], screenshots: list[float] | None = None,
+    purged: list[tuple[float, float | None]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.closing(sqlite3.connect(str(path))) as db:
@@ -152,6 +153,22 @@ def _make_db(
                 "image_path) VALUES (?, 1, ?, NULL)",
                 (i, ts),
             )
+        # SCR-277: the local-only ``purged_interval`` table scrub_worker writes,
+        # in the SAME transaction as its retroactive-disable row deletes. Present
+        # only once a disable has run; ``derive_skip_intervals`` unions these as
+        # absolute EXCLUDE spans (an ``end`` of None = open-ended → +inf).
+        if purged is not None:
+            db.execute(
+                "CREATE TABLE purged_interval ("
+                "id INTEGER PRIMARY KEY, start_ts REAL NOT NULL, "
+                "end_ts REAL, disabled_at REAL)"
+            )
+            for start_ts, end_ts in purged:
+                db.execute(
+                    "INSERT INTO purged_interval (start_ts, end_ts, disabled_at) "
+                    "VALUES (?, ?, 1000.0)",
+                    (start_ts, end_ts),
+                )
         db.commit()
 
 
@@ -324,6 +341,93 @@ def test_event_timestamps_not_orphan_flagged(tmp_path):
     titles = _apps(result)
     assert "main.py" in titles
     assert "#dev — Slack" in titles
+
+
+# ===========================================================================
+# SCR-277 — a retroactively-purged mid-recording span must not reach the model
+# ===========================================================================
+
+
+def test_purged_span_leaks_without_persisted_interval(tmp_path):
+    """Proof-first: with NO ``purged_interval`` table the purged span LEAKS.
+
+    This is the SCR-277 hole. The disable deleted the [2000, 3000) rows, but a
+    benign window at 1000 survives before it, so the canonical pass sees only the
+    enclosing benign [1000, +inf) ALLOW span and the uncovered-gap pass counts
+    2000 as 'covered' (2000 >= the earliest surviving window). Nothing blocks the
+    purged span, so the stale flat events' Gmail entry reaches the summary. The
+    persisted-interval tests below are what close it.
+    """
+    rec_dir = tmp_path / "rec-purge-noninterval"
+    rec_dir.mkdir()
+    _make_db(rec_dir / "recording.db", windows=[
+        {"ts": 1000.0, "bundle": "com.example.unknownbenign", "title": "start"},
+    ])  # no ``purged=`` → no purged_interval table
+    result = build_activity_summary(
+        "rec", _MANIFESTS, _source(), blocked_source=rec_dir,
+    )
+    assert "Gmail" in _apps(result), (
+        "baseline: a purged mid-recording span leaks when its interval was not "
+        "persisted — this is the hole persistence closes"
+    )
+
+
+def test_purged_span_persisted_interval_strips_events(tmp_path):
+    """A purged span sandwiched between surviving benign windows is stripped.
+
+    The recording.db has a benign window at 1000 (its ALLOW span [1000, +inf)
+    ENCLOSES the purged span, so canonical + uncovered-gap can't see it) and the
+    persisted ``purged_interval`` (2000, 3000) scrub_worker wrote. The stale flat
+    events still carry the purged Gmail ``window.switch`` (2000) and typed
+    ``secret password`` (2010); both must be stripped, while the benign windows
+    survive.
+    """
+    rec_dir = tmp_path / "rec-purged-events"
+    rec_dir.mkdir()
+    _make_db(
+        rec_dir / "recording.db",
+        windows=[
+            {"ts": 1000.0, "bundle": "com.example.unknownbenign", "title": "start"},
+        ],
+        purged=[(2000.0, 3000.0)],
+    )
+    result = build_activity_summary(
+        "rec", _MANIFESTS, _source(), blocked_source=rec_dir,
+    )
+    titles = _apps(result) if result else []
+    assert "Gmail" not in titles, "purged [2000,3000) span leaked its window title"
+    all_typed = [t for e in result["entries"] for t in e.get("typed", [])]
+    assert "secret password" not in all_typed, "purged span leaked its typed text"
+    # The raw-fallback structures (idle-gap heuristic input) are stripped too.
+    assert not any(2000.0 <= ts < 3000.0 for ts in result["raw_timestamps"])
+    # Benign activity outside the purge interval still passes through.
+    assert "main.py" in titles     # window.switch at 1100, ALLOW
+    assert "auth.py" in titles     # window.switch at 3000 (== purge end, half-open)
+
+
+def test_purged_span_persisted_interval_strips_transcript(tmp_path):
+    """A transcript segment inside a purged span is stripped.
+
+    Transcripts have NO DB-row analog (they only ever lived in the flat
+    ``transcript_NNNN.json``), so the persisted purge interval is their ONLY
+    guard. The stale transcript's segment at abs_ts 2200 is inside the purged
+    [2000, 3000) span and must not survive; the abs_ts 1050 segment is ALLOW.
+    """
+    rec_dir = tmp_path / "rec-purged-tx"
+    rec_dir.mkdir()
+    _make_db(
+        rec_dir / "recording.db",
+        windows=[
+            {"ts": 1000.0, "bundle": "com.example.unknownbenign", "title": "start"},
+        ],
+        purged=[(2000.0, 3000.0)],
+    )
+    result = build_activity_summary(
+        "rec", _MANIFESTS, _source(), blocked_source=rec_dir,
+    )
+    texts = [s["text"] for s in result["summary"].get("transcript", [])]
+    assert "Working in the editor" in texts        # ALLOW (abs_ts 1050)
+    assert "Reading a private email" not in texts   # purged (abs_ts 2200)
 
 
 # ===========================================================================

@@ -31,6 +31,7 @@ from screencap.backfill.skip_intervals import (
     AMBIGUOUS_SECURE_FIELD,
     AMBIGUOUS_TITLE,
     ORPHAN_SCREENSHOT,
+    RETROACTIVE_PURGE,
     UNCOVERED_GAP,
     CanonicalDerivationError,
     build_classifier_evaluator,
@@ -68,13 +69,16 @@ def _make_db(
     actions: list[dict] | None = None,
     with_browser_url: bool = True,
     pixel_ratio: float = 2.0,
+    purged: list[tuple[float, float | None]] | None = None,
 ) -> None:
     """Build a minimal recording.db with window_event (+ optional action_event).
 
     ``windows`` items: ``{ts, bundle, title, url, window_id}`` (any omitted →
     column NULL, *not* empty string — the raw NULL is the point of the
     ambiguity tests). ``with_browser_url=False`` simulates a legacy schema
-    predating the ``browser_url`` column.
+    predating the ``browser_url`` column. ``purged`` items ``(start_ts, end_ts)``
+    seed the SCR-277 ``purged_interval`` table scrub_worker persists (an
+    ``end_ts`` of None = open-ended → +inf); omit it to leave the table absent.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.closing(sqlite3.connect(str(path))) as db:
@@ -128,6 +132,18 @@ def _make_db(
                 "VALUES (?, 1, ?, ?, ?, ?)",
                 (i, a.get("name", "press"), a["ts"], a.get("key_char"), es_raw),
             )
+        if purged is not None:
+            db.execute(
+                "CREATE TABLE purged_interval ("
+                "id INTEGER PRIMARY KEY, start_ts REAL NOT NULL, "
+                "end_ts REAL, disabled_at REAL)"
+            )
+            for start_ts, end_ts in purged:
+                db.execute(
+                    "INSERT INTO purged_interval (start_ts, end_ts, disabled_at) "
+                    "VALUES (?, ?, 0.0)",
+                    (start_ts, end_ts),
+                )
         db.commit()
 
 
@@ -252,6 +268,105 @@ def test_uncovered_gap_biased_outward_no_leak(tmp_path):
     assert gap is not None and gap.reason == UNCOVERED_GAP
     assert gap.start < 100.0 < gap.end  # strictly outward on both sides
     assert gap.end < 200.0  # does not leak into the surviving window's span
+
+
+# --------------------------------------------------------------------------
+# Retroactive-purge intervals (SCR-277) — persisted spans, blind to deleted rows
+# --------------------------------------------------------------------------
+
+
+def test_purged_interval_blocks_under_enclosing_benign_window(tmp_path):
+    """A persisted ``purged_interval`` blocks even when a benign window covers it.
+
+    This is the SCR-277 shape: the disabled app's window_event rows are DELETED,
+    so a surviving benign window at 100 canonically spans [100, +inf) → ALLOW, and
+    the uncovered-gap pass counts 250 as 'covered' (250 >= 100). Only the persisted
+    (200, 300) purge span blocks it — as EXCLUDE / retroactive_purge — for both a
+    coverage (event) timestamp and a frame timestamp.
+    """
+    db = tmp_path / "recording.db"
+    _make_db(
+        db,
+        windows=[
+            {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+        ],
+        purged=[(200.0, 300.0)],
+    )
+    classifier, evaluator = _public()
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        coverage_timestamps=[250.0],   # an event/transcript timestamp
+        screenshot_timestamps=[260.0],  # a frame timestamp
+    )
+    for ts in (250.0, 260.0):
+        blocked = _blocked_at(ts, intervals)
+        assert blocked is not None, f"{ts} inside the purged span was not blocked"
+        assert blocked.action == PrivacyAction.EXCLUDE
+        assert blocked.reason == RETROACTIVE_PURGE
+    # A timestamp outside the purge span is still allowed (covered by the benign
+    # window) — the purge interval does not over-block.
+    assert _blocked_at(350.0, intervals) is None
+
+
+def test_purged_interval_applies_without_supplied_timestamps(tmp_path):
+    """Purge spans are absolute — they block even with no supplied timestamps.
+
+    Unlike the gap/orphan residuals (which key off supplied timestamps), the
+    persisted purge span is an absolute interval, so it appears in the merged set
+    regardless of whether the caller passes screenshot/coverage timestamps.
+    """
+    db = tmp_path / "recording.db"
+    _make_db(
+        db,
+        windows=[
+            {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+        ],
+        purged=[(200.0, 300.0)],
+    )
+    classifier, evaluator = _public()
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+    )
+    blocked = _blocked_at(250.0, intervals)
+    assert blocked is not None and blocked.reason == RETROACTIVE_PURGE
+
+
+def test_purged_interval_null_end_is_open_ended(tmp_path):
+    """A NULL ``end_ts`` blocks every later timestamp (open-ended → +inf)."""
+    db = tmp_path / "recording.db"
+    _make_db(
+        db,
+        windows=[
+            {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+        ],
+        purged=[(200.0, None)],
+    )
+    classifier, evaluator = _public()
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 10_000.0),
+        coverage_timestamps=[250.0, 9_000.0],
+    )
+    for ts in (250.0, 9_000.0):
+        blocked = _blocked_at(ts, intervals)
+        assert blocked is not None and blocked.reason == RETROACTIVE_PURGE
+
+
+def test_no_purged_table_is_not_an_error(tmp_path):
+    """A recording that never had a disable (no table) derives cleanly, no raise.
+
+    Absence of the ``purged_interval`` table is the normal case; it must not
+    raise even for the fail-closed ``require_canonical`` caller.
+    """
+    db = tmp_path / "recording.db"
+    _make_db(db, windows=[
+        {"ts": 100.0, "bundle": "com.example.unknownbenign", "title": "Notes"},
+    ])  # no purged= → no table
+    classifier, evaluator = _public()
+    intervals = derive_skip_intervals(
+        db, classifier=classifier, evaluator=evaluator, time_range=(0.0, 1000.0),
+        coverage_timestamps=[250.0], require_canonical=True,
+    )
+    assert _blocked_at(250.0, intervals) is None
 
 
 # --------------------------------------------------------------------------

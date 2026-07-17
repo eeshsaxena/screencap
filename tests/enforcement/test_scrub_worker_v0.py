@@ -1077,3 +1077,146 @@ def test_scrub_works_with_no_flush_primitives(tmp_path: Path) -> None:
 
     assert entry["scrub_status"] == "completed"
     assert entry["scrub_result"]["window_events"] == 1
+
+
+# ---------------------------------------------------------------------------
+# SCR-277 — the purge spans are persisted (crash-consistently) so the R11 strip
+# can still block the disabled app's stale flat-file events/transcripts
+# ---------------------------------------------------------------------------
+
+
+def _read_purged_intervals(conn: sqlite3.Connection) -> list[tuple[float, float | None]]:
+    """Return (start_ts, end_ts) rows from the ``purged_interval`` table, or []."""
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='purged_interval'"
+    ).fetchone()
+    if not has_table:
+        return []
+    return [
+        (row[0], row[1])
+        for row in conn.execute(
+            "SELECT start_ts, end_ts FROM purged_interval ORDER BY start_ts"
+        ).fetchall()
+    ]
+
+
+def test_purge_persists_bounded_interval(tmp_path: Path) -> None:
+    """A disabled app sandwiched between benign windows persists a bounded span.
+
+    Benign Safari at 100, target Spotify at 200, benign Safari at 300 → the
+    target's active span is [200 - prelude, 300). The purge deletes Spotify's
+    rows AND persists that span in ``purged_interval`` in the SAME transaction, so
+    the R11 re-derivation (blind to the now-deleted span) can still block it.
+    """
+    worker, db_path = _make_worker(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    rec_id = _seed_recording(conn)
+    _insert_window_event(
+        conn, recording_id=rec_id, timestamp=100.0,
+        bundle_id="com.apple.Safari", app_name="Safari",
+    )
+    _insert_window_event(
+        conn, recording_id=rec_id, timestamp=200.0,
+        bundle_id="com.spotify.client", app_name="Spotify",
+    )
+    _insert_window_event(
+        conn, recording_id=rec_id, timestamp=300.0,
+        bundle_id="com.apple.Safari", app_name="Safari",
+    )
+    conn.commit()
+    conn.close()
+
+    entry = worker._handle({
+        "kind": "app",
+        "bundle_id": "com.spotify.client",
+        "app_name": "Spotify",
+        "root_domain": None,
+        "ts_unix": 5000.0,
+        "source": "menubar",
+    })
+
+    assert entry["scrub_status"] == "completed"
+    assert entry["scrub_result"]["window_events"] == 1
+    assert entry["scrub_result"]["purged_intervals"] == 1
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # The deleted span and its persisted interval are crash-consistent: the
+        # Spotify row is gone AND the interval that covers it is recorded.
+        assert _count(conn, "window_event", "app_bundle_id = 'com.spotify.client'") == 0
+        rows = _read_purged_intervals(conn)
+        assert rows == [(198.0, 300.0)]  # 200 - 2.0s prelude → 300 (next benign)
+    finally:
+        conn.close()
+
+
+def test_purge_persists_open_ended_interval_as_null_end(tmp_path: Path) -> None:
+    """A target active at recording end persists ``end_ts = NULL`` (→ +inf).
+
+    Only a Spotify window survives at the tail, so its active interval is
+    open-ended. It must round-trip through the DB as a NULL ``end_ts`` — the
+    reader (``skip_intervals._read_purged_intervals``) maps NULL → +inf, so the
+    open-ended purge span blocks every later timestamp.
+    """
+    worker, db_path = _make_worker(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    rec_id = _seed_recording(conn)
+    _insert_window_event(
+        conn, recording_id=rec_id, timestamp=100.0,
+        bundle_id="com.apple.Safari", app_name="Safari",
+    )
+    _insert_window_event(
+        conn, recording_id=rec_id, timestamp=200.0,
+        bundle_id="com.spotify.client", app_name="Spotify",
+    )
+    conn.commit()
+    conn.close()
+
+    entry = worker._handle({
+        "kind": "app",
+        "bundle_id": "com.spotify.client",
+        "app_name": "Spotify",
+        "root_domain": None,
+        "ts_unix": 6000.0,
+        "source": "menubar",
+    })
+
+    assert entry["scrub_result"]["purged_intervals"] == 1
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = _read_purged_intervals(conn)
+        assert len(rows) == 1
+        start_ts, end_ts = rows[0]
+        assert start_ts == 198.0
+        assert end_ts is None  # open-ended → NULL, NOT a serialized inf
+    finally:
+        conn.close()
+
+
+def test_empty_target_persists_no_interval(tmp_path: Path) -> None:
+    """A no-op disable (nothing matched) writes no ``purged_interval`` rows."""
+    worker, db_path = _make_worker(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    rec_id = _seed_recording(conn)
+    _insert_window_event(
+        conn, recording_id=rec_id, timestamp=400.0,
+        bundle_id="com.apple.Safari", app_name="Safari",
+    )
+    conn.commit()
+    conn.close()
+
+    entry = worker._handle({
+        "kind": "app",
+        "bundle_id": "com.example.NotRunning",
+        "app_name": "Nothing",
+        "root_domain": None,
+        "ts_unix": 7000.0,
+        "source": "menubar",
+    })
+
+    assert entry["scrub_result"]["purged_intervals"] == 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert _read_purged_intervals(conn) == []
+    finally:
+        conn.close()
