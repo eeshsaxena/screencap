@@ -352,6 +352,7 @@ class Supervisor:
         poll_interval: float | None = None,
         startup_timeout: float | None = None,
         stop_timeout: float | None = None,
+        stop_kill_grace: float | None = None,
         reconcile_grace: float | None = None,
         start_gate: StartGate | None = None,
         clock: Callable[[], float] | None = None,
@@ -396,6 +397,17 @@ class Supervisor:
             if stop_timeout is not None
             else _float_env("SCREENCAP_DAEMON_STOP_TIMEOUT", 30.0)
         )
+        # SCR-273: hard backstop for the no-kill stop path. Must exceed the
+        # engine's real sequential post-SIGTERM drain (screen_recorder.py
+        # teardown: stop_scrub_worker 30s + stop_chunk_processor 300s deadline
+        # + 10s force grace, then finalize_uploads) with headroom, so only a
+        # genuinely hung engine is ever force-killed — a slow-but-progressing
+        # drain being killed here would reproduce the exact SCR-273 bug.
+        self._stop_kill_grace = (
+            stop_kill_grace
+            if stop_kill_grace is not None
+            else _float_env("SCREENCAP_DAEMON_STOP_KILL_GRACE", 630.0)
+        )
         self._reconcile_grace = (
             reconcile_grace
             if reconcile_grace is not None
@@ -407,6 +419,7 @@ class Supervisor:
         self._session_state: dict[str, Any] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._poll_task: asyncio.Task[None] | None = None
+        self._stop_backstop_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
         # Out-of-band engine ID-token seam (cloud recordings only). The file holds
         # the short-lived token; the refresh task re-mints it for recordings that
@@ -929,8 +942,20 @@ class Supervisor:
         force: bool = False,
         expected_claimant_pid: int | None = None,
         expected_started_at: float | None = None,
+        kill_on_timeout: bool = False,
     ) -> dict[str, Any]:
-        """Stop the active recording or a CAS-approved cross-claimant holder."""
+        """Stop the active recording or a CAS-approved cross-claimant holder.
+
+        ``kill_on_timeout``: when True, an engine still alive at
+        ``stop_timeout`` is SIGKILLed (the pre-SCR-273 bounded-time contract)
+        instead of being left to drain in the background. Reserved for callers
+        that are about to invalidate the engine's world and therefore MUST NOT
+        return while it can still write — today only ``storage.lock``, whose
+        KTD-15 seal force-detaches the volume the engine writes into. Every
+        other caller keeps the default False: the engine finishes its
+        finalize work (scrub OCR etc.) and the stop concludes via the exit
+        funnel, with ``final_state: "finalizing"`` returned immediately.
+        """
         async with self._operation_lock:
             if self._recovering:
                 raise errors.ReconcilingError(
@@ -1008,7 +1033,31 @@ class Supervisor:
                     )
                     final_state = "stopped"
                 except asyncio.TimeoutError:
+                    if proc.is_alive() and not kill_on_timeout:
+                        # SCR-273: an engine alive past stop_timeout is normally
+                        # still draining legitimate finalize work — the final
+                        # chunk's transcribe + scrub OCR can take minutes once
+                        # stills capture is on, and the engine's own drain
+                        # budget is 300s. Killing it here left scrub pending on
+                        # disk and synthesized a force_stopped finalize (the
+                        # "stopped before it finished processing" banner) on
+                        # every such stop. Instead, let it finish in the
+                        # background: re-arm the exit poll so the eventual exit
+                        # funnels through _handle_engine_exit exactly as a
+                        # normal self-exit would (lock release, resume,
+                        # ambient re-arm), and arm a hard backstop kill so a
+                        # truly hung engine still cannot outlive the daemon's
+                        # supervision.
+                        self._poll_task = asyncio.create_task(
+                            self._exit_poll(proc)
+                        )
+                        self._arm_stop_backstop(proc)
+                        return {"stopped": True, "final_state": "finalizing"}
                     if proc.is_alive():
+                        # kill_on_timeout caller (storage.lock): bounded-time
+                        # contract wins — the store is about to be sealed out
+                        # from under the engine, so it must not outlive this
+                        # return.
                         proc.kill()
                     final_state = "force_stopped"
                 try:
@@ -2494,6 +2543,36 @@ class Supervisor:
             )
             return await self._bus.subscribe()
 
+    def _arm_stop_backstop(self, proc: _PopenEngineProcess) -> None:
+        """Arm the post-stop hard-kill backstop (SCR-273).
+
+        Companion to the no-kill stop path: the engine was SIGTERMed and is
+        draining finalize work in the background. If it is still alive after
+        ``stop_kill_grace`` (default 330s — the engine's own 300s drain budget
+        plus margin), it is hung, not draining, and gets SIGKILLed. The
+        re-armed ``_exit_poll`` observes the exit either way, so this task
+        never runs the exit funnel itself.
+        """
+        if self._stop_backstop_task is not None and not self._stop_backstop_task.done():
+            # A repeated stop() during the same drain keeps the FIRST deadline —
+            # re-arming would reset the countdown, letting a retrying client
+            # postpone the hung-engine kill indefinitely.
+            return
+        self._stop_backstop_task = asyncio.create_task(
+            self._stop_backstop(proc)
+        )
+
+    async def _stop_backstop(self, proc: _PopenEngineProcess) -> None:
+        try:
+            await proc.wait(timeout=self._stop_kill_grace)
+        except asyncio.TimeoutError:
+            if proc.is_alive():
+                logger.warning(
+                    "engine still alive %.0fs after stop; force-killing",
+                    self._stop_kill_grace,
+                )
+                proc.kill()
+
     async def _cancel_exit_poll(self) -> None:
         """Cancel the engine exit poll task before a late subscribe.
 
@@ -2842,6 +2921,9 @@ class Supervisor:
         self._session_state = None
         self._stderr_task = None
         self._poll_task = None
+        if self._stop_backstop_task is not None and not self._stop_backstop_task.done():
+            self._stop_backstop_task.cancel()
+        self._stop_backstop_task = None
         if self._token_refresh_task is not None and not self._token_refresh_task.done():
             self._token_refresh_task.cancel()
         self._token_refresh_task = None

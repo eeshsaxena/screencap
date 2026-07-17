@@ -2732,6 +2732,9 @@ def stop(force, as_json):
     JSON envelope:
       {ok, schema_version, action, stopped, final_state, error}
     where ``action`` ∈ {"sigterm", "sigkill", "no_daemon", "no_recording"}.
+    ``final_state`` may be ``"finalizing"`` (SCR-273): the engine outlived the
+    daemon's stop budget and is finishing scrub/transcribe work in the
+    background; the stop has succeeded and the recording converges on its own.
     """
     from screencap.cli._autospawn import (
         LaunchAgentNotRunningError,
@@ -2817,10 +2820,14 @@ def stop(force, as_json):
     _stop_outcome["final_state"] = result.get("final_state")
     if not as_json:
         if _stop_outcome["stopped"]:
-            label = (
-                "force-stopped" if _stop_outcome["final_state"] == "force_stopped"
-                else "stopped"
-            )
+            if _stop_outcome["final_state"] == "force_stopped":
+                label = "force-stopped"
+            elif _stop_outcome["final_state"] == "finalizing":
+                # SCR-273: the engine outlived the stop budget and is draining
+                # finalize work (scrub/transcribe) in the background.
+                label = "stopped; still finalizing in the background"
+            else:
+                label = "stopped"
             console.print(f"[#22d3ee]Recording {label}.[/#22d3ee]")
         else:
             console.print(

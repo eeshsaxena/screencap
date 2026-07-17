@@ -77,6 +77,13 @@ def fake_engine_script(tmp_path: Path) -> Path:
 
 
             def handle_term(_signum, _frame) -> None:
+                if os.environ.get("FAKE_IGNORE_TERM") == "1":
+                    return  # hung engine: neither finalizes nor exits
+                # Simulated slow finalize drain (SCR-273): post-SIGTERM work
+                # (transcribe / scrub OCR) before the finalized event.
+                delay = float(os.environ.get("FAKE_TERM_DELAY", "0"))
+                if delay:
+                    time.sleep(delay)
                 if os.environ.get("FAKE_FINALIZE_ON_TERM", "1") == "1":
                     emit(
                         "recording_finalized",
@@ -268,6 +275,97 @@ async def test_worker_sigsegv_publishes_crash_and_finalized(
     assert finalized["force_stopped"] is True
     await _wait_until(lambda: not isolated_lock.lock_is_active())
     await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stop_lets_slow_finalize_drain_instead_of_killing(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
+) -> None:
+    """SCR-273: an engine still draining finalize work past stop_timeout is
+    left alive (stop returns ``finalizing``), and its own clean
+    ``recording_finalized`` (force_stopped=False) lands instead of a
+    kill-synthesized force-stop."""
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("FAKE_TERM_DELAY", "1.0")
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=0.05,
+        startup_timeout=2.0,
+        stop_timeout=0.3,
+        stop_kill_grace=10.0,
+    )
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="slow", output_dir=str(tmp_path / "slow"))
+    )
+    try:
+        final_sub = await bus.subscribe()
+        stopped = await supervisor.stop(force=False)
+        assert stopped == {"stopped": True, "final_state": "finalizing"}
+
+        while True:
+            finalized = await asyncio.wait_for(final_sub.queue.get(), timeout=5.0)
+            if finalized["type"] == _stderr_events.EVENT_RECORDING_FINALIZED:
+                break
+        assert finalized["force_stopped"] is False
+        await _wait_until(lambda: not isolated_lock.lock_is_active())
+        assert supervisor.current_session() is None
+    finally:
+        await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stop_backstop_kills_engine_hung_past_grace(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
+) -> None:
+    """SCR-273 backstop: an engine that ignores SIGTERM and never finalizes is
+    SIGKILLed after ``stop_kill_grace``, and the exit funnel synthesizes the
+    force-stopped finalize."""
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("FAKE_IGNORE_TERM", "1")
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=0.05,
+        startup_timeout=2.0,
+        stop_timeout=0.3,
+        stop_kill_grace=0.6,
+    )
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="hung", output_dir=str(tmp_path / "hung"))
+    )
+    try:
+        final_sub = await bus.subscribe()
+        stopped = await supervisor.stop(force=False)
+        assert stopped == {"stopped": True, "final_state": "finalizing"}
+        # A retried stop() during the drain must not reset the backstop
+        # deadline (it keeps the FIRST countdown), so the kill below still
+        # fires within the original grace despite this second call.
+        stopped_again = await supervisor.stop(force=False)
+        assert stopped_again == {"stopped": True, "final_state": "finalizing"}
+
+        while True:
+            finalized = await asyncio.wait_for(final_sub.queue.get(), timeout=5.0)
+            if finalized["type"] == _stderr_events.EVENT_RECORDING_FINALIZED:
+                break
+        assert finalized["force_stopped"] is True
+        await _wait_until(lambda: not isolated_lock.lock_is_active())
+    finally:
+        await supervisor.shutdown()
 
 
 def _write_lock(lock_file: Path, payload: dict) -> None:
