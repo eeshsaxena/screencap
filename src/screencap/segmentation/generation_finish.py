@@ -75,6 +75,9 @@ _GROUNDING_INSTRUCTIONS = (
     "activity, using ONLY the evidence provided below. Ground every claim in "
     "that evidence. If the evidence does not contain enough to answer, say so "
     "plainly and briefly — do not guess, invent, or draw on outside knowledge. "
+    "When the evidence is a timeline of apps and window titles, summarize what "
+    "the user was doing in your own words, but name only the apps, sites, and "
+    "durations that appear in the evidence — never invent an app, site, or number. "
     "Keep the answer concise."
 )
 

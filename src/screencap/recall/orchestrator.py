@@ -534,8 +534,17 @@ _AGGREGATE_RE = re.compile("|".join(_AGGREGATE_CUES), re.IGNORECASE)
 _RECAP_CUES = (
     r"\bwhat (?:did|have) (?:i|we) (?:do|done|been doing|work(?:ed|ing)? on|"
     r"get(?: done)?|been up to|been working on)\b",
+    # "what I did" / "what we worked on" word order — the mirror of the verb-first
+    # cue above, and the phrasing the original set missed (e.g. "what I did today").
+    r"\bwhat (?:i|we) (?:did|have done|got done|been doing|been working on|"
+    r"work(?:ed|ing)? on|was doing|were doing)\b",
     r"\bwhat was (?:i|we) (?:doing|working on|up to)\b",
     r"\bwalk me through (?:my|the|what)\b",
+    # Everyday recap openers. The aggregate cues already cover "recap" / "summar" /
+    # "overview", so "today's summary" needs no entry here. "my day" excludes the
+    # "my day job" false positive.
+    r"\bmy day\b(?!\s+job\b)",
+    r"\bcatch me up\b",
 )
 _RECAP_RE = re.compile("|".join(_RECAP_CUES), re.IGNORECASE)
 

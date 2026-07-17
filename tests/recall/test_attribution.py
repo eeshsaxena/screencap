@@ -25,8 +25,10 @@ import pytest
 
 from screencap.recall.attribution import (
     AttributionVerdict,
+    is_refusal,
     validate_attribution,
 )
+from screencap.recall.dispatch import REFUSAL_TEXT_FOUND_NO_ANSWER
 from screencap.recall.orchestrator import (
     CoverageDescriptor,
     CoverageState,
@@ -283,6 +285,13 @@ def test_refusal_always_passes_even_with_evidence():
         bundle=bundle,
     )
     assert verdict.ok is True
+
+
+def test_found_but_unanswerable_refusal_is_recognized_as_a_refusal():
+    """The dispatch's found-but-unanswerable message (KTD3/R5) must read as a
+    refusal marker so a re-validation of it passes — otherwise a downstream
+    re-check could treat the honest decline as a fabricated answer."""
+    assert is_refusal(REFUSAL_TEXT_FOUND_NO_ANSWER) is True
 
 
 # ===========================================================================
