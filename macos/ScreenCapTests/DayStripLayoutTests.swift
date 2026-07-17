@@ -194,6 +194,203 @@ final class DayStripLayoutTests: XCTestCase {
         )
     }
 
+    // MARK: - U5: gap → cause resolver
+
+    /// One recording per end status; the gap that follows each maps to exactly
+    /// the contract's cause: clean → nothing on file, interrupted → cut short
+    /// (anchored at the span end), live → still recording, unknown/nil →
+    /// can't verify (R4/R7/R11 — a live recording is never called interrupted).
+    func testGapCauseMapsEachEndStatus() {
+        let now = dayStart + 20 * hour
+        func cause(_ endStatus: String?) -> DayStripLayout.GapCause {
+            let span = DayStripLayout.SpanProvenance(
+                startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: endStatus
+            )
+            return DayStripLayout.gapCause(
+                gapStartMs: dayStart + 10 * hour, gapEndMs: dayStart + 11 * hour,
+                spans: [span], storeMounted: true, provenanceReady: true, nowMs: now
+            )
+        }
+        XCTAssertEqual(cause("clean"), .nothingOnFile)
+        XCTAssertEqual(cause("interrupted"), .interrupted(aroundMs: dayStart + 10 * hour))
+        XCTAssertEqual(cause("live"), .stillRecording)
+        XCTAssertEqual(cause("unknown"), .cantVerify)
+        XCTAssertEqual(cause(nil), .cantVerify, "older daemon (no end_status) is unprovable → can't verify")
+        XCTAssertEqual(cause("something-new"), .cantVerify, "unrecognized wire status never earns a claim")
+    }
+
+    /// Future time claims NOTHING (R11): a gap at/after now resolves to no
+    /// cause even when the preceding recording ended provably.
+    func testGapCauseFutureClaimsNothing() {
+        let now = dayStart + 10 * hour
+        let span = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "interrupted"
+        )
+        XCTAssertEqual(
+            DayStripLayout.gapCause(
+                gapStartMs: now, gapEndMs: now + hour,
+                spans: [span], storeMounted: true, provenanceReady: true, nowMs: now
+            ),
+            DayStripLayout.GapCause.none
+        )
+    }
+
+    /// Load gate: while the day query hasn't returned (or failed), EVERY gap
+    /// carries no cause claim — even one that would read "interrupted" once
+    /// loaded.
+    func testGapCauseNotLoadedClaimsNothingForEveryGap() {
+        let span = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "interrupted"
+        )
+        XCTAssertEqual(
+            DayStripLayout.gapCause(
+                gapStartMs: dayStart + 10 * hour, gapEndMs: dayStart + 11 * hour,
+                spans: [span], storeMounted: false, provenanceReady: false,
+                nowMs: dayStart + 20 * hour
+            ),
+            DayStripLayout.GapCause.none
+        )
+    }
+
+    /// Store gate: storeMounted == false makes every (past) empty stretch
+    /// "can't verify" — never "nothing on file" — even after a clean shutdown.
+    func testGapCauseStoreLockedReadsCantVerify() {
+        let span = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "clean"
+        )
+        XCTAssertEqual(
+            DayStripLayout.gapCause(
+                gapStartMs: dayStart + 10 * hour, gapEndMs: dayStart + 11 * hour,
+                spans: [span], storeMounted: false, provenanceReady: true,
+                nowMs: dayStart + 20 * hour
+            ),
+            DayStripLayout.GapCause.cantVerify
+        )
+    }
+
+    /// A leading gap (no same-day recording before it) is an honest data claim:
+    /// the day query returned and holds nothing there → "nothing on file".
+    func testGapCauseLeadingGapReadsNothingOnFile() {
+        let span = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "clean"
+        )
+        XCTAssertEqual(
+            DayStripLayout.gapCause(
+                gapStartMs: dayStart + 8 * hour, gapEndMs: dayStart + 9 * hour,
+                spans: [span], storeMounted: true, provenanceReady: true,
+                nowMs: dayStart + 20 * hour
+            ),
+            DayStripLayout.GapCause.nothingOnFile
+        )
+    }
+
+    /// A gap straddling now splits so the pre-now part can carry a cause while
+    /// the future part claims nothing (R11 — "still recording" is bounded to
+    /// now). Fully-past and fully-future gaps pass through unsplit.
+    func testSplitGapAtNowBoundsClaimsToNow() {
+        let now = dayStart + 10 * hour
+        let straddling = DayStripLayout.splitGapAtNow(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 11 * hour, nowMs: now
+        )
+        XCTAssertEqual(straddling.count, 2)
+        XCTAssertEqual(straddling[0].startMs, dayStart + 9 * hour)
+        XCTAssertEqual(straddling[0].endMs, now)
+        XCTAssertEqual(straddling[1].startMs, now)
+        XCTAssertEqual(straddling[1].endMs, dayStart + 11 * hour)
+        let past = DayStripLayout.splitGapAtNow(
+            startMs: dayStart + 8 * hour, endMs: dayStart + 9 * hour, nowMs: now
+        )
+        XCTAssertEqual(past.count, 1)
+        let future = DayStripLayout.splitGapAtNow(
+            startMs: dayStart + 11 * hour, endMs: dayStart + 12 * hour, nowMs: now
+        )
+        XCTAssertEqual(future.count, 1)
+    }
+
+    // MARK: - U5: hover hit targets (R13)
+
+    /// A sliver region's hover frame expands (centered) to the 6pt minimum;
+    /// an already-wide region keeps its own frame.
+    func testHitFramesExpandSliversToMinimumWidth() {
+        let frames = DayStripLayout.hitFrames([(minX: 100, width: 2), (minX: 200, width: 40)])
+        let sliver = frames.first { $0.index == 0 }!
+        XCTAssertEqual(sliver.minX, 98)
+        XCTAssertEqual(sliver.width, 6)
+        let wide = frames.first { $0.index == 1 }!
+        XCTAssertEqual(wide.minX, 200)
+        XCTAssertEqual(wide.width, 40)
+    }
+
+    /// Smaller-region-wins at boundary collisions: the returned draw order is
+    /// wider-originals-first, so the smaller region renders later (on top) and
+    /// wins the hover where expanded frames collide (later ZStack children win
+    /// hit-testing). Ties keep input order.
+    func testHitFramesOrderSmallerRegionsOnTop() {
+        let frames = DayStripLayout.hitFrames([
+            (minX: 0, width: 3), (minX: 4, width: 300), (minX: 500, width: 20),
+        ])
+        XCTAssertEqual(frames.map(\.index), [1, 2, 0], "widest drawn first, narrowest last (topmost)")
+        let ties = DayStripLayout.hitFrames([(minX: 0, width: 10), (minX: 50, width: 10)])
+        XCTAssertEqual(ties.map(\.index), [0, 1], "equal widths keep stable input order")
+    }
+
+    // MARK: - U5: cause strings (one home for hover + VoiceOver, R12)
+
+    /// The dispatcher yields exactly one honest sentence per cause — and `nil`
+    /// for `.none` (future / not loaded), which must claim nothing.
+    func testGapCauseLabelsStateOneCauseWithTimeRange() {
+        let start = dayStart, end = dayStart + hour
+        let nothing = DayStripAccessibility.gapCauseLabel(.nothingOnFile, startMs: start, endMs: end)!
+        XCTAssertTrue(nothing.hasPrefix("Nothing on file, "), "data claim — never 'no recording was running'")
+        XCTAssertTrue(nothing.contains(" to "))
+        let cut = DayStripAccessibility.gapCauseLabel(.interrupted(aroundMs: end), startMs: start, endMs: end)!
+        XCTAssertTrue(cut.hasPrefix("Recording was cut short around "))
+        XCTAssertEqual(
+            DayStripAccessibility.gapCauseLabel(.stillRecording, startMs: start, endMs: end),
+            "Still recording"
+        )
+        let unverified = DayStripAccessibility.gapCauseLabel(.cantVerify, startMs: start, endMs: end)!
+        XCTAssertTrue(unverified.hasPrefix("Can't verify what happened here, "))
+        XCTAssertNil(DayStripAccessibility.gapCauseLabel(.none, startMs: start, endMs: end))
+    }
+
+    /// R6: a purged span names the rule when identity is on the wire (app name
+    /// preferred, then root domain, then bundle id) and degrades to the generic
+    /// privacy-rule sentence when identity-free — never inventing a name.
+    func testPurgedLabelNamesRuleAndDegradesIdentityFree() {
+        let start = dayStart, end = dayStart + hour
+        let named = DayStripAccessibility.purgedLabel(
+            DayPurgedInterval(startMs: start, endMs: end, bundleId: "com.hnc.Discord", appName: "Discord")
+        )
+        XCTAssertTrue(named.hasPrefix("Removed by your 'disable Discord' rule, "))
+        let domain = DayStripAccessibility.purgedLabel(
+            DayPurgedInterval(startMs: start, endMs: end, rootDomain: "discord.com")
+        )
+        XCTAssertTrue(domain.hasPrefix("Removed by your 'disable discord.com' rule, "))
+        let bundleOnly = DayStripAccessibility.purgedLabel(
+            DayPurgedInterval(startMs: start, endMs: end, bundleId: "com.hnc.Discord")
+        )
+        XCTAssertTrue(bundleOnly.hasPrefix("Removed by your 'disable com.hnc.Discord' rule, "))
+        let bare = DayStripAccessibility.purgedLabel(DayPurgedInterval(startMs: start, endMs: end))
+        XCTAssertTrue(bare.hasPrefix("Removed by a privacy rule, "))
+    }
+
+    /// The purged-band mapping is a straight union across the day's recordings
+    /// (identity rides along for the R6 copy).
+    func testPurgedBandsUnionAcrossRecordings() {
+        let spans = [
+            DaySegmentRecording(
+                name: "rec-a", startMs: dayStart, endMs: dayStart + hour,
+                purged: [DayPurgedInterval(startMs: dayStart + 100, endMs: dayStart + 200, appName: "Discord")]
+            ),
+            DaySegmentRecording(name: "rec-b", startMs: dayStart + 2 * hour, endMs: dayStart + 3 * hour),
+        ]
+        XCTAssertEqual(
+            DayPurgedInterval.bands(from: spans),
+            [DayPurgedInterval(startMs: dayStart + 100, endMs: dayStart + 200, appName: "Discord")]
+        )
+    }
+
     // MARK: - Accessibility labels
 
     func testAccessibilityLabelsNameSegmentBlockedAndPlayhead() {

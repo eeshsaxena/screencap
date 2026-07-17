@@ -27,6 +27,10 @@ struct DayTimelineView: View {
     @State private var loadPhase: LoadPhase = .loading
     @State private var reloading = false
     @State private var spans: [DaySegmentRecording] = []
+    /// U5 — store gate: false while the vault is sealed (`store_mounted` on the
+    /// `timeline.day` response). Feeds the strip so every empty stretch reads
+    /// "can't verify" instead of "nothing on file" when the store is locked.
+    @State private var storeMounted = true
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var searchTask: Task<Void, Never>?
@@ -476,6 +480,19 @@ struct DayTimelineView: View {
                 matchesMs: dayMatchesMs,
                 playheadMs: engine.currentDayMs,
                 onSeek: { engine.seek(toDayMs: $0) },
+                // U5 — provenance: purged spans (R10/R6), unverifiable
+                // intervals, the gap-cause inputs, and the load/store gates.
+                purgedBands: DayPurgedInterval.bands(from: spans),
+                unverifiableBands: spans.flatMap { span in
+                    span.unverifiable.map { (startMs: $0.startMs, endMs: $0.endMs) }
+                },
+                spanProvenance: spans.map {
+                    DayStripLayout.SpanProvenance(
+                        startMs: $0.startMs, endMs: $0.endMs, endStatus: $0.endStatus
+                    )
+                },
+                storeMounted: storeMounted,
+                provenanceReady: loadPhase == .ready,
                 pendingSelection: markPendingSelection,
                 pendingEndpointMs: markPendingEndpoint
             )
@@ -567,9 +584,12 @@ struct DayTimelineView: View {
         do {
             let response = try await DaemonClient.timelineDay(request)
             spans = response.recordings
+            storeMounted = response.storeMounted
             loadPhase = .ready
         } catch {
             spans = []
+            // A failed load claims nothing (the strip's load gate keys off
+            // `loadPhase != .ready`), so `storeMounted` is left as-is.
             loadPhase = .daemonUnavailable
             return
         }

@@ -77,6 +77,16 @@ struct DayStripBlockedBand: Equatable {
     }
 }
 
+/// U5 — the purged-band mapping: a straight union of every recording's
+/// retroactively-purged intervals (identity rides along for the R6 hover copy).
+/// Purged renders as its own class — the blocked hatch *geometry* in a distinct
+/// plum hue (R10) — never the blocked rust.
+extension DayPurgedInterval {
+    static func bands(from spans: [DaySegmentRecording]) -> [DayPurgedInterval] {
+        spans.flatMap(\.purged)
+    }
+}
+
 /// Pure axis geometry for the day strip.
 enum DayStripLayout {
 
@@ -297,6 +307,102 @@ enum DayStripLayout {
         }
         return result
     }
+
+    // MARK: - U5: gap → cause provenance
+
+    /// A recording span with its end-status provenance (`timeline.day` v3) —
+    /// the resolver input. `endStatus` is the open wire string
+    /// ("live"|"clean"|"interrupted"|"unknown"); nil (an older daemon) means
+    /// unknown provenance.
+    struct SpanProvenance: Equatable {
+        let startMs: Int
+        let endMs: Int
+        let endStatus: String?
+    }
+
+    /// Why an empty stretch is empty — exactly one cause per gap (R4), each a
+    /// claim the wire can prove (R7). `.none` claims nothing: future time, or
+    /// the day query hasn't returned yet (the load gate).
+    enum GapCause: Equatable {
+        case nothingOnFile
+        case interrupted(aroundMs: Int)
+        case stillRecording
+        case cantVerify
+        case none
+    }
+
+    /// Resolve one gap to its single honest cause. Precedence: the load gate
+    /// (no data → no claim), then the future (claims NOTHING, R11), then the
+    /// store gate (sealed vault → nothing is verifiable), then the *preceding
+    /// same-day recording's* end status — interruption attribution never
+    /// crosses the day because `spans` is the requested day's (day-clamped)
+    /// set. A gap with no same-day predecessor is an honest data claim: the
+    /// query returned and holds nothing there. Unknown / nil / unrecognized
+    /// statuses are unprovable → "can't verify", never a fabricated cause (R7);
+    /// a live predecessor reads "still recording" and is never called
+    /// interrupted (R11). Callers must pre-split gaps at `nowMs`
+    /// (`splitGapAtNow`) so one gap never mixes a past claim with future time.
+    static func gapCause(
+        gapStartMs: Int,
+        gapEndMs: Int,
+        spans: [SpanProvenance],
+        storeMounted: Bool,
+        provenanceReady: Bool,
+        nowMs: Int
+    ) -> GapCause {
+        guard provenanceReady else { return .none }
+        guard gapStartMs < nowMs else { return .none }
+        guard storeMounted else { return .cantVerify }
+        let preceding = spans
+            .filter { $0.endMs <= gapStartMs }
+            .max { $0.endMs < $1.endMs }
+        guard let preceding else { return .nothingOnFile }
+        switch preceding.endStatus {
+        case "clean": return .nothingOnFile
+        case "interrupted": return .interrupted(aroundMs: preceding.endMs)
+        case "live": return .stillRecording
+        default: return .cantVerify
+        }
+    }
+
+    /// Split a gap at `nowMs` so the pre-now part can carry a cause while the
+    /// future part claims nothing (R11 — "still recording" is bounded to now).
+    /// Fully-past and fully-future gaps pass through unsplit.
+    static func splitGapAtNow(startMs: Int, endMs: Int, nowMs: Int) -> [(startMs: Int, endMs: Int)] {
+        guard startMs < nowMs, nowMs < endMs else { return [(startMs: startMs, endMs: endMs)] }
+        return [(startMs: startMs, endMs: nowMs), (startMs: nowMs, endMs: endMs)]
+    }
+
+    // MARK: - U5: hover hit targets (R13)
+
+    /// An overlay's hover/accessibility frame: `index` points back into the
+    /// caller's region array; the frame is the region's, expanded to the
+    /// minimum hit-target width when the region is a sliver.
+    struct HitFrame: Equatable {
+        let index: Int
+        let minX: CGFloat
+        let width: CGFloat
+    }
+
+    /// Every drawn region must be hover-targetable (R13): expand slivers
+    /// (centered) to `minWidth`, and return the frames in back-to-front draw
+    /// order — wider originals first — so where expanded frames collide the
+    /// SMALLER region renders later, sits on top, and wins the hover (later
+    /// ZStack children win hit-testing in SwiftUI). Ties keep input order.
+    static func hitFrames(
+        _ regions: [(minX: CGFloat, width: CGFloat)],
+        minWidth: CGFloat = 6
+    ) -> [HitFrame] {
+        regions.enumerated()
+            .map { index, region -> HitFrame in
+                let width = max(region.width, minWidth)
+                return HitFrame(index: index, minX: region.minX - (width - region.width) / 2, width: width)
+            }
+            .sorted { a, b in
+                let (wa, wb) = (regions[a.index].width, regions[b.index].width)
+                return wa == wb ? a.index < b.index : wa > wb
+            }
+    }
 }
 
 /// The strip legend's honest copy + swatch kinds. SCR-214 retires the pre-task
@@ -328,6 +434,15 @@ enum DayStripLegend {
     ]
 }
 
+/// U5 — the purged-hatch hue (R10): a muted plum, deliberately distinct from
+/// the blocked `scRust` so a purged span never reads as blocked. Matches the
+/// palette's SCTile3 violet (`#7A4A8A`); authored as a literal (the
+/// `SCGradient` pattern) rather than a new asset role — promote to a
+/// `SC*.colorset` when the legend/caption unit finalizes the purged vocabulary.
+extension Color {
+    static let scPlum = Color(.sRGB, red: 0x7A / 255, green: 0x4A / 255, blue: 0x8A / 255)
+}
+
 struct DayStripView: View {
     let bounds: DayStripLayout.Bounds
     /// The "unsplit — still searchable" base layer — one per recording.
@@ -339,6 +454,25 @@ struct DayStripView: View {
     let matchesMs: [Int]
     let playheadMs: Int?
     var onSeek: (Int) -> Void
+    /// U5 — retroactively-purged spans (R10): the blocked hatch geometry in the
+    /// distinct plum hue, with R6 rule-naming hover/VoiceOver copy.
+    var purgedBands: [DayPurgedInterval] = []
+    /// U5 — `unverifiable` intervals inside recordings: rendered neutrally (no
+    /// band — R7) but hover/VoiceOver-targetable with the "can't verify" copy.
+    var unverifiableBands: [(startMs: Int, endMs: Int)] = []
+    /// U5 — the day's spans + end-status provenance feeding the gap-cause
+    /// resolver (R4).
+    var spanProvenance: [DayStripLayout.SpanProvenance] = []
+    /// U5 — store gate: false while the vault is sealed → every empty stretch
+    /// reads "can't verify", never "nothing on file".
+    var storeMounted: Bool = true
+    /// U5 — load gate: false until the day query returns; while false, gap
+    /// regions carry NO cause claim (neutral copy only). Defaults to false so
+    /// a call site that never wires provenance can't over-claim.
+    var provenanceReady: Bool = false
+    /// The "now" used to bound "still recording" and silence future time
+    /// (R11). Injectable for determinism; defaults to wall-clock at render.
+    var nowMs: Int = Int(Date().timeIntervalSince1970 * 1000)
     /// SCR-214 U11 — the in-progress retroactive task selection (both endpoints
     /// marked), drawn as a dashed amber band so the user sees the span they're
     /// about to label. Nil when no selection is in flight (default) — additive,
@@ -425,20 +559,35 @@ struct DayStripView: View {
             }
 
             for band in blockedBands {
-                hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width))
+                hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
+                      color: .scRust)
+            }
+            // U5 — purged spans: the same hatch geometry in the distinct plum
+            // hue (R10), so purged is visually its own class, never blocked.
+            for band in purgedBands {
+                hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
+                      color: .scPlum)
             }
             // One caption per cluster (pure `captionClusters` — single overlap
             // guard across all caption classes), not one per band: nearby
-            // blocked bands share a caption instead of overprinting. Only
-            // `.blocked` bands feed it today; purged joins in a later unit.
+            // blocked bands share a caption instead of overprinting. U5 routes
+            // purged bands in as `.purged`: a purged-only cluster captions
+            // "removed" in plum; a mixed cluster keeps the "blocked" caption
+            // (the hard-stop claim dominates the shared slot) until the legend
+            // unit finalizes the purged caption vocabulary.
             let captions = DayStripLayout.captionClusters(
                 blockedBands.map {
                     (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .blocked)
+                } + purgedBands.map {
+                    (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .purged)
                 }
             )
             for caption in captions {
+                let text = caption.classes.contains(.blocked)
+                    ? Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust)
+                    : Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scPlum)
                 ctx.draw(
-                    Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust),
+                    text,
                     in: CGRect(x: caption.x, y: trackTop + trackHeight + 8, width: 50, height: 12)
                 )
             }
@@ -505,9 +654,11 @@ struct DayStripView: View {
         return CGRect(x: x0, y: trackTop, width: max(x1 - x0, 2), height: trackHeight)
     }
 
-    /// The design's blocked hatch: 45° rust lines on a transparent band
-    /// (`repeating-linear-gradient(45deg, #B4552B33 …)`, line 450).
-    private func hatch(ctx: GraphicsContext, rect: CGRect) {
+    /// The design's hatch: 45° lines on a transparent band
+    /// (`repeating-linear-gradient(45deg, #B4552B33 …)`, line 450). One
+    /// geometry, two hues: blocked draws it in rust, purged in plum (R10) —
+    /// the color is the class distinction, the pattern is shared.
+    private func hatch(ctx: GraphicsContext, rect: CGRect, color: Color) {
         var clipped = ctx
         clipped.clip(to: Path(roundedRect: rect, cornerRadius: 4))
         var path = Path()
@@ -517,7 +668,7 @@ struct DayStripView: View {
             path.addLine(to: CGPoint(x: x + rect.height, y: rect.maxY))
             x += 6
         }
-        clipped.stroke(path, with: .color(.scRust.opacity(0.45)), lineWidth: 3)
+        clipped.stroke(path, with: .color(color.opacity(0.45)), lineWidth: 3)
     }
 
     /// Invisible positioned elements so VoiceOver announces every region type —
@@ -550,23 +701,22 @@ struct DayStripView: View {
                     .accessibilitySortPriority(Self.sortPriority(startMs: segment.startMs))
                     .help(segment.name)
             }
-            ForEach(nothingCapturedGaps, id: \.startMs) { gap in
-                let rect = bandRect(startMs: gap.startMs, endMs: gap.endMs, width: width)
-                Color.clear
-                    .frame(width: rect.width, height: rect.height)
-                    .offset(x: rect.minX, y: rect.minY)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(DayStripAccessibility.gapLabel(startMs: gap.startMs, endMs: gap.endMs))
-                    .accessibilitySortPriority(Self.sortPriority(startMs: gap.startMs))
-            }
-            ForEach(Array(blockedBands.enumerated()), id: \.offset) { _, band in
-                let rect = bandRect(startMs: band.startMs, endMs: band.endMs, width: width)
-                Color.clear
-                    .frame(width: rect.width, height: rect.height)
-                    .offset(x: rect.minX, y: rect.minY)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(DayStripAccessibility.blockedLabel(band))
-                    .accessibilitySortPriority(Self.sortPriority(startMs: band.startMs))
+            // U5 — the provenance layer: gaps (cause-resolved), blocked,
+            // purged, and unverifiable regions in ONE hover/VoiceOver pass.
+            // `hitFrames` expands slivers to the ~6pt minimum hit target and
+            // orders wider regions first, so the smaller region renders later
+            // — on top of base tracks, task bands, and its wider neighbours —
+            // and wins the hover at boundary collisions (R13). The SAME cause
+            // sentence feeds `.help` and the accessibility label (R12).
+            let regions = provenanceRegions
+            let frames = DayStripLayout.hitFrames(
+                regions.map { region -> (minX: CGFloat, width: CGFloat) in
+                    let rect = bandRect(startMs: region.startMs, endMs: region.endMs, width: width)
+                    return (minX: rect.minX, width: rect.width)
+                }
+            )
+            ForEach(frames, id: \.index) { frame in
+                provenanceOverlay(region: regions[frame.index], frame: frame)
             }
             if let playheadMs {
                 let x = DayStripLayout.x(forMs: playheadMs, bounds: bounds, width: width)
@@ -586,6 +736,94 @@ struct DayStripView: View {
             bounds: bounds,
             spans: baseTracks.map { (startMs: $0.startMs, endMs: $0.endMs) }
         )
+    }
+
+    /// U5 — one hover/VoiceOver region on the provenance layer. `claim` is the
+    /// single honest cause sentence, shared verbatim by `.help` and the
+    /// accessibility label (R12); nil = no claim (the load gate), where
+    /// VoiceOver falls back to the neutral unavailable copy.
+    private struct ProvenanceRegion {
+        let startMs: Int
+        let endMs: Int
+        let claim: String?
+        let accessibilityFallback: String?
+
+        var accessibilityLabel: String { claim ?? accessibilityFallback ?? "" }
+    }
+
+    /// Build the provenance layer: each gap (split at now so a claim never
+    /// leaks into future time, R11) resolved to its one cause via the pure
+    /// `gapCause`; plus blocked, purged, and unverifiable intervals. A future
+    /// gap contributes nothing (future time claims NOTHING); an unloaded day
+    /// contributes claim-free regions with neutral VoiceOver copy (load gate).
+    private var provenanceRegions: [ProvenanceRegion] {
+        var regions: [ProvenanceRegion] = []
+        for gap in nothingCapturedGaps {
+            for part in DayStripLayout.splitGapAtNow(startMs: gap.startMs, endMs: gap.endMs, nowMs: nowMs) {
+                let cause = DayStripLayout.gapCause(
+                    gapStartMs: part.startMs, gapEndMs: part.endMs,
+                    spans: spanProvenance, storeMounted: storeMounted,
+                    provenanceReady: provenanceReady, nowMs: nowMs
+                )
+                if let claim = DayStripAccessibility.gapCauseLabel(
+                    cause, startMs: part.startMs, endMs: part.endMs
+                ) {
+                    regions.append(ProvenanceRegion(
+                        startMs: part.startMs, endMs: part.endMs,
+                        claim: claim, accessibilityFallback: nil
+                    ))
+                } else if !provenanceReady {
+                    regions.append(ProvenanceRegion(
+                        startMs: part.startMs, endMs: part.endMs,
+                        claim: nil,
+                        accessibilityFallback: DayStripAccessibility.gapPendingLabel(
+                            startMs: part.startMs, endMs: part.endMs
+                        )
+                    ))
+                }
+            }
+        }
+        for band in blockedBands {
+            regions.append(ProvenanceRegion(
+                startMs: band.startMs, endMs: band.endMs,
+                claim: DayStripAccessibility.blockedLabel(band), accessibilityFallback: nil
+            ))
+        }
+        for band in purgedBands {
+            regions.append(ProvenanceRegion(
+                startMs: band.startMs, endMs: band.endMs,
+                claim: DayStripAccessibility.purgedLabel(band), accessibilityFallback: nil
+            ))
+        }
+        for band in unverifiableBands {
+            regions.append(ProvenanceRegion(
+                startMs: band.startMs, endMs: band.endMs,
+                claim: DayStripAccessibility.cantVerifyLabel(startMs: band.startMs, endMs: band.endMs),
+                accessibilityFallback: nil
+            ))
+        }
+        return regions
+    }
+
+    /// One provenance overlay element: an invisible frame carrying the cause
+    /// as tooltip + accessibility label. `.help` attaches only when there is a
+    /// claim — a claim-free region is VoiceOver-reachable (neutral copy) but
+    /// asserts nothing on hover.
+    @ViewBuilder
+    private func provenanceOverlay(
+        region: ProvenanceRegion, frame: DayStripLayout.HitFrame
+    ) -> some View {
+        let base = Color.clear
+            .frame(width: frame.width, height: trackHeight)
+            .offset(x: frame.minX, y: trackTop)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(region.accessibilityLabel)
+            .accessibilitySortPriority(Self.sortPriority(startMs: region.startMs))
+        if let claim = region.claim {
+            base.help(claim)
+        } else {
+            base
+        }
     }
 
     /// Later regions get a lower priority, so VoiceOver / keyboard focus walks
@@ -697,8 +935,57 @@ enum DayStripAccessibility {
     }
 
     /// A between-recording gap: nothing was captured here (R7 — no footage).
+    /// Legacy blanket copy (pinned by DayTimelineTaskBandsTests); the strip's
+    /// gap overlays now speak through `gapCauseLabel` instead (U5).
     static func gapLabel(startMs: Int, endMs: Int) -> String {
         "Nothing captured, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
+    }
+
+    // MARK: - U5: gap-cause + purged copy (one string home — the SAME sentence
+    // feeds `.help` (hover) and `.accessibilityLabel` (VoiceOver), so
+    // provenance is never pointer-only, R12).
+
+    /// Exactly one cause + time range per empty stretch (R4). "Nothing on
+    /// file" is a data claim — never "no recording was running". Returns nil
+    /// for `.none` (future time / not loaded), which must claim nothing.
+    static func gapCauseLabel(_ cause: DayStripLayout.GapCause, startMs: Int, endMs: Int) -> String? {
+        let range = "\(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
+        switch cause {
+        case .nothingOnFile:
+            return "Nothing on file, \(range)"
+        case .interrupted(let aroundMs):
+            return "Recording was cut short around \(hourMinuteText(ms: aroundMs))"
+        case .stillRecording:
+            return "Still recording"
+        case .cantVerify:
+            return cantVerifyLabel(startMs: startMs, endMs: endMs)
+        case .none:
+            return nil
+        }
+    }
+
+    /// An unprovable stretch — a sealed store, unknown provenance, or an
+    /// `unverifiable` interval inside a recording (R7: unprovable → say so).
+    static func cantVerifyLabel(startMs: Int, endMs: Int) -> String {
+        "Can't verify what happened here, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
+    }
+
+    /// A retroactively-purged span (R6): name the rule when identity is on the
+    /// wire — app name preferred, then root domain, then bundle id — and
+    /// degrade to the generic privacy-rule sentence when identity-free.
+    static func purgedLabel(_ interval: DayPurgedInterval) -> String {
+        let range = "\(hourMinuteText(ms: interval.startMs)) to \(hourMinuteText(ms: interval.endMs))"
+        if let identity = interval.appName ?? interval.rootDomain ?? interval.bundleId {
+            return "Removed by your 'disable \(identity)' rule, \(range)"
+        }
+        return "Removed by a privacy rule, \(range)"
+    }
+
+    /// The load-gate gap label: while the day query hasn't returned (or
+    /// failed), gaps carry NO cause claim — VoiceOver gets this neutral
+    /// unavailable string instead.
+    static func gapPendingLabel(startMs: Int, endMs: Int) -> String {
+        "Day details unavailable, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
     }
 
     static func blockedLabel(_ band: DayStripBlockedBand) -> String {
