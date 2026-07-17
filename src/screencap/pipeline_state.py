@@ -348,13 +348,26 @@ _TASK_SEGMENTS_ADDED_COLUMNS = (
 # terminal_stage branch points BEFORE _persist_local_tasks rewrites task-row
 # ``source``, so ``mechanical_only`` (idle-gap heuristic) stays distinct from
 # ``produced_tasks``. Local-only, in ``recording.db`` (never uploaded — R8).
+# ``detail`` (SCR-275 U6, R8): the optional distinct degradation reason recorded
+# alongside the outcome (e.g. ``context-window`` vs ``respond-failed``) — NULL
+# when the outcome has nothing to report (fully-model produced) or on a
+# pre-U6 row.
 _RECORDING_OUTCOME_DDL = """
 CREATE TABLE IF NOT EXISTS pipeline_recording_outcome (
     recording_id INTEGER PRIMARY KEY,
     reason TEXT NOT NULL,
+    detail TEXT,
     updated_at REAL
 )
 """
+
+# Guarded ALTER-ADD migration for the U6 ``detail`` column (same pattern as
+# ``_TASK_SEGMENTS_ADDED_COLUMNS``): an EXISTING pre-U6 outcome table keeps its
+# shape under CREATE IF NOT EXISTS, so the column is ALTER-added; existing rows
+# read back ``detail`` NULL — exactly a fresh detail-less write.
+_RECORDING_OUTCOME_ADDED_COLUMNS = (
+    ("detail", "detail TEXT"),
+)
 
 # SCR-275 U4 (KTD-6). Per-window on-device naming cache — a MEMO of completed
 # model naming calls, keyed by window span + digest hash, NEVER task truth (the
@@ -431,6 +444,29 @@ def _migrate_task_segments_columns(conn: sqlite3.Connection) -> None:
                 raise
 
 
+def _migrate_recording_outcome_columns(conn: sqlite3.Connection) -> None:
+    """ALTER-ADD the U6 ``detail`` column to a pre-U6 outcome table (SCR-275).
+
+    Same guarded pattern as :func:`_migrate_task_segments_columns`: PRAGMA-check,
+    only ALTER-add what is missing, tolerate a concurrent opener's
+    duplicate-column race. A DB without the table at all is a no-op (the DDL
+    creates it with the full shape).
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(pipeline_recording_outcome)")
+    }
+    if not existing:
+        return  # table absent — _RECORDING_OUTCOME_DDL creates the full shape
+    for col, ddl in _RECORDING_OUTCOME_ADDED_COLUMNS:
+        if col in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE pipeline_recording_outcome ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+
 def ensure_pipeline_state_schema(db_path: Path | str) -> None:
     """Create the ledger tables + ``chunks_expected`` column on an EXISTING DB.
 
@@ -457,8 +493,10 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         # Migrate an EXISTING pre-U5 table (created before source/edited existed)
         # — the DDL above is a no-op on it, so the columns are ALTER-added here.
         _migrate_task_segments_columns(conn)
-        # U2: per-recording segmentation outcome (idempotent create).
+        # U2: per-recording segmentation outcome (idempotent create) + the U6
+        # ``detail`` column ALTER-added onto an existing pre-U6 table.
         conn.execute(_RECORDING_OUTCOME_DDL)
+        _migrate_recording_outcome_columns(conn)
         # SCR-275 U4: on-device naming cache + scrub-generation counter.
         conn.execute(_ONDEVICE_NAMES_DDL)
         conn.execute(_SCRUB_GENERATION_DDL)
@@ -1146,26 +1184,34 @@ class PipelineLedger:
             finally:
                 conn.close()
 
-    def set_recording_outcome(self, reason: str) -> None:
+    def set_recording_outcome(self, reason: str, detail: str | None = None) -> None:
         """Record this recording's segmentation OUTCOME reason (U2, honest status).
 
         One row per recording (upsert on the PK). Captured at the terminal_stage
         branch BEFORE the task rows are rewritten, so ``mechanical_only`` (idle-gap
         heuristic) stays distinct from ``produced_tasks``. Defensively creates the
-        table so a ``recording.db`` that predates U2 still writes. Local-only — the
+        table — AND ALTER-adds the U6 ``detail`` column onto a pre-U6 table — so a
+        ``recording.db`` that predates either schema still writes. Local-only — the
         table lives in ``recording.db`` and is never uploaded (R8).
+
+        ``detail`` (SCR-275 U6, R8): the distinct degradation reason of the pass
+        that recorded this outcome (e.g. ``context-window``); every write sets it
+        (``None`` → NULL), so the stored detail always describes the CURRENT
+        recorded reason, never a stale earlier pass.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(_RECORDING_OUTCOME_DDL)
+                _migrate_recording_outcome_columns(conn)
                 conn.execute(
                     "INSERT INTO pipeline_recording_outcome "
-                    "(recording_id, reason, updated_at) VALUES (?, ?, ?) "
+                    "(recording_id, reason, detail, updated_at) VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(recording_id) DO UPDATE SET "
-                    "reason=excluded.reason, updated_at=excluded.updated_at",
-                    (self._recording_id, reason, _now()),
+                    "reason=excluded.reason, detail=excluded.detail, "
+                    "updated_at=excluded.updated_at",
+                    (self._recording_id, reason, detail, _now()),
                 )
                 conn.commit()
             except Exception:
@@ -1197,6 +1243,29 @@ class PipelineLedger:
                 (self._recording_id,),
             ).fetchone()
             return None if row is None else str(row[0])
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def get_recording_outcome_detail(self) -> str | None:
+        """The outcome's optional degradation-reason detail (SCR-275 U6), or ``None``.
+
+        ``None`` for a legacy row/table (pre-U6 schema without the ``detail``
+        column — the SELECT's missing-column error is swallowed), an unrecorded
+        outcome, or a detail-less write. Fail-safe exactly like
+        :meth:`get_recording_outcome`: any SQLite error resolves to ``None``.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT detail FROM pipeline_recording_outcome "
+                "WHERE recording_id=?",
+                (self._recording_id,),
+            ).fetchone()
+            return None if row is None or row[0] is None else str(row[0])
         except sqlite3.Error:
             return None
         finally:

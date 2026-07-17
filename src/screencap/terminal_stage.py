@@ -1053,20 +1053,40 @@ def _run_local_segmentation(
     """
     from screencap.segmentation.consent import ConsentPolicy
     from screencap.segmentation.degrade import DegradeAction, resolve_day_split
-    from screencap.segmentation.outcome import PRODUCED_TASKS, Branch, pick_reason
+    from screencap.segmentation.ondevice_pipeline import REASON_STOPPED
+    from screencap.segmentation.outcome import (
+        PRODUCED_TASKS,
+        PRODUCED_TASKS_PARTIAL,
+        Branch,
+        pick_reason,
+    )
+    from screencap.segmentation.provider import PROVIDER_UNAVAILABLE
 
-    def _record(branch: "Branch") -> None:
+    def _record(
+        branch: "Branch", *, detail: str | None = None, provisional: bool = False,
+    ) -> None:
         # Record WHY this recording has (or lacks) AI-named tasks (U2). Reads the
         # prior reason so pick_reason stays monotonic (a live degrade never
-        # downgrades a recording that already produced tasks). Strictly fail-open:
-        # outcome bookkeeping must never block terminal completion.
+        # downgrades a recording that already produced tasks). ``detail`` (U6, R8)
+        # is the pass's distinct degradation reason; a fully-produced outcome
+        # carries none, and a same-reason detail-less record is skipped so it
+        # never NULLs a prior pass's stored detail. ``provisional`` forces the
+        # picker's live mapping — used for a quiesce-stopped pass, which must
+        # settle as ``in_progress`` (re-runs on resume), never a final reason.
+        # Strictly fail-open: outcome bookkeeping must never block terminal
+        # completion.
         if ledger is None:
             return
         try:
             prior = ledger.get_recording_outcome()
-            ledger.set_recording_outcome(
-                pick_reason(branch=branch, is_live=is_live, prior=prior)
+            picked = pick_reason(
+                branch=branch, is_live=is_live or provisional, prior=prior,
             )
+            if picked == PRODUCED_TASKS:
+                detail = None
+            if picked == prior and detail is None:
+                return  # nothing new — keep the prior record (and its detail).
+            ledger.set_recording_outcome(picked, detail=detail)
         except Exception as exc:  # noqa: BLE001 — outcome record must never block terminal
             logger.debug(
                 "terminal_stage: recording outcome record failed open for %s (%s)",
@@ -1074,7 +1094,7 @@ def _run_local_segmentation(
             )
 
     try:
-        summary, provider_result = _segment_local_tasks(
+        summary, provider_result, unavailable_reason = _segment_local_tasks(
             recording_dir, stop_event=stop_event, is_live=is_live,
         )
     except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
@@ -1085,6 +1105,19 @@ def _run_local_segmentation(
         _record(Branch.FAILED)
         return
 
+    if provider_result is PROVIDER_UNAVAILABLE and unavailable_reason == REASON_STOPPED:
+        # SCR-275 U6: a fully-stopped pre-work pass — the storage.lock quiesce
+        # (or a stop signal) tripped before any model work ran. This is NOT a
+        # real unavailability, so it must consult NEITHER the cloud-summary
+        # fallback nor the heuristic (nothing is persisted, mirroring
+        # TerminalStageInterrupted, which records nothing at all). The outcome
+        # maps through the picker's provisional live branch — ``in_progress``
+        # (or a kept produced/partial prior) — because the pass re-runs: a live
+        # tick retries next tick, and an interrupted finalize resumes via the
+        # unlock/startup reconcile.
+        _record(Branch.NOTHING, provisional=True)
+        return
+
     try:
         decision = resolve_day_split(provider_result, ConsentPolicy.from_config())
     except Exception as exc:  # noqa: BLE001 — the ladder must never block terminal
@@ -1092,7 +1125,7 @@ def _run_local_segmentation(
             "terminal_stage: degradation resolve failed open for %s (%s)",
             recording_dir.name, exc,
         )
-        _record(Branch.FAILED)
+        _record(Branch.FAILED, detail=unavailable_reason)
         return
 
     from_heuristic = False
@@ -1130,7 +1163,7 @@ def _run_local_segmentation(
                     "terminal_stage: idle-gap heuristic failed open for %s (%s)",
                     recording_dir.name, exc,
                 )
-                _record(Branch.FAILED)
+                _record(Branch.FAILED, detail=unavailable_reason)
                 return
     else:
         # NONE (provider ran, no tasks) or CLOUD (never reachable for day-split)
@@ -1140,8 +1173,9 @@ def _run_local_segmentation(
 
     if not tasks:
         # HEURISTIC path with neither a consented cloud naming nor heuristic output
-        # → the attempt produced nothing at all (couldn't run, on finalize).
-        _record(Branch.FAILED)
+        # → the attempt produced nothing at all (couldn't run, on finalize). The
+        # provider's distinct unavailable reason (R8) rides as the detail.
+        _record(Branch.FAILED, detail=unavailable_reason)
         return
 
     # Classify by a code-owned flag, not by introspecting the tasks dict: only the
@@ -1149,17 +1183,24 @@ def _run_local_segmentation(
     # HEURISTIC branch is a real (cloud-named) result → produced. Keying off a
     # model-emittable ``summary.source`` value would let a provider that echoed
     # "idle_gap_heuristic" be misclassified as mechanical (correctness/adversarial).
-    branch = Branch.MECHANICAL if from_heuristic else Branch.PRODUCED
+    # Within a real provider result, the per-task source MIX distinguishes a fully
+    # model-named pass from a partial one (SCR-275 U6 / KTD-8) — read here, BEFORE
+    # ``_persist_local_tasks`` rewrites row-level ownership to ``agent``.
+    branch = Branch.MECHANICAL if from_heuristic else _provider_pass_branch(tasks)
 
-    # Monotonic task-row gating (R7 / KTD2): once a recording produced real AI tasks,
-    # a later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
-    # "AI-named" above a mechanical list). Skip persistence and keep produced_tasks.
+    # Monotonic task-row gating (R7 / KTD2 / KTD-8): once a recording produced real
+    # AI tasks — fully (produced_tasks) or partially (produced_tasks_partial) — a
+    # later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
+    # "AI-named" above a mechanical list). Skip persistence and keep the reason.
     if (
         branch is Branch.MECHANICAL
         and ledger is not None
-        and ledger.get_recording_outcome() == PRODUCED_TASKS
+        and ledger.get_recording_outcome()
+        in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
     ):
-        _record(Branch.MECHANICAL)  # pick_reason keeps produced_tasks; rows untouched
+        # pick_reason keeps produced/partial; rows untouched — and no detail is
+        # passed, so the prior pass's stored detail is preserved too.
+        _record(Branch.MECHANICAL)
         return
 
     # KTD3 carve-out — drop any fresh AGENT task overlapping a PROTECTED span
@@ -1179,7 +1220,37 @@ def _run_local_segmentation(
         _record(Branch.FAILED)
         return
     result.tasks_persisted = n
-    _record(branch)
+    # PARTIAL/MECHANICAL carry the provider's distinct reason (the dominant
+    # per-window failure for a partial pass; the unavailable reason for a
+    # heuristic one). A PRODUCED record drops the detail inside _record.
+    _record(branch, detail=unavailable_reason)
+
+
+def _provider_pass_branch(tasks: dict) -> "Branch":
+    """Classify a USE_PROVIDER pass from its per-task source mix (SCR-275 U6, KTD-8).
+
+    The on-device heuristic-first pipeline marks every task it assembles with
+    ``source`` ∈ {``ondevice_model``, ``idle_gap_heuristic``}. A pass mixing BOTH
+    is a partial success (some windows model-named, some mechanically filled) →
+    :attr:`Branch.PARTIAL`. Everything else — all model-named, a cloud/BYO
+    provider's tasks (no source markers), or a malformed shape — classifies
+    :attr:`Branch.PRODUCED`: only a genuine mix may soften the reason, so a
+    provider echoing a single marker can never talk itself DOWN below produced
+    (the adversarial concern the code-owned ``from_heuristic`` flag guards).
+    """
+    from screencap.segmentation.ondevice_pipeline import (
+        SOURCE_MECHANICAL,
+        SOURCE_MODEL,
+    )
+    from screencap.segmentation.outcome import Branch
+
+    task_list = tasks.get("tasks") if isinstance(tasks, dict) else None
+    if not isinstance(task_list, list):
+        return Branch.PRODUCED
+    sources = {t.get("source") for t in task_list if isinstance(t, dict)}
+    if SOURCE_MODEL in sources and SOURCE_MECHANICAL in sources:
+        return Branch.PARTIAL
+    return Branch.PRODUCED
 
 
 def _carve_out_protected_spans(
@@ -1252,10 +1323,10 @@ def _segment_local_tasks(
     *,
     stop_event: "threading.Event | None" = None,
     is_live: bool = False,
-) -> "tuple[dict | None, SegmentResult]":
+) -> "tuple[dict | None, SegmentResult, str | None]":
     """Build the stripped activity summary and run the configured day-split provider.
 
-    Returns ``(stripped_summary, provider_result)``:
+    Returns ``(stripped_summary, provider_result, unavailable_reason)``:
 
     * ``stripped_summary`` — the ALLOW-only, ``stripped=True``-marked activity
       summary dict (or ``None`` when there is no local activity to summarize). It
@@ -1268,6 +1339,11 @@ def _segment_local_tasks(
       (could not run). The sentinel is preserved (not collapsed to a falsy ``None``)
       so the caller's degradation ladder can route on the None-vs-unavailable
       distinction.
+    * ``unavailable_reason`` — the provider's out-of-band
+      ``last_unavailable_reason`` (SCR-275 U6, KTD-1): ``None`` after a
+      fully-model pass, the dominant per-window failure reason after a partial
+      one, and the distinct unavailable reason alongside the sentinel. Read via
+      ``getattr`` so legacy providers without the attribute yield ``None``.
 
     All heavy imports are deferred so the terminal-stage import surface stays light.
     """
@@ -1280,7 +1356,7 @@ def _segment_local_tasks(
 
     manifests = load_local_manifests(recording_dir)
     if not manifests:
-        return None, None
+        return None, None, None
 
     summary = build_activity_summary(
         recording_dir.name,
@@ -1292,7 +1368,7 @@ def _segment_local_tasks(
         blocked_source=recording_dir,
     )
     if summary is None:
-        return None, None
+        return None, None, None
 
     # The summary was built with blocked_source, so build_activity_summary has
     # run the R11 strip and marked the summary stripped AUTHORITATIVELY — the
@@ -1314,7 +1390,12 @@ def _segment_local_tasks(
     provider = build_day_split_provider(
         recording_dir=recording_dir, stop_event=stop_event, is_live=is_live,
     )
-    return summary, provider.segment(summary)
+    provider_result = provider.segment(summary)
+    return (
+        summary,
+        provider_result,
+        getattr(provider, "last_unavailable_reason", None),
+    )
 
 
 def _session_window(summary: dict | None) -> "tuple[float, float] | None":
