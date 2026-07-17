@@ -436,6 +436,62 @@ def test_stopped_pass_reruns_to_convergence_via_cache(tmp_path):
     assert _sources(second) == ["ondevice_model"] * 4
 
 
+def test_halt_reuses_committed_name_for_uncached_trailing_window(tmp_path):
+    """SCR-278 (R10): a halt must not flap a model-named uncached trailing task.
+
+    The live trailing window is named but never cached (mutable until it
+    settles). When a halt (quiesce / budget) lands before this pass can re-name
+    it — while cache hits elsewhere keep the pass a PARTIAL, not the halted
+    sentinel — it must reuse the prior COMMITTED name instead of overwriting the
+    shown model name with ``task_N``. A later unhalted tick re-names it fresh.
+    """
+    rec = _make_rec(tmp_path, {0: list(_CHUNK0_CLUSTERS), 1: [4700.0]})
+
+    # Tick 1 (live): every window model-named; the trailing window (idx 3) is
+    # named but forced uncacheable. The terminal stage commits all four as
+    # unedited agent rows.
+    p1 = _ScriptedProvider()
+    first = _run(p1, rec, is_live=True)
+    assert _sources(first) == ["ondevice_model"] * 4
+    _commit_tasks(rec, first)
+
+    # Tick 2 (live) with a quiesce halt already in effect: windows 0-2 are
+    # cache hits (model, no model call), window 3 is an uncached miss that hits
+    # the halt gate and would otherwise flap to "task_4".
+    stop = threading.Event()
+    stop.set()
+    p2 = _ScriptedProvider(name_prefix="P2 ")
+    second = _run(p2, rec, is_live=True, stop_event=stop)
+
+    assert isinstance(second, dict)
+    assert len(p2.name_calls) == 0  # cache hits + a halted miss: no model calls
+    # The trailing window keeps its committed name — NOT "task_4" (the R10 flap).
+    assert second["tasks"][3]["name"] == first["tasks"][3]["name"]
+    assert second["tasks"][3]["derived_name"] == first["tasks"][3]["derived_name"]
+    # Provenance stays mechanical — no model naming ran for it this pass — so the
+    # honesty seam never over-claims a model name it did not produce.
+    assert _sources(second) == ["ondevice_model"] * 3 + ["idle_gap_heuristic"]
+
+
+def test_halt_keeps_task_n_for_a_genuinely_new_uncached_window(tmp_path):
+    """A halt-degraded window with NO committed span still gets ``task_N``.
+
+    The carry-forward reuse (SCR-278) is scoped to windows a prior pass already
+    named; a brand-new window the model never reached keeps its mechanical name.
+    """
+    rec = _make_rec(tmp_path, {0: list(_CHUNK0_CLUSTERS), 1: [4700.0]})
+    # No prior commit → no committed spans to carry forward.
+    stop = threading.Event()
+    stop.set()
+    provider = _ScriptedProvider()
+    result = _run(provider, rec, is_live=True, stop_event=stop)
+
+    # Nothing was ever named/committed, so every window is a halted cache miss →
+    # zero model names → the halted-pass sentinel (never a spurious carry).
+    assert result is PROVIDER_UNAVAILABLE
+    assert provider.last_unavailable_reason == "stopped"
+
+
 # ---------------------------------------------------------------------------
 # Single-window day skips arbitration
 # ---------------------------------------------------------------------------
