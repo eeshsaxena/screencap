@@ -4194,10 +4194,16 @@ async def storage_lock(request: Request) -> JSONResponse:
 
     try:
         # step 2: stop the active recording (finalizes the chunk; 30s budget).
+        # kill_on_timeout: the seal below force-detaches the volume the engine
+        # writes into, so the SCR-273 background-drain stop ("finalizing"
+        # return with the engine still alive) is NOT acceptable here — an
+        # engine that misses the budget is killed so it can never write into
+        # the detach. Its recording converges later via the open-recording
+        # resume path.
         await _emit_store_event(
             request.app, EVENT_STORE_LOCK_PROGRESS, phase="stopping"
         )
-        await supervisor.stop(force=False)
+        await supervisor.stop(force=False, kill_on_timeout=True)
 
         # step 3: emit the PRE-DETACH reader signal, pause background jobs, and
         # quiesce in-flight terminal-stage resumes within the grace budget.
