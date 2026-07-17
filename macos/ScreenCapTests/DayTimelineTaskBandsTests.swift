@@ -210,15 +210,25 @@ final class DayTimelineTaskBandsTests: XCTestCase {
 
     // MARK: - Legend
 
-    /// SCR-214 retires the honesty substitutions: the four honest region swatches
-    /// (task, unsplit, nothing-captured, blocked) are all present with copy that
-    /// states them directly — no "recording" placeholder.
-    func testLegendHasTheFourRequiredSwatches() {
+    /// U6 (R8/R10): every legend entry speaks plain language a first-time user
+    /// can parse; the empty-stretch entry signals that hover explains the
+    /// cause; and the purged entry carries its OWN swatch — pinned unequal to
+    /// the blocked one so purged can never render as blocked.
+    func testLegendUsesPlainLanguageAndCarriesDistinctPurgedSwatch() {
         let items = DayStripLegend.items
-        XCTAssertTrue(items.contains { $0.swatch == .task && $0.text == "agent/user task" })
-        XCTAssertTrue(items.contains { $0.swatch == .unsplit && $0.text == "unsplit — still searchable" })
-        XCTAssertTrue(items.contains { $0.swatch == .nothingCaptured && $0.text == "nothing captured" })
-        XCTAssertTrue(items.contains { $0.swatch == .blocked && $0.text == "blocked — nothing captured" })
+        XCTAssertTrue(items.contains { $0.swatch == .task && $0.text == "task" })
+        XCTAssertTrue(items.contains { $0.swatch == .unsplit && $0.text == "recorded — searchable" })
+        XCTAssertTrue(items.contains {
+            $0.swatch == .nothingCaptured && $0.text == "nothing on file — hover for why"
+        })
+        XCTAssertTrue(items.contains { $0.swatch == .searchMatch && $0.text == "search match" })
+        XCTAssertTrue(items.contains { $0.swatch == .blocked && $0.text == "blocked at capture" })
+        let purged = items.first { $0.text == "removed by your rules" }
+        XCTAssertEqual(purged?.swatch, DayStripLegend.Swatch.purged, "purged has its own swatch")
+        XCTAssertNotEqual(
+            purged?.swatch, DayStripLegend.Swatch.blocked,
+            "R10: the purged swatch is never the blocked swatch"
+        )
         XCTAssertFalse(items.contains { $0.text == "recording" }, "the 'recording' placeholder is retired")
     }
 
@@ -271,10 +281,14 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         XCTAssertTrue(baseLabel.hasPrefix("Morning session, "))
         XCTAssertTrue(baseLabel.contains("unsplit, still searchable"))
 
-        let gapLabel = DayStripAccessibility.gapLabel(startMs: dayStart, endMs: dayStart + hour)
-        XCTAssertTrue(gapLabel.hasPrefix("Nothing captured, "))
+        // U6: the legacy blanket `gapLabel` is retired — gaps speak through the
+        // U5 cause labels ("Nothing on file, …" is the honest data claim).
+        let gapLabel = DayStripAccessibility.gapCauseLabel(
+            .nothingOnFile, startMs: dayStart, endMs: dayStart + hour
+        )
+        XCTAssertEqual(gapLabel?.hasPrefix("Nothing on file, "), true)
 
         let blocked = DayStripBlockedBand(startMs: dayStart, endMs: dayStart + hour)
-        XCTAssertTrue(DayStripAccessibility.blockedLabel(blocked).hasPrefix("Blocked, nothing captured"))
+        XCTAssertTrue(DayStripAccessibility.blockedLabel(blocked).hasPrefix("Blocked at capture, "))
     }
 }

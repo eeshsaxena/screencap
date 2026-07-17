@@ -405,7 +405,32 @@ final class DayStripLayoutTests: XCTestCase {
         )
         XCTAssertTrue(DayStripAccessibility.baseTrackLabel(base).contains("unsplit, still searchable"))
         let band = DayStripBlockedBand(startMs: dayStart, endMs: dayStart + hour)
-        XCTAssertTrue(DayStripAccessibility.blockedLabel(band).hasPrefix("Blocked, nothing captured"))
+        XCTAssertTrue(DayStripAccessibility.blockedLabel(band).hasPrefix("Blocked at capture, "))
         XCTAssertTrue(DayStripAccessibility.playheadLabel(ms: dayStart).hasPrefix("Playhead at "))
+    }
+
+    /// AE10: no purged surface pairs "blocked" (or the blocked entry's
+    /// "nothing captured" claim) with a purge — every purged legend and
+    /// accessibility string avoids both words, so a purge never reads as a
+    /// capture-time block.
+    func testPurgedStringsNeverSayBlockedOrNothingCaptured() {
+        let purgedLegendText = DayStripLegend.items.first { $0.swatch == .purged }?.text
+        XCTAssertNotNil(purgedLegendText, "the legend carries a purged entry")
+        let purgedStrings = [
+            DayStripAccessibility.purgedLabel(
+                DayPurgedInterval(startMs: dayStart, endMs: dayStart + hour, appName: "Discord")
+            ),
+            DayStripAccessibility.purgedLabel(
+                DayPurgedInterval(startMs: dayStart, endMs: dayStart + hour)
+            ),
+            purgedLegendText ?? "",
+        ]
+        for text in purgedStrings {
+            XCTAssertFalse(text.lowercased().contains("blocked"), "purged string says 'blocked': \(text)")
+            XCTAssertFalse(
+                text.lowercased().contains("nothing captured"),
+                "purged string says 'nothing captured': \(text)"
+            )
+        }
     }
 }

@@ -405,11 +405,13 @@ enum DayStripLayout {
     }
 }
 
-/// The strip legend's honest copy + swatch kinds. SCR-214 retires the pre-task
-/// "honesty substitutions": `agent/user task` and `unsplit — still searchable`
-/// now have real referents (ambient capture + on-device segmentation exist), so
-/// the copy states them directly. Pure data so the entry set is unit-testable
-/// without a render (the `DayStripAccessibility` pattern).
+/// The strip legend's honest copy + swatch kinds — U6: one plain-language
+/// vocabulary a first-time user can parse without product terms (R8), shared
+/// with the accessibility labels and the recorded-summary pane (R9). The
+/// empty-stretch entry points at hover for the per-gap cause; the purged entry
+/// has its OWN swatch (plum, never the blocked rust — R10) and never pairs
+/// "blocked"/"nothing captured" with a purge (AE10). Pure data so the entry
+/// set is unit-testable without a render (the `DayStripAccessibility` pattern).
 enum DayStripLegend {
     enum Swatch: Equatable {
         case task
@@ -417,6 +419,7 @@ enum DayStripLegend {
         case nothingCaptured
         case searchMatch
         case blocked
+        case purged
     }
 
     struct Item: Equatable, Identifiable {
@@ -426,19 +429,20 @@ enum DayStripLegend {
     }
 
     static let items: [Item] = [
-        Item(text: "agent/user task", swatch: .task),
-        Item(text: "unsplit — still searchable", swatch: .unsplit),
-        Item(text: "nothing captured", swatch: .nothingCaptured),
+        Item(text: "task", swatch: .task),
+        Item(text: "recorded — searchable", swatch: .unsplit),
+        Item(text: "nothing on file — hover for why", swatch: .nothingCaptured),
         Item(text: "search match", swatch: .searchMatch),
-        Item(text: "blocked — nothing captured", swatch: .blocked),
+        Item(text: "blocked at capture", swatch: .blocked),
+        Item(text: "removed by your rules", swatch: .purged),
     ]
 }
 
 /// U5 — the purged-hatch hue (R10): a muted plum, deliberately distinct from
-/// the blocked `scRust` so a purged span never reads as blocked. Matches the
-/// palette's SCTile3 violet (`#7A4A8A`); authored as a literal (the
-/// `SCGradient` pattern) rather than a new asset role — promote to a
-/// `SC*.colorset` when the legend/caption unit finalizes the purged vocabulary.
+/// the blocked `scRust` so a purged span never reads as blocked. Used by the
+/// strip's purged hatch, its caption, and the legend's purged swatch (U6).
+/// Matches the palette's SCTile3 violet (`#7A4A8A`); authored as a literal
+/// (the `SCGradient` pattern) rather than a new asset role.
 extension Color {
     static let scPlum = Color(.sRGB, red: 0x7A / 255, green: 0x4A / 255, blue: 0x8A / 255)
 }
@@ -572,9 +576,9 @@ struct DayStripView: View {
             // guard across all caption classes), not one per band: nearby
             // blocked bands share a caption instead of overprinting. U5 routes
             // purged bands in as `.purged`: a purged-only cluster captions
-            // "removed" in plum; a mixed cluster keeps the "blocked" caption
-            // (the hard-stop claim dominates the shared slot) until the legend
-            // unit finalizes the purged caption vocabulary.
+            // "removed" in plum (never "blocked" — AE10); a mixed cluster keeps
+            // the "blocked" caption (the hard-stop claim dominates the shared
+            // slot; the purged member is still visually plum + hover-explained).
             let captions = DayStripLayout.captionClusters(
                 blockedBands.map {
                     (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .blocked)
@@ -868,10 +872,9 @@ struct DayStripView: View {
     }
 
     private var legend: some View {
-        // SCR-214: the pre-task "honesty substitutions" are retired — the task
-        // band and "unsplit — still searchable" swatches now have referents
-        // (see `DayStripLegend`). Driven off the pure legend model so the copy
-        // and the render can't drift.
+        // U6: one plain-language vocabulary (see `DayStripLegend`), including
+        // the purged entry with its own plum swatch (R10). Driven off the pure
+        // legend model so the copy and the render can't drift.
         HStack(spacing: 16) {
             ForEach(DayStripLegend.items) { item in
                 legendItem(text: item.text) { swatch(for: item.swatch) }
@@ -908,6 +911,12 @@ struct DayStripView: View {
             RoundedRectangle(cornerRadius: 2)
                 .fill(Color.scRust.opacity(0.25))
                 .frame(width: 10, height: 8)
+        case .purged:
+            // R10: the purged swatch is the plum hue — the same distinction the
+            // strip's hatch draws — never the blocked rust.
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Color.scPlum.opacity(0.25))
+                .frame(width: 10, height: 8)
         }
     }
 
@@ -934,12 +943,9 @@ enum DayStripAccessibility {
         "\(base.title), unsplit, still searchable, \(hourMinuteText(ms: base.startMs)) to \(hourMinuteText(ms: base.endMs))"
     }
 
-    /// A between-recording gap: nothing was captured here (R7 — no footage).
-    /// Legacy blanket copy (pinned by DayTimelineTaskBandsTests); the strip's
-    /// gap overlays now speak through `gapCauseLabel` instead (U5).
-    static func gapLabel(startMs: Int, endMs: Int) -> String {
-        "Nothing captured, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
-    }
+    // U6: the legacy blanket `gapLabel` ("Nothing captured, …") is retired —
+    // gaps speak exclusively through the U5 cause labels (`gapCauseLabel`),
+    // so an empty stretch always carries its one honest cause (R8/R9).
 
     // MARK: - U5: gap-cause + purged copy (one string home — the SAME sentence
     // feeds `.help` (hover) and `.accessibilityLabel` (VoiceOver), so
@@ -988,8 +994,11 @@ enum DayStripAccessibility {
         "Day details unavailable, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
     }
 
+    /// A provably-blocked band (U6 vocabulary): "blocked at capture" — the
+    /// hard-stop claim without the redundant "nothing captured" pairing, and
+    /// the same wording the legend and the recorded-summary pane use (R9).
     static func blockedLabel(_ band: DayStripBlockedBand) -> String {
-        "Blocked, nothing captured, \(hourMinuteText(ms: band.startMs)) to \(hourMinuteText(ms: band.endMs))"
+        "Blocked at capture, \(hourMinuteText(ms: band.startMs)) to \(hourMinuteText(ms: band.endMs))"
     }
 
     static func playheadLabel(ms: Int) -> String {
