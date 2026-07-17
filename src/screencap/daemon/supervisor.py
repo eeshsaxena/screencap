@@ -1235,31 +1235,38 @@ class Supervisor:
             )
 
     async def _run_startup_sweep(self) -> None:
-        """Resume every cloud recording left incomplete at daemon startup (F3).
+        """Resume recordings left incomplete at daemon startup / unlock (F3).
 
         Scans the recordings dir for recordings with an ENGINE-ORIGIN frozen
-        ``chunks_expected`` and an UNSATISFIED finalize gate, and resumes each.
-        It NEVER freezes-from-disk (no ``reconcile_ledger_from_disk``): a
-        crash-before-finalize recording has no authoritative count, so it is not
-        auto-converted to "complete" — its chunks may upload but it never gets a
-        false sentinel; full recovery is via manual ``screencap upload``.
+        ``chunks_expected`` that are not terminally settled (a cloud recording with
+        an UNSATISFIED finalize gate, or an ``in_progress`` LOCAL recording — SCR-279)
+        and resumes each. It NEVER freezes-from-disk (no
+        ``reconcile_ledger_from_disk``): a crash-before-finalize recording has no
+        authoritative count, so it is not auto-converted to "complete" — its chunks
+        may upload but it never gets a false sentinel; full recovery is via manual
+        ``screencap upload``.
 
-        Auth pre-flight: if not signed in, the sweep is SKIPPED entirely (the
-        recordings stay on disk for a later daemon start / sign-in) — it never
-        evicts or partially-converges without auth.
+        Auth pre-flight: cloud convergence (scrub → upload → sentinel) needs auth,
+        so a not-signed-in daemon DEFERS cloud resumes per-candidate (the recordings
+        stay on disk for a later start / sign-in; nothing evicted or partially
+        converged without auth). A LOCAL resume (SCR-279 — re-run the
+        segmentation-only, no-upload terminal stage over an ``in_progress``
+        recording) needs no auth, so the sweep still runs for those even when signed
+        out; without this, a sealed-then-unlocked local library never leaves "still
+        processing…".
         """
         from screencap import auth
         from screencap.config import get_recordings_dir
 
+        signed_in = True
         try:
             await asyncio.to_thread(auth.get_id_token)
         except Exception as exc:  # noqa: BLE001 — NotSignedIn / AuthError / Keychain
+            signed_in = False
             logger.info(
-                "daemon startup sweep: not signed in (%s); skipping "
-                "(incomplete recordings preserved for a later attempt)",
-                type(exc).__name__,
+                "daemon startup sweep: not signed in (%s); cloud resumes deferred, "
+                "local resumes still proceed", type(exc).__name__,
             )
-            return
 
         try:
             recordings_dir = get_recordings_dir()
@@ -1283,19 +1290,24 @@ class Supervisor:
         refused: list[str] = []
         for d in candidates:
             try:
-                if await asyncio.to_thread(self._recording_needs_resume, d):
-                    result = await self.resume_terminal_stage(d)
-                    # SCR-116 observability: a result carrying an upload_warning
-                    # (e.g. account-ownership mismatch) did NOT converge — surface
-                    # it at WARNING and track it apart from the truly-swept count.
-                    if result is not None and result.upload_warning:
-                        refused.append(d.name)
-                        logger.warning(
-                            "daemon startup sweep: %s not converged (%s)",
-                            d.name, result.upload_warning,
-                        )
-                    else:
-                        swept.append(d.name)
+                if not await asyncio.to_thread(self._recording_needs_resume, d):
+                    continue
+                # Cloud convergence needs auth; defer cloud candidates when signed
+                # out (preserved on disk). LOCAL resumes proceed regardless (SCR-279).
+                if not signed_in and await asyncio.to_thread(_is_cloud_recording, d):
+                    continue
+                result = await self.resume_terminal_stage(d)
+                # SCR-116 observability: a result carrying an upload_warning
+                # (e.g. account-ownership mismatch) did NOT converge — surface
+                # it at WARNING and track it apart from the truly-swept count.
+                if result is not None and result.upload_warning:
+                    refused.append(d.name)
+                    logger.warning(
+                        "daemon startup sweep: %s not converged (%s)",
+                        d.name, result.upload_warning,
+                    )
+                else:
+                    swept.append(d.name)
             except Exception:  # noqa: BLE001 — one bad recording never aborts the sweep
                 logger.exception("daemon startup sweep: resume failed for %s", d)
         if swept:
@@ -1311,17 +1323,24 @@ class Supervisor:
 
     @staticmethod
     def _recording_needs_resume(recording_dir: Path) -> bool:
-        """True iff a cloud recording is ENGINE-frozen but not finalize-complete.
+        """True iff a recording is ENGINE-frozen but not terminally settled.
+
+        Two arms, both gated on a frozen engine-origin ``chunks_expected`` (a
+        crash-before-finalize recording has no authoritative count — it is left for
+        manual recovery, never auto-completed):
+
+        * **cloud** — the finalize gate is unsatisfied (chunks still to upload).
+        * **local (SCR-279)** — the recorded segmentation outcome is still
+          ``in_progress``: a quiesce-stopped / killed-mid-finalize local naming
+          pass that never settled. Re-running the idempotent terminal stage
+          converges it and records the real outcome, so the Journal stops showing
+          "still processing…" forever.
 
         Read-only: must NOT migrate the ledger schema (that would mutate
-        recording.db and defeat scrubbed-copy reuse) and must NOT freeze-from-disk
-        (a crash-before-finalize recording has no authoritative count — it is left
-        for manual recovery, never auto-completed).
+        recording.db and defeat scrubbed-copy reuse) and must NOT freeze-from-disk.
         """
         from screencap.terminal_stage import _open_ledger_readonly
 
-        if not _is_cloud_recording(recording_dir):
-            return False  # local / legacy / no-intent → not a cloud resume.
         ledger = _open_ledger_readonly(recording_dir)
         if ledger is None:
             return False  # no engine-origin ledger (legacy / not seeded).
@@ -1329,7 +1348,13 @@ class Supervisor:
             expected = ledger.chunks_expected()
             if not expected:
                 return False  # crash-before-freeze → no authoritative count.
-            return not ledger.finalize_gate_satisfied()
+            if _is_cloud_recording(recording_dir):
+                return not ledger.finalize_gate_satisfied()
+            # local / legacy: only an unsettled (``in_progress``) naming pass
+            # re-runs; a settled real outcome is done, never re-segmented.
+            from screencap.segmentation.outcome import IN_PROGRESS
+
+            return ledger.get_recording_outcome() == IN_PROGRESS
         except Exception:  # noqa: BLE001 — unreadable ledger → conservative skip
             return False
 

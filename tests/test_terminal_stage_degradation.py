@@ -1060,6 +1060,54 @@ def test_stopped_sentinel_skips_fallbacks_and_stays_provisional(tmp_path, monkey
 
 
 @pytest.mark.privacy
+def test_quiesced_local_finalize_raises_instead_of_completing(tmp_path, monkeypatch):
+    """SCR-279: a ``storage.lock`` that quiesces DURING the local naming pass must
+    halt the finalize, not complete it. The stopped arm records a provisional
+    ``in_progress`` and returns; the LOCAL branch's post-segmentation ``_check_stop``
+    then raises :class:`TerminalStageInterrupted` — so retention is skipped and the
+    recording is left for the startup/unlock resume to re-run (rather than settling
+    as a completed-but-``in_progress`` recording the Journal shows "still
+    processing…" forever)."""
+    import threading
+
+    from screencap.pipeline_state import PipelineLedger
+    from screencap.terminal_stage import TerminalStageInterrupted
+
+    rec_dir = _make_local_recording(tmp_path)
+
+    # A provider that TRIPS the quiesce mid-pass (as the on-device pipeline does on
+    # detecting the stop_event) and reports the ``stopped`` pseudo-reason.
+    stop_event = threading.Event()
+
+    class _QuiescingProvider(_ReasonProvider):
+        def segment(self, activity_summary):  # noqa: ANN001, ANN201
+            stop_event.set()
+            return super().segment(activity_summary)
+
+    _install_provider(
+        monkeypatch, _QuiescingProvider(PROVIDER_UNAVAILABLE, reason="stopped"),
+    )
+    _install_consent(monkeypatch, ConsentPolicy())
+
+    # Retention must NOT run once the finalize is interrupted.
+    from screencap import terminal_stage as ts
+
+    retention_calls: list[object] = []
+    real_retention = ts._apply_retention
+    monkeypatch.setattr(
+        ts, "_apply_retention",
+        lambda *a, **k: retention_calls.append(a) or real_retention(*a, **k),
+    )
+
+    with pytest.raises(TerminalStageInterrupted):
+        ts.run_terminal_stage(rec_dir, stop_event=stop_event)
+
+    assert retention_calls == []  # interrupted before retention.
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "in_progress"  # re-runs on resume.
+
+
+@pytest.mark.privacy
 def test_stopped_sentinel_keeps_prior_partial_and_its_detail(tmp_path, monkeypatch):
     """Monotonic: a stopped pass never downgrades a recorded partial — and never
     clobbers its stored detail with NULL."""
