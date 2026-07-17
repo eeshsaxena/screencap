@@ -883,6 +883,24 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertEqual(fake.presentHideHintCount, 1, "the hint is one-time — no second present")
     }
 
+    /// The first-recording beat's one-shot burns only on the sheet's dismissal
+    /// (the binding's true→false transition), never at fire time — a start that
+    /// nothing can host must not silently consume the one guidance moment (AE2).
+    func testBeatOneShotBurnsOnDismissalNotAtFireTime() {
+        let fake = FakeWindowLifecycle()
+        let suite = "beat-seen-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = HUDHintStore(defaults: defaults)
+        let recorder = RecorderController(windowLifecycle: fake, hintStore: store)
+
+        recorder.showFirstRecordingBeat = true  // the record path fires the beat
+        XCTAssertFalse(store.firstRecordingBeatSeen, "presenting alone must not burn the one-shot")
+
+        recorder.showFirstRecordingBeat = false  // every sheet dismissal route resets the binding
+        XCTAssertTrue(store.firstRecordingBeatSeen, "dismissal after presentation burns the one-shot")
+    }
+
     /// The one-time hint is torn down when the recording ends (via the `.hideHUD`
     /// teardown), so it never outlives the recording with now-false "Still
     /// recording" copy (review fix).

@@ -377,7 +377,9 @@ struct MainWindow: View {
         }
         .sheet(isPresented: $recorder.showFirstRecordingBeat) {
             // U7 (honest status): the one-time first-recording beat, presented over
-            // the shell after the record action fires (non-blocking).
+            // the shell after the record action fires (non-blocking). Burning the
+            // beat-seen one-shot is controller-owned — the binding's reset on
+            // dismissal triggers `showFirstRecordingBeat`'s `didSet` (AE2).
             FirstRecordingBeatSheet(
                 isPresented: $recorder.showFirstRecordingBeat,
                 onOpenIntelligence: { route = .intelligence }
