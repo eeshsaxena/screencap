@@ -21,7 +21,17 @@ from screencap.segmentation.provider import (
 
 
 class ChainedOnDeviceProvider:
-    """Try each on-device backend in order; cascade only on ``PROVIDER_UNAVAILABLE``."""
+    """Try each on-device backend in order; cascade only on ``PROVIDER_UNAVAILABLE``.
+
+    ``last_unavailable_reason`` (SCR-275, U3 / KTD-1) forwards the reason of
+    whichever backend's result the chain returned — the same optional-attribute
+    pattern as ``supports_frames``: read via ``getattr(…, None)``, so a backend
+    that doesn't expose one (e.g. the downloaded model) simply forwards ``None``.
+    """
+
+    #: Forwarded diagnostic of the backend whose result was returned;
+    #: ``None`` after a success or when that backend exposes no reason.
+    last_unavailable_reason: str | None = None
 
     def __init__(self, backends: list[LLMProvider]) -> None:
         self._backends = backends
@@ -29,12 +39,23 @@ class ChainedOnDeviceProvider:
     def segment(self, activity_summary: dict) -> SegmentResult:
         # If the chain is empty, nothing on-device is available (→ heuristic).
         result: SegmentResult = PROVIDER_UNAVAILABLE
+        self.last_unavailable_reason = None
+        backend = None
         for backend in self._backends:
             result = backend.segment(activity_summary)
             if result is PROVIDER_UNAVAILABLE:
                 continue  # this backend could not run — try the next
             # A tasks dict (use it) OR None (ran, declined — fail-open) stops here.
+            self.last_unavailable_reason = getattr(
+                backend, "last_unavailable_reason", None
+            )
             return result
+        if backend is not None:
+            # Every backend was unavailable — forward the LAST one's reason
+            # (the chain's result is that backend's result).
+            self.last_unavailable_reason = getattr(
+                backend, "last_unavailable_reason", None
+            )
         return result
 
 
