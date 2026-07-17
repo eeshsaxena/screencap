@@ -817,6 +817,14 @@ def _run_locked(
         _run_local_segmentation(
             recording_dir, ledger, result, is_live=False, stop_event=stop_event,
         )
+        # U9 (SCR-279): ledger-safe boundary AFTER the naming pass. A quiesce that
+        # tripped mid-pass leaves the outcome provisional (``in_progress``) and the
+        # segmenter returns; bail here so the finalize does NOT continue to
+        # retention and settle as a completed-but-``in_progress`` recording with no
+        # resume trigger. Symmetric with the cloud branch's ``_check_stop``
+        # boundaries and the incremental path — the startup/unlock reconcile
+        # re-runs the segmentation body over the (idempotent) terminal stage.
+        _check_stop(stop_event)
         # Retention is UNIVERSAL (R11): a local recording with a size/time cap
         # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
         # no-op. No remote precondition for local eviction.

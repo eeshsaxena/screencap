@@ -1731,6 +1731,52 @@ def _make_incomplete_cloud_recording(parent: Path, name: str, *, n_chunks: int,
     return rec_dir
 
 
+def _make_local_recording(parent: Path, name: str, *, n_chunks: int = 1,
+                          outcome: str = "in_progress", freeze: bool = True) -> Path:
+    """A LOCAL recording, with all chunks LOCAL_DONE, whose recorded segmentation
+    ``outcome`` is set (SCR-279).
+
+    ``outcome='in_progress'`` + ``freeze=True`` models a quiesce-stopped /
+    killed-mid-finalize local finalize whose naming pass never settled — a local
+    resume candidate. Any other outcome models a normally-settled recording (NOT a
+    candidate). ``freeze=False`` models a live / crash-before-finalize recording
+    (``chunks_expected`` never frozen) — never a candidate even with ``in_progress``."""
+    import json as _json
+
+    from screencap.engine.db import create_db, crud
+    from screencap.pipeline_state import PipelineLedger, ensure_pipeline_state_schema
+
+    rec_dir = parent / name
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    db_path = rec_dir / "recording.db"
+    engine, Session = create_db(str(db_path))
+    session = Session()
+    crud.insert_recording(session, {
+        "timestamp": 1000.0, "platform": "darwin",
+        "monitor_width": 1920, "monitor_height": 1080, "pixel_ratio": 2.0,
+        "double_click_interval_seconds": 0.5, "double_click_distance_pixels": 5.0,
+    })
+    session.close()
+    engine.dispose()
+    for i in range(n_chunks):
+        (rec_dir / f"chunk_{i:04d}.mp4").write_bytes(b"\x00" * 64)
+    ensure_pipeline_state_schema(db_path)
+    ledger = PipelineLedger(db_path)
+    for i in range(n_chunks):
+        ledger.seed_chunk(i)
+        ledger.mark_staged(i)
+        ledger.mark_local_done(i)
+    if freeze:
+        ledger.freeze_chunks_expected(n_chunks)  # ENGINE-origin freeze (finalize reached)
+    ledger.set_recording_outcome(outcome)
+    (rec_dir / ".recording_intent").write_text(_json.dumps({
+        "version": 2, "destination": "local",
+        "retention_policy": "keep_forever", "retention_params": {},
+    }))
+    (rec_dir / ".recording_id").write_text(name)
+    return rec_dir
+
+
 @pytest.mark.asyncio
 async def test_resume_fails_closed_on_not_signed_in(tmp_path, monkeypatch):
     """Research H4: a not-signed-in / promotion error in the resume returns None
@@ -2042,3 +2088,64 @@ def test_recording_needs_resume_crash_before_freeze_is_false(tmp_path):
 
     # No engine-origin frozen count → not a sweep candidate (never auto-completed).
     assert Supervisor._recording_needs_resume(rec_dir) is False
+
+
+def test_recording_needs_resume_local_in_progress_is_true(tmp_path):
+    """SCR-279: a finalize-frozen LOCAL recording whose recorded outcome is still
+    ``in_progress`` (a quiesce-stopped / killed-mid-finalize naming pass) IS a
+    resume candidate — the segmentation body must re-run so the Journal stops
+    showing "still processing…"."""
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_local_recording(tmp_path, "local-stuck", outcome="in_progress")
+    assert Supervisor._recording_needs_resume(rec_dir) is True
+
+
+def test_recording_needs_resume_local_settled_is_false(tmp_path):
+    """A LOCAL recording whose naming pass settled (a real outcome) is NOT a resume
+    candidate — only ``in_progress`` re-runs."""
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_local_recording(tmp_path, "local-done", outcome="produced_tasks")
+    assert Supervisor._recording_needs_resume(rec_dir) is False
+
+
+def test_recording_needs_resume_local_in_progress_unfrozen_is_false(tmp_path):
+    """The frozen-``chunks_expected`` gate applies to the local arm too: a LOCAL
+    recording that is ``in_progress`` but never reached finalize (live tick /
+    crash-before-freeze) has no authoritative count and is NOT auto-resumed."""
+    from screencap.daemon.supervisor import Supervisor
+
+    rec_dir = _make_local_recording(
+        tmp_path, "local-live", outcome="in_progress", freeze=False,
+    )
+    assert Supervisor._recording_needs_resume(rec_dir) is False
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_resumes_local_in_progress_without_auth(
+    tmp_path, monkeypatch,
+):
+    """SCR-279: a LOCAL in_progress recording resumes on the startup/unlock sweep
+    EVEN when not signed in — a local (segmentation-only, no-upload) convergence
+    needs no cloud auth, so the not-signed-in early-return must not swallow it."""
+    from screencap import auth
+    from screencap.config import get_recordings_dir
+    from screencap.daemon.supervisor import Supervisor
+
+    _make_local_recording(get_recordings_dir(), "local-stuck", outcome="in_progress")
+
+    def _not_signed_in(force_refresh=False):
+        raise auth.NotSignedIn("no creds")
+
+    monkeypatch.setattr("screencap.auth.get_id_token", _not_signed_in)
+
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    resumed: list[Path] = []
+
+    async def _spy(d):
+        resumed.append(Path(d))
+
+    monkeypatch.setattr(sup, "resume_terminal_stage", _spy)
+    await sup._run_startup_sweep()
+    assert [p.name for p in resumed] == ["local-stuck"]
