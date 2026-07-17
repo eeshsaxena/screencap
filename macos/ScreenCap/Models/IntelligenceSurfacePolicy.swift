@@ -10,8 +10,13 @@ enum IntelligenceSurfacePolicy {
     /// wasn't already made or seen in onboarding. So a fresh install that made the
     /// choice in the wizard is never asked again, and an existing user who never saw
     /// the wizard still gets the one-time beat.
-    static func shouldShowFirstRecordingBeat(hasRecordedOnce: Bool, onboardingChoiceSeen: Bool) -> Bool {
-        !hasRecordedOnce && !onboardingChoiceSeen
+    ///
+    /// `beatSeen` is "the sheet actually presented and was dismissed" (AE2), NOT "a
+    /// recording happened": marking at fire time would silently burn the one guidance
+    /// moment on a start nothing can host (a menu-bar start with the main window
+    /// closed). `RecorderController.showFirstRecordingBeat`'s `didSet` owns the write.
+    static func shouldShowFirstRecordingBeat(beatSeen: Bool, onboardingChoiceSeen: Bool) -> Bool {
+        !beatSeen && !onboardingChoiceSeen
     }
 
     /// The beat's adaptive content, resolved from the live verdict (U5 / KTD3). While

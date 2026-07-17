@@ -9,19 +9,19 @@ final class IntelligenceSurfacePolicyTests: XCTestCase {
 
     // MARK: - beat gate (catch-up)
 
-    func testBeatFiresForNewUserWhoDidNotSeeOnboardingChoice() {
+    func testBeatFiresForUserWhoDidNotSeeOnboardingChoice() {
         XCTAssertTrue(IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
-            hasRecordedOnce: false, onboardingChoiceSeen: false))
+            beatSeen: false, onboardingChoiceSeen: false))
     }
 
-    func testBeatDoesNotFireAfterFirstRecording() {
+    func testBeatDoesNotFireAfterItWasSeen() {
         XCTAssertFalse(IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
-            hasRecordedOnce: true, onboardingChoiceSeen: false))
+            beatSeen: true, onboardingChoiceSeen: false))
     }
 
     func testBeatDoesNotFireWhenOnboardingChoiceWasSeen() {
         XCTAssertFalse(IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
-            hasRecordedOnce: false, onboardingChoiceSeen: true))
+            beatSeen: false, onboardingChoiceSeen: true))
     }
 
     // MARK: - beat mode (adaptive content)

@@ -198,7 +198,10 @@ struct NewRecordingSheet: View {
     /// banner nudges when the verdict is not usable.
     private var firstBeatWillFire: Bool {
         let hints = HUDHintStore()
-        return !hints.hasRecordedOnce && !hints.intelligenceChoiceSeen
+        return IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
+            beatSeen: hints.firstRecordingBeatSeen,
+            onboardingChoiceSeen: hints.intelligenceChoiceSeen
+        )
     }
 
     @ViewBuilder

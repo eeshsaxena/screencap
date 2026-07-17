@@ -534,10 +534,19 @@ final class RecorderController: ObservableObject {
     /// the persisted `audio_default` (the plain toolbar / menu-bar path), `false`
     /// forces audio off (daemon `audio:false` / CLI `--no-audio`), `true` forces
     /// it on via the daemon body.
-    /// Honest status U7 — set true when the first-ever recording starts so the
-    /// one-time first-recording beat presents. Public set so the presenting sheet
-    /// binds and resets it on dismiss.
-    @Published var showFirstRecordingBeat = false
+    /// Honest status U7 — set true when a recording starts and the beat is still
+    /// owed, so the one-time first-recording beat presents. Public set so the
+    /// presenting sheet binds and resets it on dismiss. The true→false dismissal
+    /// transition is the ONLY place the persisted beat-seen one-shot burns (AE2):
+    /// the sheet demonstrably presented and the user dismissed it. App or window
+    /// teardown skips the write, deliberately — re-showing beats never showing.
+    @Published var showFirstRecordingBeat = false {
+        didSet {
+            if oldValue && !showFirstRecordingBeat {
+                hintStore.markFirstRecordingBeatSeen()
+            }
+        }
+    }
 
     func start(name: String? = nil, audio: Bool? = nil) {
         guard !state.isRecording else { return }
@@ -575,18 +584,16 @@ final class RecorderController: ObservableObject {
         apply(machine.enterStarting())
 
         // U7 (honest status): fire the one-time first-recording beat as catch-up,
-        // NON-BLOCKING — the recording proceeds regardless below. Marks the first
-        // recording so the beat fires at most once; it only shows when the
-        // intelligence choice wasn't already made/seen in onboarding (existing users
-        // and skippers), never for someone who chose in the wizard.
-        let hints = HUDHintStore()
-        if !hints.hasRecordedOnce {
-            if IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
-                hasRecordedOnce: false, onboardingChoiceSeen: hints.intelligenceChoiceSeen
-            ) {
-                showFirstRecordingBeat = true
-            }
-            hints.markRecordedOnce()
+        // NON-BLOCKING — the recording proceeds regardless below. It only shows when
+        // the intelligence choice wasn't already made/seen in onboarding (existing
+        // users and skippers), never for someone who chose in the wizard. The
+        // beat-seen one-shot is deliberately NOT marked here — see
+        // `showFirstRecordingBeat`'s `didSet`.
+        if IntelligenceSurfacePolicy.shouldShowFirstRecordingBeat(
+            beatSeen: hintStore.firstRecordingBeatSeen,
+            onboardingChoiceSeen: hintStore.intelligenceChoiceSeen
+        ) {
+            showFirstRecordingBeat = true
         }
 
         switch transport {

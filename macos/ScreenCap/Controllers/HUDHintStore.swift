@@ -13,9 +13,10 @@ struct HUDHintStore {
     /// SCR-239 — the standing "enable local intelligence" sidebar hint, dismissed
     /// once (persisted so it never reappears — R7 no intrusive re-prompt).
     static let localModelHintDismissedKey = "com.screencap.macos.localModelHintDismissed"
-    /// Honest status U7 — set the first time a recording is started, so the
-    /// one-time first-recording beat fires at most once.
-    static let hasRecordedOnceKey = "com.screencap.macos.hasRecordedOnce"
+    /// Honest status U7 — set only after the first-recording beat sheet actually
+    /// presented and was dismissed (the hide-hint idiom above), so a start that
+    /// nothing can host (menu-bar start, window closed) never burns the one-shot.
+    static let firstRecordingBeatSeenKey = "com.screencap.macos.firstRecordingBeatSeen"
     /// Honest status U7 — set at the onboarding download-model step (on BOTH a
     /// choice and a skip). Its absence is what makes the beat "catch-up": a user
     /// who never reached that step (existing users) has it unset and is eligible.
@@ -43,13 +44,13 @@ struct HUDHintStore {
         defaults.set(true, forKey: Self.localModelHintDismissedKey)
     }
 
-    /// Whether a recording has ever been started (U7 — gates the one-time beat).
-    var hasRecordedOnce: Bool {
-        defaults.bool(forKey: Self.hasRecordedOnceKey)
+    /// Whether the first-recording beat was actually seen (U7 — gates the one-time beat).
+    var firstRecordingBeatSeen: Bool {
+        defaults.bool(forKey: Self.firstRecordingBeatSeenKey)
     }
 
-    func markRecordedOnce() {
-        defaults.set(true, forKey: Self.hasRecordedOnceKey)
+    func markFirstRecordingBeatSeen() {
+        defaults.set(true, forKey: Self.firstRecordingBeatSeenKey)
     }
 
     /// Whether the intelligence choice was made or seen in onboarding (U7 catch-up).
