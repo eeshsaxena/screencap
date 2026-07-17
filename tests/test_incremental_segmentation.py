@@ -182,10 +182,16 @@ def _isolate_run_dir(tmp_path, monkeypatch):
 
 
 def _install_provider(monkeypatch, provider) -> None:
-    """Wire a fake provider into the day-split routing seam."""
+    """Wire a fake provider into the day-split routing seam.
+
+    The builder now receives the SCR-275 per-recording context
+    (``recording_dir`` / ``stop_event`` / ``is_live``); the fake ignores it.
+    """
     import screencap.segmentation.routing as routing
 
-    monkeypatch.setattr(routing, "build_day_split_provider", lambda: provider)
+    monkeypatch.setattr(
+        routing, "build_day_split_provider", lambda *a, **k: provider,
+    )
 
 
 def _install_consent(monkeypatch, policy: ConsentPolicy) -> None:
@@ -466,7 +472,7 @@ def test_provider_error_leaves_prior_tasks_unchanged(tmp_path, monkeypatch):
     # Second pass: the provider builder RAISES → fail-open, tasks untouched.
     import screencap.segmentation.routing as routing
 
-    def _raise():
+    def _raise(*a, **k):
         raise RuntimeError("provider build exploded")
 
     monkeypatch.setattr(routing, "build_day_split_provider", _raise)
@@ -523,3 +529,132 @@ def test_incremental_pass_skips_when_flock_held(tmp_path, monkeypatch):
     # Prior tasks are untouched — the pass wrote nothing while the flock was held.
     after = _ledger(rec_dir).read_task_segments()
     assert [s.name for s in after] == [s.name for s in before]
+
+
+# ---------------------------------------------------------------------------
+# SCR-275 U4 wiring: the per-recording context reaches the day-split provider,
+# and the on-device heuristic-first pipeline runs end-to-end via a fake helper.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_incremental_pass_threads_recording_context(tmp_path, monkeypatch):
+    """The tick path hands recording_dir + stop_event + is_live=True to the
+    day-split builder (the KTD-1 transport)."""
+    import threading
+
+    import screencap.segmentation.routing as routing
+
+    rec_dir = _make_local_recording(tmp_path)
+    captured: dict = {}
+    provider = _FakeProvider(_canned_tasks())
+
+    def _build(recording_dir=None, stop_event=None, is_live=False):
+        captured.update(
+            recording_dir=recording_dir, stop_event=stop_event, is_live=is_live,
+        )
+        return provider
+
+    monkeypatch.setattr(routing, "build_day_split_provider", _build)
+    ev = threading.Event()
+
+    result = _run_incremental(rec_dir, stop_event=ev)
+
+    assert result.tasks_persisted == 2
+    assert captured["recording_dir"] == rec_dir
+    assert captured["stop_event"] is ev
+    assert captured["is_live"] is True
+
+
+@pytest.mark.privacy
+def test_finalize_threads_context_with_is_live_false(tmp_path, monkeypatch):
+    import screencap.segmentation.routing as routing
+    from screencap import terminal_stage as ts
+
+    rec_dir = _make_local_recording(tmp_path)
+    captured: dict = {}
+    provider = _FakeProvider(_canned_tasks())
+
+    def _build(recording_dir=None, stop_event=None, is_live=False):
+        captured.update(recording_dir=recording_dir, is_live=is_live)
+        return provider
+
+    monkeypatch.setattr(routing, "build_day_split_provider", _build)
+
+    ts.run_terminal_stage(rec_dir)
+
+    assert captured["recording_dir"] == rec_dir
+    assert captured["is_live"] is False
+
+
+@pytest.mark.privacy
+def test_preset_stop_event_interrupts_incremental_pass(tmp_path, monkeypatch):
+    """A quiesce already in progress halts the pass before any work (KTD-7)."""
+    import threading
+
+    from screencap import terminal_stage as ts
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _FakeProvider(_canned_tasks()))
+    ev = threading.Event()
+    ev.set()
+
+    with pytest.raises(ts.TerminalStageInterrupted):
+        _run_incremental(rec_dir, stop_event=ev)
+
+    assert _ledger(rec_dir).read_task_segments() == []
+
+
+@pytest.mark.privacy
+def test_ondevice_pipeline_end_to_end_via_fake_helper(tmp_path, monkeypatch):
+    """Full wiring proof: terminal stage → routing → OnDeviceProvider(context) →
+    heuristic-first pipeline → fake helper verbs → model-named rows persisted.
+
+    Exercises the REAL R11 strip derivation over the fixture's recording.db
+    (the unit suite injects a predicate; this path does not).
+    """
+    import sys
+
+    import screencap.segmentation.routing as routing
+    from screencap import config
+
+    rec_dir = _make_local_recording(tmp_path)
+
+    helper = tmp_path / "fake_helper.py"
+    helper.write_text(
+        "#!" + sys.executable + "\n"
+        + "import json, sys\n"
+        + "req = json.load(sys.stdin)\n"
+        + "task = req.get('task')\n"
+        + "if task == 'arbitrate':\n"
+        + "    print(json.dumps({'status': 'ok', 'result': {'merges': []}}))\n"
+        + "elif task == 'name-window':\n"
+        + "    print(json.dumps({'status': 'ok', 'result':\n"
+        + "        {'name': 'Deep work', 'category': 'development'}}))\n"
+        + "elif task == 'day-summary':\n"
+        + "    print(json.dumps({'status': 'ok', 'result':\n"
+        + "        {'overview': 'Focused day', 'tags': ['focus']}}))\n"
+        + "else:\n"
+        + "    print(json.dumps({'status': 'unavailable',\n"
+        + "                      'reason': 'unexpected-legacy-call'}))\n"
+    )
+    helper.chmod(0o755)
+    monkeypatch.setenv("SCREENCAP_ONDEVICE_HELPER", str(helper))
+    monkeypatch.setenv("SCREENCAP_ONDEVICE_HELPER_TIMEOUT", "10")
+    monkeypatch.setattr(config, "get_llm_provider", lambda: "on-device")
+    monkeypatch.setattr(routing, "_downloaded_model_installed", lambda: False)
+
+    result = _run_incremental(rec_dir)
+
+    assert result.tasks_persisted >= 1
+    segs = _ledger(rec_dir).read_task_segments()
+    assert [s.name for s in segs] == ["Deep work"] * len(segs)
+    assert all(s.category == "development" for s in segs)
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert persisted["summary"]["overview"] == "Focused day"
+    assert persisted["tags"] == ["focus"]
+    # Per-task provenance marks the model source in the returned/persisted dict
+    # metadata path: tasks.json rewrites source to the row-ownership 'agent'
+    # (the U2/U6 classifier reads the mix BEFORE persist), so here we assert
+    # the names prove the model path ran (mechanical would be task_1 ...).
+    assert all(t["name"] == "Deep work" for t in persisted["tasks"])

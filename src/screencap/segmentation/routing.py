@@ -17,12 +17,26 @@ on-device-class backends are ever placed in the day-split provider set.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from screencap.segmentation.generation import GenerationProvider
 from screencap.segmentation.provider import LLMProvider
 
 
-def build_day_split_provider() -> LLMProvider:
-    """Return the provider to call for day-split, per the configured active provider."""
+def build_day_split_provider(
+    recording_dir: "Path | str | None" = None,
+    stop_event: "object | None" = None,
+    is_live: bool = False,
+) -> LLMProvider:
+    """Return the provider to call for day-split, per the configured active provider.
+
+    ``recording_dir`` / ``stop_event`` / ``is_live`` are the SCR-275 U4
+    per-recording context (KTD-1 transport): the terminal stage supplies them
+    at call time so the on-device backend can run the heuristic-first windowed
+    pipeline (with cooperative stop checks) instead of the legacy whole-day
+    call. Callers that pass none (legacy callers) get the old behavior; the
+    downloaded / BYO backends ignore the context entirely.
+    """
     from screencap import config
     from screencap.segmentation.endpoint import LOCAL, classify_endpoint
     from screencap.segmentation.providers.chained import (
@@ -35,7 +49,11 @@ def build_day_split_provider() -> LLMProvider:
     if name == "on-device":
         from screencap.segmentation.providers.ondevice import OnDeviceProvider
 
-        backends: list[LLMProvider] = [OnDeviceProvider()]
+        backends: list[LLMProvider] = [OnDeviceProvider(
+            recording_dir=recording_dir,
+            stop_event=stop_event,
+            is_live=is_live,
+        )]
         if _downloaded_model_installed():
             from screencap.segmentation.providers.downloaded import DownloadedProvider
 

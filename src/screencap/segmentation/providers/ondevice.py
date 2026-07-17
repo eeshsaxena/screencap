@@ -134,6 +134,7 @@ REASON_OVERSIZED_STDOUT = "oversized-stdout"
 REASON_NOT_STRIPPED = "not-stripped"
 REASON_GATE_REFUSED = "gate-refused"
 REASON_EMPTY_ANSWER = "empty-answer"
+REASON_PIPELINE_FAILED = "pipeline-failed"
 
 # Retry taxonomy (KTD-3): ONE fresh-spawn retry for ``decoding-failure`` (also
 # the symptom of an output-cap truncation) and ONE post-backoff retry for
@@ -327,14 +328,32 @@ class OnDeviceProvider:
 
     supports_frames: bool = False
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        recording_dir: "Path | str | None" = None,
+        stop_event: "object | None" = None,
+        is_live: bool = False,
+    ) -> None:
         #: Out-of-band diagnostic (KTD-1): WHY the most recent ``segment`` /
         #: ``answer`` / ``call_*`` invocation was unavailable; ``None`` after
-        #: a success (including segment's ran-but-no-usable-tasks ``None``).
-        #: Read via ``getattr`` by the chained provider / terminal stage —
-        #: never part of the return value, which stays the identity-compared
-        #: :data:`PROVIDER_UNAVAILABLE` singleton.
+        #: a full success (including segment's ran-but-no-usable-tasks
+        #: ``None``). After a PARTIAL windowed pass (a tasks dict mixing model
+        #: and mechanical sources) it carries the dominant per-window failure
+        #: reason — the U6 honesty seam (KTD-8). Read via ``getattr`` by the
+        #: chained provider / terminal stage — never part of the return value,
+        #: which stays the identity-compared :data:`PROVIDER_UNAVAILABLE`
+        #: singleton.
         self.last_unavailable_reason: str | None = None
+        # SCR-275 U4 (KTD-1 transport): optional per-recording context. When
+        # ``recording_dir`` is present (the terminal stage supplies it at call
+        # time via ``build_day_split_provider``) AND the recording has chunk
+        # manifests, ``segment`` runs the heuristic-first windowed pipeline
+        # instead of the legacy whole-day helper call. Legacy callers that
+        # construct the provider bare keep the old behavior unchanged.
+        self._recording_dir = Path(recording_dir) if recording_dir else None
+        self._stop_event = stop_event
+        self._is_live = is_live
 
     def segment(
         self,
@@ -362,6 +381,15 @@ class OnDeviceProvider:
             log.info("On-device helper not found (CLI-only install?); unavailable")
             self.last_unavailable_reason = REASON_HELPER_MISSING
             return PROVIDER_UNAVAILABLE
+
+        # SCR-275 U4 (KTD-1): with per-recording context AND on-disk chunk
+        # manifests, the heuristic-first windowed pipeline replaces the legacy
+        # whole-day call — same tri-state exterior. No manifests (legacy /
+        # single-file recording) → fall through to the whole-day path.
+        if self._recording_dir is not None:
+            manifests = self._load_manifests()
+            if manifests:
+                return self._segment_windowed(activity_summary, manifests)
 
         payload = json.dumps(activity_summary["summary"])
 
@@ -393,6 +421,58 @@ class OnDeviceProvider:
         except Exception:
             log.warning("On-device helper output failed validation", exc_info=True)
             return None
+
+    def _load_manifests(self) -> list[dict]:
+        """The recording's on-disk chunk manifests; ``[]`` fails open to legacy."""
+        try:
+            from screencap.segmentation.local_source import load_local_manifests
+
+            return load_local_manifests(self._recording_dir)
+        except Exception:  # noqa: BLE001 — viability probe, never a crash
+            log.debug("manifest load for windowed segmentation failed",
+                      exc_info=True)
+            return []
+
+    def _segment_windowed(
+        self, activity_summary: dict, manifests: list[dict],
+    ) -> dict | None | ProviderUnavailable:
+        """Run the SCR-275 heuristic-first pipeline (U4) for this recording.
+
+        The pipeline drives this provider's ``call_arbitrate`` /
+        ``call_name_window`` / ``call_day_summary`` verbs and records the pass
+        outcome on :attr:`last_unavailable_reason`. Any unexpected error maps
+        to the sentinel (with :data:`REASON_PIPELINE_FAILED`) so the caller's
+        degrade ladder still routes — never a raise.
+        """
+        try:
+            from screencap.segmentation.local_source import LocalActivitySource
+            from screencap.segmentation.ondevice_pipeline import (
+                compute_pinned_before_ts,
+                run_heuristic_pipeline,
+            )
+
+            pinned = (
+                compute_pinned_before_ts(self._recording_dir)
+                if self._is_live else None
+            )
+            return run_heuristic_pipeline(
+                self,
+                self._recording_dir,
+                LocalActivitySource(self._recording_dir, manifests),
+                manifests,
+                session_start=float(activity_summary.get("session_start") or 0.0),
+                session_end=float(activity_summary.get("session_end") or 0.0),
+                is_live=self._is_live,
+                stop_event=self._stop_event,
+                pinned_before_ts=pinned,
+            )
+        except Exception:  # noqa: BLE001 — the tri-state must hold, never a raise
+            log.warning(
+                "heuristic-first on-device pipeline failed; unavailable",
+                exc_info=True,
+            )
+            self.last_unavailable_reason = REASON_PIPELINE_FAILED
+            return PROVIDER_UNAVAILABLE
 
     @staticmethod
     def _parse_envelope(stdout: str) -> tuple[dict | None, str | None]:

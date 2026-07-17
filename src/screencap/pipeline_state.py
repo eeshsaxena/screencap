@@ -106,6 +106,7 @@ __all__ = [
     "LedgerError",
     "EvictionRefused",
     "ensure_pipeline_state_schema",
+    "bump_scrub_generation",
     "from_chunk_status",
     "reconcile_ledger_from_disk",
     "read_task_segments_wire",
@@ -355,6 +356,53 @@ CREATE TABLE IF NOT EXISTS pipeline_recording_outcome (
 )
 """
 
+# SCR-275 U4 (KTD-6). Per-window on-device naming cache — a MEMO of completed
+# model naming calls, keyed by window span + digest hash, NEVER task truth (the
+# sinks — ``tasks.json`` + ``pipeline_task_segments`` — stay authoritative). A
+# hit skips the model call; any boundary/digest change is a miss, never an
+# error. Colocated in the local-only ``recording.db`` so it inherits the
+# never-uploaded rule and the recording destroy/eviction lifecycle for free.
+# No ``recording_id`` column: ``recording.db`` is strictly per-recording.
+_ONDEVICE_NAMES_DDL = """
+CREATE TABLE IF NOT EXISTS ondevice_window_names (
+    id INTEGER PRIMARY KEY,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    digest_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT,
+    created_at REAL,
+    UNIQUE (window_start, window_end, digest_hash)
+)
+"""
+
+# SCR-275 U4 (KTD-10). Single-row staleness counter: the scrub worker
+# increments it inside its delete transaction; a naming pass snapshots it
+# before digest computation and re-checks it inside its commit transaction —
+# a mismatch means a retroactive scrub landed mid-pass, so the pass deletes
+# its own cache writes and hands nothing to the sinks.
+_SCRUB_GENERATION_DDL = """
+CREATE TABLE IF NOT EXISTS scrub_generation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+
+def bump_scrub_generation(conn: sqlite3.Connection) -> None:
+    """Increment the scrub-generation counter ON ``conn`` (no commit — KTD-10).
+
+    Usable inside an EXISTING transaction: the scrub worker calls this on its
+    own connection, inside the same ``BEGIN IMMEDIATE`` transaction that
+    deletes the scrubbed source rows, so the generation bump and the deletes
+    are one atom. Upserts the single row, so a DB that has the table but no
+    row yet (fresh schema) starts at 1.
+    """
+    conn.execute(
+        "INSERT INTO scrub_generation (id, generation) VALUES (1, 1) "
+        "ON CONFLICT(id) DO UPDATE SET generation = generation + 1"
+    )
+
 
 def _migrate_task_segments_columns(conn: sqlite3.Connection) -> None:
     """ALTER-ADD the U5 ``source``/``edited`` columns to a pre-columns table.
@@ -411,6 +459,9 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         _migrate_task_segments_columns(conn)
         # U2: per-recording segmentation outcome (idempotent create).
         conn.execute(_RECORDING_OUTCOME_DDL)
+        # SCR-275 U4: on-device naming cache + scrub-generation counter.
+        conn.execute(_ONDEVICE_NAMES_DDL)
+        conn.execute(_SCRUB_GENERATION_DDL)
         conn.commit()
     except sqlite3.OperationalError:
         # Read-only DB (an old recording opened for read) — do not crash; the
@@ -1150,6 +1201,169 @@ class PipelineLedger:
             return None
         finally:
             if conn is not None:
+                conn.close()
+
+    # ------------------------------------------------------------------
+    # SCR-275 U4 — per-window on-device naming cache (memo, never task truth)
+    # + the KTD-10 scrub-generation staleness guard.
+    # ------------------------------------------------------------------
+
+    def lookup_window_name(
+        self, window_start: float, window_end: float, digest_hash: str,
+    ) -> "tuple[str, str | None] | None":
+        """Return the cached ``(name, category)`` for an exact span+digest key.
+
+        ``None`` on a miss — including a missing table (a pre-SCR-275
+        ``recording.db``): a miss is never an error (KTD-6, memo-not-truth).
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT name, category FROM ondevice_window_names "
+                "WHERE window_start=? AND window_end=? AND digest_hash=?",
+                (window_start, window_end, digest_hash),
+            ).fetchone()
+            if row is None:
+                return None
+            return (str(row["name"]), row["category"])
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def store_window_name(
+        self,
+        window_start: float,
+        window_end: float,
+        digest_hash: str,
+        name: str,
+        category: "str | None",
+    ) -> None:
+        """Persist one completed naming call (delete-then-insert, idempotent).
+
+        Written under the terminal-stage flock as each call completes (KTD-6),
+        with the ledger's own ``BEGIN IMMEDIATE`` discipline. The delete is
+        span-scoped (any prior digest for the same span goes), so a span holds
+        exactly its CURRENT digest's name and a re-run never duplicates.
+        Defensively creates the table so an old DB caches on first use.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_ONDEVICE_NAMES_DDL)
+                conn.execute(
+                    "DELETE FROM ondevice_window_names "
+                    "WHERE window_start=? AND window_end=?",
+                    (window_start, window_end),
+                )
+                conn.execute(
+                    "INSERT INTO ondevice_window_names "
+                    "(window_start, window_end, digest_hash, name, category, "
+                    " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (window_start, window_end, digest_hash, name, category,
+                     _now()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def delete_window_names_overlapping(self, start: float, end: float) -> int:
+        """Delete cache rows overlapping ``(start, end)``; return the count.
+
+        Overlap is ``window_end > start AND window_start < end`` — the same
+        predicate the scrub worker's in-transaction purge uses (which is the
+        production purge path; this accessor is for callers that own no open
+        transaction). Missing table → 0 (fail-open).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "DELETE FROM ondevice_window_names "
+                    "WHERE window_end > ? AND window_start < ?",
+                    (start, end),
+                )
+                n = cur.rowcount
+                conn.commit()
+                return max(0, n)
+            except sqlite3.OperationalError:
+                conn.rollback()
+                return 0
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def read_scrub_generation(self) -> int:
+        """Return the current scrub generation (0 for a missing table/row).
+
+        Fail-safe like :meth:`get_recording_outcome`: any SQLite error reads
+        as 0 — the guard then compares 0 == 0 and passes, which is correct for
+        a DB where the counter (and therefore the scrub bump) cannot exist.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT generation FROM scrub_generation WHERE id=1"
+            ).fetchone()
+            return int(row[0]) if row is not None else 0
+        except sqlite3.Error:
+            return 0
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def finalize_window_names(
+        self,
+        written_keys: "list[tuple[float, float, str]]",
+        expected_generation: int,
+    ) -> bool:
+        """KTD-10 commit-time staleness guard, in ONE transaction.
+
+        Re-reads the scrub generation inside a ``BEGIN IMMEDIATE`` transaction.
+        Unchanged → ``True`` (the pass's cache writes stand). Changed — a
+        retroactive scrub landed mid-pass — → deletes exactly the cache rows
+        this pass wrote (``written_keys``), commits that deletion, and returns
+        ``False``: the caller must hand nothing to the sinks, so no
+        pre-scrub-derived name survives anywhere.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT generation FROM scrub_generation WHERE id=1"
+                    ).fetchone()
+                    gen = int(row[0]) if row is not None else 0
+                except sqlite3.OperationalError:
+                    gen = 0
+                if gen == int(expected_generation):
+                    conn.commit()
+                    return True
+                try:
+                    for ws, we, dh in written_keys:
+                        conn.execute(
+                            "DELETE FROM ondevice_window_names "
+                            "WHERE window_start=? AND window_end=? "
+                            "AND digest_hash=?",
+                            (ws, we, dh),
+                        )
+                except sqlite3.OperationalError:
+                    pass  # table dropped concurrently — nothing to delete
+                conn.commit()
+                return False
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
                 conn.close()
 
     def insert_task_segment(self, seg: TaskSegmentRow) -> int:

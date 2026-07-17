@@ -813,7 +813,9 @@ def _run_locked(
         # leaves the recording unnamed but NEVER blocks terminal completion,
         # and never triggers an upload (AE1 — the LOCAL branch has no upload
         # seam and the tasks store is excluded from upload by rule).
-        _run_local_segmentation(recording_dir, ledger, result, is_live=False)
+        _run_local_segmentation(
+            recording_dir, ledger, result, is_live=False, stop_event=stop_event,
+        )
         # Retention is UNIVERSAL (R11): a local recording with a size/time cap
         # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
         # no-op. No remote precondition for local eviction.
@@ -947,6 +949,7 @@ def run_incremental_segmentation(
     *,
     non_blocking: bool = True,
     lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+    stop_event: "threading.Event | None" = None,
 ) -> TerminalResult:
     """Incrementally segment a LIVE (still-recording) ambient day (U6, R6/R7/KTD4).
 
@@ -978,10 +981,18 @@ def run_incremental_segmentation(
     Returns a :class:`TerminalResult` (``destination='local'``); ``tasks_persisted``
     is the agent-task count written this pass. Raises :class:`TerminalStageBusy`
     when the flock is contended (per ``non_blocking`` / ``lock_timeout``).
+
+    ``stop_event`` (SCR-275 U4 / SCR-258 KTD-15): the daemon tick threads its
+    quiesce flag through so a ``storage.lock`` in progress halts the windowed
+    naming pass at its next safe row boundary (remaining windows go mechanical
+    this pass; cache hits converge the re-run). A stop set BEFORE the pass
+    starts raises :class:`TerminalStageInterrupted`, mirroring
+    :func:`run_terminal_stage`.
     """
     recording_dir = Path(recording_dir)
     name = recording_dir.name
     result = TerminalResult(destination="local")
+    _check_stop(stop_event)
     # Flock FIRST (AE12), exactly like run_terminal_stage — a concurrent finalize
     # that holds it means this best-effort pass SKIPS (non_blocking) rather than
     # double-writing the agent task set.
@@ -989,7 +1000,9 @@ def run_incremental_segmentation(
         ledger = _open_ledger(recording_dir)
         if ledger is not None:
             result.n_expected = ledger.chunks_expected()
-        _run_local_segmentation(recording_dir, ledger, result, is_live=True)
+        _run_local_segmentation(
+            recording_dir, ledger, result, is_live=True, stop_event=stop_event,
+        )
         result.routed = True
     return result
 
@@ -1000,6 +1013,7 @@ def _run_local_segmentation(
     result: TerminalResult,
     *,
     is_live: bool = False,
+    stop_event: "threading.Event | None" = None,
 ) -> None:
     """Segment a LOCAL recording into named tasks; persist to the local store (U4/U7).
 
@@ -1060,7 +1074,9 @@ def _run_local_segmentation(
             )
 
     try:
-        summary, provider_result = _segment_local_tasks(recording_dir)
+        summary, provider_result = _segment_local_tasks(
+            recording_dir, stop_event=stop_event, is_live=is_live,
+        )
     except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
         logger.debug(
             "terminal_stage: local segmentation failed open for %s (%s)",
@@ -1233,6 +1249,9 @@ def _carve_out_protected_spans(
 
 def _segment_local_tasks(
     recording_dir: Path,
+    *,
+    stop_event: "threading.Event | None" = None,
+    is_live: bool = False,
 ) -> "tuple[dict | None, SegmentResult]":
     """Build the stripped activity summary and run the configured day-split provider.
 
@@ -1287,7 +1306,14 @@ def _segment_local_tasks(
     # touches the network (R5). segment() returns a validated tasks dict, None
     # (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not run — routed to
     # the idle-gap heuristic by the caller's ladder, KTD6).
-    provider = build_day_split_provider()
+    #
+    # SCR-275 U4 (KTD-1 transport): the per-recording context — recording dir,
+    # cooperative stop signal, live flag — rides into the provider so the
+    # on-device backend runs the heuristic-first windowed pipeline (with
+    # boundary pinning on live passes) instead of the legacy whole-day call.
+    provider = build_day_split_provider(
+        recording_dir=recording_dir, stop_event=stop_event, is_live=is_live,
+    )
     return summary, provider.segment(summary)
 
 

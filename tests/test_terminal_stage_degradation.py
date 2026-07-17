@@ -182,7 +182,9 @@ def _install_provider(monkeypatch, provider) -> None:
     """Wire a fake provider into the U8 day-split routing seam."""
     import screencap.segmentation.routing as routing
 
-    monkeypatch.setattr(routing, "build_day_split_provider", lambda: provider)
+    monkeypatch.setattr(
+        routing, "build_day_split_provider", lambda *a, **k: provider,
+    )
 
 
 def _install_consent(monkeypatch, policy: ConsentPolicy) -> None:
