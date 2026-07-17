@@ -422,12 +422,16 @@ def _resolve_blocked_predicate(
 
     ``strip_tss`` are the exact timestamps the strip will test — the activity
     summary's own event/transcript timestamps. They are forwarded to
-    ``derive_skip_intervals`` as ``screenshot_timestamps`` so the fail-closed
-    **uncovered-gap** and **orphan-screenshot** residual protects precisely the
-    timestamps being stripped: a timestamp with no covering ``window_event``
-    (its rows were retroactively deleted) is treated as blocked, exactly as
-    ``frame_blocked.build_is_blocked`` protects the frame timestamps. Without
-    this, an event before the first surviving window would silently under-block.
+    ``derive_skip_intervals`` as ``coverage_timestamps`` so the fail-closed
+    **uncovered-gap** residual protects precisely the timestamps being
+    stripped: a timestamp before the first surviving ``window_event`` (its
+    covering rows were retroactively deleted) is treated as blocked, exactly as
+    ``frame_blocked.build_is_blocked`` protects the frame timestamps. They are
+    deliberately EXCLUDED from the **orphan-screenshot** cross-check — that
+    pass set-matches against the ``screenshot`` table's frame rows, which an
+    event/transcript timestamp never coincides with, so routing them through
+    ``screenshot_timestamps`` would falsely orphan-flag every event and strip
+    the whole recording's activity.
 
     Fail-closed on ANY error (missing/unreadable/partial ``recording.db``, a
     ``require_canonical`` raise, or a failure building the privacy machinery):
@@ -457,10 +461,16 @@ def _resolve_blocked_predicate(
             classifier=classifier,
             evaluator=evaluator,
             time_range=window,
-            # Forward the exact strip timestamps so the uncovered-gap / orphan
-            # residual protects them (fail-closed) — an event before the first
-            # surviving window would otherwise slip through unblocked.
-            screenshot_timestamps=list(strip_tss),
+            # Forward the exact strip timestamps so the uncovered-gap residual
+            # protects them (fail-closed) — an event before the first surviving
+            # window would otherwise slip through unblocked. These are EVENT/
+            # transcript timestamps, not frame filenames, so they ride
+            # ``coverage_timestamps``: the orphan-screenshot cross-check
+            # set-matches against ``screenshot`` table rows, and an event
+            # timestamp never matches a frame's, so routing them through
+            # ``screenshot_timestamps`` would falsely orphan-flag every event
+            # and strip the entire recording's activity (summary → None).
+            coverage_timestamps=list(strip_tss),
             # require_canonical makes derive_skip_intervals RAISE on a partial
             # canonical read rather than silently returning the under-blocked
             # set — the except below maps that to the all-blocked sentinel

@@ -266,7 +266,8 @@ def _aggregate_recording(
     # blocked → this recording contributes nothing (mirrors build_is_blocked's
     # _always_blocked sentinel and the point flow's whole-recording drop).
     is_span_blocked = _build_blocked_span_test(
-        rec_dir, win_start, win_end, samples,
+        rec_dir, win_start, win_end,
+        screenshot_ts=screenshot_ts, action_ts=action_ts,
     )
 
     for app, s_start, s_end in spans:
@@ -333,7 +334,9 @@ def _build_blocked_span_test(
     rec_dir: Path,
     win_start: float,
     win_end: float,
-    samples: list[float],
+    *,
+    screenshot_ts: list[float],
+    action_ts: list[float],
 ):
     """Return ``is_span_blocked(s, e)`` for this recording's window (FIX A).
 
@@ -345,6 +348,14 @@ def _build_blocked_span_test(
     predicate that answers whether a focus span ``[s, e)`` overlaps any blocked
     interval. A masked (MASK_WINDOW/EXCLUDE / secure-field) window's whole span
     lands in that set, so the caller drops it.
+
+    The two timestamp families are routed separately: ``screenshot_ts`` (flat
+    frame timestamps) get the full residual set including the SCR-191
+    orphan-screenshot cross-check; ``action_ts`` (action-event timestamps) ride
+    ``coverage_timestamps`` — uncovered-gap protection only — because an action
+    timestamp never coincides with a ``screenshot`` row and routing it through
+    ``screenshot_timestamps`` would falsely orphan-flag every action event and
+    drop every active focus span from the figures.
 
     Fail-closed: ANY failure to derive the canonical block set (a partial/locked/
     missing ``recording.db`` under ``require_canonical`` → ``CanonicalDerivationError``,
@@ -365,7 +376,8 @@ def _build_blocked_span_test(
             classifier=classifier,
             evaluator=evaluator,
             time_range=(win_start, win_end),
-            screenshot_timestamps=list(samples),
+            screenshot_timestamps=list(screenshot_ts),
+            coverage_timestamps=list(action_ts),
             require_canonical=True,
         )
     except Exception:

@@ -62,9 +62,10 @@ def _make_local_recording(
     base = 1000.0
     chunk_dur = 3600.0
     # The event timestamps (per chunk offset) — the same values forwarded to the
-    # U3 strip as screenshot_timestamps, so they need canonical window coverage
-    # AND a surviving screenshot row (else the fail-closed orphan/uncovered-gap
-    # residual strips them). Mirrors what a real recording carries on disk.
+    # U3 strip as coverage_timestamps, so they need canonical window coverage
+    # (else the fail-closed uncovered-gap residual strips them). The screenshot
+    # rows mirror what a real recording carries on disk; events are deliberately
+    # NOT orphan-cross-checked against them.
     event_offsets = (10.0, 20.0, 30.0)
     for i in range(n_chunks):
         cs = base + i * chunk_dur
