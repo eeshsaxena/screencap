@@ -162,20 +162,7 @@ enum DayStripLayout {
     /// one; the cluster renders at the mean x. Keeps a dense day's markers
     /// legible instead of painting dozens of overlapping bars.
     static func clusterXs(_ xs: [CGFloat], thresholdPx: CGFloat = 14) -> [CGFloat] {
-        let sorted = xs.sorted()
-        guard thresholdPx > 0, !sorted.isEmpty else { return sorted }
-        var clusters: [CGFloat] = []
-        var bucket: [CGFloat] = [sorted[0]]
-        for x in sorted.dropFirst() {
-            if x - bucket[bucket.count - 1] <= thresholdPx {
-                bucket.append(x)
-            } else {
-                clusters.append(bucket.reduce(0, +) / CGFloat(bucket.count))
-                bucket = [x]
-            }
-        }
-        clusters.append(bucket.reduce(0, +) / CGFloat(bucket.count))
-        return clusters
+        captionClusters(xs.map { (x: $0, cls: .blocked) }, thresholdPx: thresholdPx).map(\.x)
     }
 
     /// A placed task label above its band (design 451–453). `truncated` is true
@@ -633,22 +620,30 @@ struct DayStripView: View {
         ctx.resolve(Text(name).font(SCTypography.mono(size: 9.5)).foregroundColor(.scTeal))
     }
 
-    /// Ellipsize a task name to `maxWidth`: drop trailing characters until the
-    /// name + "…" measures within the width, so a truncated label ends in a
-    /// visible ellipsis instead of a hard clip. Worst case falls back to a bare
-    /// "…" (the 44pt hint floor makes that practically unreachable).
+    /// Ellipsize a task name to `maxWidth`: binary-search the longest prefix
+    /// whose text + "…" measures within the width, so a truncated label ends in
+    /// a visible ellipsis instead of a hard clip. Runs inside the Canvas draw
+    /// closure, so O(log n) resolve/measure calls, not one per character. Worst
+    /// case falls back to a bare "…" (the 44pt hint floor makes that
+    /// practically unreachable).
     private func ellipsizedTaskLabel(
         _ name: String, maxWidth: CGFloat, ctx: GraphicsContext
     ) -> GraphicsContext.ResolvedText {
-        var characters = Array(name)
-        while !characters.isEmpty {
-            let candidate = resolveTaskLabel(String(characters) + "…", ctx: ctx)
+        let characters = Array(name)
+        var lo = 0
+        var hi = characters.count
+        var best: GraphicsContext.ResolvedText?
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            let candidate = resolveTaskLabel(String(characters.prefix(mid)) + "…", ctx: ctx)
             if candidate.measure(in: taskLabelMaxSize).width <= maxWidth {
-                return candidate
+                best = candidate
+                lo = mid
+            } else {
+                hi = mid - 1
             }
-            characters.removeLast()
         }
-        return resolveTaskLabel("…", ctx: ctx)
+        return best ?? resolveTaskLabel("…", ctx: ctx)
     }
 
     private func bandRect(startMs: Int, endMs: Int, width: CGFloat) -> CGRect {
@@ -865,10 +860,12 @@ struct DayStripView: View {
     /// pure `tickLabelMinX` centers/clamps with. Falls back to the monospaced
     /// system font if the bundled face is somehow unregistered, mirroring
     /// `Font.custom`'s own fallback.
-    private static func hourLabelWidth(_ text: String) -> CGFloat {
-        let font = NSFont(name: SCFonts.IBMPlexMono.regular, size: 10)
+    private static let hourLabelFont: NSFont =
+        NSFont(name: SCFonts.IBMPlexMono.regular, size: 10)
             ?? NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        return (text as NSString).size(withAttributes: [.font: font]).width
+
+    private static func hourLabelWidth(_ text: String) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: hourLabelFont]).width
     }
 
     private var legend: some View {

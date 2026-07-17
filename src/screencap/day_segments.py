@@ -35,7 +35,6 @@ from __future__ import annotations
 import calendar
 import json
 import logging
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +49,8 @@ from screencap.backfill.skip_intervals import (
     build_classifier_evaluator,
     derive_skip_intervals,
 )
+from screencap.enforcement import disable_log
+from screencap.recording_db import has_table, open_recording_db
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ _METRICS_FILENAME = "system_metrics.json"
 # The menubar disable audit log (enforcement/disable_log.py) — JSONL whose first
 # line is a `_meta` frontmatter; entries carry `ts_unix` + `target{bundle_id,
 # app_name, root_domain}`, joined against `purged_interval.disabled_at`.
-_DISABLE_LOG_FILENAME = ".menubar_disable_log.jsonl"
+_DISABLE_LOG_FILENAME = disable_log.LOG_FILENAME
 
 # Sentinel distinguishing "artifact absent" (None) from "artifact present but
 # unparseable" — corrupt evidence must land in `unknown`, never a confident cause.
@@ -235,14 +236,8 @@ def _purge_identity_map(
     """
     spans: dict[tuple[float, float], float | None] = {}
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
-            conn.execute("PRAGMA busy_timeout=10000")
-            row = conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name='purged_interval'"
-            ).fetchone()
-            if row is None:
+        with open_recording_db(db_path, busy_timeout_ms=10000) as conn:
+            if not has_table(conn, "purged_interval"):
                 return {}
             for start_ts, end_ts, disabled_at in conn.execute(
                 "SELECT start_ts, end_ts, disabled_at FROM purged_interval "
@@ -256,8 +251,6 @@ def _purge_identity_map(
                     spans[key] = None  # conflicting provenance → identity-free
                 else:
                     spans[key] = disabled_at
-        finally:
-            conn.close()
     except Exception:
         logger.warning(
             "day_segments: purged_interval identity read failed for %s",
