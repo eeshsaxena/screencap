@@ -19,9 +19,28 @@ from screencap.segmentation.provider import (
     SegmentResult,
 )
 
+# Halt pseudo-reasons that must STOP the chain (SCR-275 KTD-7/KTD-10): a
+# quiesce stop or a mid-pass retroactive scrub cancelled the pass — cascading
+# to the next backend would immediately re-run the very pass the halt just
+# cancelled. String literals deliberately mirror ``ondevice_pipeline.
+# REASON_STOPPED`` / ``REASON_STALE_SCRUB`` (pinned by tests) rather than
+# importing them: this module stays import-light, and ``ondevice_pipeline``
+# pulls the whole windows/pipeline_state surface at import time.
+_HALT_REASONS = ("stopped", "stale-scrub")
+
 
 class ChainedOnDeviceProvider:
-    """Try each on-device backend in order; cascade only on ``PROVIDER_UNAVAILABLE``."""
+    """Try each on-device backend in order; cascade only on ``PROVIDER_UNAVAILABLE``.
+
+    ``last_unavailable_reason`` (SCR-275, U3 / KTD-1) forwards the reason of
+    whichever backend's result the chain returned — the same optional-attribute
+    pattern as ``supports_frames``: read via ``getattr(…, None)``, so a backend
+    that doesn't expose one (e.g. the downloaded model) simply forwards ``None``.
+    """
+
+    #: Forwarded diagnostic of the backend whose result was returned;
+    #: ``None`` after a success or when that backend exposes no reason.
+    last_unavailable_reason: str | None = None
 
     def __init__(self, backends: list[LLMProvider]) -> None:
         self._backends = backends
@@ -29,12 +48,30 @@ class ChainedOnDeviceProvider:
     def segment(self, activity_summary: dict) -> SegmentResult:
         # If the chain is empty, nothing on-device is available (→ heuristic).
         result: SegmentResult = PROVIDER_UNAVAILABLE
+        self.last_unavailable_reason = None
+        backend = None
         for backend in self._backends:
             result = backend.segment(activity_summary)
             if result is PROVIDER_UNAVAILABLE:
+                reason = getattr(backend, "last_unavailable_reason", None)
+                if reason in _HALT_REASONS:
+                    # A halted pass (quiesce stop / mid-pass scrub) is NOT a
+                    # real unavailability — do not try the next backend;
+                    # forward the halt so the terminal stage short-circuits.
+                    self.last_unavailable_reason = reason
+                    return result
                 continue  # this backend could not run — try the next
             # A tasks dict (use it) OR None (ran, declined — fail-open) stops here.
+            self.last_unavailable_reason = getattr(
+                backend, "last_unavailable_reason", None
+            )
             return result
+        if backend is not None:
+            # Every backend was unavailable — forward the LAST one's reason
+            # (the chain's result is that backend's result).
+            self.last_unavailable_reason = getattr(
+                backend, "last_unavailable_reason", None
+            )
         return result
 
 

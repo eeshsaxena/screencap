@@ -741,3 +741,24 @@ def build_activity_summary(
         # path (``blocked_source is None``) so the golden stays byte-identical.
         result["stripped"] = True
     return result
+
+
+def attest_derived_stripped(payload: dict, *, stripped: bool) -> dict:
+    """Attach the R11 ``stripped`` attestation to a payload DERIVED from a
+    builder-stripped summary (SCR-275 U4).
+
+    The ONE sanctioned re-attestation point outside the builder write above —
+    ``tests/segmentation/test_stripped_marker_guard.py`` pins every marker
+    write to this file. The window digests (``windows.py``) derive their
+    model-facing payloads from a span summary this builder marked, dropping
+    the marker in the trim; the per-window helper calls (``call_name_window``)
+    fail-closed without it, so the orchestrator re-attests HERE, passing the
+    derivation chain's own flag (``WindowDigest.stripped`` — true only when
+    the source span summary carried the builder's marker). Hand-passing a
+    forged ``True`` is exactly the bypass the guard exists to make visible in
+    review. Anything but exactly ``True`` attests ``False`` (fail-closed),
+    which the provider's gate then refuses without spawning the helper.
+    """
+    out = dict(payload)
+    out["stripped"] = stripped is True
+    return out

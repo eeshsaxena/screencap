@@ -2350,12 +2350,26 @@ class Supervisor:
         """
         from screencap.terminal_stage import (
             TerminalStageBusy,
+            TerminalStageInterrupted,
             run_incremental_segmentation,
         )
 
+        # SCR-275 U4 (KTD-7): thread the shared quiesce flag so a
+        # ``storage.lock`` in progress halts the windowed naming pass at its
+        # next safe row boundary — mirroring resume_terminal_stage's wiring of
+        # the same event into ``run_terminal_stage``'s ``stop_event``.
+        stop_event = self._quiesce_event
+
         def _run() -> None:
             try:
-                run_incremental_segmentation(recording_dir, non_blocking=True)
+                run_incremental_segmentation(
+                    recording_dir, non_blocking=True, stop_event=stop_event,
+                )
+            except TerminalStageInterrupted:
+                logger.info(
+                    "ambient incremental segmentation: %s halted for a store "
+                    "lock; resumes on a later tick", recording_dir,
+                )
             except TerminalStageBusy:
                 logger.debug(
                     "ambient incremental segmentation: %s busy (a finalize/upload "

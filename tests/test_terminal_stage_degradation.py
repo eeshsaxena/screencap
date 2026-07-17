@@ -170,6 +170,37 @@ class _FakeProvider:
         return self._result
 
 
+class _ReasonProvider(_FakeProvider):
+    """A canned provider carrying the U3/U6 ``last_unavailable_reason`` seam."""
+
+    def __init__(self, result, reason: str | None = None) -> None:  # noqa: ANN001
+        super().__init__(result)
+        self.last_unavailable_reason = reason
+
+
+class _SequenceProvider:
+    """A provider whose ``segment`` walks scripted ``(result, reason)`` pairs.
+
+    The retry-observing seam for the stale-scrub finalize tests: each call
+    consumes the next pair (the last repeats) and records the reason on the
+    ``last_unavailable_reason`` attribute like the real on-device provider.
+    """
+
+    def __init__(self, script: "list[tuple]") -> None:
+        self._script = list(script)
+        self.calls: list[dict] = []
+        self.last_unavailable_reason: str | None = None
+
+    def segment(self, activity_summary: dict):  # noqa: ANN201
+        self.calls.append(activity_summary)
+        if len(self._script) > 1:
+            result, reason = self._script.pop(0)
+        else:
+            result, reason = self._script[0]
+        self.last_unavailable_reason = reason
+        return result
+
+
 @pytest.fixture(autouse=True)
 def _isolate_run_dir(tmp_path, monkeypatch):
     """Point the terminal-stage lock dir at a per-test tmp dir."""
@@ -182,7 +213,9 @@ def _install_provider(monkeypatch, provider) -> None:
     """Wire a fake provider into the U8 day-split routing seam."""
     import screencap.segmentation.routing as routing
 
-    monkeypatch.setattr(routing, "build_day_split_provider", lambda: provider)
+    monkeypatch.setattr(
+        routing, "build_day_split_provider", lambda *a, **k: provider,
+    )
 
 
 def _install_consent(monkeypatch, policy: ConsentPolicy) -> None:
@@ -878,3 +911,323 @@ def test_summary_cloud_frames_on_device_target_builds_nothing(monkeypatch):
         Path("/nonexistent"), (0.0, 10.0), _Vision(), policy, ExecutionTarget.ON_DEVICE
     )
     assert frames == ()
+
+
+# ---------------------------------------------------------------------------
+# SCR-275 U6 (KTD-1/KTD-8) — partial success as a first-class outcome, the
+# distinct unavailable-reason detail, and the ``stopped`` quiesce special-case.
+# ---------------------------------------------------------------------------
+
+
+def _mixed_source_tasks() -> dict:
+    """An on-device pipeline result mixing model and mechanical task sources.
+
+    ``source`` values mirror ``ondevice_pipeline.SOURCE_MODEL`` /
+    ``SOURCE_MECHANICAL`` — the per-task provenance the U4 orchestrator emits and
+    the terminal stage must read BEFORE ``_persist_local_tasks`` rewrites
+    row-level ownership to ``agent``.
+    """
+    return {
+        "tasks": [
+            {"start_ts": 1000.0, "end_ts": 2000.0,
+             "name": "Draft launch email", "derived_name": "draft-launch-email",
+             "category": "communication", "source": "ondevice_model"},
+            {"start_ts": 2000.0, "end_ts": 2800.0,
+             "name": "task_2", "derived_name": "task-2",
+             "category": "other", "source": "idle_gap_heuristic"},
+        ],
+        "summary": {"overview": "A partly-named day.", "primary_focus": "communication",
+                    "time_breakdown": {}, "key_accomplishments": []},
+        "tags": [],
+    }
+
+
+def _all_model_tasks() -> dict:
+    """An on-device pipeline result whose every task is model-named."""
+    return {
+        "tasks": [
+            {"start_ts": 1000.0, "end_ts": 2800.0,
+             "name": "Write design doc", "derived_name": "write-design-doc",
+             "category": "writing", "source": "ondevice_model"},
+        ],
+        "summary": {"overview": "Wrote the doc.", "primary_focus": "writing",
+                    "time_breakdown": {}, "key_accomplishments": []},
+        "tags": [],
+    }
+
+
+@pytest.mark.privacy
+def test_partial_pass_records_partial_with_detail_and_skips_cloud_fallback(
+    tmp_path, monkeypatch,
+):
+    """KTD-1/KTD-8: a mixed-source pass is a REAL provider result — it records
+    ``produced_tasks_partial`` (with the dominant per-window failure reason as
+    detail) and must NOT consult the consented cloud-summary fallback, which
+    fires only on true PROVIDER_UNAVAILABLE."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(
+        monkeypatch, _ReasonProvider(_mixed_source_tasks(), reason="context-window"),
+    )
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    result = _run_terminal(rec_dir)
+
+    assert cloud.calls == []  # partial ≠ unavailable → no cloud-summary fallback.
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Draft launch email", "task_2"]
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "produced_tasks_partial"
+    assert ledger.get_recording_outcome_detail() == "context-window"
+    assert result.tasks_persisted == 2
+
+
+@pytest.mark.privacy
+def test_all_model_pass_records_produced_with_no_detail(tmp_path, monkeypatch):
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(monkeypatch, _ReasonProvider(_all_model_tasks(), reason=None))
+    _install_consent(monkeypatch, ConsentPolicy())
+
+    _run_terminal(rec_dir)
+
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "produced_tasks"
+    assert ledger.get_recording_outcome_detail() is None
+
+
+@pytest.mark.privacy
+def test_unavailable_sentinel_records_mechanical_with_distinct_detail(
+    tmp_path, monkeypatch,
+):
+    """R8: the zero-model-names sentinel path still consults the consented
+    cloud-summary fallback, then the heuristic — and the outcome carries the
+    DISTINCT unavailable reason as detail (context-window ≠ intelligence-off)."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(
+        monkeypatch, _ReasonProvider(PROVIDER_UNAVAILABLE, reason="context-window"),
+    )
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(None)  # consulted, declines → heuristic.
+    _install_cloud_provider(monkeypatch, cloud)
+
+    _run_terminal(rec_dir)
+
+    assert len(cloud.calls) == 1  # true unavailability DOES consult cloud.
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "mechanical_only"
+    assert ledger.get_recording_outcome_detail() == "context-window"
+
+
+@pytest.mark.privacy
+def test_stopped_sentinel_skips_fallbacks_and_stays_provisional(tmp_path, monkeypatch):
+    """The ``stopped`` pseudo-reason marks a quiesce-interrupted pre-work pass —
+    NOT a real unavailability. The terminal stage must consult NEITHER the
+    cloud-summary fallback nor the heuristic (nothing is persisted), and the
+    outcome maps through the picker's provisional live branch (``in_progress``)
+    so the re-run on resume records the real outcome."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_provider(
+        monkeypatch, _ReasonProvider(PROVIDER_UNAVAILABLE, reason="stopped"),
+    )
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    _run_terminal(rec_dir)
+
+    assert cloud.calls == []  # a quiesce interrupt never consults cloud.
+    assert not (rec_dir / "tasks.json").exists()  # no mechanical overwrite either.
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "in_progress"
+    assert ledger.get_recording_outcome_detail() is None
+
+
+@pytest.mark.privacy
+def test_stopped_sentinel_keeps_prior_partial_and_its_detail(tmp_path, monkeypatch):
+    """Monotonic: a stopped pass never downgrades a recorded partial — and never
+    clobbers its stored detail with NULL."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    ledger.set_recording_outcome("produced_tasks_partial", detail="context-window")
+    _install_provider(
+        monkeypatch, _ReasonProvider(PROVIDER_UNAVAILABLE, reason="stopped"),
+    )
+    _install_consent(monkeypatch, ConsentPolicy())
+
+    _run_terminal(rec_dir)
+
+    assert ledger.get_recording_outcome() == "produced_tasks_partial"
+    assert ledger.get_recording_outcome_detail() == "context-window"
+
+
+@pytest.mark.privacy
+def test_live_sequence_produced_then_mixed_recomputes_to_partial(
+    tmp_path, monkeypatch,
+):
+    """KTD-8 live recompute: an early all-model live pass records produced; a
+    later live tick whose grown window set includes one mechanical task moves
+    the outcome to partial (produced → partial IS allowed on live)."""
+    from screencap import terminal_stage as ts
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_consent(monkeypatch, ConsentPolicy())
+    ledger = PipelineLedger(rec_dir / "recording.db")
+
+    _install_provider(monkeypatch, _ReasonProvider(_all_model_tasks(), reason=None))
+    ts.run_incremental_segmentation(rec_dir)
+    assert ledger.get_recording_outcome() == "produced_tasks"
+
+    _install_provider(
+        monkeypatch, _ReasonProvider(_mixed_source_tasks(), reason="decoding-failure"),
+    )
+    ts.run_incremental_segmentation(rec_dir)
+    assert ledger.get_recording_outcome() == "produced_tasks_partial"
+    assert ledger.get_recording_outcome_detail() == "decoding-failure"
+    # The mixed pass IS persisted (partial keeps its model names + mechanical fill).
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Draft launch email", "task_2"]
+
+
+@pytest.mark.privacy
+def test_mechanical_pass_never_overwrites_partial_rows(tmp_path, monkeypatch):
+    """The monotonic row gate extends to partial: once a recording holds a
+    partially-model-named task set, a later fully-mechanical pass must not
+    overwrite those rows, and the reason stays partial."""
+    from screencap import terminal_stage as ts
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_consent(monkeypatch, ConsentPolicy())
+    ledger = PipelineLedger(rec_dir / "recording.db")
+
+    _install_provider(
+        monkeypatch, _ReasonProvider(_mixed_source_tasks(), reason="context-window"),
+    )
+    ts.run_incremental_segmentation(rec_dir)
+    assert ledger.get_recording_outcome() == "produced_tasks_partial"
+    rows_before = [s.name for s in ledger.read_task_segments()]
+    assert rows_before == ["Draft launch email", "task_2"]
+
+    # Next live tick degrades all the way to the heuristic (provider unavailable).
+    _install_provider(
+        monkeypatch, _ReasonProvider(PROVIDER_UNAVAILABLE, reason="respond-failed"),
+    )
+    ts.run_incremental_segmentation(rec_dir)
+
+    assert [s.name for s in ledger.read_task_segments()] == rows_before
+    assert ledger.get_recording_outcome() == "produced_tasks_partial"
+    # The stored detail explains the RECORDED partial — the mechanical pass's
+    # fresh failure reason must not have replaced it.
+    assert ledger.get_recording_outcome_detail() == "context-window"
+
+
+@pytest.mark.privacy
+def test_finalize_partial_pass_never_overwrites_produced_rows(tmp_path, monkeypatch):
+    """Finalize is strictly monotonic (partial never downgrades produced) — so
+    a finalize PARTIAL pass over a ``produced_tasks`` prior must ALSO skip
+    persisting its rows: the recorded reason and the stored rows stay in
+    agreement (no produced label above a partly-mechanical list). A LIVE
+    partial pass keeps persisting (the deliberate recompute — covered by
+    ``test_live_sequence_produced_then_mixed_recomputes_to_partial``)."""
+    from screencap import terminal_stage as ts
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    _install_consent(monkeypatch, ConsentPolicy())
+    ledger = PipelineLedger(rec_dir / "recording.db")
+
+    _install_provider(monkeypatch, _ReasonProvider(_all_model_tasks(), reason=None))
+    ts.run_incremental_segmentation(rec_dir)
+    assert ledger.get_recording_outcome() == "produced_tasks"
+    rows_before = [s.name for s in ledger.read_task_segments()]
+    assert rows_before == ["Write design doc"]
+
+    _install_provider(
+        monkeypatch, _ReasonProvider(_mixed_source_tasks(), reason="decoding-failure"),
+    )
+    _run_terminal(rec_dir)  # finalize with a mixed-source provider result
+
+    assert [s.name for s in ledger.read_task_segments()] == rows_before
+    assert ledger.get_recording_outcome() == "produced_tasks"
+    assert ledger.get_recording_outcome_detail() is None
+
+
+# ---------------------------------------------------------------------------
+# SCR-275 KTD-10 — the distinct ``stale-scrub`` halt at finalize.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+def test_stale_scrub_at_finalize_retries_once_over_settled_rows(
+    tmp_path, monkeypatch,
+):
+    """A staleness-guard trip at finalize gets ONE immediate same-call retry:
+    the scrub that tripped it has committed, so the post-scrub rows are
+    settled and the retry succeeds without waiting for a resume."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    provider = _SequenceProvider([
+        (PROVIDER_UNAVAILABLE, "stale-scrub"),
+        (_all_model_tasks(), None),
+    ])
+    _install_provider(monkeypatch, provider)
+    _install_consent(monkeypatch, ConsentPolicy())
+
+    _run_terminal(rec_dir)
+
+    assert len(provider.calls) == 2  # exactly one same-call retry
+    persisted = json.loads((rec_dir / "tasks.json").read_text())
+    assert [t["name"] for t in persisted["tasks"]] == ["Write design doc"]
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "produced_tasks"
+
+
+@pytest.mark.privacy
+def test_stale_scrub_second_trip_stays_provisional(tmp_path, monkeypatch):
+    """A second staleness trip takes the provisional path: no further retry,
+    neither the cloud-summary fallback nor the heuristic runs, nothing is
+    persisted, and the outcome settles as ``in_progress`` (re-runs on the
+    startup/unlock reconcile) — never ``nothing_to_name``."""
+    from screencap.pipeline_state import PipelineLedger
+
+    rec_dir = _make_local_recording(tmp_path)
+    provider = _SequenceProvider([
+        (PROVIDER_UNAVAILABLE, "stale-scrub"),
+        (PROVIDER_UNAVAILABLE, "stale-scrub"),
+    ])
+    _install_provider(monkeypatch, provider)
+    _install_consent(monkeypatch, ConsentPolicy(
+        cloud_provider="openai", summary_cloud_consent=True,
+    ))
+    cloud = _FakeProvider(_cloud_named_tasks())
+    _install_cloud_provider(monkeypatch, cloud)
+
+    _run_terminal(rec_dir)
+
+    assert len(provider.calls) == 2  # one retry, then the provisional path
+    assert cloud.calls == []  # a halted pass never consults cloud
+    assert not (rec_dir / "tasks.json").exists()  # no mechanical fallback either
+    ledger = PipelineLedger(rec_dir / "recording.db")
+    assert ledger.get_recording_outcome() == "in_progress"
+    assert ledger.get_recording_outcome_detail() is None

@@ -81,7 +81,67 @@ _EMPTY_COUNTS: dict[str, int] = {
     "screenshot_files": 0,
     "matched_timestamps": 0,
     "orphan_action_events": 0,
+    "ondevice_window_names": 0,
 }
+
+
+def _purge_ondevice_window_names(
+    cur: sqlite3.Cursor,
+    conn: sqlite3.Connection,
+    intervals: list[tuple[float, float]],
+) -> int:
+    """Purge cached on-device window names overlapping ``intervals`` and bump
+    the scrub generation (SCR-275, KTD-10a) — INSIDE the caller's transaction.
+
+    A cached name is a derived artifact of window titles this scrub deletes —
+    the same R7 lifecycle rule that gave the content index its purge hook. This
+    runs on the scrub's OWN connection/cursor inside its existing
+    ``BEGIN IMMEDIATE`` transaction (same DB), so the source-row deletes, the
+    cache purge, and the generation bump commit as one atom.
+
+    Boundaries are second-widened (floor start / ceil end — the content-index
+    purge's ms floor/ceil precedent) so a name whose window span was rounded
+    can't survive at a sub-second interval boundary; an ``inf`` end means
+    open-ended. Both tables are existence-guarded (a pre-SCR-275
+    ``recording.db`` has neither — and then no cache/pass to invalidate) and
+    any failure is swallowed per the worker's fail-open discipline.
+    """
+    try:
+        # Lazy import (like bump_scrub_generation below) so the enforcement
+        # package's import surface stays light.
+        from screencap.recording_db import has_table
+
+        deleted = 0
+        if has_table(conn, "ondevice_window_names"):
+            before = conn.total_changes
+            for start, end in intervals:
+                lo = math.floor(start)
+                if end == float("inf"):
+                    cur.execute(
+                        "DELETE FROM ondevice_window_names WHERE window_end > ?",
+                        (lo,),
+                    )
+                else:
+                    cur.execute(
+                        "DELETE FROM ondevice_window_names "
+                        "WHERE window_end > ? AND window_start < ?",
+                        (lo, math.ceil(end)),
+                    )
+            deleted = conn.total_changes - before
+        if has_table(conn, "scrub_generation"):
+            # Signal a concurrently-running naming pass that its pre-scrub
+            # snapshot is stale (KTD-10b) — bumped whenever source rows were
+            # deleted, even if no cache row overlapped. Lazy import: light
+            # module, and only when the SCR-275 schema is actually present.
+            from screencap.pipeline_state import bump_scrub_generation
+
+            bump_scrub_generation(conn)
+        return deleted
+    except Exception:
+        logger.warning(
+            "on-device name-cache purge failed (non-fatal)", exc_info=True
+        )
+        return 0
 
 
 def _chunks(seq: list[Any], size: int) -> list[list[Any]]:
@@ -585,6 +645,13 @@ class ScrubWorker:
                 # AFTER a previous scrub of the same target.
                 counts["orphan_action_events"] = (
                     self._delete_orphan_action_events(cur, conn)
+                )
+
+                # SCR-275 (KTD-10a): purge cached on-device window names whose
+                # spans overlap the scrubbed intervals + bump the staleness
+                # generation, in this SAME transaction (same recording.db).
+                counts["ondevice_window_names"] = _purge_ondevice_window_names(
+                    cur, conn, intervals,
                 )
 
                 conn.commit()

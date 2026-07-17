@@ -2316,24 +2316,28 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     return read_task_segments_wire(resolve_recording_dir(recording))
 
 
-def _run_recording_outcome(recording: str) -> str | None:
-    """Read a LOCAL recording's segmentation OUTCOME reason, off the event loop (U3).
+def _run_recording_outcome(recording: str) -> "tuple[str | None, str | None]":
+    """Read a LOCAL recording's segmentation OUTCOME, off the event loop (U3).
 
-    ``None`` for a missing recording dir / ``recording.db`` (legacy / pre-U2), a DB
-    with no recorded outcome, or any read error — the app renders that as the neutral
-    "unknown" state (KTD6). Never raises: an outcome read must not fail the read verb.
-    Local-only read (never leaves the Mac — R4/R8).
+    Returns ``(reason, detail)``. ``detail`` (SCR-275 U6, R8) is the optional
+    distinct degradation reason recorded alongside the outcome (e.g.
+    ``context-window`` vs ``respond-failed``); ``None`` for a pre-U6 row or a
+    detail-less outcome. ``(None, None)`` for a missing recording dir /
+    ``recording.db`` (legacy / pre-U2), a DB with no recorded outcome, or any
+    read error — the app renders that as the neutral "unknown" state (KTD6).
+    Never raises: an outcome read must not fail the read verb. Local-only read
+    (never leaves the Mac — R4/R8).
     """
     from screencap.config import resolve_recording_dir
     from screencap.pipeline_state import PipelineLedger
 
     db_path = resolve_recording_dir(recording) / "recording.db"
     if not db_path.exists():
-        return None
+        return None, None
     try:
-        return PipelineLedger(db_path).get_recording_outcome()
+        return PipelineLedger(db_path).get_recording_outcome_with_detail()
     except Exception:  # noqa: BLE001 — an outcome read must never fail tasks.list
-        return None
+        return None, None
 
 
 async def tasks_list(request: Request) -> JSONResponse:
@@ -2369,7 +2373,9 @@ async def tasks_list(request: Request) -> JSONResponse:
             )
         validate_recording_name(parsed.recording)
         rows = await asyncio.to_thread(_run_tasks_list, parsed.recording)
-        reason = await asyncio.to_thread(_run_recording_outcome, parsed.recording)
+        reason, detail = await asyncio.to_thread(
+            _run_recording_outcome, parsed.recording,
+        )
         tasks = [schema.TaskSegment(**row).model_dump() for row in rows]
         return JSONResponse(
             schema.envelope(
@@ -2377,6 +2383,9 @@ async def tasks_list(request: Request) -> JSONResponse:
                 recording=parsed.recording,
                 tasks=tasks,
                 reason=reason,
+                # SCR-275 U6: additive optional degradation-reason detail — old
+                # clients simply ignore the extra field.
+                detail=detail,
             )
         )
     except errors.DaemonAPIError as exc:

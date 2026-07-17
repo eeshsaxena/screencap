@@ -55,6 +55,29 @@ class TestChainCascade:
         afm, dl = _Fake(PROVIDER_UNAVAILABLE), _Fake(PROVIDER_UNAVAILABLE)
         assert ChainedOnDeviceProvider([afm, dl]).segment({}) is PROVIDER_UNAVAILABLE
 
+    @pytest.mark.privacy
+    @pytest.mark.parametrize("reason", ["stopped", "stale-scrub"])
+    def test_halt_reason_stops_chain_and_forwards(self, reason):
+        """A halted pass (quiesce stop / mid-pass scrub) is NOT a real
+        unavailability: the chain must not consult the next backend — which
+        would immediately re-run the pass the halt just cancelled — and must
+        forward the halt reason for the terminal stage's short-circuit."""
+        afm, dl = _Fake(PROVIDER_UNAVAILABLE), _Fake(_TASKS)
+        afm.last_unavailable_reason = reason
+        chain = ChainedOnDeviceProvider([afm, dl])
+
+        assert chain.segment({}) is PROVIDER_UNAVAILABLE
+        assert dl.calls == 0  # the downloaded backend is never consulted
+        assert chain.last_unavailable_reason == reason
+
+    @pytest.mark.privacy
+    def test_ordinary_unavailable_reason_still_cascades(self):
+        """A real unavailability reason (helper missing etc.) keeps cascading."""
+        afm, dl = _Fake(PROVIDER_UNAVAILABLE), _Fake(_TASKS)
+        afm.last_unavailable_reason = "helper-missing"
+        assert ChainedOnDeviceProvider([afm, dl]).segment({}) is _TASKS
+        assert dl.calls == 1
+
     def test_empty_chain_is_unavailable(self):
         assert ChainedOnDeviceProvider([]).segment({}) is PROVIDER_UNAVAILABLE
 

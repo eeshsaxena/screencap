@@ -76,11 +76,19 @@ struct TasksListResponse: Decodable, Sendable {
     let recording: String
     let tasks: [RecordingTask]
     /// U2/U3 (honest status): why this recording has (or lacks) AI-named tasks —
-    /// `produced_tasks` / `mechanical_only` / `nothing_to_name` / `couldnt_run` /
-    /// `in_progress`. `nil` for a legacy recording with no recorded outcome, or an
-    /// older daemon that omits the field — both render as the neutral "unknown"
-    /// state (KTD6), never a false "not set up".
+    /// `produced_tasks` / `produced_tasks_partial` (SCR-275 U6: some tasks
+    /// model-named, some mechanical) / `mechanical_only` / `nothing_to_name` /
+    /// `couldnt_run` / `in_progress`. `nil` for a legacy recording with no recorded
+    /// outcome, or an older daemon that omits the field — both render as the
+    /// neutral "unknown" state (KTD6), never a false "not set up".
     let reason: String?
+    /// SCR-275 U6/U7 (additive): the distinct degradation reason recorded
+    /// alongside `reason` — e.g. `context-window` ("the session was too long for
+    /// the on-device model") vs `respond-failed`. Populated for the degraded
+    /// outcomes (`produced_tasks_partial` / `mechanical_only` / `couldnt_run`);
+    /// always `nil` for `produced_tasks`, a legacy row, or an older daemon that
+    /// omits the field.
+    let detail: String?
 
     init(
         ok: Bool = true,
@@ -89,7 +97,8 @@ struct TasksListResponse: Decodable, Sendable {
         apiSchemaVersion: Int = 1,
         recording: String,
         tasks: [RecordingTask],
-        reason: String? = nil
+        reason: String? = nil,
+        detail: String? = nil
     ) {
         self.ok = ok
         self.schemaVersion = schemaVersion
@@ -98,6 +107,7 @@ struct TasksListResponse: Decodable, Sendable {
         self.recording = recording
         self.tasks = tasks
         self.reason = reason
+        self.detail = detail
     }
 
     enum CodingKeys: String, CodingKey {
@@ -108,6 +118,7 @@ struct TasksListResponse: Decodable, Sendable {
         case recording
         case tasks
         case reason
+        case detail
     }
 }
 

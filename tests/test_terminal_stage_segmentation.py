@@ -185,7 +185,9 @@ def _install_provider(monkeypatch, provider) -> None:
     """
     import screencap.segmentation.routing as routing
 
-    monkeypatch.setattr(routing, "build_day_split_provider", lambda: provider)
+    monkeypatch.setattr(
+        routing, "build_day_split_provider", lambda *a, **k: provider,
+    )
 
 
 def _run_terminal(rec_dir: Path):
@@ -357,7 +359,7 @@ def test_unavailable_provider_is_fail_open(tmp_path, monkeypatch):
 
     rec_dir = _make_local_recording(tmp_path)
 
-    def _raise():
+    def _raise(*a, **k):
         raise RuntimeError("provider build failed unexpectedly")
 
     monkeypatch.setattr(routing, "build_day_split_provider", _raise)

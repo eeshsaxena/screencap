@@ -83,6 +83,7 @@ coexistence story) for the same reason ``scrub_worker`` does.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -93,6 +94,8 @@ from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from screencap.chunk_processor import ChunkStatus
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "Lifecycle",
@@ -106,6 +109,8 @@ __all__ = [
     "LedgerError",
     "EvictionRefused",
     "ensure_pipeline_state_schema",
+    "open_ledger_or_none",
+    "bump_scrub_generation",
     "from_chunk_status",
     "reconcile_ledger_from_disk",
     "read_task_segments_wire",
@@ -347,13 +352,73 @@ _TASK_SEGMENTS_ADDED_COLUMNS = (
 # terminal_stage branch points BEFORE _persist_local_tasks rewrites task-row
 # ``source``, so ``mechanical_only`` (idle-gap heuristic) stays distinct from
 # ``produced_tasks``. Local-only, in ``recording.db`` (never uploaded — R8).
+# ``detail`` (SCR-275 U6, R8): the optional distinct degradation reason recorded
+# alongside the outcome (e.g. ``context-window`` vs ``respond-failed``) — NULL
+# when the outcome has nothing to report (fully-model produced) or on a
+# pre-U6 row.
 _RECORDING_OUTCOME_DDL = """
 CREATE TABLE IF NOT EXISTS pipeline_recording_outcome (
     recording_id INTEGER PRIMARY KEY,
     reason TEXT NOT NULL,
+    detail TEXT,
     updated_at REAL
 )
 """
+
+# Guarded ALTER-ADD migration for the U6 ``detail`` column (same pattern as
+# ``_TASK_SEGMENTS_ADDED_COLUMNS``): an EXISTING pre-U6 outcome table keeps its
+# shape under CREATE IF NOT EXISTS, so the column is ALTER-added; existing rows
+# read back ``detail`` NULL — exactly a fresh detail-less write.
+_RECORDING_OUTCOME_ADDED_COLUMNS = (
+    ("detail", "detail TEXT"),
+)
+
+# SCR-275 U4 (KTD-6). Per-window on-device naming cache — a MEMO of completed
+# model naming calls, keyed by window span + digest hash, NEVER task truth (the
+# sinks — ``tasks.json`` + ``pipeline_task_segments`` — stay authoritative). A
+# hit skips the model call; any boundary/digest change is a miss, never an
+# error. Colocated in the local-only ``recording.db`` so it inherits the
+# never-uploaded rule and the recording destroy/eviction lifecycle for free.
+# No ``recording_id`` column: ``recording.db`` is strictly per-recording.
+_ONDEVICE_NAMES_DDL = """
+CREATE TABLE IF NOT EXISTS ondevice_window_names (
+    id INTEGER PRIMARY KEY,
+    window_start REAL NOT NULL,
+    window_end REAL NOT NULL,
+    digest_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT,
+    created_at REAL,
+    UNIQUE (window_start, window_end, digest_hash)
+)
+"""
+
+# SCR-275 U4 (KTD-10). Single-row staleness counter: the scrub worker
+# increments it inside its delete transaction; a naming pass snapshots it
+# before digest computation and re-checks it inside its commit transaction —
+# a mismatch means a retroactive scrub landed mid-pass, so the pass deletes
+# its own cache writes and hands nothing to the sinks.
+_SCRUB_GENERATION_DDL = """
+CREATE TABLE IF NOT EXISTS scrub_generation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+
+def bump_scrub_generation(conn: sqlite3.Connection) -> None:
+    """Increment the scrub-generation counter ON ``conn`` (no commit — KTD-10).
+
+    Usable inside an EXISTING transaction: the scrub worker calls this on its
+    own connection, inside the same ``BEGIN IMMEDIATE`` transaction that
+    deletes the scrubbed source rows, so the generation bump and the deletes
+    are one atom. Upserts the single row, so a DB that has the table but no
+    row yet (fresh schema) starts at 1.
+    """
+    conn.execute(
+        "INSERT INTO scrub_generation (id, generation) VALUES (1, 1) "
+        "ON CONFLICT(id) DO UPDATE SET generation = generation + 1"
+    )
 
 
 def _migrate_task_segments_columns(conn: sqlite3.Connection) -> None:
@@ -379,6 +444,29 @@ def _migrate_task_segments_columns(conn: sqlite3.Connection) -> None:
             # is idempotent (the column now exists — the desired end state), so
             # swallow it; any other OperationalError (e.g. read-only) propagates
             # to the caller's read-only guard.
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+
+def _migrate_recording_outcome_columns(conn: sqlite3.Connection) -> None:
+    """ALTER-ADD the U6 ``detail`` column to a pre-U6 outcome table (SCR-275).
+
+    Same guarded pattern as :func:`_migrate_task_segments_columns`: PRAGMA-check,
+    only ALTER-add what is missing, tolerate a concurrent opener's
+    duplicate-column race. A DB without the table at all is a no-op (the DDL
+    creates it with the full shape).
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(pipeline_recording_outcome)")
+    }
+    if not existing:
+        return  # table absent — _RECORDING_OUTCOME_DDL creates the full shape
+    for col, ddl in _RECORDING_OUTCOME_ADDED_COLUMNS:
+        if col in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE pipeline_recording_outcome ADD COLUMN {ddl}")
+        except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
 
@@ -409,8 +497,13 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         # Migrate an EXISTING pre-U5 table (created before source/edited existed)
         # — the DDL above is a no-op on it, so the columns are ALTER-added here.
         _migrate_task_segments_columns(conn)
-        # U2: per-recording segmentation outcome (idempotent create).
+        # U2: per-recording segmentation outcome (idempotent create) + the U6
+        # ``detail`` column ALTER-added onto an existing pre-U6 table.
         conn.execute(_RECORDING_OUTCOME_DDL)
+        _migrate_recording_outcome_columns(conn)
+        # SCR-275 U4: on-device naming cache + scrub-generation counter.
+        conn.execute(_ONDEVICE_NAMES_DDL)
+        conn.execute(_SCRUB_GENERATION_DDL)
         conn.commit()
     except sqlite3.OperationalError:
         # Read-only DB (an old recording opened for read) — do not crash; the
@@ -418,6 +511,29 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         pass
     finally:
         conn.close()
+
+
+def open_ledger_or_none(recording_dir: "Path | str") -> "PipelineLedger | None":
+    """Open ``recording_dir``'s ledger with the schema ensured; ``None`` fails open.
+
+    The shared opener behind ``terminal_stage._open_ledger`` and
+    ``ondevice_pipeline._open_cache_ledger``: a missing ``recording.db`` (legacy
+    single-file recording) or ANY open/migration error yields ``None`` — callers
+    proceed without ledger bookkeeping (and without the naming cache /
+    staleness guard) rather than failing the pass.
+    """
+    try:
+        db_path = Path(recording_dir) / "recording.db"
+        if not db_path.exists():
+            return None
+        ensure_pipeline_state_schema(db_path)
+        return PipelineLedger(db_path)
+    except Exception as exc:  # noqa: BLE001 — the ledger is bookkeeping, never a gate
+        log.debug(
+            "pipeline_state: ledger unavailable for %s (%s); proceeding without it",
+            recording_dir, exc,
+        )
+        return None
 
 
 def _now() -> float:
@@ -1095,26 +1211,34 @@ class PipelineLedger:
             finally:
                 conn.close()
 
-    def set_recording_outcome(self, reason: str) -> None:
+    def set_recording_outcome(self, reason: str, detail: str | None = None) -> None:
         """Record this recording's segmentation OUTCOME reason (U2, honest status).
 
         One row per recording (upsert on the PK). Captured at the terminal_stage
         branch BEFORE the task rows are rewritten, so ``mechanical_only`` (idle-gap
         heuristic) stays distinct from ``produced_tasks``. Defensively creates the
-        table so a ``recording.db`` that predates U2 still writes. Local-only — the
+        table — AND ALTER-adds the U6 ``detail`` column onto a pre-U6 table — so a
+        ``recording.db`` that predates either schema still writes. Local-only — the
         table lives in ``recording.db`` and is never uploaded (R8).
+
+        ``detail`` (SCR-275 U6, R8): the distinct degradation reason of the pass
+        that recorded this outcome (e.g. ``context-window``); every write sets it
+        (``None`` → NULL), so the stored detail always describes the CURRENT
+        recorded reason, never a stale earlier pass.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(_RECORDING_OUTCOME_DDL)
+                _migrate_recording_outcome_columns(conn)
                 conn.execute(
                     "INSERT INTO pipeline_recording_outcome "
-                    "(recording_id, reason, updated_at) VALUES (?, ?, ?) "
+                    "(recording_id, reason, detail, updated_at) VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(recording_id) DO UPDATE SET "
-                    "reason=excluded.reason, updated_at=excluded.updated_at",
-                    (self._recording_id, reason, _now()),
+                    "reason=excluded.reason, detail=excluded.detail, "
+                    "updated_at=excluded.updated_at",
+                    (self._recording_id, reason, detail, _now()),
                 )
                 conn.commit()
             except Exception:
@@ -1150,6 +1274,222 @@ class PipelineLedger:
             return None
         finally:
             if conn is not None:
+                conn.close()
+
+    def get_recording_outcome_detail(self) -> str | None:
+        """The outcome's optional degradation-reason detail (SCR-275 U6), or ``None``.
+
+        ``None`` for a legacy row/table (pre-U6 schema without the ``detail``
+        column — the SELECT's missing-column error is swallowed), an unrecorded
+        outcome, or a detail-less write. Fail-safe exactly like
+        :meth:`get_recording_outcome`: any SQLite error resolves to ``None``.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT detail FROM pipeline_recording_outcome "
+                "WHERE recording_id=?",
+                (self._recording_id,),
+            ).fetchone()
+            return None if row is None or row[0] is None else str(row[0])
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def get_recording_outcome_with_detail(self) -> "tuple[str | None, str | None]":
+        """Return ``(reason, detail)`` in ONE read; ``(None, None)`` if unrecorded.
+
+        The combined form of :meth:`get_recording_outcome` +
+        :meth:`get_recording_outcome_detail` for callers that want both (the
+        ``tasks.list`` verb), with the same fail-safe discipline: any SQLite
+        error resolves to ``(None, None)``. A pre-U6 table without the
+        ``detail`` column still yields ``(reason, None)`` — exactly what the
+        paired accessors return there.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT reason, detail FROM pipeline_recording_outcome "
+                    "WHERE recording_id=?",
+                    (self._recording_id,),
+                ).fetchone()
+                if row is None:
+                    return None, None
+                return str(row[0]), (None if row[1] is None else str(row[1]))
+            except sqlite3.OperationalError:
+                # Pre-U6 schema (no ``detail`` column): fall back to a
+                # reason-only read so the reason is not lost with the detail.
+                row = conn.execute(
+                    "SELECT reason FROM pipeline_recording_outcome "
+                    "WHERE recording_id=?",
+                    (self._recording_id,),
+                ).fetchone()
+                return (None if row is None else str(row[0])), None
+        except sqlite3.Error:
+            return None, None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    # ------------------------------------------------------------------
+    # SCR-275 U4 — per-window on-device naming cache (memo, never task truth)
+    # + the KTD-10 scrub-generation staleness guard.
+    # ------------------------------------------------------------------
+
+    def lookup_window_name(
+        self, window_start: float, window_end: float, digest_hash: str,
+    ) -> "tuple[str, str | None] | None":
+        """Return the cached ``(name, category)`` for an exact span+digest key.
+
+        ``None`` on a miss — including a missing table (a pre-SCR-275
+        ``recording.db``): a miss is never an error (KTD-6, memo-not-truth).
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT name, category FROM ondevice_window_names "
+                "WHERE window_start=? AND window_end=? AND digest_hash=?",
+                (window_start, window_end, digest_hash),
+            ).fetchone()
+            if row is None:
+                return None
+            return (str(row["name"]), row["category"])
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def store_window_name(
+        self,
+        window_start: float,
+        window_end: float,
+        digest_hash: str,
+        name: str,
+        category: "str | None",
+        *,
+        expected_generation: "int | None" = None,
+    ) -> bool:
+        """Persist one completed naming call (delete-then-insert, idempotent).
+
+        Written under the terminal-stage flock as each call completes (KTD-6),
+        with the ledger's own ``BEGIN IMMEDIATE`` discipline. The delete is
+        span-scoped (any prior digest for the same span goes), so a span holds
+        exactly its CURRENT digest's name and a re-run never duplicates.
+        Defensively creates the table so an old DB caches on first use.
+
+        ``expected_generation`` (KTD-10, per-write half): when given, the scrub
+        generation is re-read INSIDE the transaction and a mismatch — a
+        retroactive scrub landed since the pass snapshotted it — skips the
+        write entirely and returns ``False`` (the window stays named-but-
+        uncached this pass). Returns ``True`` when the row was written. The
+        end-of-pass :meth:`finalize_window_names` guard is unchanged and still
+        owns the hand-nothing-to-sinks decision.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_ONDEVICE_NAMES_DDL)
+                if expected_generation is not None:
+                    try:
+                        row = conn.execute(
+                            "SELECT generation FROM scrub_generation WHERE id=1"
+                        ).fetchone()
+                        gen = int(row[0]) if row is not None else 0
+                    except sqlite3.OperationalError:
+                        gen = 0
+                    if gen != int(expected_generation):
+                        conn.commit()
+                        return False
+                conn.execute(
+                    "DELETE FROM ondevice_window_names "
+                    "WHERE window_start=? AND window_end=?",
+                    (window_start, window_end),
+                )
+                conn.execute(
+                    "INSERT INTO ondevice_window_names "
+                    "(window_start, window_end, digest_hash, name, category, "
+                    " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (window_start, window_end, digest_hash, name, category,
+                     _now()),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def read_scrub_generation(self) -> int:
+        """Return the current scrub generation (0 for a missing table/row).
+
+        Fail-safe like :meth:`get_recording_outcome`: any SQLite error reads
+        as 0 — the guard then compares 0 == 0 and passes, which is correct for
+        a DB where the counter (and therefore the scrub bump) cannot exist.
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT generation FROM scrub_generation WHERE id=1"
+            ).fetchone()
+            return int(row[0]) if row is not None else 0
+        except sqlite3.Error:
+            return 0
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def finalize_window_names(
+        self,
+        written_keys: "list[tuple[float, float, str]]",
+        expected_generation: int,
+    ) -> bool:
+        """KTD-10 commit-time staleness guard, in ONE transaction.
+
+        Re-reads the scrub generation inside a ``BEGIN IMMEDIATE`` transaction.
+        Unchanged → ``True`` (the pass's cache writes stand). Changed — a
+        retroactive scrub landed mid-pass — → deletes exactly the cache rows
+        this pass wrote (``written_keys``), commits that deletion, and returns
+        ``False``: the caller must hand nothing to the sinks, so no
+        pre-scrub-derived name survives anywhere.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT generation FROM scrub_generation WHERE id=1"
+                    ).fetchone()
+                    gen = int(row[0]) if row is not None else 0
+                except sqlite3.OperationalError:
+                    gen = 0
+                if gen == int(expected_generation):
+                    conn.commit()
+                    return True
+                try:
+                    for ws, we, dh in written_keys:
+                        conn.execute(
+                            "DELETE FROM ondevice_window_names "
+                            "WHERE window_start=? AND window_end=? "
+                            "AND digest_hash=?",
+                            (ws, we, dh),
+                        )
+                except sqlite3.OperationalError:
+                    pass  # table dropped concurrently — nothing to delete
+                conn.commit()
+                return False
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
                 conn.close()
 
     def insert_task_segment(self, seg: TaskSegmentRow) -> int:

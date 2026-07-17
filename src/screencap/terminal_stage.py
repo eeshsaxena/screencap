@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from screencap.pipeline_policy import Destination, ResolvedPolicy, RetentionPolicy
     from screencap.pipeline_state import PipelineLedger
     from screencap.segmentation.consent import ConsentPolicy, ExecutionTarget
+    from screencap.segmentation.outcome import Branch
     from screencap.segmentation.provider import SegmentResult
     from screencap.upload import FileInfo
 
@@ -813,7 +814,9 @@ def _run_locked(
         # leaves the recording unnamed but NEVER blocks terminal completion,
         # and never triggers an upload (AE1 — the LOCAL branch has no upload
         # seam and the tasks store is excluded from upload by rule).
-        _run_local_segmentation(recording_dir, ledger, result, is_live=False)
+        _run_local_segmentation(
+            recording_dir, ledger, result, is_live=False, stop_event=stop_event,
+        )
         # Retention is UNIVERSAL (R11): a local recording with a size/time cap
         # also evicts its LOCAL_DONE chunks. keep_forever (the default) is a
         # no-op. No remote precondition for local eviction.
@@ -864,24 +867,14 @@ def _resolve_destination(recording_dir: Path, policy: "ResolvedPolicy | None"):
 def _open_ledger(recording_dir: Path) -> "PipelineLedger | None":
     """Open the U1 ledger over ``recording.db``, or ``None`` for legacy dirs.
 
+    Delegates to the shared :func:`screencap.pipeline_state.open_ledger_or_none`.
     A missing ``recording.db`` (legacy single-file recording) or a DB with no
     recording row yields ``None`` — the terminal stage still routes/uploads via
     the whole-dir scrub path; only the per-chunk ledger bookkeeping is skipped.
     """
-    db_path = recording_dir / "recording.db"
-    if not db_path.exists():
-        return None
-    try:
-        from screencap.pipeline_state import (
-            PipelineLedger,
-            ensure_pipeline_state_schema,
-        )
+    from screencap.pipeline_state import open_ledger_or_none
 
-        ensure_pipeline_state_schema(db_path)
-        return PipelineLedger(db_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("terminal_stage: ledger unavailable (%s); proceeding without it", exc)
-        return None
+    return open_ledger_or_none(recording_dir)
 
 
 def _open_ledger_readonly(recording_dir: Path) -> "PipelineLedger | None":
@@ -947,6 +940,7 @@ def run_incremental_segmentation(
     *,
     non_blocking: bool = True,
     lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+    stop_event: "threading.Event | None" = None,
 ) -> TerminalResult:
     """Incrementally segment a LIVE (still-recording) ambient day (U6, R6/R7/KTD4).
 
@@ -978,10 +972,18 @@ def run_incremental_segmentation(
     Returns a :class:`TerminalResult` (``destination='local'``); ``tasks_persisted``
     is the agent-task count written this pass. Raises :class:`TerminalStageBusy`
     when the flock is contended (per ``non_blocking`` / ``lock_timeout``).
+
+    ``stop_event`` (SCR-275 U4 / SCR-258 KTD-15): the daemon tick threads its
+    quiesce flag through so a ``storage.lock`` in progress halts the windowed
+    naming pass at its next safe row boundary (remaining windows go mechanical
+    this pass; cache hits converge the re-run). A stop set BEFORE the pass
+    starts raises :class:`TerminalStageInterrupted`, mirroring
+    :func:`run_terminal_stage`.
     """
     recording_dir = Path(recording_dir)
     name = recording_dir.name
     result = TerminalResult(destination="local")
+    _check_stop(stop_event)
     # Flock FIRST (AE12), exactly like run_terminal_stage — a concurrent finalize
     # that holds it means this best-effort pass SKIPS (non_blocking) rather than
     # double-writing the agent task set.
@@ -989,7 +991,9 @@ def run_incremental_segmentation(
         ledger = _open_ledger(recording_dir)
         if ledger is not None:
             result.n_expected = ledger.chunks_expected()
-        _run_local_segmentation(recording_dir, ledger, result, is_live=True)
+        _run_local_segmentation(
+            recording_dir, ledger, result, is_live=True, stop_event=stop_event,
+        )
         result.routed = True
     return result
 
@@ -1000,6 +1004,7 @@ def _run_local_segmentation(
     result: TerminalResult,
     *,
     is_live: bool = False,
+    stop_event: "threading.Event | None" = None,
 ) -> None:
     """Segment a LOCAL recording into named tasks; persist to the local store (U4/U7).
 
@@ -1039,20 +1044,54 @@ def _run_local_segmentation(
     """
     from screencap.segmentation.consent import ConsentPolicy
     from screencap.segmentation.degrade import DegradeAction, resolve_day_split
-    from screencap.segmentation.outcome import PRODUCED_TASKS, Branch, pick_reason
+    from screencap.segmentation.ondevice_pipeline import (
+        REASON_STALE_SCRUB,
+        REASON_STOPPED,
+    )
+    from screencap.segmentation.outcome import (
+        PRODUCED_TASKS,
+        PRODUCED_TASKS_PARTIAL,
+        Branch,
+        pick_reason,
+    )
+    from screencap.segmentation.provider import PROVIDER_UNAVAILABLE
 
-    def _record(branch: "Branch") -> None:
+    def _record(
+        branch: "Branch", *, detail: str | None = None, provisional: bool = False,
+    ) -> None:
         # Record WHY this recording has (or lacks) AI-named tasks (U2). Reads the
         # prior reason so pick_reason stays monotonic (a live degrade never
-        # downgrades a recording that already produced tasks). Strictly fail-open:
-        # outcome bookkeeping must never block terminal completion.
+        # downgrades a recording that already produced tasks). ``detail`` (U6, R8)
+        # is the pass's distinct degradation reason; a fully-produced outcome
+        # carries none, and a same-reason detail-less record is skipped so it
+        # never NULLs a prior pass's stored detail. ``provisional`` forces the
+        # picker's live mapping — used for a quiesce-stopped pass, which must
+        # settle as ``in_progress`` (re-runs on resume), never a final reason.
+        # Strictly fail-open: outcome bookkeeping must never block terminal
+        # completion.
         if ledger is None:
             return
         try:
             prior = ledger.get_recording_outcome()
-            ledger.set_recording_outcome(
-                pick_reason(branch=branch, is_live=is_live, prior=prior)
+            picked = pick_reason(
+                branch=branch, is_live=is_live or provisional, prior=prior,
             )
+            if picked == PRODUCED_TASKS:
+                detail = None
+            if picked == prior and detail is None:
+                return  # nothing new — keep the prior record (and its detail).
+            if (
+                picked == prior
+                and picked in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
+                and branch not in (Branch.PRODUCED, Branch.PARTIAL)
+            ):
+                # The picker KEPT a sticky produced/partial prior on a
+                # degraded (mechanical/nothing/failed) pass: the STORED detail
+                # explains the recorded reason — this pass's fresh failure
+                # detail describes an outcome that was never recorded, so it
+                # must not replace it.
+                return
+            ledger.set_recording_outcome(picked, detail=detail)
         except Exception as exc:  # noqa: BLE001 — outcome record must never block terminal
             logger.debug(
                 "terminal_stage: recording outcome record failed open for %s (%s)",
@@ -1060,13 +1099,50 @@ def _run_local_segmentation(
             )
 
     try:
-        summary, provider_result = _segment_local_tasks(recording_dir)
+        summary, provider_result, unavailable_reason = _segment_local_tasks(
+            recording_dir, stop_event=stop_event, is_live=is_live,
+        )
+        if (
+            provider_result is PROVIDER_UNAVAILABLE
+            and unavailable_reason == REASON_STALE_SCRUB
+            and not is_live
+        ):
+            # SCR-275 KTD-10 at FINALIZE: a retroactive scrub landed mid-pass
+            # and the staleness guard discarded it. The scrub has committed,
+            # so the post-scrub rows are now settled — run ONE immediate
+            # same-call retry. This is a single sequential retry (no
+            # recursion): a second trip falls through to the provisional
+            # short-circuit below, exactly like a live-tick trip.
+            logger.info(
+                "terminal_stage: stale-scrub trip for %s at finalize; "
+                "retrying once over the settled rows", recording_dir.name,
+            )
+            summary, provider_result, unavailable_reason = _segment_local_tasks(
+                recording_dir, stop_event=stop_event, is_live=is_live,
+            )
     except Exception as exc:  # noqa: BLE001 — segmentation must never block terminal
         logger.debug(
             "terminal_stage: local segmentation failed open for %s (%s)",
             recording_dir.name, exc,
         )
         _record(Branch.FAILED)
+        return
+
+    if provider_result is PROVIDER_UNAVAILABLE and unavailable_reason in (
+        REASON_STOPPED, REASON_STALE_SCRUB,
+    ):
+        # SCR-275 U6: a halted pass — the storage.lock quiesce (or a stop
+        # signal) tripped before any model work ran, or a retroactive scrub
+        # landed mid-pass and the staleness guard discarded the pass (after
+        # the one finalize retry above). Neither is a real unavailability, so
+        # it must consult NEITHER the cloud-summary fallback nor the heuristic
+        # (nothing is persisted, mirroring TerminalStageInterrupted, which
+        # records nothing at all). The outcome maps through the picker's
+        # provisional live branch — ``in_progress`` (or a kept
+        # produced/partial prior) — because the pass re-runs: a live tick
+        # retries next tick, and an interrupted finalize resumes via the
+        # unlock/startup reconcile.
+        _record(Branch.NOTHING, provisional=True)
         return
 
     try:
@@ -1076,7 +1152,7 @@ def _run_local_segmentation(
             "terminal_stage: degradation resolve failed open for %s (%s)",
             recording_dir.name, exc,
         )
-        _record(Branch.FAILED)
+        _record(Branch.FAILED, detail=unavailable_reason)
         return
 
     from_heuristic = False
@@ -1114,7 +1190,7 @@ def _run_local_segmentation(
                     "terminal_stage: idle-gap heuristic failed open for %s (%s)",
                     recording_dir.name, exc,
                 )
-                _record(Branch.FAILED)
+                _record(Branch.FAILED, detail=unavailable_reason)
                 return
     else:
         # NONE (provider ran, no tasks) or CLOUD (never reachable for day-split)
@@ -1124,8 +1200,9 @@ def _run_local_segmentation(
 
     if not tasks:
         # HEURISTIC path with neither a consented cloud naming nor heuristic output
-        # → the attempt produced nothing at all (couldn't run, on finalize).
-        _record(Branch.FAILED)
+        # → the attempt produced nothing at all (couldn't run, on finalize). The
+        # provider's distinct unavailable reason (R8) rides as the detail.
+        _record(Branch.FAILED, detail=unavailable_reason)
         return
 
     # Classify by a code-owned flag, not by introspecting the tasks dict: only the
@@ -1133,17 +1210,33 @@ def _run_local_segmentation(
     # HEURISTIC branch is a real (cloud-named) result → produced. Keying off a
     # model-emittable ``summary.source`` value would let a provider that echoed
     # "idle_gap_heuristic" be misclassified as mechanical (correctness/adversarial).
-    branch = Branch.MECHANICAL if from_heuristic else Branch.PRODUCED
+    # Within a real provider result, the per-task source MIX distinguishes a fully
+    # model-named pass from a partial one (SCR-275 U6 / KTD-8) — read here, BEFORE
+    # ``_persist_local_tasks`` rewrites row-level ownership to ``agent``.
+    branch = Branch.MECHANICAL if from_heuristic else _provider_pass_branch(tasks)
 
-    # Monotonic task-row gating (R7 / KTD2): once a recording produced real AI tasks,
-    # a later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
-    # "AI-named" above a mechanical list). Skip persistence and keep produced_tasks.
+    # Monotonic task-row gating (R7 / KTD2 / KTD-8): once a recording produced real
+    # AI tasks — fully (produced_tasks) or partially (produced_tasks_partial) — a
+    # later MECHANICAL pass must NOT overwrite the AI rows (else the card would show
+    # "AI-named" above a mechanical list). Skip persistence and keep the reason.
+    # The same gate covers a PARTIAL pass at FINALIZE over a produced_tasks
+    # prior: pick_reason keeps produced there (strict finalize monotonicity),
+    # so the rows must stay the produced pass's too — rows and reason in
+    # agreement. A live PARTIAL keeps persisting (the deliberate recompute).
+    prior_outcome = (
+        ledger.get_recording_outcome() if ledger is not None else None
+    )
     if (
         branch is Branch.MECHANICAL
-        and ledger is not None
-        and ledger.get_recording_outcome() == PRODUCED_TASKS
+        and prior_outcome in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
+    ) or (
+        branch is Branch.PARTIAL
+        and not is_live
+        and prior_outcome == PRODUCED_TASKS
     ):
-        _record(Branch.MECHANICAL)  # pick_reason keeps produced_tasks; rows untouched
+        # pick_reason keeps produced/partial; rows untouched — and no detail is
+        # passed, so the prior pass's stored detail is preserved too.
+        _record(branch)
         return
 
     # KTD3 carve-out — drop any fresh AGENT task overlapping a PROTECTED span
@@ -1163,7 +1256,37 @@ def _run_local_segmentation(
         _record(Branch.FAILED)
         return
     result.tasks_persisted = n
-    _record(branch)
+    # PARTIAL/MECHANICAL carry the provider's distinct reason (the dominant
+    # per-window failure for a partial pass; the unavailable reason for a
+    # heuristic one). A PRODUCED record drops the detail inside _record.
+    _record(branch, detail=unavailable_reason)
+
+
+def _provider_pass_branch(tasks: dict) -> "Branch":
+    """Classify a USE_PROVIDER pass from its per-task source mix (SCR-275 U6, KTD-8).
+
+    The on-device heuristic-first pipeline marks every task it assembles with
+    ``source`` ∈ {``ondevice_model``, ``idle_gap_heuristic``}. A pass mixing BOTH
+    is a partial success (some windows model-named, some mechanically filled) →
+    :attr:`Branch.PARTIAL`. Everything else — all model-named, a cloud/BYO
+    provider's tasks (no source markers), or a malformed shape — classifies
+    :attr:`Branch.PRODUCED`: only a genuine mix may soften the reason, so a
+    provider echoing a single marker can never talk itself DOWN below produced
+    (the adversarial concern the code-owned ``from_heuristic`` flag guards).
+    """
+    from screencap.segmentation.ondevice_pipeline import (
+        SOURCE_MECHANICAL,
+        SOURCE_MODEL,
+    )
+    from screencap.segmentation.outcome import Branch
+
+    task_list = tasks.get("tasks") if isinstance(tasks, dict) else None
+    if not isinstance(task_list, list):
+        return Branch.PRODUCED
+    sources = {t.get("source") for t in task_list if isinstance(t, dict)}
+    if SOURCE_MODEL in sources and SOURCE_MECHANICAL in sources:
+        return Branch.PARTIAL
+    return Branch.PRODUCED
 
 
 def _carve_out_protected_spans(
@@ -1233,10 +1356,13 @@ def _carve_out_protected_spans(
 
 def _segment_local_tasks(
     recording_dir: Path,
-) -> "tuple[dict | None, SegmentResult]":
+    *,
+    stop_event: "threading.Event | None" = None,
+    is_live: bool = False,
+) -> "tuple[dict | None, SegmentResult, str | None]":
     """Build the stripped activity summary and run the configured day-split provider.
 
-    Returns ``(stripped_summary, provider_result)``:
+    Returns ``(stripped_summary, provider_result, unavailable_reason)``:
 
     * ``stripped_summary`` — the ALLOW-only, ``stripped=True``-marked activity
       summary dict (or ``None`` when there is no local activity to summarize). It
@@ -1249,6 +1375,11 @@ def _segment_local_tasks(
       (could not run). The sentinel is preserved (not collapsed to a falsy ``None``)
       so the caller's degradation ladder can route on the None-vs-unavailable
       distinction.
+    * ``unavailable_reason`` — the provider's out-of-band
+      ``last_unavailable_reason`` (SCR-275 U6, KTD-1): ``None`` after a
+      fully-model pass, the dominant per-window failure reason after a partial
+      one, and the distinct unavailable reason alongside the sentinel. Read via
+      ``getattr`` so legacy providers without the attribute yield ``None``.
 
     All heavy imports are deferred so the terminal-stage import surface stays light.
     """
@@ -1261,7 +1392,7 @@ def _segment_local_tasks(
 
     manifests = load_local_manifests(recording_dir)
     if not manifests:
-        return None, None
+        return None, None, None
 
     summary = build_activity_summary(
         recording_dir.name,
@@ -1273,7 +1404,7 @@ def _segment_local_tasks(
         blocked_source=recording_dir,
     )
     if summary is None:
-        return None, None
+        return None, None, None
 
     # The summary was built with blocked_source, so build_activity_summary has
     # run the R11 strip and marked the summary stripped AUTHORITATIVELY — the
@@ -1287,8 +1418,23 @@ def _segment_local_tasks(
     # touches the network (R5). segment() returns a validated tasks dict, None
     # (ran, no usable tasks), or PROVIDER_UNAVAILABLE (could not run — routed to
     # the idle-gap heuristic by the caller's ladder, KTD6).
-    provider = build_day_split_provider()
-    return summary, provider.segment(summary)
+    #
+    # SCR-275 U4 (KTD-1 transport): the per-recording context — recording dir,
+    # cooperative stop signal, live flag — rides into the provider so the
+    # on-device backend runs the heuristic-first windowed pipeline (with
+    # boundary pinning on live passes) instead of the legacy whole-day call.
+    provider = build_day_split_provider(
+        recording_dir=recording_dir, stop_event=stop_event, is_live=is_live,
+        # Reuse the manifests already loaded above so the on-device windowed
+        # path doesn't re-glob/re-parse them from disk.
+        manifests=manifests,
+    )
+    provider_result = provider.segment(summary)
+    return (
+        summary,
+        provider_result,
+        getattr(provider, "last_unavailable_reason", None),
+    )
 
 
 def _session_window(summary: dict | None) -> "tuple[float, float] | None":
@@ -1463,6 +1609,7 @@ def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
     """
     from screencap import config
     from screencap.recording_db import Row, open_recording_db
+    from screencap.segmentation.ondevice_pipeline import SOURCE_MECHANICAL
     from screencap.task_manifest import _segment_tasks
 
     db_path = recording_dir / "recording.db"
@@ -1487,11 +1634,11 @@ def _heuristic_local_tasks(recording_dir: Path) -> dict | None:
             "name": f"task_{i + 1}",
             "derived_name": f"task-{i + 1}",
             "event_count": count,
-            "source": "idle_gap_heuristic",
+            "source": SOURCE_MECHANICAL,
         }
         for i, (start, end, count) in enumerate(segments)
     ]
-    return {"tasks": tasks, "summary": {"source": "idle_gap_heuristic"}, "tags": []}
+    return {"tasks": tasks, "summary": {"source": SOURCE_MECHANICAL}, "tags": []}
 
 
 def _persist_local_tasks(

@@ -5,12 +5,14 @@ can render a distinct honest state instead of an ambiguous empty task list. The 
 is pure and monotonic: once a recording has produced real AI tasks, a later live
 (incremental) pass never downgrades it to a mechanical/empty reason.
 
-Reasons — the four the daemon can observe directly at segmentation time. R7's fifth
-honest state, ``not_set_up``, plus the ``unknown`` absence state, are derived app-side
+Reasons — the six the daemon can observe directly at segmentation time. R7's
+``not_set_up`` honest state, plus the ``unknown`` absence state, are derived app-side
 (the daemon never probes Apple-Intelligence availability and never invents a reason for
 a recording it did not segment):
 
 - ``produced_tasks`` — a provider (on-device or consented cloud fallback) named the day.
+- ``produced_tasks_partial`` — a pass mixed model names with mechanical fills: some
+  windows were model-named, others fell back per-window (SCR-275 U6 / KTD-8).
 - ``mechanical_only`` — degraded to the idle-gap heuristic; names are mechanical, not AI.
 - ``nothing_to_name`` — a provider ran and declined (no usable tasks) on a finalized recording.
 - ``couldnt_run`` — the attempt failed / was unavailable and no fallback produced anything.
@@ -22,13 +24,21 @@ from __future__ import annotations
 import enum
 
 PRODUCED_TASKS = "produced_tasks"
+PRODUCED_TASKS_PARTIAL = "produced_tasks_partial"
 MECHANICAL_ONLY = "mechanical_only"
 NOTHING_TO_NAME = "nothing_to_name"
 COULDNT_RUN = "couldnt_run"
 IN_PROGRESS = "in_progress"
 
 ALL_REASONS = frozenset(
-    {PRODUCED_TASKS, MECHANICAL_ONLY, NOTHING_TO_NAME, COULDNT_RUN, IN_PROGRESS}
+    {
+        PRODUCED_TASKS,
+        PRODUCED_TASKS_PARTIAL,
+        MECHANICAL_ONLY,
+        NOTHING_TO_NAME,
+        COULDNT_RUN,
+        IN_PROGRESS,
+    }
 )
 
 
@@ -36,24 +46,40 @@ class Branch(enum.Enum):
     """The raw segmentation outcome observed at a terminal_stage branch point."""
 
     PRODUCED = "produced"      # real provider tasks, or a consented cloud-fallback naming
+    PARTIAL = "partial"        # a mixed pass: some model-named tasks, some mechanical (KTD-8)
     MECHANICAL = "mechanical"  # idle-gap heuristic tasks (``source: idle_gap_heuristic``)
     NOTHING = "nothing"        # a provider ran and declined (``DegradeAction.NONE``)
     FAILED = "failed"          # an exception, or degraded with no fallback output at all
 
 
+# Success ranking for the monotonic rules: PRODUCED > PARTIAL > MECHANICAL.
+_STICKY_PRIORS = (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL)
+
+
 def pick_reason(*, branch: Branch, is_live: bool, prior: str | None) -> str:
     """Map a raw branch outcome to a persisted reason, monotonically.
 
-    Monotonicity (R7 / KTD2): once ``produced_tasks`` is recorded, a later pass that
-    is not itself a PRODUCED result keeps ``produced_tasks`` — a live degrade never
-    downgrades a recording that already got real AI tasks. On a live recording a
-    NOTHING/FAILED pass is provisional (``in_progress``); only on finalize does it
-    settle to ``nothing_to_name`` / ``couldnt_run``.
+    Monotonicity (R7 / KTD2 / SCR-275 KTD-8), in the order PRODUCED > PARTIAL >
+    MECHANICAL: once ``produced_tasks`` or ``produced_tasks_partial`` is
+    recorded, a MECHANICAL/NOTHING/FAILED pass keeps the recorded reason — a
+    degrade never downgrades a recording that already got real AI names. A
+    PRODUCED pass always upgrades (partial → produced included). A PARTIAL pass
+    is the one deliberate exception: **on live** the outcome recomputes from the
+    current pass's source mix, so produced → partial IS allowed (the window set
+    grew and a new window went mechanical); **at finalize** the order is
+    strictly monotonic, so partial never downgrades a prior produced. On a live
+    recording a NOTHING/FAILED pass with no sticky prior is provisional
+    (``in_progress``); only on finalize does it settle to ``nothing_to_name`` /
+    ``couldnt_run``.
     """
-    if prior == PRODUCED_TASKS and branch is not Branch.PRODUCED:
-        return PRODUCED_TASKS
     if branch is Branch.PRODUCED:
         return PRODUCED_TASKS
+    if branch is Branch.PARTIAL:
+        if not is_live and prior == PRODUCED_TASKS:
+            return PRODUCED_TASKS
+        return PRODUCED_TASKS_PARTIAL
+    if prior in _STICKY_PRIORS:
+        return prior
     if branch is Branch.MECHANICAL:
         return MECHANICAL_ONLY
     if is_live:
