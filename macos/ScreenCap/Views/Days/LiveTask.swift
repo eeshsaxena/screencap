@@ -9,7 +9,7 @@ import Foundation
 //
 // The draft + the close rules are pure so they unit-test without a running
 // daemon; `LiveTaskController` is the thin `@MainActor` glue that persists a
-// closed draft through the shared `JournalTasks` write-through layer.
+// closed draft through the shared `DayTasks` write-through layer.
 
 /// An in-progress user task span not yet persisted. `recording` is the ambient
 /// recording (today's continuous stream) the span belongs to; `startedAt` is its
@@ -85,15 +85,15 @@ enum LiveTaskClose {
     }
 }
 
-/// `@MainActor` glue driving the live-task lifecycle over `JournalTasks`.
+/// `@MainActor` glue driving the live-task lifecycle over `DayTasks`.
 @MainActor
 final class LiveTaskController: ObservableObject {
     /// The currently-open span, or nil. Drives the provisional card.
     @Published private(set) var draft: LiveTaskDraft?
 
-    private let tasks: JournalTasks
+    private let tasks: DayTasks
 
-    init(tasks: JournalTasks) {
+    init(tasks: DayTasks) {
         self.tasks = tasks
     }
 
@@ -114,7 +114,7 @@ final class LiveTaskController: ObservableObject {
 
     /// Explicitly stop and persist the open span. Returns true on a successful
     /// `tasks.create` (false when nothing was open or the write failed — the
-    /// failure surfaces on `JournalTasks.writeError`).
+    /// failure surfaces on `DayTasks.writeError`).
     @discardableResult
     func stop(at now: Date = Date()) async -> Bool {
         await close(reason: .stopped, at: now)
@@ -130,7 +130,7 @@ final class LiveTaskController: ObservableObject {
 
     /// Persist and clear the open draft. The draft is cleared BEFORE the write so
     /// the provisional card disappears immediately; a write failure is surfaced by
-    /// `JournalTasks` (with a retryable create) rather than re-opening the draft.
+    /// `DayTasks` (with a retryable create) rather than re-opening the draft.
     @discardableResult
     private func close(reason: LiveTaskCloseReason, at now: Date, calendar: Calendar = .current) async -> Bool {
         guard let open = draft else { return false }

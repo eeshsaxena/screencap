@@ -12,11 +12,32 @@ final class ShellSidebarModelTests: XCTestCase {
 
     // MARK: - Routing + enablement
 
-    func testLibraryRoutesAndIsEnabled() {
-        let library = item(ShellSidebarModel.primaryNav, "library")
-        XCTAssertEqual(library.route, .library)
-        XCTAssertTrue(library.isEnabled)
-        XCTAssertNil(library.helpText, "an enabled row has no coming-soon tooltip")
+    /// R1 — the primary nav is exactly Days · Tasks · Clips · Chat, in order,
+    /// with no Library/Journal/Collections rows.
+    func testPrimaryNavIsDaysTasksClipsChat() {
+        XCTAssertEqual(ShellSidebarModel.primaryNav.map(\.id), ["days", "tasks", "clips", "chat"])
+        XCTAssertEqual(
+            ShellSidebarModel.primaryNav.map(\.route),
+            [.days, .tasks, .clips, .chat]
+        )
+        XCTAssertTrue(ShellSidebarModel.primaryNav.allSatisfy(\.isEnabled))
+    }
+
+    func testDaysRoutesAndIsEnabled() {
+        let days = item(ShellSidebarModel.primaryNav, "days")
+        XCTAssertEqual(days.route, .days)
+        XCTAssertTrue(days.isEnabled)
+        XCTAssertNil(days.helpText, "an enabled row has no coming-soon tooltip")
+    }
+
+    /// Tasks and Clips route now (to honest placeholders until U6/U11 land).
+    func testTasksAndClipsRouteAndAreEnabled() {
+        let tasks = item(ShellSidebarModel.primaryNav, "tasks")
+        XCTAssertEqual(tasks.route, .tasks)
+        XCTAssertTrue(tasks.isEnabled)
+        let clips = item(ShellSidebarModel.primaryNav, "clips")
+        XCTAssertEqual(clips.route, .clips)
+        XCTAssertTrue(clips.isEnabled)
     }
 
     /// KTD-4 (account-sheet U5): Account is pinned FIRST in the SETTINGS group
@@ -36,27 +57,11 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertNil(privacy.helpText)
     }
 
-    func testJournalRoutesAndIsEnabled() {
-        let journal = item(ShellSidebarModel.primaryNav, "journal")
-        XCTAssertEqual(journal.route, .journal)
-        XCTAssertTrue(journal.isEnabled, "Journal routes to its pane since U8")
-        XCTAssertNil(journal.helpText)
-    }
-
     func testAppRulesRoutesAndIsEnabled() {
         let row = item(ShellSidebarModel.settingsNav, "appRules")
         XCTAssertEqual(row.route, .appRules)
         XCTAssertTrue(row.isEnabled, "App rules routes to its pane since U13")
         XCTAssertNil(row.helpText)
-    }
-
-    /// Collections is a deferred capability — disabled with the SCR-222 tooltip,
-    /// and it never carries the design's mock collection names (R4 / U14 sweep).
-    func testCollectionsIsStubbedWithTicket() {
-        let collections = item(ShellSidebarModel.collections, "collections")
-        XCTAssertFalse(collections.isEnabled)
-        XCTAssertNil(collections.route, "a pure stub row has no destination")
-        XCTAssertEqual(collections.helpText, "Coming soon — SCR-222")
     }
 
     // MARK: - Footer storage math

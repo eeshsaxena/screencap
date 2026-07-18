@@ -1,12 +1,12 @@
 import Foundation
 
-// U8 — resolves each Journal card's app chip: the dominant app from a single
-// cached `timeline.query` per recording (U8 approach). Failure is silent by
-// contract — the chip is simply omitted (the field is nullable end to end), so
-// a daemon hiccup never degrades the Journal into an error state.
+// Resolves a day's app chip: the dominant app from a single cached
+// `timeline.query` per recording. Failure is silent by contract — the chip is
+// simply omitted (the field is nullable end to end), so a daemon hiccup never
+// degrades the Days surface into an error state.
 
 @MainActor
-final class JournalAppChips: ObservableObject {
+final class DayAppChips: ObservableObject {
     /// Successful resolutions only, keyed by recording directory name.
     @Published private(set) var apps: [String: String] = [:]
     /// Every recording we've already queried (hit, miss, or failure) — pins the
@@ -32,7 +32,7 @@ final class JournalAppChips: ObservableObject {
         attempted.insert(recording.name)
         let request = TimelineQueryRequest(recording: recording.name, limit: 500)
         guard let response = try? await service.timelineQuery(request) else { return }
-        if let app = JournalModel.dominantApp(response.rows) {
+        if let app = DaysModel.dominantApp(response.rows) {
             apps[recording.name] = app
         }
     }

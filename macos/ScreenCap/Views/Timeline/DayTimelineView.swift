@@ -12,7 +12,7 @@ struct DayTimelineView: View {
     @Environment(\.openWindow) private var openWindow
 
     let date: Date
-    /// Optional wall-clock anchor to land on (a Journal card / Recall hit).
+    /// Optional wall-clock anchor to land on (a Days card / Recall hit).
     var initialSeekMs: Int?
     var onBack: () -> Void
 
@@ -56,7 +56,7 @@ struct DayTimelineView: View {
     // two playhead endpoints (each snapped to a task/recording boundary), then a
     // label sheet confirms them into `tasks.create`. `dayTasks` is the shared
     // write-through layer (also the source of the failed-write alert).
-    @StateObject private var dayTasks = JournalTasks()
+    @StateObject private var dayTasks = DayTasks()
     @State private var markSelection = DaySpanSelection()
     @State private var pendingTaskLabel: PendingTaskLabel?
 
@@ -93,7 +93,7 @@ struct DayTimelineView: View {
     }
 
     /// Bridges `dayTasks.writeError` to an `isPresented` binding for the
-    /// retroactive create path (mirrors JournalView's write-error surfacing).
+    /// retroactive create path (mirrors the day surfaces. write-error surfacing).
     private var markTaskErrorPresented: Binding<Bool> {
         Binding(
             get: { dayTasks.writeError != nil },
@@ -126,12 +126,12 @@ struct DayTimelineView: View {
     private var header: some View {
         HStack(spacing: 16) {
             Button(action: onBack) {
-                Text("← Journal")
+                Text("← Back")
                     .font(SCTypography.sans(size: 13))
                     .foregroundStyle(Color.scInkSecondary)
             }
             .buttonStyle(.plain)
-            .help("Back to Journal")
+            .help("Back")
             Text(Self.headerDateFormatter.string(from: date))
                 .font(SCTypography.grotesk(size: 15, weight: .semibold))
                 .foregroundStyle(Color.scInk)
@@ -175,7 +175,7 @@ struct DayTimelineView: View {
             case .media:
                 AVPlayerNSView(player: engine.player)
             case .placeholder(let reason):
-                LibraryHatchPlaceholder()
+                CardHatchPlaceholder()
                 VStack(spacing: 12) {
                     Text(placeholderCaption(reason))
                         .font(SCTypography.mono(size: 12))
@@ -184,7 +184,7 @@ struct DayTimelineView: View {
                     // The daemon-down caption tells the user to retry, so give
                     // them the control to do it — a stale-daemon restart (a
                     // no-op if the daemon isn't stale) followed by a reload,
-                    // mirroring the Library's staleDaemonError affordance.
+                    // mirroring the Days surface.s staleDaemonError affordance.
                     // Without this the message is an instruction with no button.
                     if loadPhase == .daemonUnavailable {
                         Button(reloading ? "Retrying…" : "Retry") { retryDay() }
@@ -548,7 +548,7 @@ struct DayTimelineView: View {
         // resolves to `.subscriptionRequired` (recall gated) → no markers, while
         // the day timeline itself (browse verb `timeline.day`) stays fully
         // available. Graceful degradation of the in-day search overlay; the
-        // primary upgrade CTA lives on the Library + Recall-palette surfaces.
+        // primary upgrade CTA lives on the Days + Recall-palette surfaces.
         // TODO(build-verify): confirm the day-scoped search field's placeholder
         // reads acceptably with zero markers when gated (no explicit CTA here).
         guard case .loaded(let results) = searchModel.phase else { return [] }

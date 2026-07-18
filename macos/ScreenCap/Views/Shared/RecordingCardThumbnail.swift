@@ -1,15 +1,18 @@
 import SwiftUI
 
-/// The shared card thumbnail (U5 Library, U8 Journal): a rounded first-frame
-/// image with a bottom-right mono duration chip, falling back to the hatched
-/// placeholder when the recording has no readable frame. Loads its own
+/// The shared card thumbnail (Days cards, Chat sources, clip previews): a rounded
+/// first-frame image with a bottom-right mono duration chip, falling back to the
+/// hatched placeholder when the recording has no readable frame. Loads its own
 /// thumbnail via the shared frame index + cache; the parent supplies aspect
 /// ratio and border (hover styling stays per-screen).
+///
+/// Relocated to Views/Shared from the retired Library views — it is consumed by
+/// Chat, the day surfaces, and (in a later unit) clip thumbnails.
 struct RecordingCardThumbnail: View {
     let recording: RecordingSummary
     let frameIndex: RecordingFrameIndex
     let thumbnailLoader: ThumbnailLoader
-    /// 16/9.6 for Library cards (design 363), 16/9 for Journal cards (405).
+    /// 16/9.6 for the wider cards, 16/9 for day cards.
     var aspectRatio: CGFloat
     var borderColor: Color
 
@@ -47,7 +50,7 @@ struct RecordingCardThumbnail: View {
         } else {
             // Not-yet-loaded and resolved-miss both render the neutral hatch, so
             // the card never flashes an arbitrary frame (R5).
-            LibraryHatchPlaceholder()
+            CardHatchPlaceholder()
         }
     }
 

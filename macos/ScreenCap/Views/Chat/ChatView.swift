@@ -663,7 +663,7 @@ private struct ChatSourceCard: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else {
-                LibraryHatchPlaceholder()
+                CardHatchPlaceholder()
             }
         }
         .aspectRatio(16.0 / 9.0, contentMode: .fit)

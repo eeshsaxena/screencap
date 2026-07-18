@@ -129,9 +129,9 @@ enum FirstRunSetupPresentationPolicy {
 
 /// Top-level window content (U4). The prototype sidebar (`ShellSidebarView`)
 /// replaces the legacy four-pane `List` sidebar inside the existing singleton
-/// `Window` scene (KTD-1). The detail routes on `ShellRoute`: Library (U5),
-/// Journal (U8), the Day timeline (U9), Privacy settings (U12), and App rules
-/// (U13) are live.
+/// `Window` scene (KTD-1). The detail routes on `ShellRoute`: Days (U3), Tasks
+/// and Clips placeholders, the Day timeline (U9), Privacy settings, and App
+/// rules are live.
 ///
 /// The recording banner overlays the top of the detail area. Fresh installs get
 /// the onboarding wizard takeover (U11, KTD-10) instead of the shell; after
@@ -154,7 +154,7 @@ struct MainWindow: View {
         case replay
     }
 
-    @State private var route: ShellRoute = .library
+    @State private var route: ShellRoute = .days
     /// Non-nil while the onboarding wizard owns the window content (U11).
     @State private var onboarding: OnboardingMode?
     /// True while the permission-setup takeover owns the window content (U14 —
@@ -182,7 +182,7 @@ struct MainWindow: View {
     /// surface before the user acts (SCR-144).
     @State private var reopenedViaRecovery = false
     /// U6: the New-recording sheet is an in-window overlay (KTD-4), presented
-    /// from the Library header. Kept here (not in LibraryView) so it layers over
+    /// from the Days header. Kept here (not in DaysView) so it layers over
     /// the whole shell like the prototype's z-41 overlay.
     @State private var showingNewRecording = false
     /// U12 / account-sheet U5: the shared Account & Plan sheet, presented via
@@ -199,7 +199,7 @@ struct MainWindow: View {
     /// until its watchdog timeout.
     @State private var startedSignIn = false
     /// U10: the Recall palette — an in-window overlay (KTD-4) opened by the
-    /// window-scoped ⌘⇧F (KTD-13), the Library/Journal search pills, and the
+    /// window-scoped ⌘⇧F (KTD-13), the Days search pill, and the
     /// menu-bar "Search…" item (via notification).
     @State private var showingPalette = false
     /// Search U8 (R6): the one-time search-by-default disclosure. Presented as a
@@ -217,11 +217,11 @@ struct MainWindow: View {
             if let mode = onboarding {
                 // U11: the onboarding takeover replaces the window content for
                 // fresh installs (KTD-10) and for the sidebar's read-only
-                // replay. Finish routes to Library, or App rules when step 2's
+                // replay. Finish routes to Days, or App rules when step 2's
                 // "Edit the list" deep link was taken.
                 OnboardingWizard(replay: mode == .replay) { destination in
                     onboarding = nil
-                    route = destination == .appRules ? .appRules : .library
+                    route = destination == .appRules ? .appRules : .days
                     updatePermissionSetupPresentation()
                     // Search U8: new installs see the disclosure right after
                     // onboarding completes (existing installs get it on plain launch).
@@ -260,8 +260,8 @@ struct MainWindow: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .screenCapRecordingDidEnd)) { _ in
             // U7: a recording ended and the main window was restored — land on
-            // Library (with the fresh draft card).
-            route = .library
+            // Days (the default landing surface).
+            route = .days
             // SCR-262: state changes that fired mid-recording were swallowed by
             // the isRecording early return (e.g. convergence finishing while a
             // recording ran would otherwise leave the interstitial latched with
@@ -557,7 +557,7 @@ struct MainWindow: View {
         // recording→idle edge where this latch is still false — the evaluator
         // early-returns while recording, so the launch decision never settled — so
         // its interstitial still shows. The latch keeps the other mid-session
-        // sources (e.g. wiring the Library/Day-timeline "Restart helper" retries
+        // sources (e.g. wiring the Days/Day-timeline "Restart helper" retries
         // through the convergence state) from becoming a surprise window takeover.
         // The launch path itself is unaffected: at onAppear the probe hasn't
         // completed, so the latch only sets after the launch task's sequenced
@@ -644,11 +644,28 @@ struct MainWindow: View {
             // disclosure deep-links to App rules — the per-app view of what
             // the always-on policy engine masks and blocks.
             PrivacySettingsView(onOpenAppRules: { route = .appRules })
-        case .journal:
-            // U8: day-grouped Journal. The search pill opens the Recall palette (U10).
-            JournalView(
+        case .days:
+            // U3: the Days landing surface — day cards + the always-present Today
+            // card. The New-recording pill opens U6's in-window sheet (KTD-4),
+            // gated so it never opens over an active recording; the search pill
+            // opens the Recall palette (U10); a card opens the day page (U9).
+            DaysView(
+                onNewRecording: presentNewRecording,
+                onUpgradePrompt: { presentedAccountContext = .gate },
                 onOpenSearch: { showingPalette = true },
                 onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
+            )
+        case .tasks:
+            // Honest placeholder until the Tasks surface lands (U6).
+            ComingSoonPlaceholderView(
+                title: "Tasks",
+                message: "A cross-day view of the workflows split out of your days is on its way."
+            )
+        case .clips:
+            // Honest placeholder until the Clips surface lands (U11).
+            ComingSoonPlaceholderView(
+                title: "Clips",
+                message: "Moments you deliberately keep will live here. Clipping from a day is on its way."
             )
         case .appRules:
             // U13: the prototype App rules pane.
@@ -668,20 +685,8 @@ struct MainWindow: View {
         case .timeline(let day, let seekMs):
             // U9: the day view. `.id(day)` gives each date a fresh engine +
             // search scope rather than mutating one view's state across days.
-            DayTimelineView(date: day, initialSeekMs: seekMs, onBack: { route = .journal })
+            DayTimelineView(date: day, initialSeekMs: seekMs, onBack: { route = .days })
                 .id(day)
-        case .library:
-            // U5: the prototype card grid. It owns its own loading / error /
-            // empty / zero-match states over the recordings index. The
-            // New-recording pill opens U6's in-window sheet (KTD-4), gated so it
-            // never opens over an active recording (logic 780). Card clicks land
-            // on the Day timeline seeked to the recording (U9).
-            LibraryView(
-                onNewRecording: presentNewRecording,
-                onUpgradePrompt: { presentedAccountContext = .gate },
-                onOpenSearch: { showingPalette = true },
-                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
-            )
         }
     }
 

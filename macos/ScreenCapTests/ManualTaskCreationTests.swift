@@ -109,7 +109,7 @@ final class ManualTaskCreationTests: XCTestCase {
     @MainActor
     func testLiveControllerPersistsAndChainsTasks() async {
         let service = LiveFakeService()
-        let store = JournalTasks(service: service)
+        let store = DayTasks(service: service)
         let controller = LiveTaskController(tasks: store)
 
         await controller.start(name: "First", recording: "ambient-1", at: Date(timeIntervalSince1970: 1000))

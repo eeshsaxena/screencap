@@ -809,7 +809,7 @@ struct RecallPaletteRow: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else {
-                LibraryHatchPlaceholder()
+                CardHatchPlaceholder()
             }
         }
         .frame(width: 128, height: 72)

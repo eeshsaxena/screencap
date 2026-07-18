@@ -195,7 +195,7 @@ enum RecallPalette {
             .sorted { $0.key > $1.key }
             .map { day, items in
                 Group(
-                    label: JournalModel.label(for: day, now: now, calendar: calendar).uppercased(),
+                    label: DaysModel.label(for: day, now: now, calendar: calendar).uppercased(),
                     items: items
                 )
             }

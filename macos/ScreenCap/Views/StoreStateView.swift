@@ -29,7 +29,7 @@ struct StoreStateCopy: Equatable {
         case .locked:
             return StoreStateCopy(
                 systemImage: "lock.fill",
-                title: "Library is locked",
+                title: "Storage is locked",
                 message: "Your recordings are sealed and encrypted on this Mac. "
                     + "Unlock with Touch ID to view them.",
                 showsUnlock: true, showsRetry: false, showsSetup: false, isAlarm: false

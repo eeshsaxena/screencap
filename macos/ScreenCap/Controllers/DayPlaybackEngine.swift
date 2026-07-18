@@ -286,7 +286,7 @@ final class DayPlaybackEngine: ObservableObject {
     /// playhead, the source of "Clip this moment"'s snap-to-moment bounds
     /// (`/v0/tasks.list`, KD2). Empty on a miss / daemon hiccup, in which case
     /// the clip falls back to a centered fixed window — never an error state,
-    /// matching `JournalTasks`. Cached per recording so re-seeking within one
+    /// matching `DayTasks`. Cached per recording so re-seeking within one
     /// recording doesn't refetch.
     @Published private(set) var currentRecordingTasks: [RecordingTask] = []
     private var tasksCache: [String: [RecordingTask]] = [:]

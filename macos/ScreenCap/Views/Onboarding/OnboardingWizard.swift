@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// Where the shell lands when the wizard exits (U11): Library normally, App
-/// rules when the user asked to edit the pre-blocked list (the step-2 deep
-/// link).
+/// Where the shell lands when the wizard exits (U11): Days normally, App rules
+/// when the user asked to edit the pre-blocked list (the step-2 deep link).
 enum OnboardingFinishDestination: Equatable {
-    case library
+    case days
     case appRules
 }
 
@@ -35,7 +34,7 @@ struct OnboardingWizard: View {
     @State private var step: OnboardingStep = .welcome
     @State private var tier: OnboardingStorageTier = .local
     /// Step 2's "Edit the list" deep link: finish the wizard, then land on the
-    /// App rules pane instead of Library.
+    /// App rules pane instead of Days.
     @State private var openAppRulesAfterFinish = false
     /// Collapses double-fires of the finish path (e.g. a sign-in completion
     /// racing a skip tap).
@@ -234,7 +233,7 @@ struct OnboardingWizard: View {
             markers.setWizardPending(false)
             markers.setWizardStarted(false)
         }
-        onFinish(.library)
+        onFinish(.days)
     }
 
     private func storageContinue() {
@@ -280,7 +279,7 @@ struct OnboardingWizard: View {
     private func complete() {
         guard !finishing else { return }
         finishing = true
-        let destination: OnboardingFinishDestination = openAppRulesAfterFinish ? .appRules : .library
+        let destination: OnboardingFinishDestination = openAppRulesAfterFinish ? .appRules : .days
         if replay {
             onFinish(destination)
             return
