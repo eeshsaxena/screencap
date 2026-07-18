@@ -101,6 +101,11 @@ _TASKS_SPLIT_API_VERSION = 1
 # (new verbs) — no global API_SCHEMA_VERSION bump (mirrors the backfill / tasks
 # additive precedent). Human-only by design: NEVER exposed as an MCP tool (R18).
 _DELETE_API_VERSION = 1
+# Day-first navigation U10: the in-vault clips store verbs (clip.create /
+# clip.list / clip.delete). Additive (new verbs) — no global API_SCHEMA_VERSION
+# bump (mirrors the delete / backfill / tasks additive precedent). clip.create is
+# additively exposable to MCP (creator='mcp', R18); clip.delete is human-only.
+_CLIP_API_VERSION = 1
 # SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
 # global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
 _MODELS_API_VERSION = 1
@@ -182,6 +187,12 @@ _MODEL_NAMES = {
     "DeleteRecordingPlan",
     "DeletePreviewResponse",
     "DeleteStatusResponse",
+    "ClipCreateRequest",
+    "ClipRecord",
+    "ClipCreateResponse",
+    "ClipListResponse",
+    "ClipDeleteRequest",
+    "ClipDeleteResponse",
     "BackfillStatusResponse",
     "BackfillProgressEvent",
     "StorageMigrateRequest",
@@ -935,6 +946,83 @@ def _load_models() -> dict[str, Any]:
         deleted_chunks: int
         reconfirm_required: bool
 
+    class ClipCreateRequest(_DaemonModel):
+        """U10 ``clip.create`` input: an absolute-ms range in a single recording.
+
+        ``recording`` is validated by the canonical traversal-safe name validator
+        in the handler. ``start_ms`` / ``end_ms`` are absolute unix ms (the
+        timeline units); an inverted / zero-length range is a typed 400 in the
+        handler. ``tz_offset_seconds`` (seconds EAST of UTC, ±14h) maps the clip's
+        start to its local calendar ``source_day`` (KTD-11). ``creator`` records
+        provenance (``ui`` from the app, ``mcp`` from the agent tool, R18); an
+        unrecognized value coerces to ``ui``.
+        """
+
+        recording: str
+        start_ms: _EpochMs
+        end_ms: _EpochMs
+        tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
+        creator: str = "ui"
+
+    class ClipRecord(_DaemonModel):
+        """One durable clip's catalog entry (+ a derived ``path`` for playback).
+
+        ``source_recording`` is opaque plumbing (never shown as a browsing entity,
+        R5) but retained so purge matching never re-derives it. ``honesty_flags``
+        carries at least ``clip_video_capture_blocked_only`` (the clip's video is
+        capture-blocked, not post-hoc masked) and, once a policy purge partially
+        overlaps it, ``policy_purged_partial``. ``path`` is the absolute on-disk
+        mp4 (same-EUID reply — the UI plays it locally; clips never leave the Mac).
+        """
+
+        id: str
+        source_recording: str
+        source_day: str
+        start_ms: int
+        end_ms: int
+        created_at: float
+        creator: str
+        honesty_flags: dict = {}
+        path: str | None = None
+
+    class ClipCreateResponse(EnvelopeResponse):
+        """The created clip, or a typed clip-domain ``reason`` (envelope ``ok``).
+
+        ``ok`` reflects whether the clip was cut (mirrors the ``screencap clip``
+        CLI taxonomy carried in-envelope, not by exit code): on success ``clip`` is
+        the persisted entry and ``reason`` is null; on a clip-domain failure
+        ``ok=false`` + ``reason`` (``policy_purged`` — fail-closed over a
+        policy-purged range — / ``not_eligible`` / ``no_frames_in_range`` /
+        ``masked_video_required`` / ``clip_busy`` / ``trim_failed``) and ``clip``
+        is null. HTTP is 200 for every clip-domain outcome; a malformed range is a
+        typed 400 and a sealed store a typed 409.
+        """
+
+        reason: str | None = None
+        clip: ClipRecord | None = None
+        store_state: str = "mounted"
+
+    class ClipListResponse(EnvelopeResponse):
+        """The clips catalog, newest-first (R11 Clips surface).
+
+        ``store_state`` carries the vault state (KTD-14): a locked / absent / error
+        store returns an empty ``clips`` list with a degraded ``store_state``
+        rather than a 500.
+        """
+
+        clips: list[ClipRecord]
+        store_state: str = "mounted"
+
+    class ClipDeleteRequest(_DaemonModel):
+        """U10 ``clip.delete`` input: the clip id to remove (mp4 + catalog entry)."""
+
+        clip_id: str = Field(min_length=1, max_length=128)
+
+    class ClipDeleteResponse(EnvelopeResponse):
+        """Whether the clip existed and was removed (idempotent ``false`` if not)."""
+
+        deleted: bool
+
     class StorageMigrateRequest(_DaemonModel):
         """SCR-228 ``storage.migrate`` input: the new recordings directory.
 
@@ -1417,6 +1505,12 @@ def _load_models() -> dict[str, Any]:
         "DeleteRecordingPlan": DeleteRecordingPlan,
         "DeletePreviewResponse": DeletePreviewResponse,
         "DeleteStatusResponse": DeleteStatusResponse,
+        "ClipCreateRequest": ClipCreateRequest,
+        "ClipRecord": ClipRecord,
+        "ClipCreateResponse": ClipCreateResponse,
+        "ClipListResponse": ClipListResponse,
+        "ClipDeleteRequest": ClipDeleteRequest,
+        "ClipDeleteResponse": ClipDeleteResponse,
         "BackfillProgressEvent": BackfillProgressEvent,
         "StorageMigrateRequest": StorageMigrateRequest,
         "TasksListRequest": TasksListRequest,
@@ -1494,6 +1588,7 @@ __all__ = [
     "_TASKS_MERGE_API_VERSION",
     "_TASKS_SPLIT_API_VERSION",
     "_DELETE_API_VERSION",
+    "_CLIP_API_VERSION",
     "_MODELS_API_VERSION",
     "_CHAT_ANSWER_API_VERSION",
     "daemon_version",

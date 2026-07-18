@@ -501,7 +501,12 @@ def _enumerate_recordings(recordings_dir: Path) -> list[Path]:
         (
             d
             for d in recordings_dir.iterdir()
-            if d.is_dir() and d.name != active
+            # Skip dot-prefixed reserved dirs (``.store/`` sidecars, ``.clips/``
+            # store — KTD-8): they are never source recordings, and enumerating
+            # them as phantom units would derive an empty skip set + SKIP them
+            # per unit. Mirrors ``catalog.list_recordings`` /
+            # ``range_delete._candidate_recording_dirs``.
+            if d.is_dir() and not d.name.startswith(".") and d.name != active
         ),
         key=lambda d: d.name,
     )

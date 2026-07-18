@@ -858,6 +858,15 @@ class ScrubWorker:
                 intervals,
             )
 
+            # U10 (R17): propagate this POLICY purge to the clips store — a durable,
+            # retention-exempt clip that overlaps a retroactively-purged span must
+            # not keep those pixels playable (full overlap → delete; partial →
+            # flag). Only the POLICY purge cascades; a user range-delete
+            # (``origin='user'``, driven by ``range_delete``) never calls here (R11).
+            # Post-commit, strictly fail-open — a clips-store hiccup must never break
+            # the scrub worker.
+            self._purge_clips_intervals(intervals)
+
             return counts
         finally:
             conn.close()
@@ -882,6 +891,31 @@ class ScrubWorker:
         :func:`purge_tasks_json_intervals`.
         """
         return purge_tasks_json_intervals(self._capture_dir, intervals)
+
+    def _purge_clips_intervals(
+        self, intervals: list[tuple[float, float]],
+    ) -> None:
+        """Propagate this POLICY purge to overlapping clips (R17) — fail-open.
+
+        Deletes (full overlap) or flags (partial overlap) any durable clip whose
+        span intersects a retroactively-purged interval, so purged pixels can't
+        survive in a retention-exempt artifact. Lazily imports ``screencap.clips``
+        (like the content-index purge lazily imports ``content_index``) — the
+        package-boundary guard permits ``enforcement`` → a top-level ``screencap``
+        module. A user range-delete never routes here (R11). Never raises.
+        """
+        try:
+            from screencap.clips import purge_clips_for_intervals
+
+            purge_clips_for_intervals(
+                self._capture_dir.name,
+                intervals,
+                recordings_dir=self._capture_dir.parent,
+            )
+        except Exception:
+            logger.warning(
+                "clips purge propagation failed (non-fatal)", exc_info=True
+            )
 
 
 def purge_content_index_intervals(

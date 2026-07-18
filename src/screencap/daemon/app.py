@@ -3484,6 +3484,208 @@ async def delete_cancel(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# U10 (KTD-8): the in-vault clips store verbs — clip.create / clip.list /
+# clip.delete. Clips are DURABLE (retention-exempt, upload-excluded) artifacts in
+# the reserved ``<recordings>/.clips/`` dir. clip.create FAILS CLOSED over a
+# policy-purged range (never re-cuts purged pixels into a durable artifact, R17).
+# clip.create is additively exposable to MCP (creator='mcp', R18); clip.delete is
+# human-only (like range delete). Read verb (clip.list) NOT in ``_ACTIVITY_PATHS``.
+# ---------------------------------------------------------------------------
+
+
+def _require_store_mounted_for_clip(request: Request, schema_version: int) -> None:
+    """Raise a typed ``store_locked`` / ``store_absent`` for a non-mounted store.
+
+    A clip WRITE (create / delete) is a store-touching mutation: a sealed / absent
+    / error store must refuse and touch NOTHING (KTD-14), the same typed-error-
+    before-work convention ``recording.start`` / range delete use. ``ERROR`` maps
+    to ``store_locked`` (conservative — the store is not safely writable).
+    """
+    state = _store_state_value(request)
+    if state == StoreState.MOUNTED.value:
+        return
+    if state == StoreState.ABSENT.value:
+        raise errors.StoreAbsentError(schema_version=schema_version)
+    raise errors.StoreLockedError(schema_version=schema_version)
+
+
+def _clip_record_payload(entry: dict, recordings_dir: "Path | None" = None) -> dict:
+    """Enrich a stored catalog entry with the derived absolute ``path`` (playback).
+
+    The mp4 filename is id-derived, so ``path`` is never persisted (only the entry
+    fields the plan lists). Recording identifiers stay opaque plumbing (R5), but the
+    local file path is fine on this same-EUID reply — the UI plays the clip locally
+    and clips never leave the Mac.
+    """
+    from screencap import clips
+
+    out = dict(entry)
+    cid = entry.get("id")
+    if isinstance(cid, str):
+        out["path"] = str(clips.clip_mp4_path(cid, recordings_dir))
+    return out
+
+
+async def clip_create(request: Request) -> JSONResponse:
+    """``POST /v0/clip.create`` — cut an absolute-ms range into a durable clip (R11/R17).
+
+    Wraps the shared ``screencap clip`` engine (single recording, KTD-8) in-process.
+    BEFORE cutting it reads ``purged_interval`` (both origins) and FAILS CLOSED with
+    ``reason='policy_purged'`` when the range overlaps a POLICY-purged interval —
+    never resurrecting purged pixels into a durable, retention-exempt artifact. A
+    clip-domain failure rides the envelope (``ok=false`` + ``reason``), HTTP 200 —
+    mirroring the CLI clip taxonomy; a malformed / inverted range is a typed 400 and
+    a sealed / absent store a typed 409 (nothing created). Audit-logged (peer +
+    range + outcome). NOT in ``_ACTIVITY_PATHS``.
+    """
+    from pydantic import ValidationError
+
+    from screencap import clips
+    from screencap.daemon import audit_log, provenance
+    from screencap.daemon._name_validation import validate_recording_name
+
+    _v = schema._CLIP_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str, **extra: Any) -> None:
+        audit_log.record_verb(
+            "clip.create",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            **extra,
+        )
+
+    try:
+        body = await _backfill_body(request)  # tolerant read (empty body → {})
+        try:
+            parsed = schema.ClipCreateRequest.model_validate(body)
+        except ValidationError:
+            _audit(errors.INVALID_REQUEST)
+            return _validation_error_response(schema_version=_v)
+        validate_recording_name(parsed.recording)  # traversal-safe → InvalidNameError
+        if parsed.end_ms <= parsed.start_ms:
+            _audit(errors.INVALID_REQUEST, start_ms=parsed.start_ms, end_ms=parsed.end_ms)
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        # Store gate (mutation): sealed / absent → typed error, nothing created.
+        _require_store_mounted_for_clip(request, _v)
+
+        result = await asyncio.to_thread(
+            clips.create_clip,
+            parsed.recording,
+            parsed.start_ms,
+            parsed.end_ms,
+            tz_offset_seconds=parsed.tz_offset_seconds,
+            creator=parsed.creator,
+        )
+        _audit(
+            "ok" if result.ok else (result.reason or "trim_failed"),
+            start_ms=parsed.start_ms, end_ms=parsed.end_ms,
+        )
+        clip = _clip_record_payload(result.clip) if result.clip is not None else None
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v,
+                ok=result.ok,
+                reason=result.reason,
+                clip=clip,
+                store_state=_store_state_value(request),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def clip_list(request: Request) -> JSONResponse:
+    """``GET /v0/clip.list`` — the clips catalog, newest-first (R11).
+
+    Read-only. KTD-14: a locked / absent / error vault is a healthy serving state —
+    an empty ``clips`` list + a degraded ``store_state`` on a 200, never a 500.
+    Deliberately NOT in ``_ACTIVITY_PATHS`` — a poll must not reset the idle clock.
+    """
+    from screencap import clips
+
+    _v = schema._CLIP_API_VERSION
+    try:
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=_v, clips=[], store_state=store_state,
+                )
+            )
+        entries = await asyncio.to_thread(clips.list_clips)
+        payload = [_clip_record_payload(e) for e in entries]
+        # Verb parity check: validate the shape through the typed model.
+        validated = [schema.ClipRecord(**c).model_dump() for c in payload]
+        return JSONResponse(
+            schema.envelope(
+                schema_version=_v, clips=validated, store_state=store_state,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def clip_delete(request: Request) -> JSONResponse:
+    """``POST /v0/clip.delete`` — remove a clip's mp4 + catalog entry (human-only).
+
+    Clips are built to be durable (R11), so deletion is a deliberate, audit-logged
+    act (peer + clip id + outcome) — never an MCP tool (R18). A sealed / absent
+    store → typed 409, nothing removed. Idempotent: an unknown id returns
+    ``deleted=false``.
+    """
+    from pydantic import ValidationError
+
+    from screencap import clips
+    from screencap.daemon import audit_log, provenance
+
+    _v = schema._CLIP_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str, **extra: Any) -> None:
+        audit_log.record_verb(
+            "clip.delete",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            **extra,
+        )
+
+    try:
+        body = await _backfill_body(request)  # tolerant read (empty body → {})
+        try:
+            parsed = schema.ClipDeleteRequest.model_validate(body)
+        except ValidationError:
+            _audit(errors.INVALID_REQUEST)
+            return _validation_error_response(schema_version=_v)
+
+        # Store gate (mutation): sealed / absent → typed error, nothing removed.
+        _require_store_mounted_for_clip(request, _v)
+
+        removed = await asyncio.to_thread(clips.delete_clip, parsed.clip_id)
+        _audit("ok", deleted=removed)
+        return JSONResponse(
+            schema.envelope(schema_version=_v, deleted=bool(removed))
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+# ---------------------------------------------------------------------------
 # SCR-258 U6 (KTD-18): upgrade-migration job — copy/verify → cutover → sweep.
 # ---------------------------------------------------------------------------
 
@@ -4877,6 +5079,9 @@ def build_app() -> Starlette:
             Route("/v0/delete.start", delete_start, methods=["POST"]),
             Route("/v0/delete.status", delete_status, methods=["GET"]),
             Route("/v0/delete.cancel", delete_cancel, methods=["POST"]),
+            Route("/v0/clip.create", clip_create, methods=["POST"]),
+            Route("/v0/clip.list", clip_list, methods=["GET"]),
+            Route("/v0/clip.delete", clip_delete, methods=["POST"]),
             Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
             Route("/v0/storage.lock", storage_lock, methods=["POST"]),
             Route("/v0/storage.unlock", storage_unlock, methods=["POST"]),
