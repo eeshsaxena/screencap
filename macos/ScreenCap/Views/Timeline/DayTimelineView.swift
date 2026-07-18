@@ -449,6 +449,27 @@ struct DayTimelineView: View {
         .overlay(alignment: .bottomLeading) { timestampChip }
         .overlay(alignment: .bottomTrailing) { if !clipMode { actionButtons } }
         .overlay(alignment: .bottom) { clipBoundsOverlay }
+        // KTD-10: the Inspect window survives only as a day-page footage DEBUG
+        // entry (it also hosts Undated recordings) — never a browsing or citation
+        // path. Chat / search citations route here to the day page instead (U12).
+        .contextMenu { footageDebugMenu }
+    }
+
+    /// KTD-10 — the per-recording Inspect window as a right-click DEBUG affordance
+    /// over footage. Only offered when a recording sits under the playhead; opens
+    /// the Inspect window seeked to the current moment. Labeled "(debug)" so it
+    /// never reads as a primary affordance; it is the one surviving reach into the
+    /// Inspect window (and the host for Undated recordings), NOT a citation path.
+    @ViewBuilder
+    private var footageDebugMenu: some View {
+        if let name = engine.currentRecording {
+            Button("Inspect recording (debug)") {
+                if let ms = engine.currentDayMs {
+                    InspectWindowOpener.shared.pendingSeekMs[name] = ms
+                }
+                InspectWindowOpener.shared.open(recordingName: name)
+            }
+        }
     }
 
     private func placeholderCaption(_ reason: DayPlaceholderReason) -> String {

@@ -73,6 +73,16 @@ struct ReviewWindow: View {
         ))
     }
 
+    /// R14 / AE4 — the window's day + time title (never the recording name). The
+    /// `startedAt` comes from the loaded review data when ready, else the index
+    /// summary; `ReviewTitle` shows a bare "Review" if neither has resolved yet
+    /// (and re-renders to the full day + time once one does).
+    private var windowTitle: String {
+        let startedAt = model.state.reviewData?.startedAt
+            ?? index.recordings.first(where: { $0.name == recordingName })?.startedAt
+        return ReviewTitle.title(startedAt: startedAt, recordingName: recordingName)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             content
@@ -80,7 +90,13 @@ struct ReviewWindow: View {
             bottomActions
         }
         .frame(minWidth: 720, minHeight: 540)
-        .navigationTitle(recordingName)
+        // R14 / AE4 — the window titles itself with a day + time label, never the
+        // raw `rec-<timestamp>` name (recordings are retired from the UI). Prefer
+        // the loaded review data's `startedAt`; fall back to the index summary's;
+        // `ReviewTitle` degrades to a bare "Review" if neither resolves — a
+        // recording identifier never surfaces. This holds for EVERY entry point
+        // (day badge, day-page footage share), since all reach this one title.
+        .navigationTitle(windowTitle)
         .onAppear {
             // Forward the dismiss action so the auto-close timer can fire it.
             // Set on the StateObject-preserved viewmodel rather than a

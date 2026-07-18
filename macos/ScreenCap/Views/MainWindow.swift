@@ -692,12 +692,18 @@ struct MainWindow: View {
             IntelligenceSettingsView()
         case .chat:
             // Conversational-recall U8: the multi-turn Chat surface. Grounded
-            // answers with the captured moments shown as sources; each source
-            // deep-links the Inspect window at that timestamp. Reuses Search's
-            // shipped result components (SnippetHighlighter, RecordingCardThumbnail)
-            // and the deep-link opener — no new pointer rendering (KTD7). The
-            // no-backend affordance (R6) deep-links to the Intelligence pane.
-            ChatView(onOpenIntelligenceSettings: { route = .intelligence })
+            // answers with the captured moments shown as sources rendered as
+            // day + time (R13/KTD-11, never a recording name). U12: a source tap
+            // routes to the DAY PAGE seeked to that moment (replacing the old
+            // Inspect deep-link, KTD-10); the incoming `highlight` (nil for Chat
+            // sources today) threads AE3's task-band emphasis. The no-backend
+            // affordance (R6) deep-links to the Intelligence pane.
+            ChatView(
+                onOpenIntelligenceSettings: { route = .intelligence },
+                onOpenCitation: { day, seekMs, highlight in
+                    route = .timeline(day: day, seekMs: seekMs, highlight: highlight)
+                }
+            )
         case .timeline(let day, let seekMs, let highlight):
             // U9: the day view. `.id(day)` gives each date a fresh engine +
             // search scope rather than mutating one view's state across days.
