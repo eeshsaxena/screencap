@@ -87,6 +87,17 @@ extension DayPurgedInterval {
     }
 }
 
+/// U9 (R8) — the "removed by you" band mapping: a straight union of every
+/// recording's USER range-delete intervals. Rendered as its OWN class —
+/// distinct from the policy-purged plum (R8) — so a user delete never reads as a
+/// privacy-rule purge. Pure so the mapping is render-free unit-testable, mirroring
+/// `DayPurgedInterval.bands(from:)`.
+extension DayDeletedInterval {
+    static func bands(from spans: [DaySegmentRecording]) -> [DayDeletedInterval] {
+        spans.flatMap(\.deleted)
+    }
+}
+
 /// Pure axis geometry for the day strip.
 enum DayStripLayout {
 
@@ -246,14 +257,16 @@ enum DayStripLayout {
         return frames
     }
 
-    /// A caption band's class. Both `blocked` and `purged` (retroactively
-    /// purged app spans) render today — `captionClusters` is fed both band
-    /// sets. A mixed cluster keeps the "blocked" wording (the hard-stop claim
-    /// dominates the shared slot); the class tag exists so the single
-    /// overlap guard covers both classes in one pass.
+    /// A caption band's class. `blocked`, `purged` (retroactively purged app
+    /// spans), and `deleted` (user range-deletes, U9) all render today —
+    /// `captionClusters` is fed every band set. A mixed cluster resolves its
+    /// wording by precedence (blocked > purged > deleted — the hard-stop claim
+    /// dominates the shared slot); the class tag exists so the single overlap
+    /// guard covers every class in one pass.
     enum CaptionClass: Hashable {
         case blocked
         case purged
+        case deleted
     }
 
     /// One caption per single-linkage cluster: the cluster's mean leading x +
@@ -461,6 +474,7 @@ enum DayStripLegend {
         case searchMatch
         case blocked
         case purged
+        case removedByYou
     }
 
     struct Item: Equatable, Identifiable {
@@ -476,6 +490,9 @@ enum DayStripLegend {
         Item(text: "search match", swatch: .searchMatch),
         Item(text: "blocked at capture", swatch: .blocked),
         Item(text: "removed by your rules", swatch: .purged),
+        // U9 (R8) — user range-deletes render as their own honest state, visually
+        // distinct (slate) from the policy-purged plum.
+        Item(text: "removed by you", swatch: .removedByYou),
     ]
 }
 
@@ -486,6 +503,15 @@ enum DayStripLegend {
 /// (the `SCGradient` pattern) rather than a new asset role.
 extension Color {
     static let scPlum = Color(.sRGB, red: 0x7A / 255, green: 0x4A / 255, blue: 0x8A / 255)
+}
+
+/// U9 — the "removed by you" hue (R8): a muted slate grey, deliberately distinct
+/// from the policy-purged plum (`scPlum`) and the blocked rust (`scRust`), so a
+/// user range-delete reads as its own honest state — "you erased this", not a
+/// privacy-rule removal. Used by the strip's deleted hatch, its caption, and the
+/// legend's "removed by you" swatch. Authored as a literal (the `scPlum` pattern).
+extension Color {
+    static let scSlate = Color(.sRGB, red: 0x5C / 255, green: 0x63 / 255, blue: 0x70 / 255)
 }
 
 struct DayStripView: View {
@@ -502,6 +528,12 @@ struct DayStripView: View {
     /// U5 — retroactively-purged spans (R10): the blocked hatch geometry in the
     /// distinct plum hue, with R6 rule-naming hover/VoiceOver copy.
     var purgedBands: [DayPurgedInterval] = []
+    /// U9 (R8) — user range-delete spans ("removed by you"): the hatch geometry
+    /// in the distinct slate hue with "removed from this Mac" hover/VoiceOver
+    /// copy, kept separate from `purgedBands` so a user delete never reads as a
+    /// privacy-rule purge. Additive/defaulted so existing call sites are
+    /// unaffected.
+    var deletedBands: [DayDeletedInterval] = []
     /// U5 — `unverifiable` intervals inside recordings: rendered neutrally (no
     /// band — R7) but hover/VoiceOver-targetable with the "can't verify" copy.
     var unverifiableBands: [(startMs: Int, endMs: Int)] = []
@@ -664,6 +696,13 @@ struct DayStripView: View {
                 hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
                       color: .scPlum)
             }
+            // U9 (R8) — user range-deletes: the same hatch geometry in the
+            // distinct slate hue, so "removed by you" is visually its own class,
+            // never the policy-purged plum or the blocked rust.
+            for band in deletedBands {
+                hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
+                      color: .scSlate)
+            }
             // One caption per cluster (pure `captionClusters` — single overlap
             // guard across all caption classes), not one per band: nearby
             // blocked bands share a caption instead of overprinting. U5 routes
@@ -676,12 +715,22 @@ struct DayStripView: View {
                     (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .blocked)
                 } + purgedBands.map {
                     (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .purged)
+                } + deletedBands.map {
+                    (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .deleted)
                 }
             )
             for caption in captions {
-                let text = caption.classes.contains(.blocked)
-                    ? Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust)
-                    : Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scPlum)
+                // Precedence for the shared slot: blocked > purged > deleted.
+                // Purged and deleted both caption "removed"; the hue (plum vs
+                // slate) + hover copy carry the class distinction.
+                let text: Text
+                if caption.classes.contains(.blocked) {
+                    text = Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust)
+                } else if caption.classes.contains(.purged) {
+                    text = Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scPlum)
+                } else {
+                    text = Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scSlate)
+                }
                 ctx.draw(
                     text,
                     in: CGRect(x: caption.x, y: trackTop + trackHeight + 8, width: 50, height: 12)
@@ -925,6 +974,14 @@ struct DayStripView: View {
                 claim: DayStripAccessibility.purgedLabel(band), accessibilityFallback: nil
             ))
         }
+        // U9 (R8/R20) — user range-deletes: the "removed from this Mac" hover +
+        // VoiceOver copy, distinct from the policy-purged "removed by your rules".
+        for band in deletedBands {
+            regions.append(ProvenanceRegion(
+                startMs: band.startMs, endMs: band.endMs,
+                claim: DayStripAccessibility.deletedLabel(band), accessibilityFallback: nil
+            ))
+        }
         for band in unverifiableBands {
             regions.append(ProvenanceRegion(
                 startMs: band.startMs, endMs: band.endMs,
@@ -1045,6 +1102,12 @@ struct DayStripView: View {
             RoundedRectangle(cornerRadius: 2)
                 .fill(Color.scPlum.opacity(0.25))
                 .frame(width: 10, height: 8)
+        case .removedByYou:
+            // R8: the user-delete swatch is the slate hue — distinct from the
+            // policy-purged plum, so "removed by you" never reads as a rule purge.
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Color.scSlate.opacity(0.30))
+                .frame(width: 10, height: 8)
         }
     }
 
@@ -1113,6 +1176,13 @@ enum DayStripAccessibility {
             return "Removed by your 'disable \(identity)' rule, \(range)"
         }
         return "Removed by a privacy rule, \(range)"
+    }
+
+    /// U9 (R8/R20) — a span the USER range-deleted: the "removed from this Mac"
+    /// wording (local-only in v1), distinct from the policy-purged rule sentence.
+    static func deletedLabel(_ interval: DayDeletedInterval) -> String {
+        let range = "\(hourMinuteText(ms: interval.startMs)) to \(hourMinuteText(ms: interval.endMs))"
+        return "Removed from this Mac by you, \(range)"
     }
 
     /// The load-gate gap label: while the day query hasn't returned (or

@@ -719,6 +719,27 @@ struct DayPurgedInterval: Codable, Sendable, Hashable {
     }
 }
 
+/// U9 (R8) — a span the USER range-deleted (`origin='user'`, "removed by you"),
+/// absolute unix ms. Kept SEPARATE from `DayPurgedInterval` (`origin='policy'`,
+/// "removed by your rules") because the two render as distinct honest states on
+/// the strip: a deleted span carries NO disable-target identity (there is no app
+/// to attribute — the user chose it), just the honest removed extent. Mirrors the
+/// Python `day_segments` `deleted` list of `{start_ms, end_ms}`.
+struct DayDeletedInterval: Codable, Sendable, Hashable {
+    let startMs: Int
+    let endMs: Int
+
+    init(startMs: Int, endMs: Int) {
+        self.startMs = startMs
+        self.endMs = endMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+    }
+}
+
 /// One recording's day-clamped span + honest blocked-interval split (U3).
 /// `blockedProven` may be hatched "blocked"; `unverifiable` must render as a
 /// neutral gap, never labelled "blocked" (R7).
@@ -738,6 +759,12 @@ struct DayPurgedInterval: Codable, Sendable, Hashable {
 /// daemon serving the pre-v3 shape) means *unknown* provenance — nil / empty
 /// via `decodeIfPresent`, never a decode error — and rendering must not gate
 /// on these fields.
+///
+/// `deleted` (U8/U9, additive) carries the USER range-delete spans
+/// (`origin='user'`) SEPARATE from `purged` (`origin='policy'`), so the strip can
+/// render "removed by you" (R8) distinct from "removed by your rules". Empty
+/// (never absent) for a recording with no user deletes or an older daemon —
+/// decoded via `decodeIfPresent`.
 struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let name: String
     let recordingId: String?
@@ -749,13 +776,15 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let tasks: [RecordingTask]
     let endStatus: String?
     let purged: [DayPurgedInterval]
+    let deleted: [DayDeletedInterval]
 
     init(
         name: String, recordingId: String? = nil, state: String = "ready",
         startMs: Int, endMs: Int,
         blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = [],
         tasks: [RecordingTask] = [],
-        endStatus: String? = nil, purged: [DayPurgedInterval] = []
+        endStatus: String? = nil, purged: [DayPurgedInterval] = [],
+        deleted: [DayDeletedInterval] = []
     ) {
         self.name = name
         self.recordingId = recordingId
@@ -767,6 +796,7 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         self.tasks = tasks
         self.endStatus = endStatus
         self.purged = purged
+        self.deleted = deleted
     }
 
     init(from decoder: Decoder) throws {
@@ -784,6 +814,8 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         // entirely — absence = unknown provenance, never a decode error.
         endStatus = try c.decodeIfPresent(String.self, forKey: .endStatus)
         purged = try c.decodeIfPresent([DayPurgedInterval].self, forKey: .purged) ?? []
+        // Older daemon (pre-U8) omits `deleted` → no user-delete spans.
+        deleted = try c.decodeIfPresent([DayDeletedInterval].self, forKey: .deleted) ?? []
     }
 
     enum CodingKeys: String, CodingKey {
@@ -797,6 +829,7 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         case tasks
         case endStatus = "end_status"
         case purged
+        case deleted
     }
 }
 
@@ -838,6 +871,183 @@ struct TimelineDayResponse: Decodable, Sendable {
         case recordings
         case storeMounted = "store_mounted"
         case coverageComplete = "coverage_complete"
+    }
+}
+
+// MARK: - U8/U9 range-delete verbs (delete.start dry_run/execute, status, cancel)
+
+/// `delete.start` input (U8): an absolute-ms range + mode + (execute-mode) confirm
+/// token. `dryRun` (the SAFE default true) resolves + previews WITHOUT deleting;
+/// an execute call (`dryRun == false`) passes back the preview's `resolved`
+/// `{recording: [chunk_indices]}` token so the job deletes exactly that set (no
+/// TOCTOU). Mirrors the Python `DeleteStartRequest`.
+struct DeleteStartRequest: Encodable {
+    let startMs: Int
+    let endMs: Int
+    let dryRun: Bool
+    let resolved: [String: [Int]]
+
+    init(startMs: Int, endMs: Int, dryRun: Bool, resolved: [String: [Int]] = [:]) {
+        self.startMs = startMs
+        self.endMs = endMs
+        self.dryRun = dryRun
+        self.resolved = resolved
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case dryRun = "dry_run"
+        case resolved
+    }
+}
+
+/// One overlapping clip that the range delete will KEEP (findable in Clips),
+/// disclosed at confirm time so "removed from this Mac" is never silently false
+/// (R20). Every field is tolerant (`decodeIfPresent`) — the daemon forwards the
+/// U10 clip-catalog entry verbatim (`list[dict]`), whose exact shape may grow.
+struct DeleteKeptClip: Decodable, Sendable, Hashable, Identifiable {
+    let clipId: String?
+    let sourceDay: String?
+    let startMs: Int?
+    let endMs: Int?
+
+    /// Stable-ish identity for a SwiftUI list. Falls back to the span when the
+    /// catalog entry predates the `id` field.
+    var id: String { clipId ?? "\(startMs ?? 0)-\(endMs ?? 0)" }
+
+    init(clipId: String? = nil, sourceDay: String? = nil, startMs: Int? = nil, endMs: Int? = nil) {
+        self.clipId = clipId
+        self.sourceDay = sourceDay
+        self.startMs = startMs
+        self.endMs = endMs
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        clipId = try c.decodeIfPresent(String.self, forKey: .clipId)
+        sourceDay = try c.decodeIfPresent(String.self, forKey: .sourceDay)
+        startMs = try c.decodeIfPresent(Int.self, forKey: .startMs)
+        endMs = try c.decodeIfPresent(Int.self, forKey: .endMs)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case clipId = "id"
+        case sourceDay = "source_day"
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+    }
+}
+
+/// One recording's resolved slice in a `delete.start` preview (R20). Recording
+/// identifiers are fine here — this is a direct same-EUID reply, not an EventBus
+/// payload (the R9 name-free rule is a progress-event rule). Mirrors the Python
+/// `DeleteRecordingPlan`.
+struct DeleteRecordingPlan: Decodable, Sendable, Hashable {
+    let recording: String
+    let recordingId: String?
+    let chunkIndices: [Int]
+    let roundedStartMs: Int?
+    let roundedEndMs: Int?
+    let excludedLiveChunks: [Int]
+    let keptClips: [DeleteKeptClip]
+
+    init(
+        recording: String, recordingId: String? = nil, chunkIndices: [Int],
+        roundedStartMs: Int? = nil, roundedEndMs: Int? = nil,
+        excludedLiveChunks: [Int] = [], keptClips: [DeleteKeptClip] = []
+    ) {
+        self.recording = recording
+        self.recordingId = recordingId
+        self.chunkIndices = chunkIndices
+        self.roundedStartMs = roundedStartMs
+        self.roundedEndMs = roundedEndMs
+        self.excludedLiveChunks = excludedLiveChunks
+        self.keptClips = keptClips
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        recording = try c.decode(String.self, forKey: .recording)
+        recordingId = try c.decodeIfPresent(String.self, forKey: .recordingId)
+        chunkIndices = try c.decodeIfPresent([Int].self, forKey: .chunkIndices) ?? []
+        roundedStartMs = try c.decodeIfPresent(Int.self, forKey: .roundedStartMs)
+        roundedEndMs = try c.decodeIfPresent(Int.self, forKey: .roundedEndMs)
+        excludedLiveChunks = try c.decodeIfPresent([Int].self, forKey: .excludedLiveChunks) ?? []
+        keptClips = try c.decodeIfPresent([DeleteKeptClip].self, forKey: .keptClips) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case recordingId = "recording_id"
+        case chunkIndices = "chunk_indices"
+        case roundedStartMs = "rounded_start_ms"
+        case roundedEndMs = "rounded_end_ms"
+        case excludedLiveChunks = "excluded_live_chunks"
+        case keptClips = "kept_clips"
+    }
+}
+
+/// The `delete.start --dry_run` preview — resolves + reports, DELETES NOTHING.
+/// `resolved` is the confirm token the client passes back verbatim to execute.
+struct DeletePreviewResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let startMs: Int
+    let endMs: Int
+    let recordings: [DeleteRecordingPlan]
+    let resolved: [String: [Int]]
+    let totalChunks: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case recordings
+        case resolved
+        case totalChunks = "total_chunks"
+    }
+}
+
+/// The privacy-safe range-delete job snapshot (R9) — opaque counts + a
+/// `reconfirmRequired` bool, never a recording name. `state` is one of `idle` /
+/// `running` / `completed` / `reconfirm_required` / `cancelled` / `failed`;
+/// typed as `String` so a future value decodes tolerantly.
+struct DeleteStatusResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let state: String
+    let done: Int
+    let total: Int
+    let currentUnitIndex: Int
+    let deletedChunks: Int
+    let reconfirmRequired: Bool
+
+    /// Progress fraction for the determinate `ProgressView`, nil until the total
+    /// is known (mirrors `ReviewWindow`'s `framesTotal > 0` gate).
+    var fraction: Double? {
+        guard total > 0 else { return nil }
+        return min(1, max(0, Double(done) / Double(total)))
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case state
+        case done
+        case total
+        case currentUnitIndex = "current_unit_index"
+        case deletedChunks = "deleted_chunks"
+        case reconfirmRequired = "reconfirm_required"
     }
 }
 
@@ -1284,6 +1494,50 @@ enum DaemonClient {
     static func timelineDay(_ req: TimelineDayRequest) async throws -> TimelineDayResponse {
         let body = try JSONEncoder().encode(req)
         return try await request(method: "POST", path: "/v0/timeline.day", body: body)
+    }
+
+    // MARK: - U8/U9 range delete (human-only, LOCAL-ONLY in v1 — R18/R20)
+
+    /// Preview a range delete WITHOUT deleting (U9 confirm sheet source, R20).
+    /// `delete.start --dry_run`: resolves the range per recording, rounds to chunk
+    /// bounds, excludes the live in-flight chunk, and returns the actual removed
+    /// extent + the resolved confirm token + any overlapping clips-to-keep. A
+    /// sealed/absent store surfaces as a typed `.envelopeError(code:
+    /// "store_locked"/"store_absent", ...)`; an inverted range as a 400.
+    static func deleteStartPreview(startMs: Int, endMs: Int) async throws -> DeletePreviewResponse {
+        let body = try JSONEncoder().encode(
+            DeleteStartRequest(startMs: startMs, endMs: endMs, dryRun: true)
+        )
+        return try await request(method: "POST", path: "/v0/delete.start", body: body)
+    }
+
+    /// Execute a range delete (U9), passing back the preview's `resolved` confirm
+    /// token so the Supervisor-style job deletes exactly that set (no TOCTOU). The
+    /// job re-resolves under the per-recording flock and returns a
+    /// `reconfirm_required` snapshot if the set changed between preview and confirm
+    /// (e.g. the excluded live chunk flushed) — the caller then tells the user the
+    /// footage changed and to re-select. Returns the initial job snapshot; poll
+    /// `deleteStatus()` for progress. LOCAL-ONLY (removes from this Mac only, R20).
+    static func deleteStartExecute(
+        startMs: Int, endMs: Int, resolved: [String: [Int]]
+    ) async throws -> DeleteStatusResponse {
+        let body = try JSONEncoder().encode(
+            DeleteStartRequest(startMs: startMs, endMs: endMs, dryRun: false, resolved: resolved)
+        )
+        return try await request(method: "POST", path: "/v0/delete.start", body: body)
+    }
+
+    /// Current privacy-safe range-delete job snapshot (U9 progress polling).
+    /// Read-only; opaque counts + `reconfirmRequired` only, never a recording name.
+    static func deleteStatus() async throws -> DeleteStatusResponse {
+        try await request(method: "GET", path: "/v0/delete.status")
+    }
+
+    /// Signal the in-flight range delete to stop cleanly (U9). Each recording is
+    /// atomic under its flock — a cancel never tears a delete; it stops BETWEEN
+    /// recordings and reports an accurate partial snapshot.
+    static func deleteCancel() async throws -> DeleteStatusResponse {
+        try await request(method: "POST", path: "/v0/delete.cancel", body: Data("{}".utf8))
     }
 
     /// A LOCAL recording's named task segments (U10, local-first intelligence).

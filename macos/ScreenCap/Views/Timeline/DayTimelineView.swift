@@ -75,6 +75,14 @@ struct DayTimelineView: View {
     @State private var rangeSelection = RangeSelectionModel()
     @State private var pendingTaskLabel: PendingTaskLabel?
 
+    // U9 (R8/R19/R20, AE2) — the range-delete flow. `onDeleteRange` loads the
+    // `delete.start --dry_run` preview into `.confirming`; confirm tears down the
+    // AVPlayer (KTD-12) then drives the execute job through `.deleting` to
+    // `.idle` (strip reloads) or `.failed` (surfaced, never silent). A separate
+    // `deletePollTask` polls `delete.status` for progress.
+    @State private var deletePhase: DeleteRangePhase = .idle
+    @State private var deletePollTask: Task<Void, Never>?
+
     // U4 — in-page date navigation (R16). `displayedDate` overrides the opened
     // `date` once the user steps days / jumps to a date; `currentDate` is the
     // single source everything reads. `navigatedAway` gates the one-time landing
@@ -110,6 +118,7 @@ struct DayTimelineView: View {
         .onChange(of: preselectKey) { _ in applyPreselectedRange() }
         .onDisappear {
             searchTask?.cancel()
+            deletePollTask?.cancel()
             engine.tearDown()
         }
         .sheet(item: $pendingTaskLabel) { pending in
@@ -130,6 +139,33 @@ struct DayTimelineView: View {
         } message: { err in
             Text(err.message)
         }
+        // U9 (R20/AE2) — the delete confirm sheet, which morphs into the delete
+        // progress view (one sheet across the Confirm → Deleting transition).
+        .sheet(isPresented: deleteSheetPresented) {
+            if let content = deleteConfirmContent {
+                DeleteConfirmSheet(
+                    content: content,
+                    // A double-optional: nil while confirming (buttons), .some
+                    // while deleting (progress) — see `DeleteConfirmSheet`.
+                    deletingFraction: deletePhase.confirmContent != nil
+                        ? nil
+                        : Optional(deletePhase.deletingFraction),
+                    onConfirm: { confirmDeleteRange(content) },
+                    onCancel: { cancelDeleteRange() }
+                )
+            }
+        }
+        // U9 (R19) — a failed / cancelled / reconfirm-required job surfaces via
+        // the same writeError-style alert pattern, never a silent no-op.
+        .alert(
+            "Couldn't remove that footage",
+            isPresented: deleteErrorPresented,
+            presenting: deletePhase.failureMessage
+        ) { _ in
+            Button("OK", role: .cancel) { deletePhase = .idle }
+        } message: { message in
+            Text(message)
+        }
     }
 
     /// Bridges `dayTasks.writeError` to an `isPresented` binding for the
@@ -138,6 +174,35 @@ struct DayTimelineView: View {
         Binding(
             get: { dayTasks.writeError != nil },
             set: { if !$0 { dayTasks.dismissWriteError() } }
+        )
+    }
+
+    // MARK: - U9 delete-flow bindings
+
+    /// The confirm/progress sheet is up while confirming OR deleting. A dismiss
+    /// from the sheet chrome (only reachable in the confirming state — the
+    /// progress state has no cancel) collapses back to idle without deleting.
+    private var deleteSheetPresented: Binding<Bool> {
+        Binding(
+            get: { deletePhase.sheetPresented },
+            set: { presented in
+                if !presented, deletePhase.confirmContent != nil { deletePhase = .idle }
+            }
+        )
+    }
+
+    /// The confirm content, shown while confirming and held through the deleting
+    /// transition so the sheet keeps its disclosure while the progress runs.
+    @State private var deleteContentInFlight: DeleteConfirmContent?
+
+    private var deleteConfirmContent: DeleteConfirmContent? {
+        deletePhase.confirmContent ?? deleteContentInFlight
+    }
+
+    private var deleteErrorPresented: Binding<Bool> {
+        Binding(
+            get: { deletePhase.failureMessage != nil },
+            set: { if !$0 { deletePhase = .idle } }
         )
     }
 
@@ -198,11 +263,51 @@ struct DayTimelineView: View {
             dateNavigator
             Spacer()
             searchField
+            dayActionsMenu
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
         .background(Color.scCanvas)
         .overlay(alignment: .bottom) { Divider().overlay(Color.scBorderWarm) }
+    }
+
+    /// U9 (req 5, R9) — the day-page overflow menu hosting "Delete this day…".
+    /// It preselects the day's whole footage extent (U7's preselect) and enters
+    /// the SAME confirm flow a range delete uses (day/task deletes are the same
+    /// action with a preselected range). Disabled on a footage-less day.
+    private var dayActionsMenu: some View {
+        Menu {
+            Button("Delete this day…", role: .destructive) { beginDayDelete() }
+                .disabled(dayFootageExtent == nil)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.system(size: 15))
+                .foregroundStyle(Color.scInkSecondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Day actions")
+        .accessibilityLabel("Day actions")
+    }
+
+    /// The day's whole footage extent (absolute unix ms) — the union of every
+    /// recording's span. Nil on a footage-less day (nothing to delete).
+    private var dayFootageExtent: (startMs: Int, endMs: Int)? {
+        guard let lo = spans.map(\.startMs).min(),
+              let hi = spans.map(\.endMs).max(),
+              hi > lo else { return nil }
+        return (lo, hi)
+    }
+
+    /// U9 (req 5) — "Delete this day": preselect the full-day footage extent (so
+    /// the strip shows the selection band) and open the same delete confirm flow.
+    /// The Days/Tasks surfaces call this shape via `preselectedRange`; the daemon
+    /// still chunk-rounds + trims to footage, so an over-wide extent is safe.
+    private func beginDayDelete() {
+        guard let extent = dayFootageExtent else { return }
+        rangeSelection.preselect(startMs: extent.startMs, endMs: extent.endMs)
+        onDeleteRange((startMs: extent.startMs, endMs: extent.endMs))
     }
 
     /// R16 — previous/next-day chevrons + a jump-to-date picker around the viewed
@@ -537,9 +642,95 @@ struct DayTimelineView: View {
         // TODO(U11): clip the range, then present the share sheet.
     }
 
+    /// U9 (R20/AE2) — open the delete confirm flow: load the `delete.start
+    /// --dry_run` preview (the ACTUAL rounded extent + kept overlapping clips +
+    /// live-chunk exclusion), then present the confirm sheet. A daemon error
+    /// (sealed store, bad range, daemon down) surfaces via the error alert — never
+    /// a silent no-op. The selection is KEPT while confirming so a cancel returns
+    /// to the anchored menu.
     private func onDeleteRange(_ range: (startMs: Int, endMs: Int)) {
-        // TODO(U9): open the delete confirm sheet (rounded extent, no-undo,
-        // this-Mac-only, kept clips) and drive the delete.start job.
+        Task {
+            do {
+                let preview = try await DaemonClient.deleteStartPreview(
+                    startMs: range.startMs, endMs: range.endMs
+                )
+                deletePhase = .confirming(DeleteConfirmContent.from(preview: preview))
+            } catch {
+                deletePhase = .failed(message: DeleteRangeFailure.fromError(error))
+            }
+        }
+    }
+
+    /// U9 — the user confirmed the delete (Confirm → Deleting). FIRST tear down
+    /// the AVPlayer (KTD-12 — open file handles keep deleted bytes playable on
+    /// APFS), then fire the execute job with the preview's confirm token and poll
+    /// `delete.status` for progress. A `reconfirm_required` result tells the user
+    /// the footage changed and to re-select; a completed job reloads the day; any
+    /// failure surfaces via the alert.
+    private func confirmDeleteRange(_ content: DeleteConfirmContent) {
+        guard content.isDeletable else { cancelDeleteRange(); return }
+        // Tear down playback BEFORE deleting so no open handle pins deleted bytes.
+        engine.tearDown()
+        deleteContentInFlight = content
+        deletePhase = .deleting(fraction: nil)
+        deletePollTask?.cancel()
+        deletePollTask = Task { await runDeleteJob(content) }
+    }
+
+    /// Cancel the confirm sheet (R19 — an explicit dismiss, never silent). Keeps
+    /// the range selection so the anchored menu stays for another action.
+    private func cancelDeleteRange() {
+        deletePhase = .idle
+    }
+
+    /// Drive the execute job to a terminal state, polling `delete.status` for the
+    /// determinate progress bar. On completion: leave select-range mode + reload
+    /// the day so the strip shows "removed by you". On reconfirm/failed/cancelled:
+    /// surface the honest message.
+    private func runDeleteJob(_ content: DeleteConfirmContent) async {
+        do {
+            var snapshot = try await DaemonClient.deleteStartExecute(
+                startMs: content.requestedStartMs,
+                endMs: content.requestedEndMs,
+                resolved: content.resolved
+            )
+            // Poll until the job leaves a running/idle state.
+            while !Task.isCancelled, snapshot.state == "running" || snapshot.state == "idle" {
+                deletePhase = .deleting(fraction: snapshot.fraction)
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if Task.isCancelled { return }
+                guard let next = try? await DaemonClient.deleteStatus() else { break }
+                snapshot = next
+            }
+            if Task.isCancelled { return }
+            await finishDeleteJob(snapshot)
+        } catch {
+            // The execute call itself threw (daemon down, sealed store). Nothing
+            // was deleted; restore the torn-down engine and surface the error.
+            deleteContentInFlight = nil
+            deletePhase = .failed(message: DeleteRangeFailure.fromError(error))
+            await reloadDay()
+        }
+    }
+
+    /// Resolve a terminal delete snapshot to the final UI state. The AVPlayer was
+    /// torn down before the job (KTD-12), so EVERY path reloads the day to restore
+    /// a live engine + the current strip — on success the strip now carries the
+    /// "removed by you" band; on failure nothing was deleted and playback recovers.
+    private func finishDeleteJob(_ snapshot: DeleteStatusResponse) async {
+        deleteContentInFlight = nil
+        if snapshot.reconfirmRequired || snapshot.state == "reconfirm_required" {
+            // KTD-3 no-TOCTOU: the resolved set changed; nothing was deleted.
+            deletePhase = .failed(message: DeleteRangeFailure.reconfirm)
+        } else if snapshot.state == "completed" {
+            rangeSelection.cancel()  // leave select-range mode
+            deletePhase = .idle
+        } else {
+            // failed / cancelled / any unknown terminal state — surface honestly,
+            // never claim success.
+            deletePhase = .failed(message: DeleteRangeFailure.job(state: snapshot.state))
+        }
+        await reloadDay()  // restore the torn-down engine + re-render the strip
     }
 
     /// U7 (req 6) — apply an externally supplied preselected range: enter
@@ -710,6 +901,9 @@ struct DayTimelineView: View {
                 // U5 — provenance: purged spans (R10/R6), unverifiable
                 // intervals, the gap-cause inputs, and the load/store gates.
                 purgedBands: DayPurgedInterval.bands(from: spans),
+                // U9 (R8) — user range-deletes ("removed by you"), distinct from
+                // the policy-purged band.
+                deletedBands: DayDeletedInterval.bands(from: spans),
                 unverifiableBands: spans.flatMap { span in
                     span.unverifiable.map { (startMs: $0.startMs, endMs: $0.endMs) }
                 },
