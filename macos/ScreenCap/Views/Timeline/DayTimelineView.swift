@@ -22,6 +22,12 @@ struct DayTimelineView: View {
     /// unaffected. Only honored on the opened day (cleared once the user
     /// navigates to another date).
     var highlightedSpan: (startMs: Int, endMs: Int)? = nil
+    /// U7 (req 6 / R9) — a range supplied by "delete this day" / "delete this
+    /// task" that opens the action menu directly, reusing the range flow. When
+    /// present, the day page enters select-range mode with this span preselected
+    /// and the menu anchored. Additive/defaulted so a plain day open is
+    /// unaffected; U9 wires the day/task delete entry points to it.
+    var preselectedRange: (startMs: Int, endMs: Int)? = nil
     var onBack: () -> Void
 
     private enum LoadPhase: Equatable {
@@ -60,12 +66,13 @@ struct DayTimelineView: View {
     @State private var clipCenterMs = 0
     @State private var longClipNudgeDismissed = false
 
-    // SCR-214 U11 — retroactive span-select task creation (AE3). The user marks
-    // two playhead endpoints (each snapped to a task/recording boundary), then a
-    // label sheet confirms them into `tasks.create`. `dayTasks` is the shared
-    // write-through layer (also the source of the failed-write alert).
+    // SCR-214 U11 / U7 — the shared "Select range" mode (KTD-7, R9/R19). ONE
+    // two-endpoint selection fronts Clip · Share · Delete, with the SCR-214
+    // "save as task" flow layered on top (a range on footage confirms into
+    // `tasks.create` via the label sheet). `dayTasks` is the shared write-through
+    // layer (also the source of the failed-write alert).
     @StateObject private var dayTasks = DayTasks()
-    @State private var markSelection = DaySpanSelection()
+    @State private var rangeSelection = RangeSelectionModel()
     @State private var pendingTaskLabel: PendingTaskLabel?
 
     // U4 — in-page date navigation (R16). `displayedDate` overrides the opened
@@ -96,6 +103,11 @@ struct DayTimelineView: View {
         // the open page so "still recording" + newly-flushed footage stay live.
         // SwiftUI cancels it on disappear.
         .task { await runLiveRefreshSubscription() }
+        // U7 (req 6) — a programmatic "delete this day/task" preselection opens
+        // the action menu directly. Applied on appear and whenever the supplied
+        // range changes so U9's entry points can drive it at any time.
+        .onAppear { applyPreselectedRange() }
+        .onChange(of: preselectKey) { _ in applyPreselectedRange() }
         .onDisappear {
             searchTask?.cancel()
             engine.tearDown()
@@ -323,9 +335,22 @@ struct DayTimelineView: View {
         }
     }
 
+    /// The playback pane's bottom-trailing action area. In select-range mode
+    /// (U7) it becomes the endpoint-marking / fine-tune bar; otherwise it shows
+    /// the default per-moment affordances (Select range · Clip this moment ·
+    /// Share from here).
+    @ViewBuilder
     private var actionButtons: some View {
+        if rangeSelection.isActive {
+            rangeModeButtons
+        } else {
+            defaultActionButtons
+        }
+    }
+
+    private var defaultActionButtons: some View {
         HStack(spacing: 8) {
-            markTaskButton
+            selectRangeButton
             clipButton
             if let recording = shareableRecording {
                 Button("Share from here") {
@@ -343,6 +368,92 @@ struct DayTimelineView: View {
             }
         }
         .padding(14)
+    }
+
+    /// U7 (R9/R19) — enter the explicit "Select range" mode: the shared entry
+    /// for Clip · Share · Delete (and, on footage, save-as-task). The strip then
+    /// takes two playhead endpoints (KTD-7 — no drag).
+    private var selectRangeButton: some View {
+        Button("Select range") { rangeSelection.enterSelectMode() }
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: .semibold))
+            .foregroundStyle(Color.scCanvas)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(Color.scInk.opacity(0.85), in: Capsule())
+            .help("Select a time range to clip, share, or delete")
+    }
+
+    /// U7 — the in-mode bottom bar. While placing endpoints it marks start/end
+    /// from the playhead; once a range is chosen it swaps to arrow-key-nudge
+    /// fine-tune controls. Cancel (and Esc, R19) always exits the mode.
+    @ViewBuilder
+    private var rangeModeButtons: some View {
+        HStack(spacing: 8) {
+            if rangeSelection.range == nil {
+                Button(rangeMarkTitle) { markRangeEndpoint() }
+                    .buttonStyle(.plain)
+                    .font(SCTypography.sans(size: 12, weight: .semibold))
+                    .foregroundStyle(engine.currentDayMs != nil ? Color.scCanvas : Color.scCanvas.opacity(0.6))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(Color.scInk.opacity(0.85), in: Capsule())
+                    .disabled(engine.currentDayMs == nil)
+                    .help("Seek the playhead, then set this endpoint")
+            } else {
+                rangeNudgeControls
+            }
+            Button("Cancel") { rangeSelection.cancel() }
+                .buttonStyle(.plain)
+                .font(SCTypography.sans(size: 12, weight: .semibold))
+                .foregroundStyle(Color.scCanvas)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.scRust.opacity(0.85), in: Capsule())
+                .keyboardShortcut(.cancelAction)  // Esc exits the mode (R19)
+                .help("Cancel range selection (Esc)")
+        }
+        .padding(14)
+    }
+
+    private var rangeMarkTitle: String {
+        rangeSelection.pendingEndpointMs == nil ? "Set range start" : "Set range end"
+    }
+
+    /// U7 (req 2) — arrow-key-nudge fine-tune for the chosen range: 1 px ≈
+    /// minutes on a 13 h axis, so precise endpoints need a keyboard step
+    /// (`RangeSelectionModel.nudgeStepMs`). Left/Right nudge the end; Shift+Left/
+    /// Right nudge the start; the visible chevrons keep it discoverable.
+    private var rangeNudgeControls: some View {
+        let step = RangeSelectionModel.nudgeStepMs
+        return HStack(spacing: 6) {
+            Text("start")
+                .font(SCTypography.mono(size: 10))
+                .foregroundStyle(Color.scCanvas.opacity(0.8))
+            nudgeButton(system: "chevron.left") { rangeSelection.nudgeStart(byMs: -step) }
+                .keyboardShortcut(.leftArrow, modifiers: .shift)
+            nudgeButton(system: "chevron.right") { rangeSelection.nudgeStart(byMs: step) }
+                .keyboardShortcut(.rightArrow, modifiers: .shift)
+            Text("end")
+                .font(SCTypography.mono(size: 10))
+                .foregroundStyle(Color.scCanvas.opacity(0.8))
+            nudgeButton(system: "chevron.left") { rangeSelection.nudgeEnd(byMs: -step) }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+            nudgeButton(system: "chevron.right") { rangeSelection.nudgeEnd(byMs: step) }
+                .keyboardShortcut(.rightArrow, modifiers: [])
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.scInk.opacity(0.85), in: Capsule())
+        .help("Fine-tune the endpoints: arrow keys nudge the end, Shift+arrows the start")
+    }
+
+    private func nudgeButton(system: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: system).font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Color.scCanvas)
     }
 
     /// SCR-219 (U5) — "Clip this moment", enabled for a clippable recording
@@ -365,64 +476,83 @@ struct DayTimelineView: View {
                 : "Clipping isn't available for this recording")
     }
 
-    /// SCR-214 U11 — "Mark a task" (manual creation, path b, AE3). Each press
-    /// captures the current playhead as an endpoint, snapped to the nearest
-    /// task/recording boundary; the second press opens the label sheet. A
-    /// two-endpoint selection (seek → mark → seek → mark) rather than a drag
-    /// gesture, so the shared strip's seek behavior is untouched. Disabled when no
-    /// footage sits under the playhead (a task needs a stream to attach to).
-    @ViewBuilder
-    private var markTaskButton: some View {
-        let canMark = engine.currentRecording != nil && engine.currentDayMs != nil
-        Button(markTaskButtonTitle) { markTaskEndpoint() }
-            .buttonStyle(.plain)
-            .font(SCTypography.sans(size: 12, weight: canMark ? .semibold : .regular))
-            .foregroundStyle(canMark ? Color.scCanvas : Color.scCanvas.opacity(0.6))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .background(Color.scInk.opacity(0.85), in: Capsule())
-            .disabled(!canMark)
-            .help(canMark
-                ? "Mark a task span: set the start, then the end"
-                : "Seek to footage first — a task needs a stream to attach to")
-    }
-
-    private var markTaskButtonTitle: String {
-        markSelection.firstMs == nil ? "Mark a task" : "Mark task end"
-    }
-
     /// Snap boundaries for the current day (each recording's edges + each existing
-    /// task band's edges) so a new user task abuts its neighbours cleanly.
+    /// task band's edges) so a range endpoint abuts its neighbours cleanly.
     private var markSnapBoundaries: [Int] {
         DaySpanSnap.boundaries(baseTracks: stripBaseTracks, segments: stripSegments)
     }
 
-    /// The pending selection band + lone-endpoint tick handed to the strip.
-    private var markPendingSelection: (startMs: Int, endMs: Int)? {
-        markSelection.range
+    /// The pending selection band + lone-endpoint tick handed to the strip —
+    /// now sourced from the shared select-range mode (U7). VoiceOver-perceivable
+    /// via the strip's a11y overlays (R19).
+    private var stripPendingSelection: (startMs: Int, endMs: Int)? {
+        rangeSelection.range
     }
 
-    private var markPendingEndpoint: Int? {
-        markSelection.range == nil ? markSelection.firstMs : nil
+    private var stripPendingEndpoint: Int? {
+        rangeSelection.pendingEndpointMs
     }
 
-    /// Capture the playhead as the next selection endpoint. On the second
-    /// endpoint, resolve the recording under the span midpoint and open the label
-    /// sheet; a span that lands entirely in a "nothing captured" gap is discarded
-    /// (no recording to attach to).
-    private func markTaskEndpoint() {
+    // MARK: - Range selection (U7)
+
+    /// Capture the playhead as the next range endpoint, snapped to the nearest
+    /// task/recording boundary. R19: the selection MAY span a "nothing captured"
+    /// gap — there is NO silent reset when the span or its midpoint lands in a
+    /// gap (the old mark-a-task behavior is gone); the anchored menu simply
+    /// offers what applies. On completion the action menu is presented.
+    private func markRangeEndpoint() {
         guard let playheadMs = engine.currentDayMs else { return }
         let snapped = DaySpanSnap.snap(playheadMs, to: markSnapBoundaries)
-        markSelection.mark(snapped)
-        guard let range = markSelection.range else { return }
-        guard let recording = DaySpanSnap.recording(
-            forRangeMidpoint: range.startMs, range.endMs, baseTracks: stripBaseTracks
-        ) else {
-            // Span sits in a gap — nothing to attach a task to. Reset silently.
-            markSelection.reset()
-            return
-        }
+        rangeSelection.mark(snapped)
+        if rangeSelection.range != nil { rangeSelection.presentMenu() }
+    }
+
+    /// The recording under the selection's midpoint, if any — gates "save as
+    /// task" (and, in U11, single-recording clip/share). Nil when the midpoint
+    /// is in a gap: the selection is KEPT (R19); the task action is just absent.
+    private func rangeMidpointRecording(_ range: (startMs: Int, endMs: Int)) -> String? {
+        DaySpanSnap.recording(forRangeMidpoint: range.startMs, range.endMs, baseTracks: stripBaseTracks)
+    }
+
+    /// SCR-214 kept working ON TOP of the range mode: confirm the chosen span as
+    /// a task (label sheet → `tasks.create`) when a recording sits under the
+    /// midpoint. A midpoint-in-gap span is NOT discarded — this action is simply
+    /// not offered for it.
+    private func saveRangeAsTask(_ range: (startMs: Int, endMs: Int)) {
+        guard let recording = rangeMidpointRecording(range) else { return }
         pendingTaskLabel = PendingTaskLabel(recording: recording, startMs: range.startMs, endMs: range.endMs)
+    }
+
+    // U7 exposes these three DayTimelineView-owned hooks for the range action
+    // menu. U11 fills Clip/Share (via `/v0/clip.create` + the share sheet) and
+    // U9 fills Delete (the confirm sheet + the `delete.start` job). For now they
+    // are no-ops that KEEP the selection so the next unit builds on the anchored
+    // menu — deletion and clip export are deliberately NOT implemented here.
+    // (Named `on…Range` to stay distinct from the SCR-219 `clipRange` state.)
+    private func onClipRange(_ range: (startMs: Int, endMs: Int)) {
+        // TODO(U11): cut the range into a Clip via clip.create.
+    }
+
+    private func onShareRange(_ range: (startMs: Int, endMs: Int)) {
+        // TODO(U11): clip the range, then present the share sheet.
+    }
+
+    private func onDeleteRange(_ range: (startMs: Int, endMs: Int)) {
+        // TODO(U9): open the delete confirm sheet (rounded extent, no-undo,
+        // this-Mac-only, kept clips) and drive the delete.start job.
+    }
+
+    /// U7 (req 6) — apply an externally supplied preselected range: enter
+    /// select-range mode with the span set and the menu anchored (day/task
+    /// delete reuses the same flow).
+    private func applyPreselectedRange() {
+        guard let range = preselectedRange else { return }
+        rangeSelection.preselect(startMs: range.startMs, endMs: range.endMs)
+    }
+
+    /// A change key for `onChange` (tuples aren't Equatable).
+    private var preselectKey: String? {
+        preselectedRange.map { "\($0.startMs)-\($0.endMs)" }
     }
 
     /// Confirm the label → `tasks.create` over the selected span, then reload the
@@ -430,7 +560,7 @@ struct DayTimelineView: View {
     private func confirmMarkedTask(name: String) {
         guard let pending = pendingTaskLabel else { return }
         pendingTaskLabel = nil
-        markSelection.reset()
+        rangeSelection.cancel()  // task committed → leave select-range mode
         Task {
             let ok = await dayTasks.create(
                 recording: pending.recording,
@@ -443,8 +573,10 @@ struct DayTimelineView: View {
     }
 
     private func cancelMarkedTask() {
+        // Cancelling the label sheet keeps the range selection (R19 — an
+        // explicit sheet-cancel must not silently discard the span); the
+        // anchored menu stays so the user can pick a different action.
         pendingTaskLabel = nil
-        markSelection.reset()
     }
 
     /// The clip-bounds selection panel, shown at the bottom of the playback
@@ -589,18 +721,71 @@ struct DayTimelineView: View {
                 storeMounted: storeMounted,
                 coverageComplete: coverageComplete,
                 provenanceReady: loadPhase == .ready,
-                pendingSelection: markPendingSelection,
-                pendingEndpointMs: markPendingEndpoint,
+                pendingSelection: stripPendingSelection,
+                pendingEndpointMs: stripPendingEndpoint,
                 // U4 (AE3): honor the landing highlight only on the opened day —
                 // navigating to another date drops it.
                 highlightedSpan: navigatedAway ? nil : highlightedSpan
             )
+            // U7 (R9) — the action menu anchors over the completed selection,
+            // clamped inside the strip's width via the same axis mapping.
+            .overlay(alignment: .topLeading) { rangeActionMenuOverlay }
         }
         .padding(.horizontal, 24)
         .padding(.top, 18)
         .padding(.bottom, 20)
         .background(Color.scPaper)
         .overlay(alignment: .top) { Divider().overlay(Color.scBorderWarm) }
+    }
+
+    /// U7 (R9) — the action menu anchored over the chosen selection: Clip ·
+    /// Share · Delete (+ Save as task when the span sits on footage). Positioned
+    /// near the selection's leading edge, clamped inside the strip. The overlay
+    /// takes the strip's frame (so its GeometryReader width matches the axis
+    /// mapping); it appears only while a range is chosen.
+    @ViewBuilder
+    private var rangeActionMenuOverlay: some View {
+        if rangeSelection.menuAnchored, let range = rangeSelection.range {
+            GeometryReader { geo in
+                let menuWidth: CGFloat = 320
+                let leadingX = DayStripLayout.x(forMs: range.startMs, bounds: axisBounds, width: geo.size.width)
+                let clampedX = min(max(0, leadingX), max(0, geo.size.width - menuWidth))
+                rangeActionMenu(range: range)
+                    .frame(width: menuWidth, alignment: .leading)
+                    .offset(x: clampedX, y: -6)
+            }
+        }
+    }
+
+    private func rangeActionMenu(range: (startMs: Int, endMs: Int)) -> some View {
+        HStack(spacing: 10) {
+            Text("\(DayStripAccessibility.hourMinuteText(ms: range.startMs))–\(DayStripAccessibility.hourMinuteText(ms: range.endMs))")
+                .font(SCTypography.mono(size: 10))
+                .foregroundStyle(Color.scInkSecondary)
+            menuAction("Clip") { onClipRange(range) }
+            menuAction("Share") { onShareRange(range) }
+            menuAction("Delete", destructive: true) { onDeleteRange(range) }
+            if rangeMidpointRecording(range) != nil {
+                menuAction("Save as task") { saveRangeAsTask(range) }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.scCanvas, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.scBorderWarm, lineWidth: 1))
+        .shadow(color: Color.black.opacity(0.15), radius: 6, y: 2)
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            "Range actions, \(DayStripAccessibility.hourMinuteText(ms: range.startMs)) to \(DayStripAccessibility.hourMinuteText(ms: range.endMs))"
+        )
+    }
+
+    private func menuAction(_ title: String, destructive: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(SCTypography.sans(size: 12, weight: .semibold))
+            .foregroundStyle(destructive ? Color.scRust : Color.scTeal)
     }
 
     /// The "unsplit — still searchable" base layer: one full-span rectangle per

@@ -830,6 +830,31 @@ struct DayStripView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(DayStripAccessibility.playheadLabel(ms: playheadMs))
             }
+            // U7 (R19) — the in-flight range selection, made perceivable by
+            // VoiceOver: the dashed pending band + the lone endpoint tick are
+            // Canvas-drawn (opaque to assistive tech), so mirror them as
+            // positioned a11y elements carrying the endpoints/span in wall-clock
+            // time. Exactly one is present at a time (a lone endpoint before the
+            // span completes, the span after).
+            if let selection = pendingSelection {
+                let rect = bandRect(startMs: selection.startMs, endMs: selection.endMs, width: width)
+                Color.clear
+                    .frame(width: rect.width, height: rect.height)
+                    .offset(x: rect.minX, y: rect.minY)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(DayStripAccessibility.pendingSelectionLabel(
+                        startMs: selection.startMs, endMs: selection.endMs
+                    ))
+                    .accessibilitySortPriority(Self.sortPriority(startMs: selection.startMs))
+            } else if let endpointMs = pendingEndpointMs {
+                let x = DayStripLayout.x(forMs: endpointMs, bounds: bounds, width: width)
+                Color.clear
+                    .frame(width: 4, height: stripHeight)
+                    .offset(x: x - 2, y: 0)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(DayStripAccessibility.pendingEndpointLabel(ms: endpointMs))
+                    .accessibilitySortPriority(Self.sortPriority(startMs: endpointMs))
+            }
         }
         .accessibilityHint("Click the strip to move playback")
     }
@@ -1106,6 +1131,18 @@ enum DayStripAccessibility {
 
     static func playheadLabel(ms: Int) -> String {
         "Playhead at \(hourMinuteText(ms: ms))"
+    }
+
+    /// U7 (R19) — the in-flight range selection span, announced to VoiceOver so
+    /// the gesture is perceivable without sight (the Canvas band is opaque to
+    /// assistive tech).
+    static func pendingSelectionLabel(startMs: Int, endMs: Int) -> String {
+        "Range selection, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
+    }
+
+    /// U7 (R19) — a single placed endpoint awaiting its partner.
+    static func pendingEndpointLabel(ms: Int) -> String {
+        "Range start marked at \(hourMinuteText(ms: ms)), set the end"
     }
 
     static func hourText(ms: Int) -> String {
