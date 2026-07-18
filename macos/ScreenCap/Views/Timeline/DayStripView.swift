@@ -97,19 +97,20 @@ enum DayStripLayout {
     }
 
     static let hourMs = 3_600_000
-    static let minSpanMs = 8 * 3_600_000
+    /// The fixed waking window the axis always spans, as hour offsets from
+    /// local midnight: 08:00–21:00.
+    static let wakeStartHour = 8
+    static let wakeEndHour = 21
 
-    /// Dynamic axis bounds (plan assumption): the union of the day's recording
-    /// spans rounded *outward* to the hour, minimum 8h, clamped into the day.
-    /// A short union extends forward to 8h (pulling back from the day's end
-    /// when needed); a spanless day defaults to the 08:00–16:00 working window.
-    static func axisBounds(dayStartMs: Int, spans: [(startMs: Int, endMs: Int)]) -> Bounds {
-        let dayEndMs = dayStartMs + 24 * hourMs
-        guard let lo = spans.map(\.startMs).min(),
-              let hi = spans.map(\.endMs).max()
-        else {
-            return Bounds(startMs: dayStartMs + 8 * hourMs, endMs: dayStartMs + 16 * hourMs)
-        }
+    /// Honest full-day axis bounds (U1, R6): the axis always spans the fixed
+    /// 08:00–21:00 waking window, extended *outward* (hour-rounded) only when
+    /// footage falls outside it, and clamped into the real day via the passed
+    /// `dayEndMs` (DST-safe). Short footage renders as a small band on this
+    /// honest axis rather than being zoomed to fill — a sparse day reads as
+    /// "not recording", never "lost". A spanless day still shows the waking
+    /// window. Replaces the old footage-union + 8h-floor rule that made a
+    /// 51-minute recording look like "a few minutes".
+    static func axisBounds(dayStartMs: Int, dayEndMs: Int, spans: [(startMs: Int, endMs: Int)]) -> Bounds {
         func floorHour(_ ms: Int) -> Int {
             dayStartMs + ((ms - dayStartMs) / hourMs) * hourMs
         }
@@ -118,16 +119,36 @@ enum DayStripLayout {
             let rounded = (offset + hourMs - 1) / hourMs * hourMs
             return dayStartMs + rounded
         }
-        var start = max(dayStartMs, floorHour(max(lo, dayStartMs)))
-        var end = min(dayEndMs, ceilHour(min(hi, dayEndMs)))
-        if end - start < minSpanMs {
-            end = start + minSpanMs
-            if end > dayEndMs {
-                end = dayEndMs
-                start = max(dayStartMs, end - minSpanMs)
-            }
+        var start = dayStartMs + wakeStartHour * hourMs
+        var end = dayStartMs + wakeEndHour * hourMs
+        if let lo = spans.map(\.startMs).min(), lo < start {
+            start = floorHour(max(lo, dayStartMs))
         }
+        if let hi = spans.map(\.endMs).max(), hi > end {
+            end = ceilHour(min(hi, dayEndMs))
+        }
+        start = max(dayStartMs, start)
+        end = min(dayEndMs, end)
+        if end <= start { end = min(dayEndMs, start + hourMs) }  // never invert (DST/clock skew)
         return Bounds(startMs: start, endMs: end)
+    }
+
+    /// An honest edge label at a footage boundary (AE1): "recording started"
+    /// at the earliest span start, "recording stopped" at the latest span end.
+    struct BoundaryLabel: Equatable {
+        enum Kind: Equatable { case started, stopped }
+        let ms: Int
+        let kind: Kind
+    }
+
+    /// The two footage-edge labels for a day's spans — the first start and the
+    /// last end — so the strip can mark where footage begins and ends on the
+    /// full-day axis. A spanless day has none.
+    static func footageBoundaryLabels(spans: [(startMs: Int, endMs: Int)]) -> [BoundaryLabel] {
+        guard let lo = spans.map(\.startMs).min(),
+              let hi = spans.map(\.endMs).max()
+        else { return [] }
+        return [BoundaryLabel(ms: lo, kind: .started), BoundaryLabel(ms: hi, kind: .stopped)]
     }
 
     /// Map a wall-clock ms to an x in `[0, width]`, clamped to the bounds. A
@@ -493,6 +514,16 @@ struct DayStripView: View {
     private let trackTop: CGFloat = 24
     private let trackHeight: CGFloat = 16
 
+    private static let boundaryTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    static func boundaryTimeString(_ ms: Int) -> String {
+        boundaryTimeFormatter.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             GeometryReader { geo in
@@ -562,6 +593,21 @@ struct DayStripView: View {
                     : resolvedLabels[index]
                 let drawWidth = min(frame.width, label.measure(in: taskLabelMaxSize).width)
                 ctx.draw(label, in: CGRect(x: frame.minX, y: 0, width: drawWidth, height: 14))
+            }
+
+            // Footage start/stop edge times (U1/AE1): mark where footage begins
+            // and ends on the honest full-day axis, so a small band reads as
+            // real footage at a real time rather than "a few minutes".
+            for label in DayStripLayout.footageBoundaryLabels(
+                spans: baseTracks.map { (startMs: $0.startMs, endMs: $0.endMs) }
+            ) {
+                let x = DayStripLayout.x(forMs: label.ms, bounds: bounds, width: width)
+                let text = Text(Self.boundaryTimeString(label.ms))
+                    .font(SCTypography.mono(size: 9))
+                    .foregroundColor(.scInk.opacity(0.55))
+                let boxW: CGFloat = 34
+                let minX = label.kind == .started ? x + 2 : x - boxW - 2
+                ctx.draw(text, in: CGRect(x: max(0, min(minX, width - boxW)), y: 12, width: boxW, height: 11))
             }
 
             for band in blockedBands {

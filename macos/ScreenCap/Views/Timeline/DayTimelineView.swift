@@ -104,11 +104,19 @@ struct DayTimelineView: View {
     // MARK: - Day window
 
     private var dayStartMs: Int { Int(Calendar.current.startOfDay(for: date).timeIntervalSince1970 * 1000) }
-    private var dayEndMs: Int { dayStartMs + 86_400_000 }
+    /// DST-safe day end — the next local midnight, not a hardcoded +24h (a
+    /// "spring forward"/"fall back" day is 23h/25h long).
+    private var dayEndMs: Int {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: date)
+        let next = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
+        return Int(cal.startOfDay(for: next).timeIntervalSince1970 * 1000)
+    }
 
     private var axisBounds: DayStripLayout.Bounds {
         DayStripLayout.axisBounds(
             dayStartMs: dayStartMs,
+            dayEndMs: dayEndMs,
             spans: spans.map { (startMs: $0.startMs, endMs: $0.endMs) }
         )
     }
