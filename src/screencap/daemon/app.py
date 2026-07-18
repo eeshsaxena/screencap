@@ -147,6 +147,18 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         _reconcile_encrypt_job_on_start(app)
     except Exception:  # noqa: BLE001 - migration resume must never break startup
         logger.warning("encrypt-migration resume failed", exc_info=True)
+    # U8 (KTD-3): complete any outstanding user range-delete unlink a prior daemon
+    # crash left between the delete transaction (committed origin='user' span +
+    # USER_DELETED ledger rows) and the on-disk unlink — so "removed by you" bytes
+    # can never survive a crash. Idempotent (a completed delete re-runs as a no-op;
+    # a locked/absent store enumerates nothing). Strictly fail-open — a reconcile
+    # hiccup must never block start.
+    try:
+        from screencap import range_delete
+
+        await asyncio.to_thread(range_delete.reconcile_user_deletes)
+    except Exception:  # noqa: BLE001 - delete reconcile must never break startup
+        logger.warning("range-delete reconcile failed", exc_info=True)
     # U5: eagerly resolve the ``chat.answer`` request-path recall modules at
     # daemon start (the stale-daemon-after-app-update lesson — a request-path
     # module must be imported before the first request, never lazily inside the
@@ -223,6 +235,13 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         model_download_job = getattr(app.state, "model_download_job", None)
         if model_download_job is not None:
             await model_download_job.shutdown()
+        # U8: stop an in-flight range-delete BEFORE closing the bus/loop — its
+        # core runs on a to_thread worker the loop cannot cancel (the stop flag is
+        # honored between recordings). Done before event_bus.shutdown() so the
+        # run's terminal event can still publish to a live bus. Lazily attached.
+        delete_job = getattr(app.state, "delete_job", None)
+        if delete_job is not None:
+            await delete_job.shutdown()
         if hasattr(app.state, "supervisor"):
             await app.state.supervisor.shutdown()
         await app.state.event_bus.shutdown()
@@ -3287,6 +3306,184 @@ async def backfill_cancel(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# U8 (KTD-3): the irreversible, LOCAL-ONLY range-delete job. delete.start (with a
+# dry_run preview), delete.status, delete.cancel. Human-only forever — NEVER an
+# MCP tool (R18); the human-only guarantee is a tool-surface control, not a socket
+# boundary (the verb stays same-EUID-reachable per SECURITY.md).
+# ---------------------------------------------------------------------------
+
+
+def _delete_job(app: Starlette) -> Any:
+    """Lazily attach the single range-delete job holder to ``app.state``.
+
+    Scoped per app instance (mirrors ``_backfill_job``): fresh test apps don't
+    share a destructive job. Lazy init is asyncio-safe (no await between check +
+    set).
+    """
+    state = app.state
+    if not hasattr(state, "delete_job"):
+        from screencap.daemon.delete_job import DeleteJob
+
+        state.delete_job = DeleteJob(state.event_bus)
+    return state.delete_job
+
+
+def _require_store_mounted_for_delete(request: Request, schema_version: int) -> None:
+    """Raise a typed ``store_locked`` / ``store_absent`` for a non-mounted store.
+
+    Range delete is a store-touching MUTATION: a sealed / absent / error store
+    must refuse and delete NOTHING (KTD-14), the same typed-error-before-work
+    convention ``recording.start`` uses. ``ERROR`` maps to ``store_locked``
+    (conservative — the store is not safely writable).
+    """
+    state = _store_state_value(request)
+    if state == StoreState.MOUNTED.value:
+        return
+    if state == StoreState.ABSENT.value:
+        raise errors.StoreAbsentError(schema_version=schema_version)
+    raise errors.StoreLockedError(schema_version=schema_version)
+
+
+async def delete_start(request: Request) -> JSONResponse:
+    """``POST /v0/delete.start`` — preview (``dry_run``) or execute a range delete.
+
+    ``dry_run`` (the SAFE default) resolves the range per recording, rounds to
+    chunk bounds, excludes the live in-flight chunk, and returns the resolved set +
+    rounded extents + any overlapping clips-to-keep — DELETING NOTHING (R20). An
+    execute call (``dry_run=False``) passes the preview's ``resolved`` confirm token
+    back; the Supervisor-style job re-resolves under the per-recording flock and
+    deletes exactly it, aborting with ``reconfirm_required`` if the set changed
+    (no TOCTOU). LOCAL-ONLY in v1 (R20). Audit-logged (peer PID/binary + requested
+    range + outcome). A sealed/absent store → typed error, nothing deleted. A
+    malformed / inverted range → typed 400. Deliberately NOT in ``_ACTIVITY_PATHS``
+    — a running delete keeps the daemon alive via ``_daemon_is_busy``.
+    """
+    import dataclasses
+
+    from pydantic import ValidationError
+
+    from screencap import range_delete
+    from screencap.daemon import audit_log, provenance
+
+    _v = schema._DELETE_API_VERSION
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str, **extra: Any) -> None:
+        audit_log.record_verb(
+            "delete.start",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+            **extra,
+        )
+
+    try:
+        body = await _backfill_body(request)  # tolerant read (empty body → {})
+        try:
+            parsed = schema.DeleteStartRequest.model_validate(body)
+        except ValidationError:
+            _audit(errors.INVALID_REQUEST)
+            return _validation_error_response(schema_version=_v)
+        if parsed.end_ms <= parsed.start_ms:
+            _audit(errors.INVALID_REQUEST, start_ms=parsed.start_ms, end_ms=parsed.end_ms)
+            raise errors.InvalidRequestError(schema_version=_v)
+
+        # Store gate (mutation): sealed/absent → typed error, nothing deleted.
+        _require_store_mounted_for_delete(request, _v)
+
+        if parsed.dry_run:
+            preview = await asyncio.to_thread(
+                range_delete.resolve_range, parsed.start_ms, parsed.end_ms,
+            )
+            recordings = [
+                schema.DeleteRecordingPlan(**dataclasses.asdict(p)).model_dump()
+                for p in preview.recordings
+            ]
+            _audit(
+                "ok", mode="dry_run",
+                start_ms=parsed.start_ms, end_ms=parsed.end_ms,
+            )
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=_v,
+                    start_ms=preview.start_ms,
+                    end_ms=preview.end_ms,
+                    recordings=recordings,
+                    resolved=preview.resolved_map(),
+                    total_chunks=preview.total_chunks,
+                )
+            )
+
+        # Execute mode: an empty confirm token means the client never previewed.
+        resolved = {k: [int(x) for x in v] for k, v in parsed.resolved.items()}
+        if not resolved:
+            _audit(errors.INVALID_REQUEST, mode="execute")
+            raise errors.InvalidRequestError(schema_version=_v)
+        job = _delete_job(request.app)
+        snapshot = job.start(parsed.start_ms, parsed.end_ms, resolved)
+        _audit(
+            "ok", mode="execute",
+            start_ms=parsed.start_ms, end_ms=parsed.end_ms,
+        )
+        return JSONResponse(
+            schema.envelope(schema_version=_v, **snapshot.as_payload())
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(exc, schema_version=_v, request=request)
+
+
+async def delete_status(request: Request) -> JSONResponse:
+    """``GET /v0/delete.status`` — current privacy-safe range-delete snapshot.
+
+    Read-only. Opaque counts + a ``reconfirm_required`` bool only — never a
+    recording name (R9). NOT in ``_ACTIVITY_PATHS``: status-polling must not reset
+    the idle timer (the busy predicate covers liveness while a run is active).
+    """
+    try:
+        job = _delete_job(request.app)
+        snapshot = job.status()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._DELETE_API_VERSION, **snapshot.as_payload(),
+            )
+        )
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._DELETE_API_VERSION, request=request,
+        )
+
+
+async def delete_cancel(request: Request) -> JSONResponse:
+    """``POST /v0/delete.cancel`` — signal the in-flight delete to stop cleanly.
+
+    Sets the stop flag the core polls BETWEEN recordings (each recording is atomic
+    under its flock — a cancel never tears a delete). A no-op returning the current
+    snapshot when no run is in flight.
+    """
+    try:
+        body = await _backfill_body(request)  # tolerant read (empty body → {})
+        schema.DeleteCancelRequest.model_validate(body)
+        job = _delete_job(request.app)
+        snapshot = job.cancel()
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._DELETE_API_VERSION, **snapshot.as_payload(),
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc, schema_version=schema._DELETE_API_VERSION, request=request,
+        )
+
+
+# ---------------------------------------------------------------------------
 # SCR-258 U6 (KTD-18): upgrade-migration job — copy/verify → cutover → sweep.
 # ---------------------------------------------------------------------------
 
@@ -4677,6 +4874,9 @@ def build_app() -> Starlette:
             Route("/v0/backfill.start", backfill_start, methods=["POST"]),
             Route("/v0/backfill.status", backfill_status, methods=["GET"]),
             Route("/v0/backfill.cancel", backfill_cancel, methods=["POST"]),
+            Route("/v0/delete.start", delete_start, methods=["POST"]),
+            Route("/v0/delete.status", delete_status, methods=["GET"]),
+            Route("/v0/delete.cancel", delete_cancel, methods=["POST"]),
             Route("/v0/storage.migrate", storage_migrate, methods=["POST"]),
             Route("/v0/storage.lock", storage_lock, methods=["POST"]),
             Route("/v0/storage.unlock", storage_unlock, methods=["POST"]),

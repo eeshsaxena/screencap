@@ -96,6 +96,11 @@ _TASKS_UPDATE_API_VERSION = 1
 _TASKS_DELETE_API_VERSION = 1
 _TASKS_MERGE_API_VERSION = 1
 _TASKS_SPLIT_API_VERSION = 1
+# Day-first navigation U8: the irreversible, LOCAL-ONLY range-delete job
+# (delete.start with a dry_run preview / delete.status / delete.cancel). Additive
+# (new verbs) — no global API_SCHEMA_VERSION bump (mirrors the backfill / tasks
+# additive precedent). Human-only by design: NEVER exposed as an MCP tool (R18).
+_DELETE_API_VERSION = 1
 # SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
 # global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
 _MODELS_API_VERSION = 1
@@ -172,6 +177,11 @@ _MODEL_NAMES = {
     "WhoAmIResponse",
     "BackfillStartRequest",
     "BackfillCancelRequest",
+    "DeleteStartRequest",
+    "DeleteCancelRequest",
+    "DeleteRecordingPlan",
+    "DeletePreviewResponse",
+    "DeleteStatusResponse",
     "BackfillStatusResponse",
     "BackfillProgressEvent",
     "StorageMigrateRequest",
@@ -694,6 +704,12 @@ def _load_models() -> dict[str, Any]:
         tasks: list[TaskSegment] = []
         end_status: str | None = None
         purged: list[DayPurgedInterval] = []
+        # U8 (R8, additive): "removed by you" — the user's explicit range-delete
+        # spans, rendered as their own honest state distinct from ``purged``
+        # ("removed by your rules") and ``blocked_proven``. No disable-target
+        # identity (there is no app to attribute), just the removed extent.
+        # Empty on an older producer shape.
+        deleted: list[DayBlockedInterval] = []
 
     class TimelineDayResponse(EnvelopeResponse):
         date: str
@@ -845,6 +861,79 @@ def _load_models() -> dict[str, Any]:
 
     class BackfillCancelRequest(_DaemonModel):
         """SCR-178 ``backfill.cancel`` input (no parameters)."""
+
+    class DeleteStartRequest(_DaemonModel):
+        """U8 ``delete.start`` input: a range + mode + (execute-mode) confirm token.
+
+        ``start_ms`` / ``end_ms`` are absolute unix ms (the timeline units),
+        bounded to a realistic epoch ceiling. ``dry_run`` (default True — the
+        SAFE default: a bare call previews, never destroys) resolves + previews
+        WITHOUT deleting. An execute call (``dry_run=False``) MUST pass ``resolved``
+        — the ``{recording: [chunk_indices]}`` confirm token from a prior preview;
+        the job re-resolves under the flock and aborts (re-confirm required) if the
+        set changed. An inverted / zero-length range is a typed 400 in the handler.
+        """
+
+        start_ms: _EpochMs
+        end_ms: _EpochMs
+        dry_run: bool = True
+        # Confirm token: recording name -> covered chunk indices. Empty on a
+        # preview; required (non-empty) to actually delete.
+        resolved: dict[str, list[int]] = {}
+
+    class DeleteCancelRequest(_DaemonModel):
+        """U8 ``delete.cancel`` input (no parameters)."""
+
+    class DeleteRecordingPlan(_DaemonModel):
+        """One recording's resolved slice in a ``delete.start`` preview (R20).
+
+        ``chunk_indices`` are the covered chunks that WILL be deleted;
+        ``rounded_start_ms`` / ``rounded_end_ms`` the actual removed extent the
+        confirm sheet shows. ``excluded_live_chunks`` are chunks overlapping the
+        range that were EXCLUDED (the live in-flight chunk — never deleted).
+        ``kept_clips`` are overlapping clips that will be KEPT (findable in Clips) —
+        disclosed so "removed from this Mac" is never silently false. Recording
+        identifiers are fine here: this is a direct same-EUID reply, not an
+        EventBus payload (the R9 name-free rule is a progress-event rule).
+        """
+
+        recording: str
+        recording_id: str | None = None
+        chunk_indices: list[int]
+        rounded_start_ms: int | None = None
+        rounded_end_ms: int | None = None
+        excluded_live_chunks: list[int] = []
+        kept_clips: list[dict] = []
+
+    class DeletePreviewResponse(EnvelopeResponse):
+        """The ``delete.start --dry_run`` preview — resolves + reports, DELETES NOTHING.
+
+        ``resolved`` is the confirm token the client passes back verbatim to the
+        execute call (no-TOCTOU: the job re-resolves and deletes exactly it).
+        ``total_chunks`` is the total covered-chunk count across recordings.
+        """
+
+        start_ms: int
+        end_ms: int
+        recordings: list[DeleteRecordingPlan]
+        resolved: dict[str, list[int]]
+        total_chunks: int
+
+    class DeleteStatusResponse(EnvelopeResponse):
+        """The privacy-safe range-delete job snapshot (R9).
+
+        Opaque counts + a ``reconfirm_required`` bool only — never a recording
+        name (the EventBus is same-EUID-readable). ``state`` is one of ``idle`` /
+        ``running`` / ``completed`` / ``reconfirm_required`` / ``cancelled`` /
+        ``failed``.
+        """
+
+        state: str
+        done: int
+        total: int
+        current_unit_index: int
+        deleted_chunks: int
+        reconfirm_required: bool
 
     class StorageMigrateRequest(_DaemonModel):
         """SCR-228 ``storage.migrate`` input: the new recordings directory.
@@ -1323,6 +1412,11 @@ def _load_models() -> dict[str, Any]:
         "BackfillStartRequest": BackfillStartRequest,
         "BackfillCancelRequest": BackfillCancelRequest,
         "BackfillStatusResponse": BackfillStatusResponse,
+        "DeleteStartRequest": DeleteStartRequest,
+        "DeleteCancelRequest": DeleteCancelRequest,
+        "DeleteRecordingPlan": DeleteRecordingPlan,
+        "DeletePreviewResponse": DeletePreviewResponse,
+        "DeleteStatusResponse": DeleteStatusResponse,
         "BackfillProgressEvent": BackfillProgressEvent,
         "StorageMigrateRequest": StorageMigrateRequest,
         "TasksListRequest": TasksListRequest,
@@ -1399,6 +1493,7 @@ __all__ = [
     "_TASKS_DELETE_API_VERSION",
     "_TASKS_MERGE_API_VERSION",
     "_TASKS_SPLIT_API_VERSION",
+    "_DELETE_API_VERSION",
     "_MODELS_API_VERSION",
     "_CHAT_ANSWER_API_VERSION",
     "daemon_version",

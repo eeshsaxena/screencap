@@ -204,14 +204,16 @@ def test_read_task_segments_fail_open_on_missing_or_unreadable_db(tmp_path):
 
 def test_existing_day_segment_fields_unchanged_additive(tmp_path):
     """The pre-existing fields are all still present and unchanged; ``tasks``
-    (U9) and ``end_status`` / ``purged`` (SCR-277 provenance) are the only new
-    keys (additivity regression guard — closed set)."""
+    (U9), ``end_status`` / ``purged`` (SCR-277 provenance), and ``deleted`` (U8
+    "removed by you") are the only new keys (additivity regression guard — closed
+    set)."""
     rec = tmp_path / "ambient-20260703"
     _make_recording_db(rec, started=_DAY_START + 3600, end=_DAY_START + 4200)
     entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "ambient-20260703")
     assert set(entry) == {
         "name", "recording_id", "state", "start_ms", "end_ms",
         "blocked_proven", "unverifiable", "tasks", "end_status", "purged",
+        "deleted",
     }
     # The original honesty split + span keys keep their meaning/types.
     assert entry["name"] == "ambient-20260703"

@@ -202,6 +202,12 @@ def _daemon_is_busy(app: Starlette) -> bool:
     encrypt_job = getattr(app.state, "encrypt_job", None)
     if encrypt_job is not None and _backfill_running(encrypt_job):  # same shape
         return True
+    # U8: an irreversible range-delete run is in flight. ``delete.*`` is NOT in
+    # ``_ACTIVITY_PATHS`` (status-polling must not reset the idle timer), so this
+    # busy predicate is what keeps the auto-spawned daemon alive across a delete.
+    delete_job = getattr(app.state, "delete_job", None)
+    if delete_job is not None and _backfill_running(delete_job):  # same is_running() shape
+        return True
     return False
 
 

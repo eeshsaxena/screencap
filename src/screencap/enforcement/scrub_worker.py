@@ -94,6 +94,46 @@ _EMPTY_COUNTS: dict[str, int] = {
 # must not import backfill — the privacy-package DAG guard pins the boundary).
 _PURGED_INTERVAL_TABLE = "purged_interval"
 
+# U8 (range delete): the additive ``origin`` column splitting a purged span into
+# ``'policy'`` (this worker's retroactive-disable purge — "removed by your rules")
+# vs ``'user'`` (an explicit user range delete — "removed by you"). Absent/NULL
+# classifies as ``'policy'`` in BOTH day_segments and skip_intervals (every
+# pre-migration purge was policy-driven). Kept a by-literal contract with those
+# readers, same as ``_PURGED_INTERVAL_TABLE`` (enforcement must not import
+# backfill / day_segments — the package DAG guard pins the boundary).
+PURGE_ORIGIN_POLICY = "policy"
+PURGE_ORIGIN_USER = "user"
+
+
+def ensure_purged_interval_schema(cur: sqlite3.Cursor) -> None:
+    """Create ``purged_interval`` (with the U8 ``origin`` column) + migrate an
+    existing pre-U8 table by ALTER-adding ``origin`` — on the caller's cursor.
+
+    Idempotent. A fresh table gets the full shape; an existing pre-U8 table
+    (created before ``origin`` existed) is ALTER-migrated so a NULL ``origin``
+    on legacy rows classifies as ``'policy'`` by the readers. Runs on the
+    CALLER's connection/cursor so it can live inside an existing transaction.
+    """
+    cur.execute(
+        f"CREATE TABLE IF NOT EXISTS {_PURGED_INTERVAL_TABLE} ("
+        "  id INTEGER PRIMARY KEY,"
+        "  start_ts REAL NOT NULL,"
+        "  end_ts REAL,"
+        "  disabled_at REAL,"
+        "  origin TEXT"
+        ")"
+    )
+    existing = {row[1] for row in cur.execute(f"PRAGMA table_info({_PURGED_INTERVAL_TABLE})")}
+    if "origin" not in existing:
+        try:
+            cur.execute(f"ALTER TABLE {_PURGED_INTERVAL_TABLE} ADD COLUMN origin TEXT")
+        except sqlite3.OperationalError as e:
+            # Tolerate a concurrent opener's duplicate-column race (same TOCTOU
+            # window engine.db._migrate_schema handles); any other error
+            # propagates.
+            if "duplicate column name" not in str(e).lower():
+                raise
+
 
 def _purge_ondevice_window_names(
     cur: sqlite3.Cursor,
@@ -612,23 +652,20 @@ class ScrubWorker:
         """
         if not intervals:
             return 0
-        cur.execute(
-            f"CREATE TABLE IF NOT EXISTS {_PURGED_INTERVAL_TABLE} ("
-            "  id INTEGER PRIMARY KEY,"
-            "  start_ts REAL NOT NULL,"
-            "  end_ts REAL,"
-            "  disabled_at REAL"
-            ")"
-        )
+        # Ensure the table + the U8 ``origin`` column, then stamp these spans
+        # ``'policy'`` (this is the retroactive-disable purge — "removed by your
+        # rules", distinct from a user range delete's ``'user'`` origin).
+        ensure_purged_interval_schema(cur)
         written = 0
         for start_ts, end_ts in intervals:
             cur.execute(
                 f"INSERT INTO {_PURGED_INTERVAL_TABLE} "
-                "(start_ts, end_ts, disabled_at) VALUES (?, ?, ?)",
+                "(start_ts, end_ts, disabled_at, origin) VALUES (?, ?, ?, ?)",
                 (
                     float(start_ts),
                     None if end_ts == float("inf") else float(end_ts),
                     float(disabled_at) if disabled_at is not None else None,
+                    PURGE_ORIGIN_POLICY,
                 ),
             )
             written += 1
@@ -828,125 +865,150 @@ class ScrubWorker:
     def _purge_content_index_intervals(
         self, intervals: list[tuple[float, float]],
     ) -> None:
-        """Purge content-index rows for ``intervals`` (fail-open).
+        """Purge content-index rows for this recording's ``intervals`` (fail-open).
 
-        ``intervals`` are float unix SECONDS with a possible ``float('inf')``
-        trailing upper bound; the content index keys on ms, so convert (and map
-        ``inf`` → open-ended). Never opens/creates the store if indexing was
-        never used, and never raises into the disable job.
+        Thin instance wrapper over the shared module-level
+        :func:`purge_content_index_intervals` so the retroactive-disable path and
+        the U8 range-delete path can't drift on the R7 lifecycle rule.
         """
-        if not intervals:
-            return
-        try:
-            from screencap.content_index import default_index_path
-
-            path = default_index_path()
-            if not path.exists():
-                return  # never indexed → nothing to purge, don't create the store
-
-            from screencap.content_index import (
-                ContentIndex,
-                content_index_write_lock,
-            )
-
-            recording = self._capture_dir.name
-            # SCR-134: take the shared content-index write lock around the purge
-            # so it can't interleave with a concurrent inline index write that
-            # already OCR'd these (now-disabled) frames — which would otherwise
-            # resurrect just-purged text. The screenshot files were already
-            # unlinked above (before this lock), so any inline write that runs
-            # AFTER this purge re-reads an empty disk and indexes nothing.
-            with content_index_write_lock(), ContentIndex(path) as store:
-                if not store.available:
-                    return
-                for start, end in intervals:
-                    # Widen the purge window (floor start, ceil end) so a frame
-                    # whose ms timestamp was ROUNDED at write time can't survive
-                    # at a sub-ms interval boundary. Writes use round(ts*1000);
-                    # truncating the end here would miss a rounded-up boundary
-                    # frame and leave disabled-app text queryable.
-                    start_ms = math.floor(start * 1000)
-                    end_ms = None if end == float("inf") else math.ceil(end * 1000)
-                    store.delete_recording_interval(recording, start_ms, end_ms)
-        except Exception:
-            logger.warning(
-                "content-index interval purge failed (non-fatal)", exc_info=True
-            )
+        purge_content_index_intervals(self._capture_dir, intervals)
 
     def _purge_tasks_json_intervals(
         self, intervals: list[tuple[float, float]],
     ) -> int:
-        """Drop AGENT ``tasks.json`` entries overlapping ``intervals`` (SCR-280).
+        """Drop AGENT ``tasks.json`` entries overlapping this recording's ``intervals``.
 
-        The ``tasks.json`` mirror of the ledger task-segment purge: a rewrite that
-        drops agent-derived entries whose ``[start_ts, end_ts]`` overlaps a
-        scrubbed interval while carrying forward ``source='user'`` / edited
-        entries — the same protection ``terminal_stage._persist_local_tasks``
-        applies when it re-writes the file. ``tasks.json`` is local-only (excluded
-        from ``upload.list_recording_files``), so this is at-rest remanence, not a
-        cloud exposure.
-
-        Intervals are second-widened (floor start / ceil end; ``inf`` →
-        open-ended) to match the ledger + content-index purges. Best-effort: a
-        missing / torn / legacy or non-dict file is left untouched (the ledger row
-        purge is authoritative), the write is atomic (tmp + replace), and any
-        failure is swallowed — it must never raise into the disable job.
-        Returns the number of entries removed.
+        Thin instance wrapper over the shared module-level
+        :func:`purge_tasks_json_intervals`.
         """
-        if not intervals:
-            return 0
-        path = self._capture_dir / "tasks.json"
+        return purge_tasks_json_intervals(self._capture_dir, intervals)
+
+
+def purge_content_index_intervals(
+    capture_dir: Path, intervals: list[tuple[float, float]],
+) -> None:
+    """Purge content-index rows for ``capture_dir``'s ``intervals`` (fail-open).
+
+    ``intervals`` are float unix SECONDS with a possible ``float('inf')``
+    trailing upper bound; the content index keys on ms, so convert (and map
+    ``inf`` → open-ended). Never opens/creates the store if indexing was
+    never used, and never raises into the caller (the disable job OR the U8
+    range-delete job). The SHARED body behind both purge paths so the R7
+    lifecycle rule can't drift between them.
+    """
+    if not intervals:
+        return
+    try:
+        from screencap.content_index import default_index_path
+
+        path = default_index_path()
         if not path.exists():
+            return  # never indexed → nothing to purge, don't create the store
+
+        from screencap.content_index import (
+            ContentIndex,
+            content_index_write_lock,
+        )
+
+        recording = capture_dir.name
+        # SCR-134: take the shared content-index write lock around the purge
+        # so it can't interleave with a concurrent inline index write that
+        # already OCR'd these (now-disabled) frames — which would otherwise
+        # resurrect just-purged text. The screenshot files were already
+        # unlinked before this lock, so any inline write that runs AFTER this
+        # purge re-reads an empty disk and indexes nothing.
+        with content_index_write_lock(), ContentIndex(path) as store:
+            if not store.available:
+                return
+            for start, end in intervals:
+                # Widen the purge window (floor start, ceil end) so a frame
+                # whose ms timestamp was ROUNDED at write time can't survive
+                # at a sub-ms interval boundary. Writes use round(ts*1000);
+                # truncating the end here would miss a rounded-up boundary
+                # frame and leave disabled-app text queryable.
+                start_ms = math.floor(start * 1000)
+                end_ms = None if end == float("inf") else math.ceil(end * 1000)
+                store.delete_recording_interval(recording, start_ms, end_ms)
+    except Exception:
+        logger.warning(
+            "content-index interval purge failed (non-fatal)", exc_info=True
+        )
+
+
+def purge_tasks_json_intervals(
+    capture_dir: Path, intervals: list[tuple[float, float]],
+) -> int:
+    """Drop AGENT ``tasks.json`` entries overlapping ``intervals`` (SCR-280).
+
+    The ``tasks.json`` mirror of the ledger task-segment purge: a rewrite that
+    drops agent-derived entries whose ``[start_ts, end_ts]`` overlaps a
+    scrubbed interval while carrying forward ``source='user'`` / edited
+    entries — the same protection ``terminal_stage._persist_local_tasks``
+    applies when it re-writes the file. ``tasks.json`` is local-only (excluded
+    from ``upload.list_recording_files``), so this is at-rest remanence, not a
+    cloud exposure.
+
+    Intervals are second-widened (floor start / ceil end; ``inf`` →
+    open-ended) to match the ledger + content-index purges. Best-effort: a
+    missing / torn / legacy or non-dict file is left untouched (the ledger row
+    purge is authoritative), the write is atomic (tmp + replace), and any
+    failure is swallowed — it must never raise into the caller (the disable job
+    OR the U8 range-delete job). Returns the number of entries removed.
+    """
+    if not intervals:
+        return 0
+    path = capture_dir / "tasks.json"
+    if not path.exists():
+        return 0
+    try:
+        import json
+
+        # Same protection predicate the terminal-stage writer uses, imported
+        # (not re-spelled) so the two can't drift on what "user-owned" means.
+        from screencap.pipeline_state import TASK_SOURCE_USER
+
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
             return 0
-        try:
-            import json
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list):
+            return 0
 
-            # Same protection predicate the terminal-stage writer uses, imported
-            # (not re-spelled) so the two can't drift on what "user-owned" means.
-            from screencap.pipeline_state import TASK_SOURCE_USER
+        # Pre-widen the intervals once (floor start / ceil end).
+        widened = [
+            (math.floor(s), None if e == float("inf") else math.ceil(e))
+            for s, e in intervals
+        ]
 
-            data = json.loads(path.read_text())
-            if not isinstance(data, dict):
-                return 0
-            tasks = data.get("tasks")
-            if not isinstance(tasks, list):
-                return 0
-
-            # Pre-widen the intervals once (floor start / ceil end).
-            widened = [
-                (math.floor(s), None if e == float("inf") else math.ceil(e))
-                for s, e in intervals
-            ]
-
-            def _overlaps_scrubbed(t: dict) -> bool:
-                try:
-                    start = float(t.get("start_ts", 0.0))
-                    end = float(t.get("end_ts", 0.0))
-                except (TypeError, ValueError):
-                    return False  # malformed span → don't treat as overlapping
-                return any(
-                    end > lo and (hi is None or start < hi)
-                    for lo, hi in widened
-                )
-
-            kept = [
-                t for t in tasks
-                if not isinstance(t, dict)
-                # Preserve user / edited entries (the ledger's predicate).
-                or t.get("source") == TASK_SOURCE_USER
-                or t.get("edited")
-                or not _overlaps_scrubbed(t)
-            ]
-            removed = len(tasks) - len(kept)
-            if removed == 0:
-                return 0
-            data["tasks"] = kept
-            tmp_path = path.with_suffix(path.suffix + ".tmp")
-            tmp_path.write_text(json.dumps(data, indent=2))
-            tmp_path.replace(path)
-            return removed
-        except Exception:
-            logger.warning(
-                "tasks.json interval purge failed (non-fatal)", exc_info=True
+        def _overlaps_scrubbed(t: dict) -> bool:
+            try:
+                start = float(t.get("start_ts", 0.0))
+                end = float(t.get("end_ts", 0.0))
+            except (TypeError, ValueError):
+                return False  # malformed span → don't treat as overlapping
+            return any(
+                end > lo and (hi is None or start < hi)
+                for lo, hi in widened
             )
+
+        kept = [
+            t for t in tasks
+            if not isinstance(t, dict)
+            # Preserve user / edited entries (the ledger's predicate).
+            or t.get("source") == TASK_SOURCE_USER
+            or t.get("edited")
+            or not _overlaps_scrubbed(t)
+        ]
+        removed = len(tasks) - len(kept)
+        if removed == 0:
             return 0
+        data["tasks"] = kept
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2))
+        tmp_path.replace(path)
+        return removed
+    except Exception:
+        logger.warning(
+            "tasks.json interval purge failed (non-fatal)", exc_info=True
+        )
+        return 0

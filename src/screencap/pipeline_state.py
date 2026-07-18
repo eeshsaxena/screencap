@@ -165,6 +165,15 @@ class Lifecycle(str, Enum):
     UPLOADED -> EVICTED (via the evict_state sub-machine). FAILED is
     reachable from STAGED/SCRUBBED and is terminal — never evicted, never
     counted complete.
+
+    ``USER_DELETED`` (U8 range delete) is the one terminal state that is NOT a
+    pipeline outcome: it records intentional user destruction of a chunk via the
+    irreversible range-delete job. It is written in the SAME transaction as the
+    ``origin='user'`` ``purged_interval`` row, and is counted "satisfied by
+    deletion" by the completeness sentinel (a deleted not-yet-uploaded chunk in a
+    cloud recording must not strand the sentinel forever), skipped by the stage
+    runner, and ignored by eviction. It is the one place the ledger models
+    deliberate user destruction rather than a pipeline result.
     """
 
     PENDING = "pending"
@@ -175,6 +184,7 @@ class Lifecycle(str, Enum):
     SKIPPED = "skipped"
     FAILED = "failed"
     EVICTED = "evicted"
+    USER_DELETED = "user_deleted"
 
 
 class StageState(str, Enum):
@@ -1064,12 +1074,20 @@ class PipelineLedger:
         chunk is PENDING / SKIPPED / FAILED. Because the set is closed, a
         forgotten chunk surfaces as PENDING and blocks the gate (Bug 2).
         Note an ``EVICTED`` chunk was ``UPLOADED`` first; its
-        ``upload_state`` stays ``UPLOADED`` so it still satisfies the gate.
+        ``upload_state`` stays ``UPLOADED`` so it still satisfies the gate. A
+        ``USER_DELETED`` chunk (U8 range delete) is "satisfied by deletion": the
+        footage was intentionally destroyed, so it can never upload and must not
+        block the gate — otherwise a deleted not-yet-uploaded chunk in a cloud
+        recording strands the sentinel forever.
         """
         rows = self.all_chunks()
         if not rows:
             return False
-        return all(r.upload_state == UploadState.UPLOADED for r in rows)
+        return all(
+            r.upload_state == UploadState.UPLOADED
+            or r.lifecycle == Lifecycle.USER_DELETED
+            for r in rows
+        )
 
     def all_complete(self) -> bool:
         """True iff every seeded chunk reached a terminal "done" lifecycle.
@@ -1087,6 +1105,7 @@ class PipelineLedger:
             Lifecycle.LOCAL_DONE,
             Lifecycle.SKIPPED,
             Lifecycle.EVICTED,
+            Lifecycle.USER_DELETED,
         }
         return all(r.lifecycle in terminal for r in rows)
 
@@ -1118,11 +1137,17 @@ class PipelineLedger:
         if len(rows) < expected:
             return False
         # Every seeded chunk must have a confirmed upload (UPLOADED, or
-        # EVICTED which kept its UPLOADED upload_state). A single PENDING /
-        # FAILED / SKIPPED row blocks the gate (closed-set, no survivorship).
+        # EVICTED which kept its UPLOADED upload_state), OR be USER_DELETED
+        # (U8: satisfied by deletion — the footage was intentionally destroyed,
+        # so it can never upload and must not strand the sentinel). A single
+        # PENDING / FAILED / SKIPPED row blocks the gate (closed-set, no
+        # survivorship).
         return all(
-            r.lifecycle in (Lifecycle.UPLOADED, Lifecycle.EVICTED)
-            and r.upload_state == UploadState.UPLOADED
+            r.lifecycle == Lifecycle.USER_DELETED
+            or (
+                r.lifecycle in (Lifecycle.UPLOADED, Lifecycle.EVICTED)
+                and r.upload_state == UploadState.UPLOADED
+            )
             for r in rows
         )
 
