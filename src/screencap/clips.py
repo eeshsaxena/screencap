@@ -185,29 +185,26 @@ def _read_policy_purge_spans(db_path: Path) -> list[tuple[float, float]]:
     """
     from screencap.recording_db import has_column, has_table, open_recording_db
 
-    try:
-        with open_recording_db(db_path, busy_timeout_ms=10000) as conn:
-            if not has_table(conn, "purged_interval"):
-                return []
-            if has_column(conn, "purged_interval", "origin"):
-                rows = conn.execute(
-                    "SELECT start_ts, end_ts FROM purged_interval "
-                    "WHERE start_ts IS NOT NULL "
-                    "AND (origin IS NULL OR origin != ?)",
-                    (_ORIGIN_USER,),
-                ).fetchall()
-            else:
-                # Pre-U8: no origin column → every recorded purge was policy.
-                rows = conn.execute(
-                    "SELECT start_ts, end_ts FROM purged_interval "
-                    "WHERE start_ts IS NOT NULL"
-                ).fetchall()
-    except Exception:  # noqa: BLE001 — a fail-closed read that can't open must not resurrect pixels
-        logger.warning("clips: policy-span read failed for %s", db_path, exc_info=True)
-        # Fail CLOSED is the safe posture, but a DB we cannot open carries no
-        # readable purge evidence AND no readable source anchor, so the engine
-        # eligibility / anchor gates below already reject it. Return no spans.
-        return []
+    # A genuine "no purge table" is a safe empty; a READ ERROR is NOT swallowed
+    # here — it propagates so the caller fails CLOSED. Returning [] on a torn
+    # read would resurrect purged pixels if this connection hit a transient lock
+    # the sibling anchor read didn't (they are separate connections).
+    with open_recording_db(db_path, busy_timeout_ms=10000) as conn:
+        if not has_table(conn, "purged_interval"):
+            return []
+        if has_column(conn, "purged_interval", "origin"):
+            rows = conn.execute(
+                "SELECT start_ts, end_ts FROM purged_interval "
+                "WHERE start_ts IS NOT NULL "
+                "AND (origin IS NULL OR origin != ?)",
+                (_ORIGIN_USER,),
+            ).fetchall()
+        else:
+            # Pre-U8: no origin column → every recorded purge was policy.
+            rows = conn.execute(
+                "SELECT start_ts, end_ts FROM purged_interval "
+                "WHERE start_ts IS NOT NULL"
+            ).fetchall()
     return [
         (float(s), float(e) if e is not None else float("inf"))
         for s, e in rows
@@ -328,9 +325,16 @@ def create_clip(
     if anchor_s is None:
         return ClipCreateResult(ok=False, reason=REASON_NOT_ELIGIBLE)
 
-    # (2) Fail-closed policy-purge overlap check — BEFORE cutting anything.
+    # (2) Fail-closed policy-purge overlap check — BEFORE cutting anything. A
+    # purge-span read that ERRORS (transient lock, torn DB) refuses the cut
+    # rather than proceeding: we must never resurrect purged pixels because we
+    # couldn't positively clear the range.
     start_s, end_s = start_ms / 1000.0, end_ms / 1000.0
-    policy_spans = _read_policy_purge_spans(rec_dir / "recording.db")
+    try:
+        policy_spans = _read_policy_purge_spans(rec_dir / "recording.db")
+    except Exception:  # noqa: BLE001 — cannot clear the range → fail closed
+        logger.warning("clips: policy-span read failed for %s; refusing cut", recording, exc_info=True)
+        return ClipCreateResult(ok=False, reason=REASON_POLICY_PURGED)
     for ps, pe in policy_spans:
         if _overlaps(start_s, end_s, ps, pe):
             return ClipCreateResult(ok=False, reason=REASON_POLICY_PURGED)

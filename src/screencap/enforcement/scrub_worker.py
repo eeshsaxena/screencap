@@ -198,17 +198,25 @@ def _purge_task_segments(
     cur: sqlite3.Cursor,
     conn: sqlite3.Connection,
     intervals: list[tuple[float, float]],
+    *,
+    all_sources: bool = False,
 ) -> int:
-    """Purge AGENT-owned ``pipeline_task_segments`` rows overlapping ``intervals``
-    (SCR-280) — INSIDE the caller's transaction.
+    """Purge ``pipeline_task_segments`` rows overlapping ``intervals`` (SCR-280)
+    — INSIDE the caller's transaction.
 
     A task ``name`` derives from the window titles this scrub deletes, so a task
     whose ``[start_ts, end_ts]`` span overlaps a scrubbed interval is a derived
     artifact under the same R7 lifecycle rule as the on-device name cache and the
-    content index. Deletes ONLY agent-owned rows (``source='agent' AND edited=0``
-    — the LOW range) so ``source='user'`` and user-edited rows are PRESERVED,
-    mirroring ``PipelineLedger.replace_task_segments``'s protection predicate; the
-    next segmentation pass regenerates names from the post-scrub rows.
+    content index. By default deletes ONLY agent-owned rows (``source='agent' AND
+    edited=0`` — the LOW range) so ``source='user'`` and user-edited rows are
+    PRESERVED, mirroring ``PipelineLedger.replace_task_segments``'s protection
+    predicate; the next segmentation pass regenerates names from the post-scrub
+    rows. This is the right rule for a *policy* purge (a privacy rule doesn't own
+    the user's own labels). ``all_sources=True`` drops that protection — used by
+    the *user* range-delete path (U8), where explicit destroy intent over a range
+    means a label derived from or describing that removed moment must go too, or
+    it stays queryable via ``tasks.query``/``browse_day`` over a span the strip
+    reports as "removed by you".
 
     Runs on the scrub's OWN connection/cursor inside its existing
     ``BEGIN IMMEDIATE`` transaction (same ``recording.db``), so the source-row
@@ -223,20 +231,19 @@ def _purge_task_segments(
 
         if not has_table(conn, "pipeline_task_segments"):
             return 0
+        owned = "" if all_sources else "source='agent' AND edited=0 AND "
         before = conn.total_changes
         for start, end in intervals:
             lo = math.floor(start)
             if end == float("inf"):
                 cur.execute(
-                    "DELETE FROM pipeline_task_segments "
-                    "WHERE source='agent' AND edited=0 AND end_ts > ?",
+                    f"DELETE FROM pipeline_task_segments WHERE {owned}end_ts > ?",
                     (lo,),
                 )
             else:
                 cur.execute(
-                    "DELETE FROM pipeline_task_segments "
-                    "WHERE source='agent' AND edited=0 "
-                    "AND end_ts > ? AND start_ts < ?",
+                    f"DELETE FROM pipeline_task_segments "
+                    f"WHERE {owned}end_ts > ? AND start_ts < ?",
                     (lo, math.ceil(end)),
                 )
         return conn.total_changes - before
@@ -971,6 +978,8 @@ def purge_content_index_intervals(
 
 def purge_tasks_json_intervals(
     capture_dir: Path, intervals: list[tuple[float, float]],
+    *,
+    all_sources: bool = False,
 ) -> int:
     """Drop AGENT ``tasks.json`` entries overlapping ``intervals`` (SCR-280).
 
@@ -1025,12 +1034,19 @@ def purge_tasks_json_intervals(
                 for lo, hi in widened
             )
 
+        # By default preserve user / edited entries (the ledger's predicate — a
+        # policy purge doesn't own the user's own labels). ``all_sources`` drops
+        # that protection for the U8 user range-delete path: explicit destroy
+        # intent over a range removes every label describing that moment.
+        def _protected(t: dict) -> bool:
+            if all_sources:
+                return False
+            return t.get("source") == TASK_SOURCE_USER or bool(t.get("edited"))
+
         kept = [
             t for t in tasks
             if not isinstance(t, dict)
-            # Preserve user / edited entries (the ledger's predicate).
-            or t.get("source") == TASK_SOURCE_USER
-            or t.get("edited")
+            or _protected(t)
             or not _overlaps_scrubbed(t)
         ]
         removed = len(tasks) - len(kept)

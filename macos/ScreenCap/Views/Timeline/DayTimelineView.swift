@@ -833,12 +833,28 @@ struct DayTimelineView: View {
                 endMs: content.requestedEndMs,
                 resolved: content.resolved
             )
-            // Poll until the job leaves a running/idle state.
+            // Poll until the job leaves a running/idle state. A SINGLE status
+            // read can blip (socket hiccup, daemon busy) while the background
+            // job keeps deleting — do NOT treat one nil as terminal, or we'd
+            // alert "nothing was removed" while the reloaded strip shows the
+            // footage gone. Tolerate a few consecutive failures; only if the
+            // stream stays unreadable do we give up, honestly (unconfirmed).
+            var consecutivePollFailures = 0
             while !Task.isCancelled, snapshot.state == "running" || snapshot.state == "idle" {
                 deletePhase = .deleting(fraction: snapshot.fraction)
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 if Task.isCancelled { return }
-                guard let next = try? await DaemonClient.deleteStatus() else { break }
+                guard let next = try? await DaemonClient.deleteStatus() else {
+                    consecutivePollFailures += 1
+                    if consecutivePollFailures >= 4 {
+                        deleteContentInFlight = nil
+                        deletePhase = .failed(message: DeleteRangeFailure.unconfirmed)
+                        await reloadDay()
+                        return
+                    }
+                    continue
+                }
+                consecutivePollFailures = 0
                 snapshot = next
             }
             if Task.isCancelled { return }

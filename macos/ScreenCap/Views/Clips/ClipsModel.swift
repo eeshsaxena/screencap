@@ -99,9 +99,13 @@ enum ClipsModel {
     // MARK: - Honesty flags (R17 / AE8)
 
     /// The badge copy for a clip a retroactive privacy purge partially overlapped
-    /// (`policy_purged_partial`). The clip is KEPT but the purged span was removed
-    /// from its video — disclosed so the flag never silently drops.
-    static let policyPurgedFlagText = "Part of this clip was removed by your privacy rules"
+    /// (`policy_purged_partial`). The clip is KEPT and its mp4 is NOT re-cut, so
+    /// the overlapping footage the privacy rule removed from your library still
+    /// lives in this clip — the copy says exactly that so a user can't share it
+    /// believing the purged part is gone (the removal happened elsewhere, not in
+    /// the clip). See SECURITY.md (clips-store remanence).
+    static let policyPurgedFlagText =
+        "This clip still contains footage your privacy rules later removed from your library"
 
     /// Whether a clip carries the agent-created attribution (creator == mcp) —
     /// surfaced so an agent-made clip stays attributable (R18).

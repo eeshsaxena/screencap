@@ -384,6 +384,15 @@ class TestExecuteDelete:
             recordings_dir=tmp_path,
         )
         assert not _chunk_present(rec_dir, 0)
+        # ...and the user-authored task LABEL over that range is purged too — not
+        # preserved like a policy purge would (explicit destroy intent), or it
+        # would stay queryable via tasks.query/browse_day over a "removed by you"
+        # span. `insert_task_segment` forces source='user', so this proves the
+        # all_sources=True user-delete path drops user-owned labels.
+        from screencap.pipeline_state import read_task_segments_wire
+        remaining = read_task_segments_wire(rec_dir)
+        assert not any(t["start_ts"] < ce and t["end_ts"] > cs for t in remaining), \
+            f"user task label survived a user range-delete over its span: {remaining}"
 
 
 # ===========================================================================

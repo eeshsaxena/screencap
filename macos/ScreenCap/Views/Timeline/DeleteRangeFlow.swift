@@ -147,6 +147,13 @@ enum DeleteRangeFailure {
         }
     }
 
+    /// The job kept running but we lost the ability to observe its result (the
+    /// status stream stopped responding). It may have removed some or all of the
+    /// range, so this must NOT claim "nothing was removed" — the reloaded strip
+    /// shows whatever actually happened.
+    static let unconfirmed =
+        "Couldn't confirm the result — check the day to see what was removed."
+
     /// Map a thrown `DaemonClientError` to plain copy (sealed store, bad range,
     /// daemon down). Falls back to the underlying description.
     static func fromError(_ error: Error) -> String {

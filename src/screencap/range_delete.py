@@ -408,7 +408,12 @@ def _commit_delete_transaction(
             # helpers' own predicate.
             span = [(del_start_s, del_end_s)]
             _purge_ondevice_window_names(cur, conn, span)
-            _purge_task_segments(cur, conn, span)
+            # all_sources=True: a USER delete is explicit destroy intent, so a
+            # task label describing/derived from the removed range must go too —
+            # user-authored/edited names are NOT preserved here (unlike a policy
+            # purge), or they stay queryable via tasks.query over a "removed by
+            # you" span.
+            _purge_task_segments(cur, conn, span, all_sources=True)
 
             # The origin='user' purge span — crash-consistent with the deletes so
             # a crash can never leave rows gone but the span (the ground truth the
@@ -606,8 +611,10 @@ def _unlink_covered_artifacts(
     _regenerate_bare_transcript(rec_dir)
 
     # Content index + tasks.json intervals (the shared scrub_worker helpers).
+    # all_sources=True mirrors the in-transaction ledger purge: a user delete
+    # removes every task label over the range, user-authored ones included.
     purge_content_index_intervals(rec_dir, spans)
-    outcome.tasks_json_removed += purge_tasks_json_intervals(rec_dir, spans)
+    outcome.tasks_json_removed += purge_tasks_json_intervals(rec_dir, spans, all_sources=True)
 
     # The scrubbed reuse sibling.
     _purge_scrubbed_sibling(rec_dir, chunk_indices, spans)
