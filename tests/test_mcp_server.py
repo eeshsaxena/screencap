@@ -203,6 +203,8 @@ async def test_resolve_frame_is_registered():
     assert names == {
         "search_screen_content", "search_transcript", "query_timeline",
         "resolve_frame", "read_frame", "list_recordings", "whoami", "chat_answer",
+        # U13 (R18) day-first browse tools — NO delete-shaped tool (human-only).
+        "browse_day", "query_tasks", "create_clip",
     }
 
 

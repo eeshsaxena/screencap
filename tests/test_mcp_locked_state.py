@@ -37,6 +37,15 @@ class _LockedDaemonClient:
     async def frame_nearest(self, *a, **k):
         return {"stem": None, "delta_ms": None, "store_state": "locked"}
 
+    async def timeline_day(self, *a, **k):
+        # timeline.day expresses a sealed vault via store_mounted=False (KTD-14).
+        return {"date": "2026-07-18", "recordings": [], "store_mounted": False,
+                "coverage_complete": False}
+
+    async def tasks_query(self, *a, **k):
+        return {"start_date": "2026-07-18", "end_date": "2026-07-18",
+                "days": [], "recordings": [], "store_state": "locked"}
+
     async def list_recordings(self, *a, **k):
         return {"recordings": [], "store_state": "locked"}
 
@@ -97,6 +106,21 @@ async def test_chat_answer_reports_locked_as_data(_patch_locked_client):
     assert result.refusal is True
 
 
+async def test_browse_day_reports_locked_as_data(_patch_locked_client):
+    """A sealed vault is a healthy serving state (KTD-14): browse_day surfaces
+    store_mounted=False + no recordings, never a confident empty day / an error."""
+    result = await server.browse_day("2026-07-18")
+    assert result.store_mounted is False
+    assert result.coverage_complete is False
+    assert result.recordings == []
+
+
+async def test_query_tasks_reports_locked_as_data(_patch_locked_client):
+    result = await server.query_tasks("2026-07-18", "2026-07-18")
+    assert result.store_state == "locked"
+    assert result.days == [] and result.recordings == []
+
+
 async def test_no_read_tool_raises_on_locked_store(_patch_locked_client):
     """None of the read tools collapse a locked store into a tool exception."""
     # If any of these raised, pytest would fail the test — the point is that a
@@ -107,6 +131,8 @@ async def test_no_read_tool_raises_on_locked_store(_patch_locked_client):
     await server.resolve_frame("rec", 1000)
     await server.list_recordings()
     await server.chat_answer("x")
+    await server.browse_day("2026-07-18")
+    await server.query_tasks("2026-07-18", "2026-07-18")
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +144,10 @@ def test_built_server_exposes_no_store_mutation_tool():
     srv = server.build_server()
     names = {t.name for t in srv._tool_manager.list_tools()}
 
-    # The exact expected read-only tool set (pins additions too).
+    # The exact expected tool set (pins additions too). The U13 day-first browse
+    # tools (browse_day / query_tasks / create_clip, R18) are additive; create_clip
+    # writes a durable CLIP artifact but is NOT a vault-store mutation (no
+    # lock/unlock/migrate), so KTD-16 still holds.
     assert names == {
         "search_screen_content",
         "search_transcript",
@@ -128,11 +157,18 @@ def test_built_server_exposes_no_store_mutation_tool():
         "list_recordings",
         "whoami",
         "chat_answer",
+        "browse_day",
+        "query_tasks",
+        "create_clip",
     }
 
     # No store-mutation tool by any plausible name — a headless agent must never be
     # able to lock/unlock or otherwise mutate the store (prompt-injection defense).
-    forbidden_substrings = ("lock", "unlock", "seal", "storage", "migrate", "detach")
+    # Range deletion + clip deletion are also human-only (R18): no delete-shaped tool.
+    forbidden_substrings = (
+        "lock", "unlock", "seal", "storage", "migrate", "detach",
+        "delete", "remove", "purge",
+    )
     for name in names:
         lowered = name.lower()
         assert not any(s in lowered for s in forbidden_substrings), (

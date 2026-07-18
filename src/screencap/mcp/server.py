@@ -1,13 +1,20 @@
 """FastMCP stdio server exposing ScreenCap's retrieval surface to an agent.
 
-Seven tools — ``search_screen_content``, ``search_transcript``,
-``query_timeline``, ``resolve_frame``, ``list_recordings``, ``whoami``,
-``chat_answer`` — each forward to a daemon ``/v0/*`` read verb and re-wrap the
-response as a typed, POINTER-ONLY result (text snippets + ``(recording, timestamp)``
-pointers and, for ``resolve_frame``, a bare on-disk screenshot stem; never frame
-pixels). The server holds no query logic of its own (R1). ``chat_answer`` (R15) is
-the one tool that returns model-generated PROSE — output-sanitized before it
-reaches the agent — but its sources stay pointer-only.
+Each tool forwards to a daemon ``/v0/*`` verb and re-wraps the response as a typed,
+POINTER-ONLY result (text snippets + ``(recording, timestamp)`` pointers and, for
+``resolve_frame``, a bare on-disk screenshot stem; never frame pixels). The server
+holds no query logic of its own (R1).
+
+* Retrieval / search — ``search_screen_content``, ``search_transcript``,
+  ``query_timeline``, ``resolve_frame``, ``read_frame``, ``list_recordings``,
+  ``whoami``, ``chat_answer`` (R15: the one tool returning model-generated PROSE,
+  output-sanitized before it reaches the agent; its sources stay pointer-only).
+* Day-first browse (U13, R18) — ``browse_day``, ``query_tasks``, ``create_clip``,
+  backed by the same daemon verbs the UI uses (``timeline.day`` / ``tasks.query`` /
+  ``clip.create``, KTD-2). Recording identifiers are opaque plumbing; DAY + TIME is
+  the user-facing vocabulary (KTD-1). Range deletion and clip deletion are
+  deliberately NOT exposed as tools — the human-only guarantee is a tool-surface
+  control (R18).
 
 stdio discipline: with the stdio transport the server owns stdout (the JSON-RPC
 stream), so NOTHING may be written to stdout — all logging goes to stderr. Heavy
@@ -209,6 +216,162 @@ class ChatAnswerResult(BaseModel):
     store_state: str = _DEFAULT_STORE_STATE
 
 
+# -- day-first result models (U13, R18) -------------------------------------
+#
+# KTD-1: the pointer vocabulary stays ``(recording, timestamp_ms)`` — the recording
+# directory name is opaque plumbing; DAY + TIME is the user-facing surface. These
+# models expose the day/time structure the UI browses by, each carrying the opaque
+# ``recording`` key only so an agent can two-hop a moment to a frame (see the tool
+# docstrings). R18: there is NO delete-shaped model here — deletion is human-only.
+
+
+class DayInterval(BaseModel):
+    """An absolute-ms span on the day timeline (a blocked / removed stretch)."""
+
+    start_ms: int
+    end_ms: int
+
+
+class DayPurge(BaseModel):
+    """A retroactive-purge span ("removed by your rules") + the disable target it
+    was attributed to (identity fields null when the join was ambiguous)."""
+
+    start_ms: int
+    end_ms: int
+    bundle_id: str | None = None
+    app_name: str | None = None
+    root_domain: str | None = None
+
+
+class DayTask(BaseModel):
+    """One named task on the day (``start_ts`` / ``end_ts`` are unix SECONDS)."""
+
+    task_index: int
+    start_ts: float
+    end_ts: float
+    name: str
+    category: str | None = None
+    confidence: str | None = None
+
+
+class DayRecording(BaseModel):
+    """One recording's day-clamped span + honest provenance split (R7).
+
+    ``recording`` is the opaque storage key (KTD-1) — never a browsing label. The
+    honest split keeps four distinct states the agent must NOT conflate:
+    ``blocked_proven`` (provable capture-time masking), ``unverifiable`` (a
+    coverage-gap / ambiguity that is NOT proof of masking), ``deleted`` ("removed
+    by you", R8), and ``purged`` ("removed by your rules"). ``start_ms`` / ``end_ms``
+    are absolute unix ms; a task's ``start_ts`` is unix seconds.
+    """
+
+    recording: str
+    recording_id: str | None = None
+    state: str
+    start_ms: int
+    end_ms: int
+    blocked_proven: list[DayInterval] = []
+    unverifiable: list[DayInterval] = []
+    tasks: list[DayTask] = []
+    deleted: list[DayInterval] = []
+    purged: list[DayPurge] = []
+    end_status: str | None = None
+
+
+class DayResult(BaseModel):
+    """A day's spans + tasks + provenance-labeled gaps (from ``/v0/timeline.day``).
+
+    ``store_mounted`` False → the encrypted vault is locked/absent and the day is
+    "can't verify", never a confident empty day. ``coverage_complete`` False → a
+    recording couldn't be placed, so an empty stretch is not proof nothing is on
+    file (R7). Both default to the plaintext-install / complete posture on an older
+    daemon shape.
+    """
+
+    date: str
+    recordings: list[DayRecording]
+    store_mounted: bool = True
+    coverage_complete: bool = True
+
+
+class TaskHit(BaseModel):
+    """One named task in the cross-day list, carrying its recording pointer.
+
+    ``recording`` is opaque plumbing (KTD-1) retained so the agent can seek into
+    the task's day page (``browse_day`` / ``query_timeline`` → ``resolve_frame``);
+    ``start_ts`` / ``end_ts`` are unix seconds.
+    """
+
+    recording: str
+    recording_id: str | None = None
+    task_index: int
+    start_ts: float
+    end_ts: float
+    name: str
+    category: str | None = None
+    confidence: str | None = None
+
+
+class TaskDay(BaseModel):
+    """All tasks mapping to one local calendar day (KTD-11), start-ordered."""
+
+    date: str
+    tasks: list[TaskHit]
+
+
+class TaskRecordingStatus(BaseModel):
+    """Per-recording honest-status rollup (R21): a recording that named no task is
+    still listed with an honest ``state`` (``nothing_to_name`` / ``mechanical_only``
+    / ``couldnt_run`` / ``in_progress`` / …), so "nothing on file" is never misread
+    as "you did nothing"."""
+
+    recording: str
+    recording_id: str | None = None
+    state: str
+    reason: str | None = None
+    detail: str | None = None
+
+
+class TasksResult(BaseModel):
+    """Cross-day named-task segments grouped by day + the honest-status rollup
+    (from ``/v0/tasks.query``). ``days`` is newest-first, matching the UI grouping
+    (the daemon owns the single KTD-11 day-mapping rule; this tool never re-buckets).
+    """
+
+    start_date: str
+    end_date: str
+    days: list[TaskDay]
+    recordings: list[TaskRecordingStatus]
+    store_state: str = _DEFAULT_STORE_STATE
+
+
+class ClipResult(BaseModel):
+    """The outcome of a ``create_clip`` cut (from ``/v0/clip.create``).
+
+    ``ok`` reflects whether the clip was cut; on a clip-domain failure ``ok`` is
+    False + ``reason`` (``policy_purged`` — fail-closed over a policy-purged range,
+    R17 — / ``not_eligible`` / ``no_frames_in_range`` / ``masked_video_required`` /
+    ``clip_busy`` / ``trim_failed``) and ``clip_id`` is null.
+
+    ``creator`` is ``mcp`` for the agent path (R18 attribution).
+    ``clip_video_capture_blocked_only`` is the surfaced honesty flag (the clip's
+    video is capture-BLOCKED, not post-hoc masked); the full ``honesty_flags`` dict
+    rides alongside so a future flag survives without a signature change. POINTER-
+    ONLY: no media bytes — ``source_day`` + ``start_ms`` / ``end_ms`` locate it.
+    """
+
+    ok: bool
+    reason: str | None = None
+    clip_id: str | None = None
+    source_day: str | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    creator: str | None = None
+    clip_video_capture_blocked_only: bool = False
+    honesty_flags: dict = {}
+    store_state: str = _DEFAULT_STORE_STATE
+
+
 # -- lazy daemon runtime (connect + held subscription on first tool call) ---
 
 
@@ -314,7 +477,15 @@ async def query_timeline(
     recording: str | None = None,
     limit: int | None = None,
 ) -> TimelineResult:
-    """Query the authoritative app/window/time timeline from event tables."""
+    """Query the authoritative app/window/time timeline from event tables.
+
+    ``start_ms`` / ``end_ms`` are absolute unix ms. This is the first hop of the
+    day+time → frame path: each row is a ``(recording, timestamp_ms)`` pointer —
+    where ``recording`` is opaque plumbing (KTD-1), day + time is the vocabulary —
+    that ``resolve_frame(recording, timestamp_ms)`` turns into a screenshot stem.
+    Use ``browse_day`` for a whole day's spans/tasks/gaps; use this to scan by app
+    or a precise window.
+    """
     env = await (await _client()).timeline_query(
         start_ms=start_ms, end_ms=end_ms, app=app,
         recording=recording, limit=_clamp_or_none(limit),
@@ -493,6 +664,148 @@ async def chat_answer(
     )
 
 
+# -- day-first browse tools (U13, R18) --------------------------------------
+#
+# DAY + TIME is the user-facing vocabulary (KTD-1): browse a day, browse tasks
+# across days, cut a clip — all keyed by day + absolute-ms time, with the
+# ``recording`` directory name carried only as opaque plumbing. To pinpoint a
+# frame, TWO-HOP: (1) window a day with ``browse_day`` (or ``query_timeline``) to
+# get a ``(recording, timestamp_ms)`` pointer, then (2) ``resolve_frame`` that
+# pointer to an on-disk screenshot stem. R18: there is deliberately NO range-delete
+# and NO clip-delete tool — deletion stays human-only, enforced at this surface.
+
+
+async def browse_day(date: str, tz_offset_seconds: int = 0) -> DayResult:
+    """Browse one local calendar day: recordings' spans, named tasks, and honest gaps.
+
+    ``date`` is ``YYYY-MM-DD``; ``tz_offset_seconds`` is seconds EAST of UTC (the
+    day is intersected against the local calendar day at that offset — the single
+    KTD-11 day rule the UI uses). Returns each recording's day-clamped span plus its
+    named ``tasks`` and its gaps split by PROVENANCE so you never conflate them:
+    ``blocked_proven`` (provable capture-time masking), ``unverifiable`` (a coverage
+    gap that is NOT proof of masking — do not label it "blocked"), ``deleted``
+    ("removed by you"), and ``purged`` ("removed by your rules").
+
+    Recording identifiers are opaque plumbing (KTD-1) — day + time is what you
+    browse and cite by. To open a moment: pick a time inside a span, then
+    ``resolve_frame(recording, timestamp_ms)`` for its screenshot stem (the two-hop
+    day+time → frame path). Check ``store_mounted`` / ``coverage_complete`` before
+    trusting an empty stretch: a locked vault or an unplaceable recording makes
+    "nothing here" unprovable, not a fact.
+    """
+    env = await (await _client()).timeline_day(
+        date=date, tz_offset_seconds=tz_offset_seconds,
+    )
+    return DayResult(
+        date=env.get("date", date),
+        recordings=[
+            DayRecording(
+                recording=rec.get("name", ""),
+                recording_id=rec.get("recording_id"),
+                state=rec.get("state", "unknown"),
+                start_ms=rec.get("start_ms", 0),
+                end_ms=rec.get("end_ms", 0),
+                blocked_proven=[DayInterval(**i) for i in rec.get("blocked_proven", [])],
+                unverifiable=[DayInterval(**i) for i in rec.get("unverifiable", [])],
+                tasks=[DayTask(**t) for t in rec.get("tasks", [])],
+                deleted=[DayInterval(**i) for i in rec.get("deleted", [])],
+                purged=[
+                    DayPurge(**{k: p.get(k) for k in DayPurge.model_fields})
+                    for p in rec.get("purged", [])
+                ],
+                end_status=rec.get("end_status"),
+            )
+            for rec in env.get("recordings", [])
+        ],
+        store_mounted=bool(env.get("store_mounted", True)),
+        coverage_complete=bool(env.get("coverage_complete", True)),
+    )
+
+
+async def query_tasks(
+    start_date: str, end_date: str, tz_offset_seconds: int = 0,
+) -> TasksResult:
+    """List named tasks across a range of days, grouped by day (newest first).
+
+    ``start_date`` / ``end_date`` are ``YYYY-MM-DD``; ``tz_offset_seconds`` is
+    seconds EAST of UTC. Each task carries its opaque ``recording`` key (KTD-1
+    plumbing) plus its unix-second ``start_ts`` / ``end_ts`` — so you can seek into
+    the task's day page (``browse_day`` / ``query_timeline`` → ``resolve_frame``).
+
+    ``recordings`` is an honest per-recording status rollup (R21): a recording that
+    named no task is still listed with a state such as ``nothing_to_name`` /
+    ``mechanical_only`` / ``couldnt_run`` — so "nothing on file" is never misread as
+    "you did nothing". Day grouping is the daemon's single KTD-11 rule (a task maps
+    to the local day of its start); this is a browse surface — a locked/absent vault
+    returns an empty list with a degraded ``store_state``, not an error.
+    """
+    env = await (await _client()).tasks_query(
+        start_date=start_date, end_date=end_date, tz_offset_seconds=tz_offset_seconds,
+    )
+    return TasksResult(
+        start_date=env.get("start_date", start_date),
+        end_date=env.get("end_date", end_date),
+        days=[
+            TaskDay(
+                date=d.get("date", ""),
+                tasks=[TaskHit(**t) for t in d.get("tasks", [])],
+            )
+            for d in env.get("days", [])
+        ],
+        recordings=[
+            TaskRecordingStatus(
+                recording=r.get("name", ""),
+                recording_id=r.get("recording_id"),
+                state=r.get("state", "unknown"),
+                reason=r.get("reason"),
+                detail=r.get("detail"),
+            )
+            for r in env.get("recordings", [])
+        ],
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
+    )
+
+
+async def create_clip(
+    recording: str, start_ms: int, end_ms: int, tz_offset_seconds: int = 0,
+) -> ClipResult:
+    """Cut an absolute-ms time range of a recording into a durable, kept clip.
+
+    ``start_ms`` / ``end_ms`` are ABSOLUTE unix ms (the timeline units ``browse_day``
+    / ``query_timeline`` speak); ``recording`` is the opaque key from one of those
+    pointers (KTD-1). Attribution is automatic: the clip records ``creator="mcp"``,
+    so a clip the agent cut stays distinguishable from one a human cut (R18).
+
+    Fails CLOSED rather than resurrect removed footage: a range overlapping a
+    policy-purged span returns ``ok=false`` + ``reason="policy_purged"`` and writes
+    nothing (R17); other clip-domain misses (``no_frames_in_range`` /
+    ``not_eligible`` / …) ride ``reason`` the same way — never an exception.
+    ``clip_video_capture_blocked_only`` surfaces the honesty signal that the clip's
+    video is capture-blocked (not post-hoc masked). There is NO clip-delete tool —
+    removing a clip is human-only (R18).
+    """
+    env = await (await _client()).clip_create(
+        recording=recording, start_ms=start_ms, end_ms=end_ms,
+        tz_offset_seconds=tz_offset_seconds, creator="mcp",
+    )
+    clip = env.get("clip") or {}
+    flags = clip.get("honesty_flags") or {}
+    return ClipResult(
+        ok=bool(env.get("ok", False)),
+        reason=env.get("reason"),
+        clip_id=clip.get("id"),
+        source_day=clip.get("source_day"),
+        start_ms=clip.get("start_ms"),
+        end_ms=clip.get("end_ms"),
+        creator=clip.get("creator"),
+        clip_video_capture_blocked_only=bool(
+            flags.get("clip_video_capture_blocked_only", False)
+        ),
+        honesty_flags=flags,
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
+    )
+
+
 # -- server ------------------------------------------------------------------
 
 
@@ -519,6 +832,9 @@ def build_server() -> FastMCP:
     for fn in (
         search_screen_content, search_transcript, query_timeline,
         resolve_frame, read_frame, list_recordings, whoami, chat_answer,
+        # U13 (R18): day-first browse tools. NO delete-shaped tool — deletion is
+        # human-only, enforced by its absence from this surface.
+        browse_day, query_tasks, create_clip,
     ):
         mcp.tool()(fn)
     return mcp
