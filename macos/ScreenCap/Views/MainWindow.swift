@@ -674,10 +674,15 @@ struct MainWindow: View {
                 onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs, highlight: nil) }
             )
         case .tasks:
-            // Honest placeholder until the Tasks surface lands (U6).
-            ComingSoonPlaceholderView(
-                title: "Tasks",
-                message: "A cross-day view of the workflows split out of your days is on its way."
+            // U6: the cross-day Tasks surface — reverse-chronological named task
+            // segments (R4), a local free-tier filter, inline curation (R12), and
+            // honest zero states (R21). A row click opens its day page seeked to
+            // the task span with the band highlighted (AE3).
+            TasksView(
+                onOpenTimeline: { day, seekMs, highlight in
+                    route = .timeline(day: day, seekMs: seekMs, highlight: highlight)
+                },
+                onOpenIntelligence: { route = .intelligence }
             )
         case .clips:
             // U11: the Clips surface — durable clips kept from a day's range, with

@@ -1693,6 +1693,25 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/timeline.day", body: body)
     }
 
+    /// Cross-day named task segments for a local date range (U5/U6). Read-only,
+    /// pointer/data-only over each recording's local-only tasks store (never
+    /// uploaded — R4/R8); returns per-day task groups (reverse-chron) plus the
+    /// per-recording honest-status rollup the Tasks surface renders its zero states
+    /// from (R21). A malformed / inverted range surfaces as a typed 400 envelope
+    /// error; a sealed / absent / error vault returns empty days + a degraded
+    /// `store_state` (KTD-14), never a 500. On `socketUnavailable` /
+    /// `connectionFailed` the caller surfaces a daemon-down state — no CLI fallback.
+    static func tasksQuery(
+        startDate: String,
+        endDate: String,
+        tzOffsetSeconds: Int
+    ) async throws -> TasksQueryResponse {
+        let body = try JSONEncoder().encode(
+            TasksQueryRequest(startDate: startDate, endDate: endDate, tzOffsetSeconds: tzOffsetSeconds)
+        )
+        return try await request(method: "POST", path: "/v0/tasks.query", body: body)
+    }
+
     // MARK: - U8/U9 range delete (human-only, LOCAL-ONLY in v1 — R18/R20)
 
     /// Preview a range delete WITHOUT deleting (U9 confirm sheet source, R20).
