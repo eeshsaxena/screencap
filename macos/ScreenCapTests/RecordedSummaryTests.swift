@@ -182,13 +182,28 @@ final class RecordedSummaryTests: XCTestCase {
     }
 
     func testBlockedLineFormatting() {
-        XCTAssertEqual(RecordedSummaryDisplay.blockedCountLabel(1), "1 blocked interval")
-        XCTAssertEqual(RecordedSummaryDisplay.blockedCountLabel(3), "3 blocked intervals")
+        XCTAssertEqual(RecordedSummaryDisplay.blockedCountLabel(1), "1 interval")
+        XCTAssertEqual(RecordedSummaryDisplay.blockedCountLabel(3), "3 intervals")
         XCTAssertEqual(RecordedSummaryDisplay.spanLabel(ms: 5_000), "5s")
         XCTAssertEqual(RecordedSummaryDisplay.spanLabel(ms: 65_000), "1m 5s")
         XCTAssertEqual(
             RecordedSummaryDisplay.blockedLine(count: 2, spanMs: 65_000),
-            "2 blocked intervals · 1m 5s not captured")
+            "Blocked at capture · 2 intervals · 1m 5s not captured")
+    }
+
+    // U6 (R9): the pane's blocked-range VoiceOver label IS the strip's blocked
+    // wording — one vocabulary, one string home (DayStripAccessibility), no
+    // "nothing captured" pairing.
+    func testBlockedRangeAccessibilityMatchesDayStripWording() {
+        let iv = interval(0, 60)
+        let label = RecordedSummaryDisplay.rangeAccessibilityLabel(iv)
+        XCTAssertEqual(
+            label,
+            DayStripAccessibility.blockedLabel(
+                DayStripBlockedBand(startMs: iv.startMs, endMs: iv.endMs)),
+            "pane and strip share the exact blocked sentence")
+        XCTAssertTrue(label.hasPrefix("Blocked at capture, "))
+        XCTAssertFalse(label.lowercased().contains("nothing captured"))
     }
 
     // Privacy regression (KTD3/KTD5): a window.switch to a masked/excluded app that

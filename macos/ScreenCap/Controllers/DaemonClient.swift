@@ -679,6 +679,46 @@ struct DayBlockedInterval: Decodable, Sendable, Hashable {
     }
 }
 
+/// A retroactively-purged span on the day timeline, absolute unix ms (v3,
+/// additive). Identity keys say *why* the span was purged (which app rule or
+/// domain rule) and may each be explicit JSON null — a null-identity span is
+/// still a valid purged span, just identity-free.
+struct DayPurgedInterval: Codable, Sendable, Hashable {
+    let startMs: Int
+    let endMs: Int
+    let bundleId: String?
+    let appName: String?
+    let rootDomain: String?
+
+    init(
+        startMs: Int, endMs: Int,
+        bundleId: String? = nil, appName: String? = nil, rootDomain: String? = nil
+    ) {
+        self.startMs = startMs
+        self.endMs = endMs
+        self.bundleId = bundleId
+        self.appName = appName
+        self.rootDomain = rootDomain
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        startMs = try c.decode(Int.self, forKey: .startMs)
+        endMs = try c.decode(Int.self, forKey: .endMs)
+        bundleId = try c.decodeIfPresent(String.self, forKey: .bundleId)
+        appName = try c.decodeIfPresent(String.self, forKey: .appName)
+        rootDomain = try c.decodeIfPresent(String.self, forKey: .rootDomain)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case bundleId = "bundle_id"
+        case appName = "app_name"
+        case rootDomain = "root_domain"
+    }
+}
+
 /// One recording's day-clamped span + honest blocked-interval split (U3).
 /// `blockedProven` may be hatched "blocked"; `unverifiable` must render as a
 /// neutral gap, never labelled "blocked" (R7).
@@ -691,6 +731,13 @@ struct DayBlockedInterval: Decodable, Sendable, Hashable {
 /// absent) for a recording with no tasks store, a legacy recording, or an older
 /// daemon that predates the field — decoded via `decodeIfPresent`, so the app
 /// stays compatible with a daemon that never emits `tasks`.
+///
+/// `endStatus` + `purged` (v3, additive) carry recording provenance: how the
+/// recording ended ("live"|"clean"|"interrupted"|"unknown" — treated as an
+/// open string) and which spans were retroactively purged. Absence (an older
+/// daemon serving the pre-v3 shape) means *unknown* provenance — nil / empty
+/// via `decodeIfPresent`, never a decode error — and rendering must not gate
+/// on these fields.
 struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let name: String
     let recordingId: String?
@@ -700,12 +747,15 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
     let blockedProven: [DayBlockedInterval]
     let unverifiable: [DayBlockedInterval]
     let tasks: [RecordingTask]
+    let endStatus: String?
+    let purged: [DayPurgedInterval]
 
     init(
         name: String, recordingId: String? = nil, state: String = "ready",
         startMs: Int, endMs: Int,
         blockedProven: [DayBlockedInterval] = [], unverifiable: [DayBlockedInterval] = [],
-        tasks: [RecordingTask] = []
+        tasks: [RecordingTask] = [],
+        endStatus: String? = nil, purged: [DayPurgedInterval] = []
     ) {
         self.name = name
         self.recordingId = recordingId
@@ -715,6 +765,8 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         self.blockedProven = blockedProven
         self.unverifiable = unverifiable
         self.tasks = tasks
+        self.endStatus = endStatus
+        self.purged = purged
     }
 
     init(from decoder: Decoder) throws {
@@ -728,6 +780,10 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         unverifiable = try c.decode([DayBlockedInterval].self, forKey: .unverifiable)
         // Older daemon (pre-U9 `timeline.day` v2) omits `tasks` entirely.
         tasks = try c.decodeIfPresent([RecordingTask].self, forKey: .tasks) ?? []
+        // Older daemon (pre-v3 `timeline.day`) omits the provenance fields
+        // entirely — absence = unknown provenance, never a decode error.
+        endStatus = try c.decodeIfPresent(String.self, forKey: .endStatus)
+        purged = try c.decodeIfPresent([DayPurgedInterval].self, forKey: .purged) ?? []
     }
 
     enum CodingKeys: String, CodingKey {
@@ -739,10 +795,16 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
         case blockedProven = "blocked_proven"
         case unverifiable
         case tasks
+        case endStatus = "end_status"
+        case purged
     }
 }
 
-/// `timeline.day` response.
+/// `timeline.day` response. `storeMounted` (v3, additive) is false while the
+/// vault is sealed; `coverageComplete` (v3, additive) is false when a
+/// recording with an unreadable `recording.db` couldn't be placed on the day —
+/// an empty stretch is then not proof nothing is on file. An older daemon
+/// omits either → default true, never an error.
 struct TimelineDayResponse: Decodable, Sendable {
     let ok: Bool
     let schemaVersion: Int
@@ -750,6 +812,22 @@ struct TimelineDayResponse: Decodable, Sendable {
     let apiSchemaVersion: Int
     let date: String
     let recordings: [DaySegmentRecording]
+    let storeMounted: Bool
+    let coverageComplete: Bool
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try c.decode(Bool.self, forKey: .ok)
+        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        daemonVersion = try c.decode(String.self, forKey: .daemonVersion)
+        apiSchemaVersion = try c.decode(Int.self, forKey: .apiSchemaVersion)
+        date = try c.decode(String.self, forKey: .date)
+        recordings = try c.decode([DaySegmentRecording].self, forKey: .recordings)
+        // Older daemon (pre-v3 `timeline.day`) omits `store_mounted` entirely.
+        storeMounted = try c.decodeIfPresent(Bool.self, forKey: .storeMounted) ?? true
+        // Older daemon omits `coverage_complete` → complete (the pre-flag claim).
+        coverageComplete = try c.decodeIfPresent(Bool.self, forKey: .coverageComplete) ?? true
+    }
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -758,6 +836,8 @@ struct TimelineDayResponse: Decodable, Sendable {
         case apiSchemaVersion = "api_schema_version"
         case date
         case recordings
+        case storeMounted = "store_mounted"
+        case coverageComplete = "coverage_complete"
     }
 }
 

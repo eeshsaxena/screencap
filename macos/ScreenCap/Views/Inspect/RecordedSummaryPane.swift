@@ -24,9 +24,10 @@ enum RecordedSummaryDisplay {
         return .digest
     }
 
-    /// "N blocked intervals" / "1 blocked interval".
+    /// "N intervals" / "1 interval" — the count fragment of the blocked line
+    /// (the "blocked at capture" claim is stated once by `blockedLine`, U6).
     static func blockedCountLabel(_ count: Int) -> String {
-        count == 1 ? "1 blocked interval" : "\(count) blocked intervals"
+        count == 1 ? "1 interval" : "\(count) intervals"
     }
 
     /// A not-captured span rendered as `Xm Ys` (or `Ys` under a minute) from a
@@ -38,9 +39,10 @@ enum RecordedSummaryDisplay {
         return minutes > 0 ? "\(minutes)m \(seconds)s" : "\(seconds)s"
     }
 
-    /// The blocked reassurance line, e.g. "2 blocked intervals · 1m 5s not captured".
+    /// The blocked reassurance line in the day strip's vocabulary (U6/R9),
+    /// e.g. "Blocked at capture · 2 intervals · 1m 5s not captured".
     static func blockedLine(count: Int, spanMs: Int) -> String {
-        "\(blockedCountLabel(count)) · \(spanLabel(ms: spanMs)) not captured"
+        "Blocked at capture · \(blockedCountLabel(count)) · \(spanLabel(ms: spanMs)) not captured"
     }
 
     /// A single blocked range as `HH:MM–HH:MM`, reusing the day strip's wall-clock
@@ -51,12 +53,14 @@ enum RecordedSummaryDisplay {
             + "–\(DayStripAccessibility.hourMinuteText(ms: interval.endMs))"
     }
 
-    /// VoiceOver label for a blocked range, mirroring `DayStripAccessibility`'s
-    /// "Blocked, nothing captured, HH:MM to HH:MM" wording (KTD6).
+    /// VoiceOver label for a blocked range: delegates to the strip's own
+    /// `blockedLabel` ("Blocked at capture, HH:MM to HH:MM") so the pane and
+    /// the day strip can never diverge on the blocked sentence (U6/R9,
+    /// supersedes the KTD6 mirroring).
     static func rangeAccessibilityLabel(_ interval: CapturedInterval) -> String {
-        "Blocked, nothing captured, "
-            + "\(DayStripAccessibility.hourMinuteText(ms: interval.startMs)) to "
-            + "\(DayStripAccessibility.hourMinuteText(ms: interval.endMs))"
+        DayStripAccessibility.blockedLabel(
+            DayStripBlockedBand(startMs: interval.startMs, endMs: interval.endMs)
+        )
     }
 }
 
@@ -223,7 +227,11 @@ struct RecordedSummaryPane: View {
     }
 
     /// The blocked reassurance line (KTD5): count + total not-captured span,
-    /// expandable to the individual `HH:MM–HH:MM` ranges.
+    /// expandable to the individual `HH:MM–HH:MM` ranges. Blocked-only by
+    /// design: `RecordedSummary` is built from the recording's own events +
+    /// capture-time `blocked_intervals` and carries no retroactively-purged
+    /// spans (those live on the `timeline.day` wire) — so the pane makes no
+    /// purged claim rather than a wrong one (U6/AE10).
     private var blockedSection: some View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: 4) {
@@ -253,7 +261,7 @@ struct RecordedSummaryPane: View {
             .contentShape(Rectangle())
             .accessibilityElement(children: .combine)
             .accessibilityLabel(
-                "Blocked, nothing captured, "
+                "Blocked at capture, "
                     + "\(RecordedSummaryDisplay.blockedCountLabel(summary.blockedCount)), "
                     + "\(RecordedSummaryDisplay.spanLabel(ms: summary.blockedTotalMs)) not captured"
             )

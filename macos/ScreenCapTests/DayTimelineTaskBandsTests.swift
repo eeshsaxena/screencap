@@ -68,6 +68,90 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         XCTAssertTrue(resp.recordings[0].tasks.isEmpty, "absent `tasks` → empty, not an error")
     }
 
+    // MARK: - Decoding the additive provenance fields (v3)
+
+    /// A v3 `timeline.day` recording carries `end_status` + `purged` spans, and
+    /// the envelope carries `store_mounted` + `coverage_complete`.
+    func testTimelineDayDecodesProvenanceFields() throws {
+        let json = """
+        {
+          "ok": true, "schema_version": 1, "daemon_version": "0.0.0",
+          "api_schema_version": 3, "date": "2026-07-13",
+          "store_mounted": false,
+          "coverage_complete": false,
+          "recordings": [
+            {
+              "name": "rec-a", "recording_id": "id-a", "state": "ready",
+              "start_ms": 100000, "end_ms": 400000,
+              "blocked_proven": [], "unverifiable": [],
+              "end_status": "interrupted",
+              "purged": [
+                {"start_ms": 120000, "end_ms": 150000,
+                 "bundle_id": "com.1password.1password", "app_name": "1Password",
+                 "root_domain": null},
+                {"start_ms": 200000, "end_ms": 210000,
+                 "bundle_id": null, "app_name": null, "root_domain": "chase.com"}
+              ]
+            }
+          ]
+        }
+        """
+        let resp = try JSONDecoder().decode(TimelineDayResponse.self, from: Data(json.utf8))
+        XCTAssertFalse(resp.storeMounted)
+        XCTAssertFalse(resp.coverageComplete)
+        let rec = resp.recordings[0]
+        XCTAssertEqual(rec.endStatus, "interrupted")
+        XCTAssertEqual(rec.purged.count, 2)
+        XCTAssertEqual(rec.purged[0].startMs, 120_000)
+        XCTAssertEqual(rec.purged[0].endMs, 150_000)
+        XCTAssertEqual(rec.purged[0].bundleId, "com.1password.1password")
+        XCTAssertEqual(rec.purged[0].appName, "1Password")
+        XCTAssertNil(rec.purged[0].rootDomain)
+        XCTAssertNil(rec.purged[1].bundleId)
+        XCTAssertEqual(rec.purged[1].rootDomain, "chase.com")
+    }
+
+    /// An older daemon (pre-v3 `timeline.day`) omits `end_status`, `purged`,
+    /// `store_mounted`, and `coverage_complete` entirely — absence is unknown
+    /// provenance, never a decode error: nil endStatus, empty purged,
+    /// storeMounted true, coverageComplete true.
+    func testTimelineDayDecodesWithoutProvenanceFieldsFromOlderDaemon() throws {
+        let json = """
+        {
+          "ok": true, "schema_version": 1, "daemon_version": "0.0.0",
+          "api_schema_version": 2, "date": "2026-07-13",
+          "recordings": [
+            {
+              "name": "rec-legacy", "recording_id": null, "state": "ready",
+              "start_ms": 100000, "end_ms": 200000,
+              "blocked_proven": [], "unverifiable": []
+            }
+          ]
+        }
+        """
+        let resp = try JSONDecoder().decode(TimelineDayResponse.self, from: Data(json.utf8))
+        XCTAssertTrue(resp.storeMounted, "absent `store_mounted` → true, not an error")
+        XCTAssertTrue(resp.coverageComplete, "absent `coverage_complete` → true, not an error")
+        let rec = resp.recordings[0]
+        XCTAssertNil(rec.endStatus, "absent `end_status` → nil (unknown), not an error")
+        XCTAssertTrue(rec.purged.isEmpty, "absent `purged` → empty, not an error")
+    }
+
+    /// A purged span whose identity keys are all explicit JSON null decodes
+    /// identity-free rather than failing.
+    func testPurgedIntervalWithNullIdentityKeysDecodesIdentityFree() throws {
+        let json = """
+        {"start_ms": 1000, "end_ms": 2000,
+         "bundle_id": null, "app_name": null, "root_domain": null}
+        """
+        let span = try JSONDecoder().decode(DayPurgedInterval.self, from: Data(json.utf8))
+        XCTAssertEqual(span.startMs, 1000)
+        XCTAssertEqual(span.endMs, 2000)
+        XCTAssertNil(span.bundleId)
+        XCTAssertNil(span.appName)
+        XCTAssertNil(span.rootDomain)
+    }
+
     // MARK: - N tasks → N bands over the base track
 
     /// Each recording contributes one band per task, with `start_ts`/`end_ts`
@@ -130,15 +214,25 @@ final class DayTimelineTaskBandsTests: XCTestCase {
 
     // MARK: - Legend
 
-    /// SCR-214 retires the honesty substitutions: the four honest region swatches
-    /// (task, unsplit, nothing-captured, blocked) are all present with copy that
-    /// states them directly — no "recording" placeholder.
-    func testLegendHasTheFourRequiredSwatches() {
+    /// U6 (R8/R10): every legend entry speaks plain language a first-time user
+    /// can parse; the empty-stretch entry signals that hover explains the
+    /// cause; and the purged entry carries its OWN swatch — pinned unequal to
+    /// the blocked one so purged can never render as blocked.
+    func testLegendUsesPlainLanguageAndCarriesDistinctPurgedSwatch() {
         let items = DayStripLegend.items
-        XCTAssertTrue(items.contains { $0.swatch == .task && $0.text == "agent/user task" })
-        XCTAssertTrue(items.contains { $0.swatch == .unsplit && $0.text == "unsplit — still searchable" })
-        XCTAssertTrue(items.contains { $0.swatch == .nothingCaptured && $0.text == "nothing captured" })
-        XCTAssertTrue(items.contains { $0.swatch == .blocked && $0.text == "blocked — nothing captured" })
+        XCTAssertTrue(items.contains { $0.swatch == .task && $0.text == "task" })
+        XCTAssertTrue(items.contains { $0.swatch == .unsplit && $0.text == "recorded — searchable" })
+        XCTAssertTrue(items.contains {
+            $0.swatch == .nothingCaptured && $0.text == "empty — hover for why"
+        })
+        XCTAssertTrue(items.contains { $0.swatch == .searchMatch && $0.text == "search match" })
+        XCTAssertTrue(items.contains { $0.swatch == .blocked && $0.text == "blocked at capture" })
+        let purged = items.first { $0.text == "removed by your rules" }
+        XCTAssertEqual(purged?.swatch, DayStripLegend.Swatch.purged, "purged has its own swatch")
+        XCTAssertNotEqual(
+            purged?.swatch, DayStripLegend.Swatch.blocked,
+            "R10: the purged swatch is never the blocked swatch"
+        )
         XCTAssertFalse(items.contains { $0.text == "recording" }, "the 'recording' placeholder is retired")
     }
 
@@ -191,10 +285,14 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         XCTAssertTrue(baseLabel.hasPrefix("Morning session, "))
         XCTAssertTrue(baseLabel.contains("unsplit, still searchable"))
 
-        let gapLabel = DayStripAccessibility.gapLabel(startMs: dayStart, endMs: dayStart + hour)
-        XCTAssertTrue(gapLabel.hasPrefix("Nothing captured, "))
+        // U6: the legacy blanket `gapLabel` is retired — gaps speak through the
+        // U5 cause labels ("Nothing on file, …" is the honest data claim).
+        let gapLabel = DayStripAccessibility.gapCauseLabel(
+            .nothingOnFile, startMs: dayStart, endMs: dayStart + hour
+        )
+        XCTAssertEqual(gapLabel?.hasPrefix("Nothing on file, "), true)
 
         let blocked = DayStripBlockedBand(startMs: dayStart, endMs: dayStart + hour)
-        XCTAssertTrue(DayStripAccessibility.blockedLabel(blocked).hasPrefix("Blocked, nothing captured"))
+        XCTAssertTrue(DayStripAccessibility.blockedLabel(blocked).hasPrefix("Blocked at capture, "))
     }
 }

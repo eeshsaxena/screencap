@@ -19,7 +19,7 @@ from typing import Any
 
 from screencap import __version__
 
-_LOG_FILENAME = ".menubar_disable_log.jsonl"
+LOG_FILENAME = ".menubar_disable_log.jsonl"
 _FORMAT_VERSION = 1
 
 
@@ -27,7 +27,7 @@ class DisableLogWriter:
     """Append-only writer for the disable audit log."""
 
     def __init__(self, capture_dir: str | os.PathLike[str]) -> None:
-        self._path = Path(capture_dir) / _LOG_FILENAME
+        self._path = Path(capture_dir) / LOG_FILENAME
         self._lock = threading.Lock()
 
     @property

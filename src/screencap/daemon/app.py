@@ -3006,6 +3006,15 @@ async def timeline_day(request: Request) -> JSONResponse:
     must NOT label these "blocked", R7). Recording names are fine here — this is a
     same-EUID app surface (the name-free constraint is a backfill-progress rule).
 
+    SCR-277 provenance (v3, additive): each recording also carries ``end_status``
+    + ``purged`` spans, and the envelope ``store_mounted`` + ``coverage_complete``
+    flags (the latter False when an unreadable recording.db kept a recording off
+    the day — an empty stretch is then not proof of anything). The handler
+    resolves the real vault store state (KTD-14 — a locked/absent store is a
+    healthy serving state) and passes it into ``day_segments`` so a sealed store
+    surfaces as ``store_mounted: False`` with no recordings, never a confident
+    empty day.
+
     A malformed ``date`` returns a typed 400 (``invalid_request``); a legitimate
     empty day returns ``ok:true`` with no recordings. Deliberately NOT in
     ``_ACTIVITY_PATHS`` — a read verb must not reset the idle-shutdown clock.
@@ -3026,7 +3035,10 @@ async def timeline_day(request: Request) -> JSONResponse:
             )
         try:
             result = await asyncio.to_thread(
-                day_segments.day_segments, parsed.date, parsed.tz_offset_seconds,
+                day_segments.day_segments,
+                parsed.date,
+                parsed.tz_offset_seconds,
+                store_mounted=_store_is_mounted(request),
             )
         except day_segments.InvalidDayRequest:
             return _validation_error_response(
@@ -3043,6 +3055,13 @@ async def timeline_day(request: Request) -> JSONResponse:
             schema.envelope(
                 schema_version=schema._TIMELINE_DAY_API_VERSION,
                 date=result["date"],
+                # Threaded explicitly — `envelope` takes kwargs, so a key left
+                # out here would silently vanish from the wire. Absent from an
+                # older day_segments shape → True (plaintext-install behavior).
+                store_mounted=result.get("store_mounted", True),
+                # Same explicit threading; absent from an older shape → True
+                # (complete coverage was the pre-flag implicit claim).
+                coverage_complete=result.get("coverage_complete", True),
                 recordings=recordings,
             )
         )

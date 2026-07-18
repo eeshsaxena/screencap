@@ -35,7 +35,14 @@ _TIMELINE_QUERY_API_VERSION = 1
 # ``DaySegmentRecording``. No global API_SCHEMA_VERSION bump — older clients
 # ignore the unknown key (mirrors the transcript.search / daemon.info additive
 # precedent); the verb const bump signals the new field to clients that read it.
-_TIMELINE_DAY_API_VERSION = 2
+# v3 (SCR-277 provenance): additive per-recording ``end_status`` +
+# ``purged: [DayPurgedInterval]`` (retroactive-purge spans with optional
+# disable-target identity) and a top-level ``store_mounted`` on the response.
+# Same additive convention — no global bump. ``coverage_complete`` (the
+# unplaceable-recording honesty gate — False when a corrupt recording.db kept
+# a recording off the day) ships in the same v3 release, additive with a
+# tolerant default, so it needs no further bump.
+_TIMELINE_DAY_API_VERSION = 3
 # SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
 # gains nullable timing fields without an API bump (mirrors the additive
 # `daemon.info` permissions precedent — older clients ignore unknown keys).
@@ -149,6 +156,7 @@ _MODEL_NAMES = {
     "TimelineQueryResponse",
     "TimelineDayRequest",
     "DayBlockedInterval",
+    "DayPurgedInterval",
     "DaySegmentRecording",
     "TimelineDayResponse",
     "FrameNearestRequest",
@@ -604,6 +612,24 @@ def _load_models() -> dict[str, Any]:
         start_ms: int
         end_ms: int
 
+    class DayPurgedInterval(_DaemonModel):
+        """A retroactive-purge span (SCR-277) on the day timeline, in absolute
+        unix ms, optionally carrying the disable target's identity joined from
+        the per-recording disable log.
+
+        NOT capture-time masking — distinct from ``DayBlockedInterval`` so the
+        UI can never conflate a purge with proven blocking (R7). The identity
+        keys are null whenever the join was ambiguous or the audit log was
+        missing/corrupt: ``day_segments`` degrades to identity-free rather than
+        ever guessing.
+        """
+
+        start_ms: int
+        end_ms: int
+        bundle_id: str | None = None
+        app_name: str | None = None
+        root_domain: str | None = None
+
     class TaskSegment(_DaemonModel):
         """One named task segment from a LOCAL recording's tasks store (U4).
 
@@ -640,6 +666,12 @@ def _load_models() -> dict[str, Any]:
         recording with no tasks store / a legacy or cloud recording. Local-only:
         it is read straight off the recording's local ``recording.db`` and adds
         no new upload surface.
+
+        ``end_status`` / ``purged`` (SCR-277 provenance, additive): how the
+        recording ended (``"live"`` / ``"clean"`` / ``"interrupted"`` /
+        ``"unknown"``; typed ``str`` not ``Literal`` for tolerant decode,
+        mirroring :class:`PermissionGrants`) and the retroactive-purge spans.
+        Nullable/empty defaults so a pre-U1 producer shape still validates.
         """
 
         name: str
@@ -650,10 +682,22 @@ def _load_models() -> dict[str, Any]:
         blocked_proven: list[DayBlockedInterval]
         unverifiable: list[DayBlockedInterval]
         tasks: list[TaskSegment] = []
+        end_status: str | None = None
+        purged: list[DayPurgedInterval] = []
 
     class TimelineDayResponse(EnvelopeResponse):
         date: str
         recordings: list[DaySegmentRecording]
+        # SCR-277 provenance: False → the vault store is locked/absent and the
+        # UI must render the whole day "can't verify", never a confident empty
+        # day. Absent on an older daemon → True (plaintext-install behavior).
+        store_mounted: bool = True
+        # False → at least one recording couldn't be placed on the timeline
+        # (corrupt/unreadable recording.db → unknown span), so an empty stretch
+        # is NOT proof nothing is on file — the UI must degrade confident
+        # "nothing on file" gap claims to "can't verify" (R7). Absent on an
+        # older daemon → True.
+        coverage_complete: bool = True
 
     # SCR-186 frame.nearest input bounds. ``timestamp_ms`` is bounded to a
     # realistic epoch ceiling (year 9999) and ``staleness_cap_ms`` to 24h —
@@ -1185,6 +1229,7 @@ def _load_models() -> dict[str, Any]:
         "TimelineQueryResponse": TimelineQueryResponse,
         "TimelineDayRequest": TimelineDayRequest,
         "DayBlockedInterval": DayBlockedInterval,
+        "DayPurgedInterval": DayPurgedInterval,
         "DaySegmentRecording": DaySegmentRecording,
         "TimelineDayResponse": TimelineDayResponse,
         "FrameNearestRequest": FrameNearestRequest,

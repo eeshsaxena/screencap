@@ -10,7 +10,11 @@ round-trip — no per-recording ``tasks.list`` call. These tests pin:
 * a recording with NO tasks (or a legacy / missing / unreadable ``recording.db``)
   returns ``tasks: []`` — a fail-open read surface, never an error;
 * the pre-U9 ``DaySegmentRecording`` fields are unchanged (additivity);
-* the ``timeline.day`` verb API version const was bumped.
+* the ``timeline.day`` verb API version const was bumped;
+* (U2, SCR-277 provenance) the additive ``end_status`` / ``purged`` fields and
+  the top-level ``store_mounted`` survive the daemon boundary — the
+  ``DaySegmentRecording`` round-trip is ``extra="ignore"``, so a key missing
+  from the model is SILENTLY dropped from the wire.
 
 Privacy-marked (mirrors ``test_day_segments``): CI runs only ``pytest -m
 privacy``, and this exercises the same local-only day read surface. Vision-free
@@ -25,9 +29,11 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from screencap import day_segments
 from screencap.daemon import schema
+from screencap.daemon.app import build_app
 
 pytestmark = pytest.mark.privacy
 
@@ -197,14 +203,15 @@ def test_read_task_segments_fail_open_on_missing_or_unreadable_db(tmp_path):
 
 
 def test_existing_day_segment_fields_unchanged_additive(tmp_path):
-    """The pre-U9 fields are all still present and unchanged; ``tasks`` is the
-    ONLY new key (additivity regression guard)."""
+    """The pre-existing fields are all still present and unchanged; ``tasks``
+    (U9) and ``end_status`` / ``purged`` (SCR-277 provenance) are the only new
+    keys (additivity regression guard — closed set)."""
     rec = tmp_path / "ambient-20260703"
     _make_recording_db(rec, started=_DAY_START + 3600, end=_DAY_START + 4200)
     entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "ambient-20260703")
     assert set(entry) == {
         "name", "recording_id", "state", "start_ms", "end_ms",
-        "blocked_proven", "unverifiable", "tasks",
+        "blocked_proven", "unverifiable", "tasks", "end_status", "purged",
     }
     # The original honesty split + span keys keep their meaning/types.
     assert entry["name"] == "ambient-20260703"
@@ -215,5 +222,104 @@ def test_existing_day_segment_fields_unchanged_additive(tmp_path):
 
 
 def test_timeline_day_api_version_bumped():
-    """The additive ``tasks`` field bumped the ``timeline.day`` verb const."""
-    assert schema._TIMELINE_DAY_API_VERSION == 2
+    """The additive ``tasks`` field (v2) and the SCR-277 provenance fields
+    (``end_status`` / ``purged`` / ``store_mounted``, v3) each bumped the
+    ``timeline.day`` verb const."""
+    assert schema._TIMELINE_DAY_API_VERSION == 3
+
+
+# --- U2: provenance fields survive the daemon boundary ----------------------
+
+
+@pytest.mark.asyncio
+async def test_provenance_fields_survive_the_verb_wire(monkeypatch):
+    """A day_segments payload carrying ``end_status`` + purged-with-identity +
+    ``store_mounted`` reaches the HTTP response intact — guards the
+    ``extra="ignore"`` silent drop at the ``DaySegmentRecording`` round-trip and
+    the explicit envelope threading of ``store_mounted``."""
+    canned = {
+        "date": _DAY,
+        "store_mounted": False,  # non-default, proves it's threaded not defaulted
+        "coverage_complete": False,  # non-default, proves it's threaded too
+        "recordings": [
+            {"name": "r", "recording_id": None, "state": "ready",
+             "end_status": "interrupted",
+             "start_ms": 1, "end_ms": 2,
+             "blocked_proven": [], "unverifiable": [],
+             "purged": [{"start_ms": 5, "end_ms": 9,
+                         "bundle_id": "com.example.app", "app_name": "Example"}],
+             "tasks": []},
+        ],
+    }
+    monkeypatch.setattr(day_segments, "day_segments", lambda *a, **k: canned)
+    app = build_app()
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post("/v0/timeline.day", json={"date": _DAY})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["store_mounted"] is False
+    assert body["coverage_complete"] is False
+    rec = body["recordings"][0]
+    assert rec["end_status"] == "interrupted"
+    p = rec["purged"][0]
+    assert (p["start_ms"], p["end_ms"]) == (5, 9)
+    assert p["bundle_id"] == "com.example.app"
+    assert p["app_name"] == "Example"
+    # An identity key day_segments omitted dumps as null — never a guessed value.
+    assert p["root_domain"] is None
+
+
+@pytest.mark.asyncio
+async def test_verb_serves_recordings_without_the_new_keys(monkeypatch):
+    """Backward shape: a payload WITHOUT the new keys (pre-U1 producer) still
+    validates and serves — the fields are additive with tolerant defaults, and
+    an absent ``store_mounted`` / ``coverage_complete`` defaults to True on the
+    envelope."""
+    canned = {"date": _DAY, "recordings": [
+        {"name": "r", "recording_id": None, "state": "ready",
+         "start_ms": 1, "end_ms": 2, "blocked_proven": [], "unverifiable": []},
+    ]}
+    monkeypatch.setattr(day_segments, "day_segments", lambda *a, **k: canned)
+    app = build_app()
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post("/v0/timeline.day", json={"date": _DAY})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["store_mounted"] is True
+    assert body["coverage_complete"] is True
+    rec = body["recordings"][0]
+    assert rec["end_status"] is None
+    assert rec["purged"] == []
+
+
+@pytest.mark.asyncio
+async def test_verb_threads_store_state_into_day_segments(monkeypatch):
+    """The handler resolves the daemon's real store state (KTD-14 posture) and
+    passes ``store_mounted`` into ``day_segments`` — a locked store must reach
+    the day surface as ``store_mounted: False``, never a confident empty day."""
+    from screencap.daemon.store_lifecycle import StoreState
+
+    seen: dict = {}
+
+    def fake(date, tz_offset_seconds=0, recordings_dir=None, store_mounted=True):
+        seen["store_mounted"] = store_mounted
+        return {"date": date, "store_mounted": store_mounted, "recordings": []}
+
+    monkeypatch.setattr(day_segments, "day_segments", fake)
+    app = build_app()
+    app.state.store_state = StoreState.LOCKED
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post("/v0/timeline.day", json={"date": _DAY})
+    assert resp.status_code == 200, resp.text
+    assert seen["store_mounted"] is False
+    assert resp.json()["store_mounted"] is False
