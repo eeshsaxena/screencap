@@ -268,6 +268,38 @@ final class DayStripLayoutTests: XCTestCase {
         )
     }
 
+    /// Coverage gate: coverageComplete == false (a recording with an
+    /// unreadable recording.db couldn't be placed on the day) means an empty
+    /// stretch is NOT proof nothing is on file — the confident "nothing on
+    /// file" resolutions (clean predecessor AND leading gap) degrade to
+    /// "can't verify", while an interrupted predecessor's claim stands on its
+    /// own placed evidence.
+    func testGapCauseIncompleteCoverageDegradesNothingOnFileToCantVerify() {
+        let now = dayStart + 20 * hour
+        func cause(_ endStatus: String?, spans: [DayStripLayout.SpanProvenance]) -> DayStripLayout.GapCause {
+            DayStripLayout.gapCause(
+                gapStartMs: dayStart + 10 * hour, gapEndMs: dayStart + 11 * hour,
+                spans: spans, storeMounted: true, coverageComplete: false,
+                provenanceReady: true, nowMs: now
+            )
+        }
+        let clean = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "clean"
+        )
+        XCTAssertEqual(cause("clean", spans: [clean]), .cantVerify,
+                       "clean predecessor no longer proves the gap empty")
+        XCTAssertEqual(cause(nil, spans: []), .cantVerify,
+                       "a leading gap is no longer an honest data claim")
+        let interrupted = DayStripLayout.SpanProvenance(
+            startMs: dayStart + 9 * hour, endMs: dayStart + 10 * hour, endStatus: "interrupted"
+        )
+        XCTAssertEqual(
+            cause("interrupted", spans: [interrupted]),
+            .interrupted(aroundMs: dayStart + 10 * hour),
+            "the interrupted claim rests on the placed recording's own evidence"
+        )
+    }
+
     /// A leading gap (no same-day recording before it) is an honest data claim:
     /// the day query returned and holds nothing there → "nothing on file".
     func testGapCauseLeadingGapReadsNothingOnFile() {

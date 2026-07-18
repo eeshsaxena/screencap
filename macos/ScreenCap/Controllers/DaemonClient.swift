@@ -801,7 +801,10 @@ struct DaySegmentRecording: Decodable, Sendable, Hashable {
 }
 
 /// `timeline.day` response. `storeMounted` (v3, additive) is false while the
-/// vault is sealed; an older daemon omits it → default true, never an error.
+/// vault is sealed; `coverageComplete` (v3, additive) is false when a
+/// recording with an unreadable `recording.db` couldn't be placed on the day —
+/// an empty stretch is then not proof nothing is on file. An older daemon
+/// omits either → default true, never an error.
 struct TimelineDayResponse: Decodable, Sendable {
     let ok: Bool
     let schemaVersion: Int
@@ -810,6 +813,7 @@ struct TimelineDayResponse: Decodable, Sendable {
     let date: String
     let recordings: [DaySegmentRecording]
     let storeMounted: Bool
+    let coverageComplete: Bool
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -821,6 +825,8 @@ struct TimelineDayResponse: Decodable, Sendable {
         recordings = try c.decode([DaySegmentRecording].self, forKey: .recordings)
         // Older daemon (pre-v3 `timeline.day`) omits `store_mounted` entirely.
         storeMounted = try c.decodeIfPresent(Bool.self, forKey: .storeMounted) ?? true
+        // Older daemon omits `coverage_complete` → complete (the pre-flag claim).
+        coverageComplete = try c.decodeIfPresent(Bool.self, forKey: .coverageComplete) ?? true
     }
 
     enum CodingKeys: String, CodingKey {
@@ -831,6 +837,7 @@ struct TimelineDayResponse: Decodable, Sendable {
         case date
         case recordings
         case storeMounted = "store_mounted"
+        case coverageComplete = "coverage_complete"
     }
 }
 

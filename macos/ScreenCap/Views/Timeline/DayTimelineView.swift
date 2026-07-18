@@ -31,6 +31,11 @@ struct DayTimelineView: View {
     /// `timeline.day` response). Feeds the strip so every empty stretch reads
     /// "can't verify" instead of "nothing on file" when the store is locked.
     @State private var storeMounted = true
+    /// Coverage gate: false when a recording with an unreadable `recording.db`
+    /// couldn't be placed on the day (`coverage_complete` on the `timeline.day`
+    /// response). Feeds the strip so "nothing on file" degrades to "can't
+    /// verify" — never a confident data claim over unplaced footage.
+    @State private var coverageComplete = true
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var searchTask: Task<Void, Never>?
@@ -492,6 +497,7 @@ struct DayTimelineView: View {
                     )
                 },
                 storeMounted: storeMounted,
+                coverageComplete: coverageComplete,
                 provenanceReady: loadPhase == .ready,
                 pendingSelection: markPendingSelection,
                 pendingEndpointMs: markPendingEndpoint
@@ -585,6 +591,7 @@ struct DayTimelineView: View {
             let response = try await DaemonClient.timelineDay(request)
             spans = response.recordings
             storeMounted = response.storeMounted
+            coverageComplete = response.coverageComplete
             loadPhase = .ready
         } catch {
             spans = []

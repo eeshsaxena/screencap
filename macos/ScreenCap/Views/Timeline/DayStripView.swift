@@ -331,23 +331,32 @@ enum DayStripLayout {
     /// a live predecessor reads "still recording" and is never called
     /// interrupted (R11). Callers must pre-split gaps at `nowMs`
     /// (`splitGapAtNow`) so one gap never mixes a past claim with future time.
+    ///
+    /// Coverage gate (`coverageComplete == false`): a recording with an
+    /// unreadable `recording.db` couldn't be placed on the day, so an empty
+    /// stretch is no longer proof nothing is on file — the confident
+    /// `.nothingOnFile` resolutions degrade to `.cantVerify`. Interrupted /
+    /// still-recording / future / no-claim behavior is unchanged: those claims
+    /// rest on a *placed* recording's own evidence, not on the gap being empty.
     static func gapCause(
         gapStartMs: Int,
         gapEndMs: Int,
         spans: [SpanProvenance],
         storeMounted: Bool,
+        coverageComplete: Bool = true,
         provenanceReady: Bool,
         nowMs: Int
     ) -> GapCause {
         guard provenanceReady else { return .none }
         guard gapStartMs < nowMs else { return .none }
         guard storeMounted else { return .cantVerify }
+        let nothingOnFile: GapCause = coverageComplete ? .nothingOnFile : .cantVerify
         let preceding = spans
             .filter { $0.endMs <= gapStartMs }
             .max { $0.endMs < $1.endMs }
-        guard let preceding else { return .nothingOnFile }
+        guard let preceding else { return nothingOnFile }
         switch preceding.endStatus {
-        case "clean": return .nothingOnFile
+        case "clean": return nothingOnFile
         case "interrupted": return .interrupted(aroundMs: preceding.endMs)
         case "live": return .stillRecording
         default: return .cantVerify
@@ -459,6 +468,10 @@ struct DayStripView: View {
     /// U5 — store gate: false while the vault is sealed → every empty stretch
     /// reads "can't verify", never "nothing on file".
     var storeMounted: Bool = true
+    /// Coverage gate: false when a recording with an unreadable `recording.db`
+    /// couldn't be placed on the day (`coverage_complete` on the `timeline.day`
+    /// response) → "nothing on file" claims degrade to "can't verify".
+    var coverageComplete: Bool = true
     /// U5 — load gate: false until the day query returns; while false, gap
     /// regions carry NO cause claim (neutral copy only). Defaults to false so
     /// a call site that never wires provenance can't over-claim.
@@ -764,6 +777,7 @@ struct DayStripView: View {
                 let cause = DayStripLayout.gapCause(
                     gapStartMs: part.startMs, gapEndMs: part.endMs,
                     spans: spanProvenance, storeMounted: storeMounted,
+                    coverageComplete: coverageComplete,
                     provenanceReady: provenanceReady, nowMs: nowMs
                 )
                 if let claim = DayStripAccessibility.gapCauseLabel(

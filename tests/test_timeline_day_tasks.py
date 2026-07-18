@@ -240,6 +240,7 @@ async def test_provenance_fields_survive_the_verb_wire(monkeypatch):
     canned = {
         "date": _DAY,
         "store_mounted": False,  # non-default, proves it's threaded not defaulted
+        "coverage_complete": False,  # non-default, proves it's threaded too
         "recordings": [
             {"name": "r", "recording_id": None, "state": "ready",
              "end_status": "interrupted",
@@ -261,6 +262,7 @@ async def test_provenance_fields_survive_the_verb_wire(monkeypatch):
     body = resp.json()
     assert body["ok"] is True
     assert body["store_mounted"] is False
+    assert body["coverage_complete"] is False
     rec = body["recordings"][0]
     assert rec["end_status"] == "interrupted"
     p = rec["purged"][0]
@@ -275,7 +277,8 @@ async def test_provenance_fields_survive_the_verb_wire(monkeypatch):
 async def test_verb_serves_recordings_without_the_new_keys(monkeypatch):
     """Backward shape: a payload WITHOUT the new keys (pre-U1 producer) still
     validates and serves — the fields are additive with tolerant defaults, and
-    an absent ``store_mounted`` defaults to True on the envelope."""
+    an absent ``store_mounted`` / ``coverage_complete`` defaults to True on the
+    envelope."""
     canned = {"date": _DAY, "recordings": [
         {"name": "r", "recording_id": None, "state": "ready",
          "start_ms": 1, "end_ms": 2, "blocked_proven": [], "unverifiable": []},
@@ -290,6 +293,7 @@ async def test_verb_serves_recordings_without_the_new_keys(monkeypatch):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["store_mounted"] is True
+    assert body["coverage_complete"] is True
     rec = body["recordings"][0]
     assert rec["end_status"] is None
     assert rec["purged"] == []

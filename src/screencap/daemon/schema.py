@@ -38,7 +38,10 @@ _TIMELINE_QUERY_API_VERSION = 1
 # v3 (SCR-277 provenance): additive per-recording ``end_status`` +
 # ``purged: [DayPurgedInterval]`` (retroactive-purge spans with optional
 # disable-target identity) and a top-level ``store_mounted`` on the response.
-# Same additive convention — no global bump.
+# Same additive convention — no global bump. ``coverage_complete`` (the
+# unplaceable-recording honesty gate — False when a corrupt recording.db kept
+# a recording off the day) ships in the same v3 release, additive with a
+# tolerant default, so it needs no further bump.
 _TIMELINE_DAY_API_VERSION = 3
 # SCR-186 nearest-frame resolution verb. Additive (new verb); transcript.search
 # gains nullable timing fields without an API bump (mirrors the additive
@@ -689,6 +692,12 @@ def _load_models() -> dict[str, Any]:
         # UI must render the whole day "can't verify", never a confident empty
         # day. Absent on an older daemon → True (plaintext-install behavior).
         store_mounted: bool = True
+        # False → at least one recording couldn't be placed on the timeline
+        # (corrupt/unreadable recording.db → unknown span), so an empty stretch
+        # is NOT proof nothing is on file — the UI must degrade confident
+        # "nothing on file" gap claims to "can't verify" (R7). Absent on an
+        # older daemon → True.
+        coverage_complete: bool = True
 
     # SCR-186 frame.nearest input bounds. ``timestamp_ms`` is bounded to a
     # realistic epoch ceiling (year 9999) and ``staleness_cap_ms`` to 24h —

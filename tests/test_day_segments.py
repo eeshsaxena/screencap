@@ -210,7 +210,12 @@ def test_recording_outside_the_day_is_excluded(tmp_path):
 
 def test_empty_day_returns_no_recordings(tmp_path):
     result = day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path)
-    assert result == {"date": _DAY, "recordings": [], "store_mounted": True}
+    assert result == {
+        "date": _DAY,
+        "recordings": [],
+        "store_mounted": True,
+        "coverage_complete": True,
+    }
 
 
 # --- end-status classifier (U1) --------------------------------------------
@@ -453,6 +458,43 @@ def test_locked_store_signalled_and_yields_no_recordings(tmp_path):
     result = day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path, store_mounted=False)
     assert result["store_mounted"] is False
     assert result["recordings"] == []
+
+
+# --- coverage gate (unplaceable recordings) ----------------------------------
+#
+# Honesty rule (R7): a recording whose recording.db is corrupt/unreadable has
+# started=None — an UNKNOWN span that may overlap this day. Dropping it must
+# flip `coverage_complete` to False so the UI degrades confident "nothing on
+# file" gap claims to "can't verify", never a false data claim over footage
+# that exists on disk.
+
+
+def test_corrupt_recording_db_drops_coverage_complete_but_serves_good_recording(tmp_path):
+    good = tmp_path / "good-rec"
+    _make_recording_db(
+        good, started=_DAY_START + 3600, end=_DAY_START + 4200,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    corrupt = tmp_path / "corrupt-rec"
+    corrupt.mkdir()
+    # A truncated / garbage recording.db: catalog reads it as corrupt →
+    # started_at is None → the recording is unplaceable on any day.
+    (corrupt / "recording.db").write_bytes(b"this is not a sqlite database")
+
+    result = day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path)
+    assert result["coverage_complete"] is False
+    assert [r["name"] for r in result["recordings"]] == ["good-rec"]
+
+
+def test_normal_day_reports_coverage_complete(tmp_path):
+    rec = tmp_path / "healthy-rec"
+    _make_recording_db(
+        rec, started=_DAY_START + 3600, end=_DAY_START + 4200,
+        windows=[{"ts": _DAY_START + 3600, "bundle": "com.example.unknownbenign"}],
+    )
+    result = day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path)
+    assert result["coverage_complete"] is True
+    assert len(result["recordings"]) == 1
 
 
 # --- purge split (U1 / SCR-277) ---------------------------------------------

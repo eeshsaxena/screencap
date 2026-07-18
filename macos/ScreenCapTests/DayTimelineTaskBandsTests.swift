@@ -71,13 +71,14 @@ final class DayTimelineTaskBandsTests: XCTestCase {
     // MARK: - Decoding the additive provenance fields (v3)
 
     /// A v3 `timeline.day` recording carries `end_status` + `purged` spans, and
-    /// the envelope carries `store_mounted`.
+    /// the envelope carries `store_mounted` + `coverage_complete`.
     func testTimelineDayDecodesProvenanceFields() throws {
         let json = """
         {
           "ok": true, "schema_version": 1, "daemon_version": "0.0.0",
           "api_schema_version": 3, "date": "2026-07-13",
           "store_mounted": false,
+          "coverage_complete": false,
           "recordings": [
             {
               "name": "rec-a", "recording_id": "id-a", "state": "ready",
@@ -97,6 +98,7 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         """
         let resp = try JSONDecoder().decode(TimelineDayResponse.self, from: Data(json.utf8))
         XCTAssertFalse(resp.storeMounted)
+        XCTAssertFalse(resp.coverageComplete)
         let rec = resp.recordings[0]
         XCTAssertEqual(rec.endStatus, "interrupted")
         XCTAssertEqual(rec.purged.count, 2)
@@ -110,8 +112,9 @@ final class DayTimelineTaskBandsTests: XCTestCase {
     }
 
     /// An older daemon (pre-v3 `timeline.day`) omits `end_status`, `purged`,
-    /// and `store_mounted` entirely — absence is unknown provenance, never a
-    /// decode error: nil endStatus, empty purged, storeMounted true.
+    /// `store_mounted`, and `coverage_complete` entirely — absence is unknown
+    /// provenance, never a decode error: nil endStatus, empty purged,
+    /// storeMounted true, coverageComplete true.
     func testTimelineDayDecodesWithoutProvenanceFieldsFromOlderDaemon() throws {
         let json = """
         {
@@ -128,6 +131,7 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         """
         let resp = try JSONDecoder().decode(TimelineDayResponse.self, from: Data(json.utf8))
         XCTAssertTrue(resp.storeMounted, "absent `store_mounted` → true, not an error")
+        XCTAssertTrue(resp.coverageComplete, "absent `coverage_complete` → true, not an error")
         let rec = resp.recordings[0]
         XCTAssertNil(rec.endStatus, "absent `end_status` → nil (unknown), not an error")
         XCTAssertTrue(rec.purged.isEmpty, "absent `purged` → empty, not an error")

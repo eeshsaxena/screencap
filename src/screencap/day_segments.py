@@ -362,6 +362,8 @@ def day_segments(
 
         {"date": "YYYY-MM-DD",
          "store_mounted": bool,               # False → gaps are "can't verify"
+         "coverage_complete": bool,           # False → an unplaceable recording
+                                              # was dropped; empty ≠ proof (R7)
          "recordings": [
             {"name", "recording_id", "state",
              "end_status",                    # "live"|"clean"|"interrupted"|"unknown"
@@ -383,6 +385,14 @@ def day_segments(
     recordings, so the UI resolves the whole day to "can't verify" rather than a
     confident empty day.
 
+    ``coverage_complete``: True when every listed recording could be placed on
+    the timeline. A recording whose ``recording.db`` is corrupt/unreadable has
+    ``started_at is None`` — an UNKNOWN span that may well overlap this day —
+    so dropping ANY such recording flips the flag to False for the whole day:
+    an empty stretch is then no longer proof nothing is on file, and the UI
+    must degrade its confident "nothing on file" gap claims to "can't verify"
+    (R7 — never a false data claim over footage that exists on disk).
+
     A recording that spans midnight appears in BOTH days, clamped to each. Raises
     :class:`InvalidDayRequest` on a malformed ``date_str`` (the handler maps that
     to a typed 400).
@@ -400,6 +410,7 @@ def day_segments(
         "date": date_str,
         "recordings": [],
         "store_mounted": mounted,
+        "coverage_complete": True,
     }
     if not mounted:
         return result
@@ -411,6 +422,12 @@ def day_segments(
     for meta in catalog.list_recordings(recordings_dir):
         started = meta.started_at
         if started is None:
+            # Unplaceable: a corrupt/unreadable recording.db yields no start
+            # time, so this recording's span is UNKNOWN — it may overlap this
+            # day. Dropping it silently would let the strip claim "nothing on
+            # file" over footage that exists on disk, so the whole day's
+            # coverage is marked incomplete instead (R7).
+            result["coverage_complete"] = False
             continue
         end = started + (meta.duration_seconds or 0.0)
 
