@@ -82,6 +82,11 @@ _STORAGE_ENCRYPT_API_VERSION = 1
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
 # additive precedent).
 _TASKS_LIST_API_VERSION = 1
+# Day-first navigation U5: the cross-day ``tasks.query`` read verb — per-day task
+# segments aggregated across recordings + a per-recording honest-status rollup.
+# Additive (new verb) — no global API_SCHEMA_VERSION bump (mirrors the tasks.list
+# additive precedent).
+_TASKS_QUERY_API_VERSION = 1
 # SCR-214 U7 user task CRUD verbs (create/update/delete/merge/split). Each
 # mutates the LOCAL-only tasks store (never uploaded — R8). Additive (new verbs)
 # — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
@@ -173,6 +178,11 @@ _MODEL_NAMES = {
     "TasksListRequest",
     "TaskSegment",
     "TasksListResponse",
+    "TasksQueryRequest",
+    "TasksQueryTask",
+    "TasksQueryDay",
+    "TasksQueryRecordingStatus",
+    "TasksQueryResponse",
     "TasksCreateRequest",
     "TasksCreateResponse",
     "TasksUpdateRequest",
@@ -919,6 +929,78 @@ def _load_models() -> dict[str, Any]:
         # omits the field entirely (clients decode that as absent).
         detail: str | None = None
 
+    class TasksQueryRequest(_DaemonModel):
+        """U5 cross-day ``tasks.query`` input: a local calendar date RANGE.
+
+        ``start_date`` / ``end_date`` are ``YYYY-MM-DD`` (format + inverted-range
+        validated in ``tasks_query`` → typed 400, mirroring ``timeline.day``).
+        ``tz_offset_seconds`` is seconds EAST of UTC, bounded to ±14h (the widest
+        real-world offset) — the same bound + KTD-11 day rule as ``timeline.day``.
+        """
+
+        start_date: str = Field(max_length=32)
+        end_date: str = Field(max_length=32)
+        tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
+
+    class TasksQueryTask(_DaemonModel):
+        """One named task in the cross-day list, carrying its recording pointer.
+
+        The shared 6-field ``TaskSegment`` shape (``task_index`` / ``start_ts`` /
+        ``end_ts`` / ``name`` / ``category`` / ``confidence``) plus the
+        ``recording`` (+ ``recording_id``) it came from — the Tasks surface needs
+        the recording key to seek into its day page and to curate the task
+        (rename/split/merge/delete route through the per-recording CRUD verbs).
+        ``start_ts`` / ``end_ts`` are Unix seconds (the ledger's native units).
+        """
+
+        recording: str
+        recording_id: str | None = None
+        task_index: int
+        start_ts: float
+        end_ts: float
+        name: str
+        category: str | None = None
+        confidence: str | None = None
+
+    class TasksQueryDay(_DaemonModel):
+        """All tasks that map to one local calendar day (KTD-11), start-ordered."""
+
+        date: str
+        tasks: list[TasksQueryTask]
+
+    class TasksQueryRecordingStatus(_DaemonModel):
+        """Per-recording honest-status rollup entry (R21 zero states).
+
+        Every recording whose coverage intersects the range appears here — even
+        one that named no tasks — so the Tasks surface can distinguish "nothing
+        on file" from "intelligence produced nothing" (``nothing_to_name`` /
+        ``mechanical_only`` / ``couldnt_run`` / ``in_progress`` / ``None`` →
+        unknown), never a false "you did nothing". Same vocabulary + ``detail``
+        as ``tasks.list``.
+        """
+
+        name: str
+        recording_id: str | None = None
+        state: str
+        reason: str | None = None
+        detail: str | None = None
+
+    class TasksQueryResponse(EnvelopeResponse):
+        """Cross-day task segments grouped by day + the honest-status rollup.
+
+        ``days`` is reverse-chronological (newest first); ``recordings`` is the
+        rollup. ``store_state`` carries the vault store state (KTD-14): a locked /
+        absent / error store returns empty ``days`` + ``recordings`` with a
+        degraded ``store_state`` rather than a 500. Absent on an older daemon →
+        ``"mounted"``.
+        """
+
+        start_date: str
+        end_date: str
+        days: list[TasksQueryDay]
+        recordings: list[TasksQueryRecordingStatus]
+        store_state: str = "mounted"
+
     class TasksCreateRequest(_DaemonModel):
         """U7 ``tasks.create`` input: add a USER-authored task span.
 
@@ -1246,6 +1328,11 @@ def _load_models() -> dict[str, Any]:
         "TasksListRequest": TasksListRequest,
         "TaskSegment": TaskSegment,
         "TasksListResponse": TasksListResponse,
+        "TasksQueryRequest": TasksQueryRequest,
+        "TasksQueryTask": TasksQueryTask,
+        "TasksQueryDay": TasksQueryDay,
+        "TasksQueryRecordingStatus": TasksQueryRecordingStatus,
+        "TasksQueryResponse": TasksQueryResponse,
         "TasksCreateRequest": TasksCreateRequest,
         "TasksCreateResponse": TasksCreateResponse,
         "TasksUpdateRequest": TasksUpdateRequest,
@@ -1306,6 +1393,7 @@ __all__ = [
     "_ENTITLEMENT_REFRESH_API_VERSION",
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
+    "_TASKS_QUERY_API_VERSION",
     "_TASKS_CREATE_API_VERSION",
     "_TASKS_UPDATE_API_VERSION",
     "_TASKS_DELETE_API_VERSION",

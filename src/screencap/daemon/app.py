@@ -2398,6 +2398,95 @@ async def tasks_list(request: Request) -> JSONResponse:
         )
 
 
+async def tasks_query(request: Request) -> JSONResponse:
+    """``POST /v0/tasks.query`` — cross-day named task segments (U5).
+
+    Read-only surface answering "which named tasks exist in this date range"
+    across recordings. Iterates the recordings whose day-clamped coverage
+    intersects ``[start_date, end_date]`` and reads each one's named tasks via the
+    SAME per-recording read path ``tasks.list`` uses (``read_task_segments_wire``
+    off the local-only ``recording.db`` — never uploaded, R4/R8), grouping each
+    task under its local calendar day per KTD-11's single day rule (the inverse of
+    ``day_segments.day_bounds`` — a task maps to the day of its ``start_ts``). A
+    per-recording honest-status rollup (the ``produced_tasks`` / ``mechanical_only``
+    / ``nothing_to_name`` / ... vocabulary ``tasks.list`` exposes) rides alongside
+    so the Tasks surface renders honest zero states (R21) rather than "you did
+    nothing".
+
+    KTD-14: a locked/absent/error vault store is a healthy serving state — empty
+    ``days`` + ``recordings`` with a degraded ``store_state`` on a 200, never a
+    500. A malformed or inverted date range is a typed 400 (``invalid_request``).
+    Deliberately NOT in ``_ACTIVITY_PATHS`` — a read verb must not reset the
+    idle-shutdown clock.
+    """
+    from pydantic import ValidationError
+
+    from screencap import day_segments
+    from screencap import tasks_query as tq
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.TasksQueryRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._TASKS_QUERY_API_VERSION,
+            )
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            # Sealed / absent / error store — empty payload + store_state (KTD-14),
+            # echoing the requested window so the client can key the empty result.
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._TASKS_QUERY_API_VERSION,
+                    start_date=parsed.start_date,
+                    end_date=parsed.end_date,
+                    days=[],
+                    recordings=[],
+                    store_state=store_state,
+                )
+            )
+        try:
+            result = await asyncio.to_thread(
+                tq.query_tasks,
+                parsed.start_date,
+                parsed.end_date,
+                parsed.tz_offset_seconds,
+            )
+        except day_segments.InvalidDayRequest:
+            # Malformed date or inverted range → typed 400 (parity with timeline.day).
+            return _validation_error_response(
+                schema_version=schema._TASKS_QUERY_API_VERSION,
+            )
+        # Validate the aggregated shape through the typed response models (verb
+        # parity check) so any drift in tasks_query's output is caught here.
+        days = [schema.TasksQueryDay(**d).model_dump() for d in result["days"]]
+        recordings = [
+            schema.TasksQueryRecordingStatus(**r).model_dump()
+            for r in result["recordings"]
+        ]
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._TASKS_QUERY_API_VERSION,
+                start_date=result["start_date"],
+                end_date=result["end_date"],
+                days=days,
+                recordings=recordings,
+                store_state=store_state,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._TASKS_QUERY_API_VERSION,
+            request=request,
+        )
+
+
 # ---------------------------------------------------------------------------
 # tasks.create / update / delete / merge / split — U7 user task CRUD verbs.
 #
@@ -4575,6 +4664,7 @@ def build_app() -> Starlette:
             Route("/v0/frame.nearest", frame_nearest, methods=["POST"]),
             Route("/v0/frame.read", frame_read, methods=["POST"]),
             Route("/v0/tasks.list", tasks_list, methods=["POST"]),
+            Route("/v0/tasks.query", tasks_query, methods=["POST"]),
             Route("/v0/tasks.create", tasks_create, methods=["POST"]),
             Route("/v0/tasks.update", tasks_update, methods=["POST"]),
             Route("/v0/tasks.delete", tasks_delete, methods=["POST"]),
