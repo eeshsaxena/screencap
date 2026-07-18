@@ -455,25 +455,9 @@ struct ReviewWindow: View {
     /// text-masked and carries the original, unredacted audio, and it leaves to
     /// external recipients.
     private var clipHonestyNote: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("The exported clip's video is not text-masked")
-                    .font(.callout.weight(.semibold))
-                Text("These preview frames are redacted, but the exported video "
-                    + "shows on-screen text that is not masked and includes the "
-                    + "original audio. Share this clip only with people you'd show "
-                    + "your screen to.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12))
+        // Single-sourced wording (U11): the Day-timeline range Clip/Share consent
+        // shares this exact note so the unmasked-video disclosure can never drift.
+        ClipHonestyNote()
     }
 
     /// True while the clip export subprocess is running (drives the modal's

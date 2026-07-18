@@ -1051,6 +1051,203 @@ struct DeleteStatusResponse: Decodable, Sendable {
     }
 }
 
+// MARK: - U10/U11 in-vault clips store verbs (clip.create / clip.list / clip.delete)
+
+/// The clip's honesty flags (U10/U11). Decoded from the daemon's free-form
+/// `honesty_flags` dict into the two flags the UI acts on:
+/// `videoCaptureBlockedOnly` (the clip's video is capture-blocked, not post-hoc
+/// text-masked — drives the honesty note wording) and `policyPurgedPartial` (a
+/// retroactive policy purge partially overlapped this clip — R17/AE8, rendered
+/// as a flag in Clips). Tolerant: any missing/unknown key defaults false, and an
+/// empty `{}` decodes to all-false — so an older daemon or a future flag never
+/// breaks decoding.
+struct ClipHonestyFlags: Decodable, Sendable, Hashable {
+    let videoCaptureBlockedOnly: Bool
+    let policyPurgedPartial: Bool
+
+    init(videoCaptureBlockedOnly: Bool = true, policyPurgedPartial: Bool = false) {
+        self.videoCaptureBlockedOnly = videoCaptureBlockedOnly
+        self.policyPurgedPartial = policyPurgedPartial
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case videoCaptureBlockedOnly = "clip_video_capture_blocked_only"
+        case policyPurgedPartial = "policy_purged_partial"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        videoCaptureBlockedOnly = (try? c.decodeIfPresent(Bool.self, forKey: .videoCaptureBlockedOnly)) ?? false
+        policyPurgedPartial = (try? c.decodeIfPresent(Bool.self, forKey: .policyPurgedPartial)) ?? false
+    }
+}
+
+/// One durable clip's catalog entry (mirrors the Python `ClipRecord`). Recording
+/// identifiers stay opaque plumbing (R5) — `sourceRecording` is retained for
+/// purge matching but is never rendered as a browsing entity; the Clips surface
+/// shows `sourceDay` + the time range. `path` is the absolute on-disk mp4 for
+/// local playback / export (same-EUID reply; clips never leave the Mac). Every
+/// additive field is tolerant so a growing catalog shape can't break decoding.
+struct ClipRecord: Decodable, Sendable, Hashable, Identifiable {
+    let id: String
+    let sourceRecording: String
+    let sourceDay: String
+    let startMs: Int
+    let endMs: Int
+    let createdAt: Double
+    let creator: String
+    let honestyFlags: ClipHonestyFlags
+    let path: String?
+
+    init(
+        id: String, sourceRecording: String, sourceDay: String,
+        startMs: Int, endMs: Int, createdAt: Double, creator: String,
+        honestyFlags: ClipHonestyFlags = ClipHonestyFlags(), path: String? = nil
+    ) {
+        self.id = id
+        self.sourceRecording = sourceRecording
+        self.sourceDay = sourceDay
+        self.startMs = startMs
+        self.endMs = endMs
+        self.createdAt = createdAt
+        self.creator = creator
+        self.honestyFlags = honestyFlags
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        sourceRecording = try c.decode(String.self, forKey: .sourceRecording)
+        sourceDay = try c.decode(String.self, forKey: .sourceDay)
+        startMs = try c.decode(Int.self, forKey: .startMs)
+        endMs = try c.decode(Int.self, forKey: .endMs)
+        createdAt = try c.decode(Double.self, forKey: .createdAt)
+        creator = try c.decode(String.self, forKey: .creator)
+        honestyFlags = try c.decodeIfPresent(ClipHonestyFlags.self, forKey: .honestyFlags) ?? ClipHonestyFlags()
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case sourceRecording = "source_recording"
+        case sourceDay = "source_day"
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case createdAt = "created_at"
+        case creator
+        case honestyFlags = "honesty_flags"
+        case path
+    }
+}
+
+/// `clip.create` input (U11): an absolute-ms range in a SINGLE recording plus the
+/// local tz offset (so the daemon maps the clip's start to its `source_day`,
+/// KTD-11) and the creator provenance (`ui` from the app — the agent path passes
+/// `mcp`, R18).
+struct ClipCreateRequest: Encodable {
+    let recording: String
+    let startMs: Int
+    let endMs: Int
+    let tzOffsetSeconds: Int
+    let creator: String
+
+    init(recording: String, startMs: Int, endMs: Int, tzOffsetSeconds: Int, creator: String = "ui") {
+        self.recording = recording
+        self.startMs = startMs
+        self.endMs = endMs
+        self.tzOffsetSeconds = tzOffsetSeconds
+        self.creator = creator
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recording
+        case startMs = "start_ms"
+        case endMs = "end_ms"
+        case tzOffsetSeconds = "tz_offset_seconds"
+        case creator
+    }
+}
+
+/// `clip.create` response. A clip-domain failure rides the envelope (`ok=false` +
+/// a typed `reason`: `policy_purged` / `not_eligible` / `no_frames_in_range` /
+/// `masked_video_required` / `clip_busy` / `trim_failed`) at HTTP 200; the `clip`
+/// is present only on success. A malformed range is a typed 400 and a sealed
+/// store a typed 409 (both surfaced as `DaemonClientError`).
+struct ClipCreateResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let reason: String?
+    let clip: ClipRecord?
+    let storeState: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case reason
+        case clip
+        case storeState = "store_state"
+    }
+}
+
+/// `clip.list` response (R11): the catalog newest-first. A locked / absent / error
+/// store returns an empty `clips` list with a degraded `store_state` (KTD-14),
+/// never a 500 — the surface branches on `resolvedStoreState` before its empty
+/// check.
+struct ClipListResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let clips: [ClipRecord]
+    let storeState: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case clips
+        case storeState = "store_state"
+    }
+
+    /// The typed store state, tolerant of an older daemon that omits the field.
+    var resolvedStoreState: StoreState {
+        StoreState.from(state: storeState)
+    }
+}
+
+/// `clip.delete` input (U11): the clip id to remove (mp4 + catalog entry).
+struct ClipDeleteRequest: Encodable {
+    let clipId: String
+
+    enum CodingKeys: String, CodingKey {
+        case clipId = "clip_id"
+    }
+}
+
+/// `clip.delete` response: whether the clip existed and was removed (idempotent
+/// `false` for an already-absent id).
+struct ClipDeleteResponse: Decodable, Sendable {
+    let ok: Bool
+    let schemaVersion: Int
+    let daemonVersion: String
+    let apiSchemaVersion: Int
+    let deleted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case schemaVersion = "schema_version"
+        case daemonVersion = "daemon_version"
+        case apiSchemaVersion = "api_schema_version"
+        case deleted
+    }
+}
+
 private struct APIEnvelopeProbe: Decodable {
     let ok: Bool?
     let apiSchemaVersion: Int?
@@ -1538,6 +1735,49 @@ enum DaemonClient {
     /// recordings and reports an accurate partial snapshot.
     static func deleteCancel() async throws -> DeleteStatusResponse {
         try await request(method: "POST", path: "/v0/delete.cancel", body: Data("{}".utf8))
+    }
+
+    // MARK: - U11 in-vault clips store (clip.create / clip.list / clip.delete)
+
+    /// Cut an absolute-ms range in a SINGLE recording into a durable clip (R11/R17).
+    /// A clip-domain failure rides the envelope (`ok=false` + `reason`) at HTTP 200
+    /// — including `policy_purged` when the range overlaps a policy-purged interval
+    /// (the daemon fails closed rather than resurrecting purged pixels). A malformed
+    /// range is a typed 400 and a sealed / absent store a typed 409, both surfaced
+    /// as `DaemonClientError.envelopeError`. `creator` is `ui` from the app (the MCP
+    /// path passes `mcp`, R18); `tzOffsetSeconds` maps the clip start to its local
+    /// `source_day`.
+    static func clipCreate(
+        recording: String,
+        startMs: Int,
+        endMs: Int,
+        tzOffsetSeconds: Int,
+        creator: String = "ui"
+    ) async throws -> ClipCreateResponse {
+        let body = try JSONEncoder().encode(
+            ClipCreateRequest(
+                recording: recording, startMs: startMs, endMs: endMs,
+                tzOffsetSeconds: tzOffsetSeconds, creator: creator
+            )
+        )
+        return try await request(method: "POST", path: "/v0/clip.create", body: body)
+    }
+
+    /// The clips catalog, newest-first (R11). Read-only; a locked / absent / error
+    /// vault returns an empty list + a degraded `store_state` (KTD-14), never a
+    /// 500. On `socketUnavailable`/`connectionFailed` the caller surfaces a
+    /// daemon-down state (no CLI fallback for this verb).
+    static func clipList() async throws -> ClipListResponse {
+        try await request(method: "GET", path: "/v0/clip.list")
+    }
+
+    /// Remove a clip's mp4 + catalog entry (human-only, audit-logged daemon-side —
+    /// never an MCP tool, R18). Idempotent: an unknown id returns `deleted=false`.
+    /// A sealed / absent store surfaces a typed 409 (`DaemonClientError`), nothing
+    /// removed.
+    static func clipDelete(id: String) async throws -> ClipDeleteResponse {
+        let body = try JSONEncoder().encode(ClipDeleteRequest(clipId: id))
+        return try await request(method: "POST", path: "/v0/clip.delete", body: body)
     }
 
     /// A LOCAL recording's named task segments (U10, local-first intelligence).

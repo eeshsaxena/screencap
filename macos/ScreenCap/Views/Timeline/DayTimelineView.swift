@@ -83,6 +83,18 @@ struct DayTimelineView: View {
     @State private var deletePhase: DeleteRangePhase = .idle
     @State private var deletePollTask: Task<Void, Never>?
 
+    // U11 (R9/R11, F2) — the range Clip/Share flow. `clipRangeConfirm` drives the
+    // consent sheet (the single-sourced honesty note + range); confirm calls
+    // `clip.create`, keeping the clip silently in Clips (Clip) or handing the cut
+    // file to the system share sheet (Share). `clipShareURL` drives the
+    // `ShareServicePresenter`. A cross-recording range (KTD-8), a policy-purged
+    // range, or a sealed store surfaces via `clipRangeError` — never a silent
+    // no-op. The clip catalog is the durable artifact; the Clips surface reads it.
+    @State private var clipRangeConfirm: ClipRangeConfirmState?
+    @State private var clipRangeWorking = false
+    @State private var clipRangeError: String?
+    @State private var clipShareURL: URL?
+
     // U4 — in-page date navigation (R16). `displayedDate` overrides the opened
     // `date` once the user steps days / jumps to a date; `currentDate` is the
     // single source everything reads. `navigatedAway` gates the one-time landing
@@ -166,6 +178,46 @@ struct DayTimelineView: View {
         } message: { message in
             Text(message)
         }
+        // U11 (R9/R11, F2) — the range Clip/Share consent sheet (honesty note +
+        // range). Confirm cuts the clip; Clip keeps it silently in Clips, Share
+        // hands the cut file to the system share sheet.
+        .sheet(item: $clipRangeConfirm) { confirm in
+            ClipRangeConfirmSheet(
+                rangeClockText: confirm.rangeClockText,
+                intent: confirm.intent,
+                working: clipRangeWorking,
+                onConfirm: { confirmClipRange(confirm) },
+                onCancel: { cancelClipRange() }
+            )
+        }
+        // U11 — a clip/share failure (cross-recording, policy-purged, sealed
+        // store, daemon down) surfaces honestly, never a silent no-op.
+        .alert(
+            "Couldn't make that clip",
+            isPresented: clipRangeErrorPresented,
+            presenting: clipRangeError
+        ) { _ in
+            Button("OK", role: .cancel) { clipRangeError = nil }
+        } message: { message in
+            Text(message)
+        }
+        // U11 (F2) — the system share sheet for a just-cut clip file (Share arm).
+        // A hidden anchor in the strip's top-leading corner; upload-share stays
+        // routed through the Review window (consent boundary unchanged, KTD-4).
+        .background(alignment: .topLeading) {
+            ShareServicePresenter(item: $clipShareURL)
+                .frame(width: 1, height: 1)
+                .accessibilityHidden(true)
+        }
+    }
+
+    /// Bridges `clipRangeError` to an `isPresented` binding for the range
+    /// Clip/Share error alert (mirrors the delete-error surfacing).
+    private var clipRangeErrorPresented: Binding<Bool> {
+        Binding(
+            get: { clipRangeError != nil },
+            set: { if !$0 { clipRangeError = nil } }
+        )
     }
 
     /// Bridges `dayTasks.writeError` to an `isPresented` binding for the
@@ -628,18 +680,84 @@ struct DayTimelineView: View {
         pendingTaskLabel = PendingTaskLabel(recording: recording, startMs: range.startMs, endMs: range.endMs)
     }
 
-    // U7 exposes these three DayTimelineView-owned hooks for the range action
-    // menu. U11 fills Clip/Share (via `/v0/clip.create` + the share sheet) and
-    // U9 fills Delete (the confirm sheet + the `delete.start` job). For now they
-    // are no-ops that KEEP the selection so the next unit builds on the anchored
-    // menu — deletion and clip export are deliberately NOT implemented here.
-    // (Named `on…Range` to stay distinct from the SCR-219 `clipRange` state.)
+    // U7 exposed these DayTimelineView-owned hooks for the range action menu; U11
+    // fills Clip/Share (via `/v0/clip.create` + the share sheet). Both resolve the
+    // range to a SINGLE recording first (KTD-8) — a range crossing recordings, or
+    // one over a pure gap, gets an honest error naming the split rather than a
+    // silent no-op. (Named `on…Range` to stay distinct from the SCR-219
+    // `clipRange` state.)
     private func onClipRange(_ range: (startMs: Int, endMs: Int)) {
-        // TODO(U11): cut the range into a Clip via clip.create.
+        beginClipRangeAction(range, intent: .clip)
     }
 
     private func onShareRange(_ range: (startMs: Int, endMs: Int)) {
-        // TODO(U11): clip the range, then present the share sheet.
+        beginClipRangeAction(range, intent: .share)
+    }
+
+    /// U11 — resolve the selected range to one recording (KTD-8) and open the
+    /// consent sheet, or surface the honest cross-recording / no-footage error.
+    private func beginClipRangeAction(_ range: (startMs: Int, endMs: Int), intent: ClipRangeIntent) {
+        let tracks = stripBaseTracks.map {
+            ClipsModel.RecordingTrack(recording: $0.recording, startMs: $0.startMs, endMs: $0.endMs)
+        }
+        switch ClipsModel.resolveRange(startMs: range.startMs, endMs: range.endMs, tracks: tracks) {
+        case .single(let recording):
+            clipRangeWorking = false
+            clipRangeConfirm = ClipRangeConfirmState(
+                recording: recording, startMs: range.startMs, endMs: range.endMs, intent: intent
+            )
+        case .crossesRecordings(let splitMs):
+            clipRangeError = ClipsModel.crossRecordingMessage(splitMs: splitMs)
+        case .noFootage:
+            clipRangeError = ClipsModel.noFootageMessage
+        }
+    }
+
+    /// U11 — the user confirmed the clip/share. Cut the clip via `clip.create`
+    /// (creator `ui`); on success keep it silently in Clips (Clip) or hand the cut
+    /// file to the system share sheet (Share). A clip-domain reason
+    /// (policy-purged, not-eligible, …) or a thrown error surfaces honestly.
+    private func confirmClipRange(_ confirm: ClipRangeConfirmState) {
+        clipRangeWorking = true
+        Task {
+            let tzOffset = TimeZone.current.secondsFromGMT(
+                for: Date(timeIntervalSince1970: Double(confirm.startMs) / 1000)
+            )
+            do {
+                let response = try await DaemonClient.clipCreate(
+                    recording: confirm.recording,
+                    startMs: confirm.startMs,
+                    endMs: confirm.endMs,
+                    tzOffsetSeconds: tzOffset,
+                    creator: "ui"
+                )
+                clipRangeWorking = false
+                clipRangeConfirm = nil
+                guard response.ok, let clip = response.clip else {
+                    // Clip-domain failure rides the envelope (ok=false + reason).
+                    clipRangeError = response.reason.map(ClipsModel.reasonMessage)
+                        ?? "Couldn't make that clip."
+                    return
+                }
+                // The clip is the durable artifact now — leave select-range mode.
+                rangeSelection.cancel()
+                if confirm.intent == .share, let path = clip.path {
+                    clipShareURL = URL(fileURLWithPath: path)
+                }
+                // Clip intent: saved silently into Clips (no further UI, R11).
+            } catch {
+                clipRangeWorking = false
+                clipRangeConfirm = nil
+                clipRangeError = ClipsModel.errorMessage(error)
+            }
+        }
+    }
+
+    /// Cancel the clip/share consent sheet (R19 — explicit, never silent). Keeps
+    /// the range selection so the anchored menu stays for another action.
+    private func cancelClipRange() {
+        clipRangeConfirm = nil
+        clipRangeWorking = false
     }
 
     /// U9 (R20/AE2) — open the delete confirm flow: load the `delete.start
@@ -1196,6 +1314,22 @@ private struct PendingTaskLabel: Identifiable {
     let recording: String
     let startMs: Int
     let endMs: Int
+}
+
+/// U11 — a range resolved to a SINGLE recording (KTD-8), awaiting Clip/Share
+/// consent. Absolute unix ms; `recording` is the one recording the range sits in.
+private struct ClipRangeConfirmState: Identifiable {
+    let id = UUID()
+    let recording: String
+    let startMs: Int
+    let endMs: Int
+    let intent: ClipRangeIntent
+
+    /// "HH:mm–HH:mm" over the range — shown on the consent sheet (never a
+    /// recording name, R5).
+    var rangeClockText: String {
+        "\(ClipsModel.clock(startMs))–\(ClipsModel.clock(endMs))"
+    }
 }
 
 /// Label-entry sheet for a retroactively-marked task span (SCR-214 U11, AE3).

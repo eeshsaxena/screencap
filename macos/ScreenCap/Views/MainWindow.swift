@@ -680,11 +680,9 @@ struct MainWindow: View {
                 message: "A cross-day view of the workflows split out of your days is on its way."
             )
         case .clips:
-            // Honest placeholder until the Clips surface lands (U11).
-            ComingSoonPlaceholderView(
-                title: "Clips",
-                message: "Moments you deliberately keep will live here. Clipping from a day is on its way."
-            )
+            // U11: the Clips surface — durable clips kept from a day's range, with
+            // local playback, Export a copy, Share, and a no-undo Delete (R11/R20).
+            ClipsView()
         case .appRules:
             // U13: the prototype App rules pane.
             AppRulesView()
