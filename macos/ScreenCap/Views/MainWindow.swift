@@ -155,6 +155,12 @@ struct MainWindow: View {
     }
 
     @State private var route: ShellRoute = .days
+    /// U4 (origin-aware back): the last primary surface the user was on before
+    /// opening the day page, so the day page's "← Back" returns there (Days /
+    /// Tasks / Chat) rather than always Days. Defaults to Days (R2). Recorded on
+    /// every navigation into one of those surfaces; the day page itself never
+    /// overwrites it.
+    @State private var lastNonTimelineRoute: ShellRoute = .days
     /// Non-nil while the onboarding wizard owns the window content (U11).
     @State private var onboarding: OnboardingMode?
     /// True while the permission-setup takeover owns the window content (U14 —
@@ -257,6 +263,18 @@ struct MainWindow: View {
             decideOnboardingTakeover()
             updatePermissionSetupPresentation()
             Task { await maybePresentSearchDisclosure() }
+        }
+        .onChange(of: route) { newValue in
+            // U4 (origin-aware back): remember the primary surface a day page can
+            // be opened FROM — Days, Tasks, or Chat — so `onBack` returns there.
+            // The day page (`.timeline`) and the settings routes never become an
+            // origin, so a back-out never lands on a settings pane.
+            switch newValue {
+            case .days, .tasks, .chat:
+                lastNonTimelineRoute = newValue
+            default:
+                break
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .screenCapRecordingDidEnd)) { _ in
             // U7: a recording ended and the main window was restored — land on
@@ -415,7 +433,7 @@ struct MainWindow: View {
             if showingPalette {
                 RecallPaletteView(
                     isPresented: $showingPalette,
-                    onJump: { day, seekMs in route = .timeline(day: day, seekMs: seekMs) }
+                    onJump: { day, seekMs in route = .timeline(day: day, seekMs: seekMs, highlight: nil) }
                 )
             }
         }
@@ -653,7 +671,7 @@ struct MainWindow: View {
                 onNewRecording: presentNewRecording,
                 onUpgradePrompt: { presentedAccountContext = .gate },
                 onOpenSearch: { showingPalette = true },
-                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs) }
+                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs, highlight: nil) }
             )
         case .tasks:
             // Honest placeholder until the Tasks surface lands (U6).
@@ -682,10 +700,18 @@ struct MainWindow: View {
             // and the deep-link opener — no new pointer rendering (KTD7). The
             // no-backend affordance (R6) deep-links to the Intelligence pane.
             ChatView(onOpenIntelligenceSettings: { route = .intelligence })
-        case .timeline(let day, let seekMs):
+        case .timeline(let day, let seekMs, let highlight):
             // U9: the day view. `.id(day)` gives each date a fresh engine +
             // search scope rather than mutating one view's state across days.
-            DayTimelineView(date: day, initialSeekMs: seekMs, onBack: { route = .days })
+            // U4: `onBack` restores the surface the user came from (Days/Tasks/
+            // Chat), not always Days; an incoming task-span highlight (AE3) is
+            // threaded through to the strip.
+            DayTimelineView(
+                date: day,
+                initialSeekMs: seekMs,
+                highlightedSpan: highlight.map { (startMs: $0.startMs, endMs: $0.endMs) },
+                onBack: { route = lastNonTimelineRoute }
+            )
                 .id(day)
         }
     }

@@ -64,6 +64,40 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertNil(row.helpText)
     }
 
+    // MARK: - U4 active-row highlighting
+
+    /// The day page (`.timeline`) has no row of its own — it is part of the Days
+    /// experience, so it highlights the Days row (U4). None of Tasks/Clips/Chat
+    /// light up while a day page is open.
+    func testTimelineRouteHighlightsDaysRow() {
+        let route = ShellRoute.timeline(day: Date(), seekMs: nil, highlight: nil)
+        XCTAssertEqual(ShellSidebarModel.highlightedRoute(for: route), .days)
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "days"), route: route))
+        for id in ["tasks", "clips", "chat"] {
+            XCTAssertFalse(
+                ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, id), route: route),
+                "\(id) is not active while the day page is open"
+            )
+        }
+    }
+
+    /// A landing highlight rides `.timeline` without changing the Days-row rule.
+    func testTimelineWithHighlightStillHighlightsDaysRow() {
+        let route = ShellRoute.timeline(
+            day: Date(), seekMs: 1_000, highlight: DaySpanHighlight(startMs: 1_000, endMs: 2_000)
+        )
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "days"), route: route))
+    }
+
+    /// Regression: the timeline mapping doesn't disturb the ordinary case —
+    /// every other route highlights its own row and no other.
+    func testEachRouteHighlightsItsOwnRow() {
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "tasks"), route: .tasks))
+        XCTAssertFalse(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "days"), route: .tasks))
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.settingsNav, "privacy"), route: .privacy))
+        XCTAssertFalse(ShellSidebarModel.isActive(item(ShellSidebarModel.settingsNav, "account"), route: .privacy))
+    }
+
     // MARK: - Footer storage math
 
     func testStorageFooterSumsBytesAndFormatsGB() {

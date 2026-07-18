@@ -22,10 +22,22 @@ enum ShellRoute: Hashable {
     /// palette (NOT a sidebar destination). Chat and Search share the retrieval
     /// backend and Search's result components, not a destination pattern.
     case chat
-    case timeline(day: Date, seekMs: Int?)
+    /// The day page (U4). Carries an optional wall-clock `seekMs` anchor and an
+    /// optional task-span `highlight` (AE3) — populated by Tasks/Chat landings
+    /// (U6/U12); nil for a plain day-card open. `.timeline` has no sidebar row:
+    /// it highlights the Days row (see `ShellSidebarModel.highlightedRoute`).
+    case timeline(day: Date, seekMs: Int?, highlight: DaySpanHighlight?)
     case privacy
     case appRules
     case intelligence
+}
+
+/// A task span to emphasize when a day page is opened from Tasks or Chat (AE3).
+/// A dedicated Hashable value so it can ride `ShellRoute.timeline`'s associated
+/// values (a bare tuple can't — tuples aren't Hashable).
+struct DaySpanHighlight: Hashable {
+    let startMs: Int
+    let endMs: Int
 }
 
 /// A sidebar nav row's presentation contract — pure, so the routing / enablement /
@@ -71,6 +83,23 @@ enum ShellSidebarModel {
         // the real moments as sources.
         ShellNavItem(id: "chat", label: "Chat", route: .chat, availability: .enabled),
     ]
+
+    /// Which sidebar route a given active route highlights. The day page
+    /// (`.timeline`) has no row of its own — it is part of the Days experience
+    /// (reached from Days cards and citations), so it highlights the Days row
+    /// (U4). Every other route highlights its own row.
+    static func highlightedRoute(for route: ShellRoute) -> ShellRoute {
+        if case .timeline = route { return .days }
+        return route
+    }
+
+    /// Whether a nav row should render as active for the current route — pure so
+    /// the `.timeline`-highlights-Days rule is directly assertable. A pure stub
+    /// row (no destination) is never active.
+    static func isActive(_ item: ShellNavItem, route: ShellRoute) -> Bool {
+        guard let itemRoute = item.route else { return false }
+        return itemRoute == highlightedRoute(for: route)
+    }
 
     static let settingsNav: [ShellNavItem] = [
         // Account is pinned FIRST (KTD-4): it is the paid-only gate's home
@@ -291,7 +320,9 @@ struct ShellSidebarView: View {
 
     @ViewBuilder
     private func navRow(_ item: ShellNavItem) -> some View {
-        let isActive = item.route.map { $0 == route } ?? false
+        // U4: `.timeline` highlights the Days row (see `highlightedRoute`), so a
+        // day page opened from a card/citation still shows Days as active.
+        let isActive = ShellSidebarModel.isActive(item, route: route)
         Button {
             if let dest = item.route { route = dest }
         } label: {

@@ -151,6 +151,28 @@ enum DayStripLayout {
         return [BoundaryLabel(ms: lo, kind: .started), BoundaryLabel(ms: hi, kind: .stopped)]
     }
 
+    /// Resolve a landing highlight (a Tasks/Chat jump to a task span, AE3) to the
+    /// exact span the strip should emphasize. Precedence: a task band with
+    /// matching endpoints, then the task band containing the highlight's
+    /// midpoint, else the raw highlight span — so a highlight always renders,
+    /// even before the task bands load or when it lands in unsplit footage.
+    /// Pure so the emphasis geometry is unit-testable without a render.
+    static func resolveHighlightSpan(
+        highlight: (startMs: Int, endMs: Int),
+        segments: [(startMs: Int, endMs: Int)]
+    ) -> (startMs: Int, endMs: Int) {
+        if let exact = segments.first(where: {
+            $0.startMs == highlight.startMs && $0.endMs == highlight.endMs
+        }) {
+            return exact
+        }
+        let mid = highlight.startMs + (highlight.endMs - highlight.startMs) / 2
+        if let containing = segments.first(where: { $0.startMs <= mid && mid < $0.endMs }) {
+            return containing
+        }
+        return highlight
+    }
+
     /// Map a wall-clock ms to an x in `[0, width]`, clamped to the bounds. A
     /// non-positive width or span maps everything to 0 — no NaN, no
     /// divide-by-zero (the retired SearchTimelineLayout's placeMarkers rule).
@@ -508,6 +530,11 @@ struct DayStripView: View {
     /// SCR-214 U11 — a single marked endpoint awaiting its partner, drawn as a
     /// standalone tick.
     var pendingEndpointMs: Int? = nil
+    /// U4 (AE3) — a task span to emphasize when the day page is opened from
+    /// Tasks or Chat: a subtle outline + glow around the matching task band.
+    /// Nil (default) when there is nothing to highlight, so existing call sites
+    /// are unaffected. Resolved to the exact band via `resolveHighlightSpan`.
+    var highlightedSpan: (startMs: Int, endMs: Int)? = nil
 
     /// Strip metrics per the design (444–461): 64pt band area, 16pt track.
     private let stripHeight: CGFloat = 64
@@ -593,6 +620,23 @@ struct DayStripView: View {
                     : resolvedLabels[index]
                 let drawWidth = min(frame.width, label.measure(in: taskLabelMaxSize).width)
                 ctx.draw(label, in: CGRect(x: frame.minX, y: 0, width: drawWidth, height: 14))
+            }
+
+            // U4 (AE3) — a landing highlight from Tasks/Chat: a subtle teal
+            // outline + glow around the emphasized task band. The span is
+            // resolved to the exact band via the pure `resolveHighlightSpan`
+            // (exact match → containing band → raw span), so it lands on the
+            // task even before the bands finish loading.
+            if let highlight = highlightedSpan {
+                let resolved = DayStripLayout.resolveHighlightSpan(
+                    highlight: highlight,
+                    segments: segments.map { (startMs: $0.startMs, endMs: $0.endMs) }
+                )
+                let outline = bandRect(startMs: resolved.startMs, endMs: resolved.endMs, width: width)
+                    .insetBy(dx: -2, dy: -3)
+                let path = Path(roundedRect: outline, cornerRadius: 5)
+                ctx.stroke(path, with: .color(.scTeal.opacity(0.35)), lineWidth: 5)
+                ctx.stroke(path, with: .color(.scTeal), lineWidth: 2)
             }
 
             // Footage start/stop edge times (U1/AE1): mark where footage begins

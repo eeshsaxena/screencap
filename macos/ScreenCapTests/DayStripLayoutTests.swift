@@ -13,6 +13,43 @@ final class DayStripLayoutTests: XCTestCase {
     /// The DST-safe day end the view now passes; a synthetic 24h day here.
     private var dayEnd: Int { dayStart + 24 * hour }
 
+    // MARK: - U4 landing highlight (AE3)
+
+    /// An exact-endpoints task span resolves to that band (the common AE3 case:
+    /// Tasks/Chat hands the task's own span).
+    func testResolveHighlightSpanPrefersExactTaskMatch() {
+        let segments = [
+            (startMs: dayStart, endMs: dayStart + hour),
+            (startMs: dayStart + hour, endMs: dayStart + 2 * hour),
+        ]
+        let resolved = DayStripLayout.resolveHighlightSpan(
+            highlight: (startMs: dayStart + hour, endMs: dayStart + 2 * hour), segments: segments
+        )
+        XCTAssertEqual(resolved.startMs, dayStart + hour)
+        XCTAssertEqual(resolved.endMs, dayStart + 2 * hour)
+    }
+
+    /// A highlight whose endpoints don't match but whose midpoint sits inside a
+    /// band emphasizes that containing band.
+    func testResolveHighlightSpanFallsBackToContainingBand() {
+        let segments = [(startMs: dayStart, endMs: dayStart + 2 * hour)]
+        let resolved = DayStripLayout.resolveHighlightSpan(
+            highlight: (startMs: dayStart + 30 * 60_000, endMs: dayStart + 90 * 60_000),
+            segments: segments
+        )
+        XCTAssertEqual(resolved.startMs, dayStart)
+        XCTAssertEqual(resolved.endMs, dayStart + 2 * hour, "lands on the containing task band")
+    }
+
+    /// No task band matches (unsplit footage, or bands not loaded yet) → outline
+    /// the raw highlight span, never drop it.
+    func testResolveHighlightSpanFallsBackToRawSpanWhenNoBandMatches() {
+        let hl = (startMs: dayStart + 5 * hour, endMs: dayStart + 6 * hour)
+        let resolved = DayStripLayout.resolveHighlightSpan(highlight: hl, segments: [])
+        XCTAssertEqual(resolved.startMs, hl.startMs)
+        XCTAssertEqual(resolved.endMs, hl.endMs)
+    }
+
     // MARK: - Axis bounds (fixed waking window, R6)
 
     /// The founding fix (AE1): a short afternoon recording on an otherwise

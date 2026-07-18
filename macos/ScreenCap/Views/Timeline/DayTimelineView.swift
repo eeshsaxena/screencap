@@ -11,9 +11,17 @@ struct DayTimelineView: View {
     @EnvironmentObject private var index: RecordingsIndex
     @Environment(\.openWindow) private var openWindow
 
+    /// The day the view was OPENED on (the route's day; the `.id` anchor in
+    /// MainWindow). In-page date navigation (R16) tracks the currently-viewed
+    /// day in `displayedDate`; read `currentDate` everywhere, never `date`.
     let date: Date
     /// Optional wall-clock anchor to land on (a Days card / Recall hit).
     var initialSeekMs: Int?
+    /// U4 (AE3) — a task span to emphasize on the strip, populated by a
+    /// Tasks/Chat landing. Additive/defaulted so a plain day-card open is
+    /// unaffected. Only honored on the opened day (cleared once the user
+    /// navigates to another date).
+    var highlightedSpan: (startMs: Int, endMs: Int)? = nil
     var onBack: () -> Void
 
     private enum LoadPhase: Equatable {
@@ -60,6 +68,21 @@ struct DayTimelineView: View {
     @State private var markSelection = DaySpanSelection()
     @State private var pendingTaskLabel: PendingTaskLabel?
 
+    // U4 — in-page date navigation (R16). `displayedDate` overrides the opened
+    // `date` once the user steps days / jumps to a date; `currentDate` is the
+    // single source everything reads. `navigatedAway` gates the one-time landing
+    // affordances (the initial seek anchor + the task highlight) to the opened
+    // day, so navigating elsewhere never re-seeks or re-highlights.
+    @State private var displayedDate: Date?
+    @State private var navigatedAway = false
+    /// U4 (R15/KTD-12) — coalesces live-refresh reloads: a burst of recording
+    /// events during one in-flight reload collapses to a single reload.
+    @State private var liveReloadInFlight = false
+
+    /// The day currently on screen — the navigated date if the user moved, else
+    /// the opened `date`.
+    private var currentDate: Date { displayedDate ?? date }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -67,7 +90,12 @@ struct DayTimelineView: View {
             strip
         }
         .background(Color.scPaper)
-        .task(id: date) { await loadDay() }
+        .task(id: currentDate) { await reloadDay() }
+        // U4 (R15/KTD-12): one long-lived subscription for the view's lifetime
+        // (independent of the date-keyed reload above) — recording events reload
+        // the open page so "still recording" + newly-flushed footage stay live.
+        // SwiftUI cancels it on disappear.
+        .task { await runLiveRefreshSubscription() }
         .onDisappear {
             searchTask?.cancel()
             engine.tearDown()
@@ -103,14 +131,37 @@ struct DayTimelineView: View {
 
     // MARK: - Day window
 
-    private var dayStartMs: Int { Int(Calendar.current.startOfDay(for: date).timeIntervalSince1970 * 1000) }
+    private var dayStartMs: Int { Int(Calendar.current.startOfDay(for: currentDate).timeIntervalSince1970 * 1000) }
     /// DST-safe day end — the next local midnight, not a hardcoded +24h (a
     /// "spring forward"/"fall back" day is 23h/25h long).
     private var dayEndMs: Int {
         let cal = Calendar.current
-        let start = cal.startOfDay(for: date)
+        let start = cal.startOfDay(for: currentDate)
         let next = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
         return Int(cal.startOfDay(for: next).timeIntervalSince1970 * 1000)
+    }
+
+    // MARK: - Date navigation (R16)
+
+    /// Jump the viewed day to `newDate` (start-of-day), a no-op when it is
+    /// already the viewed day. Marks the page as navigated so the landing seek +
+    /// highlight don't fire on the new day. Any date opens — a footage-less date
+    /// renders the honest empty page (AE7), never an error.
+    private func navigateToDay(_ newDate: Date) {
+        let day = Calendar.current.startOfDay(for: newDate)
+        guard !Calendar.current.isDate(day, inSameDayAs: currentDate) else { return }
+        navigatedAway = true
+        displayedDate = day
+    }
+
+    /// Step the viewed day by whole days (month/DST-safe via `DayNavigation`).
+    private func stepDay(_ delta: Int) {
+        navigateToDay(DayNavigation.adjacentDay(to: currentDate, delta: delta))
+    }
+
+    /// Binding for the jump-to-date `DatePicker`.
+    private var datePickerBinding: Binding<Date> {
+        Binding(get: { currentDate }, set: { navigateToDay($0) })
     }
 
     private var axisBounds: DayStripLayout.Bounds {
@@ -132,9 +183,7 @@ struct DayTimelineView: View {
             }
             .buttonStyle(.plain)
             .help("Back")
-            Text(Self.headerDateFormatter.string(from: date))
-                .font(SCTypography.grotesk(size: 15, weight: .semibold))
-                .foregroundStyle(Color.scInk)
+            dateNavigator
             Spacer()
             searchField
         }
@@ -142,6 +191,39 @@ struct DayTimelineView: View {
         .padding(.vertical, 16)
         .background(Color.scCanvas)
         .overlay(alignment: .bottom) { Divider().overlay(Color.scBorderWarm) }
+    }
+
+    /// R16 — previous/next-day chevrons + a jump-to-date picker around the viewed
+    /// date. Any date opens (honest empty page on a footage-less date, AE7).
+    private var dateNavigator: some View {
+        HStack(spacing: 10) {
+            Button { stepDay(-1) } label: {
+                Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.scInkSecondary)
+            .help("Previous day")
+            .accessibilityLabel("Previous day")
+
+            Text(Self.headerDateFormatter.string(from: currentDate))
+                .font(SCTypography.grotesk(size: 15, weight: .semibold))
+                .foregroundStyle(Color.scInk)
+                .frame(minWidth: 150, alignment: .leading)
+
+            Button { stepDay(1) } label: {
+                Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.scInkSecondary)
+            .help("Next day")
+            .accessibilityLabel("Next day")
+
+            // A compact graphical calendar affordance for jumping to any date.
+            DatePicker("", selection: datePickerBinding, displayedComponents: [.date])
+                .datePickerStyle(.field)
+                .labelsHidden()
+                .accessibilityLabel("Jump to a date")
+        }
     }
 
     private var searchField: some View {
@@ -356,7 +438,7 @@ struct DayTimelineView: View {
                 startTs: Double(pending.startMs) / 1000,
                 endTs: Double(pending.endMs) / 1000
             )
-            if ok { await loadDay() }
+            if ok { await reloadDay() }
         }
     }
 
@@ -508,7 +590,10 @@ struct DayTimelineView: View {
                 coverageComplete: coverageComplete,
                 provenanceReady: loadPhase == .ready,
                 pendingSelection: markPendingSelection,
-                pendingEndpointMs: markPendingEndpoint
+                pendingEndpointMs: markPendingEndpoint,
+                // U4 (AE3): honor the landing highlight only on the opened day —
+                // navigating to another date drops it.
+                highlightedSpan: navigatedAway ? nil : highlightedSpan
             )
         }
         .padding(.horizontal, 24)
@@ -553,8 +638,18 @@ struct DayTimelineView: View {
         // reads acceptably with zero markers when gated (no explicit CTA here).
         guard case .loaded(let results) = searchModel.phase else { return [] }
         return results.items.compactMap { item in
-            guard let ms = item.anchorMs, ms >= dayStartMs, ms < dayEndMs else { return nil }
-            return ms
+            // R13 edge: an unanchored hit (a transcript hit whose chunk can't be
+            // resolved) falls back to its recording's `startedAt` — a day +
+            // startedAt pointer — rather than being dropped.
+            let startedAtMs = index.recordings
+                .first { $0.name == item.recording }?
+                .startedAt.map { Int($0 * 1000) }
+            return DaySearchHitResolver.markerMs(
+                anchorMs: item.anchorMs,
+                recordingStartedAtMs: startedAtMs,
+                dayStartMs: dayStartMs,
+                dayEndMs: dayEndMs
+            )
         }
     }
 
@@ -566,7 +661,7 @@ struct DayTimelineView: View {
         reloading = true
         Task {
             await DaemonInstallController.restartStaleDaemonIfNeeded()
-            await loadDay()
+            await reloadDay()
             reloading = false
         }
     }
@@ -582,15 +677,45 @@ struct DayTimelineView: View {
 
     // MARK: - Loading
 
-    private func loadDay() async {
-        loadPhase = .loading
-        if let data = try? await CLIClient.runJSONRaw(["settings", "--json"]),
+    /// The full day load — the `.task(id:)` entry, the daemon-unavailable retry,
+    /// and the post-task-create refresh all route through here. Seeks to the
+    /// landing anchor only on the opened day (never after the user navigated to
+    /// another date), and clears the highlight the same way.
+    private func reloadDay() async {
+        await loadDay(
+            seekToMs: navigatedAway ? nil : initialSeekMs,
+            showLoading: true,
+            refreshSettings: true
+        )
+    }
+
+    /// A quiet live reload (R15/KTD-12): refresh the day's spans + playable
+    /// chunks WITHOUT flashing the loading placeholder, preserving the current
+    /// playhead so a growing "still recording" strip doesn't jump. Coalesces
+    /// overlapping reloads (event bursts) and leaves last-known state on error.
+    private func liveReloadDay() async {
+        guard !liveReloadInFlight else { return }
+        liveReloadInFlight = true
+        await loadDay(seekToMs: engine.currentDayMs, showLoading: false, refreshSettings: false)
+        liveReloadInFlight = false
+    }
+
+    /// - Parameters:
+    ///   - seekToMs: the playhead anchor to (re)seek after loading chunks.
+    ///   - showLoading: flip to the loading placeholder first (a fresh open);
+    ///     `false` keeps the current strip visible for a live refresh.
+    ///   - refreshSettings: re-read daemon settings (content-index gate + chunk
+    ///     duration); skipped on live reloads — they don't change mid-recording.
+    private func loadDay(seekToMs: Int?, showLoading: Bool, refreshSettings: Bool) async {
+        if showLoading { loadPhase = .loading }
+        if refreshSettings,
+           let data = try? await CLIClient.runJSONRaw(["settings", "--json"]),
            let env = try? JSONDecoder().decode(SettingsEnvelope.self, from: data) {
             contentIndexEnabled = env.settings.contentIndexEnabled ?? false
             if let dur = env.settings.chunkDuration { searchModel.chunkDurationSeconds = dur }
         }
 
-        let dayStart = Calendar.current.startOfDay(for: date)
+        let dayStart = Calendar.current.startOfDay(for: currentDate)
         let request = TimelineDayRequest(
             date: Self.wireDateFormatter.string(from: dayStart),
             tzOffsetSeconds: TimeZone.current.secondsFromGMT(for: dayStart)
@@ -602,10 +727,13 @@ struct DayTimelineView: View {
             coverageComplete = response.coverageComplete
             loadPhase = .ready
         } catch {
-            spans = []
-            // A failed load claims nothing (the strip's load gate keys off
-            // `loadPhase != .ready`), so `storeMounted` is left as-is.
-            loadPhase = .daemonUnavailable
+            // A live reload leaves last-known state untouched on a transient
+            // daemon blip. A fresh open claims nothing (the strip's load gate
+            // keys off `loadPhase != .ready`), so `storeMounted` is left as-is.
+            if showLoading {
+                spans = []
+                loadPhase = .daemonUnavailable
+            }
             return
         }
 
@@ -630,7 +758,33 @@ struct DayTimelineView: View {
                 )
             }
         }.value
-        engine.load(chunks: chunks, seekToMs: initialSeekMs)
+        engine.load(chunks: chunks, seekToMs: seekToMs)
+    }
+
+    /// R15/KTD-12 — the live-refresh subscription. Rides the EXISTING daemon
+    /// event stream (`DaemonClient.subscribe`): a recording event on the opened
+    /// day quietly reloads the page. Only recording lifecycle/footage events
+    /// while viewing today trigger a reload (`DayLiveRefresh`), so past days —
+    /// which are immutable — never churn. A dropped stream (daemon restart)
+    /// reconnects after a short backoff; cancelled on disappear.
+    private func runLiveRefreshSubscription() async {
+        while !Task.isCancelled {
+            do {
+                for try await event in DaemonClient.subscribe() {
+                    if Task.isCancelled { return }
+                    guard DayLiveRefresh.shouldReload(
+                        eventType: event.type,
+                        isViewingToday: Calendar.current.isDateInToday(currentDate)
+                    ) else { continue }
+                    await liveReloadDay()
+                }
+            } catch {
+                // A dropped subscription is non-fatal — fall through to backoff
+                // and reconnect; the strip keeps its last-known state meanwhile.
+            }
+            if Task.isCancelled { return }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
     }
 
     // MARK: - Formatters
@@ -715,5 +869,62 @@ private struct MarkTaskLabelSheet: View {
         let f = DateFormatter()
         f.dateFormat = "HH:mm"
         return f.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
+}
+
+/// U4 (R16) — pure day-stepping math for the prev/next chevrons, factored out so
+/// the month/year/DST-boundary behavior is unit-testable without a view.
+enum DayNavigation {
+    /// The start-of-day `delta` whole days from `date` on the local calendar.
+    /// Uses `Calendar` date arithmetic so month, year, and DST boundaries are
+    /// handled correctly (a naive `± 86_400s` would drift on 23h/25h days).
+    static func adjacentDay(to date: Date, delta: Int, calendar: Calendar = .current) -> Date {
+        let start = calendar.startOfDay(for: date)
+        let stepped = calendar.date(byAdding: .day, value: delta, to: start) ?? start
+        return calendar.startOfDay(for: stepped)
+    }
+}
+
+/// U4 (R15/KTD-12) — which streamed daemon events should reload an open day
+/// page, pure so the trigger set is testable without a live socket.
+enum DayLiveRefresh {
+    /// Recording lifecycle / footage events that change what an open day page
+    /// should show — capture started/stopped or a new chunk flushed to disk.
+    /// Non-recording events (permission, capture-health, backfill/upload
+    /// progress, heartbeats) never trigger a reload.
+    static let reloadTriggerEventTypes: Set<String> = [
+        "started",
+        "chunk_finalized",
+        "recording_finalized",
+        "recording_failed",
+        "stopped",
+    ]
+
+    /// Whether a streamed event should reload the day. Only recording
+    /// lifecycle/footage events, and only while viewing today — past days are
+    /// immutable, so a live event never changes them (the "only-if-viewing-
+    /// today" guard, KTD-12).
+    static func shouldReload(eventType: String, isViewingToday: Bool) -> Bool {
+        isViewingToday && reloadTriggerEventTypes.contains(eventType)
+    }
+}
+
+/// U4 (R13 edge) — resolve a day-scoped search/citation hit to a within-day
+/// marker ms. Pure so the unanchored-hit fallback is testable.
+enum DaySearchHitResolver {
+    /// Prefer the hit's own anchor; when it has none (a transcript hit whose
+    /// chunk couldn't be resolved) fall back to the recording's `startedAt` — a
+    /// day + startedAt pointer — so the hit is placed at the recording's start
+    /// rather than dropped. Returns nil only when neither is available or the
+    /// resolved ms falls outside the day's `[startMs, endMs)`.
+    static func markerMs(
+        anchorMs: Int?,
+        recordingStartedAtMs: Int?,
+        dayStartMs: Int,
+        dayEndMs: Int
+    ) -> Int? {
+        guard let ms = anchorMs ?? recordingStartedAtMs else { return nil }
+        guard ms >= dayStartMs, ms < dayEndMs else { return nil }
+        return ms
     }
 }
