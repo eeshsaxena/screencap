@@ -423,6 +423,74 @@ def test_aggregate_figure_answer_passes_with_verbatim_number():
     assert "90 minutes" in result.answer
 
 
+def test_figure_lines_render_focus_names_and_titles():
+    """The enriched aggregate rendering (recall-aggregate-timings): per-app lines
+    lead with wall-clock focus, carry the human display name and the
+    longest-focused window titles, and the recorded-coverage line frames the
+    period — so a day-recap answer can say what actually happened, not just
+    bundle ids with decimal minutes."""
+
+    class _App:
+        app = "com.brave.Browser"
+        display_name = "Brave Browser"
+        covered_active_ms = 11 * 60 * 1000
+        focus_ms = 50 * 60 * 1000
+        event_count = 1276
+        top_titles = ["Believing in music", "Seedj"]
+
+    class _Agg:
+        covered_active_ms = 13 * 60 * 1000
+        uncovered_ms = 40 * 60 * 1000
+        recorded_ms = 53 * 60 * 1000
+        apps = [_App()]
+
+    from screencap.recall.dispatch import _figure_lines
+
+    lines = _figure_lines(_Agg())
+    joined = "\n".join(lines)
+    assert "screen time recorded in this period: 53 minutes" in joined
+    assert "no captured interaction" in joined
+    assert "Brave Browser: 50 minutes in focus (11 minutes actively interacting" in joined
+    assert '"Believing in music", "Seedj"' in joined
+    # A pre-enrichment aggregate (no focus/display/titles) still renders the
+    # legacy per-app line — the renderer is duck-typed, never a hard contract.
+    legacy = _figure_lines(_FakeAggregate(covered_active_ms=90 * 60 * 1000))
+    assert any("computed active time" in line for line in legacy)
+
+
+def test_enriched_figures_pass_the_egress_guard():
+    """The enriched figure lines (focus / titles / display names) are
+    bundle-derived text, so the whole-payload egress guard must accept an
+    aggregate turn end-to-end — a rendering word missing from the allowed set
+    would silently turn EVERY day-recap into a refusal."""
+
+    class _App:
+        app = "com.brave.Browser"
+        display_name = "Brave Browser"
+        covered_active_ms = 11 * 60 * 1000
+        focus_ms = 50 * 60 * 1000
+        event_count = 1276
+        top_titles = ["Believing in music"]
+
+    class _Agg:
+        covered_active_ms = 13 * 60 * 1000
+        uncovered_ms = 40 * 60 * 1000
+        recorded_ms = 53 * 60 * 1000
+        apps = [_App()]
+
+    fn = FakeAnswerFn(
+        answer_text="You spent 50 minutes in Brave Browser, mostly Believing in music."
+    )
+    bundle = _bundle(
+        [], figures=_Agg(), kind=QuestionKind.AGGREGATE, state=CoverageState.OK
+    )
+    result = answer_from_bundle(
+        bundle, question="what was I doing today?", policy=_CLOUD_CONSENTED, answer_fn=fn
+    )
+    assert result.refusal is False, f"egress guard tripped: reason={result.reason}"
+    assert "50 minutes" in result.answer
+
+
 # ===========================================================================
 # SCR-272 U5 — masked frames ride ONLY at the cloud-bound recall point
 # ===========================================================================

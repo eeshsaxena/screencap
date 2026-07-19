@@ -143,7 +143,15 @@ evidence does not contain enough to answer, say so plainly and briefly — do no
 guess, invent, or draw on outside knowledge. When the evidence is a timeline of \
 apps and window titles, summarize what the user was doing in your own words, but \
 name only the apps, sites, and durations that appear in the evidence — never \
-invent an app, site, or number. Keep the answer concise.
+invent an app, site, or number. When the evidence carries computed period \
+figures, answer like a helpful recap of the person's day, not a data dump: lead \
+with where most of the time went, using the in-focus durations as the time in \
+each app; use the window titles to say concretely what was being worked on or \
+watched; and mention actively-interacting time only when it differs a lot from \
+focus time (that gap usually means reading or watching). Speak naturally in the \
+second person, round numbers the way a person would, and close with the single \
+most notable thing from the period when the evidence shows one. Keep the answer \
+concise.
 """
 
 // Short verb-specific instructions for the window-scoped verbs (SCR-275,

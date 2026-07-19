@@ -155,31 +155,69 @@ class ChatAnswer:
 # ---------------------------------------------------------------------------
 
 
+def _fmt_minutes(ms: float) -> str:
+    """Whole-minute rendering for the model ("50 minutes", "under 1 minute").
+
+    Rounded ints, never decimals — a model echoes these numbers verbatim, and
+    "5.7 minutes" reads like telemetry, not an answer about someone's day.
+    ``attribution._figure_numbers`` mirrors this rendering so an echoed figure
+    counts as backed; keep the two in lockstep.
+    """
+    minutes = round(ms / 60_000.0)
+    if minutes < 1:
+        return "under 1 minute"
+    if minutes == 1:
+        return "1 minute"
+    return f"{minutes} minutes"
+
+
 def _figure_lines(figures: object | None) -> list[str]:
     """Render a computed :class:`WindowAggregate` (duck-typed) into human figure
-    lines for the evidence text. Never a hard import of U2."""
+    lines for the evidence text. Never a hard import of U2.
+
+    Focus time (wall-clock in front of the app, within recorded coverage) is the
+    headline per-app figure; the corroborated-active figure rides alongside as
+    the interaction qualifier. The longest-focused window titles give the model
+    something concrete to say about WHAT was happening, not just where.
+    """
     if figures is None:
         return []
     lines: list[str] = []
+    recorded_ms = getattr(figures, "recorded_ms", None)
     covered_ms = getattr(figures, "covered_active_ms", None)
     uncovered_ms = getattr(figures, "uncovered_ms", None)
+    if isinstance(recorded_ms, (int, float)) and recorded_ms > 0:
+        lines.append(f"screen time recorded in this period: {_fmt_minutes(recorded_ms)}")
     if isinstance(covered_ms, (int, float)):
-        minutes = covered_ms / 60_000.0
-        minutes = int(minutes) if abs(minutes - round(minutes)) < 1e-9 else round(minutes, 1)
-        lines.append(f"computed active time (over covered spans): {minutes} minutes")
+        lines.append(
+            f"computed active time (over covered spans): {_fmt_minutes(covered_ms)}"
+        )
     if isinstance(uncovered_ms, (int, float)) and uncovered_ms > 0:
-        umin = uncovered_ms / 60_000.0
-        umin = int(umin) if abs(umin - round(umin)) < 1e-9 else round(umin, 1)
-        lines.append(f"uncovered (idle / away / not captured): {umin} minutes")
+        lines.append(
+            f"of the recorded time, {_fmt_minutes(uncovered_ms)} had no captured "
+            "interaction (reading / watching / idle)"
+        )
     for app in getattr(figures, "apps", []) or []:
         name = getattr(app, "app", None)
         covered = getattr(app, "covered_active_ms", None)
         count = getattr(app, "event_count", None)
-        if isinstance(name, str) and isinstance(covered, (int, float)):
-            m = covered / 60_000.0
-            m = int(m) if abs(m - round(m)) < 1e-9 else round(m, 1)
-            extra = f", {count} events" if isinstance(count, int) else ""
-            lines.append(f"{name}: {m} minutes active{extra}")
+        if not isinstance(name, str) or not isinstance(covered, (int, float)):
+            continue
+        display = getattr(app, "display_name", "") or name
+        focus = getattr(app, "focus_ms", None)
+        extra = f", {count} input events" if isinstance(count, int) else ""
+        if isinstance(focus, (int, float)) and focus > 0:
+            line = (
+                f"{display}: {_fmt_minutes(focus)} in focus "
+                f"({_fmt_minutes(covered)} actively interacting{extra})"
+            )
+        else:
+            line = f"{name}: {_fmt_minutes(covered)} active{extra}"
+        titles = [t for t in (getattr(app, "top_titles", None) or []) if isinstance(t, str) and t]
+        if titles:
+            # Quoted so a title containing a separator can't read as two titles.
+            line += "; windows: " + ", ".join(f'"{t}"' for t in titles)
+        lines.append(line)
     return lines
 
 
@@ -257,7 +295,9 @@ _SCAFFOLD_TOKENS = frozenset(
     # main's structural labels + the structural words the figure renderer emits.
     ["evidence", "question", "answer", "computed", "minutes", "events",
      "active", "covered", "uncovered", "idle", "away", "captured", "spans",
-     "span", "not"]
+     "span", "not", "screen", "time", "recorded", "period", "focus",
+     "actively", "interacting", "input", "windows", "under", "reading",
+     "watching", "interaction", "had"]
 )
 
 

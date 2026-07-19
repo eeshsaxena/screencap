@@ -151,18 +151,18 @@ def test_echoed_computed_figure_passes():
     assert verdict.ok is True
 
 
-def test_fractional_minute_figure_rendering_is_backed():
-    """FIX B: the guardrail prompt renders minutes at 1 decimal (``_figure_lines``:
-    ``round(minutes, 1)`` → "1.7 minutes"), so an answer that faithfully echoes that
-    "1.7" must be BACKED. Previously ``_figure_numbers`` only rendered the 2-decimal
-    "1.67", so the model's honest "1.7" was flagged unbacked and the answer was
-    blanked to a refusal — a faithful answer refused."""
+def test_rendered_minute_figure_is_backed():
+    """FIX B lockstep: the guardrail prompt renders WHOLE minutes
+    (``dispatch._fmt_minutes``: ``round(ms/60000)`` → "2 minutes"), so an answer
+    that faithfully echoes the rendering the model was shown must be BACKED —
+    if ``_figure_numbers`` misses a rendering ``_figure_lines`` can emit, a
+    faithful answer is blanked to a refusal."""
     from screencap.recall.dispatch import _figure_lines
 
     figures = _FakeAggregate(covered_active_ms=100_000)  # 100000/60000 = 1.6667 min
-    # The guardrail prompt the model actually sees renders "1.7 minutes".
+    # The guardrail prompt the model actually sees renders "2 minutes".
     lines = " ".join(_figure_lines(figures))
-    assert "1.7 minutes" in lines
+    assert "2 minutes" in lines
 
     bundle = _bundle(
         [_item("Salesforce dashboard")],
@@ -170,10 +170,16 @@ def test_fractional_minute_figure_rendering_is_backed():
         kind=QuestionKind.AGGREGATE,
     )
     verdict = validate_attribution(
+        answer="You spent about 2 minutes in Salesforce, over covered spans.",
+        bundle=bundle,
+    )
+    assert verdict.ok is True, "a faithfully-echoed whole-minute figure must pass"
+    # The legacy 1-decimal rendering stays backed too (older evidence texts).
+    verdict = validate_attribution(
         answer="You spent about 1.7 minutes in Salesforce, over covered spans.",
         bundle=bundle,
     )
-    assert verdict.ok is True, "a faithfully-echoed 1-decimal minute figure must pass"
+    assert verdict.ok is True, "the legacy 1-decimal rendering must stay backed"
 
 
 def test_number_present_in_evidence_text_passes():

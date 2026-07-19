@@ -354,6 +354,11 @@ def test_masked_app_name_and_time_are_stripped_from_aggregate(tmp_path):
     assert result.covered_active_ms == 0, (
         "a masked focus span must not be credited as active time (fail-closed)"
     )
+    # Even the unattributed "screen time recorded" total must not carry the
+    # masked session's duration (blocked intervals are subtracted from it).
+    assert result.recorded_ms == 0, (
+        "a fully-masked recording's timing must not surface in recorded_ms"
+    )
 
 
 def test_aggregate_fails_closed_when_blocked_intervals_underivable(tmp_path, monkeypatch):
@@ -386,6 +391,173 @@ def test_aggregate_fails_closed_when_blocked_intervals_underivable(tmp_path, mon
     )
     assert result.apps == [], "an underivable recording must contribute no apps (fail-closed)"
     assert result.covered_active_ms == 0
+
+
+# --- coverage clamp: a dead recording contributes nothing -------------------
+
+
+def test_dead_recording_adds_no_phantom_uncovered_time(tmp_path):
+    """REGRESSION (recall-aggregate-timings). A recording whose events all ended
+    BEFORE the window must contribute nothing: without the coverage clamp, its
+    last focus row was carried into a phantom span across the whole window, and
+    every dead recording in the library added ``window_ms`` of fake "uncovered"
+    time (254 h of "uncovered" in a 15 h day on a real library)."""
+    dead = tmp_path / "dead"
+    # Recording ran (and ended) well before the queried window.
+    _make_recording_db(
+        dead,
+        started=_BASE - 7200,
+        end=_BASE - 6600,
+        windows=[{"ts": _BASE - 7200, "bundle": "com.apple.TextEdit", "app_name": "TextEdit"}],
+        actions=[{"ts": _BASE - 7200 + t} for t in range(0, 600, 10)],
+    )
+    result = aggregate.aggregate_window(
+        int(_BASE * 1000), int((_BASE + 3600) * 1000), recordings_dir=tmp_path
+    )
+    assert result.apps == [], "a dead recording must not surface any app"
+    assert result.uncovered_ms == 0, (
+        "a dead recording must not add phantom uncovered time to the window"
+    )
+    assert result.recorded_ms == 0
+
+
+def test_live_recording_contribution_clamps_to_its_coverage_end(tmp_path):
+    """A recording that stops mid-window contributes only up to its last captured
+    evidence — the time after it stopped is 'not recorded', never 'idle in the
+    last-focused app'."""
+    rec = tmp_path / "stops-early"
+    start = _BASE
+    rec_end = _BASE + 600  # recording stops 10 min in
+    _make_recording_db(
+        rec,
+        started=start,
+        end=rec_end,
+        windows=[{"ts": start, "bundle": "com.apple.TextEdit", "app_name": "TextEdit"}],
+        actions=[{"ts": start + t} for t in range(0, 600, 10)],
+    )
+    # Query a 2 h window — 110 min of it have no recording at all.
+    result = aggregate.aggregate_window(
+        int(start * 1000), int((start + 7200) * 1000), recordings_dir=tmp_path
+    )
+    assert result.recorded_ms <= 600_000
+    editor = _app(result, "com.apple.TextEdit")
+    assert editor is not None
+    assert editor.focus_ms <= 600_000, (
+        "focus must clamp to the recording's coverage end, not the window end"
+    )
+    assert result.uncovered_ms <= 600_000, (
+        "time after the recording stopped must not be counted as uncovered/idle"
+    )
+
+
+# --- encrypted-corpus stills corroborate coverage ---------------------------
+
+
+def test_encrypted_stills_corroborate_active_time(tmp_path):
+    """REGRESSION (recall-aggregate-timings). Under ``corpus_encrypted`` every
+    still is ``*.jpg.enc``; the frame-presence coverage signal must survive —
+    a ``.jpg``-only glob silently halves the credited active time on the shipped
+    default posture."""
+    rec = tmp_path / "encshots"
+    start = _BASE
+    end = _BASE + 120
+    shot_ts = [start + 10, start + 20, start + 30, start + 40]
+    _make_recording_db(
+        rec,
+        started=start,
+        end=end,
+        windows=[{"ts": start, "bundle": "com.apple.TextEdit", "app_name": "TextEdit"}],
+        actions=[],
+        screenshots=shot_ts,
+    )
+    # Re-write the stills in the encrypted-corpus form (name-only encryption
+    # stand-in; the aggregate never reads the bytes). The DB image_path rows keep
+    # the same timestamps, mirroring a real encrypted capture.
+    shots = rec / "screenshots"
+    for ts in shot_ts:
+        (shots / f"{ts}.jpg").rename(shots / f"{ts}.jpg.enc")
+    result = aggregate.aggregate_window(
+        int(start * 1000), int(end * 1000), recordings_dir=tmp_path
+    )
+    editor = _app(result, "com.apple.TextEdit")
+    assert editor is not None
+    assert editor.covered_active_ms > 0, (
+        "encrypted .jpg.enc stills must corroborate coverage like plaintext .jpg"
+    )
+
+
+# --- focus figures: wall-clock focus rides alongside active time ------------
+
+
+def test_focus_time_and_display_name_surface_alongside_active(tmp_path):
+    """The per-app figure carries wall-clock focus (the number a person means by
+    'time in that app') next to the stricter corroborated-active figure, plus the
+    human display name and longest-focused window titles for narration. A
+    static reading tail counts toward focus but NOT toward active (the honest
+    coverage model is unchanged)."""
+    rec = tmp_path / "focus"
+    start = _BASE
+    end = _BASE + 600
+    _make_recording_db(
+        rec,
+        started=start,
+        end=end,
+        windows=[{
+            "ts": start, "bundle": "com.apple.TextEdit",
+            "app_name": "TextEdit", "title": "notes.txt — TextEdit",
+        }],
+        # 100 s of clicks, then a 500 s untouched reading tail.
+        actions=[{"ts": start + t} for t in range(0, 100, 10)],
+    )
+    result = aggregate.aggregate_window(
+        int(start * 1000), int(end * 1000), recordings_dir=tmp_path
+    )
+    editor = _app(result, "com.apple.TextEdit")
+    assert editor is not None
+    # Focus covers the whole recorded span; active only the corroborated part.
+    assert editor.focus_ms == 600_000
+    assert editor.covered_active_ms < editor.focus_ms
+    assert editor.display_name == "TextEdit"
+    assert editor.top_titles == ["notes.txt — TextEdit"]
+    assert result.recorded_ms == 600_000
+
+
+def test_blocked_sliver_clips_span_instead_of_erasing_it(tmp_path, monkeypatch):
+    """REGRESSION (recall-aggregate-timings). A small blocked interval (e.g. an
+    uncovered-gap residual at a span edge) must CLIP the overlapped part of a
+    focus span, not erase the whole span — the old any-overlap drop erased
+    minutes of legitimate activity for a 10 s residual. A fully-masked span
+    still vanishes entirely (its blocked interval covers all of it) — pinned by
+    ``test_masked_app_name_and_time_are_stripped_from_aggregate``."""
+    rec = tmp_path / "sliver"
+    start = _BASE
+    end = _BASE + 300
+    _make_recording_db(
+        rec,
+        started=start,
+        end=end,
+        windows=[{"ts": start, "bundle": "com.apple.TextEdit", "app_name": "TextEdit"}],
+        actions=[{"ts": start + t} for t in range(0, 300, 10)],
+    )
+
+    class _Sliver:
+        start = _BASE
+        end = _BASE + 10
+
+    def _fake_derive(*_a, **_k):
+        return [_Sliver()]
+
+    monkeypatch.setattr(
+        "screencap.backfill.skip_intervals.derive_skip_intervals", _fake_derive
+    )
+    result = aggregate.aggregate_window(
+        int(start * 1000), int(end * 1000), recordings_dir=tmp_path
+    )
+    editor = _app(result, "com.apple.TextEdit")
+    assert editor is not None, "a 10 s sliver must not erase the whole span"
+    # The clipped span keeps everything but the blocked sliver.
+    assert editor.focus_ms == 290_000
+    assert editor.covered_active_ms > 200_000
 
 
 # --- empty window: honest zero, not a fabricated figure --------------------
