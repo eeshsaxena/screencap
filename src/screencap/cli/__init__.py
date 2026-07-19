@@ -4981,6 +4981,41 @@ def _backfill_client_or_exit(*, auto_spawn: bool = True) -> "DaemonHTTPClient":
     return DaemonHTTPClient()
 
 
+@cli.group("feedback")
+def feedback_group() -> None:
+    """Send in-app bug reports, feedback, and feature requests.
+
+    The macOS app is the intended caller: it pipes a JSON payload to
+    ``feedback send`` over stdin. The command relays it to the vendor-side
+    ``submit-feedback`` function (which files a Linear triage issue) and prints
+    a JSON envelope. It exits 0 even on expected failures so the app can read
+    the ``error_kind`` and show honest, cause-specific copy.
+    """
+
+
+@feedback_group.command("send")
+def feedback_send() -> None:
+    """Read a feedback payload on stdin and relay it; print a JSON envelope.
+
+    Stdin: ``{type, message, email?, versions{app,daemon,macos},
+    attachments:[{path, content_type}]}``. Always exits 0 for expected
+    failures; the envelope carries ``ok`` and, on failure, ``error_kind`` +
+    ``retryable``.
+    """
+    from screencap.feedback import send_feedback
+
+    raw = sys.stdin.buffer.read()
+    try:
+        payload = json.loads(raw or b"{}")
+    except (ValueError, TypeError):
+        click.echo(json.dumps({"ok": False, "error_kind": "invalid", "message": "invalid payload", "retryable": False}))
+        return
+    if not isinstance(payload, dict):
+        click.echo(json.dumps({"ok": False, "error_kind": "invalid", "message": "invalid payload", "retryable": False}))
+        return
+    click.echo(json.dumps(send_feedback(payload)))
+
+
 def _backfill_call_or_exit(call) -> dict[str, Any]:
     """Run a daemon verb, translating transport/schema/API failures to exits.
 
