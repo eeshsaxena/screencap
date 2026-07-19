@@ -35,7 +35,7 @@ final class RecordingsIndex: ObservableObject {
     /// `recording.list` SUCCESS envelope (and the CLI `list --json` fallback's typed
     /// output) — an INDEPENDENT property, NOT a `LoadErrorKind` case, because that
     /// verb succeeds with an empty payload for a locked/absent/error store and never
-    /// throws. `LibraryView` (and Search/Chat) branch on this BEFORE the
+    /// throws. `DaysView` (and Search/Chat) branch on this BEFORE the
     /// `recordings.isEmpty` check so a sealed store never falls through to the
     /// "Nothing recorded yet" welcome screen (the R6 data-loss look). `.mounted` for
     /// a plaintext install, an older daemon, or a generic load failure.

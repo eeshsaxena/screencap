@@ -421,6 +421,13 @@ def _evictable_candidates(
     for r in rows:
         if r.evict_state == EvictState.EVICTED:
             continue
+        # U8: a USER_DELETED chunk's media is already unlinked by the range-delete
+        # job (its manifest is gone → unknown capture window). Eviction ignores it
+        # — it is neither UPLOADED nor LOCAL_DONE, but an already-UPLOADED chunk
+        # deleted afterwards keeps upload_state=UPLOADED, so guard it explicitly so
+        # the cloud branch below never re-selects it.
+        if r.lifecycle == Lifecycle.USER_DELETED:
+            continue
         if local:
             if r.lifecycle == Lifecycle.LOCAL_DONE:
                 out.append(r)

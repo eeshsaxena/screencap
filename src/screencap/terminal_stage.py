@@ -2045,7 +2045,11 @@ def _media_upload_indices(
             continue
         if row.upload_state == UploadState.UPLOADED:
             continue
-        if row.lifecycle in (Lifecycle.LOCAL_DONE, Lifecycle.SKIPPED, Lifecycle.EVICTED):
+        # U8: USER_DELETED chunks have their media unlinked — never (re)upload.
+        if row.lifecycle in (
+            Lifecycle.LOCAL_DONE, Lifecycle.SKIPPED, Lifecycle.EVICTED,
+            Lifecycle.USER_DELETED,
+        ):
             continue
         out.append(row.chunk_index)
     return out
@@ -2496,7 +2500,11 @@ def _mark_uploaded_chunks(
             continue
         if row.upload_state == UploadState.UPLOADED:
             continue
-        if row.lifecycle in (Lifecycle.LOCAL_DONE, Lifecycle.SKIPPED):
+        # U8: a USER_DELETED chunk's media is gone — never confirm/mark it
+        # uploaded (its deletion already satisfies the sentinel gate).
+        if row.lifecycle in (
+            Lifecycle.LOCAL_DONE, Lifecycle.SKIPPED, Lifecycle.USER_DELETED,
+        ):
             continue
         if _chunk_confirmed_remote(recording_dir, idx, remote_exists=remote_exists):
             with contextlib.suppress(Exception):

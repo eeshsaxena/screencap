@@ -4,8 +4,11 @@ import SwiftUI
 // Conversational-recall U8 — the multi-turn Chat destination (KTD7). A scrolling
 // transcript of grounded answers, each with a collapsible sources strip that
 // REUSES Search's shipped result components (`SnippetHighlighter`,
-// `RecordingCardThumbnail`) and the deep-link opener (`InspectWindowOpener`).
-// Selecting a source opens the Inspect window at that exact moment.
+// `RecordingCardThumbnail`). Each source card shows the moment as a day + time
+// (R13/KTD-11, never a recording name — R5); selecting a source routes to the
+// DAY PAGE seeked to that moment (U12/KTD-10), replacing the old Inspect-window
+// deep-link. The pointer itself stays `(recording, timestamp_ms)` (KTD-1) — only
+// its presentation and landing change.
 //
 // Interaction states this surface commits to (U8 Approach):
 //  - In-flight answer: a thinking indicator while generating (whole-render after
@@ -26,6 +29,13 @@ struct ChatView: View {
     /// (R6). Wired by `MainWindow` to its `ShellRoute` (`route = .intelligence`); a
     /// no-op default keeps previews and standalone instantiation working.
     var onOpenIntelligenceSettings: () -> Void = {}
+    /// U12 (R13, KTD-10) — a source tap routes to the day page seeked to that
+    /// moment. Wired by `MainWindow` to `route = .timeline(day:seekMs:highlight:)`.
+    /// `highlight` carries a task span when the citation lands on one (AE3); Chat
+    /// sources carry no span today, so it is nil — the seam stays for a future
+    /// task-anchored source. A no-op default keeps previews / standalone
+    /// instantiation working.
+    var onOpenCitation: (_ day: Date, _ seekMs: Int?, _ highlight: DaySpanHighlight?) -> Void = { _, _, _ in }
     @StateObject private var model = ChatViewModel()
     /// Recall-consent state surfacing (KTD1) — the existing recall row governs
     /// cloud use; on-device is the default and shown at rest.
@@ -274,11 +284,21 @@ struct ChatView: View {
         composerFocused = true
     }
 
-    /// A source tap → open the Inspect window at that exact moment, mirroring the
-    /// Library/palette deep-link (set `pendingSeekMs` then open, keyed by name).
+    /// A source tap → route to the DAY PAGE seeked to that moment (U12/KTD-10),
+    /// mirroring `RecallPaletteView.onJump`. The day is derived from the pointer's
+    /// `timestamp_ms` via KTD-11's rule; an unanchored source (no timestamp — the
+    /// daemon always supplies one in v1, so this is defensive) keeps its day from
+    /// the recording's `startedAt` and seeks to the day's start. A citation into
+    /// deleted / evicted footage still routes here — the day page renders the
+    /// honest "removed by you" / "nothing on file" band at the seek point (R13/R8).
     private func openSource(_ source: ChatSource) {
-        InspectWindowOpener.shared.pendingSeekMs[source.recording] = source.timestampMs
-        InspectWindowOpener.shared.open(recordingName: source.recording)
+        if let ms = source.timestampMs {
+            onOpenCitation(CitationTarget.day(forAnchorMs: ms), ms, nil)
+        } else if let day = index.recordings.first(where: { $0.name == source.recording })?.startedDay {
+            onOpenCitation(day, nil, nil)
+        }
+        // else: no resolvable day — nothing to land on. Never open the recording
+        // by name (R5); silently no-op the unresolvable defensive case.
     }
 
     private func terms(_ question: String) -> [String] {
@@ -624,7 +644,7 @@ private struct ChatSourceCard: View {
                         RoundedRectangle(cornerRadius: SCMetrics.radiusPill)
                             .strokeBorder(Color.scBorderWarm, lineWidth: 1)
                     )
-                Text(source.recording)
+                Text(momentLabel)
                     .font(SCTypography.sans(size: 11))
                     .foregroundStyle(Color.scInkSecondary)
                     .lineLimit(1)
@@ -634,7 +654,7 @@ private struct ChatSourceCard: View {
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Source: \(streamLabel), \(source.recording). Opens the moment.")
+        .accessibilityLabel("Source: \(streamLabel), \(momentLabel). Opens the day at that moment.")
         .accessibilityAddTraits(.isButton)
     }
 
@@ -663,7 +683,7 @@ private struct ChatSourceCard: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else {
-                LibraryHatchPlaceholder()
+                CardHatchPlaceholder()
             }
         }
         .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -690,5 +710,20 @@ private struct ChatSourceCard: View {
         case .transcript: return "audio"
         case .timeline: return "activity"
         }
+    }
+
+    /// The moment as a day + time (R13/KTD-11) — the card's subtitle, REPLACING
+    /// the recording name (R5). Anchored → "Today · 14:32"; an unanchored source
+    /// (defensive — the daemon always supplies a timestamp in v1) keeps the
+    /// recording's day when resolvable, else an honest "Time unknown". Never a
+    /// `rec-<timestamp>` identifier.
+    private var momentLabel: String {
+        if let ms = source.timestampMs {
+            return CitationTarget.dayTimeLabel(anchorMs: ms)
+        }
+        if let day = summary?.startedDay {
+            return CitationTarget.dayOnlyLabel(day: day)
+        }
+        return "Time unknown"
     }
 }

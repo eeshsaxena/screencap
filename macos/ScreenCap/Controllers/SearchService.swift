@@ -18,7 +18,7 @@ protocol SearchService: Sendable {
     func tasksList(_ req: TasksListRequest) async throws -> TasksListResponse
 
     // SCR-214 U11 — the task-curation write verbs, on the same seam as
-    // `tasksList` so `JournalTasks` write-through injects a single fake in tests.
+    // `tasksList` so `DayTasks` write-through injects a single fake in tests.
     // Unlike the read verbs a throw here is NOT swallowed: a failed write must
     // surface a visible retry/error and revert optimistic state (R8), so the
     // caller inspects the throw rather than degrading silently.

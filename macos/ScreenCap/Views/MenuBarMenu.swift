@@ -167,14 +167,14 @@ struct MenuBarMenu: View {
             Text("Unlocking…")
         } else {
             if MenuBarMenuPolicy.unlockItemVisible(storeState: index.storeState, phase: store.phase) {
-                Button("Unlock Library…") { store.unlock() }
+                Button("Unlock storage…") { store.unlock() }
             }
             if MenuBarMenuPolicy.lockItemVisible(
                 storeState: index.storeState,
                 containerEnabled: privacy.containerEnabled == true,
                 phase: store.phase
             ) {
-                Button("Lock Library") { store.lock() }
+                Button("Lock storage") { store.lock() }
             }
         }
         if let err = store.lastError {

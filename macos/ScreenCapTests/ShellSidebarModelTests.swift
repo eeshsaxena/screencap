@@ -12,11 +12,32 @@ final class ShellSidebarModelTests: XCTestCase {
 
     // MARK: - Routing + enablement
 
-    func testLibraryRoutesAndIsEnabled() {
-        let library = item(ShellSidebarModel.primaryNav, "library")
-        XCTAssertEqual(library.route, .library)
-        XCTAssertTrue(library.isEnabled)
-        XCTAssertNil(library.helpText, "an enabled row has no coming-soon tooltip")
+    /// R1 — the primary nav is exactly Days · Tasks · Clips · Chat, in order,
+    /// with no Library/Journal/Collections rows.
+    func testPrimaryNavIsDaysTasksClipsChat() {
+        XCTAssertEqual(ShellSidebarModel.primaryNav.map(\.id), ["days", "tasks", "clips", "chat"])
+        XCTAssertEqual(
+            ShellSidebarModel.primaryNav.map(\.route),
+            [.days, .tasks, .clips, .chat]
+        )
+        XCTAssertTrue(ShellSidebarModel.primaryNav.allSatisfy(\.isEnabled))
+    }
+
+    func testDaysRoutesAndIsEnabled() {
+        let days = item(ShellSidebarModel.primaryNav, "days")
+        XCTAssertEqual(days.route, .days)
+        XCTAssertTrue(days.isEnabled)
+        XCTAssertNil(days.helpText, "an enabled row has no coming-soon tooltip")
+    }
+
+    /// Tasks and Clips route now (to honest placeholders until U6/U11 land).
+    func testTasksAndClipsRouteAndAreEnabled() {
+        let tasks = item(ShellSidebarModel.primaryNav, "tasks")
+        XCTAssertEqual(tasks.route, .tasks)
+        XCTAssertTrue(tasks.isEnabled)
+        let clips = item(ShellSidebarModel.primaryNav, "clips")
+        XCTAssertEqual(clips.route, .clips)
+        XCTAssertTrue(clips.isEnabled)
     }
 
     /// KTD-4 (account-sheet U5): Account is pinned FIRST in the SETTINGS group
@@ -36,13 +57,6 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertNil(privacy.helpText)
     }
 
-    func testJournalRoutesAndIsEnabled() {
-        let journal = item(ShellSidebarModel.primaryNav, "journal")
-        XCTAssertEqual(journal.route, .journal)
-        XCTAssertTrue(journal.isEnabled, "Journal routes to its pane since U8")
-        XCTAssertNil(journal.helpText)
-    }
-
     func testAppRulesRoutesAndIsEnabled() {
         let row = item(ShellSidebarModel.settingsNav, "appRules")
         XCTAssertEqual(row.route, .appRules)
@@ -50,13 +64,38 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertNil(row.helpText)
     }
 
-    /// Collections is a deferred capability — disabled with the SCR-222 tooltip,
-    /// and it never carries the design's mock collection names (R4 / U14 sweep).
-    func testCollectionsIsStubbedWithTicket() {
-        let collections = item(ShellSidebarModel.collections, "collections")
-        XCTAssertFalse(collections.isEnabled)
-        XCTAssertNil(collections.route, "a pure stub row has no destination")
-        XCTAssertEqual(collections.helpText, "Coming soon — SCR-222")
+    // MARK: - U4 active-row highlighting
+
+    /// The day page (`.timeline`) has no row of its own — it is part of the Days
+    /// experience, so it highlights the Days row (U4). None of Tasks/Clips/Chat
+    /// light up while a day page is open.
+    func testTimelineRouteHighlightsDaysRow() {
+        let route = ShellRoute.timeline(day: Date(), seekMs: nil, highlight: nil)
+        XCTAssertEqual(ShellSidebarModel.highlightedRoute(for: route), .days)
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "days"), route: route))
+        for id in ["tasks", "clips", "chat"] {
+            XCTAssertFalse(
+                ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, id), route: route),
+                "\(id) is not active while the day page is open"
+            )
+        }
+    }
+
+    /// A landing highlight rides `.timeline` without changing the Days-row rule.
+    func testTimelineWithHighlightStillHighlightsDaysRow() {
+        let route = ShellRoute.timeline(
+            day: Date(), seekMs: 1_000, highlight: DaySpanHighlight(startMs: 1_000, endMs: 2_000)
+        )
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "days"), route: route))
+    }
+
+    /// Regression: the timeline mapping doesn't disturb the ordinary case —
+    /// every other route highlights its own row and no other.
+    func testEachRouteHighlightsItsOwnRow() {
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "tasks"), route: .tasks))
+        XCTAssertFalse(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "days"), route: .tasks))
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.settingsNav, "privacy"), route: .privacy))
+        XCTAssertFalse(ShellSidebarModel.isActive(item(ShellSidebarModel.settingsNav, "account"), route: .privacy))
     }
 
     // MARK: - Footer storage math

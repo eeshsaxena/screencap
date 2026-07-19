@@ -295,4 +295,99 @@ final class DayTimelineTaskBandsTests: XCTestCase {
         let blocked = DayStripBlockedBand(startMs: dayStart, endMs: dayStart + hour)
         XCTAssertTrue(DayStripAccessibility.blockedLabel(blocked).hasPrefix("Blocked at capture, "))
     }
+
+    // MARK: - U4 date navigation (R16)
+
+    private func gregorian() -> Calendar {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "America/New_York")!
+        return cal
+    }
+
+    /// Next-day from Jan 31 lands on Feb 1 (month rollover), not "Jan 32".
+    func testAdjacentDayCrossesMonthBoundary() {
+        let cal = gregorian()
+        let jan31 = cal.date(from: DateComponents(year: 2026, month: 1, day: 31))!
+        let feb1 = DayNavigation.adjacentDay(to: jan31, delta: 1, calendar: cal)
+        XCTAssertEqual(cal.component(.month, from: feb1), 2)
+        XCTAssertEqual(cal.component(.day, from: feb1), 1)
+    }
+
+    /// Previous-day from Jan 1 crosses the year boundary to Dec 31.
+    func testAdjacentDayCrossesYearBoundaryBackward() {
+        let cal = gregorian()
+        let jan1 = cal.date(from: DateComponents(year: 2026, month: 1, day: 1))!
+        let dec31 = DayNavigation.adjacentDay(to: jan1, delta: -1, calendar: cal)
+        XCTAssertEqual(cal.component(.year, from: dec31), 2025)
+        XCTAssertEqual(cal.component(.month, from: dec31), 12)
+        XCTAssertEqual(cal.component(.day, from: dec31), 31)
+    }
+
+    /// A midday source date snaps to the next start-of-day (00:00), not +24h.
+    func testAdjacentDayReturnsStartOfDay() {
+        let cal = gregorian()
+        let noon = cal.date(from: DateComponents(year: 2026, month: 6, day: 15, hour: 12))!
+        let next = DayNavigation.adjacentDay(to: noon, delta: 1, calendar: cal)
+        XCTAssertEqual(next, cal.startOfDay(for: next))
+        XCTAssertEqual(cal.component(.day, from: next), 16)
+        XCTAssertEqual(cal.component(.hour, from: next), 0)
+    }
+
+    // MARK: - U4 live refresh (R15/KTD-12)
+
+    /// Every recording lifecycle / footage event reloads an open Today page.
+    func testLiveRefreshReloadsOnRecordingEventsWhenViewingToday() {
+        for type in ["started", "chunk_finalized", "recording_finalized", "recording_failed", "stopped"] {
+            XCTAssertTrue(
+                DayLiveRefresh.shouldReload(eventType: type, isViewingToday: true),
+                "\(type) should reload an open Today page"
+            )
+        }
+    }
+
+    /// Non-recording events (permission, capture health, backfill/upload
+    /// progress, heartbeats) never reload the day.
+    func testLiveRefreshIgnoresNonRecordingEvents() {
+        for type in ["permission_lost", "capture_unhealthy", "backfill.progress",
+                     "matrix_disclosure_required", "_close"] {
+            XCTAssertFalse(DayLiveRefresh.shouldReload(eventType: type, isViewingToday: true))
+        }
+    }
+
+    /// A past day is immutable — a live recording event never reloads it.
+    func testLiveRefreshNeverReloadsPastDays() {
+        XCTAssertFalse(DayLiveRefresh.shouldReload(eventType: "chunk_finalized", isViewingToday: false))
+    }
+
+    // MARK: - U4 unanchored-hit fallback (R13 edge)
+
+    func testSearchHitUsesAnchorWhenPresent() {
+        let ms = DaySearchHitResolver.markerMs(
+            anchorMs: dayStart + hour, recordingStartedAtMs: dayStart,
+            dayStartMs: dayStart, dayEndMs: dayStart + 24 * hour
+        )
+        XCTAssertEqual(ms, dayStart + hour)
+    }
+
+    /// An unanchored hit lands on the recording's `startedAt` rather than being
+    /// dropped (R13 edge — day + startedAt pointer).
+    func testSearchHitFallsBackToStartedAtWhenUnanchored() {
+        let ms = DaySearchHitResolver.markerMs(
+            anchorMs: nil, recordingStartedAtMs: dayStart + 2 * hour,
+            dayStartMs: dayStart, dayEndMs: dayStart + 24 * hour
+        )
+        XCTAssertEqual(ms, dayStart + 2 * hour)
+    }
+
+    /// No pointer at all, or a pointer outside the day, drops the hit.
+    func testSearchHitDroppedWhenNoPointerOrOutsideDay() {
+        XCTAssertNil(DaySearchHitResolver.markerMs(
+            anchorMs: nil, recordingStartedAtMs: nil,
+            dayStartMs: dayStart, dayEndMs: dayStart + 24 * hour
+        ))
+        XCTAssertNil(DaySearchHitResolver.markerMs(
+            anchorMs: nil, recordingStartedAtMs: dayStart - hour,
+            dayStartMs: dayStart, dayEndMs: dayStart + 24 * hour
+        ), "startedAt before the day → dropped")
+    }
 }

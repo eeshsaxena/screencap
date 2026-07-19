@@ -12,8 +12,11 @@ import SwiftUI
 /// dismissal; renders `RecallPaletteContent` (pure, hostable in tests).
 struct RecallPaletteView: View {
     @Binding var isPresented: Bool
-    /// ↵ / click on a hit — MainWindow routes to the Day timeline (U9).
-    var onJump: (Date, Int) -> Void
+    /// ↵ / click on a hit — MainWindow routes to the Day timeline (U9). `seekMs`
+    /// is nil for an UNANCHORED hit (U12/R13): the hit keeps its day (from the
+    /// recording's `startedAt`) and lands on the day page at the day's start
+    /// rather than being dropped.
+    var onJump: (Date, Int?) -> Void
 
     @StateObject private var model = SearchViewModel()
     @StateObject private var recentStore = RecentSearchesStore()
@@ -106,6 +109,13 @@ struct RecallPaletteView: View {
                     selectedResultID: selectedResultID,
                     frameIndex: frameIndex,
                     thumbnailLoader: thumbnailLoader,
+                    // U12/R13 — resolve a recording's day (from `startedAt`) so an
+                    // unanchored hit's title keeps its DAY instead of the retired
+                    // recording-name fallback. Index-backed; the pure test host
+                    // defaults it to nil.
+                    recordingDay: { name in
+                        index.recordings.first(where: { $0.name == name })?.startedDay
+                    },
                     // Unknown (nil, pre-load) -> gated: default to requiring presence
                     // until settings confirm the corpus is NOT encrypted.
                     presenceGate: (corpusEncrypted ?? true) ? presenceGate : nil,
@@ -243,10 +253,24 @@ struct RecallPaletteView: View {
     }
 
     private func jump(_ item: SearchResultItem) {
-        guard let target = RecallPalette.timelineTarget(for: item) else { return }
+        // U12/R13 — an unanchored hit is NEVER dropped: fall back to the
+        // recording's day (from its `startedAt`), landing on the day page at the
+        // day's start (seek unknown). Only a truly unresolvable hit (no anchor
+        // AND no known recording day) has nowhere to land.
+        let day: Date
+        let seekMs: Int?
+        if let target = RecallPalette.timelineTarget(for: item) {
+            day = target.day
+            seekMs = target.seekMs
+        } else if let recDay = index.recordings.first(where: { $0.name == item.recording })?.startedDay {
+            day = recDay
+            seekMs = nil
+        } else {
+            return
+        }
         recentStore.record(query)
         dismiss()
-        onJump(target.day, target.seekMs)
+        onJump(day, seekMs)
     }
 
     private func runChipQuery(_ text: String) {
@@ -357,6 +381,10 @@ struct RecallPaletteContent: View {
     let selectedResultID: SearchResultItem.ID?
     let frameIndex: RecordingFrameIndex?
     let thumbnailLoader: ThumbnailLoader?
+    /// U12/R13 — resolve a recording name → its local calendar day, so an
+    /// unanchored hit's title keeps the DAY (never the recording name, R5).
+    /// Defaulted to nil-returning so the pure test host stays index-free.
+    var recordingDay: (String) -> Date? = { _ in nil }
     /// Search U6 (R4): when set (corpus encrypted / guardrails on), the results list
     /// — which carries still previews — reveals only after present-user auth. `nil`
     /// (default / pre-flip) leaves results ungated, unchanged.
@@ -472,6 +500,7 @@ struct RecallPaletteContent: View {
                             isSelected: item.id == effectiveSelectedID(results),
                             frameIndex: frameIndex,
                             thumbnailLoader: thumbnailLoader,
+                            recordingDay: recordingDay(item.recording),
                             onOpen: { onOpen(item) }
                         )
                     }
@@ -765,6 +794,9 @@ struct RecallPaletteRow: View {
     let isSelected: Bool
     let frameIndex: RecordingFrameIndex?
     let thumbnailLoader: ThumbnailLoader?
+    /// U12/R13 — the hit recording's day (resolved by the palette from the
+    /// index), so an unanchored hit's title keeps the DAY. nil when unknown.
+    var recordingDay: Date? = nil
     var onOpen: () -> Void
 
     @State private var loaded: Loaded?
@@ -809,7 +841,7 @@ struct RecallPaletteRow: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else {
-                LibraryHatchPlaceholder()
+                CardHatchPlaceholder()
             }
         }
         .frame(width: 128, height: 72)
@@ -862,10 +894,17 @@ struct RecallPaletteRow: View {
         }
     }
 
-    /// Bold title: window title / app / recording — the design's sample
-    /// meeting-title lead line, from what the daemon actually returns.
+    /// Bold title: window title / app / the MOMENT (day + time) — never the
+    /// recording name (R5/R13). The retired `item.recording` fallback is replaced
+    /// by `CitationTarget.hitTitle`, which names the moment (or the day, for an
+    /// unanchored hit) instead of a `rec-<timestamp>` identifier.
     private var titleText: String {
-        item.title ?? item.app ?? item.recording
+        CitationTarget.hitTitle(
+            title: item.title,
+            app: item.app,
+            anchorMs: item.anchorMs,
+            recordingDay: recordingDay
+        )
     }
 
     /// Quoted snippet with the matched terms bolded (screen/audio only —

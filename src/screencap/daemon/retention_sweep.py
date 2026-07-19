@@ -59,7 +59,13 @@ def sweep_once(recordings_dir: Path | str | None = None, *, now: float | None = 
     if not root.is_dir():
         return report
     try:
-        rec_dirs = sorted(p for p in root.iterdir() if p.is_dir())
+        # Skip dot-prefixed reserved dirs (``.store/`` sidecars, ``.clips/`` store
+        # — KTD-8): they hold no evictable screenshots and are retention-exempt,
+        # so scanning them would count phantom "recordings". Mirrors
+        # ``catalog.list_recordings`` / ``backfill.engine._enumerate_recordings``.
+        rec_dirs = sorted(
+            p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
+        )
     except OSError:
         return report
 

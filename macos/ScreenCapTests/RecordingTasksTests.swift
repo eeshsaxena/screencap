@@ -2,7 +2,7 @@ import XCTest
 @testable import ScreenCap
 
 /// U10 (local-first intelligence) — the `tasks.list` read models, the
-/// task-aware title/summary rules (`JournalModel`), and the `JournalTasks`
+/// task-aware title/summary rules (`DaysModel`), and the `DayTasks`
 /// resolver's caching / fail-silent contract. Rendering is verified by
 /// build-and-run; these pin the pure logic + decoding.
 final class RecordingTasksTests: XCTestCase {
@@ -65,7 +65,7 @@ final class RecordingTasksTests: XCTestCase {
 
     func testDisplayTitleKeepsNamerTitleWhenPresent() {
         let rec = recording(name: "2026-07-06_10-00-00", title: "Payroll Reconciliation")
-        let title = JournalModel.displayTitle(rec, tasks: [task(0, "Some task")])
+        let title = DaysModel.displayTitle(rec, tasks: [task(0, "Some task")])
         XCTAssertEqual(title, "Payroll Reconciliation", "a distinct recording title is never overridden by a task")
     }
 
@@ -73,13 +73,13 @@ final class RecordingTasksTests: XCTestCase {
         // title == name means the recording has no distinct title (RecordingSummary
         // defaults title to the directory name).
         let rec = recording(name: "2026-07-06_10-00-00", title: nil)
-        let title = JournalModel.displayTitle(rec, tasks: [task(0, "Payroll run in Gusto")])
+        let title = DaysModel.displayTitle(rec, tasks: [task(0, "Payroll run in Gusto")])
         XCTAssertEqual(title, "Payroll run in Gusto")
     }
 
     func testDisplayTitleKeepsDirectoryNameWhenNoTasks() {
         let rec = recording(name: "2026-07-06_10-00-00", title: nil)
-        let title = JournalModel.displayTitle(rec, tasks: [])
+        let title = DaysModel.displayTitle(rec, tasks: [])
         XCTAssertEqual(title, "2026-07-06_10-00-00", "no tasks + no distinct title → directory name, no crash")
     }
 
@@ -91,7 +91,7 @@ final class RecordingTasksTests: XCTestCase {
         let rec = recording(name: "rec-20260717T172042",
                             title: "Recording · Jul 17, 5:20 PM",
                             titleIsUserSet: false)
-        let title = JournalModel.displayTitle(rec, tasks: [task(0, "Seedj Browsing")])
+        let title = DaysModel.displayTitle(rec, tasks: [task(0, "Seedj Browsing")])
         XCTAssertEqual(title, "Seedj Browsing",
                        "a derived date default (title_is_user_set == false) yields to a named task")
     }
@@ -102,7 +102,7 @@ final class RecordingTasksTests: XCTestCase {
         let rec = recording(name: "rec-20260717T172042",
                             title: "Quarterly close",
                             titleIsUserSet: true)
-        let title = JournalModel.displayTitle(rec, tasks: [task(0, "Seedj Browsing")])
+        let title = DaysModel.displayTitle(rec, tasks: [task(0, "Seedj Browsing")])
         XCTAssertEqual(title, "Quarterly close",
                        "a user-set title is never overridden by a task name")
     }
@@ -112,7 +112,7 @@ final class RecordingTasksTests: XCTestCase {
         let rec = recording(name: "rec-20260717T172042",
                             title: "Recording · Jul 17, 5:20 PM",
                             titleIsUserSet: false)
-        XCTAssertEqual(JournalModel.displayTitle(rec, tasks: []), "Recording · Jul 17, 5:20 PM")
+        XCTAssertEqual(DaysModel.displayTitle(rec, tasks: []), "Recording · Jul 17, 5:20 PM")
     }
 
     // MARK: - summaryLine (task-aware overload)
@@ -120,7 +120,7 @@ final class RecordingTasksTests: XCTestCase {
     func testSummaryLinePrefersNamerSummary() {
         let rec = recording(name: "r", title: "T", summary: "Ran the mid-month cycle")
         XCTAssertEqual(
-            JournalModel.summaryLine(rec, tasks: [task(0, "A task")]),
+            DaysModel.summaryLine(rec, tasks: [task(0, "A task")]),
             "Ran the mid-month cycle"
         )
     }
@@ -128,28 +128,28 @@ final class RecordingTasksTests: XCTestCase {
     func testSummaryLineFallsBackToTaskCountLine() {
         let rec = recording(name: "r", title: "T", summary: nil)
         XCTAssertEqual(
-            JournalModel.summaryLine(rec, tasks: [task(0, "First"), task(1, "Second"), task(2, "Third")]),
+            DaysModel.summaryLine(rec, tasks: [task(0, "First"), task(1, "Second"), task(2, "Third")]),
             "First · +2 more"
         )
         XCTAssertEqual(
-            JournalModel.summaryLine(rec, tasks: [task(0, "Only one")]),
+            DaysModel.summaryLine(rec, tasks: [task(0, "Only one")]),
             "Only one"
         )
     }
 
     func testSummaryLineNilWhenNoSummaryAndNoTasks() {
         let rec = recording(name: "r", title: "T", summary: nil)
-        XCTAssertNil(JournalModel.summaryLine(rec, tasks: []))
+        XCTAssertNil(DaysModel.summaryLine(rec, tasks: []))
     }
 
-    // MARK: - JournalTasks resolver
+    // MARK: - DayTasks resolver
 
     /// A daemon miss (throw) → tasks omitted (empty), never an error.
     @MainActor
     func testTasksOmittedOnDaemonFailure() async {
         let service = FakeTasksService()
         service.shouldThrow = true
-        let resolver = JournalTasks(service: service)
+        let resolver = DayTasks(service: service)
         let rec = recording(name: "r1", title: nil)
         await resolver.resolve(rec)
         XCTAssertEqual(resolver.tasks(for: rec), [])
@@ -160,7 +160,7 @@ final class RecordingTasksTests: XCTestCase {
     func testResolvesOncePerRecording() async {
         let service = FakeTasksService()
         service.tasks = [task(0, "Payroll run in Gusto")]
-        let resolver = JournalTasks(service: service)
+        let resolver = DayTasks(service: service)
         let rec = recording(name: "r1", title: nil)
         await resolver.resolve(rec)
         await resolver.resolve(rec)
@@ -251,7 +251,7 @@ final class RecordingTasksTests: XCTestCase {
     @MainActor
     func testCreateRefreshesCache() async {
         let service = FakeTasksService()
-        let store = JournalTasks(service: service)
+        let store = DayTasks(service: service)
         let ok = await store.create(recording: "r1", name: "Marked span", startTs: 100, endTs: 200)
         XCTAssertTrue(ok)
         XCTAssertEqual(store.tasksByRecording["r1"]?.map(\.name), ["Marked span"])
@@ -264,7 +264,7 @@ final class RecordingTasksTests: XCTestCase {
     func testRenameRefreshesCache() async {
         let service = FakeTasksService()
         service.store["r1"] = [task(3, "Old name")]
-        let store = JournalTasks(service: service)
+        let store = DayTasks(service: service)
         let ok = await store.rename(recording: "r1", taskIndex: 3, to: "New name")
         XCTAssertTrue(ok)
         XCTAssertEqual(store.tasksByRecording["r1"]?.first?.name, "New name")
@@ -276,7 +276,7 @@ final class RecordingTasksTests: XCTestCase {
     func testFailedWriteRevertsAndSurfaces() async {
         let service = FakeTasksService()
         service.store["r1"] = [task(3, "Keep me")]
-        let store = JournalTasks(service: service)
+        let store = DayTasks(service: service)
         await store.refresh("r1")   // seed the cache
         service.failWrites = true
 
@@ -293,7 +293,7 @@ final class RecordingTasksTests: XCTestCase {
     func testRetryReplaysFailedWrite() async {
         let service = FakeTasksService()
         service.store["r1"] = [task(3, "Keep me")]
-        let store = JournalTasks(service: service)
+        let store = DayTasks(service: service)
         await store.refresh("r1")
         service.failWrites = true
         _ = await store.delete(recording: "r1", taskIndex: 3)
@@ -311,7 +311,7 @@ final class RecordingTasksTests: XCTestCase {
     @MainActor
     func testEmptyDayPlaceholderGate() async {
         let service = FakeTasksService()   // no store entry, empty flat list
-        let store = JournalTasks(service: service)
+        let store = DayTasks(service: service)
         let rec = recording(name: "r1", title: nil)
         XCTAssertFalse(store.hasResolved(rec))
         await store.resolve(rec)

@@ -136,6 +136,13 @@ AMBIGUOUS_SECURE_FIELD = "ambiguous_secure_field"
 # surviving trace of a purged span (its window/action/screenshot rows are gone,
 # so canonical + uncovered-gap + ambiguity are all blind to it).
 RETROACTIVE_PURGE = "retroactive_purge"
+# U8 (range delete): a persisted ``origin='user'`` purged span — an EXPLICIT user
+# range delete ("removed by you"), distinct from the policy-driven
+# ``RETROACTIVE_PURGE`` ("removed by your rules"). Its OWN fail-closed category so
+# ``frame.nearest`` / backfill degrade honestly (the footage is gone) and
+# ``day_segments`` can render the honest R8 split. Both are absolute EXCLUDE spans
+# (both block indexing / frame resolution); only the reason LABEL differs.
+USER_RANGE_DELETE = "user_range_delete"
 
 # The local-only table ``enforcement/scrub_worker.py`` writes its purge spans to,
 # in the SAME transaction as the row deletes (crash-consistent). recording.db is
@@ -579,22 +586,34 @@ def _read_purged_intervals(db_path: Path) -> list[BlockedInterval]:
     Intervals are NOT clipped to a caller's ``time_range``: an out-of-range span
     matches no in-range timestamp anyway, and clipping an open-ended span would
     silently shorten its protection.
+
+    U8: the additive ``origin`` column splits each span's reason —
+    ``origin='user'`` → :data:`USER_RANGE_DELETE` ("removed by you"), everything
+    else (``'policy'`` OR a NULL/absent origin on a legacy row) →
+    :data:`RETROACTIVE_PURGE` ("removed by your rules"). Every pre-migration purge
+    was policy-driven, so NULL classifies as policy. Both are absolute EXCLUDE
+    spans — only the label differs.
     """
     with open_recording_db(db_path) as conn:
         if not has_table(conn, _PURGED_INTERVAL_TABLE):
             return []
+        has_origin = has_column(conn, _PURGED_INTERVAL_TABLE, "origin")
+        cols = "start_ts, end_ts" + (", origin" if has_origin else "")
         rows = conn.execute(
-            f"SELECT start_ts, end_ts FROM {_PURGED_INTERVAL_TABLE} "
+            f"SELECT {cols} FROM {_PURGED_INTERVAL_TABLE} "
             "WHERE start_ts IS NOT NULL"
         ).fetchall()
 
     out: list[BlockedInterval] = []
-    for start_ts, end_ts in rows:
+    for row in rows:
+        start_ts, end_ts = row[0], row[1]
+        origin = row[2] if has_origin else None
+        reason = USER_RANGE_DELETE if origin == "user" else RETROACTIVE_PURGE
         out.append(BlockedInterval(
             start=float(start_ts),
             end=float(end_ts) if end_ts is not None else float("inf"),
             action=PrivacyAction.EXCLUDE,
-            reason=RETROACTIVE_PURGE,
+            reason=reason,
         ))
     return out
 

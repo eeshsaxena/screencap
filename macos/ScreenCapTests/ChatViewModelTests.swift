@@ -205,9 +205,10 @@ final class ChatViewModelTests: XCTestCase {
     // MARK: - Source deep-link opener
 
     func testSelectingSourceTriggersDeepLinkOpener() async {
-        // The deep-link seam is `InspectWindowOpener.shared` — assert that setting
-        // pendingSeekMs + open() fires, mirroring the Library/palette call site.
-        // This mirrors what ChatView.openSource does.
+        // The `InspectWindowOpener.shared` seam survives as the day-page footage
+        // DEBUG entry (KTD-10) — Chat citations no longer use it (U12 routes them
+        // to the day page). This pins the opener mechanism the debug entry drives:
+        // setting pendingSeekMs + open() fires the registered closure.
         let openerFired = expectation(description: "openInspect called")
         var openedName: String?
         InspectWindowOpener.shared.openInspect = { name in

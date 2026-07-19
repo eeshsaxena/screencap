@@ -11,12 +11,16 @@ its blocked intervals split into two honesty classes (R7):
   (classification ambiguity). Fail-closed for capture decisions, but NOT proof
   nothing was captured — the UI must render these as neutral gaps, never labelled
   "blocked".
-* ``purged`` — retroactive-disable purge spans (SCR-277) read back from the
-  ``purged_interval`` ground truth ``scrub_worker`` persisted when it deleted the
-  disabled app's rows. NOT capture-time masking, so never in ``blocked_proven``;
-  each span optionally carries the disable target's identity joined from the
+* ``purged`` — retroactive-disable POLICY purge spans (SCR-277, ``origin='policy'``
+  or a legacy NULL origin) read back from the ``purged_interval`` ground truth
+  ``scrub_worker`` persisted when it deleted the disabled app's rows ("removed by
+  your rules"). NOT capture-time masking, so never in ``blocked_proven``; each span
+  optionally carries the disable target's identity joined from the
   ``.menubar_disable_log.jsonl`` audit log (degrading to identity-free on any
   ambiguity — never a guessed identity, R7).
+* ``deleted`` — USER range-delete spans (U8, ``origin='user'``) — "removed by
+  you", an explicit user deletion distinct from a policy purge (R8). No
+  disable-target identity (there is no app to attribute), just the removed extent.
 
 Each recording also carries an additive ``end_status`` (``live`` / ``clean`` /
 ``interrupted`` / ``unknown``) resolved from its own clean-stop artifacts only —
@@ -46,6 +50,7 @@ from screencap.backfill.skip_intervals import (
     ORPHAN_SCREENSHOT,
     RETROACTIVE_PURGE,
     UNCOVERED_GAP,
+    USER_RANGE_DELETE,
     build_classifier_evaluator,
     derive_skip_intervals,
 )
@@ -277,21 +282,29 @@ def _purge_identity_map(
 
 def _blocked_intervals(
     rec_dir: Path, db_path: Path, win_start: float, win_end: float
-) -> tuple[list[dict[str, int]], list[dict[str, int]], list[dict[str, Any]]]:
-    """Return ``(blocked_proven, unverifiable, purged)`` interval lists for the
-    day window.
+) -> tuple[
+    list[dict[str, int]],
+    list[dict[str, int]],
+    list[dict[str, Any]],
+    list[dict[str, int]],
+]:
+    """Return ``(blocked_proven, unverifiable, purged, deleted)`` interval lists
+    for the day window.
 
     Strictly fail-open: any derivation error yields empty lists (a read surface
     must never 500 on one bad recording.db). The split is by the interval's
     ``reason``: residual reasons → unverifiable; ``RETROACTIVE_PURGE`` → purged
-    (ground truth from the SCR-277 purge, NOT proven capture-time masking, so it
-    must never read as ``blocked_proven``); everything else → proven.
+    ("removed by your rules" — ground truth from the SCR-277 policy purge, NOT
+    proven capture-time masking, so it must never read as ``blocked_proven``);
+    ``USER_RANGE_DELETE`` → deleted ("removed by you" — the U8 explicit user
+    range delete, distinct from a policy purge, R8); everything else → proven.
     """
     from screencap.redaction.geometry import list_screenshot_timestamps
 
     proven: list[dict[str, int]] = []
     unverifiable: list[dict[str, int]] = []
     purged: list[dict[str, Any]] = []
+    deleted: list[dict[str, int]] = []
     try:
         classifier, evaluator = build_classifier_evaluator(rec_dir)
         shots = [
@@ -309,7 +322,7 @@ def _blocked_intervals(
         logger.warning(
             "day_segments: skip-interval derivation failed for %s", rec_dir, exc_info=True
         )
-        return proven, unverifiable, purged
+        return proven, unverifiable, purged, deleted
 
     identity_map: dict[tuple[float, float], dict[str, Any]] | None = None
     for iv in intervals:
@@ -317,7 +330,11 @@ def _blocked_intervals(
         if clipped is None:
             continue
         entry: dict[str, Any] = {"start_ms": clipped[0], "end_ms": clipped[1]}
-        if iv.reason == RETROACTIVE_PURGE:
+        if iv.reason == USER_RANGE_DELETE:
+            # "removed by you" — a user range delete. No disable-target identity
+            # (there is no app to attribute); just the honest removed extent (R8).
+            deleted.append(entry)
+        elif iv.reason == RETROACTIVE_PURGE:
             if identity_map is None:  # one identity read per recording, lazily
                 identity_map = _purge_identity_map(db_path, rec_dir)
             entry.update(identity_map.get((iv.start, iv.end), {}))
@@ -326,7 +343,7 @@ def _blocked_intervals(
             unverifiable.append(entry)
         else:
             proven.append(entry)
-    return proven, unverifiable, purged
+    return proven, unverifiable, purged, deleted
 
 
 def _read_task_segments(rec_dir: Path) -> list[dict[str, Any]]:
@@ -372,6 +389,7 @@ def day_segments(
              "unverifiable":   [{"start_ms","end_ms"}, ...],
              "purged": [{"start_ms","end_ms",              # SCR-277 purge spans
                          "bundle_id"?, "app_name"?, "root_domain"?}, ...],
+             "deleted": [{"start_ms","end_ms"}, ...],      # U8 "removed by you"
              "tasks": [{"task_index","start_ts","end_ts","name",
                         "category","confidence"}, ...]},  # U9 day-level bands
             ...
@@ -442,7 +460,7 @@ def day_segments(
         clamped_end = max(min(end, win_end), clamped_start)
 
         rec_dir = recordings_dir / meta.name
-        proven, unverifiable, purged = _blocked_intervals(
+        proven, unverifiable, purged, deleted = _blocked_intervals(
             rec_dir, rec_dir / "recording.db", clamped_start, clamped_end
         )
 
@@ -461,6 +479,9 @@ def day_segments(
                 # SCR-277 purge spans with optional disable-target identity —
                 # honest provenance, never conflated with proven masking.
                 "purged": purged,
+                # U8 (R8): "removed by you" spans — the user's explicit range
+                # deletes, distinct from policy purges (never conflated).
+                "deleted": deleted,
                 # U9: every task band for this recording, so the day strip
                 # renders all bands without a per-recording tasks.list round-trip.
                 "tasks": _read_task_segments(rec_dir),

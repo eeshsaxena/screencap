@@ -66,12 +66,14 @@ class AsyncDaemonClient:
 
     # -- envelope helpers ------------------------------------------------
 
-    async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def _post(
+        self, path: str, body: dict[str, Any], *, require_ok: bool = True,
+    ) -> dict[str, Any]:
         try:
             resp = await self._client.post(path, json=body)
         except httpx.HTTPError as exc:
             raise DaemonError(f"daemon unreachable at {path}: {exc}") from exc
-        return self._ok(path, resp)
+        return self._ok(path, resp, require_ok=require_ok)
 
     async def _get(self, path: str) -> dict[str, Any]:
         try:
@@ -81,13 +83,23 @@ class AsyncDaemonClient:
         return self._ok(path, resp)
 
     @staticmethod
-    def _ok(path: str, resp: httpx.Response) -> dict[str, Any]:
+    def _ok(
+        path: str, resp: httpx.Response, *, require_ok: bool = True,
+    ) -> dict[str, Any]:
         try:
             data = resp.json()
         except ValueError as exc:
             raise DaemonError(f"daemon returned non-JSON for {path}") from exc
-        if resp.status_code >= 400 or not (isinstance(data, dict) and data.get("ok")):
+        # A typed 4xx/5xx (invalid_request / invalid_name / store_locked / …) is
+        # always a transport-level error. ``require_ok`` additionally gates the
+        # envelope ``ok`` flag: read verbs demand it, but ``clip.create`` returns a
+        # DOMAIN ``ok:false`` (fail-closed reason) at HTTP 200 that the caller must
+        # see as data, not an exception — those pass ``require_ok=False``.
+        if resp.status_code >= 400 or not isinstance(data, dict):
             code = data.get("error") if isinstance(data, dict) else None
+            raise DaemonError(f"daemon error for {path}: {code or resp.status_code}")
+        if require_ok and not data.get("ok"):
+            code = data.get("error")
             raise DaemonError(f"daemon error for {path}: {code or resp.status_code}")
         return data
 
@@ -155,6 +167,49 @@ class AsyncDaemonClient:
     async def frame_read(self, recording: str, stem: str) -> dict[str, Any]:
         return await self._post(
             "/v0/frame.read", {"recording": recording, "stem": stem}
+        )
+
+    async def timeline_day(
+        self, *, date: str, tz_offset_seconds: int = 0,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v0/timeline.day",
+            {"date": date, "tz_offset_seconds": tz_offset_seconds},
+        )
+
+    async def tasks_query(
+        self, *, start_date: str, end_date: str, tz_offset_seconds: int = 0,
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v0/tasks.query",
+            {
+                "start_date": start_date,
+                "end_date": end_date,
+                "tz_offset_seconds": tz_offset_seconds,
+            },
+        )
+
+    async def clip_create(
+        self,
+        *,
+        recording: str,
+        start_ms: int,
+        end_ms: int,
+        tz_offset_seconds: int = 0,
+        creator: str = "mcp",
+    ) -> dict[str, Any]:
+        return await self._post(
+            "/v0/clip.create",
+            {
+                "recording": recording,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "tz_offset_seconds": tz_offset_seconds,
+                "creator": creator,
+            },
+            # A clip-domain failure is ``ok:false`` + ``reason`` at HTTP 200 (R17
+            # fail-closed) — a normal result the tool surfaces, not an exception.
+            require_ok=False,
         )
 
     async def chat_answer(

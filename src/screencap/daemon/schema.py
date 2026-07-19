@@ -82,6 +82,11 @@ _STORAGE_ENCRYPT_API_VERSION = 1
 # no global API_SCHEMA_VERSION bump (mirrors the frame.nearest / apps.list
 # additive precedent).
 _TASKS_LIST_API_VERSION = 1
+# Day-first navigation U5: the cross-day ``tasks.query`` read verb — per-day task
+# segments aggregated across recordings + a per-recording honest-status rollup.
+# Additive (new verb) — no global API_SCHEMA_VERSION bump (mirrors the tasks.list
+# additive precedent).
+_TASKS_QUERY_API_VERSION = 1
 # SCR-214 U7 user task CRUD verbs (create/update/delete/merge/split). Each
 # mutates the LOCAL-only tasks store (never uploaded — R8). Additive (new verbs)
 # — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
@@ -91,6 +96,16 @@ _TASKS_UPDATE_API_VERSION = 1
 _TASKS_DELETE_API_VERSION = 1
 _TASKS_MERGE_API_VERSION = 1
 _TASKS_SPLIT_API_VERSION = 1
+# Day-first navigation U8: the irreversible, LOCAL-ONLY range-delete job
+# (delete.start with a dry_run preview / delete.status / delete.cancel). Additive
+# (new verbs) — no global API_SCHEMA_VERSION bump (mirrors the backfill / tasks
+# additive precedent). Human-only by design: NEVER exposed as an MCP tool (R18).
+_DELETE_API_VERSION = 1
+# Day-first navigation U10: the in-vault clips store verbs (clip.create /
+# clip.list / clip.delete). Additive (new verbs) — no global API_SCHEMA_VERSION
+# bump (mirrors the delete / backfill / tasks additive precedent). clip.create is
+# additively exposable to MCP (creator='mcp', R18); clip.delete is human-only.
+_CLIP_API_VERSION = 1
 # SCR-239 downloadable local-model lifecycle verbs. Additive (new verbs) — no
 # global API_SCHEMA_VERSION bump (mirrors the backfill / tasks.list precedent).
 _MODELS_API_VERSION = 1
@@ -167,12 +182,28 @@ _MODEL_NAMES = {
     "WhoAmIResponse",
     "BackfillStartRequest",
     "BackfillCancelRequest",
+    "DeleteStartRequest",
+    "DeleteCancelRequest",
+    "DeleteRecordingPlan",
+    "DeletePreviewResponse",
+    "DeleteStatusResponse",
+    "ClipCreateRequest",
+    "ClipRecord",
+    "ClipCreateResponse",
+    "ClipListResponse",
+    "ClipDeleteRequest",
+    "ClipDeleteResponse",
     "BackfillStatusResponse",
     "BackfillProgressEvent",
     "StorageMigrateRequest",
     "TasksListRequest",
     "TaskSegment",
     "TasksListResponse",
+    "TasksQueryRequest",
+    "TasksQueryTask",
+    "TasksQueryDay",
+    "TasksQueryRecordingStatus",
+    "TasksQueryResponse",
     "TasksCreateRequest",
     "TasksCreateResponse",
     "TasksUpdateRequest",
@@ -684,6 +715,12 @@ def _load_models() -> dict[str, Any]:
         tasks: list[TaskSegment] = []
         end_status: str | None = None
         purged: list[DayPurgedInterval] = []
+        # U8 (R8, additive): "removed by you" — the user's explicit range-delete
+        # spans, rendered as their own honest state distinct from ``purged``
+        # ("removed by your rules") and ``blocked_proven``. No disable-target
+        # identity (there is no app to attribute), just the removed extent.
+        # Empty on an older producer shape.
+        deleted: list[DayBlockedInterval] = []
 
     class TimelineDayResponse(EnvelopeResponse):
         date: str
@@ -836,6 +873,156 @@ def _load_models() -> dict[str, Any]:
     class BackfillCancelRequest(_DaemonModel):
         """SCR-178 ``backfill.cancel`` input (no parameters)."""
 
+    class DeleteStartRequest(_DaemonModel):
+        """U8 ``delete.start`` input: a range + mode + (execute-mode) confirm token.
+
+        ``start_ms`` / ``end_ms`` are absolute unix ms (the timeline units),
+        bounded to a realistic epoch ceiling. ``dry_run`` (default True — the
+        SAFE default: a bare call previews, never destroys) resolves + previews
+        WITHOUT deleting. An execute call (``dry_run=False``) MUST pass ``resolved``
+        — the ``{recording: [chunk_indices]}`` confirm token from a prior preview;
+        the job re-resolves under the flock and aborts (re-confirm required) if the
+        set changed. An inverted / zero-length range is a typed 400 in the handler.
+        """
+
+        start_ms: _EpochMs
+        end_ms: _EpochMs
+        dry_run: bool = True
+        # Confirm token: recording name -> covered chunk indices. Empty on a
+        # preview; required (non-empty) to actually delete.
+        resolved: dict[str, list[int]] = {}
+
+    class DeleteCancelRequest(_DaemonModel):
+        """U8 ``delete.cancel`` input (no parameters)."""
+
+    class DeleteRecordingPlan(_DaemonModel):
+        """One recording's resolved slice in a ``delete.start`` preview (R20).
+
+        ``chunk_indices`` are the covered chunks that WILL be deleted;
+        ``rounded_start_ms`` / ``rounded_end_ms`` the actual removed extent the
+        confirm sheet shows. ``excluded_live_chunks`` are chunks overlapping the
+        range that were EXCLUDED (the live in-flight chunk — never deleted).
+        ``kept_clips`` are overlapping clips that will be KEPT (findable in Clips) —
+        disclosed so "removed from this Mac" is never silently false. Recording
+        identifiers are fine here: this is a direct same-EUID reply, not an
+        EventBus payload (the R9 name-free rule is a progress-event rule).
+        """
+
+        recording: str
+        recording_id: str | None = None
+        chunk_indices: list[int]
+        rounded_start_ms: int | None = None
+        rounded_end_ms: int | None = None
+        excluded_live_chunks: list[int] = []
+        kept_clips: list[dict] = []
+
+    class DeletePreviewResponse(EnvelopeResponse):
+        """The ``delete.start --dry_run`` preview — resolves + reports, DELETES NOTHING.
+
+        ``resolved`` is the confirm token the client passes back verbatim to the
+        execute call (no-TOCTOU: the job re-resolves and deletes exactly it).
+        ``total_chunks`` is the total covered-chunk count across recordings.
+        """
+
+        start_ms: int
+        end_ms: int
+        recordings: list[DeleteRecordingPlan]
+        resolved: dict[str, list[int]]
+        total_chunks: int
+
+    class DeleteStatusResponse(EnvelopeResponse):
+        """The privacy-safe range-delete job snapshot (R9).
+
+        Opaque counts + a ``reconfirm_required`` bool only — never a recording
+        name (the EventBus is same-EUID-readable). ``state`` is one of ``idle`` /
+        ``running`` / ``completed`` / ``reconfirm_required`` / ``cancelled`` /
+        ``failed``.
+        """
+
+        state: str
+        done: int
+        total: int
+        current_unit_index: int
+        deleted_chunks: int
+        reconfirm_required: bool
+
+    class ClipCreateRequest(_DaemonModel):
+        """U10 ``clip.create`` input: an absolute-ms range in a single recording.
+
+        ``recording`` is validated by the canonical traversal-safe name validator
+        in the handler. ``start_ms`` / ``end_ms`` are absolute unix ms (the
+        timeline units); an inverted / zero-length range is a typed 400 in the
+        handler. ``tz_offset_seconds`` (seconds EAST of UTC, ±14h) maps the clip's
+        start to its local calendar ``source_day`` (KTD-11). ``creator`` records
+        provenance (``ui`` from the app, ``mcp`` from the agent tool, R18); an
+        unrecognized value coerces to ``ui``.
+        """
+
+        recording: str
+        start_ms: _EpochMs
+        end_ms: _EpochMs
+        tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
+        creator: str = "ui"
+
+    class ClipRecord(_DaemonModel):
+        """One durable clip's catalog entry (+ a derived ``path`` for playback).
+
+        ``source_recording`` is opaque plumbing (never shown as a browsing entity,
+        R5) but retained so purge matching never re-derives it. ``honesty_flags``
+        carries at least ``clip_video_capture_blocked_only`` (the clip's video is
+        capture-blocked, not post-hoc masked) and, once a policy purge partially
+        overlaps it, ``policy_purged_partial``. ``path`` is the absolute on-disk
+        mp4 (same-EUID reply — the UI plays it locally; clips never leave the Mac).
+        """
+
+        id: str
+        source_recording: str
+        source_day: str
+        start_ms: int
+        end_ms: int
+        created_at: float
+        creator: str
+        honesty_flags: dict = {}
+        path: str | None = None
+
+    class ClipCreateResponse(EnvelopeResponse):
+        """The created clip, or a typed clip-domain ``reason`` (envelope ``ok``).
+
+        ``ok`` reflects whether the clip was cut (mirrors the ``screencap clip``
+        CLI taxonomy carried in-envelope, not by exit code): on success ``clip`` is
+        the persisted entry and ``reason`` is null; on a clip-domain failure
+        ``ok=false`` + ``reason`` (``policy_purged`` — fail-closed over a
+        policy-purged range — / ``not_eligible`` / ``no_frames_in_range`` /
+        ``masked_video_required`` / ``clip_busy`` / ``trim_failed``) and ``clip``
+        is null. HTTP is 200 for every clip-domain outcome; a malformed range is a
+        typed 400 and a sealed store a typed 409.
+        """
+
+        reason: str | None = None
+        clip: ClipRecord | None = None
+        store_state: str = "mounted"
+
+    class ClipListResponse(EnvelopeResponse):
+        """The clips catalog, newest-first (R11 Clips surface).
+
+        ``store_state`` carries the vault state (KTD-14): a locked / absent / error
+        store returns an empty ``clips`` list with a degraded ``store_state``
+        rather than a 500.
+        """
+
+        clips: list[ClipRecord]
+        store_state: str = "mounted"
+
+    class ClipDeleteRequest(_DaemonModel):
+        """U10 ``clip.delete`` input: the clip id to remove (mp4 + catalog entry)."""
+
+        clip_id: str = Field(min_length=1, max_length=128)
+
+    class ClipDeleteResponse(EnvelopeResponse):
+        """Whether the clip existed and was removed (idempotent ``false`` if not)."""
+
+        deleted: bool
+
     class StorageMigrateRequest(_DaemonModel):
         """SCR-228 ``storage.migrate`` input: the new recordings directory.
 
@@ -918,6 +1105,78 @@ def _load_models() -> dict[str, Any]:
         # pre-U6 row, an unrecorded outcome, or a detail-less write; an older daemon
         # omits the field entirely (clients decode that as absent).
         detail: str | None = None
+
+    class TasksQueryRequest(_DaemonModel):
+        """U5 cross-day ``tasks.query`` input: a local calendar date RANGE.
+
+        ``start_date`` / ``end_date`` are ``YYYY-MM-DD`` (format + inverted-range
+        validated in ``tasks_query`` → typed 400, mirroring ``timeline.day``).
+        ``tz_offset_seconds`` is seconds EAST of UTC, bounded to ±14h (the widest
+        real-world offset) — the same bound + KTD-11 day rule as ``timeline.day``.
+        """
+
+        start_date: str = Field(max_length=32)
+        end_date: str = Field(max_length=32)
+        tz_offset_seconds: int = Field(default=0, ge=-50_400, le=50_400)
+
+    class TasksQueryTask(_DaemonModel):
+        """One named task in the cross-day list, carrying its recording pointer.
+
+        The shared 6-field ``TaskSegment`` shape (``task_index`` / ``start_ts`` /
+        ``end_ts`` / ``name`` / ``category`` / ``confidence``) plus the
+        ``recording`` (+ ``recording_id``) it came from — the Tasks surface needs
+        the recording key to seek into its day page and to curate the task
+        (rename/split/merge/delete route through the per-recording CRUD verbs).
+        ``start_ts`` / ``end_ts`` are Unix seconds (the ledger's native units).
+        """
+
+        recording: str
+        recording_id: str | None = None
+        task_index: int
+        start_ts: float
+        end_ts: float
+        name: str
+        category: str | None = None
+        confidence: str | None = None
+
+    class TasksQueryDay(_DaemonModel):
+        """All tasks that map to one local calendar day (KTD-11), start-ordered."""
+
+        date: str
+        tasks: list[TasksQueryTask]
+
+    class TasksQueryRecordingStatus(_DaemonModel):
+        """Per-recording honest-status rollup entry (R21 zero states).
+
+        Every recording whose coverage intersects the range appears here — even
+        one that named no tasks — so the Tasks surface can distinguish "nothing
+        on file" from "intelligence produced nothing" (``nothing_to_name`` /
+        ``mechanical_only`` / ``couldnt_run`` / ``in_progress`` / ``None`` →
+        unknown), never a false "you did nothing". Same vocabulary + ``detail``
+        as ``tasks.list``.
+        """
+
+        name: str
+        recording_id: str | None = None
+        state: str
+        reason: str | None = None
+        detail: str | None = None
+
+    class TasksQueryResponse(EnvelopeResponse):
+        """Cross-day task segments grouped by day + the honest-status rollup.
+
+        ``days`` is reverse-chronological (newest first); ``recordings`` is the
+        rollup. ``store_state`` carries the vault store state (KTD-14): a locked /
+        absent / error store returns empty ``days`` + ``recordings`` with a
+        degraded ``store_state`` rather than a 500. Absent on an older daemon →
+        ``"mounted"``.
+        """
+
+        start_date: str
+        end_date: str
+        days: list[TasksQueryDay]
+        recordings: list[TasksQueryRecordingStatus]
+        store_state: str = "mounted"
 
     class TasksCreateRequest(_DaemonModel):
         """U7 ``tasks.create`` input: add a USER-authored task span.
@@ -1241,11 +1500,27 @@ def _load_models() -> dict[str, Any]:
         "BackfillStartRequest": BackfillStartRequest,
         "BackfillCancelRequest": BackfillCancelRequest,
         "BackfillStatusResponse": BackfillStatusResponse,
+        "DeleteStartRequest": DeleteStartRequest,
+        "DeleteCancelRequest": DeleteCancelRequest,
+        "DeleteRecordingPlan": DeleteRecordingPlan,
+        "DeletePreviewResponse": DeletePreviewResponse,
+        "DeleteStatusResponse": DeleteStatusResponse,
+        "ClipCreateRequest": ClipCreateRequest,
+        "ClipRecord": ClipRecord,
+        "ClipCreateResponse": ClipCreateResponse,
+        "ClipListResponse": ClipListResponse,
+        "ClipDeleteRequest": ClipDeleteRequest,
+        "ClipDeleteResponse": ClipDeleteResponse,
         "BackfillProgressEvent": BackfillProgressEvent,
         "StorageMigrateRequest": StorageMigrateRequest,
         "TasksListRequest": TasksListRequest,
         "TaskSegment": TaskSegment,
         "TasksListResponse": TasksListResponse,
+        "TasksQueryRequest": TasksQueryRequest,
+        "TasksQueryTask": TasksQueryTask,
+        "TasksQueryDay": TasksQueryDay,
+        "TasksQueryRecordingStatus": TasksQueryRecordingStatus,
+        "TasksQueryResponse": TasksQueryResponse,
         "TasksCreateRequest": TasksCreateRequest,
         "TasksCreateResponse": TasksCreateResponse,
         "TasksUpdateRequest": TasksUpdateRequest,
@@ -1306,11 +1581,14 @@ __all__ = [
     "_ENTITLEMENT_REFRESH_API_VERSION",
     "_BACKFILL_API_VERSION",
     "_TASKS_LIST_API_VERSION",
+    "_TASKS_QUERY_API_VERSION",
     "_TASKS_CREATE_API_VERSION",
     "_TASKS_UPDATE_API_VERSION",
     "_TASKS_DELETE_API_VERSION",
     "_TASKS_MERGE_API_VERSION",
     "_TASKS_SPLIT_API_VERSION",
+    "_DELETE_API_VERSION",
+    "_CLIP_API_VERSION",
     "_MODELS_API_VERSION",
     "_CHAT_ANSWER_API_VERSION",
     "daemon_version",

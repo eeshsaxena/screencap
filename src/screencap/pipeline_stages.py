@@ -57,7 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from screencap.pipeline_state import PipelineLedger, StageState
+from screencap.pipeline_state import Lifecycle, PipelineLedger, StageState
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,18 @@ class PipelineStageRunner:
             return False
         return row.stages_state == StageState.DONE
 
+    def _is_user_deleted(self, chunk_index: int) -> bool:
+        """True if the ledger marks this chunk USER_DELETED (U8 range delete).
+
+        A user-deleted chunk's on-disk artifacts are gone; re-running its stages
+        would re-transcribe/re-export from unlinked media (and could resurrect
+        deleted content). The runner skips it entirely.
+        """
+        if self._ledger is None:
+            return False
+        row = self._ledger.get_chunk(chunk_index)
+        return row is not None and row.lifecycle == Lifecycle.USER_DELETED
+
     # ------------------------------------------------------------------
     # The run.
     # ------------------------------------------------------------------
@@ -163,6 +175,14 @@ class PipelineStageRunner:
         if self.is_staged(chunk_index):
             logger.debug(
                 "Chunk %d already STAGED — skipping agnostic stages", chunk_index
+            )
+            return None
+
+        # U8: a USER_DELETED chunk's artifacts are gone — never re-stage it (would
+        # re-derive from unlinked media / resurrect deleted content).
+        if self._is_user_deleted(chunk_index):
+            logger.debug(
+                "Chunk %d is USER_DELETED — skipping agnostic stages", chunk_index
             )
             return None
 

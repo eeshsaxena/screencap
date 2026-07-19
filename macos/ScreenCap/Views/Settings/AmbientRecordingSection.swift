@@ -278,7 +278,7 @@ enum AmbientSettingsCopy {
     static let title = "Ambient recording"
     static let sub =
         "Capture your whole day automatically — screen, audio, and transcript — so your "
-        + "Journal and timeline fill themselves. Off until you turn it on."
+        + "days and timeline fill themselves. Off until you turn it on."
 
     // First-run always-on-audio consent (R1).
     static let consentTitle = "Turn on ambient recording"

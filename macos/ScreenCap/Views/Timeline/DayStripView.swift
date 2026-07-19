@@ -87,6 +87,17 @@ extension DayPurgedInterval {
     }
 }
 
+/// U9 (R8) — the "removed by you" band mapping: a straight union of every
+/// recording's USER range-delete intervals. Rendered as its OWN class —
+/// distinct from the policy-purged plum (R8) — so a user delete never reads as a
+/// privacy-rule purge. Pure so the mapping is render-free unit-testable, mirroring
+/// `DayPurgedInterval.bands(from:)`.
+extension DayDeletedInterval {
+    static func bands(from spans: [DaySegmentRecording]) -> [DayDeletedInterval] {
+        spans.flatMap(\.deleted)
+    }
+}
+
 /// Pure axis geometry for the day strip.
 enum DayStripLayout {
 
@@ -97,19 +108,20 @@ enum DayStripLayout {
     }
 
     static let hourMs = 3_600_000
-    static let minSpanMs = 8 * 3_600_000
+    /// The fixed waking window the axis always spans, as hour offsets from
+    /// local midnight: 08:00–21:00.
+    static let wakeStartHour = 8
+    static let wakeEndHour = 21
 
-    /// Dynamic axis bounds (plan assumption): the union of the day's recording
-    /// spans rounded *outward* to the hour, minimum 8h, clamped into the day.
-    /// A short union extends forward to 8h (pulling back from the day's end
-    /// when needed); a spanless day defaults to the 08:00–16:00 working window.
-    static func axisBounds(dayStartMs: Int, spans: [(startMs: Int, endMs: Int)]) -> Bounds {
-        let dayEndMs = dayStartMs + 24 * hourMs
-        guard let lo = spans.map(\.startMs).min(),
-              let hi = spans.map(\.endMs).max()
-        else {
-            return Bounds(startMs: dayStartMs + 8 * hourMs, endMs: dayStartMs + 16 * hourMs)
-        }
+    /// Honest full-day axis bounds (U1, R6): the axis always spans the fixed
+    /// 08:00–21:00 waking window, extended *outward* (hour-rounded) only when
+    /// footage falls outside it, and clamped into the real day via the passed
+    /// `dayEndMs` (DST-safe). Short footage renders as a small band on this
+    /// honest axis rather than being zoomed to fill — a sparse day reads as
+    /// "not recording", never "lost". A spanless day still shows the waking
+    /// window. Replaces the old footage-union + 8h-floor rule that made a
+    /// 51-minute recording look like "a few minutes".
+    static func axisBounds(dayStartMs: Int, dayEndMs: Int, spans: [(startMs: Int, endMs: Int)]) -> Bounds {
         func floorHour(_ ms: Int) -> Int {
             dayStartMs + ((ms - dayStartMs) / hourMs) * hourMs
         }
@@ -118,16 +130,58 @@ enum DayStripLayout {
             let rounded = (offset + hourMs - 1) / hourMs * hourMs
             return dayStartMs + rounded
         }
-        var start = max(dayStartMs, floorHour(max(lo, dayStartMs)))
-        var end = min(dayEndMs, ceilHour(min(hi, dayEndMs)))
-        if end - start < minSpanMs {
-            end = start + minSpanMs
-            if end > dayEndMs {
-                end = dayEndMs
-                start = max(dayStartMs, end - minSpanMs)
-            }
+        var start = dayStartMs + wakeStartHour * hourMs
+        var end = dayStartMs + wakeEndHour * hourMs
+        if let lo = spans.map(\.startMs).min(), lo < start {
+            start = floorHour(max(lo, dayStartMs))
         }
+        if let hi = spans.map(\.endMs).max(), hi > end {
+            end = ceilHour(min(hi, dayEndMs))
+        }
+        start = max(dayStartMs, start)
+        end = min(dayEndMs, end)
+        if end <= start { end = min(dayEndMs, start + hourMs) }  // never invert (DST/clock skew)
         return Bounds(startMs: start, endMs: end)
+    }
+
+    /// An honest edge label at a footage boundary (AE1): "recording started"
+    /// at the earliest span start, "recording stopped" at the latest span end.
+    struct BoundaryLabel: Equatable {
+        enum Kind: Equatable { case started, stopped }
+        let ms: Int
+        let kind: Kind
+    }
+
+    /// The two footage-edge labels for a day's spans — the first start and the
+    /// last end — so the strip can mark where footage begins and ends on the
+    /// full-day axis. A spanless day has none.
+    static func footageBoundaryLabels(spans: [(startMs: Int, endMs: Int)]) -> [BoundaryLabel] {
+        guard let lo = spans.map(\.startMs).min(),
+              let hi = spans.map(\.endMs).max()
+        else { return [] }
+        return [BoundaryLabel(ms: lo, kind: .started), BoundaryLabel(ms: hi, kind: .stopped)]
+    }
+
+    /// Resolve a landing highlight (a Tasks/Chat jump to a task span, AE3) to the
+    /// exact span the strip should emphasize. Precedence: a task band with
+    /// matching endpoints, then the task band containing the highlight's
+    /// midpoint, else the raw highlight span — so a highlight always renders,
+    /// even before the task bands load or when it lands in unsplit footage.
+    /// Pure so the emphasis geometry is unit-testable without a render.
+    static func resolveHighlightSpan(
+        highlight: (startMs: Int, endMs: Int),
+        segments: [(startMs: Int, endMs: Int)]
+    ) -> (startMs: Int, endMs: Int) {
+        if let exact = segments.first(where: {
+            $0.startMs == highlight.startMs && $0.endMs == highlight.endMs
+        }) {
+            return exact
+        }
+        let mid = highlight.startMs + (highlight.endMs - highlight.startMs) / 2
+        if let containing = segments.first(where: { $0.startMs <= mid && mid < $0.endMs }) {
+            return containing
+        }
+        return highlight
     }
 
     /// Map a wall-clock ms to an x in `[0, width]`, clamped to the bounds. A
@@ -203,14 +257,16 @@ enum DayStripLayout {
         return frames
     }
 
-    /// A caption band's class. Both `blocked` and `purged` (retroactively
-    /// purged app spans) render today — `captionClusters` is fed both band
-    /// sets. A mixed cluster keeps the "blocked" wording (the hard-stop claim
-    /// dominates the shared slot); the class tag exists so the single
-    /// overlap guard covers both classes in one pass.
+    /// A caption band's class. `blocked`, `purged` (retroactively purged app
+    /// spans), and `deleted` (user range-deletes, U9) all render today —
+    /// `captionClusters` is fed every band set. A mixed cluster resolves its
+    /// wording by precedence (blocked > purged > deleted — the hard-stop claim
+    /// dominates the shared slot); the class tag exists so the single overlap
+    /// guard covers every class in one pass.
     enum CaptionClass: Hashable {
         case blocked
         case purged
+        case deleted
     }
 
     /// One caption per single-linkage cluster: the cluster's mean leading x +
@@ -418,6 +474,7 @@ enum DayStripLegend {
         case searchMatch
         case blocked
         case purged
+        case removedByYou
     }
 
     struct Item: Equatable, Identifiable {
@@ -433,6 +490,9 @@ enum DayStripLegend {
         Item(text: "search match", swatch: .searchMatch),
         Item(text: "blocked at capture", swatch: .blocked),
         Item(text: "removed by your rules", swatch: .purged),
+        // U9 (R8) — user range-deletes render as their own honest state, visually
+        // distinct (slate) from the policy-purged plum.
+        Item(text: "removed by you", swatch: .removedByYou),
     ]
 }
 
@@ -443,6 +503,15 @@ enum DayStripLegend {
 /// (the `SCGradient` pattern) rather than a new asset role.
 extension Color {
     static let scPlum = Color(.sRGB, red: 0x7A / 255, green: 0x4A / 255, blue: 0x8A / 255)
+}
+
+/// U9 — the "removed by you" hue (R8): a muted slate grey, deliberately distinct
+/// from the policy-purged plum (`scPlum`) and the blocked rust (`scRust`), so a
+/// user range-delete reads as its own honest state — "you erased this", not a
+/// privacy-rule removal. Used by the strip's deleted hatch, its caption, and the
+/// legend's "removed by you" swatch. Authored as a literal (the `scPlum` pattern).
+extension Color {
+    static let scSlate = Color(.sRGB, red: 0x5C / 255, green: 0x63 / 255, blue: 0x70 / 255)
 }
 
 struct DayStripView: View {
@@ -459,6 +528,12 @@ struct DayStripView: View {
     /// U5 — retroactively-purged spans (R10): the blocked hatch geometry in the
     /// distinct plum hue, with R6 rule-naming hover/VoiceOver copy.
     var purgedBands: [DayPurgedInterval] = []
+    /// U9 (R8) — user range-delete spans ("removed by you"): the hatch geometry
+    /// in the distinct slate hue with "removed from this Mac" hover/VoiceOver
+    /// copy, kept separate from `purgedBands` so a user delete never reads as a
+    /// privacy-rule purge. Additive/defaulted so existing call sites are
+    /// unaffected.
+    var deletedBands: [DayDeletedInterval] = []
     /// U5 — `unverifiable` intervals inside recordings: rendered neutrally (no
     /// band — R7) but hover/VoiceOver-targetable with the "can't verify" copy.
     var unverifiableBands: [(startMs: Int, endMs: Int)] = []
@@ -487,11 +562,26 @@ struct DayStripView: View {
     /// SCR-214 U11 — a single marked endpoint awaiting its partner, drawn as a
     /// standalone tick.
     var pendingEndpointMs: Int? = nil
+    /// U4 (AE3) — a task span to emphasize when the day page is opened from
+    /// Tasks or Chat: a subtle outline + glow around the matching task band.
+    /// Nil (default) when there is nothing to highlight, so existing call sites
+    /// are unaffected. Resolved to the exact band via `resolveHighlightSpan`.
+    var highlightedSpan: (startMs: Int, endMs: Int)? = nil
 
     /// Strip metrics per the design (444–461): 64pt band area, 16pt track.
     private let stripHeight: CGFloat = 64
     private let trackTop: CGFloat = 24
     private let trackHeight: CGFloat = 16
+
+    private static let boundaryTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    static func boundaryTimeString(_ ms: Int) -> String {
+        boundaryTimeFormatter.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -564,6 +654,38 @@ struct DayStripView: View {
                 ctx.draw(label, in: CGRect(x: frame.minX, y: 0, width: drawWidth, height: 14))
             }
 
+            // U4 (AE3) — a landing highlight from Tasks/Chat: a subtle teal
+            // outline + glow around the emphasized task band. The span is
+            // resolved to the exact band via the pure `resolveHighlightSpan`
+            // (exact match → containing band → raw span), so it lands on the
+            // task even before the bands finish loading.
+            if let highlight = highlightedSpan {
+                let resolved = DayStripLayout.resolveHighlightSpan(
+                    highlight: highlight,
+                    segments: segments.map { (startMs: $0.startMs, endMs: $0.endMs) }
+                )
+                let outline = bandRect(startMs: resolved.startMs, endMs: resolved.endMs, width: width)
+                    .insetBy(dx: -2, dy: -3)
+                let path = Path(roundedRect: outline, cornerRadius: 5)
+                ctx.stroke(path, with: .color(.scTeal.opacity(0.35)), lineWidth: 5)
+                ctx.stroke(path, with: .color(.scTeal), lineWidth: 2)
+            }
+
+            // Footage start/stop edge times (U1/AE1): mark where footage begins
+            // and ends on the honest full-day axis, so a small band reads as
+            // real footage at a real time rather than "a few minutes".
+            for label in DayStripLayout.footageBoundaryLabels(
+                spans: baseTracks.map { (startMs: $0.startMs, endMs: $0.endMs) }
+            ) {
+                let x = DayStripLayout.x(forMs: label.ms, bounds: bounds, width: width)
+                let text = Text(Self.boundaryTimeString(label.ms))
+                    .font(SCTypography.mono(size: 9))
+                    .foregroundColor(.scInk.opacity(0.55))
+                let boxW: CGFloat = 34
+                let minX = label.kind == .started ? x + 2 : x - boxW - 2
+                ctx.draw(text, in: CGRect(x: max(0, min(minX, width - boxW)), y: 12, width: boxW, height: 11))
+            }
+
             for band in blockedBands {
                 hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
                       color: .scRust)
@@ -573,6 +695,13 @@ struct DayStripView: View {
             for band in purgedBands {
                 hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
                       color: .scPlum)
+            }
+            // U9 (R8) — user range-deletes: the same hatch geometry in the
+            // distinct slate hue, so "removed by you" is visually its own class,
+            // never the policy-purged plum or the blocked rust.
+            for band in deletedBands {
+                hatch(ctx: ctx, rect: bandRect(startMs: band.startMs, endMs: band.endMs, width: width),
+                      color: .scSlate)
             }
             // One caption per cluster (pure `captionClusters` — single overlap
             // guard across all caption classes), not one per band: nearby
@@ -586,12 +715,22 @@ struct DayStripView: View {
                     (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .blocked)
                 } + purgedBands.map {
                     (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .purged)
+                } + deletedBands.map {
+                    (x: bandRect(startMs: $0.startMs, endMs: $0.endMs, width: width).minX, cls: .deleted)
                 }
             )
             for caption in captions {
-                let text = caption.classes.contains(.blocked)
-                    ? Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust)
-                    : Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scPlum)
+                // Precedence for the shared slot: blocked > purged > deleted.
+                // Purged and deleted both caption "removed"; the hue (plum vs
+                // slate) + hover copy carry the class distinction.
+                let text: Text
+                if caption.classes.contains(.blocked) {
+                    text = Text("blocked").font(SCTypography.mono(size: 9)).foregroundColor(.scRust)
+                } else if caption.classes.contains(.purged) {
+                    text = Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scPlum)
+                } else {
+                    text = Text("removed").font(SCTypography.mono(size: 9)).foregroundColor(.scSlate)
+                }
                 ctx.draw(
                     text,
                     in: CGRect(x: caption.x, y: trackTop + trackHeight + 8, width: 50, height: 12)
@@ -740,6 +879,31 @@ struct DayStripView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(DayStripAccessibility.playheadLabel(ms: playheadMs))
             }
+            // U7 (R19) — the in-flight range selection, made perceivable by
+            // VoiceOver: the dashed pending band + the lone endpoint tick are
+            // Canvas-drawn (opaque to assistive tech), so mirror them as
+            // positioned a11y elements carrying the endpoints/span in wall-clock
+            // time. Exactly one is present at a time (a lone endpoint before the
+            // span completes, the span after).
+            if let selection = pendingSelection {
+                let rect = bandRect(startMs: selection.startMs, endMs: selection.endMs, width: width)
+                Color.clear
+                    .frame(width: rect.width, height: rect.height)
+                    .offset(x: rect.minX, y: rect.minY)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(DayStripAccessibility.pendingSelectionLabel(
+                        startMs: selection.startMs, endMs: selection.endMs
+                    ))
+                    .accessibilitySortPriority(Self.sortPriority(startMs: selection.startMs))
+            } else if let endpointMs = pendingEndpointMs {
+                let x = DayStripLayout.x(forMs: endpointMs, bounds: bounds, width: width)
+                Color.clear
+                    .frame(width: 4, height: stripHeight)
+                    .offset(x: x - 2, y: 0)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(DayStripAccessibility.pendingEndpointLabel(ms: endpointMs))
+                    .accessibilitySortPriority(Self.sortPriority(startMs: endpointMs))
+            }
         }
         .accessibilityHint("Click the strip to move playback")
     }
@@ -808,6 +972,14 @@ struct DayStripView: View {
             regions.append(ProvenanceRegion(
                 startMs: band.startMs, endMs: band.endMs,
                 claim: DayStripAccessibility.purgedLabel(band), accessibilityFallback: nil
+            ))
+        }
+        // U9 (R8/R20) — user range-deletes: the "removed from this Mac" hover +
+        // VoiceOver copy, distinct from the policy-purged "removed by your rules".
+        for band in deletedBands {
+            regions.append(ProvenanceRegion(
+                startMs: band.startMs, endMs: band.endMs,
+                claim: DayStripAccessibility.deletedLabel(band), accessibilityFallback: nil
             ))
         }
         for band in unverifiableBands {
@@ -930,6 +1102,12 @@ struct DayStripView: View {
             RoundedRectangle(cornerRadius: 2)
                 .fill(Color.scPlum.opacity(0.25))
                 .frame(width: 10, height: 8)
+        case .removedByYou:
+            // R8: the user-delete swatch is the slate hue — distinct from the
+            // policy-purged plum, so "removed by you" never reads as a rule purge.
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Color.scSlate.opacity(0.30))
+                .frame(width: 10, height: 8)
         }
     }
 
@@ -1000,6 +1178,13 @@ enum DayStripAccessibility {
         return "Removed by a privacy rule, \(range)"
     }
 
+    /// U9 (R8/R20) — a span the USER range-deleted: the "removed from this Mac"
+    /// wording (local-only in v1), distinct from the policy-purged rule sentence.
+    static func deletedLabel(_ interval: DayDeletedInterval) -> String {
+        let range = "\(hourMinuteText(ms: interval.startMs)) to \(hourMinuteText(ms: interval.endMs))"
+        return "Removed from this Mac by you, \(range)"
+    }
+
     /// The load-gate gap label: while the day query hasn't returned (or
     /// failed), gaps carry NO cause claim — VoiceOver gets this neutral
     /// unavailable string instead.
@@ -1016,6 +1201,18 @@ enum DayStripAccessibility {
 
     static func playheadLabel(ms: Int) -> String {
         "Playhead at \(hourMinuteText(ms: ms))"
+    }
+
+    /// U7 (R19) — the in-flight range selection span, announced to VoiceOver so
+    /// the gesture is perceivable without sight (the Canvas band is opaque to
+    /// assistive tech).
+    static func pendingSelectionLabel(startMs: Int, endMs: Int) -> String {
+        "Range selection, \(hourMinuteText(ms: startMs)) to \(hourMinuteText(ms: endMs))"
+    }
+
+    /// U7 (R19) — a single placed endpoint awaiting its partner.
+    static func pendingEndpointLabel(ms: Int) -> String {
+        "Range start marked at \(hourMinuteText(ms: ms)), set the end"
     }
 
     static func hourText(ms: Int) -> String {

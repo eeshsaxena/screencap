@@ -1,14 +1,18 @@
 import SwiftUI
 
-/// The detail routes the shell can display (U4). `privacy` renders the
-/// prototype Privacy settings pane (U12), `appRules` the App rules pane
-/// (U13), and `intelligence` the Intelligence pane (U9 — model picker + the
-/// per-task cloud-consent matrix). `timeline` has no sidebar row — it is
-/// reached from Journal day links and recording cards (U9), optionally
-/// carrying a wall-clock seek anchor.
+/// The detail routes the shell can display. `privacy` renders the Privacy
+/// settings pane, `appRules` the App rules pane, and `intelligence` the
+/// Intelligence pane (model picker + the per-task cloud-consent matrix).
+/// `timeline` has no sidebar row — it is reached from Days cards and citations,
+/// optionally carrying a wall-clock seek anchor.
+///
+/// Day-first restructure (R1): the four primary destinations are Days · Tasks ·
+/// Clips · Chat. `tasks` and `clips` render honest placeholders until their
+/// surfaces land (U6/U11); `days` is the default landing surface (R2).
 enum ShellRoute: Hashable {
-    case library
-    case journal
+    case days
+    case tasks
+    case clips
     /// The Account & Plan pane (account-sheet U5, KTD-4): the Settings entry
     /// renders the shared `AccountSheetView` as an embedded pane — sheet
     /// presentation is reserved for the gate and upload entries.
@@ -18,10 +22,22 @@ enum ShellRoute: Hashable {
     /// palette (NOT a sidebar destination). Chat and Search share the retrieval
     /// backend and Search's result components, not a destination pattern.
     case chat
-    case timeline(day: Date, seekMs: Int?)
+    /// The day page (U4). Carries an optional wall-clock `seekMs` anchor and an
+    /// optional task-span `highlight` (AE3) — populated by Tasks/Chat landings
+    /// (U6/U12); nil for a plain day-card open. `.timeline` has no sidebar row:
+    /// it highlights the Days row (see `ShellSidebarModel.highlightedRoute`).
+    case timeline(day: Date, seekMs: Int?, highlight: DaySpanHighlight?)
     case privacy
     case appRules
     case intelligence
+}
+
+/// A task span to emphasize when a day page is opened from Tasks or Chat (AE3).
+/// A dedicated Hashable value so it can ride `ShellRoute.timeline`'s associated
+/// values (a bare tuple can't — tuples aren't Hashable).
+struct DaySpanHighlight: Hashable {
+    let startMs: Int
+    let endMs: Int
 }
 
 /// A sidebar nav row's presentation contract — pure, so the routing / enablement /
@@ -56,22 +72,34 @@ struct ShellNavItem: Identifiable, Hashable {
 /// out of the view so U4's routing / stub / footer rules are directly assertable.
 enum ShellSidebarModel {
 
+    /// The four primary destinations (R1): Days · Tasks · Clips · Chat. Days is
+    /// the default landing surface (R2); Tasks and Clips render honest "coming in
+    /// this update" placeholders until U6/U11 land.
     static let primaryNav: [ShellNavItem] = [
-        ShellNavItem(id: "library", label: "Library", route: .library, availability: .enabled),
-        ShellNavItem(id: "journal", label: "Journal", route: .journal, availability: .enabled),
-        // Chat — the first search-like sidebar destination (KTD7). Ask about your
-        // recorded history and get a grounded answer with the real moments as
-        // sources.
+        ShellNavItem(id: "days", label: "Days", route: .days, availability: .enabled),
+        ShellNavItem(id: "tasks", label: "Tasks", route: .tasks, availability: .enabled),
+        ShellNavItem(id: "clips", label: "Clips", route: .clips, availability: .enabled),
+        // Chat — ask about your recorded history and get a grounded answer with
+        // the real moments as sources.
         ShellNavItem(id: "chat", label: "Chat", route: .chat, availability: .enabled),
     ]
 
-    /// The design's COLLECTIONS list is mock data (sample collection names,
-    /// which the U14 sweep forbids), so Collections ships as a single honest stub
-    /// row until SCR-222 — never the sample names.
-    static let collections: [ShellNavItem] = [
-        ShellNavItem(id: "collections", label: "Collections", route: nil,
-                     availability: .stub(ticket: "SCR-222")),
-    ]
+    /// Which sidebar route a given active route highlights. The day page
+    /// (`.timeline`) has no row of its own — it is part of the Days experience
+    /// (reached from Days cards and citations), so it highlights the Days row
+    /// (U4). Every other route highlights its own row.
+    static func highlightedRoute(for route: ShellRoute) -> ShellRoute {
+        if case .timeline = route { return .days }
+        return route
+    }
+
+    /// Whether a nav row should render as active for the current route — pure so
+    /// the `.timeline`-highlights-Days rule is directly assertable. A pure stub
+    /// row (no destination) is never active.
+    static func isActive(_ item: ShellNavItem, route: ShellRoute) -> Bool {
+        guard let itemRoute = item.route else { return false }
+        return itemRoute == highlightedRoute(for: route)
+    }
 
     static let settingsNav: [ShellNavItem] = [
         // Account is pinned FIRST (KTD-4): it is the paid-only gate's home
@@ -173,9 +201,8 @@ struct ShellLogoMark: View {
     }
 }
 
-/// The prototype sidebar (design lines 299–337): traffic-light inset, brand mark,
-/// Library/Journal nav, a Collections stub, the Privacy/App-rules settings group,
-/// and the status footer. Replaces the legacy four-pane `List` sidebar (U4).
+/// The sidebar: traffic-light inset, brand mark, the Days · Tasks · Clips · Chat
+/// primary nav (R1), the Privacy/App-rules settings group, and the status footer.
 struct ShellSidebarView: View {
     @Binding var route: ShellRoute
     let recordings: [RecordingSummary]
@@ -194,8 +221,6 @@ struct ShellSidebarView: View {
             windowControlsSlot
             brand
             navGroup(ShellSidebarModel.primaryNav)
-            sectionHeader("COLLECTIONS")
-            navGroup(ShellSidebarModel.collections)
             sectionHeader("SETTINGS")
             navGroup(ShellSidebarModel.settingsNav)
             Spacer(minLength: SCMetrics.space4)
@@ -295,7 +320,9 @@ struct ShellSidebarView: View {
 
     @ViewBuilder
     private func navRow(_ item: ShellNavItem) -> some View {
-        let isActive = item.route.map { $0 == route } ?? false
+        // U4: `.timeline` highlights the Days row (see `highlightedRoute`), so a
+        // day page opened from a card/citation still shows Days as active.
+        let isActive = ShellSidebarModel.isActive(item, route: route)
         Button {
             if let dest = item.route { route = dest }
         } label: {

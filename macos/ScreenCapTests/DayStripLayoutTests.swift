@@ -1,56 +1,133 @@
 import XCTest
 @testable import ScreenCap
 
-/// U9 — the day strip's pure geometry: dynamic axis bounds (outward hour
-/// rounding, 8h minimum, day clamping), time→x mapping, marker clustering, the
+/// U9/U1 — the day strip's pure geometry: the fixed-waking-window axis bounds
+/// (08:00–21:00, extended outward for out-of-window footage, DST-safe day
+/// clamping), footage boundary labels, time→x mapping, marker clustering, the
 /// R7 blocked-band mapping, and the accessibility label builders.
 final class DayStripLayoutTests: XCTestCase {
 
     private let hour = DayStripLayout.hourMs
     /// An arbitrary local-midnight origin; the layout only does arithmetic on it.
     private let dayStart = 1_800_000_000_000
+    /// The DST-safe day end the view now passes; a synthetic 24h day here.
+    private var dayEnd: Int { dayStart + 24 * hour }
 
-    // MARK: - Axis bounds
+    // MARK: - U4 landing highlight (AE3)
 
-    func testAxisBoundsRoundOutwardToTheHour() {
-        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, spans: [
-            (startMs: dayStart + 9 * hour + 20 * 60_000, endMs: dayStart + 17 * hour + 40 * 60_000),
-        ])
-        XCTAssertEqual(bounds.startMs, dayStart + 9 * hour, "start floors to the hour")
-        XCTAssertEqual(bounds.endMs, dayStart + 18 * hour, "end ceils to the hour")
+    /// An exact-endpoints task span resolves to that band (the common AE3 case:
+    /// Tasks/Chat hands the task's own span).
+    func testResolveHighlightSpanPrefersExactTaskMatch() {
+        let segments = [
+            (startMs: dayStart, endMs: dayStart + hour),
+            (startMs: dayStart + hour, endMs: dayStart + 2 * hour),
+        ]
+        let resolved = DayStripLayout.resolveHighlightSpan(
+            highlight: (startMs: dayStart + hour, endMs: dayStart + 2 * hour), segments: segments
+        )
+        XCTAssertEqual(resolved.startMs, dayStart + hour)
+        XCTAssertEqual(resolved.endMs, dayStart + 2 * hour)
     }
 
-    func testAxisBoundsEnforceEightHourMinimum() {
-        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, spans: [
-            (startMs: dayStart + 10 * hour, endMs: dayStart + 11 * hour),
-        ])
-        XCTAssertEqual(bounds.spanMs, DayStripLayout.minSpanMs)
-        XCTAssertEqual(bounds.startMs, dayStart + 10 * hour, "minimum extends forward from the union")
+    /// A highlight whose endpoints don't match but whose midpoint sits inside a
+    /// band emphasizes that containing band.
+    func testResolveHighlightSpanFallsBackToContainingBand() {
+        let segments = [(startMs: dayStart, endMs: dayStart + 2 * hour)]
+        let resolved = DayStripLayout.resolveHighlightSpan(
+            highlight: (startMs: dayStart + 30 * 60_000, endMs: dayStart + 90 * 60_000),
+            segments: segments
+        )
+        XCTAssertEqual(resolved.startMs, dayStart)
+        XCTAssertEqual(resolved.endMs, dayStart + 2 * hour, "lands on the containing task band")
     }
 
-    func testAxisBoundsMinimumPullsBackFromDayEnd() {
-        // A late-evening recording: extending forward would cross midnight.
-        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, spans: [
-            (startMs: dayStart + 22 * hour, endMs: dayStart + 23 * hour),
-        ])
-        XCTAssertEqual(bounds.endMs, dayStart + 24 * hour)
-        XCTAssertEqual(bounds.startMs, dayStart + 16 * hour)
+    /// No task band matches (unsplit footage, or bands not loaded yet) → outline
+    /// the raw highlight span, never drop it.
+    func testResolveHighlightSpanFallsBackToRawSpanWhenNoBandMatches() {
+        let hl = (startMs: dayStart + 5 * hour, endMs: dayStart + 6 * hour)
+        let resolved = DayStripLayout.resolveHighlightSpan(highlight: hl, segments: [])
+        XCTAssertEqual(resolved.startMs, hl.startMs)
+        XCTAssertEqual(resolved.endMs, hl.endMs)
     }
 
-    /// A midnight-spanning recording arrives day-clamped from the daemon, but a
-    /// client-side span leaking past the day must still clamp into it.
+    // MARK: - Axis bounds (fixed waking window, R6)
+
+    /// The founding fix (AE1): a short afternoon recording on an otherwise
+    /// empty day renders on the full 08:00–21:00 waking axis, positioned in
+    /// early afternoon — not zoomed to fill, which read as "a few minutes".
+    func testAxisBoundsInWindowFootageKeepsFixedWakingWindow() {
+        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, dayEndMs: dayEnd, spans: [
+            (startMs: dayStart + 13 * hour + 53 * 60_000, endMs: dayStart + 14 * hour + 44 * 60_000),
+        ])
+        XCTAssertEqual(bounds.startMs, dayStart + 8 * hour, "axis starts at 08:00 regardless of footage")
+        XCTAssertEqual(bounds.endMs, dayStart + 21 * hour, "axis ends at 21:00 regardless of footage")
+    }
+
+    func testAxisBoundsSpanlessIsWakingWindow() {
+        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, dayEndMs: dayEnd, spans: [])
+        XCTAssertEqual(bounds.startMs, dayStart + 8 * hour)
+        XCTAssertEqual(bounds.endMs, dayStart + 21 * hour)
+    }
+
+    /// Footage before 08:00 extends the axis start outward (hour-floored).
+    func testAxisBoundsExtendsStartForEarlyFootage() {
+        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, dayEndMs: dayEnd, spans: [
+            (startMs: dayStart + 6 * hour + 20 * 60_000, endMs: dayStart + 9 * hour),
+        ])
+        XCTAssertEqual(bounds.startMs, dayStart + 6 * hour, "start floors to the hour below the footage")
+        XCTAssertEqual(bounds.endMs, dayStart + 21 * hour, "end stays at the waking-window close")
+    }
+
+    /// Footage after 21:00 extends the axis end outward (hour-ceiled): the
+    /// plan's "22:30 footage extends the axis to 23:00".
+    func testAxisBoundsExtendsEndForLateFootage() {
+        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, dayEndMs: dayEnd, spans: [
+            (startMs: dayStart + 20 * hour, endMs: dayStart + 22 * hour + 30 * 60_000),
+        ])
+        XCTAssertEqual(bounds.startMs, dayStart + 8 * hour, "start stays at the waking-window open")
+        XCTAssertEqual(bounds.endMs, dayStart + 23 * hour, "end ceils to the hour above the footage")
+    }
+
+    /// A client-side span leaking past the day still clamps into it (both edges).
     func testAxisBoundsClampIntoTheDay() {
-        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, spans: [
+        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, dayEndMs: dayEnd, spans: [
             (startMs: dayStart - 2 * hour, endMs: dayStart + 25 * hour),
         ])
         XCTAssertEqual(bounds.startMs, dayStart)
         XCTAssertEqual(bounds.endMs, dayStart + 24 * hour)
     }
 
-    func testAxisBoundsDefaultToWorkingWindowWhenSpanless() {
-        let bounds = DayStripLayout.axisBounds(dayStartMs: dayStart, spans: [])
-        XCTAssertEqual(bounds.startMs, dayStart + 8 * hour)
-        XCTAssertEqual(bounds.endMs, dayStart + 16 * hour)
+    /// DST-safe: the clamp uses the passed day end, not a hardcoded +24h. On a
+    /// 25h "fall back" day, late footage clamps to the real (longer) day end;
+    /// a spanless short/long day still shows the fixed waking window.
+    func testAxisBoundsClampsToPassedDayEndForDstDay() {
+        let longDayEnd = dayStart + 25 * hour
+        let late = DayStripLayout.axisBounds(dayStartMs: dayStart, dayEndMs: longDayEnd, spans: [
+            (startMs: dayStart + 23 * hour, endMs: dayStart + 24 * hour + 30 * 60_000),
+        ])
+        XCTAssertEqual(late.endMs, dayStart + 25 * hour, "end ceils but clamps to the real 25h day end")
+        let shortSpanless = DayStripLayout.axisBounds(
+            dayStartMs: dayStart, dayEndMs: dayStart + 23 * hour, spans: []
+        )
+        XCTAssertEqual(shortSpanless.startMs, dayStart + 8 * hour)
+        XCTAssertEqual(shortSpanless.endMs, dayStart + 21 * hour)
+    }
+
+    // MARK: - Footage boundary labels (AE1)
+
+    /// The first footage start and last footage end inside the axis get an
+    /// honest "recording started/stopped HH:MM" edge label; a spanless day has
+    /// none.
+    func testFootageBoundaryLabels() {
+        let start = dayStart + 13 * hour + 53 * 60_000
+        let end = dayStart + 14 * hour + 44 * 60_000
+        let labels = DayStripLayout.footageBoundaryLabels(spans: [(startMs: start, endMs: end)])
+        XCTAssertEqual(labels.count, 2)
+        XCTAssertEqual(labels[0].ms, start)
+        XCTAssertEqual(labels[0].kind, .started)
+        XCTAssertEqual(labels[1].ms, end)
+        XCTAssertEqual(labels[1].kind, .stopped)
+        XCTAssertTrue(DayStripLayout.footageBoundaryLabels(spans: []).isEmpty)
     }
 
     // MARK: - Time → x

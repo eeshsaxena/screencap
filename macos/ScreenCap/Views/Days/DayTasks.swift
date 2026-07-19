@@ -1,8 +1,8 @@
 import Foundation
 
-// U10 (local-first intelligence) — resolves each Journal card's named-task
+// U10 (local-first intelligence) — resolves each day card's named-task
 // breakdown from a single cached `tasks.list` per recording. Mirrors
-// `JournalAppChips` (the established one-query-per-recording resolver pattern):
+// `DayAppChips` (the established one-query-per-recording resolver pattern):
 // READ failure is silent by contract — a recording with no tasks (or a daemon
 // hiccup) simply renders no task breakdown, never an error state.
 //
@@ -17,7 +17,7 @@ import Foundation
 // silently diverges from the store.
 
 @MainActor
-final class JournalTasks: ObservableObject {
+final class DayTasks: ObservableObject {
     /// Resolved task lists, keyed by recording directory name. Only recordings
     /// that actually have tasks appear here (an empty result stores nothing, so
     /// `tasks(for:)` returns `[]`).
