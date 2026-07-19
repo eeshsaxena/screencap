@@ -71,8 +71,10 @@ def _fail(kind: str, message: str, *, retryable: bool) -> dict:
     return _envelope(False, error_kind=kind, message=message, retryable=retryable)
 
 
-# Which relay error kinds the user can usefully retry as-is.
-_RETRYABLE_KINDS = {"network", "server"}
+# Which relay error kinds the user can usefully retry. ``expired`` is retryable
+# (KTD-3/KTD-7): a claim that lapses mid-upload just means "re-prepare and try
+# again" — a slow-uplink honest path, not a permanent rejection.
+_RETRYABLE_KINDS = {"network", "server", "expired"}
 
 
 def _host_allowed(url: str) -> bool:

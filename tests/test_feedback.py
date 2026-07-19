@@ -108,6 +108,16 @@ def test_relay_rate_limited_passes_through_non_retryable():
     assert env["retryable"] is False
 
 
+def test_relay_expired_is_retryable():
+    with mock.patch(
+        "screencap.feedback.requests.post",
+        return_value=_Resp({"ok": False, "error_kind": "expired", "message": "timed out"}),
+    ):
+        env = feedback.send_feedback({"type": "bug", "message": "hi"})
+    assert env["error_kind"] == "expired"
+    assert env["retryable"] is True
+
+
 def test_oversize_file_rejected_before_any_network(tmp_path):
     big = _png(tmp_path, "big.mp4", size=feedback.MAX_FILE_BYTES + 1)
     with mock.patch("screencap.feedback.requests.post") as post, \

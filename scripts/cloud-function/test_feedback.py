@@ -325,6 +325,31 @@ def test_message_markup_stays_inside_fence():
     assert desc.index("![x](http://evil)") < header_idx
 
 
+def test_email_with_markdown_breakout_rejected():
+    # `x@y.z`![img](http://evil)` must NOT pass validation — it would close the
+    # inline-code span and auto-load an image in the maintainer's triage.
+    _, payload = _invoke(
+        {
+            "action": "submit",
+            "type": "bug",
+            "message": "hi",
+            "email": "x@y.z`![img](http://evil)",
+        }
+    )
+    assert payload["error_kind"] == "invalid"
+
+
+def test_plain_email_accepted():
+    with mock.patch(
+        "feedback.requests.post",
+        return_value=_FakeResp({"issueCreate": {"success": True, "issue": {"id": "i", "url": "u"}}}),
+    ):
+        _, payload = _invoke(
+            {"action": "submit", "type": "bug", "message": "hi", "email": "user.name+tag@example.co"}
+        )
+    assert payload["ok"] is True
+
+
 def test_version_field_with_markup_rejected():
     _, payload = _invoke(
         {

@@ -135,7 +135,12 @@ MAX_DECLARED_BYTES_PER_WINDOW = 120 * 1024 * 1024
 # Metadata version fields render OUTSIDE the fenced message, so they are the same
 # injection surface as message/email and are validated to this pattern (KTD-11).
 _VERSION_RE = re.compile(r"^[A-Za-z0-9 ().\-]{1,64}$")
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Conservative charset: excludes every markdown-breakout character (backtick,
+# brackets, parens, bang) so a validated email cannot escape the inline-code
+# span it renders into (KTD-11). A permissive "anything but @/space" pattern
+# would let `x@y.z`![img](http://evil)` break out and auto-load an image in the
+# maintainer's triage.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 # Connect/read timeouts mirror upload.py's tuple.
@@ -239,6 +244,24 @@ def _enforce_count(store: dict[str, list[float]], ip: str, limit: int, now: floa
         raise _err("rate_limited", "too many reports, try again later", 429)
     hits.append(now)
     store[ip] = hits
+
+
+def _sweep_stale(now: float) -> None:
+    """Drop rate-limit keys whose entries are all older than the window.
+
+    Prune-on-touch alone never removes IP *keys*, so a long-lived warm instance
+    would accumulate keys under organic traffic. This bounds the three dicts to
+    IPs seen within the window (the rightmost XFF is Google-set, so keys can't be
+    inflated with spoofed values). Cheap at this scale — keys ~ distinct IPs/hr.
+    """
+    cutoff = now - RATE_WINDOW_SECONDS
+    for store in (_submit_hits, _prepare_hits):
+        for ip in [k for k, v in store.items() if not any(t >= cutoff for t in v)]:
+            del store[ip]
+    for ip in [
+        k for k, v in _declared_bytes.items() if not any(t >= cutoff for t, _ in v)
+    ]:
+        del _declared_bytes[ip]
 
 
 def _enforce_declared_bytes(ip: str, add_bytes: int, now: float) -> None:
@@ -531,6 +554,7 @@ def submit_feedback(request):
 
     ip = client_ip(request)
     now = time.time()
+    _sweep_stale(now)
     action = body.get("action")
     try:
         if action == "prepare":
