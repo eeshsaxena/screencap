@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
+import ast
 from pathlib import Path
 from unittest import mock
 
@@ -196,29 +194,33 @@ def test_reads_only_supplied_paths_never_recordings(tmp_path):
 # --------------------------------------------------------------------------
 @pytest.mark.privacy
 def test_cli_and_relay_constants_match():
-    # Load the relay's constants in a CLEAN subprocess: the relay module imports
-    # functions_framework/flask and evaluates an HTTP decorator at import time,
-    # and the shared test interpreter may hold a mocked functions_framework from
-    # an unrelated test. A fresh interpreter isolates us from that pollution.
+    # Extract the relay's constants WITHOUT importing the module: it imports
+    # functions_framework/flask (cloud-function-only deps absent from the main
+    # test env, e.g. the privacy lane) and evaluates an HTTP decorator at import
+    # time. Parse the source and exec only the constant assignments, whose values
+    # are pure arithmetic + frozenset builtins — no third-party imports needed.
     relay_path = Path(__file__).resolve().parents[1] / "scripts" / "cloud-function" / "feedback.py"
-    reader = (
-        "import importlib.util, json, sys\n"
-        f"spec = importlib.util.spec_from_file_location('relay_feedback', {str(relay_path)!r})\n"
-        "m = importlib.util.module_from_spec(spec)\n"
-        "spec.loader.exec_module(m)\n"
-        "print(json.dumps({"
-        "'file': m.MAX_FILE_BYTES, 'total': m.MAX_TOTAL_BYTES, 'count': m.MAX_ATTACHMENTS,"
-        "'types': sorted(m.ALLOWED_CONTENT_TYPES), 'hosts': sorted(m.LINEAR_UPLOAD_HOSTS)}))\n"
-    )
-    proc = subprocess.run([sys.executable, "-c", reader], capture_output=True, text=True)
-    assert proc.returncode == 0, proc.stderr
-    relay = json.loads(proc.stdout)
+    wanted = {
+        "MAX_FILE_BYTES",
+        "MAX_TOTAL_BYTES",
+        "MAX_ATTACHMENTS",
+        "ALLOWED_CONTENT_TYPES",
+        "LINEAR_UPLOAD_HOSTS",
+    }
+    tree = ast.parse(relay_path.read_text())
+    ns: dict = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in wanted for t in node.targets
+        ):
+            exec(compile(ast.Module([node], []), str(relay_path), "exec"), ns)
+    assert wanted <= ns.keys(), f"relay constants not found: {wanted - ns.keys()}"
 
-    assert feedback.MAX_FILE_BYTES == relay["file"]
-    assert feedback.MAX_TOTAL_BYTES == relay["total"]
-    assert feedback.MAX_ATTACHMENTS == relay["count"]
-    assert sorted(feedback.ALLOWED_CONTENT_TYPES) == relay["types"]
-    assert sorted(feedback.LINEAR_UPLOAD_HOSTS) == relay["hosts"]
+    assert feedback.MAX_FILE_BYTES == ns["MAX_FILE_BYTES"]
+    assert feedback.MAX_TOTAL_BYTES == ns["MAX_TOTAL_BYTES"]
+    assert feedback.MAX_ATTACHMENTS == ns["MAX_ATTACHMENTS"]
+    assert feedback.ALLOWED_CONTENT_TYPES == ns["ALLOWED_CONTENT_TYPES"]
+    assert feedback.LINEAR_UPLOAD_HOSTS == ns["LINEAR_UPLOAD_HOSTS"]
 
 
 # --------------------------------------------------------------------------
