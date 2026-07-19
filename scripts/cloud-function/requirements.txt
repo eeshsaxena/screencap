@@ -15,3 +15,7 @@ firebase-admin>=7.4.0
 # the $5/mo Personal-cloud paywall (billing.py). Only the billing entry points
 # import it; the signing function does not.
 stripe>=9,<12
+# Feedback relay (feedback.py): Linear GraphQL client. Previously only a
+# transitive dependency (via requests-using libs), so the relay would have
+# worked by accident and broken on a future dep bump — pin it explicitly.
+requests>=2
