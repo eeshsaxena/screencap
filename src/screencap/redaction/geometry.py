@@ -38,12 +38,15 @@ from screencap.recording_db import Connection, has_column, has_table, open_recor
 def parse_screenshot_timestamp(filename: str) -> float | None:
     """Extract Unix timestamp from a screenshot filename or path.
 
-    Handles both bare filenames (``1709745600.123456.jpg``) and DB
-    image_path values with a directory prefix (``screenshots/1709745600.123456.jpg``).
+    Handles bare filenames (``1709745600.123456.jpg``), DB image_path values
+    with a directory prefix (``screenshots/1709745600.123456.jpg``), and the
+    encrypted-corpus form (``1709745600.123456.jpg.enc``).
     Returns None if the name doesn't match the expected format.
     """
     # Strip directory prefix — image_path in the DB is "screenshots/{ts}.jpg"
     basename = filename.rsplit("/", 1)[-1] if "/" in filename else filename
+    if basename.endswith(".enc"):
+        basename = basename[: -len(".enc")]
     if basename.endswith(".jpg"):
         stem = basename[: basename.rfind(".jpg")]
     elif basename.endswith(".jpeg"):
@@ -63,17 +66,23 @@ def list_screenshot_timestamps(rec_dir: Path) -> list[float]:
     Shared by the SCR-178 backfill and the U3 day-timeline surface so the flat
     frame enumeration can't drift; lives here (a light module) rather than in the
     OCR-heavy backfill engine.
+
+    Globs both the plaintext ``*.jpg`` and the encrypted-corpus ``*.jpg.enc``
+    forms (mirrors ``frame_resolve``): under ``corpus_encrypted`` every still is
+    ``.jpg.enc``, and a ``.jpg``-only glob would silently drop the frame-presence
+    signal for the whole library. A frame present as both forms mid-migration
+    counts once.
     """
     shots = rec_dir / "screenshots"
     if not shots.is_dir():
         return []
-    out: list[float] = []
-    for img in shots.glob("*.jpg"):
-        ts = parse_screenshot_timestamp(img.name)
-        if ts is not None:
-            out.append(ts)
-    out.sort()
-    return out
+    seen: set[float] = set()
+    for pattern in ("*.jpg", "*.jpg.enc"):
+        for img in shots.glob(pattern):
+            ts = parse_screenshot_timestamp(img.name)
+            if ts is not None:
+                seen.add(ts)
+    return sorted(seen)
 
 
 # ---------------------------------------------------------------------------

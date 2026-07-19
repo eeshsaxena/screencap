@@ -135,33 +135,39 @@ def _figure_numbers(figures: object | None) -> set[str]:
     The backing set MUST include every rendering the guardrail prompt can actually
     show (``dispatch._figure_lines``), or a faithfully-echoed figure is flagged
     unbacked and the answer is blanked to a refusal. ``_figure_lines`` renders
-    minutes at ONE decimal (``int`` when whole, else ``round(minutes, 1)``), so we
-    add that exact 1-decimal rendering here as well as the coarser 2-decimal /
-    seconds / hours forms (FIX B)."""
+    minutes as WHOLE minutes (``dispatch._fmt_minutes``: ``round(ms/60000)``), so
+    that rendering is included alongside the legacy 1-decimal / 2-decimal /
+    seconds / hours forms (FIX B). The focus/recorded figures the enriched
+    renderer surfaces (``focus_ms`` per app, ``recorded_ms`` overall) are backed
+    the same way."""
     if figures is None:
         return set()
-    nums: set[str] = set()
-    covered_ms = getattr(figures, "covered_active_ms", None)
-    uncovered_ms = getattr(figures, "uncovered_ms", None)
-    for ms in (covered_ms, uncovered_ms):
-        if not isinstance(ms, (int, float)):
-            continue
+
+    def _ms_renderings(ms: float) -> set[str]:
         ms = float(ms)
-        nums.add(_fmt_num(ms))
-        nums.add(_fmt_num(ms / 1000.0))          # seconds
-        nums.add(_fmt_num(ms / 60_000.0))        # minutes (2-decimal)
-        nums.add(_fmt_minutes_line(ms))          # minutes (1-decimal, as shown)
-        nums.add(_fmt_num(ms / 3_600_000.0))     # hours
+        return {
+            _fmt_num(ms),
+            _fmt_num(ms / 1000.0),           # seconds
+            _fmt_num(ms / 60_000.0),         # minutes (2-decimal)
+            _fmt_minutes_line(ms),           # minutes (1-decimal, legacy render)
+            str(round(ms / 60_000.0)),       # whole minutes (as _fmt_minutes shows)
+            _fmt_num(ms / 3_600_000.0),      # hours
+        }
+
+    nums: set[str] = set()
+    for attr in ("covered_active_ms", "uncovered_ms", "recorded_ms"):
+        ms = getattr(figures, attr, None)
+        if isinstance(ms, (int, float)):
+            nums |= _ms_renderings(ms)
     # Per-app event counts are legitimate figures too.
     for app in getattr(figures, "apps", []) or []:
         count = getattr(app, "event_count", None)
         if isinstance(count, int):
             nums.add(str(count))
-        covered = getattr(app, "covered_active_ms", None)
-        if isinstance(covered, (int, float)):
-            nums.add(_fmt_num(covered / 60_000.0))
-            nums.add(_fmt_minutes_line(float(covered)))  # 1-decimal, as shown
-            nums.add(_fmt_num(covered / 3_600_000.0))
+        for attr in ("covered_active_ms", "focus_ms"):
+            ms = getattr(app, attr, None)
+            if isinstance(ms, (int, float)):
+                nums |= _ms_renderings(ms)
     return nums
 
 
@@ -335,16 +341,18 @@ _CAPITALIZED_WORD_RE = re.compile(r"[A-Z][A-Za-z0-9]{2,}")
 def _figure_app_tokens(figures: object | None) -> set[str]:
     """Lowercase name-fragments of every app in ``figures.apps`` — each bundle-id /
     name split on non-alphanumerics so "com.tinyspeck.slackmacgap" yields
-    {"com","tinyspeck","slackmacgap"}. Used for substring-matching an app the answer
-    names against the computed figures."""
+    {"com","tinyspeck","slackmacgap"}. The human ``display_name`` (what
+    ``_figure_lines`` actually shows the model, e.g. "Arc" for
+    "company.thebrowser.Browser") contributes fragments the same way. Used for
+    substring-matching an app the answer names against the computed figures."""
     frags: set[str] = set()
     for app in getattr(figures, "apps", []) or []:
-        name = getattr(app, "app", None)
-        if isinstance(name, str):
-            frags.add(name.lower())
-            for frag in re.split(r"[^a-z0-9]+", name.lower()):
-                if frag:
-                    frags.add(frag)
+        for name in (getattr(app, "app", None), getattr(app, "display_name", None)):
+            if isinstance(name, str) and name:
+                frags.add(name.lower())
+                for frag in re.split(r"[^a-z0-9]+", name.lower()):
+                    if frag:
+                        frags.add(frag)
     return frags
 
 
@@ -395,13 +403,17 @@ def _aggregate_names_absent_app(
 
 
 def _figures_text(figures: object | None) -> str:
-    """A tiny textual rendering of a figure's app names, so an aggregate answer that
-    names the app it computed time for counts as grounded (rule c)."""
+    """A tiny textual rendering of a figure's app names, display names, and top
+    window titles — everything ``_figure_lines`` shows the model — so an aggregate
+    answer that names what it computed time for counts as grounded (rule c)."""
     if figures is None:
         return ""
     parts: list[str] = []
     for app in getattr(figures, "apps", []) or []:
-        name = getattr(app, "app", None)
-        if isinstance(name, str):
-            parts.append(name)
+        for name in (getattr(app, "app", None), getattr(app, "display_name", None)):
+            if isinstance(name, str) and name:
+                parts.append(name)
+        for title in getattr(app, "top_titles", None) or []:
+            if isinstance(title, str) and title:
+                parts.append(title)
     return " ".join(parts)

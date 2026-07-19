@@ -19,6 +19,7 @@ from screencap.redaction.geometry import (
     WindowContext,
     associate_screenshot,
     find_nearest_window,
+    list_screenshot_timestamps,
     load_window_events,
     parse_screenshot_timestamp,
 )
@@ -48,12 +49,40 @@ class TestParseScreenshotTimestamp:
             1709745600.123456
         )
 
+    def test_parses_encrypted_corpus_form(self):
+        # Under corpus_encrypted, stills (and DB image_path values) carry the
+        # ``.jpg.enc`` suffix; the timestamp parse must see through it.
+        assert parse_screenshot_timestamp("1709745600.123456.jpg.enc") == pytest.approx(
+            1709745600.123456
+        )
+        assert parse_screenshot_timestamp(
+            "screenshots/1709745600.123456.jpg.enc"
+        ) == pytest.approx(1709745600.123456)
+
     @pytest.mark.parametrize("filename", [
         "1709745600.123456.png",
         "screenshot.jpg",
     ])
     def test_rejects_non_parseable_filenames(self, filename):
         assert parse_screenshot_timestamp(filename) is None
+
+
+class TestListScreenshotTimestamps:
+    def test_lists_plaintext_and_encrypted_stills_once(self, tmp_path):
+        """The flat-frame enumeration must see the encrypted-corpus ``.jpg.enc``
+        form — a ``.jpg``-only glob silently drops the frame-presence signal for
+        every encrypted library (the aggregate / day-timeline / backfill
+        coverage inputs). A frame present as both forms mid-migration counts
+        once."""
+        shots = tmp_path / "screenshots"
+        shots.mkdir()
+        (shots / "100.5.jpg").write_bytes(b"\xff\xd8\xff")
+        (shots / "200.5.jpg.enc").write_bytes(b"enc")
+        # Mid-migration: the same frame in both forms.
+        (shots / "300.5.jpg").write_bytes(b"\xff\xd8\xff")
+        (shots / "300.5.jpg.enc").write_bytes(b"enc")
+        (shots / "not-a-frame.txt").write_text("x")
+        assert list_screenshot_timestamps(tmp_path) == [100.5, 200.5, 300.5]
 
 
 # ---------------------------------------------------------------------------
