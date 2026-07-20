@@ -29,6 +29,10 @@ effect — that gap would otherwise crash ``set_custom_user_claims`` /
 ``verify_id_token`` at runtime while unit tests (which mock init) stay green.
 
 Deploy (project: proteus-photos, region: southamerica-east1):
+    # Prefer the wrapper `scripts/cloud-function/deploy_billing.sh`, which deploys
+    # all five functions with the correct source override and Secret-Manager
+    # (`--set-secrets`) injection, and refuses a raw inline secret. The manual
+    # commands below document the per-function shape the wrapper builds.
     # CRITICAL: these entry points live in billing.py, but the GCF Python buildpack
     # DEFAULTS the source file to main.py — so every billing deploy MUST pass
     # --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py, or the container fails
