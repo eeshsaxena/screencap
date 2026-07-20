@@ -168,6 +168,33 @@ final class MomentsModelTests: XCTestCase {
         XCTAssertEqual(MomentsModel.filter(groups, query: "  ", clippedOnly: false), groups)
     }
 
+    func testClippedFilterIgnoresStaleSubstringQuery() {
+        // Regression: the substring field is hidden under the Clipped filter, so a
+        // leftover query must NOT drop clips (they carry no matchable name). Switching
+        // to Clipped while a name query persists still shows every clip (R5).
+        let groups = MomentsModel.merge(
+            days: [TasksQueryDay(date: "2026-07-17", tasks: [task(name: "Salesforce", startTs: 500)])],
+            clips: [clip(id: "k", sourceDay: "2026-07-17", startMs: 1_000_000)]
+        )
+        let filtered = MomentsModel.filter(groups, query: "Salesforce", clippedOnly: true)
+        XCTAssertEqual(filtered.flatMap { $0.rows }.map(\.id), ["clip:k"])
+    }
+
+    func testListStateClippedFilterWithStaleQueryStaysPopulated() {
+        let state = MomentsModel.listState(
+            days: [TasksQueryDay(date: "2026-07-17", tasks: [task(name: "Salesforce", startTs: 500)])],
+            clips: [clip(id: "k", sourceDay: "2026-07-17", startMs: 1_000_000)],
+            recordings: [TasksQueryRecordingStatus(name: "rec-1")],
+            query: "Salesforce",
+            clippedOnly: true,
+            verdict: nil
+        )
+        guard case .populated(let groups) = state else {
+            return XCTFail("expected populated (stale query ignored under Clipped), got \(state)")
+        }
+        XCTAssertEqual(groups.flatMap { $0.rows }.map(\.id), ["clip:k"])
+    }
+
     // MARK: - Resolved list state (R7/KTD-6, R21)
 
     func testClipsOverrideSystemZero() {

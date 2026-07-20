@@ -145,7 +145,11 @@ enum MomentsModel {
     /// excludes it — the Clipped type-filter, not a text search, is the tool for
     /// focusing on kept moments. With neither active, groups pass through unchanged.
     static func filter(_ groups: [MomentDayGroup], query: String, clippedOnly: Bool) -> [MomentDayGroup] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The Clipped filter and the substring filter are mutually exclusive in the
+        // UI (the substring field is hidden under Clipped), so ignore any stale query
+        // when clippedOnly — otherwise a leftover name search would drop every clip
+        // (clips carry no matchable name) and falsely read as "no clipped moments" (R5).
+        let needle = clippedOnly ? "" : query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard clippedOnly || !needle.isEmpty else { return groups }
         return groups.compactMap { group in
             let rows = group.rows.filter { row in
@@ -209,10 +213,12 @@ enum MomentsModel {
             return .systemZero(TasksModel.systemZero(recordings: recordings, verdict: verdict))
         }
 
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // clippedOnly ignores any (hidden, stale) substring query — the two filters
+        // are mutually exclusive in the UI, so a leftover query must never hide clips.
+        let needle = clippedOnly ? "" : query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard clippedOnly || !needle.isEmpty else { return .populated(groups) }
 
-        let filtered = filter(groups, query: needle, clippedOnly: clippedOnly)
+        let filtered = filter(groups, query: query, clippedOnly: clippedOnly)
         return filtered.isEmpty
             ? .filterZero(query: needle, clippedOnly: clippedOnly)
             : .populated(filtered)
