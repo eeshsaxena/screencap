@@ -226,6 +226,17 @@ if ! "${CLI_BINARY}" --version >/dev/null 2>&1; then
   exit 1
 fi
 
+# Hard gate: the shipped bundle must satisfy every precondition
+# SMAppService.agent(plistName:).register() needs to SUCCEED — the LaunchAgent
+# plist is present, its Label/BundleProgram match what DaemonInstallController
+# expects, and the app + embedded helper are BOTH team-signed (not ad-hoc) with a
+# MATCHING Team Identifier. Any of these regressing (a dropped post-build plist
+# copy, a renamed launcher, an ad-hoc/cross-team slip) dead-ends first-run
+# onboarding at "macos rejected the helper signature" / "the helper plist was not
+# found" for EVERY user — the launch-day blocker this gate exists to prevent.
+echo "==> Verifying daemon-registration preconditions (SMAppService)"
+"${REPO_ROOT}/script/verify_daemon_registration.sh" "${APP_PATH}"
+
 # Gatekeeper assessment: an un-notarized Developer ID app is expected to be
 # REJECTED here ("source=Unnotarized Developer ID"). Run it informationally so
 # the signing step doesn't fail; the authoritative spctl check is in
