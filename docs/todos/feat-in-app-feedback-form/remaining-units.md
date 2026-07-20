@@ -26,21 +26,15 @@ be done. They are ordered by what unblocks what.
   access + Linear admin. The operational half depends only on the relay (U1,
   done) — it can run in parallel with the Swift work.
 
-## Blocked on a safe Swift build environment
+## Swift UI units (were blocked on a safe build environment)
 
-`xcodebuild` in a `~/Documents` checkout TCC-bricks the agent session, so the
-Swift units were not implemented in the backend run. They are fully specified in
-the plan (U3–U5: Files, Approach, Patterns, Test scenarios). Implement in an
-environment where the macOS app target can compile and `xcodebuild test` can run.
-
-- **U3 — `FeedbackController` + `FeedbackModels`** (state enum, service seam over
-  `CLIClient.runJSONRawStdin` with the payload-scaled timeout of KTD-12, async
-  daemon-version fetch, per-kind error copy, selection-time validation).
-- **U4 — `FeedbackSheetView`** (embeddable form; `NSOpenPanel` intake for launch,
-  drag-and-drop deferred; per-row attachment remove; dismissal disabled while
-  sending; copyable issue link on success; per-kind error copy).
-- **U5 — Entry points** (menu bar "Send Feedback…" via the notification bridge +
-  main-window affordance; no new window scene).
+**DONE (SCR-282).** U3–U5 shipped from a TCC-safe checkout (`~/dev/screencap`
+worktree): `FeedbackController` + `FeedbackModels` + 33 controller tests,
+`FeedbackSheetView` (NSOpenPanel intake, per-row remove, sending-locked
+dismissal, copyable issue link, per-kind error copy), and both entry points
+(menu-bar "Send Feedback…" via the notification bridge + the sidebar-footer
+"Send feedback" link). Drag-and-drop remains a fast-follow. End-to-end QA
+against the deployed relay stays with U0/U6 below.
 
 ## Delivery
 

@@ -1466,8 +1466,14 @@ enum DaemonClient {
         }
     }
 
-    static func daemonInfo() async throws -> DaemonInfoResponse {
-        try await request(method: "GET", path: "/v0/daemon.info")
+    /// `timeout` is caller-tunable because some readers need a much shorter
+    /// bound than the 10s default — the feedback form's metadata probe (KTD-9)
+    /// passes ~2s so a stale-but-listening daemon can't stretch its "checking…"
+    /// line. The bound is enforced by `withTimeout`'s `connection.cancel()`,
+    /// which is the only mechanism that actually unblocks the NWConnection
+    /// reads (they are not Task-cancellation-cooperative).
+    static func daemonInfo(timeout: TimeInterval = 10) async throws -> DaemonInfoResponse {
+        try await request(method: "GET", path: "/v0/daemon.info", timeout: timeout)
     }
 
     static func recordingList() async throws -> ListResponse {
