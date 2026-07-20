@@ -139,6 +139,22 @@ def test_source_marker_label_applied_to_every_type():
         assert seen["input"]["labelIds"] == ["label-source", type_label], req_type
 
 
+def test_source_label_unset_falls_back_to_type_label_only():
+    # Backward-compat guard: with no source marker configured, labelIds must
+    # reduce to exactly the per-type label (the pre-source-marker contract).
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["input"] = json["variables"]["input"]
+        return _FakeResp({"issueCreate": {"success": True, "issue": {"id": "i", "url": "https://linear.app/x/i"}}})
+
+    with mock.patch.dict(os.environ, {}, clear=False):
+        del os.environ["SCREENCAP_LINEAR_LABEL_SOURCE"]
+        with mock.patch("feedback.requests.post", side_effect=fake_post):
+            _invoke({"action": "submit", "type": "bug", "message": "hi"})
+    assert seen["input"]["labelIds"] == ["label-bug"]
+
+
 def test_prepare_then_submit_embeds_both_attachments():
     posted = {"count": 0}
 
