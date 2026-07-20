@@ -103,14 +103,14 @@ def _print_banner() -> None:
 
     if term_width < 78:
         # Narrow terminal fallback
-        console.print(f"\n[bold #60a5fa]◉ ScreenCap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
+        console.print(f"\n[bold #60a5fa]◉ Screencap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
         return
 
     try:
         import pyfiglet
         banner_text = pyfiglet.figlet_format("SCREENCAP", font="ansi_shadow")
     except Exception:
-        console.print(f"\n[bold #60a5fa]◉ ScreenCap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
+        console.print(f"\n[bold #60a5fa]◉ Screencap[/bold #60a5fa] [dim #a78bfa]v{__version__}[/dim #a78bfa]\n")
         return
 
     banner = Text(banner_text.rstrip(), style="bold #60a5fa")

@@ -584,7 +584,7 @@ def _run_menubar(
             if self._session_mode:
                 menu.addItem_(NSMenuItem.separatorItem())
                 quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                    "Quit ScreenCap", "quitSession:", "",
+                    "Quit Screencap", "quitSession:", "",
                 )
                 quit_item.setTarget_(self)
                 menu.addItem_(quit_item)
@@ -1133,7 +1133,7 @@ def _run_menubar(
             panel.setLevel_(NSStatusWindowLevel)
             panel.setHidesOnDeactivate_(False)
             panel.setReleasedWhenClosed_(False)
-            panel.setTitle_("ScreenCap")
+            panel.setTitle_("Screencap")
             panel.setFloatingPanel_(True)
             panel.setBecomesKeyOnlyIfNeeded_(True)
 

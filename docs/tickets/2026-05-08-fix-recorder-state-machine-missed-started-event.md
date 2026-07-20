@@ -12,14 +12,14 @@ related_review_run: /tmp/compound-engineering/ce-code-review/20260508-210223-e21
 
 ## Problem
 
-In SwiftUI's `consumeDaemonEvents()` at [macos/ScreenCap/Controllers/RecorderController.swift:572](../../macos/ScreenCap/Controllers/RecorderController.swift), the client subscribes to the daemon event stream via `snapshot.cursor` after `recording.start` returns. But:
+In SwiftUI's `consumeDaemonEvents()` at [macos/Screencap/Controllers/RecorderController.swift:572](../../macos/Screencap/Controllers/RecorderController.swift), the client subscribes to the daemon event stream via `snapshot.cursor` after `recording.start` returns. But:
 
 - `Supervisor.spawn()` already awaits `EVENT_STARTED` before responding to `recording.start`.
 - Phase 1's `EventBus` has no replay buffer.
 
 So by the time SwiftUI subscribes, the `started` event is permanently in the past and unreachable. `RecordingState` stays at `.starting`. `stop()` is then blocked because its guard requires `.recording`.
 
-The unit test at [macos/ScreenCapTests/RecorderControllerDaemonTests.swift:34-38](../../macos/ScreenCapTests/RecorderControllerDaemonTests.swift) masks this bug because the mock daemon delivers `started` AFTER the subscribe — opposite of production ordering.
+The unit test at [macos/ScreencapTests/RecorderControllerDaemonTests.swift:34-38](../../macos/ScreencapTests/RecorderControllerDaemonTests.swift) masks this bug because the mock daemon delivers `started` AFTER the subscribe — opposite of production ordering.
 
 This is a real bug in the recording-start flow that nobody hit during development because the mock-daemon path doesn't reproduce production timing.
 

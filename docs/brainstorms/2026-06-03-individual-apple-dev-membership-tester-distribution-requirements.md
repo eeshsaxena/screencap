@@ -7,7 +7,7 @@ topic: individual-apple-dev-membership-tester-distribution
 
 ## Summary
 
-Distribute notarized ScreenCap tester builds now under the sole developer's individual Apple Developer Program membership, and structure signing so the eventual switch to the org account is a CI-secrets swap plus one planned permission re-grant — not a rebuild, rename, or app transfer.
+Distribute notarized Screencap tester builds now under the sole developer's individual Apple Developer Program membership, and structure signing so the eventual switch to the org account is a CI-secrets swap plus one planned permission re-grant — not a rebuild, rename, or app transfer.
 
 ---
 
@@ -15,7 +15,7 @@ Distribute notarized ScreenCap tester builds now under the sole developer's indi
 
 The org Apple Developer Program enrollment is still in progress (expected ~2 weeks out), but the macOS app is ready to put in front of a small set of external testers. Today the `.app` has no distribution path: it is dev-only, signed per-developer via the `DEVELOPMENT_TEAM` env var, and falls back to ad-hoc signing that triggers a documented TCC re-grant treadmill on every rebuild. Waiting for the org account to start external testing costs real early-feedback time during the highest-learning window.
 
-There is one genuine cost to starting under the individual account: macOS TCC keys permission grants on `(bundle id, Team ID)`. ScreenCap depends on the three heaviest grants — Screen Recording, Accessibility, Input Monitoring. When builds are later re-signed with the org's Team ID, every already-installed tester's grants orphan and must be re-granted once. For the current cohort — a handful of friendly testers reachable in Slack — that cost rounds to zero. Everything else about an individual→org switch is cheap because distribution is direct/notarized, the bundle id is stable, and no team-scoped Apple capabilities are in use.
+There is one genuine cost to starting under the individual account: macOS TCC keys permission grants on `(bundle id, Team ID)`. Screencap depends on the three heaviest grants — Screen Recording, Accessibility, Input Monitoring. When builds are later re-signed with the org's Team ID, every already-installed tester's grants orphan and must be re-granted once. For the current cohort — a handful of friendly testers reachable in Slack — that cost rounds to zero. Everything else about an individual→org switch is cheap because distribution is direct/notarized, the bundle id is stable, and no team-scoped Apple capabilities are in use.
 
 ---
 
@@ -49,7 +49,7 @@ There is one genuine cost to starting under the individual account: macOS TCC ke
 **Keep the org migration to a re-sign**
 - R4. Signing identity (Team ID), Developer ID certificate, and notary credentials are supplied via CI secrets / environment, not hardcoded in source, so switching accounts changes no application code.
 - R5. While on the individual Team ID, adopt no team-scoped Apple capabilities (e.g. CloudKit, push, app groups, Sign in with Apple) that would bind to the account and complicate migration.
-- R6. The org switchover is delivered as a single, deliberate "re-grant" release: testers are warned in advance and, once, re-grant the three TCC permissions **and** re-approve the ScreenCap helper in Login Items. The three heavy grants (Screen Recording, Accessibility, Input Monitoring) are owned by the **daemon helper** (`com.screencap.daemon`), not the app — re-signing the helper with the org Team ID orphans them, and because the helper is registered via SMAppService, the Team-ID change also triggers a one-time Login-Items re-approval. Still one release; two clicks instead of one.
+- R6. The org switchover is delivered as a single, deliberate "re-grant" release: testers are warned in advance and, once, re-grant the three TCC permissions **and** re-approve the Screencap helper in Login Items. The three heavy grants (Screen Recording, Accessibility, Input Monitoring) are owned by the **daemon helper** (`com.screencap.daemon`), not the app — re-signing the helper with the org Team ID orphans them, and because the helper is registered via SMAppService, the Team-ID change also triggers a one-time Login-Items re-approval. Still one release; two clicks instead of one.
 
 ---
 

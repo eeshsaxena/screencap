@@ -27,7 +27,7 @@ execution: code
 
 ### Summary
 
-Rebuild the Intelligence pane around one MODEL list grouped into "Included with ScreenCap" and "Your own", where the single selected row designates the model ask-time tasks may use — local answers stay the daemon's preference; a cloud selection is the consented fallback — and day-splitting always runs locally and automatically. Connection mechanics (keys, verification, local-server URL) move into a sequential add-provider sub-flow, and the consent section is rewritten in the design's plain per-row language.
+Rebuild the Intelligence pane around one MODEL list grouped into "Included with Screencap" and "Your own", where the single selected row designates the model ask-time tasks may use — local answers stay the daemon's preference; a cloud selection is the consented fallback — and day-splitting always runs locally and automatically. Connection mechanics (keys, verification, local-server URL) move into a sequential add-provider sub-flow, and the consent section is rewritten in the design's plain per-row language.
 
 ### Problem Frame
 
@@ -39,23 +39,23 @@ The pane is also gaining traffic: Chat deep-links into it for consent, onboardin
 
 ### Key Decisions
 
-- **One list, grouped by ownership.** The model list groups rows under "Included with ScreenCap" and "Your own" headers rather than the design's flat list or an active-model-card-with-sub-flow variant. Grouping satisfies the BYO plan's requirement that whose infrastructure and whose bill each option uses is legible at a glance.
+- **One list, grouped by ownership.** The model list groups rows under "Included with Screencap" and "Your own" headers rather than the design's flat list or an active-model-card-with-sub-flow variant. Grouping satisfies the BYO plan's requirement that whose infrastructure and whose bill each option uses is legible at a glance.
 - **One visible pick designates the consented answerer — honestly.** The daemon's dispatch order is local-first and unchanged: the on-device chain answers whenever it can, and the selected cloud row is the model ask-time tasks fall back to, gated by the consent toggles. Picking an on-device/local row keeps everything local. Copy never claims a cloud pick replaces the local answerer. The backend keeps its two slots; the UI hides them deliberately instead of accidentally.
 - **Downloaded model is a capability, not a choice.** The daemon's `ChainedOnDeviceProvider` already prefers Apple Intelligence and cascades to the downloaded model at generation time, so "Downloaded model" stops being a selectable row and becomes a download affordance and status on the on-device row. Explicit user preference for the downloaded model over Apple Intelligence is dropped.
 - **Connection mechanics leave the pane.** Adding or configuring a provider (API key with verification, CLI delegation, local-server URL with classification) happens in a sequential sub-flow extending the existing in-window overlay. The current sheet's two stacked pickers become the design's step-by-step flow.
 - **Local server is "Your own".** The local-server option relocates from the app-managed section to the "Your own" group, added through the sub-flow, keeping its LOCAL/REMOTE classification behavior.
-- **Hosted-cloud row stays reserved.** No hosted cloud model row is rendered and the group shows no placeholder; the "Included with ScreenCap" group is its future home.
+- **Hosted-cloud row stays reserved.** No hosted cloud model row is rendered and the group shows no placeholder; the "Included with Screencap" group is its future home.
 - **Four consent rows, not the design's three.** The design predates Chat; the Recall-answers toggle it depends on stays, alongside Summaries & titles and the two fixed rows.
 
 ### Requirements
 
 **Model list**
 
-- R1. The pane presents one MODEL list with exactly one selected row, grouped under "Included with ScreenCap" and "Your own" headers.
+- R1. The pane presents one MODEL list with exactly one selected row, grouped under "Included with Screencap" and "Your own" headers.
 - R2. The selected row designates the model ask-time tasks may use — a cloud selection is the consented fallback answerer (the daemon still prefers the local engine when it can serve the task); day-splitting and labeling always run locally regardless of selection.
 - R3. The on-device row carries the download affordance and the availability/download states; the local day-split engine resolves automatically to Apple Intelligence or the downloaded model.
 - R4. Every state reachable today remains reachable: Apple Intelligence unavailable with a System Settings deep link, download progress/cancel/retry, download-failed states (including insufficient-disk reasons, surfaced with Retry), the daemon-unreachable disabled state, BYO needs-attention, and key/CLI management (replace key, disconnect).
-- R5. "Included with ScreenCap" ships with only the on-device row.
+- R5. "Included with Screencap" ships with only the on-device row.
 
 **Add-provider sub-flow**
 
@@ -83,7 +83,7 @@ flowchart TB
     H[Header + one-line purpose caption]
     subgraph model [MODEL - single selection]
       direction TB
-      subgraph inc [Included with ScreenCap]
+      subgraph inc [Included with Screencap]
         OD[On-device row + availability/download states]
       end
       subgraph own [Your own]
@@ -133,7 +133,7 @@ flowchart TB
 
 - **Out of scope:** the design's other panes and navigation (Connections/MCP, Sharing, General, Shortcuts; sidebar structure and items other than the local-model hint condition R13 redefines); any change to consent semantics; Chat's own UI; all Python-side changes (daemon verbs, CLI, config keys, dispatcher ordering — the two-slot model and local-first dispatch stay as-is).
 - **Deferred to Follow-Up Work:**
-  - Rendering the ScreenCap-hosted cloud model row (its group slot is reserved).
+  - Rendering the Screencap-hosted cloud model row (its group slot is reserved).
   - Local-server model discovery ("found Ollama · 3 models"): requires a new CLI/daemon seam; only a legacy CLI-side Ollama probe exists (`src/screencap/namer.py`).
   - A scroll-to-consent anchor for Chat's deep link (the `.intelligence` route case carries no payload today; `timeline(day:seekMs:)` is the existing payload pattern to follow).
   - Feeding the Apple Intelligence availability probe into the sidebar hint condition (the sidebar has no FoundationModels plumbing).
@@ -212,8 +212,8 @@ U1 and U2 run in parallel (no dependencies). U3 and U4 both depend on U1 and U2 
 - **Goal:** All new behavior rules exist as unit-testable pure Swift models before any UI changes.
 - **Requirements:** R1, R2, R3, R5, R9; AE3.
 - **Dependencies:** None.
-- **Files:** new `macos/ScreenCap/Views/Settings/IntelligenceSelectionModel.swift`; `macos/ScreenCap/Views/Settings/ConnectProviderModel.swift`; `macos/ScreenCapTests/IntelligenceSettingsTests.swift`.
-- **Approach:** Replace `IntelligenceProviderOption.options`' flat list with a grouped model: group membership ("Included with ScreenCap" = on-device only, no placeholder for the reserved hosted slot; "Your own" = rows passing `keyPresent || cliAvailable || endpointSet || isCurrentCloudProvider`), the rendered-selection rule with legacy reconcile treatment (KTD1), the write-routing rule with persisted-value tap guard (KTD1), the on-device row state matrix (KTD3), REMOTE-row non-selectability (R9), and the nudge + just-added highlight predicates (KTD4/KTD7).
+- **Files:** new `macos/Screencap/Views/Settings/IntelligenceSelectionModel.swift`; `macos/Screencap/Views/Settings/ConnectProviderModel.swift`; `macos/ScreencapTests/IntelligenceSettingsTests.swift`.
+- **Approach:** Replace `IntelligenceProviderOption.options`' flat list with a grouped model: group membership ("Included with Screencap" = on-device only, no placeholder for the reserved hosted slot; "Your own" = rows passing `keyPresent || cliAvailable || endpointSet || isCurrentCloudProvider`), the rendered-selection rule with legacy reconcile treatment (KTD1), the write-routing rule with persisted-value tap guard (KTD1), the on-device row state matrix (KTD3), REMOTE-row non-selectability (R9), and the nudge + just-added highlight predicates (KTD4/KTD7).
 - **Patterns to follow:** `IntelligenceProviderOption` / `ConnectProviderModel.userOwnedOptions` pure-model style and their existing tests; `ShellSidebarModel` as the pure-logic-plus-tests exemplar.
 - **Test scenarios:**
   - Rendered selection: `cloud_provider=openai` + `provider=on-device` → BYO row selected (not on-device); `cloud_provider` unset + `provider=downloaded` → on-device row; `provider=local-server` + LOCAL endpoint → local-server row; `provider=local-server` + no/REMOTE endpoint → on-device row with reconcile treatment; legacy `provider=gemini` → on-device row with reconcile treatment (not plain Ready).
@@ -229,7 +229,7 @@ U1 and U2 run in parallel (no dependencies). U3 and U4 both depend on U1 and U2 
 - **Goal:** The two-write local-row selection, daemon-reachability signal, and download polling are safe before the UI depends on them.
 - **Requirements:** R1, R3; AE2.
 - **Dependencies:** None (parallel with U1).
-- **Files:** `macos/ScreenCap/Controllers/IntelligenceController.swift`; `macos/ScreenCap/Controllers/ModelDownloadController.swift`; `macos/ScreenCapTests/IntelligenceSettingsTests.swift`.
+- **Files:** `macos/Screencap/Controllers/IntelligenceController.swift`; `macos/Screencap/Controllers/ModelDownloadController.swift`; `macos/ScreencapTests/IntelligenceSettingsTests.swift`.
 - **Approach:** Add a `selectRow` seam on `IntelligenceController` encapsulating KTD1's ordering and abort-on-failure policy; give `setCloudProvider` the optimistic-flip + in-flight guard + revert that `setProvider` has; `refreshStatus` calls `startPollingIfNeeded` when it decodes `.downloading` (KTD8) and sets a typed `daemonUnreachable` flag when its invocation throws (KTD3's matrix input). Expose an internal `isPolling` seam for tests. No argv contract changes.
 - **Execution note:** Argv-contract tests first via the existing `FakeInvoker` seam — the invoker records exact vectors, so ordering and abort behavior are directly assertable.
 - **Test scenarios:**
@@ -244,7 +244,7 @@ U1 and U2 run in parallel (no dependencies). U3 and U4 both depend on U1 and U2 
 - **Goal:** The pane renders the two-section shape: grouped MODEL card + consent section, on-device row with merged accessories.
 - **Requirements:** R1, R2, R3, R4, R5, R9; F1, F3; AE2, AE3.
 - **Dependencies:** U1, U2.
-- **Files:** `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift`.
+- **Files:** `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift`.
 - **Approach:** One bordered card with in-card group-header rows (new small `Text` row styled like `sectionHeader`, between `rowDivider`s — consistent with the accessory-under-row idiom, `.padding(.horizontal, 44)` indent for accessories). On-device row absorbs `onDeviceStatusAccessory` + `downloadAccessory` per the state matrix; the Downloaded row and the inline endpoint field are removed from the pane (endpoint moves to the flow, U4). Local-server and BYO rows render under "Your own" with the derived membership; REMOTE local-server row disabled with honest copy. Standing consent nudge renders per U1's predicate. Re-tap deselection removed. Keep the view-level pending guards. New group-header rows carry `.accessibilityAddTraits(.isHeader)`; disabled rows expose the disabled accessibility trait, following the pane's existing accessibility idiom.
 - **Patterns to follow:** existing private helpers (`sectionHeader`, `rowDivider`, `radio`, `chip`, `fixedRow`); `SettingsToggle` from `PrivacySettingsView.swift`; SCTheme tokens throughout.
 - **Test scenarios:** (UI is verified by build-and-run per repo convention; rules were tested in U1) — pure-model additions only: group-header ordering stability (rows must not jump groups mid-interaction, the AppRulesView QA lesson).
@@ -255,7 +255,7 @@ U1 and U2 run in parallel (no dependencies). U3 and U4 both depend on U1 and U2 
 - **Goal:** Provider connection, management, and the local-server endpoint live in a step-by-step overlay flow.
 - **Requirements:** R4, R6, R7, R8, R9; F2.
 - **Dependencies:** U1, U2.
-- **Files:** new `macos/ScreenCap/Views/Settings/ConnectProviderStepPolicy.swift`; `macos/ScreenCap/Views/Settings/ConnectProviderSheet.swift`; `macos/ScreenCap/Views/Settings/ConnectProviderModel.swift`; `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift`; `macos/ScreenCapTests/IntelligenceSettingsTests.swift`.
+- **Files:** new `macos/Screencap/Views/Settings/ConnectProviderStepPolicy.swift`; `macos/Screencap/Views/Settings/ConnectProviderSheet.swift`; `macos/Screencap/Views/Settings/ConnectProviderModel.swift`; `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift`; `macos/ScreencapTests/IntelligenceSettingsTests.swift`.
 - **Approach:** Pure `ConnectProviderStepPolicy` enum (steps: pick provider → configure → done; entry points: add-new starts at pick, Manage/Set-up enters at configure with vendor preset) driving a `switch step` body in the existing overlay chrome, maintaining keyboard focus order across steps. Configure step per mechanism: key paste + validate (existing stdin seam, inline verdict), CLI delegation (availability check + honest copy), local server (URL field + Save + classification caption; `endpointDraft` re-seeded on step entry, not `.onAppear`). Finishing auto-selects via U2's `selectRow` **only when the row is selectable** (R8); the pane receives the just-added row id and renders the highlight per U1's predicate. Disconnect (in configure step) deselects first — selection visibly returns to on-device; clearing the endpoint, or saving one that classifies REMOTE, while `local-server` is active resets `provider` to `on-device` before the endpoint write. No eager credential probes on pane or flow open (keys are daemon-owned; nothing decrypts locally).
 - **Test scenarios:**
   - Step policy: add-new entry → pick; Manage(openai) entry → configure with vendor preset; back from configure → pick; done only after a terminal configure action; no step skips.
@@ -271,17 +271,17 @@ U1 and U2 run in parallel (no dependencies). U3 and U4 both depend on U1 and U2 
 - **Goal:** Consent rows and all new copy are plain-language, honest, and fully covered by the audit tests.
 - **Requirements:** R10, R11, R12.
 - **Dependencies:** U3.
-- **Files:** `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift`; `macos/ScreenCap/Views/Settings/ConnectProviderModel.swift`; `macos/ScreenCapTests/IntelligenceSettingsTests.swift`.
+- **Files:** `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift`; `macos/Screencap/Views/Settings/ConnectProviderModel.swift`; `macos/ScreencapTests/IntelligenceSettingsTests.swift`.
 - **Approach:** Hoist the four consent-row titles/captions, group headers, trust footer, nudge copy, and flow copy into pure copy enums. All selection and nudge copy follows KTD7's fallback-honest rule. Remove the false footer line (R12). Rewrite the 3-section-pinning tests to the new shape (`testHostedAndUserOwnedSectionsAreDistinct` becomes a group-legibility assertion; hosted-caption strings retired consciously with the reserved-slot decision). Expand `testHonestCopyAuditNoForbiddenStrings` to enumerate every new copy enum; `SECURITY.md` is the source of truth for trust-boundary phrasing (the footer's stripped-before-any-model claim is verified accurate: segmentation independently re-derives its skip-set from `recording.db` with a fail-closed gate at the helper boundary). Avoid prototype sample strings (`MockStringSweepTests` scans all Swift sources).
 - **Test scenarios:** audit corpus contains all new copy statics (assert corpus size or enumerate); forbidden strings absent; day-split/frames rows remain non-interactive with unchanged argv rejection (existing tests keep passing untouched — R11).
-- **Verification:** Full `ScreenCapTests` suite green including the sweep tests.
+- **Verification:** Full `ScreencapTests` suite green including the sweep tests.
 
 ### U6. Entry-point consistency
 
 - **Goal:** The sidebar hint, onboarding step, and Chat deep link behave correctly under the new semantics.
 - **Requirements:** R13.
 - **Dependencies:** U1.
-- **Files:** `macos/ScreenCap/Views/Shell/ShellSidebar.swift`; `macos/ScreenCapTests/ShellSidebarModelTests.swift`.
+- **Files:** `macos/Screencap/Views/Shell/ShellSidebar.swift`; `macos/ScreencapTests/ShellSidebarModelTests.swift`.
 - **Approach:** `shouldShowLocalModelHint` gains a `cloudProvider == nil` conjunct (never nag while a cloud row is the rendered answerer); its doc comment is corrected. Onboarding's `OnboardingDownloadModelStep` and Chat's `onOpenIntelligenceSettings` are verified unchanged — both consume seams this plan preserves (`ModelDownloadController` API, `.intelligence` route).
 - **Test scenarios:** hint hidden when `cloud_provider` set even with `provider == "on-device"` and nothing installed; hint still shows for on-device + not installed + not dismissed + no cloud provider; dismissed persistence unchanged.
 - **Verification:** `ShellSidebarModelTests` green; manual: Chat's no-backend affordance still lands on the pane.
@@ -293,7 +293,7 @@ U1 and U2 run in parallel (no dependencies). U3 and U4 both depend on U1 and U2 
 | Gate | Command | Applies to |
 |---|---|---|
 | Regenerate project after new files | `cd macos && xcodegen generate` | U1, U4 (new Swift files) |
-| App test suite | `cd macos && xcodebuild test -project ScreenCap.xcodeproj -scheme ScreenCap -only-testing:ScreenCapTests` | All units |
+| App test suite | `cd macos && xcodebuild test -project Screencap.xcodeproj -scheme Screencap -only-testing:ScreencapTests` | All units |
 | Honest-copy + mock-string sweeps | included in the suite (`IntelligenceSettingsTests`, `MockStringSweepTests`) | U4, U5 |
 | Python suite untouched | no `src/` changes expected; `PYTHONPATH=src pytest -m privacy` only if any Python file is touched (it must not be) | guard |
 | Manual smoke | build and run the app; walk F1 (select BYO), F2 (add each provider type), F3 (needs-attention states) | U3, U4 |
@@ -302,7 +302,7 @@ Known repo gotchas: re-run `xcodegen generate` if "cannot find X in scope" appea
 
 ## Definition of Done
 
-- All six units landed as one PR; `ScreenCapTests` green via the Verification Contract command.
+- All six units landed as one PR; `ScreencapTests` green via the Verification Contract command.
 - Every R1–R13 requirement is implemented or its unit's tests demonstrate it; AE1–AE3 each covered by a named test scenario.
 - Consent argv contracts and Python sources untouched.
 - Legacy `provider` read-back values (`downloaded`, `local-server` without endpoint, `gemini`) render without error, show the reconcile treatment where KTD1 requires it, and heal on re-pick.

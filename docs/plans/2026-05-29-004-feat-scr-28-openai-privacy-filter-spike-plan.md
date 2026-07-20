@@ -10,13 +10,13 @@ origin: docs/brainstorms/2026-05-29-scr-28-openai-privacy-filter-spike-requireme
 
 ## Summary
 
-This plan builds a self-contained evaluation harness under `benchmarks/scr28/` that scores GLiNER and `openai/privacy-filter` head-to-head and produces a documented **swap / no-swap verdict**. The harness **decouples inference from scoring**: each model emits predicted spans as JSON in its own Python environment (privacy-filter needs `transformers` 5.6.x, which conflicts with the repo's pinned 4.57.6), and a pure-Python scorer — reusing the in-repo scoring core from `tests/privacy/test_benchmark.py` — grades both models' JSON against gold annotations on identical entity definitions. Two tiers run through that one scorer: Tier 1 (the public PII-Masking-300k dataset, for a fast common-ground read and a published-F1 wiring sanity check) and Tier 2 (a hand-labeled testbed from real ScreenCap OCR + accessibility text, which is the deciding input). No production code under `src/screencap/` changes.
+This plan builds a self-contained evaluation harness under `benchmarks/scr28/` that scores GLiNER and `openai/privacy-filter` head-to-head and produces a documented **swap / no-swap verdict**. The harness **decouples inference from scoring**: each model emits predicted spans as JSON in its own Python environment (privacy-filter needs `transformers` 5.6.x, which conflicts with the repo's pinned 4.57.6), and a pure-Python scorer — reusing the in-repo scoring core from `tests/privacy/test_benchmark.py` — grades both models' JSON against gold annotations on identical entity definitions. Two tiers run through that one scorer: Tier 1 (the public PII-Masking-300k dataset, for a fast common-ground read and a published-F1 wiring sanity check) and Tier 2 (a hand-labeled testbed from real Screencap OCR + accessibility text, which is the deciding input). No production code under `src/screencap/` changes.
 
 ---
 
 ## Problem Frame
 
-ScreenCap runs a mature text-PII pipeline: `PiiDetector` ([src/screencap/privacy/pii.py](src/screencap/privacy/pii.py)) wraps Presidio with GLiNER (`knowledgator/gliner-pii-base-v1.0`, run via `fast-gliner` ONNX) as the default NER backend, fed by Apple Vision OCR and accessibility-tree strings, with secrets/regex layers alongside. `openai/privacy-filter` (Apache 2.0, April 2026) occupies exactly that post-OCR text-detection seat, so it is a candidate to swap into a single backend. There is **no observed deficiency** in GLiNER — this spike is exploratory. The risk it guards against: the model's headline F1 is measured on clean synthetic prose, while ScreenCap's real input is noisy, fragmentary OCR/accessibility text, a distribution where a prose winner can lose. See origin for full framing ([docs/brainstorms/2026-05-29-scr-28-openai-privacy-filter-spike-requirements.md](docs/brainstorms/2026-05-29-scr-28-openai-privacy-filter-spike-requirements.md)).
+Screencap runs a mature text-PII pipeline: `PiiDetector` ([src/screencap/privacy/pii.py](src/screencap/privacy/pii.py)) wraps Presidio with GLiNER (`knowledgator/gliner-pii-base-v1.0`, run via `fast-gliner` ONNX) as the default NER backend, fed by Apple Vision OCR and accessibility-tree strings, with secrets/regex layers alongside. `openai/privacy-filter` (Apache 2.0, April 2026) occupies exactly that post-OCR text-detection seat, so it is a candidate to swap into a single backend. There is **no observed deficiency** in GLiNER — this spike is exploratory. The risk it guards against: the model's headline F1 is measured on clean synthetic prose, while Screencap's real input is noisy, fragmentary OCR/accessibility text, a distribution where a prose winner can lose. See origin for full framing ([docs/brainstorms/2026-05-29-scr-28-openai-privacy-filter-spike-requirements.md](docs/brainstorms/2026-05-29-scr-28-openai-privacy-filter-spike-requirements.md)).
 
 ---
 
@@ -25,12 +25,12 @@ ScreenCap runs a mature text-PII pipeline: `PiiDetector` ([src/screencap/privacy
 - R1. Produce a documented **swap / no-swap recommendation** with supporting evidence attached.
 - R2. State explicitly that the spike is **exploratory** — no known regression motivated it.
 - R3. Score both models on a public PII benchmark — **PII-Masking-300k** — and reproduce privacy-filter's published F1 as a sanity check.
-- R4. Run both models through a **single scoring harness** with detections mapped through ScreenCap's `EntityType` set, so the comparison is on identical entity definitions.
-- R5. Assemble a small hand-labeled testbed from **real ScreenCap recordings** (Vision OCR + accessibility-tree strings) with known PII annotated.
+- R4. Run both models through a **single scoring harness** with detections mapped through Screencap's `EntityType` set, so the comparison is on identical entity definitions.
+- R5. Assemble a small hand-labeled testbed from **real Screencap recordings** (Vision OCR + accessibility-tree strings) with known PII annotated.
 - R6. Run both models **head-to-head on the Tier-2 testbed**; this tier is the deciding input.
 - R7. Report **per-entity precision/recall** (not just aggregate F1), so under-detection of high-priority types (names, emails, phones) is visible.
 - R8. Measure and report **latency/throughput and model footprint** (download size + resident memory) for each backend.
-- R9. Document the **entity-coverage delta**: privacy-filter adds URL/date/account_number/secret and lacks explicit SSN/credit-card classes that the current mapping uses — and how each maps onto, or falls outside, ScreenCap's `EntityType` set.
+- R9. Document the **entity-coverage delta**: privacy-filter adds URL/date/account_number/secret and lacks explicit SSN/credit-card classes that the current mapping uses — and how each maps onto, or falls outside, Screencap's `EntityType` set.
 
 **Origin acceptance examples (decision rules the verdict must honor):**
 - **AE1** (R1, R6, R8): privacy-filter matches-or-beats GLiNER on per-entity recall for high-priority types **and** acceptable latency/footprint → recommend swap.
@@ -44,7 +44,7 @@ ScreenCap runs a mature text-PII pipeline: `PiiDetector` ([src/screencap/privacy
 - **No production integration** — wiring privacy-filter into the backend, config surface, or model packaging is a follow-up ticket if the verdict is positive. No changes to `src/screencap/privacy/`.
 - **Text-only** — no image/video/audio modality work.
 - **No consolidation of the secrets-detection layer** via privacy-filter's `secret` class.
-- **No fine-tuning** of privacy-filter on ScreenCap data.
+- **No fine-tuning** of privacy-filter on Screencap data.
 - The legacy **spaCy** backend is excluded from the comparison.
 - Not a redesign of the broader redaction pipeline.
 
@@ -91,7 +91,7 @@ ScreenCap runs a mature text-PII pipeline: `PiiDetector` ([src/screencap/privacy
 - **Reuse the in-repo scoring core, don't rebuild it.** Extract the prediction-grading half of `run_benchmark` into a `score_predictions(cases, predictions_by_case) -> AggregateResult` helper in `tests/privacy/test_benchmark.py` (backward-compatible: `run_benchmark(pipeline)` then = run pipeline → call `score_predictions`). The spike scorer loads each model's JSON and calls `score_predictions`. This gives identical matching + per-type aggregation + Markdown/JSON output for both tiers and both models, and reuses the corrected entity definitions for free. (Resolves origin planning question R4; the brainstorm's assumption that `presidio-evaluator` is a project dependency is **wrong** — it is not installed; the in-repo harness fulfills R4's intent better.)
 - **BIOES → char-span via the fast tokenizer, cross-validated against `opf`.** The privacy-filter runner decodes to char offsets using `pipeline(task="token-classification", aggregation_strategy="first")` reading `(entity_group, start, end)`; U1 validates those offsets against `opf --format json` on sample inputs before trusting them. If they diverge, fall back to `opf` JSON as the authoritative decoder. Half-open offsets; merge adjacent same-type spans at scoring time. (Resolves origin planning question on BIOES alignment.)
 - **Score per OCR text block, not concatenated screens.** The scrubber calls `pipeline.detect()` per `OcrTextBlock`. Feeding privacy-filter whole documents would let its 128k-context advantage inflate results above production behavior. Tier-2 inputs are block-shaped.
-- **Compare both NER-only and full-pipeline.** Primary read: NER backend vs NER backend on the PII types both emit. Secondary read (for AE3): full pipeline — privacy-filter's NER spans **unioned with ScreenCap's existing regex + secrets detections** (both pure-Python, run in the scorer env, resolved via `DetectionResolver`) — vs the existing GLiNER full pipeline, to measure whether the regex/secrets layer compensates for privacy-filter's missing SSN/credit-card classes.
+- **Compare both NER-only and full-pipeline.** Primary read: NER backend vs NER backend on the PII types both emit. Secondary read (for AE3): full pipeline — privacy-filter's NER spans **unioned with Screencap's existing regex + secrets detections** (both pure-Python, run in the scorer env, resolved via `DetectionResolver`) — vs the existing GLiNER full pipeline, to measure whether the regex/secrets layer compensates for privacy-filter's missing SSN/credit-card classes.
 - **Spike artifacts are isolated.** All new code lives under `benchmarks/scr28/`; the only shared-surface change is the backward-compatible `score_predictions` extraction in `tests/privacy/test_benchmark.py`. The verdict doc lands in a new `docs/spikes/` directory.
 
 ---
@@ -101,7 +101,7 @@ ScreenCap runs a mature text-PII pipeline: `PiiDetector` ([src/screencap/privacy
 ### Resolved During Planning
 
 - **Does the harness ingest privacy-filter directly or need an adapter? (R4)** — Neither in the live pipeline. Inference is decoupled: a JSON-emitting runner per model, graded by the reused in-repo scorer. `presidio-evaluator` is not a dependency and is not used.
-- **How to align privacy-filter's BIOES token spans with ScreenCap's char-offset model? (R6/R7)** — Decode to char offsets with the fast tokenizer's `offset_mapping` (`aggregation_strategy="first"`), cross-validated against `opf --format json`; merge adjacent same-type spans at scoring; half-open offsets throughout.
+- **How to align privacy-filter's BIOES token spans with Screencap's char-offset model? (R6/R7)** — Decode to char offsets with the fast tokenizer's `offset_mapping` (`aggregation_strategy="first"`), cross-validated against `opf --format json`; merge adjacent same-type spans at scoring; half-open offsets throughout.
 - **Which dataset variant for Tier 1? (R3)** — Original `ai4privacy/pii-masking-300k`; the "corrected" variant is not downloadable. Expect to reproduce the **baseline** published numbers (token F1 ~0.96), not the corrected 0.974.
 
 ### Deferred to Implementation
@@ -315,11 +315,11 @@ The seam that makes this work: **predictions are data, not live model calls.** E
 
 ---
 
-### Phase 3 — Tier 2: real ScreenCap text (decisive)
+### Phase 3 — Tier 2: real Screencap text (decisive)
 
 ### U5. Tier-2 testbed assembly from real recordings
 
-**Goal:** Build a small, hand-labeled, per-block testbed from real ScreenCap OCR + accessibility text.
+**Goal:** Build a small, hand-labeled, per-block testbed from real Screencap OCR + accessibility text.
 
 **Requirements:** R5
 
@@ -361,7 +361,7 @@ The seam that makes this work: **predictions are data, not live model calls.** E
 
 **Approach:**
 - Run both runners over `tier2_testbed/inputs.jsonl` **per block** (no concatenation).
-- Score two ways: (a) **NER-only** — privacy-filter NER spans vs GLiNER NER spans on shared canonical types; (b) **full-pipeline** — privacy-filter NER ∪ ScreenCap regex+secrets (from `run_gliner.py`'s model-agnostic detections, resolved via `DetectionResolver`) vs the existing GLiNER full pipeline. This isolates the SSN/credit-card-gap question (does the regex layer cover what privacy-filter's NER misses?).
+- Score two ways: (a) **NER-only** — privacy-filter NER spans vs GLiNER NER spans on shared canonical types; (b) **full-pipeline** — privacy-filter NER ∪ Screencap regex+secrets (from `run_gliner.py`'s model-agnostic detections, resolved via `DetectionResolver`) vs the existing GLiNER full pipeline. This isolates the SSN/credit-card-gap question (does the regex layer cover what privacy-filter's NER misses?).
 - Report per-entity precision/recall with support `n` at exact and partial thresholds, plus the binary PII-vs-O roll-up. Recall is the headline for high-harm types.
 
 **Patterns to follow:** `DetectionResolver` source-priority resolution ([src/screencap/privacy/resolver.py](src/screencap/privacy/resolver.py)); U2 scorer output format.

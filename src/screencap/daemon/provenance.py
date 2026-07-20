@@ -210,7 +210,7 @@ def classify_path_and_argv(path: str | None, argv: list[str]) -> Classification:
     """Pure classifier (testable without sockets).
 
     Decision rules:
-    - Path ends with ``/ScreenCap.app/Contents/MacOS/screencap`` → ``swiftui``.
+    - Path ends with ``/Screencap.app/Contents/MacOS/screencap`` → ``swiftui``.
     - Otherwise inspect argv:
       - argv[1] == "mcp" → ``mcp``
       - argv[1] in {"start", "stop", "status"} (the live-state CLI verbs) → ``cli``

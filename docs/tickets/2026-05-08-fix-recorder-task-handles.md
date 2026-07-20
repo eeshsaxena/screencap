@@ -12,7 +12,7 @@ related_review_run: /tmp/compound-engineering/ce-code-review/20260508-210223-e21
 
 ## Problem
 
-In [macos/ScreenCap/Controllers/RecorderController.swift:180](../../macos/ScreenCap/Controllers/RecorderController.swift) and the `runStop` path, the daemon dispatch is:
+In [macos/Screencap/Controllers/RecorderController.swift:180](../../macos/Screencap/Controllers/RecorderController.swift) and the `runStop` path, the daemon dispatch is:
 
 ```swift
 Task { await startViaDaemon(name: name) }

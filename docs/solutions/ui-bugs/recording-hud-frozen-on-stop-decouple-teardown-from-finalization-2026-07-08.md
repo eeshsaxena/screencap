@@ -35,7 +35,7 @@ Clicking **"Stop & save"** on the floating recording HUD pill (`RecordingHUDPane
 
 ## Root cause
 
-In the recording state machine (`macos/ScreenCap/Controllers/RecordingStateMachine.swift`, driven by `RecorderController.swift`), the pill's teardown is modeled as a `.hideHUD` side-effect. That effect was **only** emitted by the terminal transition `enterIdle()`, which runs inside `finalizeStop()` — and `finalizeStop()` is called *after* `runStop()` `await`s the `recording_finalized` event with a deliberate 60s wall-clock fallback (`LiveStopPolicyCoordinator.inAppStopTimeout`, kept at 60s to avoid re-introducing SCR-69's false "still finalizing" toast).
+In the recording state machine (`macos/Screencap/Controllers/RecordingStateMachine.swift`, driven by `RecorderController.swift`), the pill's teardown is modeled as a `.hideHUD` side-effect. That effect was **only** emitted by the terminal transition `enterIdle()`, which runs inside `finalizeStop()` — and `finalizeStop()` is called *after* `runStop()` `await`s the `recording_finalized` event with a deliberate 60s wall-clock fallback (`LiveStopPolicyCoordinator.inAppStopTimeout`, kept at 60s to avoid re-introducing SCR-69's false "still finalizing" toast).
 
 `enterStopping()` — the transition that fires the instant Stop is clicked — returned no effects. So nothing tore the pill down until the async finalization await resolved. **The HUD's on-screen lifetime was welded to the background finalization wait.**
 

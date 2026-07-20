@@ -7,7 +7,7 @@ problem_type: runtime_error
 component: tooling
 symptoms:
   - "Daemon exits immediately with EX_CONFIG (exit code 78) on every spawn — `launchctl print gui/$UID/<label>` shows `last exit code = 78: EX_CONFIG`, `state = spawn scheduled`, never reaches `running`"
-  - "`launchctl print` reveals the resolved `stderr path` / `stdout path` is the LITERAL unexpanded string (e.g., `~/Library/Logs/ScreenCap/daemon.err.log` or `$HOME/Library/Logs/ScreenCap/daemon.err.log`)"
+  - "`launchctl print` reveals the resolved `stderr path` / `stdout path` is the LITERAL unexpanded string (e.g., `~/Library/Logs/Screencap/daemon.err.log` or `$HOME/Library/Logs/Screencap/daemon.err.log`)"
   - "No log files are created at the intended path; no Python-level error is raised — the failure is entirely inside launchd's plist validation on spawn"
   - "`launchctl bootstrap gui/$UID <plist>` returns success at bootstrap time; the failure surfaces only on the first (and every subsequent) spawn"
   - "The same EX_CONFIG fires when an absolute path is correct but the parent log directory does not yet exist at bootstrap time"
@@ -31,7 +31,7 @@ tags:
 
 ## Problem
 
-LaunchAgent plists generated for the ScreenCap daemon embedded user-relative
+LaunchAgent plists generated for the Screencap daemon embedded user-relative
 paths in `StandardErrorPath` / `StandardOutPath`. Three sequential variants
 all produced `EX_CONFIG` (exit 78) on every spawn — the daemon never started,
 no log files were ever created, and `launchctl bootstrap` returned success
@@ -47,7 +47,7 @@ which made the failure invisible until the user noticed nothing was running.
   - `stderr path = <literal-unexpanded-string>`
   - `runs = N` (climbing — KeepAlive keeps re-spawning, each attempt fails)
 - `~/.screencap/run/api.sock` never appears.
-- `~/Library/Logs/ScreenCap/daemon.{out,err}.log` never appears.
+- `~/Library/Logs/Screencap/daemon.{out,err}.log` never appears.
 - `curl --unix-socket ~/.screencap/run/api.sock http://x/v0/daemon.info`
   fails with connection refused.
 
@@ -63,20 +63,20 @@ P0 ship-blocker that triggered the investigation.
 in path keys the way it expands env-var references in `EnvironmentVariables`
 values. Empirical result on macOS 26.3 (build 25D125): launchd does NOT
 expand `$HOME` in path keys. `launchctl print` showed the literal string
-`$HOME/Library/Logs/ScreenCap/daemon.err.log` as the resolved `stderr path`.
+`$HOME/Library/Logs/Screencap/daemon.err.log` as the resolved `stderr path`.
 Daemon exited EX_CONFIG. `runs = 11` after a few seconds (KeepAlive cycling).
 
 **Attempt 3 — `~/...` literal.** Assumption: `launchd.plist(5)` performs
 tilde expansion as many POSIX tools do. Empirical result on the same macOS
 build: launchd does NOT expand `~` in path keys either. `launchctl print`
-showed `stderr path = ~/Library/Logs/ScreenCap/daemon.err.log` (literal).
-Daemon STILL exited EX_CONFIG. The parent directory `~/Library/Logs/ScreenCap/`
+showed `stderr path = ~/Library/Logs/Screencap/daemon.err.log` (literal).
+Daemon STILL exited EX_CONFIG. The parent directory `~/Library/Logs/Screencap/`
 was confirmed to exist and be writable at this point — ruling out a missing-
 directory cause and isolating the failure to launchd's path resolution
 specifically.
 
 **Verification that absolute paths work.** A hand-crafted plist with literal
-`/Users/rutefigueiredo/Library/Logs/ScreenCap/daemon.{err,out}.log` paths
+`/Users/rutefigueiredo/Library/Logs/Screencap/daemon.{err,out}.log` paths
 loaded via `launchctl bootstrap gui/$UID` produced `state = running`, pid
 assigned, socket created, log files written — all on the same machine and
 plist label as the failed attempts. This isolated launchd's tilde/`$HOME`
@@ -116,7 +116,7 @@ The CLI install path resolves the absolute log dir at the moment the user
 invokes `screencap serve --install` and `mkdir -p`s it BEFORE bootstrapping:
 
 ```python
-log_dir = Path.home() / "Library" / "Logs" / "ScreenCap"
+log_dir = Path.home() / "Library" / "Logs" / "Screencap"
 try:
     log_dir.mkdir(parents=True, exist_ok=True)
 except OSError as exc:
@@ -197,7 +197,7 @@ Checklist for any agent generating or modifying a LaunchAgent plist:
 - The Phase 1 daemon-architecture plan
   (`docs/plans/2026-05-08-001-feat-daemon-architecture-phase-1-plan.md`,
   U6 Approach, lines 522–524) recommends the unsafe pattern
-  (`StandardErrorPath: ~/Library/Logs/ScreenCap/daemon.err.log` etc.)
+  (`StandardErrorPath: ~/Library/Logs/Screencap/daemon.err.log` etc.)
   in its plist-content bullet. The implementation has diverged correctly,
   but the plan doc still carries the broken recommendation. Consider
   updating the plan with a correction note pointing at this learning.

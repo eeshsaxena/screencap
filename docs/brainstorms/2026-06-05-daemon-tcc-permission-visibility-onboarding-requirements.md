@@ -13,12 +13,12 @@ Make the macOS app aware of the recording daemon's real TCC grant state, surface
 
 ## Problem Frame
 
-ScreenCap's macOS app (`com.screencap.macos`) is a SwiftUI shell; the actual screen capture is done by a separate background daemon (`com.screencap.daemon`, the bundled `screencap serve` process) running under its own LaunchAgent and talking to the app over a UNIX socket. The daemon — not the app — is the TCC identity that must hold Screen Recording, Accessibility, and Input Monitoring.
+Screencap's macOS app (`com.screencap.macos`) is a SwiftUI shell; the actual screen capture is done by a separate background daemon (`com.screencap.daemon`, the bundled `screencap serve` process) running under its own LaunchAgent and talking to the app over a UNIX socket. The daemon — not the app — is the TCC identity that must hold Screen Recording, Accessibility, and Input Monitoring.
 
 The app's onboarding assumes **"daemon socket reachable ⟹ permissions are fine."** That assumption is false, and when it breaks the user is stranded with no recoverable path:
 
-- The first-run permission walkthrough is gated to appear only when the daemon is **unreachable** (`macos/ScreenCap/Views/MainWindow.swift` — `transport == .cliFallback`). In the normal post-setup state the daemon is reachable, so the daemon-permission walkthrough — the only UI that grants the daemon's permissions — never appears.
-- The app cannot register the daemon in TCC on the daemon's behalf (`macos/ScreenCap/Controllers/PermissionController.swift` `requestAndOpenSettings(subject: .daemon)` opens Settings but never calls a request API), so the daemon never shows up in the Screen Recording pane for the user to toggle.
+- The first-run permission walkthrough is gated to appear only when the daemon is **unreachable** (`macos/Screencap/Views/MainWindow.swift` — `transport == .cliFallback`). In the normal post-setup state the daemon is reachable, so the daemon-permission walkthrough — the only UI that grants the daemon's permissions — never appears.
+- The app cannot register the daemon in TCC on the daemon's behalf (`macos/Screencap/Controllers/PermissionController.swift` `requestAndOpenSettings(subject: .daemon)` opens Settings but never calls a request API), so the daemon never shows up in the Screen Recording pane for the user to toggle.
 - The app has no visibility into the daemon's grant state (`CLIStatus` / `daemon.info` carry no permission fields), so in daemon mode `start()` skips its permission guard, dispatches a start, and the daemon engine aborts via `permission_policy.preflight()` → `raise SystemExit(1)` (`src/screencap/recorder.py`) into an empty `serve.log`.
 
 The observed cost: a developer or tester whose daemon was rebuilt or whose grant was orphaned cannot start a recording, sees no grant prompt, and finds no entry to approve in System Settings — with no in-product way out. This pain is permanent under the current design, not a transient state. It also silently breaks the re-grant assumption in the active Developer-ID distribution plan (`docs/plans/2026-06-03-001-feat-macos-app-developer-id-notarized-distribution-plan.md`, U5), whose post-flip flow assumes the walkthrough appears after a `tccutil reset`.
@@ -28,8 +28,8 @@ The observed cost: a developer or tester whose daemon was rebuilt or whose grant
 ## Actors
 
 - A1. User (developer / tester / operator): grants permissions in System Settings and starts recordings.
-- A2. ScreenCap app (`com.screencap.macos`): the GUI shell; presents onboarding, reads the daemon's reported state, opens Settings panes, coordinates daemon refresh. Cannot register the daemon's TCC identity itself.
-- A3. ScreenCap daemon (`com.screencap.daemon`): the capture process and TCC subject; the only actor that can register itself in System Settings and authoritatively know its own grant state.
+- A2. Screencap app (`com.screencap.macos`): the GUI shell; presents onboarding, reads the daemon's reported state, opens Settings panes, coordinates daemon refresh. Cannot register the daemon's TCC identity itself.
+- A3. Screencap daemon (`com.screencap.daemon`): the capture process and TCC subject; the only actor that can register itself in System Settings and authoritatively know its own grant state.
 - A4. macOS TCC / System Settings: holds the grants, keyed on the daemon's code identity; shows a toggleable entry only for processes that have registered as screen-capture clients.
 
 ---
@@ -85,7 +85,7 @@ The observed cost: a developer or tester whose daemon was rebuilt or whose grant
 ## Acceptance Examples
 
 - AE1. **Covers R1, R2, R3.** Given the daemon is reachable but missing Screen Recording, when the app launches, then the permission walkthrough is presented (not suppressed).
-- AE2. **Covers R5, R6.** Given the walkthrough is showing and the daemon lacks Screen Recording, when the user clicks Grant, then the daemon registers as a screen-capture client and a toggleable ScreenCap-helper entry appears in the Screen Recording pane the app opens.
+- AE2. **Covers R5, R6.** Given the walkthrough is showing and the daemon lacks Screen Recording, when the user clicks Grant, then the daemon registers as a screen-capture client and a toggleable Screencap-helper entry appears in the Screen Recording pane the app opens.
 - AE3. **Covers R4, R7.** Given a required grant is missing, when a recording start reaches the daemon, then the daemon returns a structured "permission required" result naming the missing permission(s) and the app surfaces it and routes to the grant flow — `serve.log` is not left as the only (empty) trace.
 - AE4. **Covers R8, R9.** Given a grant was orphaned by a daemon rebuild while the daemon is reachable, when the user re-grants via the walkthrough, then the app reflects granted after the daemon observes live state — without any `tccutil reset` or manual daemon stop.
 

@@ -1,4 +1,4 @@
-"""ScreenCap Engine - GUI interaction capture.
+"""Screencap Engine - GUI interaction capture.
 
 Platform-agnostic event streams with time-aligned media.
 

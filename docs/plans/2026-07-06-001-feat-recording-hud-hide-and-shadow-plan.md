@@ -35,7 +35,7 @@ Add a hide control to the recording HUD pill that fully dismisses it during a re
 
 The recording pill sits bottom-center over whatever you're recording, and today its only action is *Stop & save* — there's no way to move it out of sight without ending the recording. During a screen recording that's prime real estate: it overlaps video-player controls, a composer, or the dock exactly where you're working.
 
-The pill is a dark capsule that needs some lift to separate from the content behind it, but the current shadow is far too heavy — a large, downward-offset 40%-black blur (`macos/ScreenCap/Views/Record/RecordingHUDPanel.swift`, the `pill` view's `.shadow(color: .black.opacity(0.4), radius: 16, y: 12)`). On a dark page it disappears; on light content it reads as a grey cloud wrapped around the pill, which is what looks "buggy." The heaviness may be compounded by the floating panel being sized to the pill's `fittingSize`, which can clip the shadow's soft edge.
+The pill is a dark capsule that needs some lift to separate from the content behind it, but the current shadow is far too heavy — a large, downward-offset 40%-black blur (`macos/Screencap/Views/Record/RecordingHUDPanel.swift`, the `pill` view's `.shadow(color: .black.opacity(0.4), radius: 16, y: 12)`). On a dark page it disappears; on light content it reads as a grey cloud wrapped around the pill, which is what looks "buggy." The heaviness may be compounded by the floating panel being sized to the pill's `fittingSize`, which can clip the shadow's soft edge.
 
 ### Requirements
 
@@ -67,7 +67,7 @@ The pill is a dark capsule that needs some lift to separate from the content beh
 Deferred for later:
 
 - Making Draw and Mute functional (SCR-217 / SCR-218) — the hide and shadow work does not touch them.
-- A global/system-wide hotkey to toggle the pill — ScreenCap's shortcuts are app-scoped, so one wouldn't fire while focused in the recorded app.
+- A global/system-wide hotkey to toggle the pill — Screencap's shortcuts are app-scoped, so one wouldn't fire while focused in the recorded app.
 - A remembered "always start recordings hidden" preference.
 - Restoring the pill to its last dragged position (restore is always bottom-center).
 - The minimize-to-a-dot and dock-to-edge hide shapes — considered and rejected in favor of full dismiss.
@@ -75,15 +75,15 @@ Deferred for later:
 
 ### Dependencies and Assumptions
 
-- The menu-bar label already swaps to a filled amber recording glyph while live (`macos/ScreenCap/ScreenCapApp.swift`, `MenuBarLabel`), and the dropdown already carries Stop Recording (`macos/ScreenCap/Views/MenuBarMenu.swift`) — the hide feature relies on both as the fallback indicator and stop path.
+- The menu-bar label already swaps to a filled amber recording glyph while live (`macos/Screencap/ScreencapApp.swift`, `MenuBarLabel`), and the dropdown already carries Stop Recording (`macos/Screencap/Views/MenuBarMenu.swift`) — the hide feature relies on both as the fallback indicator and stop path.
 - The pill is capture-excluded (`sharingType = .none`), so none of these changes affect what appears inside a recording. This guarantee must survive the hide/restore paths.
 
 ### Sources
 
-- `macos/ScreenCap/Views/Record/RecordingHUDPanel.swift` — the HUD pill, its `.shadow(...)`, and `RecordingHUDPanelController` (`show` / `hide` / `reposition`, capture exclusion, `fittingSize` panel sizing).
-- `macos/ScreenCap/Controllers/RecorderController.swift` — mirrors state to `@Published`, applies `.showHUD` / `.hideHUD` effects via `windowLifecycle`, and tears the HUD down in `transitionToIdle()`.
-- `macos/ScreenCap/Controllers/WindowLifecycle.swift` — the `showHUD` / `hideHUD` seam, plus `FakeWindowLifecycle` (in tests) exposing `showHUDCount` / `hideHUDCount`.
-- `macos/ScreenCap/Views/MenuBarMenu.swift` — the dropdown, Stop Recording, and recording-state gating.
+- `macos/Screencap/Views/Record/RecordingHUDPanel.swift` — the HUD pill, its `.shadow(...)`, and `RecordingHUDPanelController` (`show` / `hide` / `reposition`, capture exclusion, `fittingSize` panel sizing).
+- `macos/Screencap/Controllers/RecorderController.swift` — mirrors state to `@Published`, applies `.showHUD` / `.hideHUD` effects via `windowLifecycle`, and tears the HUD down in `transitionToIdle()`.
+- `macos/Screencap/Controllers/WindowLifecycle.swift` — the `showHUD` / `hideHUD` seam, plus `FakeWindowLifecycle` (in tests) exposing `showHUDCount` / `hideHUDCount`.
+- `macos/Screencap/Views/MenuBarMenu.swift` — the dropdown, Stop Recording, and recording-state gating.
 - `docs/runbooks/new-ui-manual-qa.md` — the manual-QA checklist for window/menu-bar/visual HUD paths, established by U7 of `docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md` (the plan that built the HUD).
 
 ---
@@ -126,7 +126,7 @@ U1 first (state + controller methods). U2 (pill hide button) and U3 (menu item) 
 - **Goal.** Add the `hudHidden` published flag and the two methods that drive user-hide and restore, with correct reset on recording start and teardown.
 - **Requirements.** R1, R2, R5, R6.
 - **Dependencies.** None.
-- **Files.** `macos/ScreenCap/Controllers/RecorderController.swift`, `macos/ScreenCapTests/RecorderControllerTests.swift`.
+- **Files.** `macos/Screencap/Controllers/RecorderController.swift`, `macos/ScreencapTests/RecorderControllerTests.swift`.
 - **Approach.**
   - Add `@Published private(set) var hudHidden: Bool = false`.
   - Add `hideRecordingHUD()`: acts only while `state` is `.recording`; sets `hudHidden = true` and calls `windowLifecycle.hideHUD()`. Does not touch the recorder service or state machine (R2).
@@ -148,7 +148,7 @@ U1 first (state + controller methods). U2 (pill hide button) and U3 (menu item) 
 - **Goal.** Add a hide affordance to the pill that calls `hideRecordingHUD()`, with an accessible label.
 - **Requirements.** R1.
 - **Dependencies.** U1.
-- **Files.** `macos/ScreenCap/Views/Record/RecordingHUDPanel.swift`, `macos/ScreenCapTests/RecordingHUDModelTests.swift`.
+- **Files.** `macos/Screencap/Views/Record/RecordingHUDPanel.swift`, `macos/ScreencapTests/RecordingHUDModelTests.swift`.
 - **Approach.**
   - Add a small hide button to the `pill` view (icon-only, e.g. a chevron-down / dismiss glyph) whose action calls `recorder.hideRecordingHUD()`. Keep it visually subordinate to Stop & save.
   - Add a `hideAccessibilityLabel` (e.g. "Hide recording controls") to `RecordingHUDModel` so the label is unit-testable, mirroring the existing `stopAccessibilityLabel` / `elapsedAccessibilityLabel` pattern.
@@ -164,7 +164,7 @@ U1 first (state + controller methods). U2 (pill hide button) and U3 (menu item) 
 - **Goal.** Add a menu-bar action that restores the pill, gated to recording-and-hidden via a testable policy.
 - **Requirements.** R4 (and preserves R3).
 - **Dependencies.** U1.
-- **Files.** `macos/ScreenCap/Views/MenuBarMenu.swift`, new `macos/ScreenCap/Views/MenuBarMenuPolicy.swift`, new `macos/ScreenCapTests/MenuBarMenuPolicyTests.swift`.
+- **Files.** `macos/Screencap/Views/MenuBarMenu.swift`, new `macos/Screencap/Views/MenuBarMenuPolicy.swift`, new `macos/ScreencapTests/MenuBarMenuPolicyTests.swift`.
 - **Approach.**
   - Add a `MenuBarMenuPolicy.showRecordingControlsVisible(state:hudHidden:)` pure predicate: true only when `state` is the `.recording` case and `hudHidden` is true.
   - In `MenuBarMenu`, render a *Show recording controls* button when the predicate holds, calling `recorder.showRecordingHUD()`. Leave the existing Stop Recording item and glyph swap untouched (R3 preserved).
@@ -180,7 +180,7 @@ U1 first (state + controller methods). U2 (pill hide button) and U3 (menu item) 
 - **Goal.** Replace the heavy shadow with a subtle universal lift that isn't clipped by the panel.
 - **Requirements.** R7.
 - **Dependencies.** None.
-- **Files.** `macos/ScreenCap/Views/Record/RecordingHUDPanel.swift`.
+- **Files.** `macos/Screencap/Views/Record/RecordingHUDPanel.swift`.
 - **Approach.** Soften the `pill` shadow (lower opacity, smaller radius/offset; optionally add a hairline capsule border so a lighter shadow still separates the pill). Ensure the floating panel does not clip the softened shadow: prefer giving the hosting content transparent room around the pill (SwiftUI padding inside the `.fixedSize()` content) over enlarging the panel. Caution: `RecordingHUDPanelController.show()` sizes the panel to the content's `fittingSize`, and its comment documents an earlier Auto-Layout feedback loop / collapsed-pill failure — do not reintroduce that by feeding the shadow extent back into a panel resize; keep the shadow room inside the measured content instead. Preserve `panel.hasShadow = false` (the SwiftUI shadow stays the single source of the lift).
 - **Technical design.** Directional only — exact opacity/radius/offset values and the clip fix (content inset vs panel-size adjustment) are the executor's call, tuned by eye.
 - **Test scenarios.** Test expectation: none — purely visual styling. Verified by manual QA on both a light background (no grey halo, no clipped/hard edge) and a dark background (pill still separates), per the runbook.
@@ -195,7 +195,7 @@ Run the macOS app unit suite from `macos/`. New files (`MenuBarMenuPolicy.swift`
 ```bash
 cd macos
 xcodegen generate
-xcodebuild test -only-testing:ScreenCapTests -project ScreenCap.xcodeproj -scheme ScreenCap
+xcodebuild test -only-testing:ScreencapTests -project Screencap.xcodeproj -scheme Screencap
 ```
 
 Gates:
@@ -210,6 +210,6 @@ Gates:
 
 - R1–R7 satisfied; AE1–AE4 pass in manual QA.
 - U1 and U3 unit tests written and green; U2's accessibility-label test green; U4 verified visually on light and dark backgrounds.
-- `xcodegen generate` re-run so the new policy/test files are in the project; the `xcodebuild test` command above passes for `ScreenCapTests`.
+- `xcodegen generate` re-run so the new policy/test files are in the project; the `xcodebuild test` command above passes for `ScreencapTests`.
 - Manual-QA runbook updated with the new hide/restore/shadow entries.
 - No dead code or abandoned-approach remnants; the pill's hide button and the menu item read the single `hudHidden` source of truth.

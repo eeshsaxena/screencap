@@ -163,7 +163,7 @@ All product-level questions are resolved; the architectural forks below were set
 
 - Segmentation engine: `src/screencap/terminal_stage.py` (`_run_local_segmentation`), `src/screencap/segmentation/` (provider, degrade ladder), `src/screencap/task_manifest.py` (idle-gap heuristic `_segment_tasks`).
 - Task surface: `/v0/tasks.list` in `src/screencap/daemon/app.py`; `pipeline_task_segments` in `src/screencap/pipeline_state.py`.
-- Day-timeline today: `macos/ScreenCap/Views/Timeline/DayTimelineView.swift`, `macos/ScreenCap/Views/Timeline/DayStripView.swift` (legend honesty substitutions); Journal: `macos/ScreenCap/Views/Journal/JournalTasks.swift`.
+- Day-timeline today: `macos/Screencap/Views/Timeline/DayTimelineView.swift`, `macos/Screencap/Views/Timeline/DayStripView.swift` (legend honesty substitutions); Journal: `macos/Screencap/Views/Journal/JournalTasks.swift`.
 - Recording lifecycle: `src/screencap/engine/recorder.py`, `recording.start` / `recording.stop` in `src/screencap/daemon/app.py`; mid-recording mic-mute in `src/screencap/daemon/app.py` (SCR-218) and `recorder.py` (`mute_control_q`).
 - Local-only rules: `src/screencap/upload.py` (`recording.db` exclusion, `assert_uploadable`), `src/screencap/content_index.py`.
 - Design + prior UI plan: `docs/design/screencap-prototype/Screencap Prototype.dc.html` (Journal / Day-timeline), `docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md`.
@@ -236,9 +236,9 @@ Cross-phase: U5 (task store `source`/`edited`) unblocks U6, U7, U8, U9. U3/U4 un
 | U7 | User task CRUD verbs | `daemon/app.py`, `daemon/schema.py`, `pipeline_state.py` | U5 |
 | U8 | Ambient retention window + task-span protection | `retention.py`, `config.py`, `pipeline_policy.py` | U5 |
 | U9 | Day-level task API field | `daemon/schema.py`, `daemon/day_segments.py`, `daemon/app.py` | U5, U6 |
-| U10 | Swift Day-timeline task bands + unsplit + legend | `macos/ScreenCap/Views/Timeline/` | U9 |
-| U11 | Swift Journal task cards + manual create + edit write-through | `macos/ScreenCap/Views/Journal/`, `Controllers/`, `Models/RecordingTasks.swift` | U7, U10 |
-| U12 | First-run consent + ambient controls (Swift) | `macos/ScreenCap/Views/`, `Controllers/DaemonClient.swift` | U3, U4 |
+| U10 | Swift Day-timeline task bands + unsplit + legend | `macos/Screencap/Views/Timeline/` | U9 |
+| U11 | Swift Journal task cards + manual create + edit write-through | `macos/Screencap/Views/Journal/`, `Controllers/`, `Models/RecordingTasks.swift` | U7, U10 |
+| U12 | First-run consent + ambient controls (Swift) | `macos/Screencap/Views/`, `Controllers/DaemonClient.swift` | U3, U4 |
 
 ### U1. Ambient config, intent, and per-day identity
 
@@ -339,7 +339,7 @@ Cross-phase: U5 (task store `source`/`edited`) unblocks U6, U7, U8, U9. U3/U4 un
 - **Goal:** Render agent/user task bands over the day, with the remainder as "unsplit — still searchable," and honest legend copy.
 - **Requirements:** R11.
 - **Dependencies:** U9.
-- **Files:** `macos/ScreenCap/Views/Timeline/DayTimelineView.swift` (emit N `DayStripSegment` per recording from the new `tasks` field, near `stripSegments` `:369`), `macos/ScreenCap/Views/Timeline/DayStripView.swift` (`DayStripSegment` task fields + unique id `:12`; overlay bands on the recording-span base track; legend `:297`; accessibility `:343`), `macos/ScreenCap/Models/`, `macos/ScreenCapTests/DayTimelineTaskBandsTests.swift`.
+- **Files:** `macos/Screencap/Views/Timeline/DayTimelineView.swift` (emit N `DayStripSegment` per recording from the new `tasks` field, near `stripSegments` `:369`), `macos/Screencap/Views/Timeline/DayStripView.swift` (`DayStripSegment` task fields + unique id `:12`; overlay bands on the recording-span base track; legend `:297`; accessibility `:343`), `macos/Screencap/Models/`, `macos/ScreencapTests/DayTimelineTaskBandsTests.swift`.
 - **Approach:** The recording-span rectangle becomes the "unsplit — still searchable" base layer; task bands overlay it with their labels. Task spans are a **non-overlapping partition** (enforced by U6's carve-out + U7's overlap validation), so band layout needs no stacking/z-order. Replace the legend's honesty substitutions (`agent-labeled task` and `unsplit — still searchable` now have referents). `DayStripSegment.id` moves off `recording` (non-unique per task) to a task-stable id. Accessibility covers keyboard focus order across bands and announcements for the unsplit / "nothing captured" / blocked regions and the span-select affordance (U11), not just task titles. A very narrow band truncates its label with a hover/tooltip fallback. Paused/blocked spans keep their existing honest rendering.
 - **Test scenarios:** N tasks in a recording render N labeled bands over the base track (non-overlapping). A recording with no tasks renders a plain unsplit base band. Legend shows task + "unsplit — still searchable" + "nothing captured" + blocked swatches. VoiceOver/keyboard can focus and announce every region type (task, unsplit, nothing-captured, blocked). A very narrow band truncates its label with a tooltip. Segment ids are unique.
 - **Verification:** The Day-timeline shows the agent split with an unsplit remainder, keyboard-navigable, matching the design legend.
@@ -349,7 +349,7 @@ Cross-phase: U5 (task store `source`/`edited`) unblocks U6, U7, U8, U9. U3/U4 un
 - **Goal:** Render agent-split task cards and let the user create, rename, merge, split, and delete tasks.
 - **Requirements:** R8, R10, R15.
 - **Dependencies:** U7, U10.
-- **Files:** `macos/ScreenCap/Views/Journal/JournalView.swift` + `JournalTasks.swift` (task cards; write-through on edit; empty-state), `macos/ScreenCap/Controllers/DaemonClient.swift` + `SearchService.swift` (`tasksCreate/Update/Delete/Merge/Split`), `macos/ScreenCap/Models/RecordingTasks.swift` (request models + `source`/`edited` marker), `macos/ScreenCap/Views/Timeline/` (span-select gesture; live "start a task" + in-progress rendering), `macos/ScreenCapTests/RecordingTasksTests.swift`.
+- **Files:** `macos/Screencap/Views/Journal/JournalView.swift` + `JournalTasks.swift` (task cards; write-through on edit; empty-state), `macos/Screencap/Controllers/DaemonClient.swift` + `SearchService.swift` (`tasksCreate/Update/Delete/Merge/Split`), `macos/Screencap/Models/RecordingTasks.swift` (request models + `source`/`edited` marker), `macos/Screencap/Views/Timeline/` (span-select gesture; live "start a task" + in-progress rendering), `macos/ScreencapTests/RecordingTasksTests.swift`.
 - **Approach:** Extend the existing `JournalTasks` one-`tasks.list`-per-recording resolver to write through the CRUD/merge/split verbs and refresh its cache on edit. Manual creation has two entry points: **(a) live "start a task"** — opens an in-progress span that ends on an explicit stop, the next task-start, or the day-roll, rendering as a growing band + a provisional Journal card until closed; **(b) retroactive span-select** on the Day-timeline — drag-to-select endpoints that snap to task/chunk boundaries, then a label-entry confirmation. When ambient is on, the app's record affordance IS "start a task" (a span in the stream), not a second `recording.start`; the daemon still rejects a concurrent `recording.start` while ambient holds the lock (existing `LockContendedError`, surfaced), and explicit start/stop stays intact when ambient is off (R16). A failed write-through shows a visible retry/error state and reverts local state (no silent divergence). An all-unsplit day shows an "unsplit — still searchable" Journal placeholder. Library/editable-titles/clip-a-moment operate on task spans as the unit (R15) — clip-a-moment already reads task bounds, so this is adaptation, not rework.
 - **Test scenarios:** Journal renders one card per task with day grouping; an all-unsplit day shows the placeholder. Create/rename/merge/split/delete call the right verb and refresh the cache. A live "start a task" renders an in-progress band/card and closes on stop / next-start / day-roll. Span-select drag sets snapped endpoints and confirms a label. A failed write shows a visible error and reverts (not silently overwritten by re-segmentation). Editing an agent task marks it `edited` so the next agent pass preserves it. `Covers AE3.` Labeling an unsplit span creates a retained task shown as a band and a card.
 - **Verification:** A user can curate the day's tasks end-to-end (including merge/split and a live task) and the edits survive re-segmentation.
@@ -359,7 +359,7 @@ Cross-phase: U5 (task store `source`/`edited`) unblocks U6, U7, U8, U9. U3/U4 un
 - **Goal:** Gate ambient on first-run consent covering always-on audio, and expose enable / pause / auto-start controls.
 - **Requirements:** R1, R2.
 - **Dependencies:** U3, U4.
-- **Files:** `macos/ScreenCap/Views/` (consent sheet + ambient settings), `macos/ScreenCap/Controllers/DaemonClient.swift` (enable + pause/resume verbs), `macos/ScreenCapTests/AmbientConsentTests.swift`.
+- **Files:** `macos/Screencap/Views/` (consent sheet + ambient settings), `macos/Screencap/Controllers/DaemonClient.swift` (enable + pause/resume verbs), `macos/ScreencapTests/AmbientConsentTests.swift`.
 - **Approach:** First enable shows a consent sheet that specifically names always-on audio (other people in meetings) before ambient starts. Controls: an enable toggle, an auto-start-on-login toggle (default on when enabled), and a pause/resume affordance wired to U4. The enable toggle reflects the daemon's surfaced state: a permission-denied or paywall-blocked ambient (U2) shows a blocked/error state with copy, not a silent on-with-nothing-recording. Pause/resume disable or show-pending during the request round-trip. Follows the app's existing consent-flow and settings patterns.
 - **Test scenarios:** Ambient stays off until consent is accepted; declining leaves it off. Enabling defaults auto-start on with an independent off. Permission-denied / paywall-blocked enable shows a blocked state + copy, not a silent non-recording toggle. Pause/resume reflect the daemon's confirmed state (not the requested echo) and show pending in-flight. Re-launch with ambient enabled resumes capture (via U2).
 - **Verification:** A first-time user can opt in through consent; a blocked enable shows why; pause/enable controls drive the daemon.
@@ -374,7 +374,7 @@ Cross-phase: U5 (task store `source`/`edited`) unblocks U6, U7, U8, U9. U3/U4 un
 | Single test | `PYTHONPATH=src pytest tests/test_retention_ambient.py::<test>` | targeted |
 | Privacy lane (CI-authoritative) | `PYTHONPATH=src pytest -m privacy` | U2, U4, U6, U8 |
 | Lint | `ruff check src/screencap/` | all Python |
-| macOS app tests | `ScreenCapTests` target (XcodeGen project) | U10–U12 |
+| macOS app tests | `ScreencapTests` target (XcodeGen project) | U10–U12 |
 
 Repo-specific gates:
 - CI runs only the `-m privacy` lane (plus the lock-policy test). Mark privacy-bearing tests `@pytest.mark.privacy` and keep them Vision-free, or they will not run on CI — this covers the capture-time enforcement paths (ambient privacy, pause gaps, retention protection, R11 strip on incremental segmentation).
@@ -391,7 +391,7 @@ Global:
 - Explicit (non-ambient) start/stop recording is verified unchanged (R16 regression).
 - `SECURITY.md` is updated for the always-on-audio trust boundary (continuous mic + 30-day retained third-party audio).
 - Capture-time privacy enforcement, pause gaps, and the fail-closed R11 strip on incremental segmentation are covered in the `-m privacy` lane and green.
-- `PYTHONPATH=src pytest tests/`, the privacy lane, and `ruff` are green; `ScreenCapTests` pass on a non-worktree build.
+- `PYTHONPATH=src pytest tests/`, the privacy lane, and `ruff` are green; `ScreencapTests` pass on a non-worktree build.
 - Abandoned/experimental code from the build is removed; no dead ambient/pipeline branches left in the diff.
 
 Per-unit: each U-ID is done when its Test scenarios pass and its Verification outcome holds. Units are landed in the Sequencing order, with U5 before U6/U7/U8/U9.

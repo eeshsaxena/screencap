@@ -24,7 +24,7 @@ How does processing currently work and what is its architecture — which compon
 
 ## Summary
 
-ScreenCap processes a recording in two connected halves, both living inside one **engine subprocess** that a background **daemon** spawns and supervises:
+Screencap processes a recording in two connected halves, both living inside one **engine subprocess** that a background **daemon** spawns and supervises:
 
 1. **Capture half (live, in-memory → disk):** Multiple reader threads capture screen/input/window/audio, fan into a single `event_q`, a single `event_processor` thread routes them to four type-specific `SynchronizedQueue`s, and four writer **processes** persist them to `recording.db` and to per-chunk `chunk_NNNN.mp4` / `audio_NNNN.flac` files. A `ChunkedVideoWriter` rotates chunks on a duration boundary and emits rotation notifications.
 

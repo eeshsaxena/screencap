@@ -1,4 +1,4 @@
-"""FastMCP stdio server exposing ScreenCap's retrieval surface to an agent.
+"""FastMCP stdio server exposing Screencap's retrieval surface to an agent.
 
 Each tool forwards to a daemon ``/v0/*`` verb and re-wraps the response as a typed,
 POINTER-ONLY result (text snippets + ``(recording, timestamp)`` pointers and, for
@@ -394,7 +394,7 @@ class _Runtime:
                         ensure_daemon_or_spawn, stderr_emitter=_stderr,
                     )
                 except Exception as exc:
-                    raise DaemonError(f"could not reach the ScreenCap daemon: {exc}") from exc
+                    raise DaemonError(f"could not reach the Screencap daemon: {exc}") from exc
                 client = AsyncDaemonClient()
                 sub = LivenessSubscription(client.raw)
                 try:
@@ -822,7 +822,7 @@ def build_server() -> FastMCP:
     mcp = FastMCP(
         "screencap",
         instructions=(
-            "Search a local ScreenCap screen-recording memory. Returns text "
+            "Search a local Screencap screen-recording memory. Returns text "
             "snippets + (recording, timestamp) pointers, never frame images. "
             "On-screen content recall is best-effort (action-gated frames, OCR "
             "and redaction limits); the timeline is authoritative."

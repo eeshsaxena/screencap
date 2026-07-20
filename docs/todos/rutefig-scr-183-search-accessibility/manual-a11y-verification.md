@@ -34,8 +34,8 @@ turning on audible VoiceOver and changing system text size):
 
 ## Non-result states + announcements (U6)
 - [ ] `.searching` announces "Searching your history", not a bare "progress indicator".
-- [ ] Empty / "Nothing recorded then" / idle / "ScreenCap isn't running" each read as one coherent message.
-- [ ] **Running a search posts a spoken announcement** of the outcome ("12 results" / "1 result" / "No matches" / "ScreenCap isn't running"). ⚠️ Confirm the AppKit `NSAccessibility.post(.announcementRequested)` actually speaks on macOS 13 — if not, that's the known fallback risk.
+- [ ] Empty / "Nothing recorded then" / idle / "Screencap isn't running" each read as one coherent message.
+- [ ] **Running a search posts a spoken announcement** of the outcome ("12 results" / "1 result" / "No matches" / "Screencap isn't running"). ⚠️ Confirm the AppKit `NSAccessibility.post(.announcementRequested)` actually speaks on macOS 13 — if not, that's the known fallback risk.
 
 ## Keyboard (U3, U4)
 - [ ] Opening Search (sidebar → Search) places the caret in the field; typing works without a click. Leaving and returning re-focuses.

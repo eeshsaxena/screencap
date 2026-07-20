@@ -17,7 +17,7 @@ Collapse the two divergent processing paths — the live cloud chunk-processor a
 
 ## Problem Frame
 
-ScreenCap has two ways to turn a recording into processed, possibly-uploaded artifacts, forked at recording start off `.recording_intent`. The **live path** (`src/screencap/chunk_processor.py`) runs only when cloud-bound — transcribe, export, manifest, scrub (forced PUBLIC), upload, evict — while the **local path** writes chunks and keeps them all, scrubbing lazily on demand via `src/screencap/scrubber.py`. From that single branch, two whole worlds diverge: scrub runs in two places, the DB-skip rule is enforced three different ways, privacy policy is forced in one path and user-configured in the other, and the safety invariants that prevent silent data loss live entirely in-memory in the live path and don't exist in the local one. Every new cloud or processing feature has to be reasoned about twice. With per-user GCP isolation shipped (unblocking monetization), wiring that into two diverging paths would compound the drift. Full motivation, actors (A1–A4), and flows (F1–F3) are in the origin document (see Sources & References).
+Screencap has two ways to turn a recording into processed, possibly-uploaded artifacts, forked at recording start off `.recording_intent`. The **live path** (`src/screencap/chunk_processor.py`) runs only when cloud-bound — transcribe, export, manifest, scrub (forced PUBLIC), upload, evict — while the **local path** writes chunks and keeps them all, scrubbing lazily on demand via `src/screencap/scrubber.py`. From that single branch, two whole worlds diverge: scrub runs in two places, the DB-skip rule is enforced three different ways, privacy policy is forced in one path and user-configured in the other, and the safety invariants that prevent silent data loss live entirely in-memory in the live path and don't exist in the local one. Every new cloud or processing feature has to be reasoned about twice. With per-user GCP isolation shipped (unblocking monetization), wiring that into two diverging paths would compound the drift. Full motivation, actors (A1–A4), and flows (F1–F3) are in the origin document (see Sources & References).
 
 ---
 
@@ -49,7 +49,7 @@ ScreenCap has two ways to turn a recording into processed, possibly-uploaded art
 - R15. Existing chunked recordings on disk (including partially-uploaded ones) are handled without data loss; upload/retention state is reconciled from disk.
 - R16. Local recording requires no account; the account gate applies only to the cloud routing branch.
 
-**Origin actors:** A1 (local-only operator), A2 (cloud operator), A3 (ScreenCap engineer — primary beneficiary), A4 (processing pipeline, system actor)
+**Origin actors:** A1 (local-only operator), A2 (cloud operator), A3 (Screencap engineer — primary beneficiary), A4 (processing pipeline, system actor)
 **Origin flows:** F1 (local-only, kept rich), F2 (cloud with reclaim-local), F3 (crash / interruption recovery)
 **Origin acceptance examples:** AE1 (R6,R7), AE2 (R9), AE3 (R10,R11), AE4 (R8), AE5 (R12), AE6 (R16). Plan-added: AE7 (`both`), AE8 (promote-after-evict refuses), AE9 (size-cap never deletes a FAILED chunk), AE10 (crash mid-scrub re-detected), AE11 (`recording.db` never in uploaded set), AE12 (concurrent terminal runs upload exactly once).
 

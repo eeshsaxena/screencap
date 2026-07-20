@@ -22,7 +22,7 @@ only ever recorded `--no-audio` may never have established the daemon's mic gran
    helper `.app` (`ScreencapDaemon.app`, bundle id `com.screencap.daemon`, its
    own `Info.plist`, executable at `Contents/MacOS/screencap`) — see
    `pyinstaller/screencap.spec` (the `BUNDLE(...)` block) and
-   `macos/ScreenCap/Scripts/embed-cli.sh` ("Info.plist is what makes macOS treat
+   `macos/Screencap/Scripts/embed-cli.sh` ("Info.plist is what makes macOS treat
    the daemon as a first-class TCC subject"). So macOS attributes the daemon's
    mic access to `com.screencap.daemon`, **not** to the app.
    → **The daemon needs its OWN mic grant; the app's grant does not cover it.**
@@ -41,9 +41,9 @@ only ever recorded `--no-audio` may never have established the daemon's mic gran
      (`pyinstaller/screencap.spec` `info_plist` had only bundle-id / display-name
      / `LSUIElement`). A process that opens the mic without a purpose string gets
      no meaningful prompt, and AVFoundation clients are terminated outright.
-   - The daemon's entitlements (`macos/ScreenCap/Scripts/screencap-cli.entitlements`)
+   - The daemon's entitlements (`macos/Screencap/Scripts/screencap-cli.entitlements`)
      deliberately omit `com.apple.security.device.audio-input` (the app's
-     `ScreenCap.entitlements` declares it). That entitlement is a *sandbox* key,
+     `Screencap.entitlements` declares it). That entitlement is a *sandbox* key,
      not required for a hardened-runtime Developer-ID binary — TCC + the usage
      string are what gate mic access here — so this is expected, not the blocker.
 
@@ -63,7 +63,7 @@ mic open (a different path from AVFoundation's `AVCaptureDevice`). On a **clean*
 machine with a **signed** daemon build carrying the new usage string, verify:
 
 1. **Audio-on baseline:** record with audio ON via the app → daemon. Confirm
-   audio is captured and a **"ScreenCap"** row appears under
+   audio is captured and a **"Screencap"** row appears under
    System Settings → Privacy → Microphone (attributed to `com.screencap.daemon`).
    This alone tells us whether the daemon can acquire the mic at all.
 2. **First unmute of a `--no-audio` recording (R2):** start `--no-audio`, then

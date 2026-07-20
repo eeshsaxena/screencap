@@ -77,7 +77,7 @@ flowchart TB
 
 - No replacement naming feature. If friendly recording names are wanted later, that is a new brainstorm built on the segmentation consent model.
 - No changes to segmentation's consent rules or cloud-summary fallback — verified correct during scoping.
-- No migration of existing recording directory names or `task_description` values already on disk. The `task_description` column, its readers (`src/screencap/catalog.py`, `src/screencap/scrubber.py`, `macos/ScreenCap/Models/RecordingSummary.swift`), and its `--description` writer are live and stay.
+- No migration of existing recording directory names or `task_description` values already on disk. The `task_description` column, its readers (`src/screencap/catalog.py`, `src/screencap/scrubber.py`, `macos/Screencap/Models/RecordingSummary.swift`), and its `--description` writer are live and stay.
 - No broader dead-code sweep beyond the bounded chain above; `menubar.py` and `engine/menubar_policy.py` are fully untouched. After removal, the menubar rename UI's `.menubar_rename` file has no reader (the dead block was its only one) — behaviorally identical to today; removing or repurposing that UI is deferred to a follow-up ticket.
 - Cloud transcription's own consent posture (OpenAI Whisper egress in `src/screencap/transcription.py` and `src/screencap/chunk_processor.py`) is pre-existing and out of scope; the guard test pins it as sanctioned rather than judging it.
 
@@ -134,7 +134,7 @@ flowchart TB
 - Goal: Remove the namer module and every test that exercises it.
 - Requirements: R1, R4
 - Dependencies: U1
-- Files: `src/screencap/namer.py` (delete), `tests/test_namer.py` (delete), `tests/test_file_screenshots.py`, `tests/test_cli.py`, `src/screencap/catalog.py`, `macos/ScreenCap/Models/RecordingSummary.swift`
+- Files: `src/screencap/namer.py` (delete), `tests/test_namer.py` (delete), `tests/test_file_screenshots.py`, `tests/test_cli.py`, `src/screencap/catalog.py`, `macos/Screencap/Models/RecordingSummary.swift`
 - Approach: Delete `namer.py` whole (sole import site went with U1). Delete `tests/test_namer.py` (all nine classes test namer internals). In `tests/test_file_screenshots.py`, remove only the namer-specific tests (lines ~302-414, `_sample_screenshots_from_db`); the `samples.py` coverage in the same file is live. In `tests/test_cli.py`, delete the already-skipped legacy-start scaffolding block (lines ~1862-2032) that `mock.patch`es `screencap.namer.auto_name`. Reword the stale doc-comment at `RecordingSummary.swift:34` ("The namer's task_description") to describe the field without namer attribution — the field itself is live via `--description`. Same treatment for the Python twin: `catalog.py`'s `_humanize_name` docstring (~lines 286-293) attributes behavior to `namer.validate_slug` and "a recording the namer never renamed" — reword without namer attribution; the function itself is live for legacy on-disk names and stays.
 - Test scenarios: Test expectation: none — pure deletion of a module and its dedicated tests; behavior preservation is proven by the surviving suite (R6 scenarios live in U1/U3).
 - Verification: `rg -n "namer|auto_name" src/ tests/ macos/` returns no production references (historical `docs/` mentions acceptable); full suite green.

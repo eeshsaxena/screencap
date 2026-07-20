@@ -69,7 +69,7 @@ class LaunchAgentNotRunningError(RuntimeError):
     """LaunchAgent is installed but daemon is not running; user must kickstart."""
 
     KICKSTART_HINT = (
-        "Error: ScreenCap daemon is registered with launchd but not running.\n"
+        "Error: Screencap daemon is registered with launchd but not running.\n"
         "Start it with: launchctl kickstart -kp gui/$UID/com.screencap.daemon\n"
         "(Auto-start was suppressed because launchd is managing this daemon. "
         "Running it manually would conflict with launchd supervision.)"
@@ -315,7 +315,7 @@ def ensure_daemon_or_spawn(
     plan = _build_spawn_plan(idle_shutdown_s=idle_shutdown_s, socket_path=socket_path)
 
     if stderr_emitter is not None:
-        stderr_emitter("Starting ScreenCap daemon...")
+        stderr_emitter("Starting Screencap daemon...")
 
     # Bounded retry across the spawn-race window — two parallel CLI
     # invocations might both reach this branch; only one wins the
@@ -350,7 +350,7 @@ def ensure_daemon_or_spawn(
             logger.debug("auto-spawn attempt 1 failed; retrying")
 
     raise DaemonAutoSpawnError(
-        f"ScreenCap daemon failed to start within {readiness_timeout_s:.0f}s. "
+        f"Screencap daemon failed to start within {readiness_timeout_s:.0f}s. "
         f"Last log lines from {_AUTO_LOG_PATH}:",
         log_tail=last_log_tail,
     )

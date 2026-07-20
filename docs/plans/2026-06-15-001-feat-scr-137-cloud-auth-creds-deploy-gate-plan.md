@@ -141,7 +141,7 @@ So there are two distinct jobs, now correctly ordered by urgency:
 - `.github/workflows/release.yml` — tag-triggered build (clean checkout, no `.env`): `pip install` →
   `pyinstaller …spec` → smoke → GCS upload. `binary-test.yml` (PR build) is currently disabled.
 - `.claude/skills/local-release/SKILL.md` — the local PyInstaller build path.
-- `macos/ScreenCap/Scripts/embed-cli.sh` — bundles `dist/screencap/` into the app; the app shells out to the
+- `macos/Screencap/Scripts/embed-cli.sh` — bundles `dist/screencap/` into the app; the app shells out to the
   bundled CLI, so injecting into the CLI covers the app (no separate Swift injection).
 - `docs/runbooks/cloud-auth-setup.md` — provisioning runbook + the existing pre-deploy gate (now being lifted/executed).
 

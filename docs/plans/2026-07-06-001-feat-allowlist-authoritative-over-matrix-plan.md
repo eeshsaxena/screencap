@@ -120,7 +120,7 @@ Key Flows omitted: the change is policy-shaped; the confirmation interaction is 
 - src/screencap/privacy/actions.py:44-74 — the action sets each downstream layer keys on (BLOCK, KEYSTROKE_NULL, VIDEO_BLOCK, SCRUB_BLOCK).
 - src/screencap/cli/__init__.py:1780-1904 — the `apps --json` command; `is_matrix_exclude` computed as "EXCLUDE in every mode" (1859-1862), true only for PASSWORD_MANAGER; `_APPS_SCHEMA_VERSION` at line 52.
 - src/screencap/setup_wizard.py:33, 690-694 — wizard-scoped `_BLOCKED_CLASSES` ({PASSWORD_MANAGER, BANKING}) and the silent auto-allow path; the matrix-ack one-time-flag machinery (`matrix_acknowledged_v2026_04`, `SCREENCAP_PARENT=swiftui`) as the nearest confirmation-flow analog.
-- macos/ScreenCap — pure CLI client, no daemon settings verbs: `PrivacyController.swift` (84-156) shells to `screencap settings privacy` / `apps --json`; `AppRuleSegmentPolicy.swift` derivation priority (46-118) documents the exclude-not-matrix-locked state as "only reachable via a hand-edited config" (66-70) — a state this change makes routine; `InstalledApp.swift` decodes all fields as required (no Optionals) — decode-skew risk with a stale daemon (docs/solutions/integration-issues/stale-daemon-after-app-update-http-500-2026-07-02.md).
+- macos/Screencap — pure CLI client, no daemon settings verbs: `PrivacyController.swift` (84-156) shells to `screencap settings privacy` / `apps --json`; `AppRuleSegmentPolicy.swift` derivation priority (46-118) documents the exclude-not-matrix-locked state as "only reachable via a hand-edited config" (66-70) — a state this change makes routine; `InstalledApp.swift` decodes all fields as required (no Optionals) — decode-skew risk with a stale daemon (docs/solutions/integration-issues/stale-daemon-after-app-update-http-500-2026-07-02.md).
 - SECURITY.md:66 — the narrowed-R7 ALLOW-only content-index invariant R10 must re-word.
 - tests/test_privacy_matrix_corrections.py:108-247 — `TestAllowAppsRespectsMatrixFloor` and `TestAllowAppsStrictnessFloor`, the suites U1 inverts; tests/test_privacy_settings.py (direct-seam) and tests/test_settings_privacy.py (CliRunner) for the CLI guard. None of the five relevant test files carry `@pytest.mark.privacy` today, so none run in CI (`pytest -m privacy` is the only CI lane) — U1/U2 fix this for the touched suites. New precedence tests must stay Vision-free so the `privacy-guards-visionfree` lane runs them (docs/solutions/workflow-issues/privacy-guards-deselected-on-ci-silently-rot-2026-06-10.md).
 - Linear: SCR-235 (this change), SCR-64 (daemon trust boundary rationale to update), SCR-225 (UI mask override).
@@ -275,14 +275,14 @@ U1 (policy core) → U2 (settings/CLI) → U3 (payload + wizard) → U5 (Swift U
 - **Goal:** Confirmation-required rows unlock behind the app's first confirmation dialog; confirmed rows read as Record; stale-daemon skew degrades safely.
 - **Requirements:** R6, R7, R8 (UI half); AE2 (KTD8)
 - **Dependencies:** U2, U3
-- **Files:** macos/ScreenCap/Models/InstalledApp.swift; macos/ScreenCap/Views/Settings/AppRuleSegmentPolicy.swift; macos/ScreenCap/Views/Settings/AppRulesView.swift; macos/ScreenCap/Controllers/PrivacyController.swift; macos/ScreenCapTests/AppRuleSegmentPolicyTests.swift; macos/ScreenCapTests/PrivacyControllerTests.swift
+- **Files:** macos/Screencap/Models/InstalledApp.swift; macos/Screencap/Views/Settings/AppRuleSegmentPolicy.swift; macos/Screencap/Views/Settings/AppRulesView.swift; macos/Screencap/Controllers/PrivacyController.swift; macos/ScreencapTests/AppRuleSegmentPolicyTests.swift; macos/ScreencapTests/PrivacyControllerTests.swift
 - **Approach:** Decode the new payload fields as Optionals with locked/unconfirmed defaults (KTD8). Rework `AppRuleSegmentPolicy.derive`: confirmation-required + unconfirmed → Record segment enabled but its transition requires confirmation; confirmed → Record selected and writable; the formerly "hand-edited config only" exclude-not-matrix-locked state becomes a first-class rendered state. Add the Settings surface's first `confirmationDialog` (nearest prior art is LibraryView's plain alert); dialog copy names the R7 consequences with conditional cloud phrasing ("if a recording is cloud-destined") since the destination is often decided per-recording. On confirm, `PrivacyController` invokes the CLI with the confirm flag; cancel writes nothing; `refreshApps()` snaps state either way. If the CLI call fails after confirm, the existing `lastError` banner surfaces and the row returns to its unconfirmed state on refresh — the user re-taps to retry (no silent retry). New row states carry note strings following the existing derive() note pattern (exact copy lands at implementation; the derivation tests pin it). Dialog copy for browsers also states that banking/auth/payment pages stay protected (R12).
 - **Execution note:** `AppRuleSegmentPolicy` is pure — build its derivation tests first; app builds via XcodeGen per macos/README.md.
 - **Test scenarios:**
   - Segment derivation for: confirmation-required + unconfirmed, confirmed, legacy-allow, unlisted-sensitive, and unlisted-safe apps.
   - Covers AE2 (UI half). Tapping Record on a confirmation-required app produces the confirmation transition, not a direct write; confirm → CLI invoked with the flag; cancel → no CLI call.
   - Decoding a payload without the new fields (stale daemon) → defaults applied, no decode failure, rows render as today.
-- **Verification:** macOS test suite passes (`xcodebuild test`, ScreenCap scheme; the known flaky daemon-reconnect test is unrelated).
+- **Verification:** macOS test suite passes (`xcodebuild test`, Screencap scheme; the known flaky daemon-reconnect test is unrelated).
 
 ### U6. SECURITY.md and trust-boundary docs
 
@@ -305,7 +305,7 @@ Run from the repo root; in a worktree, prefix pytest with `PYTHONPATH=src` (edit
 | Enforcement suites | `pytest tests/enforcement/test_filter_factory.py tests/enforcement/test_recorder_enforcement.py` | U4 |
 | Structural guards | `pytest tests/test_privacy_filter_call_graph.py tests/test_package_boundary_call_graph.py tests/redaction/test_import_lightness.py` | package DAG + factory homes intact |
 | CI-lane parity | `pytest -m privacy --collect-only` collects the new/changed tests; full `pytest -m privacy` passes | R11 tests actually run in CI, Vision-free |
-| macOS app | `xcodegen generate` then `xcodebuild test` (ScreenCap scheme, per macos/README.md) | U5 |
+| macOS app | `xcodegen generate` then `xcodebuild test` (Screencap scheme, per macos/README.md) | U5 |
 | SECURITY.md docs | No automated gate (documentation-only); verified by the Definition of Done's SECURITY.md criterion | U6 |
 
 ---

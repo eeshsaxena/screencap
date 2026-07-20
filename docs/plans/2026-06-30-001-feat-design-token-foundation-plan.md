@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-06-30-design-token-foundation-requirements.md
 
 ## Summary
 
-Stand up a semantic design-token foundation for the ScreenCap macOS app and apply it to the launch-visible surfaces for the 2026-07-03 launch. Colors are authored as asset-catalog color sets (named roles, light/dark/high-contrast variants resolve automatically); the signature accent ships as a global `AccentColor` plus an "Aurora" lime→aqua gradient for hero moments; spacing/radius/type live in Swift token namespaces (`SCMetrics`, `SCTypography`). Full migration of the remaining surfaces and a dark-mode craft pass stay fast-follow.
+Stand up a semantic design-token foundation for the Screencap macOS app and apply it to the launch-visible surfaces for the 2026-07-03 launch. Colors are authored as asset-catalog color sets (named roles, light/dark/high-contrast variants resolve automatically); the signature accent ships as a global `AccentColor` plus an "Aurora" lime→aqua gradient for hero moments; spacing/radius/type live in Swift token namespaces (`SCMetrics`, `SCTypography`). Full migration of the remaining surfaces and a dark-mode craft pass stay fast-follow.
 
 ---
 
@@ -57,12 +57,12 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 
 ### Relevant Code and Patterns
 
-- `macos/project.yml` — XcodeGen manifest. Deployment target macOS 13.0; `Assets.xcassets` is a target resource; app icon set via `ASSETCATALOG_COMPILER_APPICON_NAME`. The global accent is set here (`ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME`), then `xcodegen generate` regenerates the project — do **not** hand-edit `ScreenCap.xcodeproj/project.pbxproj`.
-- `macos/ScreenCap/Assets.xcassets` — currently only `AppIcon.appiconset`; no color sets. Asset-catalog color sets natively support Any/Dark appearance + High Contrast variants, which resolve automatically (no `colorScheme` branching) — this is what makes R2's "derive from roles" feasible on the 13.0 target.
-- `macos/ScreenCap/Views/Privacy/PrivacyBadgeStyle.swift` — the only existing style abstraction; `color` returns `.red` / `.orange` / `.secondary` for `blockedBySecurity` / `excludedByUser` / `captured`. The seed to generalize (R5).
-- Launch-surface files: `macos/ScreenCap/ScreenCapApp.swift` (singleton `Window`, `MenuBarLabel` with `record.circle` + orange attention dot), `macos/ScreenCap/Views/RecordingBanner.swift` (pulsing red dot + elapsed + Stop), `macos/ScreenCap/Views/MainWindow.swift` (`NavigationSplitView`, `.orange` usages, `controlBackgroundColor` cards), `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` (first-run; `.orange`, hardcoded `.font(.system(size:))`).
+- `macos/project.yml` — XcodeGen manifest. Deployment target macOS 13.0; `Assets.xcassets` is a target resource; app icon set via `ASSETCATALOG_COMPILER_APPICON_NAME`. The global accent is set here (`ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME`), then `xcodegen generate` regenerates the project — do **not** hand-edit `Screencap.xcodeproj/project.pbxproj`.
+- `macos/Screencap/Assets.xcassets` — currently only `AppIcon.appiconset`; no color sets. Asset-catalog color sets natively support Any/Dark appearance + High Contrast variants, which resolve automatically (no `colorScheme` branching) — this is what makes R2's "derive from roles" feasible on the 13.0 target.
+- `macos/Screencap/Views/Privacy/PrivacyBadgeStyle.swift` — the only existing style abstraction; `color` returns `.red` / `.orange` / `.secondary` for `blockedBySecurity` / `excludedByUser` / `captured`. The seed to generalize (R5).
+- Launch-surface files: `macos/Screencap/ScreencapApp.swift` (singleton `Window`, `MenuBarLabel` with `record.circle` + orange attention dot), `macos/Screencap/Views/RecordingBanner.swift` (pulsing red dot + elapsed + Stop), `macos/Screencap/Views/MainWindow.swift` (`NavigationSplitView`, `.orange` usages, `controlBackgroundColor` cards), `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` (first-run; `.orange`, hardcoded `.font(.system(size:))`).
 - 12 `.accentColor` / `.tint` call sites across `CalendarView.swift`, `SearchDayTimeline.swift`, `TimelinePane.swift`, etc. — all inherit the global `AccentColor` with zero edits.
-- macOS app tests live in `macos/ScreenCapTests/`, run via `xcodebuild` (XcodeGen project). The Python CI lane (`pytest -m privacy`) does not cover the Swift app.
+- macOS app tests live in `macos/ScreencapTests/`, run via `xcodebuild` (XcodeGen project). The Python CI lane (`pytest -m privacy`) does not cover the Swift app.
 
 ### Institutional Learnings
 
@@ -114,14 +114,14 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Assets.xcassets/AccentColor.colorset/Contents.json` (the derived solid spring-teal, light + dark)
-- Create: per-role `macos/ScreenCap/Assets.xcassets/SC*.colorset/Contents.json` (each Any/Dark + High-Contrast). **Author color sets only for roles with a confirmed launch-surface consumer**; name-and-stub the rest in `SCColor.swift` so the contract is fixed without bloating the catalog.
+- Create: `macos/Screencap/Assets.xcassets/AccentColor.colorset/Contents.json` (the derived solid spring-teal, light + dark)
+- Create: per-role `macos/Screencap/Assets.xcassets/SC*.colorset/Contents.json` (each Any/Dark + High-Contrast). **Author color sets only for roles with a confirmed launch-surface consumer**; name-and-stub the rest in `SCColor.swift` so the contract is fixed without bloating the catalog.
   - **Author now (launch-consumed):** `recording`; the split signal roles `errorFg` / `errorSurface`, `advisorySurface` (advisory foreground = `textSecondary`, per R7's de-color), `successFg`; structural `surface`, `surfaceElevated`, `textPrimary`, `textSecondary`; interactive `selection`, `backgroundHover`, `backgroundPressed`, `disabledOnAccentFg` (Stop button states).
   - **Name-and-stub for R9 (no launch consumer yet):** `border`, `separator`, `textDisabled`, `focusRing`, `overlayScrim` — declare in `SCColor.swift` as `// TODO(R9): author color set` without creating the asset files.
   - Note the fg/surface split is the origin R2 contract (`state-error-fg`/`state-error-surface`, `state-advisory-fg`/`state-advisory-surface`); MainWindow's `.red.opacity` / `.yellow.opacity` overlays are *surface* uses and the icon tints are *fg* uses, so both halves are genuinely consumed at launch.
-- Create: `macos/ScreenCap/Theme/SCColor.swift` (a `Color` extension exposing each role; the `AuroraButtonStyle`; and **two** gradient constants — `auroraGradient` (dark/neon) and `auroraGradientLight` (deepened, for light backgrounds). Call sites branch on `@Environment(\.colorScheme)` for the gradient — see the contradiction note below.)
+- Create: `macos/Screencap/Theme/SCColor.swift` (a `Color` extension exposing each role; the `AuroraButtonStyle`; and **two** gradient constants — `auroraGradient` (dark/neon) and `auroraGradientLight` (deepened, for light backgrounds). Call sites branch on `@Environment(\.colorScheme)` for the gradient — see the contradiction note below.)
 - Modify: `macos/project.yml` (add `ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor` under the target settings)
-- Test: `macos/ScreenCapTests/SCColorTests.swift`
+- Test: `macos/ScreencapTests/SCColorTests.swift`
 
 **Approach:**
 - Author color sets with Universal + Dark appearances and the High Contrast variant; values from the resolved Aurora palette (R6/R7), OKLCH-tuned + contrast-checked.
@@ -151,9 +151,9 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Theme/SCMetrics.swift` (spacing ramp `space1…spaceN`, radii `radiusSm/Md/Lg`)
-- Create: `macos/ScreenCap/Theme/SCTypography.swift` (named steps `display`, `title`, `body`, `labelPrimary`, `labelSecondary`, `metadata`, `monoTimer` mapped onto system `Font` + Dynamic Type)
-- Test: `macos/ScreenCapTests/SCMetricsTests.swift`
+- Create: `macos/Screencap/Theme/SCMetrics.swift` (spacing ramp `space1…spaceN`, radii `radiusSm/Md/Lg`)
+- Create: `macos/Screencap/Theme/SCTypography.swift` (named steps `display`, `title`, `body`, `labelPrimary`, `labelSecondary`, `metadata`, `monoTimer` mapped onto system `Font` + Dynamic Type)
+- Test: `macos/ScreencapTests/SCMetricsTests.swift`
 
 **Approach:**
 - Spacing ramp calibrated toward the relaxed end (not compact); radii structural (not pill/capsule) by default, capsule reserved for the single primary action.
@@ -179,8 +179,8 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 **Dependencies:** U1
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Privacy/PrivacyBadgeStyle.swift` (map `blockedBySecurity` → `errorFg`, `excludedByUser` → advisory (text-only: foreground `textSecondary`, no distinct fill), `captured` → `textSecondary`)
-- Test: `macos/ScreenCapTests/PrivacyBadgeStyleTests.swift`
+- Modify: `macos/Screencap/Views/Privacy/PrivacyBadgeStyle.swift` (map `blockedBySecurity` → `errorFg`, `excludedByUser` → advisory (text-only: foreground `textSecondary`, no distinct fill), `captured` → `textSecondary`)
+- Test: `macos/ScreencapTests/PrivacyBadgeStyleTests.swift`
 
 **Approach:**
 - **No `SCComponents.swift`.** Creating a named components module is the R5 component-vocabulary work the plan's own Deferred list defers — don't start it. `AuroraButtonStyle` lives in `SCColor.swift` (U1) alongside the gradient it consumes; the recording indicator is an inline `Circle().fill(Color.scRecording)` at its one call site in `RecordingBanner.swift` (U4), not an extracted view.
@@ -209,11 +209,11 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 **Dependencies:** U1, U2, U3
 
 **Files:** (each bullet lists the *specific* literals to retire — the "no literals remain" test depends on naming them all)
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` (`MenuBarLabel` — `Color.orange` attention dot dropped; recording glyph `Color.red` → `Color.scRecording`; status-item glyph adopts the accent. **Realistically the menubar glyph renders as a template image (system-tinted), so it will take the solid accent via `Color.accentColor`/`scAccent`, not the gradient** — treat gradient-on-menubar as speculative, solid as the default.)
-- Modify: `macos/ScreenCap/Views/RecordingBanner.swift` (recording dot `Color.red` → inline `Circle().fill(Color.scRecording)`; Stop button `.tint(.red)`/`.borderedProminent` → `AuroraButtonStyle`; spacing/radius tokens)
-- Modify: `macos/ScreenCap/Views/MainWindow.swift` (sidebar selection = `scSelection`; **error overlay `.red.opacity(0.15)` → `Color.scErrorSurface`; advisory overlay `.yellow.opacity(0.18)` → neutral `scSurfaceElevated` (per R7 de-color, *not* yellow); icon `.orange` → advisory/state fg; toolbar `.tint(.red)` Stop → accent/AuroraButtonStyle**; cards `controlBackgroundColor` → `surfaceElevated`; spacing/radius tokens)
-- Modify: `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` (**ad-hoc-build callout `.orange` icon + `.orange.opacity(0.12)` background → advisory roles; the `daemonInstallIconColor` switch `.green`→`successFg` / `.red`→`errorFg` / `.orange`→advisory fg; "Granted" `.green` label → `successFg`**; replace `.font(.system(size: 16/22/20))` literals with type-scale steps)
-- Test: `macos/ScreenCapTests/LaunchSurfaceTokenTests.swift` (source-level grep guard) + the manual light/dark gate below
+- Modify: `macos/Screencap/ScreencapApp.swift` (`MenuBarLabel` — `Color.orange` attention dot dropped; recording glyph `Color.red` → `Color.scRecording`; status-item glyph adopts the accent. **Realistically the menubar glyph renders as a template image (system-tinted), so it will take the solid accent via `Color.accentColor`/`scAccent`, not the gradient** — treat gradient-on-menubar as speculative, solid as the default.)
+- Modify: `macos/Screencap/Views/RecordingBanner.swift` (recording dot `Color.red` → inline `Circle().fill(Color.scRecording)`; Stop button `.tint(.red)`/`.borderedProminent` → `AuroraButtonStyle`; spacing/radius tokens)
+- Modify: `macos/Screencap/Views/MainWindow.swift` (sidebar selection = `scSelection`; **error overlay `.red.opacity(0.15)` → `Color.scErrorSurface`; advisory overlay `.yellow.opacity(0.18)` → neutral `scSurfaceElevated` (per R7 de-color, *not* yellow); icon `.orange` → advisory/state fg; toolbar `.tint(.red)` Stop → accent/AuroraButtonStyle**; cards `controlBackgroundColor` → `surfaceElevated`; spacing/radius tokens)
+- Modify: `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` (**ad-hoc-build callout `.orange` icon + `.orange.opacity(0.12)` background → advisory roles; the `daemonInstallIconColor` switch `.green`→`successFg` / `.red`→`errorFg` / `.orange`→advisory fg; "Granted" `.green` label → `successFg`**; replace `.font(.system(size: 16/22/20))` literals with type-scale steps)
+- Test: `macos/ScreencapTests/LaunchSurfaceTokenTests.swift` (source-level grep guard) + the manual light/dark gate below
 
 **Approach:**
 - "Applied" = no inline color literals remain on these four surfaces and role references are in place (per R8). The MainWindow and FirstRunPermissions literals above are easy to miss — they are the reason this list is exhaustive rather than "the `.orange` ones."
@@ -254,7 +254,7 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 | Neon gradient fails contrast on white (light mode) | Deepened light-mode gradient authored in U1; dark-validation gate also checks light |
 | `project.yml` edited but project not regenerated → global accent not applied | U1 verification requires `xcodegen generate` + a build before the accent is confirmed |
 | Half-migration (4 surfaces tokenized, rest stock) reads inconsistent | Global `AccentColor` makes untokenized surfaces inherit the accent + dark resolution, narrowing the gap |
-| The repo's SwiftUI test host (`ScreenCapTests/SearchViewHostingHarness.swift`) cannot read back a `Color` or distinguish shapes | Automated checks lean on the pure-mapping unit tests (U1 role resolution, U3 `kind→role`) + a deterministic source-level grep guard for "no literals remain" (U4); color/shape correctness is the manual light/dark gate, by design |
+| The repo's SwiftUI test host (`ScreencapTests/SearchViewHostingHarness.swift`) cannot read back a `Color` or distinguish shapes | Automated checks lean on the pure-mapping unit tests (U1 role resolution, U3 `kind→role`) + a deterministic source-level grep guard for "no literals remain" (U4); color/shape correctness is the manual light/dark gate, by design |
 | Ad-hoc dev rebuilds drop TCC grants while QA'ing onboarding | `tccutil reset` for a clean first-run (institutional learning) |
 
 ---
@@ -263,4 +263,4 @@ The app is essentially stock SwiftUI — ~164 scattered inline color literals, d
 
 - **Origin document:** [docs/brainstorms/2026-06-30-design-token-foundation-requirements.md](docs/brainstorms/2026-06-30-design-token-foundation-requirements.md)
 - Color design pass + Aurora palette rationale: [docs/ideation/2026-06-30-visual-design-language-ideation.md](docs/ideation/2026-06-30-visual-design-language-ideation.md)
-- Related code: `macos/project.yml`, `macos/ScreenCap/Assets.xcassets`, `macos/ScreenCap/Views/Privacy/PrivacyBadgeStyle.swift`, `macos/ScreenCap/ScreenCapApp.swift`
+- Related code: `macos/project.yml`, `macos/Screencap/Assets.xcassets`, `macos/Screencap/Views/Privacy/PrivacyBadgeStyle.swift`, `macos/Screencap/ScreencapApp.swift`

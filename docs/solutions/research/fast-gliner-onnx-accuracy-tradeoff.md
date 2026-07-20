@@ -21,7 +21,7 @@ references:
 
 # fast-gliner ONNX swap — accuracy tradeoff
 
-ScreenCap runs GLiNER through `fast-gliner` (ONNX, no `transformers` at inference) for
+Screencap runs GLiNER through `fast-gliner` (ONNX, no `transformers` at inference) for
 footprint and bundled-binary reasons — see
 [scr-28-privacy-filter-vs-gliner.md](scr-28-privacy-filter-vs-gliner.md) for *why* that
 runtime was chosen. This doc preserves the **accuracy cost** of that swap, measured by
@@ -30,7 +30,7 @@ result JSONs were removed in SCR-119; the numbers live here.
 
 **Verdict: ACCEPTED.** The swap **held recall, document-leak rate, and redaction
 survival** while trading ~3.7 precision points via two extra PERSON/ADDRESS false
-positives. For ScreenCap (PII-sparse dev-screen captures where the precision/FP axis is
+positives. For Screencap (PII-sparse dev-screen captures where the precision/FP axis is
 the one that matters) this was an acceptable cost for the footprint/speed win.
 
 ## Measured delta

@@ -12,7 +12,7 @@ related_review_run: /tmp/compound-engineering/ce-code-review/20260508-210223-e21
 
 ## Problem
 
-In [macos/ScreenCap/Controllers/RecorderController.swift:572](../../macos/ScreenCap/Controllers/RecorderController.swift), `consumeDaemonEvents` re-fetches `sessionSnapshot()` on every reconnect iteration and uses **the snapshot's cursor**, not the cursor of the last successfully delivered event. Events emitted between stream drop and the re-fetch snapshot are irretrievably lost.
+In [macos/Screencap/Controllers/RecorderController.swift:572](../../macos/Screencap/Controllers/RecorderController.swift), `consumeDaemonEvents` re-fetches `sessionSnapshot()` on every reconnect iteration and uses **the snapshot's cursor**, not the cursor of the last successfully delivered event. Events emitted between stream drop and the re-fetch snapshot are irretrievably lost.
 
 The PR body's residual #17(a) characterizes this as "uses initial snapshot cursor for every retry." That framing is **wrong**: the cursor IS updated per re-fetch. The actual gap is that no code path saves `event.cursor` from received events anywhere, so the reconnect cursor is the server's current position at re-fetch time, not the position right after the last received event. A follow-up implementor reading only the PR body may write a "track cursor across retries" fix that doesn't address the dropped window around re-fetch.
 

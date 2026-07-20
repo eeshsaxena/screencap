@@ -181,7 +181,7 @@ nearest_frame(frames, anchor_ms, cap_ms = 30_000, blocked_intervals = ()):
 **Patterns to follow:**
 - `src/screencap/index_core.py:187`-`195` (glob/parse/sort) and its `SCRUB_BLOCK_ACTIONS` interval-skip shape.
 - `src/screencap/redaction/geometry.py:38` (`parse_screenshot_timestamp`).
-- Swift source of truth: `macos/ScreenCap/Controllers/RecordingFrameIndex.swift:26` (`nearest`), `:99` (`loadFrames`), `:65` (cap).
+- Swift source of truth: `macos/Screencap/Controllers/RecordingFrameIndex.swift:26` (`nearest`), `:99` (`loadFrames`), `:65` (cap).
 
 **Test scenarios:**
 - Happy path — frames at epochs `[1719400000.0, 1719400001.25, 1719400002.5]`, anchor `1719400001000` ms → nearest stem + signed `delta_ms`; asserts parse+sort+ms-rounding.
@@ -377,7 +377,7 @@ Keep all privacy-marked tests Vision/OCR-free (naturally satisfied — no OCR in
 ## Sources & References
 
 - **Origin ticket:** [SCR-186](https://linear.app/zk-email/issue/SCR-186/p2-add-daemon-v0-mcp-frameresolve-nearest-frame-primitive-scr-177) — related to [SCR-177](https://linear.app/zk-email/issue/SCR-177/search-results-screenshot-thumbnails-matched-text-highlighting) (PR [#288](https://github.com/proteus-computer-use/screencap/pull/288)).
-- Swift algorithm: `macos/ScreenCap/Controllers/RecordingFrameIndex.swift`, tests `macos/ScreenCapTests/RecordingFrameIndexTests.swift`.
+- Swift algorithm: `macos/Screencap/Controllers/RecordingFrameIndex.swift`, tests `macos/ScreencapTests/RecordingFrameIndexTests.swift`.
 - Daemon: `src/screencap/daemon/app.py`, `schema.py`, `_idle_shutdown.py`, `_name_validation.py`.
 - MCP: `src/screencap/mcp/server.py`, `src/screencap/mcp/_client.py`.
 - Reuse: `src/screencap/redaction/geometry.py` (`parse_screenshot_timestamp`), `src/screencap/index_core.py`, `src/screencap/backfill/skip_intervals.py` (fail-closed blocked-interval derivation), `src/screencap/config.py` (`resolve_recording_dir`, `get_chunk_duration`).

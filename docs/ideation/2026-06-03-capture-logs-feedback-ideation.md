@@ -5,15 +5,15 @@ focus: How to capture logs and feedback from the users
 mode: repo-grounded
 ---
 
-# Ideation: Capturing logs & feedback from ScreenCap's users
+# Ideation: Capturing logs & feedback from Screencap's users
 
-The through-line: ScreenCap's **dominant documented bug is silent failure**, and its persona is **non-technical**, and its brand is **privacy/local-first**. So the whole topic is "convert invisible machine and user signal into observable, privacy-safe, low-friction data" — ideally over **one shared substrate** rather than five bespoke pipes, with **zero automatic egress** as an architectural invariant.
+The through-line: Screencap's **dominant documented bug is silent failure**, and its persona is **non-technical**, and its brand is **privacy/local-first**. So the whole topic is "convert invisible machine and user signal into observable, privacy-safe, low-friction data" — ideally over **one shared substrate** rather than five bespoke pipes, with **zero automatic egress** as an architectural invariant.
 
 ## Grounding Context (Codebase Context)
 
 - **Project shape:** macOS-only Python `click` CLI (`screencap`) supervised by a background daemon (LaunchAgent + UNIX-socket `/v0/*` HTTP API), plus a SwiftUI macOS app shell. Engine is an internal sub-package.
 - **Logging today:** every module uses stdlib `logging.getLogger(__name__)` but there is **no centralized logging config and no `RotatingFileHandler`** — logs scatter and spawned engine-worker logs can vanish (no root handler in children).
-- **Existing sinks:** `~/.screencap/run/auto-serve.log` (mode 0o600); `~/Library/Logs/ScreenCap/daemon.{out,err}.log` (LaunchAgent stdout/stderr); `~/.screencap/menubar_debug.log`; per-recording `.recording_error.log` + `.recording_ready` sentinels and network `.mitmdump.log`; per-recording `system_metrics.json` (schema v4: platform/network/psutil). Recordings live at `~/.screencap/recordings/<name>/`.
+- **Existing sinks:** `~/.screencap/run/auto-serve.log` (mode 0o600); `~/Library/Logs/Screencap/daemon.{out,err}.log` (LaunchAgent stdout/stderr); `~/.screencap/menubar_debug.log`; per-recording `.recording_error.log` + `.recording_ready` sentinels and network `.mitmdump.log`; per-recording `system_metrics.json` (schema v4: platform/network/psutil). Recordings live at `~/.screencap/recordings/<name>/`.
 - **Reusable substrate already present:** daemon EventBus + `/v0/events?since=cursor` replay + `/v0/status`; opt-in GCS upload pipeline being built.
 - **No** `doctor` / `feedback` / `bugreport` / `telemetry` / `crash-report` command exists today. Sentry is **not** a dependency (it appears only in privacy blocklists).
 - **Dominant in-repo bug shape = SILENT FAILURE:** `except Exception: pass` (including on the error-logger itself at `session.py:242`), success inferred from partial state, "Recording complete" shown over destroyed data, install verification piped to `/dev/null` hiding a SIGKILL, mitmproxy "0 flows" indistinguishable from success. North star for this topic: **make absence observable; fail closed.**

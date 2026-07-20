@@ -18,7 +18,7 @@ Phase 1 adds a `screencap serve` subcommand that runs an ASGI app on a self-boun
 
 ## Problem Frame
 
-ScreenCap's current shape — CLI-as-engine, SwiftUI-shells-CLI — is the textbook subprocess-per-call pattern that every durable 3-surface tool (Tailscale, Docker, Ollama, Syncthing, rclone) refactored away from once a third surface arrived. With MCP for computer-use agents now a near-term commitment per `STRATEGY.md`, the same pressure is here. Phase 1 extracts the API contract first and routes SwiftUI through it; Phase 2 (separate plan, after Phase 1 is observable in production) consolidates the engine into the daemon and lands the MCP server. See [origin brainstorm](docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md) for the full motivation, actor model, and rejected alternatives.
+Screencap's current shape — CLI-as-engine, SwiftUI-shells-CLI — is the textbook subprocess-per-call pattern that every durable 3-surface tool (Tailscale, Docker, Ollama, Syncthing, rclone) refactored away from once a third surface arrived. With MCP for computer-use agents now a near-term commitment per `STRATEGY.md`, the same pressure is here. Phase 1 extracts the API contract first and routes SwiftUI through it; Phase 2 (separate plan, after Phase 1 is observable in production) consolidates the engine into the daemon and lands the MCP server. See [origin brainstorm](docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md) for the full motivation, actor model, and rejected alternatives.
 
 ---
 
@@ -42,7 +42,7 @@ Phase 1 advances these origin requirements (R-IDs preserved from origin):
 
 R7 and R12 are Phase 2; tracked here only as forward constraints on the API contract shape.
 
-**Origin actors:** A1 (CLI power user), A2 (non-technical GUI operator — primary persona), A3 (computer-use agent via MCP — Phase 2 consumer, but contract designed in Phase 1), A4 (ScreenCap engineer).
+**Origin actors:** A1 (CLI power user), A2 (non-technical GUI operator — primary persona), A3 (computer-use agent via MCP — Phase 2 consumer, but contract designed in Phase 1), A4 (Screencap engineer).
 
 **Origin flows:** F1 (GUI records, agent observes — Phase 2 completes), F2 (agent starts, GUI joins late — late-join semantics defined here), F3 (CLI power user, no GUI — Phase 1 honors), F4 (first-launch install — Phase 1 delivers).
 
@@ -86,9 +86,9 @@ R7 and R12 are Phase 2; tracked here only as forward constraints on the API cont
 - [src/screencap/session.py](src/screencap/session.py) — `SessionController` at lines 427+; existing signal-handler / supervisor pattern. Daemon either reuses it or factors out a thinner supervisor.
 - [src/screencap/pidfile.py](src/screencap/pidfile.py) — `claim_lock(capture_dir, claimant)` flock primitive; `read_lock_metadata()` / `lock_is_active()` non-contending probes; `find_orphaned_processes` / `terminate_processes` for the SIGTERM→SIGKILL pattern.
 - [src/screencap/catalog.py](src/screencap/catalog.py) — `list_recordings()` directory-scan + per-recording SQLite reads; concurrent-safe (read-only `query_only=ON` + `busy_timeout=5000`).
-- [macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift) — single point of subprocess spawning. `runJSON<T>` at lines 121-132, long-lived `spawn` at lines 261-340, `LineBuffer` at lines 411-444. Pipe-drain-to-EOF in `terminationHandler` is load-bearing (lines 304-331) — must be preserved through transport swap.
-- [macos/ScreenCap/Controllers/RecorderController.swift](macos/ScreenCap/Controllers/RecorderController.swift) — `SUPPORTED_EVENT_SCHEMA_VERSION=1`; `RecorderEventLine` decode shape; `RecordingState` machine driven by 10 event types. New `SUPPORTED_API_SCHEMA_VERSION` mirrors this.
-- [macos/ScreenCap/Controllers/PermissionController.swift](macos/ScreenCap/Controllers/PermissionController.swift) — `relaunchApplication()` at lines 197-241, `requestAndOpenSettings(for:)` at lines 251-269. Reusable for the daemon-relaunch verb and the TCC migration UX.
+- [macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift) — single point of subprocess spawning. `runJSON<T>` at lines 121-132, long-lived `spawn` at lines 261-340, `LineBuffer` at lines 411-444. Pipe-drain-to-EOF in `terminationHandler` is load-bearing (lines 304-331) — must be preserved through transport swap.
+- [macos/Screencap/Controllers/RecorderController.swift](macos/Screencap/Controllers/RecorderController.swift) — `SUPPORTED_EVENT_SCHEMA_VERSION=1`; `RecorderEventLine` decode shape; `RecordingState` machine driven by 10 event types. New `SUPPORTED_API_SCHEMA_VERSION` mirrors this.
+- [macos/Screencap/Controllers/PermissionController.swift](macos/Screencap/Controllers/PermissionController.swift) — `relaunchApplication()` at lines 197-241, `requestAndOpenSettings(for:)` at lines 251-269. Reusable for the daemon-relaunch verb and the TCC migration UX.
 - [pyinstaller/screencap.spec](pyinstaller/screencap.spec) — Onedir bundle; `multiprocessing.freeze_support()` in [pyinstaller/main.py](pyinstaller/main.py). Same spec serves the daemon — `screencap serve` is just another subcommand.
 - [tests/test_stderr_event_contract.py](tests/test_stderr_event_contract.py) — Golden-shape pinning per event type. New `tests/daemon/test_event_contract.py` mirrors this for NDJSON stream.
 
@@ -153,7 +153,7 @@ R7 and R12 are Phase 2; tracked here only as forward constraints on the API cont
 - Whether to use `posix_spawn` vs `multiprocessing.Process` for the engine subprocess — depends on observed re-import cost in the frozen binary.
 - Per-recording chunk size adjustment (currently 15s, defensible default; benchmarking once daemon is in place may warrant a change).
 - **Drain-to-EOF buffer-chain invariant** (U4): NDJSON-over-chunked-HTTP introduces three buffers (asyncio.Queue → uvicorn transport → kernel UDS) where the existing stderr pipe drain only had one. Need an explicit on-shutdown discipline — likely "EventBus broadcasts a `stream_closing` sentinel to every subscriber queue; each `events` route handler awaits its own queue drain before returning from the ASGI handler; only then does uvicorn close the response." Settle the exact mechanism (sentinel event vs ASGI lifespan shutdown hook vs timed drain) at U4 implementation time. Test must verify final events are delivered when daemon receives SIGTERM mid-recording.
-- **launchd KeepAlive race with orphan-cleanup window** (U5): the proposed approach runs orphan reconciliation *before* accepting connections (line: "on serve start (before accepting connections)"). For a daemon restart during an active recording, this incurs up to 30s of `connection refused` for clients (SwiftUI sees ScreenCap "unresponsive after restart"). Consider running orphan reconciliation *concurrently* with accept, with `session.snapshot` returning a `recovering` state during the window. Alternatively, shorten the SIGTERM grace (5s) and rely on SIGKILL. Pick the trade-off at U5 implementation time, document the chosen approach.
+- **launchd KeepAlive race with orphan-cleanup window** (U5): the proposed approach runs orphan reconciliation *before* accepting connections (line: "on serve start (before accepting connections)"). For a daemon restart during an active recording, this incurs up to 30s of `connection refused` for clients (SwiftUI sees Screencap "unresponsive after restart"). Consider running orphan reconciliation *concurrently* with accept, with `session.snapshot` returning a `recovering` state during the window. Alternatively, shorten the SIGTERM grace (5s) and rely on SIGKILL. Pick the trade-off at U5 implementation time, document the chosen approach.
 - **`force=true` cross-claimant authorization** (U5): same-EUID origin check is the only gate today, which means any same-user process (including a future MCP server) can terminate any user-owned recording silently. Decide between (a) CAS-style proof-of-intent (caller must echo `claimant_pid` + `started_at` from a prior `session.snapshot` read), (b) UI-confirmation-only (accept that direct socket callers can force-stop and rely on operational discipline), or (c) drop `force=true` entirely from Phase 1 and require users to use `kill -TERM` explicitly. Resolve at U5 implementation time before the verb ships.
 
 ---
@@ -174,7 +174,7 @@ The plan introduces a new `daemon/` sub-package and a new `tests/daemon/` tree. 
             supervisor.py          # Engine subprocess lifecycle, SIGCHLD handling, orphan reconciliation
             launchagent.py         # Plist rendering, install/uninstall, launchctl orchestration
 
-    macos/ScreenCap/Controllers/
+    macos/Screencap/Controllers/
         DaemonClient.swift         # NWConnection-over-UDS, HTTP framing, NDJSON parser, schema-version pin
 
     tests/
@@ -457,7 +457,7 @@ NDJSON. One JSON object per `\n`-terminated line. Events carry `{type, ts, schem
 - `recording.stop` flow: if current claimant is `daemon`, send graceful stop to engine (existing `screencap stop` SIGTERM-then-orphan-detect-then-SIGKILL chain); if claimant is `cli` and `force` is false, return `not_owned_by_daemon` error; if `force=true`, reuse `pidfile.terminate_processes` pattern.
 - Engine crash detection: SIGCHLD → reconciliation routine: kernel auto-released the engine's flock (per `pidfile.py` comment); finalize catalog row to `terminated_unexpectedly`; emit `engine_crashed` then `recording_finalized(force_stopped=true)` on the bus so SwiftUI's existing `forceStopped` parser path handles it.
 - Daemon-startup orphan reconciliation: on serve start (before accepting connections), scan `pidfile.read_lock_metadata()`; if `claimant="daemon"` and engine PID is alive but not our PID, SIGTERM with 30s grace, then SIGKILL (mirrors `pidfile.terminate_processes` pattern); emit `previous_session_force_terminated` to subsequent subscribers; finalize catalog row. If `claimant="daemon"` but engine PID is already dead, emit `previous_session_recovered` instead. **Negative branch:** when the lock claimant is anything other than `daemon` (e.g., `cli`, `swiftui`), the daemon never touches it — log + leave alone + surface as a read-only session via U3.
-- **No `daemon.reload` API verb.** Earlier draft included one; removed because (a) it ships a privileged self-termination endpoint to a production socket for what is fundamentally a dev-mode and prod-upgrade convenience, and (b) the right tool already exists. SwiftUI's "ScreenCap daemon needs to reload" UI invokes `launchctl kickstart -kp gui/$UID/com.screencap.daemon` (via a small NSAppleScript or shell-out) — same effect, no new attack surface. CLI users get the same path documented in Operational Notes. Production upgrade flow: the installer calls `launchctl kickstart` after replacing the binary; the daemon does not auto-detect on-disk binary changes (no inotify polling).
+- **No `daemon.reload` API verb.** Earlier draft included one; removed because (a) it ships a privileged self-termination endpoint to a production socket for what is fundamentally a dev-mode and prod-upgrade convenience, and (b) the right tool already exists. SwiftUI's "Screencap daemon needs to reload" UI invokes `launchctl kickstart -kp gui/$UID/com.screencap.daemon` (via a small NSAppleScript or shell-out) — same effect, no new attack surface. CLI users get the same path documented in Operational Notes. Production upgrade flow: the installer calls `launchctl kickstart` after replacing the binary; the daemon does not auto-detect on-disk binary changes (no inotify polling).
 
 **Execution note:** This is the highest-risk unit. Land `recording.start` / `recording.stop` happy-path first, then engine-crash reconciliation, then daemon-restart orphan cleanup. Each lands as its own commit-sized change so regressions are bisectable.
 
@@ -519,7 +519,7 @@ NDJSON. One JSON object per `\n`-terminated line. Events carry `{type, ts, schem
   - `ProcessType: Adaptive`
   - **No `LimitLoadToSessionType` key.** Earlier draft set this to `Aqua`; dropped because `gui/$UID` domain bootstrap implicitly requires an Aqua session anyway, and explicit `Aqua` would block legitimate headless-install paths (e.g., `screencap serve --install` over SSH where the user has launched a GUI session previously but isn't actively in one).
   - `ExitTimeOut: 30`
-  - **Path-valued plist keys** (`StandardErrorPath`, `StandardOutPath`, etc.): launchd does NOT expand `~` or `$HOME` in these keys (verified empirically on macOS 26.3 — see [docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md](docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md)). Two-mode `render_plist()`: bundled SMAppService plist omits both path keys (logs route to the unified system log via `log show --predicate 'process == "screencap"'`); CLI install path bakes the absolute log dir resolved via `Path.home()` at install time AND `mkdir -p`s it before `launchctl bootstrap`. Earlier drafts of this bullet recommended `~/Library/Logs/ScreenCap/daemon.{out,err}.log` literal — that recommendation is wrong and produces `EX_CONFIG` on every spawn.
+  - **Path-valued plist keys** (`StandardErrorPath`, `StandardOutPath`, etc.): launchd does NOT expand `~` or `$HOME` in these keys (verified empirically on macOS 26.3 — see [docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md](docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md)). Two-mode `render_plist()`: bundled SMAppService plist omits both path keys (logs route to the unified system log via `log show --predicate 'process == "screencap"'`); CLI install path bakes the absolute log dir resolved via `Path.home()` at install time AND `mkdir -p`s it before `launchctl bootstrap`. Earlier drafts of this bullet recommended `~/Library/Logs/Screencap/daemon.{out,err}.log` literal — that recommendation is wrong and produces `EX_CONFIG` on every spawn.
   - **`SCREENCAP_RUN_DIR` should NOT be set in EnvironmentVariables.** launchd does not expand `$HOME` in env-var values either; the daemon's own `default_socket_path()` resolves `~/.screencap/run/api.sock` via `Path.home()` at runtime. Earlier drafts that included `SCREENCAP_RUN_DIR: ~/.screencap/run` would plant a literal `~` path on every machine but the developer's.
   - `EnvironmentVariables: { PATH: <safe default> }` — PATH only.
   - No `WatchPaths`, no `Sockets`, no `MachServices`.
@@ -559,18 +559,18 @@ NDJSON. One JSON object per `\n`-terminated line. Events carry `{type, ts, schem
 **Dependencies:** U1, U2, U3, U4, U5.
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/DaemonClient.swift`
-- Modify: `macos/ScreenCap/Controllers/CLIClient.swift` (keep `runJSON` and `spawn` for CLI-subprocess fallback path during Phase 1; add doc note pointing to `DaemonClient` for daemon-driven flows)
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (route start/stop/snapshot through `DaemonClient`; subscribe to events over the socket; preserve `RecorderEventLine` decode shape)
-- Modify: `macos/ScreenCap/State/RecordingsIndex.swift` (use `DaemonClient.list` instead of `CLIClient.runJSON(["list", "--json"])`)
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (add `SUPPORTED_API_SCHEMA_VERSION: Int = 1`; warn on mismatch via existing OSLog category `recorder`)
-- Test: `macos/ScreenCapTests/DaemonClientTests.swift`, extend `macos/ScreenCapTests/RecorderControllerTests.swift`
+- Create: `macos/Screencap/Controllers/DaemonClient.swift`
+- Modify: `macos/Screencap/Controllers/CLIClient.swift` (keep `runJSON` and `spawn` for CLI-subprocess fallback path during Phase 1; add doc note pointing to `DaemonClient` for daemon-driven flows)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (route start/stop/snapshot through `DaemonClient`; subscribe to events over the socket; preserve `RecorderEventLine` decode shape)
+- Modify: `macos/Screencap/State/RecordingsIndex.swift` (use `DaemonClient.list` instead of `CLIClient.runJSON(["list", "--json"])`)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (add `SUPPORTED_API_SCHEMA_VERSION: Int = 1`; warn on mismatch via existing OSLog category `recorder`)
+- Test: `macos/ScreencapTests/DaemonClientTests.swift`, extend `macos/ScreencapTests/RecorderControllerTests.swift`
 
 **Approach:**
 - `DaemonClient` is the new transport sibling of `CLIClient`. Public surface: `request<T: Decodable>(method:, path:, body:) async throws -> T`, `subscribe(path:) -> AsyncStream<RecorderEventLine>`. Connection management: lazily connect to `~/.screencap/run/api.sock` on first call; reconnect on transport failure.
 - HTTP framing: `NWConnection` + manual write of request line / headers / body, parse status line + headers + Content-Length body. ~80 lines for a one-shot request, plus a streaming variant for `events` that uses `connection.receive(...)` looping and a line-buffer.
 - NDJSON parser reuses the existing `LineBuffer` in `CLIClient.swift:411-444` — same `0x0A` split logic, just consuming from `NWConnection.receive` instead of `Pipe.readabilityHandler`.
-- Schema-version pin: `SUPPORTED_API_SCHEMA_VERSION = 1` constant; on every response check `api_schema_version`; on mismatch surface "ScreenCap daemon needs to reload" UI. **The reload action shells out to `launchctl kickstart -kp gui/$UID/com.screencap.daemon`** (via NSAppleScript or `Process` invocation) — there is no daemon-side `reload` verb. After kickstart, `DaemonClient` reconnects via the standard reconnect path (close → reconnect → fresh snapshot → resubscribe). Mirrors existing `SUPPORTED_EVENT_SCHEMA_VERSION` discipline.
+- Schema-version pin: `SUPPORTED_API_SCHEMA_VERSION = 1` constant; on every response check `api_schema_version`; on mismatch surface "Screencap daemon needs to reload" UI. **The reload action shells out to `launchctl kickstart -kp gui/$UID/com.screencap.daemon`** (via NSAppleScript or `Process` invocation) — there is no daemon-side `reload` verb. After kickstart, `DaemonClient` reconnects via the standard reconnect path (close → reconnect → fresh snapshot → resubscribe). Mirrors existing `SUPPORTED_EVENT_SCHEMA_VERSION` discipline.
 - `RecorderController.start(name:)` now: `DaemonClient.request(method: .post, path: "/v0/recording.start", body: ...)` → on `LockContended` show existing UX; on success, call `/v0/session.snapshot` for the cursor, then subscribe to `/v0/events?since=<cursor>` and feed events through the same handler that today processes stderr events. `RecorderEventLine` and `RecordingState` machine unchanged.
 - `RecorderController.stop()` now calls `DaemonClient.request(method: .post, path: "/v0/recording.stop")`; existing 30s grace and event-driven UI transitions preserved.
 - Transitional path: when `session.snapshot` returns `daemon_owned: false` (i.e., a CLI process holds the lock), SwiftUI **renders a generic "Another process is recording" message** and disables Start. No dedicated CLI-claimant payload, no read-only-banner copy, no force-stop UI in Phase 1 — the polished mixed-mode UX is intentionally out of scope (see Scope Boundaries below). The existing CLI-subprocess fallback path is kept in `CLIClient` only as a safety net for cases where the daemon is uninstalled but SwiftUI still has stale state; that path is removed in Phase 2.
@@ -579,9 +579,9 @@ NDJSON. One JSON object per `\n`-terminated line. Events carry `{type, ts, schem
 
 The following surfaces have explicit named states that the implementation must render. Copy specifics defer to design; state taxonomy does not.
 
-- **DaemonClient connection probing** (first call after launch / after disconnect): `connecting` (loading indicator, "Connecting to ScreenCap daemon…"), `connected` (proceed), `connect_failed` (terminal error card with Retry + "Open install help" CTAs).
+- **DaemonClient connection probing** (first call after launch / after disconnect): `connecting` (loading indicator, "Connecting to Screencap daemon…"), `connected` (proceed), `connect_failed` (terminal error card with Retry + "Open install help" CTAs).
 - **Daemon-not-installed** (probe succeeds with no socket present): `prompt_install` state — surface CTA that triggers SMAppService registration + walks user through TCC re-prompt sequence (see U8 catalog).
-- **Schema-mismatch reload**: `mismatch_detected` (banner with reload CTA), `reloading` (spinner, "Restarting ScreenCap daemon…", 10s timeout), `reload_failed` (error card with manual CLI command), `reload_succeeded` (banner clears, normal flow resumes).
+- **Schema-mismatch reload**: `mismatch_detected` (banner with reload CTA), `reloading` (spinner, "Restarting Screencap daemon…", 10s timeout), `reload_failed` (error card with manual CLI command), `reload_succeeded` (banner clears, normal flow resumes).
 - **Mid-recording schema mismatch**: surface banner but do not interrupt active recording; reload CTA disabled until the recording stops or the user explicitly stops it.
 - **Recording state machine** (unchanged in shape from current `RecordingState` enum): `idle`, `starting`, `recording`, `stopping`, plus new `another_process_recording` (replaces the dedicated CLI-claimant banner). `another_process_recording` polls `session.snapshot` at 2s cadence to detect when the lock releases, then transitions back to `idle`.
 - **Connection-drop mid-recording**: `reconnecting` (transient, ≤3s, no UI surface needed), `recording_recovered` (continue normally if snapshot still shows daemon-owned recording), `recording_lost` (banner: daemon disappeared mid-recording — surface `engine_crashed` + `recording_finalized(force_stopped=true)` events that the daemon emits on restart).
@@ -622,9 +622,9 @@ The following surfaces have explicit named states that the implementation must r
 **Dependencies:** U6, U7.
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` (route to daemon install + TCC granting sequence for the daemon binary)
-- Modify: `macos/ScreenCap/AppDelegate.swift` or `ScreenCapApp.swift` (register daemon via `SMAppService.agent(plistName:).register()` on first launch)
-- Test: extend `macos/ScreenCapTests/PermissionControllerTests.swift`
+- Modify: `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` (route to daemon install + TCC granting sequence for the daemon binary)
+- Modify: `macos/Screencap/AppDelegate.swift` or `ScreencapApp.swift` (register daemon via `SMAppService.agent(plistName:).register()` on first launch)
+- Test: extend `macos/ScreencapTests/PermissionControllerTests.swift`
 
 **Approach:**
 - **First-launch flow (no migration banner; both surfaces hold TCC during interim):** on app launch, SwiftUI runs:
@@ -633,13 +633,13 @@ The following surfaces have explicit named states that the implementation must r
   3. TCC granting sequence for the daemon binary: walk user through System Settings deep-links for Screen Recording → Accessibility → Input Monitoring (sequential, one prompt at a time, with a checklist UI showing progress). Subject is `com.screencap.daemon`. Reuses existing `PermissionController.requestAndOpenSettings(for:)` infrastructure with the new subject.
   4. SwiftUI **continues to probe** TCC for `com.screencap.macos` in `PermissionController` (existing behavior unchanged) — the probes are informational during the interim period and become removable when U9 ships.
 - **Daemon-startup polling state catalog** (during step 1-2 above):
-  - `polling` — visible loading indicator with copy "Starting ScreenCap helper…" and a 10s timer.
+  - `polling` — visible loading indicator with copy "Starting Screencap helper…" and a 10s timer.
   - `polling_succeeded` — proceeds to step 3.
-  - `polling_failed` — error card with copy "ScreenCap helper didn't start. Try again, or open the install help for manual steps." Buttons: Retry, Open install help, Quit.
+  - `polling_failed` — error card with copy "Screencap helper didn't start. Try again, or open the install help for manual steps." Buttons: Retry, Open install help, Quit.
 - **Install-state taxonomy** (`screencap serve --install` and SwiftUI install path):
   - `installed_and_running` — daemon's `daemon.info` responded.
   - `install_failed_<reason>` where `<reason>` is a closed enum: `plist_write_failed` | `launchctl_bootstrap_failed` | `daemon_did_not_start` | `daemon_signing_invalid` | `disk_full` | `unknown`.
-  - `permission_required` — SMAppService approval pending. Recovery: surface "Approve ScreenCap helper in System Settings → Login Items" with a deep-link button; poll `SMAppService.agent.status` every 2s; on approval, transition to `polling`; on user explicit cancel, transition to `daemon_disabled` banner.
+  - `permission_required` — SMAppService approval pending. Recovery: surface "Approve Screencap helper in System Settings → Login Items" with a deep-link button; poll `SMAppService.agent.status` every 2s; on approval, transition to `polling`; on user explicit cancel, transition to `daemon_disabled` banner.
 - **Interim-period UX honesty:** because both surfaces have TCC entries and the daemon binary is ad-hoc-signed (no Developer ID yet), users will re-grant TCC for the daemon on every dev rebuild — same UX as today's SwiftUI app. Document this expectation in the runbook so users aren't surprised. The promise of "grants persist across updates" is **not** made until U9 ships.
 
 **Patterns to follow:**
@@ -648,7 +648,7 @@ The following surfaces have explicit named states that the implementation must r
 
 **Test scenarios:**
 - Happy path: fresh install → daemon registers via SMAppService → user grants three TCC permissions to daemon binary → recording works.
-- Edge case: user denies SMAppService approval → SwiftUI surfaces "ScreenCap helper required" UI with retry; recording disabled until approved.
+- Edge case: user denies SMAppService approval → SwiftUI surfaces "Screencap helper required" UI with retry; recording disabled until approved.
 - Edge case: user denies one of the three TCC prompts → existing engine `permission_lost` flow handles it; daemon emits the event; SwiftUI's existing `handlePermissionLost` path activates.
 - Edge case: dev-mode ad-hoc rebuild of daemon binary → TCC entry orphans (per documented learning); workaround documented as `tccutil reset com.screencap.daemon` in dev runbook.
 - Integration: covers AE3 — fresh machine without GUI install: `screencap serve --install` from terminal followed by `screencap record` works end-to-end.
@@ -677,10 +677,10 @@ This section ships only after Developer ID Application signing has been validate
 **Dependencies:** U8 shipped; **Developer ID Application signing validated end-to-end** (apply for cert; validate that signed builds produce stable TCC anchoring across rebuilds; document the signing pipeline before this unit starts). Cross-persona agreement (feasibility, product-lens, adversarial) flagged signing as the load-bearing prerequisite for the entitlement drop.
 
 **Files:**
-- Modify: `macos/ScreenCap/Info.plist` and `macos/ScreenCap/ScreenCap.entitlements` (drop Screen Recording / Accessibility / Input Monitoring usage descriptions and entitlements)
-- Modify: `macos/ScreenCap/Controllers/PermissionController.swift` (remove in-process probes for the three migrated permissions; keep mic/camera unchanged)
-- Create: `macos/ScreenCap/Views/Privacy/DaemonMigrationView.swift` (one-time banner)
-- Modify: `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` (insert the migration-banner step before the U8 install + TCC walkthrough on upgrade paths)
+- Modify: `macos/Screencap/Info.plist` and `macos/Screencap/Screencap.entitlements` (drop Screen Recording / Accessibility / Input Monitoring usage descriptions and entitlements)
+- Modify: `macos/Screencap/Controllers/PermissionController.swift` (remove in-process probes for the three migrated permissions; keep mic/camera unchanged)
+- Create: `macos/Screencap/Views/Privacy/DaemonMigrationView.swift` (one-time banner)
+- Modify: `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` (insert the migration-banner step before the U8 install + TCC walkthrough on upgrade paths)
 - Create: `docs/runbooks/developer-id-signing-validation.md` (signing pipeline + rebuild-survives-TCC verification)
 - Test: manual smoke runbook for AE2 (rebuild + verify-grants-persist cycle)
 
@@ -688,12 +688,12 @@ This section ships only after Developer ID Application signing has been validate
 - **Pre-flight signing validation** (gate to U9 starting): build a `screencap` binary with the Developer ID Application certificate, notarize it, install on a clean macOS 13+ machine, grant Screen Recording TCC, rebuild with same cert, reinstall, verify grant persists without re-prompt. Document in the runbook so future releases follow the same pipeline. If validation fails (notarization gap, cert not yet provisioned), **do not start U9** — Phase 1c remains deferred.
 - **Upgrade-flow ordering (explicit sequence):** on app launch after upgrade, SwiftUI runs the following without overlap:
   1. Check marker file `~/.screencap/.tcc-migrated-v1`. If present, skip to step 5.
-  2. Show `DaemonMigrationView` (one-time banner) explaining "ScreenCap now uses a background helper for stable permissions across updates. Grant permissions once and they'll persist across all future ScreenCap updates." User dismisses to proceed.
+  2. Show `DaemonMigrationView` (one-time banner) explaining "Screencap now uses a background helper for stable permissions across updates. Grant permissions once and they'll persist across all future Screencap updates." User dismisses to proceed.
   3. Run U8's daemon install + TCC granting sequence (already in place from U8 release).
   4. Write the marker file. Banner never shows again.
   5. Normal flow proceeds.
 - **`DaemonMigrationView` active-recording collision:** banner is suppressed if `session.snapshot` returns `is_recording: true` (CLI process recording). Avoids stacking modal-feeling surfaces.
-- **Entitlement drop:** remove `NSScreenCaptureUsageDescription`, `NSAccessibilityUsageDescription`, and Input Monitoring equivalents from `Info.plist`; `ScreenCap.entitlements` matching keys.
+- **Entitlement drop:** remove `NSScreenCaptureUsageDescription`, `NSAccessibilityUsageDescription`, and Input Monitoring equivalents from `Info.plist`; `Screencap.entitlements` matching keys.
 - **`PermissionController` cleanup:** remove `checkScreenRecording`, `checkAccessibility`, `checkInputMonitoring` and associated probes. Microphone and camera permissions stay.
 - **Marker file is not the sole source of truth:** daemon's startup path runs `_check_macos_permissions()` independently. The marker only suppresses the *banner*; it does not suppress actual TCC verification. A spoofed marker still triggers `permission_lost` events when grants are missing.
 
@@ -726,7 +726,7 @@ This section ships only after Developer ID Application signing has been validate
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| TCC re-prompt UX confuses existing users on upgrade | High | Medium | Explicit one-time migration banner (`DaemonMigrationView`); release notes call out "ScreenCap now requests permissions for the background helper — grant them once and they'll persist across all future updates." |
+| TCC re-prompt UX confuses existing users on upgrade | High | Medium | Explicit one-time migration banner (`DaemonMigrationView`); release notes call out "Screencap now requests permissions for the background helper — grant them once and they'll persist across all future updates." |
 | Schema drift in dev (`pip install -e .` swaps binary while daemon runs) | High | Low | Daemon advertises `daemon_version` + `api_schema_version` on every response; SwiftUI surfaces "reload daemon" UI on mismatch; CTA shells out to `launchctl kickstart -kp gui/$UID/com.screencap.daemon`. Same path documented in Operational Notes for CLI users. |
 | Orphan engine subprocess after daemon SIGKILL via launchd | Medium | High | Daemon-startup orphan reconciliation (U5): scan lock metadata for daemon-claimant orphans, SIGTERM with 30s grace, then SIGKILL; mirrors existing `pidfile.terminate_processes` pattern. |
 | Swift `NWConnection` HTTP framing edge cases (chunked-encoding boundaries, content-length parsing) | Medium | Medium | Hand-rolled framing kept minimal — small explicit parser with golden-shape tests; reuse existing `LineBuffer` for body splitting; fall back to BSD socket dial via `Darwin` if `sun_path` >104 chars (codebase uses `~/.screencap/run/api.sock` which is well under). |
@@ -799,7 +799,7 @@ This section ships only after Developer ID Application signing has been validate
 
 ## Documentation Plan
 
-- README: add a "Daemon (Phase 1)" subsection — what `screencap serve` does, how it's installed via SwiftUI vs CLI, how to debug (`~/Library/Logs/ScreenCap/daemon.{out,err}.log`).
+- README: add a "Daemon (Phase 1)" subsection — what `screencap serve` does, how it's installed via SwiftUI vs CLI, how to debug (`~/Library/Logs/Screencap/daemon.{out,err}.log`).
 - `macos/README.md`: update with SMAppService registration flow, TCC migration note for upgrading users.
 - `CLAUDE.md`: extend Project Overview to describe daemon process; add the `~/.screencap/run/api.sock` to the path list.
 - New `docs/solutions/` entries to capture once Phase 1 ships:
@@ -813,7 +813,7 @@ This section ships only after Developer ID Application signing has been validate
 
 ## Operational / Rollout Notes
 
-- **Logs path:** `~/Library/Logs/ScreenCap/daemon.{out,err}.log` — conventional location, easy for users to attach to bug reports.
+- **Logs path:** `~/Library/Logs/Screencap/daemon.{out,err}.log` — conventional location, easy for users to attach to bug reports.
 - **Diagnostic command:** `curl --unix-socket ~/.screencap/run/api.sock http://x/v0/daemon.info` — language-agnostic, works without Python — exposed as a documented debugging primitive.
 - **Force-restart:** `launchctl kickstart -kp gui/$UID/com.screencap.daemon` — documented in support runbook.
 - **Uninstall:** `screencap serve --uninstall` is idempotent; user can run it twice without harm. Removes plist and unloads agent. SwiftUI app's "Reset to defaults" UI may shell out to it.
@@ -826,6 +826,6 @@ This section ships only after Developer ID Application signing has been validate
 
 - **Origin document:** [docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md](docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md)
 - **Strategy:** [STRATEGY.md](STRATEGY.md) — UX & native experience load-bearing this quarter; MCP near-term commitment.
-- Relevant code anchors: [src/screencap/cli.py](src/screencap/cli.py), [src/screencap/_stderr_events.py](src/screencap/_stderr_events.py), [src/screencap/pidfile.py](src/screencap/pidfile.py), [src/screencap/engine/screen_recorder.py](src/screencap/engine/screen_recorder.py), [macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift), [macos/ScreenCap/Controllers/RecorderController.swift](macos/ScreenCap/Controllers/RecorderController.swift).
+- Relevant code anchors: [src/screencap/cli.py](src/screencap/cli.py), [src/screencap/_stderr_events.py](src/screencap/_stderr_events.py), [src/screencap/pidfile.py](src/screencap/pidfile.py), [src/screencap/engine/screen_recorder.py](src/screencap/engine/screen_recorder.py), [macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift), [macos/Screencap/Controllers/RecorderController.swift](macos/Screencap/Controllers/RecorderController.swift).
 - Institutional learnings: [docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md](docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md), [docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md](docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md), [docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md](docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md), [docs/solutions/runtime-errors/sigint-handler-timing-and-recording-stop-methods.md](docs/solutions/runtime-errors/sigint-handler-timing-and-recording-stop-methods.md), [docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md](docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md), [docs/solutions/build-errors/pyinstaller-frozen-binary-ci-failures.md](docs/solutions/build-errors/pyinstaller-frozen-binary-ci-failures.md), [docs/solutions/build-errors/macos-pre14-binary-install-failure.md](docs/solutions/build-errors/macos-pre14-binary-install-failure.md).
 - External: Docker Engine API events ([API ref](https://docs.docker.com/reference/api/engine/version/v1.52/)), Apple [SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice), [`launchd.plist(5)`](https://keith.github.io/xcode-man-pages/launchd.plist.5.html), Apple DevForum threads [756756](https://developer.apple.com/forums/thread/756756) and [719635](https://developer.apple.com/forums/thread/719635) on `NWEndpoint.unix(path:)`, `man 3 getpeereid` and `man 4 unix`.

@@ -45,12 +45,12 @@ SCR-174 (PR #283) shipped the Ask-Your-History Search v1. It works, but the inte
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/Views/Search/SearchView.swift` — the SwiftUI surface. `runSearch()` (line ~358) is the only search trigger today, fired from `.onSubmit`. Phase-switch in `content` (line ~113) renders idle/searching/loaded/daemonDown. The top `Section` of `resultsList` (line ~142) already hosts the interpretation label, coverage row, and consent banner — the natural home for a count/truncation header.
-- `macos/ScreenCap/Views/Search/SearchViewModel.swift` — `@MainActor` view model. `Phase` enum (line 15) is the view-state source of truth. `search(_:contentIndexEnabled:)` (line 47) fans out to three streams, each fetched with a hardcoded `limit: 200` (lines 164, 175, 187). The `inFlight` guard (line 48) currently **drops** any search started while one is running — this is the behavior that must change for latest-query-wins. `SearchResults` (line 271) is the view-facing result struct.
-- `macos/ScreenCap/Views/Search/SearchAccessibility.swift` — pure, unit-testable VoiceOver-label builders (the established pattern for testable Search string logic). `searchOutcomeAnnouncement` (line 92) already speaks the result count; extend it for days/truncation parity.
-- `macos/ScreenCap/Controllers/PermissionController.swift` — the repo's `UserDefaults`-injection pattern (`defaults: UserDefaults = .standard`, line ~326) for a persistence store that stays unit-testable against an isolated suite. Mirror this for recent searches.
-- `macos/ScreenCap/Controllers/SearchService.swift` — protocol seam + `FakeSearchService` (in tests) that lets the view model be driven without a live socket.
-- `macos/ScreenCapTests/SearchViewModelTests.swift`, `SearchAccessibilityTests.swift`, `SearchKeyboardNavTests.swift` — existing test homes for this surface.
+- `macos/Screencap/Views/Search/SearchView.swift` — the SwiftUI surface. `runSearch()` (line ~358) is the only search trigger today, fired from `.onSubmit`. Phase-switch in `content` (line ~113) renders idle/searching/loaded/daemonDown. The top `Section` of `resultsList` (line ~142) already hosts the interpretation label, coverage row, and consent banner — the natural home for a count/truncation header.
+- `macos/Screencap/Views/Search/SearchViewModel.swift` — `@MainActor` view model. `Phase` enum (line 15) is the view-state source of truth. `search(_:contentIndexEnabled:)` (line 47) fans out to three streams, each fetched with a hardcoded `limit: 200` (lines 164, 175, 187). The `inFlight` guard (line 48) currently **drops** any search started while one is running — this is the behavior that must change for latest-query-wins. `SearchResults` (line 271) is the view-facing result struct.
+- `macos/Screencap/Views/Search/SearchAccessibility.swift` — pure, unit-testable VoiceOver-label builders (the established pattern for testable Search string logic). `searchOutcomeAnnouncement` (line 92) already speaks the result count; extend it for days/truncation parity.
+- `macos/Screencap/Controllers/PermissionController.swift` — the repo's `UserDefaults`-injection pattern (`defaults: UserDefaults = .standard`, line ~326) for a persistence store that stays unit-testable against an isolated suite. Mirror this for recent searches.
+- `macos/Screencap/Controllers/SearchService.swift` — protocol seam + `FakeSearchService` (in tests) that lets the view model be driven without a live socket.
+- `macos/ScreencapTests/SearchViewModelTests.swift`, `SearchAccessibilityTests.swift`, `SearchKeyboardNavTests.swift` — existing test homes for this surface.
 
 ### Institutional Learnings
 
@@ -105,7 +105,7 @@ SCR-174 (PR #283) shipped the Ask-Your-History Search v1. It works, but the inte
 | `.idle` | true | Spinner (first-ever search) |
 | `.loaded(prior)` | true | Prior results + thin inline refresh indicator (U2) |
 | `.loaded(results)` | false | Results + count/truncation header (U3) |
-| `.daemonDown` | — | "ScreenCap isn't running" (unchanged) |
+| `.daemonDown` | — | "Screencap isn't running" (unchanged) |
 
 `isSearching` is only *meaningful* while `phase == .loaded` (an in-place refresh); it is set/cleared in all phases via `defer` but ignored for rendering outside `.loaded`.
 
@@ -135,9 +135,9 @@ keystroke → query changes
 **Dependencies:** None
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (debounce on `query` change; keep `.onSubmit` as an immediate-fire path)
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (remove `inFlight` drop-guard; add cooperative cancellation before publishing)
-- Test: `macos/ScreenCapTests/SearchViewModelTests.swift`
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (debounce on `query` change; keep `.onSubmit` as an immediate-fire path)
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (remove `inFlight` drop-guard; add cooperative cancellation before publishing)
+- Test: `macos/ScreencapTests/SearchViewModelTests.swift`
 
 **Approach:**
 - View: on `query` change, cancel the **single** held `searchTask` and start a new one that delays ~300 ms (cancellably) then calls `runSearch()` — the delay and the search are the same handle, so a superseded delay can never orphan-fire. `.onSubmit` and (U4) chip taps call `runSearch()` immediately but still cancel any pending task first. Empty/whitespace-only query returns to `.idle` (mirrors the current `runSearch` guard).
@@ -167,9 +167,9 @@ keystroke → query changes
 **Dependencies:** U1 at integration (the in-place refresh is only *visible* on-device once live re-search lands). The model-level `isSearching` behavior and its tests can be authored independently — the existing `FakeSearchService` exercises a second `search()` over `.loaded` without any view-level debounce.
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (add `@Published private(set) var isSearching`; set on entry + `defer { isSearching = false }`; only transition to `.searching` when phase is not already `.loaded`)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (render the inline refresh indicator when `isSearching && phase == .loaded`; reset `selectedResultID` when a new `.loaded` publishes; keep the full-screen spinner only for the idle→first-search case)
-- Test: `macos/ScreenCapTests/SearchViewModelTests.swift`
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (add `@Published private(set) var isSearching`; set on entry + `defer { isSearching = false }`; only transition to `.searching` when phase is not already `.loaded`)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (render the inline refresh indicator when `isSearching && phase == .loaded`; reset `selectedResultID` when a new `.loaded` publishes; keep the full-screen spinner only for the idle→first-search case)
+- Test: `macos/ScreencapTests/SearchViewModelTests.swift`
 
 **Approach:**
 - On entering `search`: set `isSearching = true` and `defer { isSearching = false }` (mirrors the old `inFlight`/`defer` pattern so **every** exit — empty-query early return, daemon-down, terminal load — clears it). If current phase is `.loaded`, leave it untouched (results stay visible); otherwise set `.searching`.
@@ -196,10 +196,10 @@ keystroke → query changes
 **Dependencies:** None for the helpers/heuristic; the announcement-gating change coordinates with U2's `isSearching`. Sequenced after U1/U2 for a clean diff.
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchAccessibility.swift` (add pure `resultCountLabel` / `truncationNote` static methods — same file as the other Search string helpers, no new file; extend/gate `searchOutcomeAnnouncement`)
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (promote `200` to a `streamFetchLimit` constant; add a `truncated: Bool` flag to `SearchResults`, defaulted so existing call sites still construct it; compute it from raw per-stream fetch counts)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (render the count label + truncation cue in the header `Section`; count on its own line, truncation cue on the line immediately below in secondary style, above the coverage row)
-- Test: `macos/ScreenCapTests/SearchAccessibilityTests.swift` (count/truncation helpers + announcement), `macos/ScreenCapTests/SearchViewModelTests.swift` (truncation flag)
+- Modify: `macos/Screencap/Views/Search/SearchAccessibility.swift` (add pure `resultCountLabel` / `truncationNote` static methods — same file as the other Search string helpers, no new file; extend/gate `searchOutcomeAnnouncement`)
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (promote `200` to a `streamFetchLimit` constant; add a `truncated: Bool` flag to `SearchResults`, defaulted so existing call sites still construct it; compute it from raw per-stream fetch counts)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (render the count label + truncation cue in the header `Section`; count on its own line, truncation cue on the line immediately below in secondary style, above the coverage row)
+- Test: `macos/ScreencapTests/SearchAccessibilityTests.swift` (count/truncation helpers + announcement), `macos/ScreencapTests/SearchViewModelTests.swift` (truncation flag)
 
 **Approach:**
 - Compute truncation **inside each per-stream `if case .ok` block**, where the raw pre-filter counts live (`rows` for the main timeline fetch, `payload.hits` for content, `hits` for transcript) — capture e.g. `let timelineTruncated = rows.count == streamFetchLimit` per block, then OR them when constructing `SearchResults`. Scope it to the **main** timeline fetch only; the per-recording correlation `timeline.query` calls (which always request 200) must not feed the heuristic, or every time-only query would falsely show truncated.
@@ -230,9 +230,9 @@ keystroke → query changes
 **Dependencies:** U1 (chip tap reuses the immediate-fire `runSearch()` path and the commit-only recording rule)
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/RecentSearchesStore.swift` (`UserDefaults`-backed, capped, move-to-front dedupe, injectable defaults)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (hold the store as `@StateObject`/`@State`; idle `content` branch renders chips; record on commit only; chip tap sets `query` and fires immediately)
-- Test: `macos/ScreenCapTests/RecentSearchesStoreTests.swift` (new)
+- Create: `macos/Screencap/Controllers/RecentSearchesStore.swift` (`UserDefaults`-backed, capped, move-to-front dedupe, injectable defaults)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (hold the store as `@StateObject`/`@State`; idle `content` branch renders chips; record on commit only; chip tap sets `query` and fires immediately)
+- Test: `macos/ScreencapTests/RecentSearchesStoreTests.swift` (new)
 
 **Approach:**
 - `RecentSearchesStore`: `record(_ query:)` trims, de-dupes (move existing to front), caps at ~6, persists to an injected `UserDefaults`; `recent` returns the list. Constructor takes `defaults: UserDefaults = .standard` (mirrors `PermissionController`); held in the view as `@StateObject`/`@State` so it survives body rebuilds (`MainWindow.detail` builds a fresh `SearchView` per window open, but the data lives in `UserDefaults` regardless).
@@ -287,4 +287,4 @@ keystroke → query changes
 - **Origin ticket:** [SCR-182 — Search UX polish](https://linear.app/zk-email/issue/SCR-182/search-ux-polish-live-results-result-count-truncation-note-recent)
 - **Predecessor:** [SCR-174 — Ask-Your-History Search v1](https://linear.app/zk-email/issue/SCR-174/ask-your-history-search-in-app-v1) (PR #283); requirements at `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`
 - **Sibling work already merged:** SCR-177 (thumbnails/highlighting), SCR-183 (`docs/plans/2026-06-26-003-feat-scr-183-search-accessibility-plan.md`)
-- Related code: `macos/ScreenCap/Views/Search/SearchView.swift`, `macos/ScreenCap/Views/Search/SearchViewModel.swift`, `macos/ScreenCap/Views/Search/SearchAccessibility.swift`, `macos/ScreenCap/Controllers/PermissionController.swift`
+- Related code: `macos/Screencap/Views/Search/SearchView.swift`, `macos/Screencap/Views/Search/SearchViewModel.swift`, `macos/Screencap/Views/Search/SearchAccessibility.swift`, `macos/Screencap/Controllers/PermissionController.swift`

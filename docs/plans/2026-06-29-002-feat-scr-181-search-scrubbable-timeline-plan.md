@@ -52,14 +52,14 @@ The in-app Search surface works today, but its result presentation is the reliab
 
 ### Relevant Code and Patterns
 
-- **Results rendering (the seam to extend)** — `macos/ScreenCap/Views/Search/SearchResultsView.swift`: `resultsList(_:)` builds the `List(selection:)` with a leading coverage/consent/backfill `Section` then per-day `ForEach(days)` sections. The timeline pins above this List. `searchDetailLayout(bar:content:)` (same file) is the `.safeAreaInset(edge: .top)` composition that fixed SCR-174 — the timeline pin must use the **same mechanism**, not a VStack sibling.
+- **Results rendering (the seam to extend)** — `macos/Screencap/Views/Search/SearchResultsView.swift`: `resultsList(_:)` builds the `List(selection:)` with a leading coverage/consent/backfill `Section` then per-day `ForEach(days)` sections. The timeline pins above this List. `searchDetailLayout(bar:content:)` (same file) is the `.safeAreaInset(edge: .top)` composition that fixed SCR-174 — the timeline pin must use the **same mechanism**, not a VStack sibling.
 - **Day grouping + labels (reuse as-is)** — `SearchResultsView.swift`: `searchResultsGroupedByDay(_:)` → `[(day, items)]` most-recent-first; `searchDayLabel(_:)` → "Today"/"Yesterday"/"EEE MMM d". The day strip and axis source their days/markers from these.
-- **Canvas marker timeline (the pattern to mirror)** — `macos/ScreenCap/Views/Review/TimelinePane.swift`: `Canvas` drawing ticks, **batched into one `Path` per category** (the explicit 10k-event performance note), drag→seconds via the pure `TimelinePaneScrub` enum (`scrubSeconds(forX:width:duration:)` / `cursorX(forSeconds:…)`). This is the template for both the draw loop and the extract-pure-math discipline.
+- **Canvas marker timeline (the pattern to mirror)** — `macos/Screencap/Views/Review/TimelinePane.swift`: `Canvas` drawing ticks, **batched into one `Path` per category** (the explicit 10k-event performance note), drag→seconds via the pure `TimelinePaneScrub` enum (`scrubSeconds(forX:width:duration:)` / `cursorX(forSeconds:…)`). This is the template for both the draw loop and the extract-pure-math discipline.
 - **Open-at-moment (already wired — just call it)** — `SearchView.openInspect(_:)` → `InspectRouting.decide(recording:anchorMs:isStub:)` → `InspectWindowOpener.shared.pendingSeekMs[recording]` + `openWindow(id: InspectWindowID, value:)`. A marker tap routes the selected `SearchResultItem` straight into this existing `onOpen` callback.
 - **Item model** — `SearchViewModel.swift`: `SearchResultItem { id, stream(.screen/.audio/.activity), recording, anchorMs: Int?, approximate, score, snippet, app, title }`; `SearchResultItem.streamTint`/`streamIcon`/`timeLabel`/`primaryText` extensions in `SearchResultsView.swift`.
 - **Keyboard selection + Return (the seam to keep in sync)** — `SearchView.swift` owns `@State selectedResultID`; `SearchResultsView.returnKeyHandler` opens the selected item on Return (and deliberately stands down while the field is focused / consent banner / backfill is active — the SCR-183 "don't hijack the default action" discipline). Markers must drive this same `selection`, and must **not** be `Button`s (which would steal the window default action).
-- **Pure a11y builders (extend)** — `macos/ScreenCap/Views/Search/SearchAccessibility.swift`: `resultRowLabel`, `coverageChipLabel`, etc. — SwiftUI-free, unit-tested. Marker/cluster VoiceOver labels belong here as new pure builders.
-- **View-hosting test infra (reuse)** — `macos/ScreenCapTests/SearchViewHostingHarness.swift` (`SearchViewHost.host` offscreen NSHostingView + `detailColumn` reproducing the NavigationSplitView detail; `SearchFixtures`) and `macos/ScreenCapTests/SearchViewLayoutTests.swift` (the SCR-174 starvation guard).
+- **Pure a11y builders (extend)** — `macos/Screencap/Views/Search/SearchAccessibility.swift`: `resultRowLabel`, `coverageChipLabel`, etc. — SwiftUI-free, unit-tested. Marker/cluster VoiceOver labels belong here as new pure builders.
+- **View-hosting test infra (reuse)** — `macos/ScreencapTests/SearchViewHostingHarness.swift` (`SearchViewHost.host` offscreen NSHostingView + `detailColumn` reproducing the NavigationSplitView detail; `SearchFixtures`) and `macos/ScreencapTests/SearchViewLayoutTests.swift` (the SCR-174 starvation guard).
 
 ### Institutional Learnings
 
@@ -149,8 +149,8 @@ pinned ABOVE the results List via `.safeAreaInset(edge: .top)`
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Search/SearchTimelineLayout.swift` (pure enum/struct: `placeMarkers`, `cluster`, `nodeAt`, day-bounds helper; a `TimelineNode` value type = `.single(SearchResultItem)` / `.cluster(items:count:x:)`)
-- Test: `macos/ScreenCapTests/SearchTimelineLayoutTests.swift`
+- Create: `macos/Screencap/Views/Search/SearchTimelineLayout.swift` (pure enum/struct: `placeMarkers`, `cluster`, `nodeAt`, day-bounds helper; a `TimelineNode` value type = `.single(SearchResultItem)` / `.cluster(items:count:x:)`)
+- Test: `macos/ScreencapTests/SearchTimelineLayoutTests.swift`
 
 **Approach:**
 - Mirror `TimelinePaneScrub`: guard non-positive width / zero-span (no NaN, no divide-by-zero), clamp ratios to `[0,1]`.
@@ -186,7 +186,7 @@ pinned ABOVE the results List via `.safeAreaInset(edge: .top)`
 **Dependencies:** U1
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Search/SearchDayTimeline.swift` (the day strip + `Canvas` axis + cluster disclosure; takes the day groups, a `selectedDay` binding, the shared `selectedResultID` binding, and an `onOpen` callback)
+- Create: `macos/Screencap/Views/Search/SearchDayTimeline.swift` (the day strip + `Canvas` axis + cluster disclosure; takes the day groups, a `selectedDay` binding, the shared `selectedResultID` binding, and an `onOpen` callback)
 - Modify: `macos/project.yml` only if needed, then `cd macos && xcodegen generate`
 - Test: covered indirectly via U1 (math) and U3 (host render); SwiftUI view body itself is manual-QA per repo norm (`openWindow`/Canvas not unit-testable)
 
@@ -215,9 +215,9 @@ pinned ABOVE the results List via `.safeAreaInset(edge: .top)`
 **Dependencies:** U2
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchResultsView.swift` (in the `.loaded` path, attach `SearchDayTimeline` via `.safeAreaInset(edge: .top)` on the results `List`; thread `selection` and `onOpen` through; show the timeline only when there is ≥1 anchored item)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` only if the `selectedDay` state must live alongside `selectedResultID` (default-most-recent + reset on new phase, mirroring the existing `selectedResultID` reset in `.onChange(of: model.phase)`)
-- Test: `macos/ScreenCapTests/SearchViewLayoutTests.swift` (extend with timeline-present cases)
+- Modify: `macos/Screencap/Views/Search/SearchResultsView.swift` (in the `.loaded` path, attach `SearchDayTimeline` via `.safeAreaInset(edge: .top)` on the results `List`; thread `selection` and `onOpen` through; show the timeline only when there is ≥1 anchored item)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` only if the `selectedDay` state must live alongside `selectedResultID` (default-most-recent + reset on new phase, mirroring the existing `selectedResultID` reset in `.onChange(of: model.phase)`)
+- Test: `macos/ScreencapTests/SearchViewLayoutTests.swift` (extend with timeline-present cases)
 
 **Approach:**
 - Render `SearchDayTimeline` as `.safeAreaInset(edge: .top)` on the existing `List` — the same inset mechanism `searchDetailLayout` uses for the search field. The List remains the detail root; the companion per-day sections and the "Heard in audio" section are unchanged.
@@ -247,9 +247,9 @@ pinned ABOVE the results List via `.safeAreaInset(edge: .top)`
 **Dependencies:** U2, U3
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchAccessibility.swift` (pure builders: `markerLabel(_:)` and `clusterLabel(items:)` — e.g. "Safari at 15:04, on screen" / "5 results between 15:00 and 15:10")
-- Modify: `macos/ScreenCap/Views/Search/SearchDayTimeline.swift` (apply the labels; ensure markers/clusters are accessibility elements with `.isButton` trait but are NOT SwiftUI `Button`s; keep selection in sync with `selectedResultID`)
-- Test: `macos/ScreenCapTests/SearchAccessibilityTests.swift` (label builders); `macos/ScreenCapTests/SearchKeyboardNavTests.swift` (selection→Return-open parity, if the existing seam is unit-reachable)
+- Modify: `macos/Screencap/Views/Search/SearchAccessibility.swift` (pure builders: `markerLabel(_:)` and `clusterLabel(items:)` — e.g. "Safari at 15:04, on screen" / "5 results between 15:00 and 15:10")
+- Modify: `macos/Screencap/Views/Search/SearchDayTimeline.swift` (apply the labels; ensure markers/clusters are accessibility elements with `.isButton` trait but are NOT SwiftUI `Button`s; keep selection in sync with `selectedResultID`)
+- Test: `macos/ScreencapTests/SearchAccessibilityTests.swift` (label builders); `macos/ScreencapTests/SearchKeyboardNavTests.swift` (selection→Return-open parity, if the existing seam is unit-reachable)
 
 **Approach:**
 - Add pure label builders mirroring `resultRowLabel`: a marker reads its `primaryText`/app + `timeLabel` + stream phrasing + an "approximate, from audio" suffix when applicable; a cluster reads its count + time span, never enumerating raw content (pointer-only posture preserved, R6/R8).
@@ -296,7 +296,7 @@ pinned ABOVE the results List via `.safeAreaInset(edge: .top)`
 - **Origin document:** [docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md](docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md) (R5, AE1, F1; "Per-day timeline rendering performance" Outstanding Question)
 - Ticket: [SCR-181](https://linear.app/zk-email/issue/SCR-181/search-results-graphical-scrubbable-per-day-timeline); v1: [SCR-174](https://linear.app/zk-email/issue/SCR-174/ask-your-history-search-in-app-v1) (PR #283)
 - v1 plan: `docs/plans/2026-06-24-002-feat-ask-your-history-search-plan.md`
-- Seam to extend: `macos/ScreenCap/Views/Search/SearchResultsView.swift`, `SearchView.swift`, `SearchAccessibility.swift`
-- Pattern to mirror: `macos/ScreenCap/Views/Review/TimelinePane.swift` (Canvas + `TimelinePaneScrub`)
-- Open-at-moment path: `macos/ScreenCap/Controllers/InspectRouting.swift`, `State/InspectWindowOpener.swift`
-- Test infra: `macos/ScreenCapTests/SearchViewHostingHarness.swift`, `SearchViewLayoutTests.swift`
+- Seam to extend: `macos/Screencap/Views/Search/SearchResultsView.swift`, `SearchView.swift`, `SearchAccessibility.swift`
+- Pattern to mirror: `macos/Screencap/Views/Review/TimelinePane.swift` (Canvas + `TimelinePaneScrub`)
+- Open-at-moment path: `macos/Screencap/Controllers/InspectRouting.swift`, `State/InspectWindowOpener.swift`
+- Test infra: `macos/ScreencapTests/SearchViewHostingHarness.swift`, `SearchViewLayoutTests.swift`

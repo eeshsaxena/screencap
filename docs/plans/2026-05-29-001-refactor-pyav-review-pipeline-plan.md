@@ -19,7 +19,7 @@ Replace the external `ffmpeg`/`ffprobe` CLI dependency in the native-review vide
 
 ## Problem Frame
 
-The native-review path prepares a recording for AVKit playback by shelling out to `ffmpeg`/`ffprobe` for chunk concat, pixel-format probing, and the yuv444p→yuv420p remediation re-encode AVKit's hardware H.264 decoder requires. Those binaries are not bundled, and a `.app` launched from Finder/Launchpad gets the minimal GUI PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so `shutil.which("ffmpeg")` fails even when the operator ran `brew install ffmpeg` — `CLIClient.mergedEnv()` ([macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift)) deliberately does not augment PATH. The failure is structural for the friend-trial operator this feature serves: native review silently fails to play chunked or yuv444p recordings, with an error pointing at a tool that may not even fix the problem. See origin doc for the full pain narrative.
+The native-review path prepares a recording for AVKit playback by shelling out to `ffmpeg`/`ffprobe` for chunk concat, pixel-format probing, and the yuv444p→yuv420p remediation re-encode AVKit's hardware H.264 decoder requires. Those binaries are not bundled, and a `.app` launched from Finder/Launchpad gets the minimal GUI PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), so `shutil.which("ffmpeg")` fails even when the operator ran `brew install ffmpeg` — `CLIClient.mergedEnv()` ([macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift)) deliberately does not augment PATH. The failure is structural for the friend-trial operator this feature serves: native review silently fails to play chunked or yuv444p recordings, with an error pointing at a tool that may not even fix the problem. See origin doc for the full pain narrative.
 
 PyAV (`av`) is already a hard dependency, ships inside the app, and is the same library the recorder writes video with — so moving the playback-critical path in-process eliminates both the install burden and the GUI-launched minimal-PATH fragility with zero new dependency.
 
@@ -39,7 +39,7 @@ PyAV (`av`) is already a hard dependency, ships inside the app, and is the same 
 - R8. moov-atom faststart optimization is unchanged — it continues to use the `ffmpeg` binary and to skip gracefully when the binary is absent.
 - R9. When PyAV genuinely cannot decode or process a source video, review surfaces a real "can't process this video" failure state, structurally distinct from a missing-dependency error. The `ffmpeg-not-found` envelope and the ffprobe-missing "remediate anyway" branch are removed.
 
-**Origin actors:** Operator (internal-tool-heavy user running ScreenCap in the SwiftUI app; consumes review playback via the native window).
+**Origin actors:** Operator (internal-tool-heavy user running Screencap in the SwiftUI app; consumes review playback via the native window).
 **Origin acceptance examples:** AE1 (Covers R1, R5), AE2 (Covers R3), AE3 (Covers R7), AE4 (Covers R6), AE5 (Covers R9), AE6 (Covers R8).
 
 ---

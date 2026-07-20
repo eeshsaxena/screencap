@@ -16,7 +16,7 @@ Ship the v1 privacy + onboarding polish for the macOS SwiftUI shell. Adds a per-
 
 ## Problem Frame
 
-SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before the friend-trial DMG ships. Today the Privacy sidebar section renders a "Coming in Unit 18" stub ([macos/ScreenCap/Views/MainWindow.swift:213](macos/ScreenCap/Views/MainWindow.swift:213)), and there is no in-app disclosure of what the privacy matrix actually does — non-technical users get a working recording with default privacy behavior but no visibility into which apps are blocked, masked, or text-redacted. The CLI surface for both reads (`screencap apps --json`) and writes (`screencap settings privacy <field> <op> <value>`) already exists from Phase 1; this plan is the SwiftUI consumer side plus one small CLI read-side gap.
+SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before the friend-trial DMG ships. Today the Privacy sidebar section renders a "Coming in Unit 18" stub ([macos/Screencap/Views/MainWindow.swift:213](macos/Screencap/Views/MainWindow.swift:213)), and there is no in-app disclosure of what the privacy matrix actually does — non-technical users get a working recording with default privacy behavior but no visibility into which apps are blocked, masked, or text-redacted. The CLI surface for both reads (`screencap apps --json`) and writes (`screencap settings privacy <field> <op> <value>`) already exists from Phase 1; this plan is the SwiftUI consumer side plus one small CLI read-side gap.
 
 ---
 
@@ -50,11 +50,11 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 
 ### Relevant Code and Patterns
 
-- [macos/ScreenCap/Views/MainWindow.swift:213](macos/ScreenCap/Views/MainWindow.swift:213) — sidebar Privacy section currently disabled. The detail area is where `PrivacyPaneView` will be wired in.
-- [macos/ScreenCap/Controllers/PermissionController.swift](macos/ScreenCap/Controllers/PermissionController.swift) — `@MainActor ObservableObject` pattern that `PrivacyController` should mirror (async refresh, `@Published` state, bound into the scene via `@StateObject` in `ScreenCapApp`).
-- [macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift) — `runJSON` / `runAwaitingExit` are the existing entry points. New CLI invocations should call these rather than re-spawning `Process` directly. Note the `--json` assertion at [CLIClient.swift:124](macos/ScreenCap/Controllers/CLIClient.swift:124).
-- [macos/ScreenCap/Views/RecordingBanner.swift](macos/ScreenCap/Views/RecordingBanner.swift) — closest visual precedent for a non-blocking banner above the detail area; reuse its overlay/transition idiom for the first-run banner.
-- [macos/ScreenCap/ScreenCapApp.swift:47](macos/ScreenCap/ScreenCapApp.swift:47) — `MenuBarExtra` label site where the attention dot will be composed.
+- [macos/Screencap/Views/MainWindow.swift:213](macos/Screencap/Views/MainWindow.swift:213) — sidebar Privacy section currently disabled. The detail area is where `PrivacyPaneView` will be wired in.
+- [macos/Screencap/Controllers/PermissionController.swift](macos/Screencap/Controllers/PermissionController.swift) — `@MainActor ObservableObject` pattern that `PrivacyController` should mirror (async refresh, `@Published` state, bound into the scene via `@StateObject` in `ScreencapApp`).
+- [macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift) — `runJSON` / `runAwaitingExit` are the existing entry points. New CLI invocations should call these rather than re-spawning `Process` directly. Note the `--json` assertion at [CLIClient.swift:124](macos/Screencap/Controllers/CLIClient.swift:124).
+- [macos/Screencap/Views/RecordingBanner.swift](macos/Screencap/Views/RecordingBanner.swift) — closest visual precedent for a non-blocking banner above the detail area; reuse its overlay/transition idiom for the first-run banner.
+- [macos/Screencap/ScreencapApp.swift:47](macos/Screencap/ScreencapApp.swift:47) — `MenuBarExtra` label site where the attention dot will be composed.
 - [src/screencap/cli/__init__.py:1839](src/screencap/cli/__init__.py:1839) — `apps` command, schema v2; returns the exact fields needed (`resolved_action`, `in_exclude_apps`, `in_allow_apps`, `is_matrix_exclude`, `has_per_frame_overrides`, `classification_source`).
 - [src/screencap/cli/__init__.py:3333](src/screencap/cli/__init__.py:3333) — `settings privacy` write command with symmetric JSON envelope (`_SETTINGS_PRIVACY_SCHEMA_VERSION`). Already validates `allow_apps add` against the matrix action under the configured mode.
 - [src/screencap/cli/__init__.py:3131](src/screencap/cli/__init__.py:3131) — `settings` group + `settings --json` (the read-side that U1 extends).
@@ -63,7 +63,7 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 ### Institutional Learnings
 
 - [docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md](docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md) — Foundation.Process + Pipe pitfalls (stdout deadlock, termination-handler race, TCC subject identity, timer-driven spawn fork-bombs). `CLIClient` already addresses these; this plan should not bypass `CLIClient` for its new invocations.
-- [docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md](docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md) — `MainWindowID` is a singleton `Window`, not a `WindowGroup`. Banner state lives on a long-lived `PrivacyController` (singleton via `@StateObject` in `ScreenCapApp`) so it survives the menu bar / Dock reopen flow.
+- [docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md](docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md) — `MainWindowID` is a singleton `Window`, not a `WindowGroup`. Banner state lives on a long-lived `PrivacyController` (singleton via `@StateObject` in `ScreencapApp`) so it survives the menu bar / Dock reopen flow.
 
 ### External References
 
@@ -76,7 +76,7 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 - **All Python config writes go through the existing `screencap settings privacy <field> <op> <value>` helper, never via Swift TOML serialization.** Rationale: preserves the R16 invariant (mode never silently mutated by exclude/allow writes), keeps the advisory flock + symmetric-envelope semantics in one place, and means the Privacy pane behaves identically whether toggled from SwiftUI or `screencap` in Terminal.
 - **Banner state derives from `setup_skipped`, read via an extended `screencap settings --json` payload.** Rationale: matches the user's selected option; gives SwiftUI a single round-trip readback path that respects the CLI as source of truth, and avoids a SwiftUI-side `UserDefaults` flag that would drift if the user mutates state via `screencap` in Terminal.
 - **"Review what's captured" CTA marks setup complete on pane visit alone** (writes `setup_skipped=true` the first time `PrivacyPaneView.onAppear` fires while the banner is active). Rationale: matches the user's selected option; simplest state machine and lowest friction. Trade-off acknowledged: a user could navigate away without scanning the list. Mitigation: the banner copy itself is the disclosure, the pane is the secondary affordance.
-- **`PrivacyController` is a singleton `@StateObject` in `ScreenCapApp`**, alongside `recorder` / `permissions` / `index`. Banner state is read from it both inside `MainWindow` and from the `MenuBarExtra` label in the same scene, so a single source of truth drives both surfaces.
+- **`PrivacyController` is a singleton `@StateObject` in `ScreencapApp`**, alongside `recorder` / `permissions` / `index`. Banner state is read from it both inside `MainWindow` and from the `MenuBarExtra` label in the same scene, so a single source of truth drives both surfaces.
 - **App icon loading happens Swift-side via `NSWorkspace.shared.icon(forFile: path)`.** Rationale: `apps --json` returns `icon_path = ""` by design (see comment at [cli/__init__.py:1944](src/screencap/cli/__init__.py:1944)). Avoids shipping icon bytes through the JSON envelope.
 - **Pane refreshes on appear + manual refresh button only** — no live watcher in v1. Rationale: matches `RecordingsIndex` refresh pattern; live watcher is a separate complexity that friend-trial can pull in if needed.
 - **Menu bar attention dot uses SF Symbol composition** (`record.circle` base + a small offset overlay badge). Rationale: stays inside the SwiftUI `MenuBarExtra` label contract; avoids touching `NSStatusItem` directly. Visual distinctness from the red recording dot is enforced by color (accent / orange) and position (corner badge vs full-fill).
@@ -146,11 +146,11 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 **Dependencies:** U1 (the controller's readback consumes the extended `settings --json` payload).
 
 **Files:**
-- Create: `macos/ScreenCap/Models/InstalledApp.swift` (Codable struct matching the `apps --json` row schema v2)
-- Create: `macos/ScreenCap/Models/PrivacyStatus.swift` (Codable struct matching the new `settings --json` privacy block)
-- Create: `macos/ScreenCap/Controllers/PrivacyController.swift`
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` (add `@StateObject private var privacy = PrivacyController()` and pass it through `.environmentObject(privacy)`; bind into the `MenuBarExtra` label)
-- Test: `macos/ScreenCapTests/PrivacyControllerTests.swift`
+- Create: `macos/Screencap/Models/InstalledApp.swift` (Codable struct matching the `apps --json` row schema v2)
+- Create: `macos/Screencap/Models/PrivacyStatus.swift` (Codable struct matching the new `settings --json` privacy block)
+- Create: `macos/Screencap/Controllers/PrivacyController.swift`
+- Modify: `macos/Screencap/ScreencapApp.swift` (add `@StateObject private var privacy = PrivacyController()` and pass it through `.environmentObject(privacy)`; bind into the `MenuBarExtra` label)
+- Test: `macos/ScreencapTests/PrivacyControllerTests.swift`
 
 **Approach:**
 - Mirror `PermissionController`: `@Published` state for `apps: [InstalledApp]`, `status: PrivacyStatus?`, `isLoading`, `lastError`. `async` methods for `refreshApps()`, `refreshStatus()`, `toggleExclude(bundleId:excluded:)`, `markSetupComplete()`, `ensureFirstLaunchModeWritten()`.
@@ -177,8 +177,8 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 - Integration: covers F1 (first-run mode write) — first-launch sequencing ordering of `ensureFirstLaunchModeWritten` → `refreshStatus` → banner state derivation.
 
 **Verification:**
-- `xcodebuild test -scheme ScreenCap -only-testing:ScreenCapTests/PrivacyControllerTests` passes.
-- Privacy controller compiles and binds cleanly into `ScreenCapApp` without breaking other `@StateObject` initialization.
+- `xcodebuild test -scheme Screencap -only-testing:ScreencapTests/PrivacyControllerTests` passes.
+- Privacy controller compiles and binds cleanly into `ScreencapApp` without breaking other `@StateObject` initialization.
 
 ---
 
@@ -191,10 +191,10 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 **Dependencies:** U2 (the pane reads from `PrivacyController`).
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Privacy/PrivacyPaneView.swift`
-- Create: `macos/ScreenCap/Views/Privacy/PrivacyAppRow.swift`
-- Create: `macos/ScreenCap/Views/Privacy/PrivacyBadgeStyle.swift` (pure-function badge string + color derivation, separated so it can be tested without rendering)
-- Test: `macos/ScreenCapTests/PrivacyBadgeStyleTests.swift`
+- Create: `macos/Screencap/Views/Privacy/PrivacyPaneView.swift`
+- Create: `macos/Screencap/Views/Privacy/PrivacyAppRow.swift`
+- Create: `macos/Screencap/Views/Privacy/PrivacyBadgeStyle.swift` (pure-function badge string + color derivation, separated so it can be tested without rendering)
+- Test: `macos/ScreencapTests/PrivacyBadgeStyleTests.swift`
 
 **Approach:**
 - Pane layout: header `VStack` with "Privacy" title + "Mode: internal (read-only)" subheading + manual refresh `Button`. Body is a `List` (native macOS row separators + scroll) bound to `controller.apps`.
@@ -204,8 +204,8 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 - Toggle action: `Task { await controller.toggleExclude(bundleId:..., excluded: newValue) }`, then optimistic update of the local row state (re-derived on next `refreshApps`).
 
 **Patterns to follow:**
-- [macos/ScreenCap/Views/RecordingsListView.swift](macos/ScreenCap/Views/RecordingsListView.swift) — `List` + per-row view with secondary text.
-- [macos/ScreenCap/Views/PrivacyMatrixDisclosureView.swift](macos/ScreenCap/Views/PrivacyMatrixDisclosureView.swift) — label / icon idiom for privacy-themed UI.
+- [macos/Screencap/Views/RecordingsListView.swift](macos/Screencap/Views/RecordingsListView.swift) — `List` + per-row view with secondary text.
+- [macos/Screencap/Views/PrivacyMatrixDisclosureView.swift](macos/Screencap/Views/PrivacyMatrixDisclosureView.swift) — label / icon idiom for privacy-themed UI.
 
 **Test scenarios:**
 - Covers R3. `is_matrix_exclude == true` → badge text `"Always blocked (security)"`, toggle disabled.
@@ -219,7 +219,7 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 - Edge case: empty app list → pane shows an empty state, not a frozen ProgressView.
 
 **Verification:**
-- `xcodebuild test -only-testing:ScreenCapTests/PrivacyBadgeStyleTests` passes.
+- `xcodebuild test -only-testing:ScreencapTests/PrivacyBadgeStyleTests` passes.
 - SwiftUI Preview renders the pane with a fixture of 5–8 apps covering each badge state.
 
 ---
@@ -233,7 +233,7 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 **Dependencies:** U3 (the pane exists), U2 (controller is in the environment).
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/MainWindow.swift` (remove `.disabled(true)` at `:125`; swap the stub `VStack` at `:213` for `PrivacyPaneView()`)
+- Modify: `macos/Screencap/Views/MainWindow.swift` (remove `.disabled(true)` at `:125`; swap the stub `VStack` at `:213` for `PrivacyPaneView()`)
 
 **Approach:**
 - Pull `@EnvironmentObject private var privacy: PrivacyController` into `MainWindow`.
@@ -262,17 +262,17 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 **Dependencies:** U2 (`PrivacyController` exposes banner state + write paths), U4 ("Review what's captured" needs the Privacy section enabled).
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Privacy/FirstRunPrivacyBanner.swift`
-- Modify: `macos/ScreenCap/Views/MainWindow.swift` (mount banner above the existing `RecordingBanner` in the detail `VStack` at `:34`; wire the "Review what's captured" CTA to set `section = .privacy` and call `privacy.markSetupComplete()`)
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` (compose the menu bar attention dot in the `MenuBarExtra` label at `:47`; call `privacy.ensureFirstLaunchModeWritten()` + `privacy.refreshStatus()` in the existing `.task` block at `:36`)
-- Modify: `macos/ScreenCap/Views/Privacy/PrivacyPaneView.swift` (on `.onAppear`, if banner is active, call `privacy.markSetupComplete()` — this is the "pane visit alone clears banner" semantic)
-- Test: `macos/ScreenCapTests/FirstRunPrivacyBannerTests.swift` (banner state machine + first-launch write sequencing)
+- Create: `macos/Screencap/Views/Privacy/FirstRunPrivacyBanner.swift`
+- Modify: `macos/Screencap/Views/MainWindow.swift` (mount banner above the existing `RecordingBanner` in the detail `VStack` at `:34`; wire the "Review what's captured" CTA to set `section = .privacy` and call `privacy.markSetupComplete()`)
+- Modify: `macos/Screencap/ScreencapApp.swift` (compose the menu bar attention dot in the `MenuBarExtra` label at `:47`; call `privacy.ensureFirstLaunchModeWritten()` + `privacy.refreshStatus()` in the existing `.task` block at `:36`)
+- Modify: `macos/Screencap/Views/Privacy/PrivacyPaneView.swift` (on `.onAppear`, if banner is active, call `privacy.markSetupComplete()` — this is the "pane visit alone clears banner" semantic)
+- Test: `macos/ScreencapTests/FirstRunPrivacyBannerTests.swift` (banner state machine + first-launch write sequencing)
 
 **Approach:**
 - `FirstRunPrivacyBanner` is a stateless `View` that renders the honest copy + two CTAs + a small `[x]` (so the dismiss affordance isn't only the two buttons), and takes two closures (`onReview`, `onDismiss`). Visual style: muted background (matches `.controlBackgroundColor` per `FirstRunPermissionsView` precedent), `lock.shield` icon, body text + sub-line.
 - `MainWindow` derives `bannerActive` from `privacy.status?.setupSkipped == false`. When `bannerActive` is true, render the banner above `RecordingBanner` in the existing detail `VStack` (above the recording banner so an active recording doesn't push the first-run banner below the fold).
 - `MenuBarExtra` label composition: `ZStack` of `Image(systemName: recorder.state.isRecording ? "record.circle.fill" : "record.circle")` plus, when `privacy.bannerActive`, a small badge overlay (initial pick: `Image(systemName: "circle.fill").font(.system(size: 5)).foregroundStyle(.orange)` offset to upper-right). Final SF symbol chosen during implementation.
-- First-launch sequencing in `ScreenCapApp.task`: `ensureFirstLaunchModeWritten()` (no-op if `[privacy]` already exists) → `refreshStatus()` → `refreshApps()`. Runs after the existing `recorder.probeDaemon()` to avoid contending with the daemon probe.
+- First-launch sequencing in `ScreencapApp.task`: `ensureFirstLaunchModeWritten()` (no-op if `[privacy]` already exists) → `refreshStatus()` → `refreshApps()`. Runs after the existing `recorder.probeDaemon()` to avoid contending with the daemon probe.
 - The "Review" CTA flow: closure body sets `section = .privacy`, then awaits `privacy.markSetupComplete()`. The pane's `.onAppear` is an *additional* dismiss hook for the case where the user navigates to the pane via the sidebar directly (not via the CTA) — both paths go through `markSetupComplete()`, which is idempotent.
 - The "I'll configure later" CTA flow: awaits `privacy.markSetupComplete()`. No navigation.
 - The `[x]` close affordance: same behavior as "I'll configure later" — both invoke `markSetupComplete()` (lower-friction dismiss for users who don't want to pick between the two CTAs).
@@ -293,7 +293,7 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 - Integration: full first-launch flow — app launches, daemon probe completes, `ensureFirstLaunchModeWritten` fires, `refreshStatus` returns `setupSkipped=false`, banner appears, user clicks Review, `section` flips to `.privacy`, pane renders, `markSetupComplete` fires, banner clears on next render tick. (Drives the first-friend-trial Done-when criterion.)
 
 **Verification:**
-- `xcodebuild test -only-testing:ScreenCapTests/FirstRunPrivacyBannerTests` passes.
+- `xcodebuild test -only-testing:ScreencapTests/FirstRunPrivacyBannerTests` passes.
 - Manual SwiftUI run on a fresh `~/.screencap/` directory: banner appears, dot appears, clicking each CTA clears both.
 - Manual run on a config with `setup_skipped = true`: no banner, no dot.
 
@@ -301,7 +301,7 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 
 ## System-Wide Impact
 
-- **Interaction graph:** `PrivacyController` is read by `MainWindow` (banner gate + pane content), `ScreenCapApp` (menu bar label dot), and `PrivacyPaneView` (`.onAppear` dismiss hook). All three depend on `@Published` state from the same singleton instance.
+- **Interaction graph:** `PrivacyController` is read by `MainWindow` (banner gate + pane content), `ScreencapApp` (menu bar label dot), and `PrivacyPaneView` (`.onAppear` dismiss hook). All three depend on `@Published` state from the same singleton instance.
 - **Error propagation:** CLI failures surface in `controller.lastError` and render in the pane header (similar to `RecordingsIndex` error state) — they do NOT pop modal alerts. A failed first-launch mode write logs a warning and leaves `hasPrivacySection` as-is; the banner still shows so the user can retry the dismiss flow.
 - **State lifecycle risks:** The first-launch write is gated by `hasPrivacySection == false`. Two app instances launching simultaneously (rare — singleton via `LSUIElement` + activation policy) would both try to write; the advisory flock in `_privacy_config_writer()` serializes them. Toggle writes are similarly safe.
 - **API surface parity:** SwiftUI is a consumer of the existing CLI surface. The only API addition is the `privacy` block inside `settings --json` (U1) — this is a backward-compatible additive change; the schema version bump signals it to consumers that care.
@@ -336,4 +336,4 @@ SCR-13 (SwiftUI v1 umbrella) needs onboarding + per-app privacy controls before 
 - **Parent umbrella:** [SCR-13 — Native macOS SwiftUI app — v1 (umbrella)](https://linear.app/zk-email/issue/SCR-13/native-macos-swiftui-app-v1-umbrella)
 - **Related institutional learnings:** [docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md](docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md), [docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md](docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md)
 - **Key CLI entry points:** `src/screencap/cli/__init__.py` — `apps` (`:1839`), `settings` (`:3138`), `settings_privacy` (`:3341`)
-- **Key SwiftUI entry points:** [macos/ScreenCap/ScreenCapApp.swift](macos/ScreenCap/ScreenCapApp.swift), [macos/ScreenCap/Views/MainWindow.swift](macos/ScreenCap/Views/MainWindow.swift), [macos/ScreenCap/Controllers/PermissionController.swift](macos/ScreenCap/Controllers/PermissionController.swift), [macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift)
+- **Key SwiftUI entry points:** [macos/Screencap/ScreencapApp.swift](macos/Screencap/ScreencapApp.swift), [macos/Screencap/Views/MainWindow.swift](macos/Screencap/Views/MainWindow.swift), [macos/Screencap/Controllers/PermissionController.swift](macos/Screencap/Controllers/PermissionController.swift), [macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift)

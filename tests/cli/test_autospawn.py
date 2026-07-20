@@ -78,7 +78,7 @@ def test_no_launchagent_spawns_and_polls_ready(monkeypatch, isolated_log):
     # The spawn binary MUST be an absolute path so a hostile PATH cannot
     # inject a sibling that inherits TCC grants. Pin this explicitly.
     assert os.path.isabs(spawned["path"])
-    assert emitted == ["Starting ScreenCap daemon...", "Daemon ready."]
+    assert emitted == ["Starting Screencap daemon...", "Daemon ready."]
 
 
 def test_spawn_strips_screencap_daemon_env_vars(monkeypatch, isolated_log):

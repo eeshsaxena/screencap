@@ -1,5 +1,5 @@
 ---
-title: Why ScreenCap keeps both video and screenshots — a detailed analysis
+title: Why Screencap keeps both video and screenshots — a detailed analysis
 date: 2026-07-10
 type: analysis
 status: draft
@@ -10,7 +10,7 @@ motivation: >
   inform a possible cut/keep or capture-posture decision.
 ---
 
-# Why ScreenCap keeps both video and screenshots
+# Why Screencap keeps both video and screenshots
 
 ## TL;DR
 
@@ -22,7 +22,7 @@ motivation: >
 
 2. **The default is video-only.** `RECORD_VIDEO=True`, `RECORD_IMAGES=False`
    ([config.py:39-43](../../src/screencap/engine/config.py)). An empty `screenshots/` dir is
-   the norm, "not an edge" ([RecordingFrameIndex.swift:113-120](../../macos/ScreenCap/Controllers/RecordingFrameIndex.swift)).
+   the norm, "not an edge" ([RecordingFrameIndex.swift:113-120](../../macos/Screencap/Controllers/RecordingFrameIndex.swift)).
    Screenshots are the **opt-in materialized index**, produced when the search/OCR stack is used.
 
 3. **They are specialized to opposite access patterns.** Video = *sequential watching* (cheap

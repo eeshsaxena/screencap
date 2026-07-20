@@ -13,7 +13,7 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Let users power ScreenCap's cloud-eligible intelligence (summaries, titles, Recall answers) with their own OpenAI, Anthropic, or Google Gemini account — via a pasted API key or by delegating to a locally-installed provider CLI — free of a ScreenCap subscription, and visibly separated from ScreenCap-hosted cloud.
+- **Objective:** Let users power Screencap's cloud-eligible intelligence (summaries, titles, Recall answers) with their own OpenAI, Anthropic, or Google Gemini account — via a pasted API key or by delegating to a locally-installed provider CLI — free of a Screencap subscription, and visibly separated from Screencap-hosted cloud.
 - **Product authority:** Rute Figueiredo (product owner). Product Contract is authoritative for scope; this plan owns the how.
 - **Product Contract preservation:** unchanged — R1–R13 carried verbatim from the requirements-only artifact; planning added no product-scope changes.
 - **Execution profile:** Deep, cross-cutting. Python daemon (provider abstraction, config, settings CLI, keychain) plus the Swift/SwiftUI settings surface. Landable as ~7 dependency-ordered commits.
@@ -26,19 +26,19 @@ execution: code
 
 ### Summary
 
-Add "connect your own account" for OpenAI, Anthropic, and Gemini as a first-class **user-owned** Intelligence option, alongside on-device. Two ways to connect: paste a provider API key, or delegate to the user's already-signed-in `codex` / `claude` / `gemini` CLI to reuse a subscription. A connected provider slots into the existing provider picker and inherits the current per-task cloud consent rules unchanged. The Intelligence surface makes the line between ScreenCap-hosted cloud and user-owned intelligence unmistakable.
+Add "connect your own account" for OpenAI, Anthropic, and Gemini as a first-class **user-owned** Intelligence option, alongside on-device. Two ways to connect: paste a provider API key, or delegate to the user's already-signed-in `codex` / `claude` / `gemini` CLI to reuse a subscription. A connected provider slots into the existing provider picker and inherits the current per-task cloud consent rules unchanged. The Intelligence surface makes the line between Screencap-hosted cloud and user-owned intelligence unmistakable.
 
 ### Problem Frame
 
-ScreenCap's on-device and local-server models are the privacy-safe default, but they aren't frontier quality — summaries, titles, and Recall answers are noticeably weaker than GPT/Claude/Gemini output. The provider abstraction was built to accommodate cloud backends, and `docs/plans/2026-07-06-002-feat-local-first-intelligence-plan.md` R2 already named Claude, OpenAI, and Gemini as opt-in backends "with their own key," but only Gemini shipped and only as an app-managed backend. The Intelligence UI still shows an inert "Add another provider…" stub ("Coming soon — add a cloud provider with your own API key"). So users who already pay OpenAI/Anthropic/Google, or who simply want better output, have no way to bring that capability to ScreenCap — and no clear picture of which cloud is ScreenCap's and which is theirs.
+Screencap's on-device and local-server models are the privacy-safe default, but they aren't frontier quality — summaries, titles, and Recall answers are noticeably weaker than GPT/Claude/Gemini output. The provider abstraction was built to accommodate cloud backends, and `docs/plans/2026-07-06-002-feat-local-first-intelligence-plan.md` R2 already named Claude, OpenAI, and Gemini as opt-in backends "with their own key," but only Gemini shipped and only as an app-managed backend. The Intelligence UI still shows an inert "Add another provider…" stub ("Coming soon — add a cloud provider with your own API key"). So users who already pay OpenAI/Anthropic/Google, or who simply want better output, have no way to bring that capability to Screencap — and no clear picture of which cloud is Screencap's and which is theirs.
 
 ### Key Decisions
 
-- **Delegate to the provider's CLI; never hold subscription tokens.** Subscription reuse rides each provider's own sanctioned surface — Codex "sign in with ChatGPT", `claude -p`, the Gemini CLI — which the user has already authenticated. ScreenCap invokes the installed binary and holds no OAuth token. App-held or reverse-engineered subscription tokens are rejected: they violate provider ToS and can get a user's account flagged, which is intolerable for a trust-first product.
+- **Delegate to the provider's CLI; never hold subscription tokens.** Subscription reuse rides each provider's own sanctioned surface — Codex "sign in with ChatGPT", `claude -p`, the Gemini CLI — which the user has already authenticated. Screencap invokes the installed binary and holds no OAuth token. App-held or reverse-engineered subscription tokens are rejected: they violate provider ToS and can get a user's account flagged, which is intolerable for a trust-first product.
 - **Two mechanisms with asymmetric risk.** The API-key path is the stable baseline — it completes the deferred R2 and behaves predictably. CLI delegation is net-new (no existing plan contemplated it) and carries all the fragility: an external-binary dependency plus providers re-metering subscriptions. The paths are independent, so if delegation breaks, key and on-device still work.
-- **Hard separation of ScreenCap-hosted cloud vs user-owned intelligence.** Hosted cloud (app-managed models, cloud upload/storage behind the Personal cloud subscription) and user-owned intelligence (BYO key or CLI delegation, running against the user's own account) are presented so a user can tell at a glance whose infrastructure runs it and whose bill it lands on.
+- **Hard separation of Screencap-hosted cloud vs user-owned intelligence.** Hosted cloud (app-managed models, cloud upload/storage behind the Personal cloud subscription) and user-owned intelligence (BYO key or CLI delegation, running against the user's own account) are presented so a user can tell at a glance whose infrastructure runs it and whose bill it lands on.
 - **BYO inherits the existing consent matrix; the frames invariant is absolute.** A connected provider is just another cloud target under `consent.py`. Connecting your own account unlocks no new data category — only text leaves the device; screen frames stay hard-blocked regardless of whose key it is.
-- **Ungated and free for now; billing coupling deferred.** Connecting a provider needs no ScreenCap subscription. It's the power-user lane next to on-device; hosted cloud still serves the non-technical majority who won't set up a key or CLI.
+- **Ungated and free for now; billing coupling deferred.** Connecting a provider needs no Screencap subscription. It's the power-user lane next to on-device; hosted cloud still serves the non-technical majority who won't set up a key or CLI.
 
 ### Requirements
 
@@ -47,7 +47,7 @@ ScreenCap's on-device and local-server models are the privacy-safe default, but 
 - R1. Users can connect their own OpenAI, Anthropic, or Google Gemini account as a selectable Intelligence provider from the existing provider picker, replacing the current "Add another provider…" stub.
 - R2. Both connection mechanisms are supported: paste a provider API key, and delegate to a locally-installed provider CLI the user has already signed into.
 - R3. An API-key connection stores the key as a secret (Keychain-class storage, following the existing auth pattern), never in plaintext config, and never uploads it.
-- R4. A CLI-delegation connection stores no secret in ScreenCap — the provider's CLI owns authentication; ScreenCap detects the installed binary and invokes it non-interactively.
+- R4. A CLI-delegation connection stores no secret in Screencap — the provider's CLI owns authentication; Screencap detects the installed binary and invokes it non-interactively.
 - R5. When a provider's CLI is not installed or not signed in, that delegation option renders as unavailable with a path to fix it (install / sign in), and never silently falls back to a different provider.
 
 **Task routing and privacy**
@@ -58,9 +58,9 @@ ScreenCap's on-device and local-server models are the privacy-safe default, but 
 
 **Hosted vs user-owned separation**
 
-- R9. The Intelligence surface visibly distinguishes ScreenCap-hosted cloud (app-managed models plus cloud upload/storage behind the Personal cloud subscription) from user-owned intelligence (BYO key or CLI delegation against the user's own account), so whose infrastructure and whose bill each option uses is legible at a glance.
+- R9. The Intelligence surface visibly distinguishes Screencap-hosted cloud (app-managed models plus cloud upload/storage behind the Personal cloud subscription) from user-owned intelligence (BYO key or CLI delegation against the user's own account), so whose infrastructure and whose bill each option uses is legible at a glance.
 - R10. Gemini appears as one coherent "your Google/Gemini account" BYO entry; the existing app-managed Gemini backend is reconciled so users do not see a duplicate or ambiguous double-Gemini.
-- R11. Connecting a BYO provider is free and requires no ScreenCap subscription.
+- R11. Connecting a BYO provider is free and requires no Screencap subscription.
 
 **Honesty and resilience**
 
@@ -71,13 +71,13 @@ ScreenCap's on-device and local-server models are the privacy-safe default, but 
 
 - F1. Connect via API key
   - **Trigger:** User picks a provider from the picker and chooses "use my API key."
-  - **Steps:** User pastes a key; ScreenCap stores it as a secret and validates it; the provider becomes a selectable active model.
+  - **Steps:** User pastes a key; Screencap stores it as a secret and validates it; the provider becomes a selectable active model.
   - **Outcome:** Cloud-eligible tasks can route to that provider, subject to R6-R8.
   - **Covered by:** R1, R2, R3, R6, R7, R8.
 - F2. Connect via CLI delegation
   - **Trigger:** User picks a provider and chooses "use my subscription (via CLI)."
-  - **Steps:** ScreenCap checks for the installed, signed-in CLI; if present, the provider becomes selectable and tasks invoke the CLI non-interactively; if absent, the option shows as unavailable with a fix path.
-  - **Outcome:** Cloud-eligible tasks run on the user's subscription without ScreenCap holding a token.
+  - **Steps:** Screencap checks for the installed, signed-in CLI; if present, the provider becomes selectable and tasks invoke the CLI non-interactively; if absent, the option shows as unavailable with a fix path.
+  - **Outcome:** Cloud-eligible tasks run on the user's subscription without Screencap holding a token.
   - **Covered by:** R1, R2, R4, R5, R12, R13.
 - F3. Route a cloud-eligible task to a connected provider
   - **Trigger:** A SUMMARY / RECALL_ANSWER task runs with a BYO provider active.
@@ -129,7 +129,7 @@ ScreenCap's on-device and local-server models are the privacy-safe default, but 
 
 ### Key Technical Decisions
 
-- KTD1. **CLI delegation is a subprocess of the vendor's real binary — never token extraction.** The delegation backend invokes `codex exec` / `claude -p` / `gemini -p` in non-interactive mode and reads only stdout. It never reads or copies the vendor's stored OAuth token (`~/.codex/auth.json`, the Claude Code macOS Keychain entry, `~/.gemini` credentials). Rationale: Anthropic enforced its ToS in Jan 2026 against tools that lifted the Claude OAuth token into their own HTTP clients, while explicitly sanctioning subprocess use of the real `claude` binary; Codex documents the same boundary. This is the ToS-safe path *and* removes token-custody from ScreenCap. The daemon runs as the user (same EUID), so each CLI resolves its own credentials.
+- KTD1. **CLI delegation is a subprocess of the vendor's real binary — never token extraction.** The delegation backend invokes `codex exec` / `claude -p` / `gemini -p` in non-interactive mode and reads only stdout. It never reads or copies the vendor's stored OAuth token (`~/.codex/auth.json`, the Claude Code macOS Keychain entry, `~/.gemini` credentials). Rationale: Anthropic enforced its ToS in Jan 2026 against tools that lifted the Claude OAuth token into their own HTTP clients, while explicitly sanctioning subprocess use of the real `claude` binary; Codex documents the same boundary. This is the ToS-safe path *and* removes token-custody from Screencap. The daemon runs as the user (same EUID), so each CLI resolves its own credentials.
 
 - KTD2. **Encode provider identity as vendor + mechanism, and register BYO ids as cloud-fallback providers only.** Represent the 3-vendor × 2-mechanism matrix as distinct provider ids — `openai` / `anthropic` (API key) and `openai-cli` / `anthropic-cli` / `gemini-cli` (delegation) — and reconcile the existing `gemini` id as the BYO-key Gemini. Rationale: the daemon has **two** provider keys with different roles — top-level `llm_provider` (the active/preferred provider, `_VALID_LLM_PROVIDERS`, which drives day-split routing) and `[intelligence].cloud_provider` (the consented cloud fallback, `_VALID_CLOUD_PROVIDERS`, the only key cloud routing invokes via `get_provider()`). A BYO provider only ever runs as the consented `cloud_provider` fallback — `routing.build_day_split_provider` sends any non-on-device active provider to `UnavailableProvider`. So the new ids are added to `_VALID_CLOUD_PROVIDERS` (and the settings-CLI `cloud_provider` validation branch) only; `_VALID_LLM_PROVIDERS` stays on-device-class. Selecting a BYO provider in the UI writes `cloud_provider`, not the active `provider`.
 
@@ -154,7 +154,7 @@ flowchart TB
   KEYB -->|"HTTPS + stored key (text only)"| VAPI["Vendor HTTP API"]
   CLIB -->|"subprocess: codex exec / claude -p / gemini -p (text only)"| VCLI["Vendor CLI"]
   KSEC[("Keychain<br/>screencap-VENDOR")] -.->|"key over stdin/file, never argv"| KEYB
-  VAUTH[("Vendor-owned auth<br/>~/.codex, Claude Keychain, ~/.gemini")] -.->|"CLI reads its own auth;<br/>ScreenCap never touches it"| VCLI
+  VAUTH[("Vendor-owned auth<br/>~/.codex, Claude Keychain, ~/.gemini")] -.->|"CLI reads its own auth;<br/>Screencap never touches it"| VCLI
 ```
 
 ### Assumptions
@@ -256,7 +256,7 @@ U1 (config/identity) is the foundation for everything. U2 (key storage) and U4 (
 - **Goal:** Replace the "Add another provider…" stub with a real connect flow covering both mechanisms.
 - **Requirements:** R1, R2, R3, R4, R5, R13.
 - **Dependencies:** U1, U2, U4.
-- **Files:** `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift`, `macos/ScreenCap/Controllers/IntelligenceController.swift`, new view(s) as needed, macOS app tests.
+- **Files:** `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift`, `macos/Screencap/Controllers/IntelligenceController.swift`, new view(s) as needed, macOS app tests.
 - **Approach:** Build a connect flow: choose vendor, choose mechanism. For API key, a `SecureField` whose value is handed to the controller and piped to the daemon over stdin/file (never argv), with inline validation feedback from U2. For CLI delegation, show the option with its availability state from U4 and an install/sign-in path when unavailable (R5); render a distinct needs-attention state when a connected CLI later reports `PROVIDER_UNAVAILABLE` at runtime — e.g. metered/restricted mid-use (R13) — reusing the R5 unavailable surface. Selecting a connected provider persists it as the consented `cloud_provider` (not the active `provider`) so cloud routing can reach it (KTD2); extend `IntelligenceSettings` (controller ~13-77) with the new fields and add controller writes mirroring `setConsent`. Allow disconnect (clear the key / deselect).
 - **Patterns to follow:** `IntelligenceProviderOption.options(...)`, the controller's CLI-bridge `setProvider`/`setConsent` with optimistic pending state, the existing non-interactive fixed-row rendering.
 - **Test scenarios:**
@@ -269,11 +269,11 @@ U1 (config/identity) is the foundation for everything. U2 (key storage) and U4 (
 
 ### U7. Swift UI: hosted-vs-user-owned separation, Gemini single-listing, honest copy
 
-- **Goal:** Make the picker legibly separate ScreenCap-hosted cloud from user-owned intelligence, list Gemini once, and keep copy honest.
+- **Goal:** Make the picker legibly separate Screencap-hosted cloud from user-owned intelligence, list Gemini once, and keep copy honest.
 - **Requirements:** R9, R10, R12.
 - **Dependencies:** U6.
-- **Files:** `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift` (grouping + copy), `macos/ScreenCap/Controllers/IntelligenceController.swift` (option assembly if needed), macOS app tests.
-- **Approach:** Group the provider list into a "ScreenCap-hosted cloud" section (app-managed models, cloud upload/storage behind the Personal cloud subscription) and a "Your own account" section (BYO key + CLI delegation), with labels making whose-bill clear (R9). Ensure Gemini surfaces once as "your Gemini account" (R10). Add honest copy for delegation: subscription usage is bounded by the provider's limits/terms and can change; surface Gemini free-tier rate limits plainly (R12). No E2EE / "we can't see it" / "free unlimited" strings.
+- **Files:** `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift` (grouping + copy), `macos/Screencap/Controllers/IntelligenceController.swift` (option assembly if needed), macOS app tests.
+- **Approach:** Group the provider list into a "Screencap-hosted cloud" section (app-managed models, cloud upload/storage behind the Personal cloud subscription) and a "Your own account" section (BYO key + CLI delegation), with labels making whose-bill clear (R9). Ensure Gemini surfaces once as "your Gemini account" (R10). Add honest copy for delegation: subscription usage is bounded by the provider's limits/terms and can change; surface Gemini free-tier rate limits plainly (R12). No E2EE / "we can't see it" / "free unlimited" strings.
 - **Patterns to follow:** existing section grouping in the settings views; the honest-copy gate from the Personal cloud billing plan.
 - **Test scenarios:**
   - Honest-copy audit: assert no forbidden strings (E2EE / "free unlimited" / "we can't watch") appear in the Intelligence pane copy. Extend the existing honesty-gate test if one exists.
@@ -290,7 +290,7 @@ U1 (config/identity) is the foundation for everything. U2 (key storage) and U4 (
 - **External CLI interface drift.** `codex exec` / `claude -p` / `gemini -p` flags and output formats can change across releases. Pin to documented flags, parse output defensively, and fail open (KTD5) rather than trusting a fixed shape.
 - **Gemini free-tier rate limits.** The Google-sign-in tier is tight (≈5 RPM / 100 RPD for 2.5 Pro) — a summarizing daemon can hit it. Surface the limit honestly (R12); a paid `GEMINI_API_KEY` removes the caps but is metered, not subscription reuse.
 - **Keychain entitlement (release dependency if the assumption fails).** Per-vendor service names are assumed to work under the already-entitled shared access group with no provisioning-profile change (verified in U2). If that assumption is wrong, adding them becomes a signing/notarization dependency (`SCREENCAP_DAEMON_PROVISION_PROFILE`), and dev builds rely on the `keyring` fallback until then.
-- **User-provided environment.** ScreenCap cannot install or sign in the CLIs; delegation availability depends entirely on the user's machine. The daemon's restricted PATH (launchd env channel) means binaries must be resolved explicitly (KTD5).
+- **User-provided environment.** Screencap cannot install or sign in the CLIs; delegation availability depends entirely on the user's machine. The daemon's restricted PATH (launchd env channel) means binaries must be resolved explicitly (KTD5).
 - **System-wide impact — expanded trust surface.** BYO adds third-party cloud egress paths and daemon subprocess execution of external binaries. It is governed by the existing consent matrix with no new enforcement point (KTD4), but it widens the trust surface for a privacy-first product; the honest-copy audit (U7) is the guard that keeps claims matching behavior.
 
 ---
@@ -302,7 +302,7 @@ U1 (config/identity) is the foundation for everything. U2 (key storage) and U4 (
 | Privacy guards | `pytest -m privacy` | U1, U3, U4, U5 | Frames and day-split never resolve to a BYO provider; forbidden consent rows stay rejected. All guard tests must be `@pytest.mark.privacy` and Vision-free (CI runs only this lane). |
 | Python unit tests | `pytest tests/` (in a worktree: `PYTHONPATH=src pytest tests/`) | U1–U5 | Config, settings CLI, key storage, backends, and routing pass. |
 | Secret hygiene | `pytest tests/` + manual `ps`/log check | U2, U6 | No API key appears in argv, logs, or `--json` read-back. |
-| macOS app build/test | XcodeGen generate + `xcodebuild test` for the ScreenCap scheme | U6, U7 | App builds; settings view-model logic and honest-copy audit pass. |
+| macOS app build/test | XcodeGen generate + `xcodebuild test` for the Screencap scheme | U6, U7 | App builds; settings view-model logic and honest-copy audit pass. |
 | Lint | `ruff check src/screencap/engine/` | engine files only | Clean. Note: `segmentation/` is outside the ruff scope defined in CLAUDE.md; new Python files there are not ruff-gated. |
 
 ---

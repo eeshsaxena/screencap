@@ -3,7 +3,7 @@ name: screencap-redaction
 description: Decision-making guide and reference for PII/secrets redaction in the screencap macOS recording tool. Use when working on scrubber.py, privacy features, redaction pipeline design, or evaluating redaction tools/approaches. Triggers on redaction architecture, PII detection, secrets scanning, OCR-based scrubbing, audio redaction, accessibility-based redaction, or any privacy-related feature work in screencap.
 ---
 
-# ScreenCap Redaction Guide
+# Screencap Redaction Guide
 
 ## Overview
 

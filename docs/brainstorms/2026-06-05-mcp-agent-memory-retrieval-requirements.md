@@ -7,13 +7,13 @@ topic: mcp-agent-memory-retrieval
 
 ## Summary
 
-A local MCP server that lets an agent query a user's ScreenCap recordings across three streams — structured metadata, audio transcript, and on-screen content. The new capability beneath it is a **content index**: a post-redaction OCR pass that runs inline in chunk processing, decoupled from the privacy pipeline, making what was on screen searchable without ever exposing pixels to the agent.
+A local MCP server that lets an agent query a user's Screencap recordings across three streams — structured metadata, audio transcript, and on-screen content. The new capability beneath it is a **content index**: a post-redaction OCR pass that runs inline in chunk processing, decoupled from the privacy pipeline, making what was on screen searchable without ever exposing pixels to the agent.
 
 ---
 
 ## Problem Frame
 
-ScreenCap captures rich signal, but today none of it can come back out for an agent. There is no search or query surface of any kind — the catalog is raw SQLite, replay is a static HTML viewer, and the data-flywheel / MCP track named in the strategy has nothing in the backlog. The agent that the strategy bets on as the eventual buyer cannot ask "what dashboards did I touch this morning" or "find the screen where the invoice total was wrong." From the agent's perspective, every recording is write-only.
+Screencap captures rich signal, but today none of it can come back out for an agent. There is no search or query surface of any kind — the catalog is raw SQLite, replay is a static HTML viewer, and the data-flywheel / MCP track named in the strategy has nothing in the backlog. The agent that the strategy bets on as the eventual buyer cannot ask "what dashboards did I touch this morning" or "find the screen where the invoice total was wrong." From the agent's perspective, every recording is write-only.
 
 The strategic cost is that the product's headline JTBD — "let an agent do the next round of the workflow for me" — and the data-flywheel cash-in have no surface to land on. The recordings accumulate value that the operator's own tools cannot reach.
 
@@ -55,10 +55,10 @@ flowchart TB
 
 ## Actors
 
-- A1. **Developer / agent-builder (MCP client author)**: wires ScreenCap's MCP server into an agent or internal copilot. The primary first user. Cares about a stable, typed tool surface and predictable results.
+- A1. **Developer / agent-builder (MCP client author)**: wires Screencap's MCP server into an agent or internal copilot. The primary first user. Cares about a stable, typed tool surface and predictable results.
 - A2. **Non-technical operator on a consumer agent app** (Claude Desktop / Codex app): the widening base. Cares about asking in natural language and getting useful answers without knowing any schema.
 - A3. **The querying agent**: the software actor that calls the MCP tools and consumes results. Cares about typed contracts and bounded, safe payloads.
-- A4. **ScreenCap engineer**: maintains the index pass and the query surface. Cares about keeping retrieval decoupled from the privacy pipeline and preserving the fail-closed invariant.
+- A4. **Screencap engineer**: maintains the index pass and the query surface. Cares about keeping retrieval decoupled from the privacy pipeline and preserving the fail-closed invariant.
 
 ---
 
@@ -90,7 +90,7 @@ flowchart TB
 ## Requirements
 
 **Query surface (MCP)**
-- R1. ScreenCap exposes a local MCP server that lets an agent query past recordings. The MCP server is a thin wrapper over the daemon's existing local API and holds no query logic of its own beyond protocol translation.
+- R1. Screencap exposes a local MCP server that lets an agent query past recordings. The MCP server is a thin wrapper over the daemon's existing local API and holds no query logic of its own beyond protocol translation.
 - R2. The query surface spans three streams through one coherent interface: structured metadata (apps, windows, URLs, action timeline), audio transcript text, and on-screen content text.
 - R3. Queries are answerable from natural language well enough that a non-technical operator on a consumer agent app gets useful results without knowing the underlying schema, while still presenting a stable typed contract an agent-builder can rely on.
 
@@ -121,7 +121,7 @@ flowchart TB
 
 ## Success Criteria
 
-- An agent-builder (A1) can wire ScreenCap's MCP server into an agent and get reliable answers to both "what did I do" (metadata/transcript) and "find the screen where X" (content) questions.
+- An agent-builder (A1) can wire Screencap's MCP server into an agent and get reliable answers to both "what did I do" (metadata/transcript) and "find the screen where X" (content) questions.
 - A non-technical operator (A2) on Claude Desktop / Codex app can ask a natural-language question about their recordings and get a useful answer without schema knowledge.
 - Turning on content indexing does not change redaction output and puts no pre-redaction text and no frame pixels in front of the agent.
 - The content-index pass does not push active-recording overhead past the run-all-day budget. If it does, that is the explicit signal to graduate to the shared single-OCR-pass design (see Key Decisions).

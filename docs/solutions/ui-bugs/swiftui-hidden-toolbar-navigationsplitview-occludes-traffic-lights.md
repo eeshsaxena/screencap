@@ -26,7 +26,7 @@ tags:
 
 ## Problem
 
-ScreenCap's main window showed no close / minimize / zoom buttons. The buttons were present, unhidden, and fully functional the whole time — they were **visually occluded** by the `NavigationSplitView` sidebar's hosting view, which had expanded over the top edge of the window and painted its opaque background on top of them.
+Screencap's main window showed no close / minimize / zoom buttons. The buttons were present, unhidden, and fully functional the whole time — they were **visually occluded** by the `NavigationSplitView` sidebar's hosting view, which had expanded over the top edge of the window and painted its opaque background on top of them.
 
 ## Symptoms
 
@@ -51,7 +51,7 @@ Before (`MainWindow.swift` `shellContent` + `sidebar`):
 NavigationSplitView {
     sidebar            // ShellSidebarView(...)
         .navigationSplitViewColumnWidth(248)
-        .navigationTitle("ScreenCap")
+        .navigationTitle("Screencap")
         .toolbar(.hidden, for: .windowToolbar)   // ← collapses the strip → sidebar covers the buttons
 } detail: {
     detailColumn
@@ -95,7 +95,7 @@ The occlusion is a view-hierarchy z-order problem, not a hidden/disabled button.
 
 - **Do not hide the window toolbar on a `NavigationSplitView` while relying on `.hiddenTitleBar` to reveal the traffic lights** — the sidebar hosting view will cover them. The toolbar strip is what reserves the clear space the buttons live in.
 - **If the sidebar is a fully custom fixed-width column (not a native `List` sidebar) and routing does not use `NavigationLink`/`NavigationStack`, prefer a plain `HStack`.** `NavigationSplitView` then adds only native chrome you have to fight.
-- On macOS 14+, `.toolbar(removing: .sidebarToggle)` can suppress just the sidebar toggle while keeping the toolbar strip (and buttons) — but ScreenCap targets macOS 13, so that path is unavailable here.
+- On macOS 14+, `.toolbar(removing: .sidebarToggle)` can suppress just the sidebar toggle while keeping the toolbar strip (and buttons) — but Screencap targets macOS 13, so that path is unavailable here.
 - **Unit tests can't catch this** — it's a runtime AppKit z-order/occlusion issue, invisible to logic-only XCTest (734 green tests shipped the regression). Guard it with a manual visual check on window-chrome changes, or a UI test that hit-tests the buttons.
 - The `.hiddenTitleBar` and the toolbar-hide were introduced together in commit `78cf55fb` and had been in direct conflict ever since — a reminder that "reveal the real traffic lights" and "hide the toolbar" are contradictory on a split view.
 

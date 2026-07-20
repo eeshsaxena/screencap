@@ -18,8 +18,8 @@ tags:
   - macos-app-shell
   - xcodebuild
 symptoms:
-  - "Recordings self-terminate within seconds with \"ScreenCap stopped recording because screen_recording was disabled in System Settings\""
-  - "The Screen Recording toggles for `screencap` / `ScreenCap` are ON, yet every recording is 'revoked'"
+  - "Recordings self-terminate within seconds with \"Screencap stopped recording because screen_recording was disabled in System Settings\""
+  - "The Screen Recording toggles for `screencap` / `Screencap` are ON, yet every recording is 'revoked'"
   - "`codesign -dvv` on the built app shows `Signature=adhoc, TeamIdentifier=not set` even though DEVELOPMENT_TEAM is set in `.env`"
   - "build_and_run.sh prints `warning: DEVELOPMENT_TEAM is not set` despite the line being present in `.env`"
   - "The `screenshot` table in recording.db has 0 rows for the failed recordings"
@@ -38,9 +38,9 @@ root_cause: >
 
 Every recording died a few seconds after starting, with the dialog:
 
-> ScreenCap stopped recording because screen_recording was disabled in System Settings.
+> Screencap stopped recording because screen_recording was disabled in System Settings.
 
-But Screen Recording was clearly granted: System Settings → Privacy & Security → Screen & System Audio Recording showed both `screencap` and `ScreenCap` toggled ON. The user never disabled anything. It happened on *every* recording.
+But Screen Recording was clearly granted: System Settings → Privacy & Security → Screen & System Audio Recording showed both `screencap` and `Screencap` toggled ON. The user never disabled anything. It happened on *every* recording.
 
 Empirical confirmation it was a real capture failure, not a UI glitch:
 
@@ -114,7 +114,7 @@ After the fix: set the team in `.env` (either form works), rebuild, then clear t
 
 ```bash
 ./script/build_and_run.sh
-codesign -dvv .build/ScreenCapDerivedData/Build/Products/Debug/ScreenCap.app 2>&1 | grep Team
+codesign -dvv .build/ScreencapDerivedData/Build/Products/Debug/Screencap.app 2>&1 | grep Team
 #   → expect TeamIdentifier=<your team>, not "not set"
 tccutil reset ScreenCapture com.screencap.macos
 # relaunch, grant Screen Recording once — it now survives rebuilds

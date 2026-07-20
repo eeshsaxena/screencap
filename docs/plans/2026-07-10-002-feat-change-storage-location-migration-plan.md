@@ -22,7 +22,7 @@ Enable the currently-disabled "Change…" button in the Privacy settings pane so
 
 ### Problem Frame
 
-The storage row already displays the live recordings directory and its size, but the "Change…" button is a hardcoded stub (`.disabled(true)`, empty action, "Coming soon — SCR-228" tooltip) at `macos/ScreenCap/Views/Settings/PrivacySettingsView.swift:251`. Users cannot relocate their library.
+The storage row already displays the live recordings directory and its size, but the "Change…" button is a hardcoded stub (`.disabled(true)`, empty action, "Coming soon — SCR-228" tooltip) at `macos/Screencap/Views/Settings/PrivacySettingsView.swift:251`. Users cannot relocate their library.
 
 Setting a new path is already trivial: `config.get_recordings_dir()` (`src/screencap/config.py:112`) reads `SCREENCAP_RECORDINGS_DIR` or the `recordings_dir` config key. Two facts still make even a same-volume move non-trivial and force it into the daemon rather than a pure CLI:
 
@@ -240,8 +240,8 @@ The rename+flip pair is bracketed by the breadcrumb, so recovery always converge
 **Dependencies:** U5.
 
 **Files:**
-- `macos/ScreenCap/Controllers/PrivacyController.swift` — add `enum MigrationState { case idle, migrating, succeeded, failed(String) }`, `@Published private(set) var migrationState`, and `func startMigration(to url: URL)` that guards re-entry, calls `CLIClient.runJSONRaw(["storage","migrate", url.path, "--json"])` (mirroring `setUploadDefault` at `PrivacyController.swift:179`), maps the daemon's typed reason to a user-facing string, and on success calls `refreshStatus()` so `recordingsDir` updates the row.
-- `macos/ScreenCapTests/PrivacyControllerTests.swift` — new tests via the existing fake `JSONInvoker` seam (`PrivacyControllerTests.swift:13`).
+- `macos/Screencap/Controllers/PrivacyController.swift` — add `enum MigrationState { case idle, migrating, succeeded, failed(String) }`, `@Published private(set) var migrationState`, and `func startMigration(to url: URL)` that guards re-entry, calls `CLIClient.runJSONRaw(["storage","migrate", url.path, "--json"])` (mirroring `setUploadDefault` at `PrivacyController.swift:179`), maps the daemon's typed reason to a user-facing string, and on success calls `refreshStatus()` so `recordingsDir` updates the row.
+- `macos/ScreencapTests/PrivacyControllerTests.swift` — new tests via the existing fake `JSONInvoker` seam (`PrivacyControllerTests.swift:13`).
 
 **Approach:** One-shot `runJSONRaw`, not `spawn`/stream (KTD-7). Map each validation reason code to copy (see U7). No `.migrating(fraction:)` / cancel state — the move is effectively instantaneous; a brief `.migrating` spinner covers the round-trip.
 
@@ -262,11 +262,11 @@ The rename+flip pair is bracketed by the breadcrumb, so recovery always converge
 **Dependencies:** U6.
 
 **Files:**
-- `macos/ScreenCap/Views/Settings/PrivacySettingsView.swift` — in `storageRow` (`:238`), remove `.disabled(true)`/`.opacity(0.6)`; the button opens an `NSOpenPanel` (directories only, `directoryURL` defaulting to the parent of the current recordings dir), then presents a **confirmation** (new location + "recording is blocked during the move" + "this relocates your whole library") with Move / Cancel before calling `privacy.startMigration(to:)`; bind a result/error surface to `privacy.migrationState`.
-- `macos/ScreenCap/Views/Settings/PrivacySettingsPolicy.swift` — replace the "Coming soon — SCR-228" copy (`:76-79`) with enabled-state label + honest result/failure strings, including the per-reason validation messages (cross-volume → "External drives aren't supported yet"; cloud-synced → "Choose a folder that isn't synced to iCloud/Dropbox"; no-space → "This location needs at least X free"; non-empty → "Choose an empty folder"; env-override → explains `SCREENCAP_RECORDINGS_DIR`). Update `allRowStrings`.
-- `macos/ScreenCapTests/PrivacySettingsPolicyTests.swift` — update the honesty-gate string assertions.
+- `macos/Screencap/Views/Settings/PrivacySettingsView.swift` — in `storageRow` (`:238`), remove `.disabled(true)`/`.opacity(0.6)`; the button opens an `NSOpenPanel` (directories only, `directoryURL` defaulting to the parent of the current recordings dir), then presents a **confirmation** (new location + "recording is blocked during the move" + "this relocates your whole library") with Move / Cancel before calling `privacy.startMigration(to:)`; bind a result/error surface to `privacy.migrationState`.
+- `macos/Screencap/Views/Settings/PrivacySettingsPolicy.swift` — replace the "Coming soon — SCR-228" copy (`:76-79`) with enabled-state label + honest result/failure strings, including the per-reason validation messages (cross-volume → "External drives aren't supported yet"; cloud-synced → "Choose a folder that isn't synced to iCloud/Dropbox"; no-space → "This location needs at least X free"; non-empty → "Choose an empty folder"; env-override → explains `SCREENCAP_RECORDINGS_DIR`). Update `allRowStrings`.
+- `macos/ScreencapTests/PrivacySettingsPolicyTests.swift` — update the honesty-gate string assertions.
 - Add the `NSOpenPanel` folder-picker helper (none exists today).
-- `macos/ScreenCap/.../` recording-start error surface — map U4's typed "migration in progress" error to a user-facing message where a recording-start refusal is shown.
+- `macos/Screencap/.../` recording-start error surface — map U4's typed "migration in progress" error to a user-facing message where a recording-start refusal is shown.
 
 **Approach:** Directories-only `NSOpenPanel` presented as a sheet; selected URL → confirmation → `startMigration`. Keep decision/copy logic in `PrivacySettingsPolicy` so it stays render-tree-free and testable. Copy must be honest (R6): a same-volume move is near-instant, so no long-progress claim; it does relocate the whole library and blocks recording briefly.
 
@@ -312,12 +312,12 @@ The rename+flip pair is bracketed by the breadcrumb, so recovery always converge
 
 ## Sources & Research
 
-- `macos/ScreenCap/Views/Settings/PrivacySettingsView.swift:238` (storage row stub), `PrivacySettingsPolicy.swift:76` (copy stub).
+- `macos/Screencap/Views/Settings/PrivacySettingsView.swift:238` (storage row stub), `PrivacySettingsPolicy.swift:76` (copy stub).
 - `src/screencap/config.py:112` (`get_recordings_dir`, `mkdir`-on-read), `:82` (`save_config_atomic`), `:40` (`invalidate_config_cache`), `:129` (`set_audio_default` setter pattern); `src/screencap/privacy_settings.py:68` (`_privacy_config_writer`, invalidates cache on exit).
 - `src/screencap/daemon/app.py:538` (`recording_start` verb template), `:424` (`session.snapshot` / `is_recording` from pidfile), `:2176` (route registration); `src/screencap/daemon/schema.py:228` (request-model pattern); `src/screencap/daemon/supervisor.py` (`has_inflight_resume`); `src/screencap/daemon/_idle_shutdown.py` (`_daemon_is_busy` busy predicate — relevant to the deferred cross-volume job); `src/screencap/daemon/backfill_job.py` (background-job precedent, deferred path).
 - `src/screencap/cli/__init__.py:4256` (`backfill` group, verb-client shape), `:2964` (`settings --set`), ~`:863` (`screencap start` event-stream loop — deferred cross-volume progress); `src/screencap/cli/_daemon_client.py` (`DaemonHTTPClient`).
 - `src/screencap/network/ca_lifecycle.py:227` (`check_icloud_sync` — reused by KTD-8); `src/screencap/engine/disk_policy.py` (`shutil.disk_usage` free-space primitive).
 - Path-referencing state audit: `src/screencap/content_index.py` (global, name-keyed, query-time resolution), `src/screencap/daemon/app.py:1053` (`_iter_recording_dirs` resolves via `get_recordings_dir`), `src/screencap/upload.py:468` (recording-name GCS keys), `src/screencap/network/lifecycle.py:167` + `src/screencap/engine/recorder.py:3117` (`~/.screencap/.network_active` absolute-path sentinel — active-recording-only, neutralized by R4).
-- macOS patterns: `macos/ScreenCap/Controllers/UploadController.swift` + `UploadEventLine.parse` (`:354`), `RecorderController.swift` `RecorderEventLine.parse` (JSON event lines — relevant only to the deferred streaming path), `macos/ScreenCap/Controllers/CLIClient.swift` (`runJSONRaw`, `spawn`), `PrivacyController.swift:105` (`refreshStatus`) `:179` (`setUploadDefault`), `macos/ScreenCapTests/PrivacyControllerTests.swift:13` (fake seam).
+- macOS patterns: `macos/Screencap/Controllers/UploadController.swift` + `UploadEventLine.parse` (`:354`), `RecorderController.swift` `RecorderEventLine.parse` (JSON event lines — relevant only to the deferred streaming path), `macos/Screencap/Controllers/CLIClient.swift` (`runJSONRaw`, `spawn`), `PrivacyController.swift:105` (`refreshStatus`) `:179` (`setUploadDefault`), `macos/ScreencapTests/PrivacyControllerTests.swift:13` (fake seam).
 - Constraints: `SECURITY.md` (R8 recording.db local-only; daemon same-EUID trust boundary; `content_index.db`/`models` `0o600`/`0o700` perms), `CLAUDE.md` (daemon idle-shutdown/auto-spawn, no config hot-reload), `docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md:78` (SCR-228 stub definition).
 - Review: 7-persona ce-doc-review (2026-07-10). Same-volume-first scope adopted per product/scope/adversarial findings; synced-folder guard, idle-shutdown/terminal-stage exclusion, permissions, cross-ref and cache-invalidation clarifications folded in. Streaming/cancel/partial-failure findings resolved by the synchronous same-volume simplification and carried into the deferred cross-volume follow-up.

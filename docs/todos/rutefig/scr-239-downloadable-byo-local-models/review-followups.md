@@ -16,7 +16,7 @@ learnings, adversarial. No P0s; security lens found no actionable findings.
   `screencap settings intelligence <row> set …` (`src/screencap/cli/__init__.py`,
   `_emit_error` ~line 3266) writes `{ok:false,error:…}` to stdout then
   `raise SystemExit(1)`. `IntelligenceController.setEndpoint`/`setProvider`
-  (`macos/ScreenCap/Controllers/IntelligenceController.swift`) discard stdout on a
+  (`macos/Screencap/Controllers/IntelligenceController.swift`) discard stdout on a
   non-zero exit and fall back to `error.localizedDescription`, so the structured
   reason is lost. Follow the documented `cli-json-envelope-nonzero-exit` solution:
   either emit the envelope + exit 0 on Swift-consumed writes, or decode the stdout

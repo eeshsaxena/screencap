@@ -3,7 +3,7 @@
 Maps a ``(recording, timestamp_ms)`` search pointer to the nearest on-disk
 screenshot **stem** under ``~/.screencap/recordings/<name>/screenshots/`` — the
 daemon-side Python port of the Swift ``FrameSelection.nearest`` + ``loadFrames``
-algorithm (``macos/ScreenCap/Controllers/RecordingFrameIndex.swift``). It returns
+algorithm (``macos/Screencap/Controllers/RecordingFrameIndex.swift``). It returns
 a bare stem (e.g. ``"1719400010.000000"``) plus a signed ``delta_ms`` — never a
 path and never image bytes, so the daemon query surface stays pointer-only
 (priv-R8); the agent builds ``screenshots/<stem>.jpg`` itself with its same-EUID

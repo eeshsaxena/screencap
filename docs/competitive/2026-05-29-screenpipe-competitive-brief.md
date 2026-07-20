@@ -1,6 +1,6 @@
-# Competitive Brief: ScreenCap vs. screenpipe
+# Competitive Brief: Screencap vs. screenpipe
 
-**Date:** 2026-05-29 · **Author:** Product · **Decision this informs:** ScreenCap product strategy & prioritization
+**Date:** 2026-05-29 · **Author:** Product · **Decision this informs:** Screencap product strategy & prioritization
 **Scope:** Full product comparison (features, positioning, GTM, strategic implications)
 
 > **Shelf-life note.** screenpipe ships multiple releases per day and the team is actively
@@ -13,13 +13,13 @@
 
 ## TL;DR
 
-ScreenCap and screenpipe look like the same product — both are local-first macOS recorders that
+Screencap and screenpipe look like the same product — both are local-first macOS recorders that
 capture screen + audio with privacy/redaction. **They are not. They serve different jobs:**
 
 - **screenpipe** is a **personal AI memory layer** — "give AI the ability to live your experience."
   Record everything, 24/7, then search it and run AI agents ("pipes") over your own history.
   Consumer + developer ecosystem play. Rewind/Recall/Granola/Otter alternative.
-- **ScreenCap** is a **training-data capture pipeline** — produce high-quality, structured,
+- **Screencap** is a **training-data capture pipeline** — produce high-quality, structured,
   *consented* demonstration traces (JSONL interaction events) for training automation/agent models.
   The output is a **corpus**, not a personal memory. B2B / data-flywheel play.
 
@@ -67,19 +67,19 @@ Two axes that make the strategic difference visible:
        consumer / ───────────────┼─────────────── developer /
        individual                │                 data-pipeline
                                   │
-                                  │    · ScreenCap
+                                  │    · Screencap
                                   ▼
                     OUTPUT = structured training data / corpus
 ```
 
 - **Direct competitor for the buyer's wallet:** *weak overlap today.* A user choosing a "rewind my
-  day" tool evaluates screenpipe vs. Limitless vs. Recall — not ScreenCap. A team sourcing
-  agent-training demonstrations evaluates ScreenCap vs. in-house tooling / data vendors — not
+  day" tool evaluates screenpipe vs. Limitless vs. Recall — not Screencap. A team sourcing
+  agent-training demonstrations evaluates Screencap vs. in-house tooling / data vendors — not
   screenpipe.
 - **Direct competitor for the *technology*:** *strong overlap.* Capture engine, redaction, local
   SQLite, audio+Whisper, OCR — these are the same building blocks.
 - **Collision risk:** if screenpipe (or Mediar) reframes its corpus of screen+audio history as
-  *training data for computer-use agents*, it walks straight into ScreenCap's thesis with a 4x-larger
+  *training data for computer-use agents*, it walks straight into Screencap's thesis with a 4x-larger
   codebase and 19k-star distribution. See *Threats*.
 
 ---
@@ -90,7 +90,7 @@ Rating scale: **Strong** (market-leading) · **Adequate** (functional, undiffere
 **Weak** (exists, gaps) · **Absent**. Rated from the code in both clones, weighted by what matters
 to each product's *own* thesis where noted.
 
-| Capability | ScreenCap | screenpipe | Why it matters |
+| Capability | Screencap | screenpipe | Why it matters |
 |---|---|---|---|
 | **Capture** | | | |
 | Screen capture engine | Strong | Strong | SC: `screencapture` CLI ~150ms + action-gated. SP: ScreenCaptureKit/WGC + event-driven. Both avoid the slow CG path. |
@@ -124,7 +124,7 @@ to each product's *own* thesis where noted.
 | Linux | Absent | Adequate | SP: build-from-source. SC: none. |
 
 **Honest read:** screenpipe is ahead on **breadth, search, audio intelligence, developer surface,
-and platform coverage** — and it isn't close. ScreenCap is ahead on **resource efficiency,
+and platform coverage** — and it isn't close. Screencap is ahead on **resource efficiency,
 capture-time privacy enforcement, consent workflow, and structured training-data export** — exactly
 the axes its thesis depends on, and exactly the axes screenpipe's "record everything for me" model
 de-prioritizes.
@@ -133,7 +133,7 @@ de-prioritizes.
 
 ## 4. Positioning Analysis
 
-| | ScreenCap | screenpipe |
+| | Screencap | screenpipe |
 |---|---|---|
 | **Category claim** | "Local-first macOS recorder for building **ML-ready demonstration data** for automation/agent training." | "24/7 local AI **memory layer** — give AI the ability to live your experience." |
 | **Target customer** | Teams sourcing reproducible, structured, consented interaction traces (the "internal-tool-heavy operator" persona). | Knowledge workers (recall/meetings) **and** developers (build on the memory layer) **and** enterprises (via Mediar). |
@@ -141,14 +141,14 @@ de-prioritizes.
 | **Value proposition** | Capture → curate → train, with provable consent. | Never forget anything; let AI act on your whole digital life. |
 | **Proof points** | Deep privacy subsystem, SECURITY.md threat model, daemon architecture. | 19k stars, YC, $2.8M, 360+ releases, MIT. |
 
-**Positioning gaps & opportunities for ScreenCap:**
-- **Unclaimed position ScreenCap can own:** *"consent-grade, structured training data for
+**Positioning gaps & opportunities for Screencap:**
+- **Unclaimed position Screencap can own:** *"consent-grade, structured training data for
   computer-use agents."* No one in the screen-recording space owns "ethically-sourced agent
   training corpus." screenpipe **can't** credibly claim it — their model is record-everything,
   consent-by-device-owner, which is their single biggest public criticism.
 - **screenpipe's vulnerable claim:** "100% local / private." It's *mostly* true but has opt-in
   cloud paths (Deepgram STT, Tinfoil privacy-filter, cloud OCR). Combined with the consent-for-others
-  problem, "private" is a position they cannot fully defend — and a place ScreenCap's capture-time
+  problem, "private" is a position they cannot fully defend — and a place Screencap's capture-time
   enforcement is genuinely stronger.
 - **Crowded position to avoid:** "open-source local Rewind alternative." Saturated (screenpipe,
   Remio, ScreenMemory, Littlebird, Pieces, Omi…). Do not plant a flag here.
@@ -174,14 +174,14 @@ de-prioritizes.
   (enterprise RPA); unclear which is the real product.
 - **Onboarding friction:** CLI-vs-app, self-compile-vs-pay, pipe customization.
 
-**ScreenCap — strengths:**
+**Screencap — strengths:**
 - Sharp, defensible thesis (training corpus) that screenpipe's architecture doesn't serve.
 - Deepest-in-class **capture-time** privacy + consent workflow.
 - Efficient capture (action-gated) → low footprint, the inverse of screenpipe's biggest pain.
 - Clean licensing for B2B (AGPL + commercial dual license).
 - Disciplined engineering: daemon architecture, documented threat model, strong planning hygiene.
 
-**ScreenCap — weaknesses:**
+**Screencap — weaknesses:**
 - A fraction of the surface area: no FTS/search, no MCP/SDK/plugin ecosystem, no diarization.
 - macOS-primary; Windows is a separate codebase (maintenance drag, feature skew).
 - Single-/small-team scale vs. a funded, 19k-star project.
@@ -200,10 +200,10 @@ de-prioritizes.
 3. **Exploit the strategic-attention gap.** While Mediar chases enterprise Windows RPA, the
    *macOS, consented, structured-data* niche is comparatively unattended.
 4. **Position against the Rewind shutdown narrative differently.** screenpipe says "we can't be
-   shut down." ScreenCap can say "your contributors *chose* to contribute, and can prove it" —
+   shut down." Screencap can say "your contributors *chose* to contribute, and can prove it" —
    provenance + consent, which matters more for a *training corpus* than for personal recall.
 5. **Borrow screenpipe's best idea selectively:** per-pipe cryptographic data permissions is a
-   strong model for *who/what can touch captured data*. Worth studying for ScreenCap's
+   strong model for *who/what can touch captured data*. Worth studying for Screencap's
    corpus-access/governance story (not for building a plugin ecosystem).
 
 ---
@@ -211,17 +211,17 @@ de-prioritizes.
 ## 7. Threats
 
 1. **The collision scenario (highest-severity).** screenpipe/Mediar reframes its screen+audio
-   history as *"training data for computer-use agents"* — directly into ScreenCap's thesis, with 4x
+   history as *"training data for computer-use agents"* — directly into Screencap's thesis, with 4x
    the code, MCP/SDK distribution, cross-platform reach, and funding. Their Terminator work makes
    this adjacency real, not hypothetical. **This is the nightmare move.**
 2. **Commoditized capture + redaction.** screenpipe's MIT capture/redaction crates could become the
-   default building blocks others adopt, eroding ScreenCap's engineering lead in the plumbing.
+   default building blocks others adopt, eroding Screencap's engineering lead in the plumbing.
 3. **Developer mindshare.** MCP server + SDKs mean screenpipe is where developers integrate screen
-   context today. If "screen data for AI" *means* screenpipe to developers, ScreenCap fights uphill.
+   context today. If "screen data for AI" *means* screenpipe to developers, Screencap fights uphill.
 4. **Funding & velocity asymmetry.** $2.8M + YC + daily releases vs. a small team. They can close
-   feature gaps (incl. a consent flow) faster than ScreenCap can close breadth gaps.
+   feature gaps (incl. a consent flow) faster than Screencap can close breadth gaps.
 
-**Where ScreenCap is most vulnerable:** search/recall (absent), developer ecosystem (absent), and
+**Where Screencap is most vulnerable:** search/recall (absent), developer ecosystem (absent), and
 cross-platform parity. *Mitigant:* none of these are core to the training-corpus thesis — which is
 exactly why the strategy below says don't defend them at parity.
 
@@ -245,7 +245,7 @@ structured-data moat that screenpipe can't follow you into.
 
 **Differentiate (don't match):**
 - **Privacy = capture-time enforcement + consent**, vs. screenpipe's post-hoc + record-all. This is
-  already ScreenCap's strongest asset; widen the gap (secure-input coverage, app-matrix breadth,
+  already Screencap's strongest asset; widen the gap (secure-input coverage, app-matrix breadth,
   audit/provenance for the corpus).
 - **Curation, not recall.** If search gets built, build *dataset-curation* query/filtering (find,
   filter, and select traces for a training set) — not "search my life." Different job, serves the
@@ -261,7 +261,7 @@ structured-data moat that screenpipe can't follow you into.
 - General recall/full-text search as a headline feature. (Document the decision — it will keep coming
   up because screenpipe makes it look table-stakes. It isn't, for this thesis.)
 - A plugin/agent ecosystem and public SDK marketplace. screenpipe is far ahead and it's a different
-  business; ScreenCap's "agents" surface stays scoped (naming/transcription).
+  business; Screencap's "agents" surface stays scoped (naming/transcription).
 - Linux. No thesis justification today.
 
 **Positioning / messaging adjustments:**
@@ -277,16 +277,16 @@ structured-data moat that screenpipe can't follow you into.
 | Signal | Why | Cadence |
 |---|---|---|
 | Mediar/Terminator messaging shift toward "training data" / "demonstrations" / "agent traces" | The collision trigger | Monthly |
-| screenpipe adding a **consent/review-before-upload** flow | Directly attacks ScreenCap's wedge | Monthly |
+| screenpipe adding a **consent/review-before-upload** flow | Directly attacks Screencap's wedge | Monthly |
 | screenpipe export formats aimed at *model training* (vs. search/recall) | Thesis encroachment | Monthly |
 | Resource-usage fixes landing (RAM/CPU) | Erodes the efficiency wedge | Quarterly |
 | screenpipe pricing/license changes (esp. moving core off MIT) | Signals monetization seriousness | Quarterly |
 | macOS consent SDK / capture SDK adoption by other tools | Commoditization of the plumbing | Quarterly |
-| Hiring signals at Mediar (ML data / dataset engineers) | Strongest leading indicator of a pivot into ScreenCap's space | Quarterly |
+| Hiring signals at Mediar (ML data / dataset engineers) | Strongest leading indicator of a pivot into Screencap's space | Quarterly |
 
 ---
 
 *Caveat on fairness:* screenpipe is a genuinely strong, well-engineered project with real traction;
 this brief intentionally credits its lead on breadth/search/ecosystem. The strategic case for
-ScreenCap is **not** "we're better" — it's "we're solving a different job that their architecture and
+Screencap is **not** "we're better" — it's "we're solving a different job that their architecture and
 consent model can't serve, and we should refuse to be dragged onto their turf."

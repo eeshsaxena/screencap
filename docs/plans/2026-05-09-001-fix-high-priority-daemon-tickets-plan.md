@@ -65,9 +65,9 @@ The ce-brainstorm origin doc explicitly deferred replay to "if real consumers ne
 - [src/screencap/daemon/server.py:124-127](src/screencap/daemon/server.py:124) — `DaemonAlreadyRunning` catch site; today returns exit code 1.
 - [src/screencap/daemon/socket.py:65-148](src/screencap/daemon/socket.py:65) — `_probe_existing_socket` and `bind_unix_socket`. lsof PID capture lands inside `_probe_existing_socket` after `connect()` succeeds; PID flows up via a new `existing_pid: int | None` attribute on `DaemonAlreadyRunning`.
 - [src/screencap/daemon/launchagent.py:26-31](src/screencap/daemon/launchagent.py:26) — `InstallResult` dataclass; `state` is a free-form string. Existing values include `installed_and_running`, `install_failed_daemon_did_not_start`, etc. Add `install_failed_already_running`.
-- [macos/ScreenCap/Controllers/RecorderController.swift:565-621](macos/ScreenCap/Controllers/RecorderController.swift:565) — `consumeDaemonEvents`. Already passes `snapshot.cursor` to `daemon.subscribe(sinceCursor:)`. No client change needed once daemon honors replay.
-- [macos/ScreenCap/Controllers/DaemonClient.swift:140-153, 226-305](macos/ScreenCap/Controllers/DaemonClient.swift:140) — `RecordingStartResponse.cursor` and `subscribe(sinceCursor:)`.
-- [macos/ScreenCapTests/RecorderControllerDaemonTests.swift:25-56](macos/ScreenCapTests/RecorderControllerDaemonTests.swift:25) — current happy-path test; the mock delivers `started` AFTER the subscribe, masking the production race. The fix must add a test that delivers `started` BEFORE the subscribe and asserts the recorder still transitions.
+- [macos/Screencap/Controllers/RecorderController.swift:565-621](macos/Screencap/Controllers/RecorderController.swift:565) — `consumeDaemonEvents`. Already passes `snapshot.cursor` to `daemon.subscribe(sinceCursor:)`. No client change needed once daemon honors replay.
+- [macos/Screencap/Controllers/DaemonClient.swift:140-153, 226-305](macos/Screencap/Controllers/DaemonClient.swift:140) — `RecordingStartResponse.cursor` and `subscribe(sinceCursor:)`.
+- [macos/ScreencapTests/RecorderControllerDaemonTests.swift:25-56](macos/ScreencapTests/RecorderControllerDaemonTests.swift:25) — current happy-path test; the mock delivers `started` AFTER the subscribe, masking the production race. The fix must add a test that delivers `started` BEFORE the subscribe and asserts the recorder still transitions.
 - [tests/daemon/test_event_bus.py](tests/daemon/test_event_bus.py) — slow-consumer test at line 62-78 confirms `publish()` is non-blocking. Pure-unit pattern for the replay-buffer additions.
 - [tests/daemon/test_supervisor.py:36-103](tests/daemon/test_supervisor.py:36) — fake-engine-script fixture pattern. Extend with `FAKE_FINALIZE_BEFORE_TERM=1` env var to deterministically drive the TKT-A race.
 - [tests/daemon/test_control_verbs.py:134-196](tests/daemon/test_control_verbs.py:134) — HTTP-over-UDS pattern via `_serve` ctx; home for the wire-level replay regression test.
@@ -235,8 +235,8 @@ The ce-brainstorm origin doc explicitly deferred replay to "if real consumers ne
 **Dependencies:** U1, U2 (the daemon side must honor replay first; the SwiftUI client already passes `sinceCursor` correctly).
 
 **Files:**
-- Modify: `macos/ScreenCapTests/RecorderControllerDaemonTests.swift`
-- (Read for reference, no change expected: `macos/ScreenCapTests/DaemonClientTests.swift` — `UnixHTTPTestServer` chunked-response handling.)
+- Modify: `macos/ScreencapTests/RecorderControllerDaemonTests.swift`
+- (Read for reference, no change expected: `macos/ScreencapTests/DaemonClientTests.swift` — `UnixHTTPTestServer` chunked-response handling.)
 
 **Approach:**
 - Keep the existing happy-path test as a positive control (live delivery — which still works).
