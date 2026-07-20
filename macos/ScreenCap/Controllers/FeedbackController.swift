@@ -82,7 +82,14 @@ final class FeedbackController: ObservableObject {
     init(
         service: FeedbackService = LiveFeedbackService(),
         daemonVersionFetch: @escaping @Sendable () async throws -> String = {
-            try await DaemonClient.daemonInfo().daemonVersion
+            // Bound at the TRANSPORT (connection.cancel via withTimeout), not
+            // just at the raceProbe deadline: the task group awaits its
+            // children on exit, and NWConnection reads ignore task
+            // cancellation — so an unbounded fetch would stretch the probe to
+            // the client's default 10s despite the 2s race.
+            try await DaemonClient.daemonInfo(
+                timeout: FeedbackController.daemonProbeTimeoutSeconds
+            ).daemonVersion
         },
         daemonProbeTimeout: TimeInterval = FeedbackController.daemonProbeTimeoutSeconds,
         appVersion: String = Bundle.main

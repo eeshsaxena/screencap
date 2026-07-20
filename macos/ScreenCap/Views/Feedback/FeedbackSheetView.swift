@@ -98,33 +98,48 @@ struct FeedbackSheetView: View {
     }
 
     private var messageEditor: some View {
-        ZStack(alignment: .topLeading) {
-            TextEditor(text: $controller.message)
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .frame(minHeight: 110, maxHeight: 170)
-                .disabled(isSending)
-                .accessibilityLabel("Feedback message")
-            if controller.message.isEmpty {
-                Text(messagePrompt)
+        VStack(alignment: .leading, spacing: 4) {
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $controller.message)
                     .font(.body)
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 12)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
+                    .scrollContentBackground(.hidden)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .frame(minHeight: 110, maxHeight: 170)
+                    .disabled(isSending)
+                    // VoiceOver hears the same guidance the visual placeholder
+                    // shows — the overlay itself is hidden from the tree.
+                    .accessibilityLabel(
+                        controller.message.isEmpty
+                            ? "Feedback message. \(messagePrompt)"
+                            : "Feedback message"
+                    )
+                if controller.message.isEmpty {
+                    Text(messagePrompt)
+                        .font(.body)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 12)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(nsColor: .textBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(.quaternary)
+            )
+            // The cap silently gates canSend; the disabled Send button must
+            // never be the only signal (mirrors the email field's inline copy).
+            if FeedbackFormPolicy.isMessageOverCap(controller.message) {
+                Text("Your message is over the \(FeedbackCaps.maxMessageChars.formatted()) character limit — trim it to send.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color(nsColor: .textBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(.quaternary)
-        )
     }
 
     @ViewBuilder
@@ -171,6 +186,7 @@ struct FeedbackSheetView: View {
         HStack(spacing: 8) {
             Image(systemName: attachment.isVideo ? "film" : "photo")
                 .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text(attachment.fileName)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -210,7 +226,7 @@ struct FeedbackSheetView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.png, .jpeg, .gif, .heic, .mpeg4Movie, .quickTimeMovie]
+        panel.allowedContentTypes = FeedbackCaps.allowedUTTypes
         panel.prompt = "Attach"
         panel.message = "Choose screenshots or short clips to attach"
         if panel.runModal() == .OK {

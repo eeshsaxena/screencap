@@ -1,3 +1,4 @@
+import UniformTypeIdentifiers
 import XCTest
 @testable import ScreenCap
 
@@ -400,6 +401,41 @@ final class FeedbackControllerTests: XCTestCase {
         XCTAssertTrue(controller.attachments.isEmpty)
     }
 
+    func testSpawnFailureMapsToRetryableServer() async {
+        // The non-timeout thrown-error branch: spawn/binary/decode failures
+        // all take the retryable server fallback, never a wedge or a leak of
+        // localizedDescription.
+        let service = FakeFeedbackService()
+        service.error = CLIError.binaryNotFound(searchedPaths: [])
+        let controller = makeController(service: service)
+        controller.message = "hi"
+        controller.send()
+        await waitUntilSettled(controller)
+        guard case .failure(let failure) = controller.state else {
+            return XCTFail("expected failure")
+        }
+        XCTAssertEqual(failure.kind, .server)
+        XCTAssertTrue(failure.retryable)
+        XCTAssertEqual(controller.message, "hi", "draft preserved")
+    }
+
+    func testReopenAfterSuccessShowsFreshForm() async {
+        // Dismissing the success screen without tapping Done must not strand
+        // the next open on last report's success (prepareForPresentation's
+        // stale-success reset).
+        let service = FakeFeedbackService()
+        service.result = FakeFeedbackService.envelope(#"{"ok": true}"#)
+        let controller = makeController(service: service)
+        controller.message = "hi"
+        controller.send()
+        await waitUntilSettled(controller)
+        guard case .success = controller.state else {
+            return XCTFail("expected success")
+        }
+        controller.prepareForPresentation(auth: .signedOut)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
     func testSubprocessTimeoutMapsToRetryableNetwork() async {
         let service = FakeFeedbackService()
         service.error = CLIError.timedOut(seconds: 120)
@@ -479,6 +515,31 @@ final class FeedbackControllerTests: XCTestCase {
         XCTAssertFalse(FeedbackFormPolicy.canSend(message: "hi", email: "", isSending: true))
         let huge = String(repeating: "a", count: FeedbackCaps.maxMessageChars + 1)
         XCTAssertFalse(FeedbackFormPolicy.canSend(message: huge, email: "", isSending: false))
+        let atCap = String(repeating: "a", count: FeedbackCaps.maxMessageChars)
+        XCTAssertTrue(FeedbackFormPolicy.canSend(message: atCap, email: "", isSending: false))
+    }
+
+    func testMessageCapCountsUnicodeScalarsLikeTheRelay() {
+        // The relay caps on Python len() (code points). A flag emoji is ONE
+        // grapheme but TWO scalars — grapheme counting would pass the client
+        // gate and bounce off the relay as `invalid`.
+        let flags = String(repeating: "🇵🇹", count: FeedbackCaps.maxMessageChars / 2 + 1)
+        XCTAssertLessThanOrEqual(flags.count, FeedbackCaps.maxMessageChars)
+        XCTAssertTrue(FeedbackFormPolicy.isMessageOverCap(flags))
+        XCTAssertFalse(FeedbackFormPolicy.canSend(message: flags, email: "", isSending: false))
+    }
+
+    func testPanelTypeFilterDerivesFromCaps() {
+        // Every accepted extension must resolve to a UTType — one that
+        // doesn't would silently vanish from the NSOpenPanel filter while the
+        // validator still accepts it.
+        for ext in FeedbackCaps.contentTypeByExtension.keys {
+            XCTAssertNotNil(
+                UTType(filenameExtension: ext),
+                "extension \(ext) resolves to no UTType — invisible in the panel"
+            )
+        }
+        XCTAssertFalse(FeedbackCaps.allowedUTTypes.isEmpty)
     }
 
     func testEmailAcceptance() {

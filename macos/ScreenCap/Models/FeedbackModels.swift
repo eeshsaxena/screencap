@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 /// The three request types the feedback relay routes to Linear labels
 /// (feat/in-app-feedback-form U3). Raw values are the cross-language contract
@@ -45,6 +46,14 @@ enum FeedbackCaps {
         "mp4": "video/mp4",
         "mov": "video/quicktime",
     ]
+
+    /// The NSOpenPanel filter, DERIVED from the same extension map so the
+    /// picker and the selection-time validator can never drift — a type added
+    /// to one home but not the other would otherwise silently vanish from the
+    /// panel (or get picked only to be rejected).
+    static var allowedUTTypes: [UTType] {
+        Array(Set(contentTypeByExtension.keys.compactMap { UTType(filenameExtension: $0) }))
+    }
 }
 
 /// One user-chosen attachment in the draft. `sizeBytes` is captured at
@@ -256,12 +265,20 @@ enum FeedbackFormPolicy {
         return parts.count == 2 && parts[1].contains(".") && !trimmed.contains(" ")
     }
 
+    /// Whether the message breaks the relay's `MAX_MESSAGE_CHARS` cap.
+    /// Counts unicode scalars, not graphemes — Python's `len()` counts code
+    /// points, so `message.count` (grapheme clusters) would let emoji-heavy
+    /// text pass here and still bounce off the relay as `invalid`.
+    static func isMessageOverCap(_ message: String) -> Bool {
+        message.unicodeScalars.count > FeedbackCaps.maxMessageChars
+    }
+
     /// Send-button enablement: a non-empty message, an acceptable email, a
     /// message under the relay cap, and no send already in flight.
     static func canSend(message: String, email: String, isSending: Bool) -> Bool {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         return !trimmed.isEmpty
-            && message.count <= FeedbackCaps.maxMessageChars
+            && !isMessageOverCap(message)
             && isEmailAcceptable(email)
             && !isSending
     }

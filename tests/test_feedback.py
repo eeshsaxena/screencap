@@ -233,7 +233,9 @@ def _run_cli(stdin_text):
 
     from screencap.cli import cli
 
-    return CliRunner().invoke(cli, ["feedback", "send"], input=stdin_text), _json
+    # --json mirrors the app's exact argv (CLIClient.runJSONRawStdin asserts
+    # the flag is present), so a regression to the option breaks here first.
+    return CliRunner().invoke(cli, ["feedback", "send", "--json"], input=stdin_text), _json
 
 
 def test_cli_send_success_exits_zero():
