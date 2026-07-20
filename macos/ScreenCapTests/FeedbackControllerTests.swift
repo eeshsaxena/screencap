@@ -19,23 +19,42 @@ final class FeedbackControllerTests: XCTestCase {
         )
     }
 
-    /// Yield until the controller leaves `.sending` (the send Task settled).
-    private func waitUntilSettled(
-        _ controller: FeedbackController, timeout: TimeInterval = 2
+    /// Poll until `condition` holds (or the timeout passes) — the controller's
+    /// send / daemon-probe Tasks have no completion to await directly. Mirrors
+    /// `CloudAuthControllerTests.waitUntil` / `RecorderControllerTests.waitUntil`.
+    private func waitUntil(
+        _ message: String,
+        timeout: TimeInterval = 3,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @escaping @MainActor () -> Bool
     ) async {
         let deadline = Date().addingTimeInterval(timeout)
-        while controller.state == .sending, Date() < deadline {
+        while Date() < deadline {
+            if condition() { return }
             await Task.yield()
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail(message, file: file, line: line)
+    }
+
+    private func waitUntilSettled(
+        _ controller: FeedbackController,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        await waitUntil("send never settled", file: file, line: line) {
+            controller.state != .sending
         }
     }
 
-    /// Yield until the async daemon probe resolves.
     private func waitForDaemonVersion(
-        _ controller: FeedbackController, timeout: TimeInterval = 2
+        _ controller: FeedbackController,
+        file: StaticString = #filePath,
+        line: UInt = #line
     ) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while controller.daemonVersion == nil, Date() < deadline {
-            await Task.yield()
+        await waitUntil("daemon probe never resolved", file: file, line: line) {
+            controller.daemonVersion != nil
         }
     }
 

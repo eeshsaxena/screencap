@@ -165,6 +165,14 @@ final class FeedbackController: ObservableObject {
         attachmentRejection = nil
         for url in urls {
             let fileName = url.lastPathComponent
+            // Type gate first — an unsupported pick must read "unsupported"
+            // even when it would also break a size cap (see the policy test).
+            guard let contentType = FeedbackAttachmentPolicy.contentType(
+                forExtension: url.pathExtension
+            ) else {
+                noteRejection(.unsupportedType(fileName: fileName))
+                continue
+            }
             let sizeBytes: Int
             do {
                 let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -181,12 +189,6 @@ final class FeedbackController: ObservableObject {
                 existingTotalBytes: totalAttachmentBytes
             ) {
                 noteRejection(rejection)
-                continue
-            }
-            guard let contentType = FeedbackAttachmentPolicy.contentType(
-                forExtension: url.pathExtension
-            ) else {
-                noteRejection(.unsupportedType(fileName: fileName))
                 continue
             }
             attachments.append(FeedbackAttachment(

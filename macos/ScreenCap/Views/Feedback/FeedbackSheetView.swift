@@ -169,7 +169,7 @@ struct FeedbackSheetView: View {
 
     private func attachmentRow(_ attachment: FeedbackAttachment) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: attachment.contentType.hasPrefix("video") ? "film" : "photo")
+            Image(systemName: attachment.isVideo ? "film" : "photo")
                 .foregroundStyle(.secondary)
             Text(attachment.fileName)
                 .lineLimit(1)

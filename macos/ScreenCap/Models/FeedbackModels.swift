@@ -55,6 +55,10 @@ struct FeedbackAttachment: Identifiable, Equatable {
     let fileName: String
     let sizeBytes: Int
     let contentType: String
+
+    /// MIME-kind classification for the row glyph, kept beside the model so
+    /// the view never inspects the raw MIME string.
+    var isVideo: Bool { contentType.hasPrefix("video/") }
 }
 
 /// Why a candidate file was refused at selection time (AE2/AE6/AE7). Each case
