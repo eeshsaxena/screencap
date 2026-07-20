@@ -1,6 +1,6 @@
 # benchmarks/
 
-Maintained developer tools for benchmarking ScreenCap. Not shipped, not imported by
+Maintained developer tools for benchmarking Screencap. Not shipped, not imported by
 `src/` or `tests/`. One-off spike/audit harnesses are not kept here — they are distilled
 to `docs/solutions/research/` and removed (see SCR-119 and PR #217 for the precedent).
 

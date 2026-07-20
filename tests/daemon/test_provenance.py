@@ -14,14 +14,14 @@ from screencap.daemon import provenance
 
 def test_swiftui_app_bundle_path_classifies_as_swiftui():
     assert provenance.classify_path_and_argv(
-        "/Applications/ScreenCap.app/Contents/MacOS/screencap",
+        "/Applications/Screencap.app/Contents/MacOS/screencap",
         ["screencap", "list"],
     ) == provenance.STARTED_BY_SWIFTUI
 
 
 def test_swiftui_user_install_bundle_classifies_as_swiftui():
     assert provenance.classify_path_and_argv(
-        "/Users/alice/Applications/ScreenCap.app/Contents/MacOS/screencap",
+        "/Users/alice/Applications/Screencap.app/Contents/MacOS/screencap",
         ["screencap"],
     ) == provenance.STARTED_BY_SWIFTUI
 
@@ -83,7 +83,7 @@ def test_swiftui_path_wins_over_argv():
     """If the path matches the SwiftUI bundle, the classifier picks
     swiftui regardless of what the bundled CLI was invoked with."""
     assert provenance.classify_path_and_argv(
-        "/Applications/ScreenCap.app/Contents/MacOS/screencap",
+        "/Applications/Screencap.app/Contents/MacOS/screencap",
         ["screencap", "mcp"],
     ) == provenance.STARTED_BY_SWIFTUI
 

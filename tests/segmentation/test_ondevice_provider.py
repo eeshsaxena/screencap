@@ -360,7 +360,7 @@ class TestBundledHelperDiscovery:
     """`_find_bundled_helper()` bundle-walk across the real app layouts (SCR-239).
 
     The daemon can run from more than one place inside the app, but the helper
-    only ever ships in the OUTER ``ScreenCap.app/Contents/MacOS`` (the app's
+    only ever ships in the OUTER ``Screencap.app/Contents/MacOS`` (the app's
     "Embed IntelligenceHelper" build phase copies it there). After SCR-196 the
     daemon runs from a NESTED ``ScreencapDaemon.app`` under
     ``Contents/Library/LoginItems`` — so the helper it needs is in an ANCESTOR
@@ -388,9 +388,9 @@ class TestBundledHelperDiscovery:
         return ondevice._find_bundled_helper()
 
     def test_outer_app_resources_layout_is_discovered(self, tmp_path, monkeypatch):
-        """CLI at ``ScreenCap.app/Contents/Resources`` → helper in that same
+        """CLI at ``Screencap.app/Contents/Resources`` → helper in that same
         ``Contents/MacOS`` (the historical single-bundle layout)."""
-        app = tmp_path / "ScreenCap.app"
+        app = tmp_path / "Screencap.app"
         helper = app / "Contents" / "MacOS" / "IntelligenceHelper"
         self._make_helper(helper)
         mod = self._make_module(
@@ -404,7 +404,7 @@ class TestBundledHelperDiscovery:
         own ``Contents/MacOS`` has no helper; discovery must keep walking up to
         the OUTER app's ``Contents/MacOS`` rather than stop at the first
         ``Contents``. This is the regression guard for the idle-gap fallback."""
-        app = tmp_path / "ScreenCap.app"
+        app = tmp_path / "Screencap.app"
         helper = app / "Contents" / "MacOS" / "IntelligenceHelper"
         self._make_helper(helper)
         mod = self._make_module(

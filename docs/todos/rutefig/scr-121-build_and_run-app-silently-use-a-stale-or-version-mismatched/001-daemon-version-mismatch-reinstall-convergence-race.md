@@ -9,7 +9,7 @@ related_linear: SCR-121
 related_review_run: /tmp/compound-engineering/ce-code-review/20260615-101441-f760d0b5/
 finding: "#1"
 severity: P1
-location: macos/ScreenCap/Controllers/DaemonInstallController.swift:185
+location: macos/Screencap/Controllers/DaemonInstallController.swift:185
 reviewers: adversarial, reliability
 confidence: 75
 ---
@@ -18,7 +18,7 @@ confidence: 75
 
 ## Problem
 
-When a stale/older ScreenCap daemon is squatting `~/.screencap/run/api.sock`, `DaemonInstallController` reinstalls once then re-polls — but `pollDaemon` returns `.versionMismatch` on the **first** probe that sees the wrong version (only the `.timedOut` branch polls to the deadline), and `refresh()` re-registers the agent **without stopping the running daemon**. If the old daemon is still answering when the single second-pass probe fires — and a freshly registered daemon cannot bind while it is (`socket.py` `DaemonAlreadyRunning`) — the user hits a false `.daemonVersionMismatch` on the exact path SCR-121 exists to fix.
+When a stale/older Screencap daemon is squatting `~/.screencap/run/api.sock`, `DaemonInstallController` reinstalls once then re-polls — but `pollDaemon` returns `.versionMismatch` on the **first** probe that sees the wrong version (only the `.timedOut` branch polls to the deadline), and `refresh()` re-registers the agent **without stopping the running daemon**. If the old daemon is still answering when the single second-pass probe fires — and a freshly registered daemon cannot bind while it is (`socket.py` `DaemonAlreadyRunning`) — the user hits a false `.daemonVersionMismatch` on the exact path SCR-121 exists to fix.
 
 `build_and_run.sh` added an explicit `launchctl bootout` for precisely this reason; the shipped app's install path has no equivalent, so the developer path is hardened against the squatting daemon while the user path is not.
 
@@ -39,8 +39,8 @@ The poll-to-deadline change breaks the `FakeDaemonProbe` test model: it currentl
 
 ## Evidence
 
-- `macos/ScreenCap/Controllers/DaemonInstallController.swift:185` (versionMismatch case) and `:277` (pollDaemon returns on first mismatch — only `.timedOut` polls to deadline)
-- `macos/ScreenCapTests/DaemonInstallControllerTests.swift` `testReinstallRecoversWhenFreshDaemonReportsExpectedVersion` assumes an instantaneous swap (probe sequence `["0.12.7","0.20.0"]`)
+- `macos/Screencap/Controllers/DaemonInstallController.swift:185` (versionMismatch case) and `:277` (pollDaemon returns on first mismatch — only `.timedOut` polls to deadline)
+- `macos/ScreencapTests/DaemonInstallControllerTests.swift` `testReinstallRecoversWhenFreshDaemonReportsExpectedVersion` assumes an instantaneous swap (probe sequence `["0.12.7","0.20.0"]`)
 
 ## Linear filing details (for handoff session)
 

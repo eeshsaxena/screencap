@@ -1,4 +1,4 @@
-# ScreenCap Build Report — 2026-02-20
+# Screencap Build Report — 2026-02-20
 
 ## Summary
 Complete build of screencap CLI tool wrapping openadapt-capture + openadapt-privacy.

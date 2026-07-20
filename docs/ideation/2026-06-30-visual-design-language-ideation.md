@@ -5,7 +5,7 @@ focus: Visual & interaction design language (look/feel/craft) of the macOS Swift
 mode: repo-grounded
 ---
 
-# Ideation: Visual & interaction design language for ScreenCap's macOS app
+# Ideation: Visual & interaction design language for Screencap's macOS app
 
 **Design direction (north-star):** *"A calm recording instrument that sits lightly on your Mac."* Native-Tahoe glass (you see your own desktop through a thin layer) + one coherent instrument identity expressed from Dock → menubar → live indicator + warmth-not-alarm + wordless local-first trust + a premium archive. Disciplined, scarce color; minimal honest motion; the Things/Fantastical craft tier in a category that currently has no design-forward player.
 

@@ -1,16 +1,16 @@
 ---
 name: macos-app-release
-description: Build, sign, notarize, and publish a new macOS ScreenCap.app release (.dmg). Bumps the app version, builds the embedded daemon with PyInstaller, builds the app with Xcode, Developer-ID signs + notarizes + staples, packages a DMG, tags `macos-app-vX.Y.Z`, and creates a GitHub prerelease. This is the app track — distinct from `local-release` (the headless CLI/`vX.Y.Z` track). Triggers on "release the macOS app", "new app release", "build a new DMG", "ship the app to testers", or after Swift/UI or embedded-daemon changes land.
+description: Build, sign, notarize, and publish a new macOS Screencap.app release (.dmg). Bumps the app version, builds the embedded daemon with PyInstaller, builds the app with Xcode, Developer-ID signs + notarizes + staples, packages a DMG, tags `macos-app-vX.Y.Z`, and creates a GitHub prerelease. This is the app track — distinct from `local-release` (the headless CLI/`vX.Y.Z` track). Triggers on "release the macOS app", "new app release", "build a new DMG", "ship the app to testers", or after Swift/UI or embedded-daemon changes land.
 ---
 
 # macOS App Release
 
-ScreenCap ships **two separately-versioned, independently-released artifacts**:
+Screencap ships **two separately-versioned, independently-released artifacts**:
 
 - **CLI / daemon** (`vX.Y.Z`) — the headless `install.sh` / `~/.screencap/bin` channel. Use the **`local-release`** skill.
 - **macOS app** (`macos-app-vX.Y.Z`) — a local-only signed + notarized `.dmg`, published as a GitHub **prerelease** ("tester build"). **This skill.**
 
-The app **embeds a daemon built from the current Python source at build time** (`macos/ScreenCap/Scripts/embed-cli.sh` bundles `dist/ScreencapDaemon.app` and stamps `Contents/Resources/screencap-cli-version`). It does **not** download a released CLI tarball, so an app release is self-contained and does **not** require a CLI release.
+The app **embeds a daemon built from the current Python source at build time** (`macos/Screencap/Scripts/embed-cli.sh` bundles `dist/ScreencapDaemon.app` and stamps `Contents/Resources/screencap-cli-version`). It does **not** download a released CLI tarball, so an app release is self-contained and does **not** require a CLI release.
 
 ## Step 0: Preflight — confirm the app actually needs a release
 
@@ -58,7 +58,7 @@ git log "$(git tag --list 'macos-app-v*' --sort=-v:refname | head -1)"..HEAD --o
 ## Step 2: Bump versions
 
 1. `macos/project.yml` — `CFBundleShortVersionString` + `CFBundleVersion`.
-2. `macos/ScreenCap/Info.plist` — the same two keys (keep in sync with project.yml).
+2. `macos/Screencap/Info.plist` — the same two keys (keep in sync with project.yml).
 3. If bumping the embedded daemon: `pyproject.toml` `version`, **then refresh the editable install** so the built binary reports it:
    ```bash
    .venv/bin/pip install -e . --no-deps
@@ -98,14 +98,14 @@ If `_auth-config-check` fails, Step 3 didn't run or `.env` was unset — re-inje
 ```bash
 export DEVELOPMENT_TEAM=2A8S6MV8DZ
 ( cd macos && xcodegen generate )
-xcodebuild -project macos/ScreenCap.xcodeproj -scheme ScreenCap -configuration Release \
+xcodebuild -project macos/Screencap.xcodeproj -scheme Screencap -configuration Release \
   -derivedDataPath macos/.build/ReleaseDD DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" build
 ```
 
-`macos/ScreenCap.xcodeproj` is xcodegen-generated and **gitignored** — never commit it. Expect `** BUILD SUCCEEDED **`. Then verify the built app carries the right versions and a properly-stamped, team-signed embedded daemon:
+`macos/Screencap.xcodeproj` is xcodegen-generated and **gitignored** — never commit it. Expect `** BUILD SUCCEEDED **`. Then verify the built app carries the right versions and a properly-stamped, team-signed embedded daemon:
 
 ```bash
-APP="macos/.build/ReleaseDD/Build/Products/Release/ScreenCap.app"
+APP="macos/.build/ReleaseDD/Build/Products/Release/Screencap.app"
 /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist"   # app version
 cat "$APP/Contents/Resources/screencap-cli-version"; echo                                   # embedded daemon version
 "$APP/Contents/Library/LoginItems/ScreencapDaemon.app/Contents/MacOS/screencap" --version   # helper launches
@@ -118,7 +118,7 @@ The `screencap-cli-version` stamp must equal the intended daemon version (this i
 
 ```bash
 eval "$(grep -E '^\s*export\s+(MACOS_SIGN_IDENTITY|APPLE_NOTARY_KEY_P8|APPLE_NOTARY_KEY_ID|APPLE_NOTARY_ISSUER_ID|SCREENCAP_DAEMON_PROVISION_PROFILE)=' ~/.zshrc)"
-APP="macos/.build/ReleaseDD/Build/Products/Release/ScreenCap.app"
+APP="macos/.build/ReleaseDD/Build/Products/Release/Screencap.app"
 
 # Inside-out Developer ID signing (hardened runtime). Gatekeeper 'rejected' at the
 # end is EXPECTED pre-notarization. SCR-242: sign_app.sh embeds the daemon's
@@ -135,14 +135,14 @@ APPLE_NOTARY_ISSUER_ID="$APPLE_NOTARY_ISSUER_ID" MACOS_SIGN_IDENTITY="$MACOS_SIG
   script/notarize_app.sh "$APP" <APP_VERSION>
 ```
 
-Success ends with `source=Notarized Developer ID` (accepted) and writes `.build/dmg/ScreenCap-<APP_VERSION>.dmg` + `.dmg.sha256`.
+Success ends with `source=Notarized Developer ID` (accepted) and writes `.build/dmg/Screencap-<APP_VERSION>.dmg` + `.dmg.sha256`.
 
 ## Step 7: Commit, tag, push, publish
 
 The version bump is a **direct commit to `main`** (matches the repo pattern for prior app bumps). No Claude co-authoring in the message.
 
 ```bash
-git add pyproject.toml macos/project.yml macos/ScreenCap/Info.plist
+git add pyproject.toml macos/project.yml macos/Screencap/Info.plist
 git commit -m "chore(macos): bump app version to <APP_VERSION>"   # add "; bump embedded daemon to X.Y.Z" if you bumped pyproject
 git tag "macos-app-v<APP_VERSION>"
 git push origin main
@@ -153,11 +153,11 @@ The `macos-app-v*` tag intentionally does **not** match the `v*` trigger, so pus
 
 ```bash
 gh release create "macos-app-v<APP_VERSION>" \
-  --title "ScreenCap macOS app v<APP_VERSION> (<short descriptor>)" \
+  --title "Screencap macOS app v<APP_VERSION> (<short descriptor>)" \
   --notes-file <notes.md> \
   --prerelease \
-  .build/dmg/ScreenCap-<APP_VERSION>.dmg \
-  .build/dmg/ScreenCap-<APP_VERSION>.dmg.sha256
+  .build/dmg/Screencap-<APP_VERSION>.dmg \
+  .build/dmg/Screencap-<APP_VERSION>.dmg.sha256
 ```
 
 Release notes should list the tester-facing fixes/changes since the last app tag, note the embedded daemon version, and include the DMG SHA-256 + install instructions (drag to Applications, open from there — not from the mounted DMG, or App Translocation breaks the app's by-path resolution of its embedded CLI).
@@ -165,8 +165,8 @@ Release notes should list the tester-facing fixes/changes since the last app tag
 ## Release naming & organization conventions
 
 - **App tag:** always `macos-app-vX.Y.Z` (with the `v`). The two oldest tags `macos-app-0.1.0` / `0.1.1` predate this convention — do not add more without the `v`.
-- **App title:** `ScreenCap macOS app vX.Y.Z (<short descriptor>)`.
-- **CLI title (for reference, set by `local-release`):** `ScreenCap CLI vX.Y.Z`.
+- **App title:** `Screencap macOS app vX.Y.Z (<short descriptor>)`.
+- **CLI title (for reference, set by `local-release`):** `Screencap CLI vX.Y.Z`.
 - **Prerelease:** app builds are marked `--prerelease` while tester-only. Consequence: GitHub pins the green **Latest** badge to the newest *non-prerelease*, i.e. the CLI. Making the app the headline is a deliberate "graduate out of prerelease" decision for when it's GA — not a per-release toggle.
 - **Never rename existing tags.** `install.sh` resolves CLI releases by their `vX.Y.Z` tag; renaming published tags also breaks clones.
 

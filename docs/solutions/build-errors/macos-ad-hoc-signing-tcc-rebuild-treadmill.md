@@ -7,10 +7,10 @@ category: build-errors
 severity: medium
 problem_type: dev-environment-friction
 modules:
-  - macos/ScreenCap/ScreenCap.entitlements
+  - macos/Screencap/Screencap.entitlements
   - macos/project.yml
-  - macos/ScreenCap/Scripts/embed-cli.sh
-  - macos/ScreenCap/Scripts/screencap-cli.entitlements
+  - macos/Screencap/Scripts/embed-cli.sh
+  - macos/Screencap/Scripts/screencap-cli.entitlements
 tags:
   - macos
   - tcc
@@ -21,14 +21,14 @@ tags:
   - daemon
   - pyinstaller
 symptoms:
-  - "Granted Screen Recording / Accessibility / Input Monitoring to ScreenCap once; rebuilt the app; permissions all show red again"
+  - "Granted Screen Recording / Accessibility / Input Monitoring to Screencap once; rebuilt the app; permissions all show red again"
   - "Quit & Relaunch button doesn't help — the new process is treated as a different app entirely"
-  - "Multiple ScreenCap entries appear in Privacy & Security after several rebuilds"
+  - "Multiple Screencap entries appear in Privacy & Security after several rebuilds"
   - "`tccutil reset` is the only way to recover a clean grant flow"
   - "App is team-signed but TCC grants STILL churn on rebuild — because the nested daemon binary is ad-hoc"
   - "Two separate `screencap` rows appear in a Privacy pane (one per rebuild's cdhash)"
-  - "Daemon reports denied via `/v0/daemon.info` (and the walkthrough \"ScreenCap helper\" rows) while System Settings shows the same permission granted — the app and daemon are different TCC subjects"
-  - "`tccutil reset <Service> screencap` fails with OSStatus -10814; the Screen Recording entry reads \"ScreenCap\" but Accessibility / Input Monitoring read lowercase `screencap`"
+  - "Daemon reports denied via `/v0/daemon.info` (and the walkthrough \"Screencap helper\" rows) while System Settings shows the same permission granted — the app and daemon are different TCC subjects"
+  - "`tccutil reset <Service> screencap` fails with OSStatus -10814; the Screen Recording entry reads \"Screencap\" but Accessibility / Input Monitoring read lowercase `screencap`"
 root_cause: >
   Xcode signs Debug builds with an ad-hoc signature (`Signature=adhoc,
   TeamIdentifier=not set`). TCC uses the code-signing identity to track
@@ -43,18 +43,18 @@ root_cause: >
 
 Workflow:
 
-1. Build ScreenCap.app in Xcode.
+1. Build Screencap.app in Xcode.
 2. Launch, complete the permissions walkthrough, grant Screen Recording / Accessibility / Input Monitoring in System Settings.
 3. Rebuild (any source change).
 4. Re-launch — the permissions walkthrough shows all four red dots again.
-5. Open Privacy & Security; ScreenCap is in the list, possibly multiple times, but the toggles for the *previous* build are now orphaned. Toggling them does nothing for the current build.
+5. Open Privacy & Security; Screencap is in the list, possibly multiple times, but the toggles for the *previous* build are now orphaned. Toggling them does nothing for the current build.
 
 The Quit & Relaunch button doesn't fix this case — the relaunched process still has the new ad-hoc signature, which TCC sees as the unknown app.
 
 ## Why it happens
 
 ```
-$ codesign -dvv /path/to/ScreenCap.app
+$ codesign -dvv /path/to/Screencap.app
 Identifier=com.screencap.macos
 Format=app bundle with Mach-O thin (arm64)
 CodeDirectory v=20400 size=428 flags=0x2(adhoc) hashes=3+7 location=embedded
@@ -117,9 +117,9 @@ registration request, not the app):
 ## Diagnosing it at runtime (2026-06-15): daemon says "denied" while System Settings shows "granted"
 
 The most confusing presentation of this problem: the first-run walkthrough's
-"ScreenCap helper" rows (and `/v0/daemon.info`) report Screen Recording /
+"Screencap helper" rows (and `/v0/daemon.info`) report Screen Recording /
 Accessibility / Input Monitoring as **denied**, yet System Settings shows them
-**granted** for ScreenCap, and recording is blocked. It looks like a probe bug.
+**granted** for Screencap, and recording is blocked. It looks like a probe bug.
 It isn't — it's the identity split above, plus three macOS-UI quirks. **Don't
 debug `permission_probe.py` / `daemon.info` — diagnose the TCC identity.**
 
@@ -144,21 +144,21 @@ ungranted-or-wrong-entry, fixed below.
 **3. Account for three quirks that make a correct grant *look* broken:**
 - **Per-pane name divergence — the two-row trap (canonical example).** Screen
   Recording attributes to the containing bundle, so its entry shows as
-  **"ScreenCap"** (capitalized). Accessibility and Input Monitoring attribute to
+  **"Screencap"** (capitalized). Accessibility and Input Monitoring attribute to
   the bare tool, so their entries show as lowercase **`screencap`**. The
   Accessibility pane therefore lists **two** rows that look like the same app:
 
   | Row (Accessibility pane)         | Icon            | Is the grant the daemon needs? |
   |----------------------------------|-----------------|--------------------------------|
   | `screencap` (lowercase)          | terminal "exec" | **YES** — the daemon's TCC subject (the bare helper tool) |
-  | `ScreenCap` (capitalized)        | app grid icon   | No — the app bundle, *not* the recorder |
+  | `Screencap` (capitalized)        | app grid icon   | No — the app bundle, *not* the recorder |
 
-  The natural-but-wrong move is to enable **`ScreenCap`** (looks like "the app"),
+  The natural-but-wrong move is to enable **`Screencap`** (looks like "the app"),
   which leaves the lowercase **`screencap`** row OFF — so `daemon.info` keeps
   reporting `accessibility: denied` while System Settings *looks* granted, and
   **restarting the daemon does not help** (the grant genuinely isn't there for the
   helper's subject). Fix: enable the **lowercase `screencap`** row. As of the
-  walkthrough copy fix, the "Set up ScreenCap" rows now name the exact entry per
+  walkthrough copy fix, the "Set up Screencap" rows now name the exact entry per
   pane (`PrivacyPane.helperSettingsEntryName`) and flag the lowercase one, so this
   trap is called out in-product instead of relying on this note.
 - **Default OFF + stale pane.** A freshly-registered entry is **default OFF**, and
@@ -205,7 +205,7 @@ Sign with a stable Developer ID Application identity. The release pipeline (Unit
 
 For dev-time stability before then, you could:
 
-- Generate a self-signed Developer ID in Keychain Access, then sign Debug builds with `codesign -s "ScreenCap-Dev" --entitlements ...` from a post-build script. Heavy lift for marginal benefit.
+- Generate a self-signed Developer ID in Keychain Access, then sign Debug builds with `codesign -s "Screencap-Dev" --entitlements ...` from a post-build script. Heavy lift for marginal benefit.
 - Add the .app to the Privacy & Security `+` button manually instead of via the request API — same orphaning problem on rebuild, but skips the prompt churn.
 - Move the .app to `/Applications/` once and only build there — doesn't help; the signature still changes.
 

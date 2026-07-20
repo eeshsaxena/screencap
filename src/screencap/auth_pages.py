@@ -22,7 +22,7 @@ import html
 # geometry fixed per the brand board). Stroke follows --ink, dot follows --teal,
 # so both flip in dark mode.
 _LOGO = (
-    '<svg width="22" height="22" viewBox="0 0 48 48" role="img" aria-label="ScreenCap">'
+    '<svg width="22" height="22" viewBox="0 0 48 48" role="img" aria-label="Screencap">'
     '<path d="M 20 6 L 12 6 Q 6 6 6 12 L 6 20" fill="none" stroke="var(--ink)"'
     ' stroke-width="4.5" stroke-linecap="round"/>'
     '<path d="M 28 42 L 36 42 Q 42 42 42 36 L 42 28" fill="none" stroke="var(--ink)"'
@@ -110,18 +110,18 @@ def render_callback_page(*, success: bool) -> bytes:
     muted cross + "try again" copy for a declined/failed callback.
     """
     if success:
-        tone, title_tab = "success", "Signed in — ScreenCap"
+        tone, title_tab = "success", "Signed in — Screencap"
         icon, eyebrow, title = _CHECK_ICON, "SIGNED IN", "You're all set."
         lines = [
-            "ScreenCap now has your account.",
+            "Screencap now has your account.",
             "You can close this tab and return to the app.",
         ]
     else:
-        tone, title_tab = "error", "Sign-in failed — ScreenCap"
+        tone, title_tab = "error", "Sign-in failed — Screencap"
         icon, eyebrow, title = _CROSS_ICON, "SIGN-IN FAILED", "Sign-in didn't finish."
         lines = [
             "No account was connected.",
-            "You can close this tab and try again from ScreenCap.",
+            "You can close this tab and try again from Screencap.",
         ]
 
     lines_html = "".join(f"<p>{html.escape(line)}</p>" for line in lines)

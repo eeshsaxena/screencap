@@ -1,4 +1,4 @@
-"""Minimal ASGI app for the ScreenCap daemon."""
+"""Minimal ASGI app for the Screencap daemon."""
 
 from __future__ import annotations
 
@@ -1270,7 +1270,7 @@ async def permission_cleanup_decoys(request: Request) -> JSONResponse:
     """SCR-200 (U4): identity-scoped decoy/orphan TCC cleanup, daemon-side.
 
     Removes the orphaned bare ``screencap`` identity and the legacy app's stray
-    Screen Recording / Accessibility rows so exactly one "ScreenCap" row remains
+    Screen Recording / Accessibility rows so exactly one "Screencap" row remains
     per pane (R5/R6/R8). The destructive ``tccutil`` argv is built through the
     hardened allowlists in ``tcc_cleanup`` — the single source of truth, so the
     GUI install path does not carry a second copy of the reset logic.

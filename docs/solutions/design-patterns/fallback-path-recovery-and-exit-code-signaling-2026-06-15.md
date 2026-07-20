@@ -4,7 +4,7 @@ date: 2026-06-15
 category: design-patterns
 module: macOS app shell — permission onboarding + recorder transport
 problem_type: design_pattern
-component: macos/ScreenCap (PermissionController, MainWindow, PrivacyPaneView, RecordingStateMachine); screencap.engine preflight
+component: macos/Screencap (PermissionController, MainWindow, PrivacyPaneView, RecordingStateMachine); screencap.engine preflight
 platform: macos
 severity: medium
 applies_when:

@@ -24,7 +24,7 @@ references:
 
 **Exploratory** spike — there was no observed deficiency in GLiNER. The question:
 should `openai/privacy-filter` (Apache-2.0, MoE token classifier, April 2026)
-replace `knowledgator/gliner-pii-base-v1.0` as ScreenCap's single default text-PII
+replace `knowledgator/gliner-pii-base-v1.0` as Screencap's single default text-PII
 NER backend, fed by Apple Vision OCR + accessibility text?
 
 **Verdict: NO-SWAP.** The full evaluation harness lived in PRs #211/#217 (recoverable
@@ -52,36 +52,36 @@ learnings below.
    to port the Viterbi decoder.
 
 The accuracy evidence points the same way but is **directional** (small / partly
-synthetic test sets — ScreenCap's real recordings are PII-sparse):
+synthetic test sets — Screencap's real recordings are PII-sparse):
 
 | Dimension | GLiNER | privacy-filter |
 |---|---|---|
 | Tier-1 PII-Masking-300k (n=400) person/email partial recall | **57% / 100%** | 47% / 60% |
 | Tier-1 ADDRESS partial recall | 22% | **54%** (pf better) |
 | Tier-2 synthetic OCR-noise (n=25) partial recall / doc-leak | **100% / 0%** | 69% / 32% |
-| Tier-2 real ScreenCap OCR (2 in-scope PII, 182 FP probes) | caught both, 18 FP | caught both, **8 FP** (pf cleaner) |
+| Tier-2 real Screencap OCR (2 in-scope PII, 182 FP probes) | caught both, 18 FP | caught both, **8 FP** (pf cleaner) |
 | Secrets (binary bucket, 14 secrets) — see below | n/a (NER) | 50% |
 
 privacy-filter has genuine strengths (better Tier-1 ADDRESS recall, fewer false
 positives on noisy dev-screen OCR, broader native categories). This is a **fit**
-decision for ScreenCap's current 6-type `EntityType` set and bundled-binary
+decision for Screencap's current 6-type `EntityType` set and bundled-binary
 constraint, not a quality judgment on the model.
 
 ## Secrets / API-keys — augment, not swap
 
 privacy-filter's one capability GLiNER's NER lacks is a native `secret` class. Scored
-against ScreenCap's existing regex + detect-secrets layer on a synthetic, code-OCR
+against Screencap's existing regex + detect-secrets layer on a synthetic, code-OCR
 set (14 secrets — AWS/GitHub/Stripe/Slack/Google/OpenAI keys, JWT, RSA key, conn
 string, npm, basic-auth, password — + 6 entropy-trap distractors), collapsed to a
 binary SECRET bucket:
 
 | Backend | Partial recall | Precision |
 |---|---|---|
-| **ScreenCap regex + detect-secrets (current)** | **79%** (11/14) | 100% |
+| **Screencap regex + detect-secrets (current)** | **79%** (11/14) | 100% |
 | privacy-filter `secret` NER | 50% (7/14) | 100% |
 | GLiNER NER (baseline) | 0% | — |
 
-ScreenCap's existing layer **beats** privacy-filter's native secret class, and neither
+Screencap's existing layer **beats** privacy-filter's native secret class, and neither
 over-flags the entropy traps. But they are **complementary**: privacy-filter caught 2
 secrets detect-secrets missed (an unprefixed hex key + base64 basic-auth, via context),
 while detect-secrets caught the prefixed provider tokens privacy-filter missed — union
@@ -107,7 +107,7 @@ decoder cost.
   not `"simple"` (which fragments emails/phones). Offsets include a **leading space** —
   harmless for redaction (over-covers) but breaks exact-boundary matching, so
   **partial / leak-relevant recall is the fair metric**.
-- **ScreenCap's real recordings are PII-sparse.** Dev-screen captures; AX text across
+- **Screencap's real recordings are PII-sparse.** Dev-screen captures; AX text across
   all recordings yielded 0 emails/phones/SSNs. A credible per-type recall read needs
   synthetic OCR-noise augmentation — the real set is best for the **precision / false-
   positive** axis (does a backend hallucinate PII on code/paths/timestamps?).
@@ -121,7 +121,7 @@ decoder cost.
 
 ## When to revisit
 
-- ScreenCap wants **date / url / account-number** as first-class redaction types
+- Screencap wants **date / url / account-number** as first-class redaction types
   (privacy-filter detects these natively; GLiNER does not).
 - The **bundled-binary constraint** relaxes (e.g. a server-side redaction tier where
   2.6 GB + `transformers`/`torch` are acceptable).

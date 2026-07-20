@@ -1,7 +1,7 @@
 """``hdiutil`` primitives for the at-rest encrypted recording store (SCR-236, U1).
 
 This module wraps the macOS ``hdiutil`` CLI around an **encrypted sparse-bundle**
-container (AES-256, APFS inside) that holds ScreenCap's recording data plane. It
+container (AES-256, APFS inside) that holds Screencap's recording data plane. It
 is the foundation unit: it owns the raw create / attach / detach / compact /
 status primitives, the single shared passphrase-piping helper, the typed
 exception taxonomy a daemon can later map to exit codes, ``-plist`` output
@@ -64,7 +64,7 @@ BUNDLE_NAME = "store.sparsebundle"
 ``~/.screencap/store.sparsebundle``; the concrete parent directory is resolved
 by the config/lifecycle layers (U3/U4), not here."""
 
-DEFAULT_VOLUME_NAME = "ScreenCap"
+DEFAULT_VOLUME_NAME = "Screencap"
 """APFS volume label for the mounted store. Cosmetic; ``-nobrowse`` keeps it out
 of Finder regardless."""
 
@@ -117,7 +117,7 @@ _ENTITLEMENT_MISMATCH_MSG = (
     "container key unreadable: the key is present in the shared Keychain access group "
     "but this binary is not entitled to read it (errSecMissingEntitlement). This is NOT "
     "data loss — the encrypted store and its key are intact. Run the vault from the "
-    "entitled ScreenCap app or its bundled CLI; a pip/pyenv terminal CLI or a Debug "
+    "entitled Screencap app or its bundled CLI; a pip/pyenv terminal CLI or a Debug "
     "'python3 -m screencap.cli' build is an unsupported vault consumer (KTD-22)."
 )
 """Message for :class:`ContainerKeyUnreachableError` — names the cause, points at the

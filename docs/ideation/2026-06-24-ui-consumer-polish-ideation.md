@@ -1,17 +1,17 @@
 ---
 date: 2026-06-24
 topic: ui-consumer-polish
-focus: What to add to ScreenCap's macOS UI to be more complete than Day Flow + more user-friendly than the developer-focused Screen Pipe
+focus: What to add to Screencap's macOS UI to be more complete than Day Flow + more user-friendly than the developer-focused Screen Pipe
 mode: repo-grounded
 ---
 
-# Ideation: Consumer-grade UI polish for ScreenCap
+# Ideation: Consumer-grade UI polish for Screencap
 
-**Through-line:** *Day Flow has the story but not the depth; Screen Pipe has the depth but not the story. ScreenCap already has the depth — a local content/transcript/timeline index + MCP, capture-time audit records, redaction evidence, scrubbed cloud copies — but exposes almost none of it as a polished human surface.* So "more user-friendly than Screen Pipe" is mostly **building consumer front doors on infra that already ships**, and "more complete than Day Flow" is **adding the narrative layer + verifiable local-first trust Day Flow lacks**.
+**Through-line:** *Day Flow has the story but not the depth; Screen Pipe has the depth but not the story. Screencap already has the depth — a local content/transcript/timeline index + MCP, capture-time audit records, redaction evidence, scrubbed cloud copies — but exposes almost none of it as a polished human surface.* So "more user-friendly than Screen Pipe" is mostly **building consumer front doors on infra that already ships**, and "more complete than Day Flow" is **adding the narrative layer + verifiable local-first trust Day Flow lacks**.
 
 ## Grounding Context (Codebase Context)
 
-- **Project shape:** Python 3.10+ CLI + LaunchAgent daemon (UNIX-socket `/v0/*` HTTP API, auto-spawn idle-shutdown) + SwiftUI macOS 13+ app shell (`macos/ScreenCap`). Engine is an internal sub-package.
+- **Project shape:** Python 3.10+ CLI + LaunchAgent daemon (UNIX-socket `/v0/*` HTTP API, auto-spawn idle-shutdown) + SwiftUI macOS 13+ app shell (`macos/Screencap`). Engine is an internal sub-package.
 - **Current UI surface:** menu bar (start/stop, sign-in); main window = `NavigationSplitView` with **Calendar / Recordings / Privacy** tabs; month calendar; date-grouped recordings list; per-recording **Review window** (video player + typed-event timeline + redaction-evidence markers + upload/cancel/retry); **Privacy pane** ("Mode: X · read-only in v1" + per-app binary exclude toggles); first-run permissions walkthrough + privacy banner + sign-in; live recording banner (red dot, elapsed time, stop).
 - **Latent power not yet surfaced to users:** the daemon already ships `/v0/content.search`, `/v0/transcript.search`, `/v0/timeline.query` + an MCP server (SCR-118), all **local-only, pointer-only, agent-facing** — no human search UI exists. Privacy enforcement already writes structured `AuditEntry`/`ReasonCode` records + a `disable_log` (invisible to the user). The terminal stage already produces a scrubbed/masked cloud copy via `CloudCopyProducer`, distinct from the local-only `recording.db`. Mask primitives + retroactive re-mask already exist.
 - **Concrete current-state pain:** recordings-row click shells out to `screencap view` → a **browser tab**, and the stub branch surfaces the literal CLI string "Run `screencap download`" to non-technical users.

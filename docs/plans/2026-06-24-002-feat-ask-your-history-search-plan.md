@@ -10,13 +10,13 @@ origin: docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md
 
 ## Summary
 
-Add a **Search** section to the existing singleton main window (a 4th `NavigationSplitView` item in `macos/ScreenCap/Views/MainWindow.swift`, mirroring `RecordingsListView`), backed by three new `DaemonClient` methods + pointer-only Codable models over the existing UNIX-socket transport. A local rule-based parser turns the query into time/app/text filters; results fan out across the three existing daemon verbs, are time-filtered client-side where the verbs can't, ranked by relevance+recency, rendered as markers on a scrubbable per-day timeline, and deep-linked into the native Review window via a new seek-on-open entry point. One small Python-side change exposes the OCR-indexing flag through `settings` so a one-time consent prompt can enable it; everything else is additive Swift.
+Add a **Search** section to the existing singleton main window (a 4th `NavigationSplitView` item in `macos/Screencap/Views/MainWindow.swift`, mirroring `RecordingsListView`), backed by three new `DaemonClient` methods + pointer-only Codable models over the existing UNIX-socket transport. A local rule-based parser turns the query into time/app/text filters; results fan out across the three existing daemon verbs, are time-filtered client-side where the verbs can't, ranked by relevance+recency, rendered as markers on a scrubbable per-day timeline, and deep-linked into the native Review window via a new seek-on-open entry point. One small Python-side change exposes the OCR-indexing flag through `settings` so a one-time consent prompt can enable it; everything else is additive Swift.
 
 ---
 
 ## Problem Frame
 
-ScreenCap's SwiftUI app has no way for a human to search their own recorded history — the sidebar is Calendar / Recordings / Privacy, and the powerful local retrieval verbs (`/v0/content.search`, `/v0/transcript.search`, `/v0/timeline.query`) are reachable only by agents over MCP. A non-technical operator who remembers "I saw that error in the vendor portal yesterday afternoon" can only scroll a date-grouped list. (Full motivation in origin: docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md.)
+Screencap's SwiftUI app has no way for a human to search their own recorded history — the sidebar is Calendar / Recordings / Privacy, and the powerful local retrieval verbs (`/v0/content.search`, `/v0/transcript.search`, `/v0/timeline.query`) are reachable only by agents over MCP. A non-technical operator who remembers "I saw that error in the vendor portal yesterday afternoon" can only scroll a date-grouped list. (Full motivation in origin: docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md.)
 
 ---
 
@@ -79,14 +79,14 @@ ScreenCap's SwiftUI app has no way for a human to search their own recorded hist
 
 ### Relevant Code and Patterns
 
-- **Sidebar wiring** — `macos/ScreenCap/Views/MainWindow.swift`: `SidebarSection` enum + `List(selection:)` + `sectionContent` switch. Add a `.search` case (enum + `NavigationLink` row + switch arm). Confirm the `.onChange(of: section)` `selectedDate`-clear logic doesn't need to include `.search`.
-- **View template** — `macos/ScreenCap/Views/RecordingsListView.swift`: `@EnvironmentObject`/`@StateObject` data source, loading/empty/error branches, `Button { } label: { HStack }` rows with `.contentShape(Rectangle())`, `@Environment(\.openWindow)` for navigation, `@State rowError` + `.alert`.
-- **Daemon client** — `macos/ScreenCap/Controllers/DaemonClient.swift`: generic `request<T: Decodable>(method:path:body:timeout:)` over `NWConnection(.unix)`, per-verb static methods, `Encodable` request structs, `Decodable` responses with snake→camel `CodingKeys`, `DaemonClientError` (incl. `envelopeError(code:rawBody:)`, `socketUnavailable`). Mirror `recordingStart` for the three new POST verbs.
-- **Service seam** — `macos/ScreenCap/Controllers/DaemonSessionService.swift` (`LiveDaemonSessionService`): protocol seam wrapping `DaemonClient` for `@MainActor` testability. Mirror as `SearchService`.
-- **Index/caching** — `macos/ScreenCap/State/RecordingsIndex.swift`: on-demand `refresh()` with `guard !isLoading` re-entrancy guard, no timers; `groupedByDay()`/`countsByDay` for which days have recordings (anchors the per-day timeline).
-- **Review window** — `macos/ScreenCap/Views/Review/ReviewWindow.swift`, `ReviewWindowViewModel.swift`, `State/ReviewWindowOpener.swift`, `Views/Review/TimelinePane.swift`: scene keyed on recording-name `String`; internal `seek(toSeconds:)` exists; absolute→relative conversion via `max(0, t - startedAt)`; `.reviewWindowUploadSucceeded` NotificationCenter pattern is the out-of-band-signal precedent.
-- **Consent/config** — `macos/ScreenCap/Controllers/PrivacyController.swift` (`JSONInvoker` seam, optimistic `@Published` update + re-fetch, `pendingToggles` double-tap guard, `hasPrivacySection` never-written-vs-default detection), `Views/Privacy/FirstRunPrivacyBanner.swift` (non-blocking banner pattern), `Models/PrivacyStatus.swift`.
-- **Models** — `macos/ScreenCap/Models/RecordingSummary.swift` / `UploadEventLine.swift`: `Decodable` + explicit `CodingKeys`, `decodeIfPresent ?? default` tolerance, colocated domain logic.
+- **Sidebar wiring** — `macos/Screencap/Views/MainWindow.swift`: `SidebarSection` enum + `List(selection:)` + `sectionContent` switch. Add a `.search` case (enum + `NavigationLink` row + switch arm). Confirm the `.onChange(of: section)` `selectedDate`-clear logic doesn't need to include `.search`.
+- **View template** — `macos/Screencap/Views/RecordingsListView.swift`: `@EnvironmentObject`/`@StateObject` data source, loading/empty/error branches, `Button { } label: { HStack }` rows with `.contentShape(Rectangle())`, `@Environment(\.openWindow)` for navigation, `@State rowError` + `.alert`.
+- **Daemon client** — `macos/Screencap/Controllers/DaemonClient.swift`: generic `request<T: Decodable>(method:path:body:timeout:)` over `NWConnection(.unix)`, per-verb static methods, `Encodable` request structs, `Decodable` responses with snake→camel `CodingKeys`, `DaemonClientError` (incl. `envelopeError(code:rawBody:)`, `socketUnavailable`). Mirror `recordingStart` for the three new POST verbs.
+- **Service seam** — `macos/Screencap/Controllers/DaemonSessionService.swift` (`LiveDaemonSessionService`): protocol seam wrapping `DaemonClient` for `@MainActor` testability. Mirror as `SearchService`.
+- **Index/caching** — `macos/Screencap/State/RecordingsIndex.swift`: on-demand `refresh()` with `guard !isLoading` re-entrancy guard, no timers; `groupedByDay()`/`countsByDay` for which days have recordings (anchors the per-day timeline).
+- **Review window** — `macos/Screencap/Views/Review/ReviewWindow.swift`, `ReviewWindowViewModel.swift`, `State/ReviewWindowOpener.swift`, `Views/Review/TimelinePane.swift`: scene keyed on recording-name `String`; internal `seek(toSeconds:)` exists; absolute→relative conversion via `max(0, t - startedAt)`; `.reviewWindowUploadSucceeded` NotificationCenter pattern is the out-of-band-signal precedent.
+- **Consent/config** — `macos/Screencap/Controllers/PrivacyController.swift` (`JSONInvoker` seam, optimistic `@Published` update + re-fetch, `pendingToggles` double-tap guard, `hasPrivacySection` never-written-vs-default detection), `Views/Privacy/FirstRunPrivacyBanner.swift` (non-blocking banner pattern), `Models/PrivacyStatus.swift`.
+- **Models** — `macos/Screencap/Models/RecordingSummary.swift` / `UploadEventLine.swift`: `Decodable` + explicit `CodingKeys`, `decodeIfPresent ?? default` tolerance, colocated domain logic.
 - **Verb contract** — `src/screencap/daemon/app.py` (`content_search`/`transcript_search`/`timeline_query`), `src/screencap/daemon/schema.py` (request/response models), `src/screencap/content_index.py` (`IndexState`). MCP pessimistic defaulting precedent: `src/screencap/mcp/server.py`.
 - **OCR-flag config** — `src/screencap/config.py` `get_content_index_enabled()` (top-level `content_index_enabled`, env-or-config, default off); CLI `settings` command in `src/screencap/cli/__init__.py` (`_BOOL_KEYS` allowlist, `settings_payload`, `invalidate_config_cache()`). Consumed at recording time by `chunk_processor._index_chunk_content`.
 
@@ -219,10 +219,10 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 **Dependencies:** None
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/DaemonClient.swift` (three POST methods: content.search, transcript.search, timeline.query; request + response structs)
-- Create: `macos/ScreenCap/Models/SearchResult.swift` (pointer models: content hit `{recording, timestampMs, snippet, score}`, transcript hit `{recording, chunkIndex, snippet}`, timeline row `{recording, timestampMs, app?, title?}`; response envelopes carrying hits/rows + `indexState`/`coverage`)
-- Create: `macos/ScreenCap/Controllers/SearchService.swift` (protocol + `LiveSearchService` wrapping `DaemonClient`)
-- Test: `macos/ScreenCapTests/SearchServiceTests.swift`
+- Modify: `macos/Screencap/Controllers/DaemonClient.swift` (three POST methods: content.search, transcript.search, timeline.query; request + response structs)
+- Create: `macos/Screencap/Models/SearchResult.swift` (pointer models: content hit `{recording, timestampMs, snippet, score}`, transcript hit `{recording, chunkIndex, snippet}`, timeline row `{recording, timestampMs, app?, title?}`; response envelopes carrying hits/rows + `indexState`/`coverage`)
+- Create: `macos/Screencap/Controllers/SearchService.swift` (protocol + `LiveSearchService` wrapping `DaemonClient`)
+- Test: `macos/ScreencapTests/SearchServiceTests.swift`
 
 **Approach:**
 - Mirror `recordingStart` for request encoding and `ListResponse`/`SessionSnapshotResponse` for decoding (snake→camel `CodingKeys`, tolerant optionals). Keep everything `Sendable`-clean under strict concurrency; carry raw `Data` rather than `[String:Any]`.
@@ -251,8 +251,8 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/QueryParser.swift`
-- Test: `macos/ScreenCapTests/QueryParserTests.swift`
+- Create: `macos/Screencap/Controllers/QueryParser.swift`
+- Test: `macos/ScreencapTests/QueryParserTests.swift`
 
 **Approach:**
 - Rule-based extraction of time expressions and app/site tokens; remaining text is the free-text term. No ML, no network.
@@ -281,8 +281,8 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 **Dependencies:** U2, U3
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Search/SearchViewModel.swift`
-- Test: `macos/ScreenCapTests/SearchViewModelTests.swift`
+- Create: `macos/Screencap/Views/Search/SearchViewModel.swift`
+- Test: `macos/ScreencapTests/SearchViewModelTests.swift`
 
 **Approach:**
 - Fan out to the three verbs as **independent** calls (one stream's failure must not fail the others). Timeline gets the parsed window server-side with explicit `limit=200`; **content** hits are filtered client-side by their `timestamp_ms`; **transcript** hits have no `timestamp_ms` and must first be resolved `chunk_index`→chunk-start time, then filtered (unresolvable ones surface unanchored, off the timeline).
@@ -316,11 +316,11 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 **Dependencies:** U4
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/MainWindow.swift` (add `.search` to `SidebarSection`, a `NavigationLink` row with `magnifyingglass`, and a `case .search` arm; confirm `.onChange(of: section)` handling)
-- Create: `macos/ScreenCap/Views/Search/SearchView.swift` (search field + results)
-- Create: `macos/ScreenCap/Views/Search/SearchTimelineView.swift` (day strip + scrubbable per-day marker timeline + result card)
+- Modify: `macos/Screencap/Views/MainWindow.swift` (add `.search` to `SidebarSection`, a `NavigationLink` row with `magnifyingglass`, and a `case .search` arm; confirm `.onChange(of: section)` handling)
+- Create: `macos/Screencap/Views/Search/SearchView.swift` (search field + results)
+- Create: `macos/Screencap/Views/Search/SearchTimelineView.swift` (day strip + scrubbable per-day marker timeline + result card)
 - Modify: `macos/project.yml` only if needed, then `cd macos && xcodegen generate`
-- Test: `macos/ScreenCapTests/SearchViewModelTests.swift` (view-level logic stays in the testable view-model; views themselves are not unit-tested per repo norms — see learning on MenuBarExtra/openWindow non-testability)
+- Test: `macos/ScreencapTests/SearchViewModelTests.swift` (view-level logic stays in the testable view-model; views themselves are not unit-tested per repo norms — see learning on MenuBarExtra/openWindow non-testability)
 
 **Approach:**
 - Mirror `RecordingsListView` structure (loading/empty/error branches, tappable rows). Owns a `@StateObject SearchViewModel`.
@@ -347,10 +347,10 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 **Dependencies:** U5
 
 **Files:**
-- Modify: `macos/ScreenCap/State/ReviewWindowOpener.swift` (entry point that carries an optional seek target out-of-band)
-- Modify: `macos/ScreenCap/Views/Review/ReviewWindow.swift` / `ReviewWindowViewModel.swift` (apply a pending seek after state `.ready`; guard null/0 `startedAt`)
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` only if the opener-bridge registration needs the new seek channel
-- Test: `macos/ScreenCapTests/ReviewSeekTargetTests.swift`
+- Modify: `macos/Screencap/State/ReviewWindowOpener.swift` (entry point that carries an optional seek target out-of-band)
+- Modify: `macos/Screencap/Views/Review/ReviewWindow.swift` / `ReviewWindowViewModel.swift` (apply a pending seek after state `.ready`; guard null/0 `startedAt`)
+- Modify: `macos/Screencap/ScreencapApp.swift` only if the opener-bridge registration needs the new seek channel
+- Test: `macos/ScreencapTests/ReviewSeekTargetTests.swift`
 
 **Approach:**
 - Keep the Review scene keyed on recording-name (preserve singleton dedup). Deliver "seek to `timestamp_ms`" via a NotificationCenter post (mirroring `.reviewWindowUploadSucceeded`); the Review view applies it once `videoModel` exists.
@@ -379,11 +379,11 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 **Dependencies:** U1, U4, U5
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/ContentIndexConsentController.swift` (tri-state: never-asked / consented / declined; read+write via the `settings` invoker)
-- Create: `macos/ScreenCap/Views/Search/ContentIndexConsentBanner.swift` (inline banner/sheet with Enable / Not-now)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (surface the prompt when triggered)
-- Modify: `macos/ScreenCap/Models/PrivacyStatus.swift` (extend `SettingsEnvelope.Inner` with a `content_index_enabled` field so the consent trigger can read the flag's current state — required by the trigger fix)
-- Test: `macos/ScreenCapTests/ContentIndexConsentControllerTests.swift`
+- Create: `macos/Screencap/Controllers/ContentIndexConsentController.swift` (tri-state: never-asked / consented / declined; read+write via the `settings` invoker)
+- Create: `macos/Screencap/Views/Search/ContentIndexConsentBanner.swift` (inline banner/sheet with Enable / Not-now)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (surface the prompt when triggered)
+- Modify: `macos/Screencap/Models/PrivacyStatus.swift` (extend `SettingsEnvelope.Inner` with a `content_index_enabled` field so the consent trigger can read the flag's current state — required by the trigger fix)
+- Test: `macos/ScreencapTests/ContentIndexConsentControllerTests.swift`
 
 **Approach:**
 - Fire only when free-text is present AND the `content_index_enabled` flag is **off** (read via `settings --json`) AND consent state == never-asked. Do NOT gate on `index_state == not_indexed` alone — it only signals an absent index file, so a flag-off user with a stale index gets `no_match` and would never be prompted. Never re-modal once decided.
@@ -434,4 +434,4 @@ Consent sub-flow: free-text present AND `content_index_enabled` flag is OFF (rea
 - Verb contract: `src/screencap/daemon/app.py`, `src/screencap/daemon/schema.py`, `src/screencap/content_index.py`
 - Coverage-defaulting precedent: `src/screencap/mcp/server.py`
 - OCR flag: `src/screencap/config.py`, `src/screencap/cli/__init__.py`, `src/screencap/chunk_processor.py`
-- UI surfaces: `macos/ScreenCap/Views/MainWindow.swift`, `Views/RecordingsListView.swift`, `Controllers/DaemonClient.swift`, `State/ReviewWindowOpener.swift`, `Controllers/PrivacyController.swift`
+- UI surfaces: `macos/Screencap/Views/MainWindow.swift`, `Views/RecordingsListView.swift`, `Controllers/DaemonClient.swift`, `State/ReviewWindowOpener.swift`, `Controllers/PrivacyController.swift`

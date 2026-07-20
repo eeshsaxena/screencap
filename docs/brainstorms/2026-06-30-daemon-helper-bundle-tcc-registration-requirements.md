@@ -32,7 +32,7 @@ A tactical workaround shipped (SCR-49 / U8, 2026-06-08): a daemon `permission.re
 ## Key Flows
 
 - F1. First-run grant (new user)
-  - **Trigger:** A1 launches the app for the first time and reaches the "Set up ScreenCap" walkthrough.
+  - **Trigger:** A1 launches the app for the first time and reaches the "Set up Screencap" walkthrough.
   - **Actors:** A1, A3
   - **Steps:** Approve the helper (Login Items / SMAppService) → the daemon helper is installed and running under its bundle identity → the user grants each required permission → each deep-link lands on a Privacy pane with a real, toggleable entry for the helper → the user toggles it on.
   - **Outcome:** All required TCC entries exist and are enabled for the daemon's bundle identity; recording works without any manual `+`/deep-path add.

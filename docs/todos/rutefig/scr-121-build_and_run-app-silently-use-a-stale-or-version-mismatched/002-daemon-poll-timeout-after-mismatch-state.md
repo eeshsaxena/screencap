@@ -9,7 +9,7 @@ related_linear: SCR-121
 related_review_run: /tmp/compound-engineering/ce-code-review/20260615-101441-f760d0b5/
 finding: "#2"
 severity: P2
-location: macos/ScreenCap/Controllers/DaemonInstallController.swift:176
+location: macos/Screencap/Controllers/DaemonInstallController.swift:176
 reviewers: testing
 confidence: 75
 ---
@@ -37,7 +37,7 @@ Intertwined with finding #1 (the convergence-budget change) and changes install 
 
 ## Evidence
 
-- `macos/ScreenCap/Controllers/DaemonInstallController.swift:176` — second-pass `.timedOut` case is a no-op when `allowRegistrationRefresh` is false
+- `macos/Screencap/Controllers/DaemonInstallController.swift:176` — second-pass `.timedOut` case is a no-op when `allowRegistrationRefresh` is false
 
 ## Resolution (SCR-136)
 

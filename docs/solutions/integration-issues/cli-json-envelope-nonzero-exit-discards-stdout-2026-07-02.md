@@ -38,7 +38,7 @@ The SwiftUI shell shells out to the bundled `screencap` CLI and reads its JSON e
 
 Adding `retryable: true` to the error envelope while keeping the CLI's `sys.exit(1)` failure convention. The envelope was correct on stdout, but the Swift side never saw it:
 
-- `CLIClient.runOneShot` (`macos/ScreenCap/Controllers/CLIClient.swift:243-247`) throws `CLIError.nonZeroExit(code, stderr)` on any non-zero exit and returns only stderr — **stdout is dropped**.
+- `CLIClient.runOneShot` (`macos/Screencap/Controllers/CLIClient.swift:243-247`) throws `CLIError.nonZeroExit(code, stderr)` on any non-zero exit and returns only stderr — **stdout is dropped**.
 - `runJSONRaw` propagates that throw, so `LiveInspectDataLoader.load` never reaches `JSONDecoder`. The loader's `try await` throws, the ViewModel's catch sets `.failed`, and the auto-retry loop (which only loops on a *decoded* `ok:false + retryable` envelope) is unreachable in production.
 
 The gap was invisible in unit tests because the fake `InspectDataLoader` returns a decoded envelope, bypassing `runJSONRaw` entirely. A code review tracing the real subprocess path caught it before merge.

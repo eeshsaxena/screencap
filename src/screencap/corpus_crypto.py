@@ -79,7 +79,7 @@ KEYCHAIN_ACCESS_GROUP = os.environ.get(
 )
 
 _MAGIC = b"SCE1"
-"""Corpus-ciphertext file/blob magic (ScreenCap Encrypted, format v1). Prefixes the
+"""Corpus-ciphertext file/blob magic (Screencap Encrypted, format v1). Prefixes the
 nonce so a corpus ``.jpg.enc`` / encrypted ``png_data`` blob is self-framing and
 trivially distinguishable from a plaintext JPEG (which starts ``\\xff\\xd8``). A future
 scheme emits a new magic; this scheme's :func:`decrypt` then rejects it cleanly."""

@@ -1,12 +1,12 @@
-# ScreenCap
+# Screencap
 
-ScreenCap is a private screen memory for your Mac. It records what you work on — screen, input, audio, window context — keeps everything on your machine, and makes it searchable by you and by your AI agents. Nothing leaves your Mac unless you sign in and say so.
+Screencap is a private screen memory for your Mac. It records what you work on — screen, input, audio, window context — keeps everything on your machine, and makes it searchable by you and by your AI agents. Nothing leaves your Mac unless you sign in and say so.
 
 It ships two ways: a native macOS app (the easiest way to use it) and a CLI with a background daemon (the engine underneath, useful on its own for scripting and headless setups).
 
-## Why ScreenCap
+## Why Screencap
 
-Screen recorders that promise "local and private" usually mean *we redact things afterwards*. ScreenCap's privacy is enforced while recording, and you can verify every claim in this repo:
+Screen recorders that promise "local and private" usually mean *we redact things afterwards*. Screencap's privacy is enforced while recording, and you can verify every claim in this repo:
 
 - **Capture-time blocking, fail-closed.** A real-time filter watches the foreground window and blocks capture for sensitive apps *before* anything is written — excluded screenshots never touch disk, keystrokes are nulled, video frames are dropped. The filter starts blocked and stays blocked on errors, so failure means less capture, never more.
 - **Password managers are excluded by default, in every mode.** Banking, login, and checkout pages are excluded from cloud-bound recordings and masked in personal ones — driven by a context-classification matrix you can inspect and override per app (overriding an excluded category takes an explicit confirmation step).
@@ -127,7 +127,7 @@ The daemon's trust boundary and full threat model live in [SECURITY.md](SECURITY
 
 ## Cloud sync (optional)
 
-ScreenCap never requires an account. Recording, scrubbing, search, and playback are fully local. If you want your recordings available across machines or shareable:
+Screencap never requires an account. Recording, scrubbing, search, and playback are fully local. If you want your recordings available across machines or shareable:
 
 ```bash
 screencap login          # browser sign-in; token lives in your Keychain
@@ -207,7 +207,7 @@ A recording directory (`~/.screencap/recordings/rec-YYYYMMDDTHHMMSS/`) contains 
 
 ## Where this is going
 
-ScreenCap is built for people who work across a dozen tools a day and lose the thread between them — and increasingly, for the agents working alongside them. The near-term focus:
+Screencap is built for people who work across a dozen tools a day and lose the thread between them — and increasingly, for the agents working alongside them. The near-term focus:
 
 - **Recording you can forget about** — reliability and low overhead good enough to leave on all day.
 - **Privacy that stays ahead** — deeper capture-time enforcement, E2EE from beta to default, consent that's real rather than fine print.
@@ -226,11 +226,11 @@ pytest tests/
 
 The recording engine lives at `src/screencap/engine/`, the privacy subsystem at `src/screencap/privacy/` + `enforcement/` + `redaction/`, and the SwiftUI app at `macos/` (see [macos/README.md](macos/README.md) for app builds). `CLAUDE.md` has the full architecture map. Linting: `ruff check src/screencap/engine/`.
 
-ScreenCap can also store the entire local library inside an app-managed **encrypted container** (an AES-256 sparse bundle), ciphertext at rest and mountable only by the entitled app daemon and its bundled CLI, with an optional Touch ID-gated **Lock** for a deliberately sealed state. See the "on-disk vault container" section of [`SECURITY.md`](SECURITY.md) for what it protects (backups, copies, disk images, FileVault-off machines, other local users, the sealed state) and its boundaries (a live same-user process while mounted; the unlock gate is a present-user UX gate, not a cryptographic boundary; lost key means unrecoverable recordings).
+Screencap can also store the entire local library inside an app-managed **encrypted container** (an AES-256 sparse bundle), ciphertext at rest and mountable only by the entitled app daemon and its bundled CLI, with an optional Touch ID-gated **Lock** for a deliberately sealed state. See the "on-disk vault container" section of [`SECURITY.md`](SECURITY.md) for what it protects (backups, copies, disk images, FileVault-off machines, other local users, the sealed state) and its boundaries (a live same-user process while mounted; the unlock gate is a present-user UX gate, not a cryptographic boundary; lost key means unrecoverable recordings).
 
 ## License
 
-ScreenCap is dual-licensed:
+Screencap is dual-licensed:
 
-- **Open source:** GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE). If you use, modify, or offer ScreenCap as a network service, you must release your modifications under the same license.
-- **Commercial:** If the AGPL terms don't fit your use case (e.g. embedding ScreenCap in a closed-source product or offering it as a hosted service without source disclosure), a commercial license is available. Email aayushgupta5000@gmail.com.
+- **Open source:** GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE). If you use, modify, or offer Screencap as a network service, you must release your modifications under the same license.
+- **Commercial:** If the AGPL terms don't fit your use case (e.g. embedding Screencap in a closed-source product or offering it as a hosted service without source disclosure), a commercial license is available. Email aayushgupta5000@gmail.com.

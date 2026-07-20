@@ -2,8 +2,8 @@
 
 `keyring`'s public API can only reach the legacy login keychain with a
 **per-binary trusted-application ACL** — silently readable only by the exact code
-identity that wrote it, so every *other* same-team ScreenCap binary that reads it
-triggers the macOS "ScreenCap wants to use screencap-auth" authorization prompt.
+identity that wrote it, so every *other* same-team Screencap binary that reads it
+triggers the macOS "Screencap wants to use screencap-auth" authorization prompt.
 This module stores the item on the **data-protection keychain** in a **shared
 access group** (``kSecAttrAccessGroup``) instead, so every binary signed with the
 same Team ID *and* carrying the ``keychain-access-groups`` entitlement reads it

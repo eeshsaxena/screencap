@@ -13,7 +13,7 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Realign ScreenCap's pricing so the whole install base contributes revenue. Launch paid-only — no free tier — with two subscriptions, Local Pro (unlimited local recall) and Cloud (adds upload/sync/AI), each fronted by a free trial. Defer the freemium/capped tier as a reversible fast-follow.
+- **Objective:** Realign Screencap's pricing so the whole install base contributes revenue. Launch paid-only — no free tier — with two subscriptions, Local Pro (unlimited local recall) and Cloud (adds upload/sync/AI), each fronted by a free trial. Defer the freemium/capped tier as a reversible fast-follow.
 - **Product authority:** This document's Product Contract. Builds on the shipped $5 Personal-cloud paywall (`docs/plans/2026-07-07-001-feat-personal-cloud-billing-paywall-plan.md`) and supersedes two of its premises: the single $5 cloud price and free-forever local capture.
 - **Execution profile:** ~14 units across the billing Cloud Functions, the entitlement claim, the daemon recording + recall gates (enforced via a bounded last-known-good lease), the Python auth/config layer, and the SwiftUI onboarding. Extends the shipped $5 paywall (PR #348) rather than rebuilding it. The two-sided dark rollout is preserved and extended with a third daemon-side flag; the security-critical signer gate changes zero lines.
 - **Stop conditions:** Stop and surface if repurposing the entitlement would weaken the signer's cloud gate, if a Stripe trial cannot collect a card upfront, if the local gates would lock out a paying user who is offline, or if `SCREENCAP_LOCAL_PAYWALL_ENFORCE` would flip before the paywall-capable DMG is the minimum shipped version.
@@ -26,7 +26,7 @@ execution: code
 
 ### Summary
 
-Launch ScreenCap as a paid product with no free tier. Two subscriptions — Local Pro (unlimited local recall, no cloud) and Cloud (adds upload/sync/AI) — each fronted by a short free trial. Skip all freemium/cap machinery for launch; keep the capped-free tier as an explicit, reversible fast-follow if the paid funnel proves too thin. Team stays a coming-soon waitlist.
+Launch Screencap as a paid product with no free tier. Two subscriptions — Local Pro (unlimited local recall, no cloud) and Cloud (adds upload/sync/AI) — each fronted by a short free trial. Skip all freemium/cap machinery for launch; keep the capped-free tier as an explicit, reversible fast-follow if the paid funnel proves too thin. Team stays a coming-soon waitlist.
 
 ### Problem Frame
 
@@ -393,7 +393,7 @@ Backend entitlement seam first (U1 prices/env → U2 webhook tier → U3 checkou
 - **Goal:** The picker shows Local Pro and Cloud cards with dynamic prices and trial messaging; checkout passes the chosen tier; the app reads `tier` and models the trial lifecycle.
 - **Requirements:** R1, R2, R3, R4, R5, R10, R12.
 - **Dependencies:** U3, U6.
-- **Files:** `macos/ScreenCap/Views/Onboarding/OnboardingStorageSteps.swift`, `OnboardingStepPolicy.swift` (`OnboardingCopy`), `macos/ScreenCap/Controllers/CloudAuthController.swift`, `macos/ScreenCap/.../AuthStatus.swift`; `macos/ScreenCapTests/OnboardingStepPolicyTests.swift`, `CloudAuthControllerTests.swift`.
+- **Files:** `macos/Screencap/Views/Onboarding/OnboardingStorageSteps.swift`, `OnboardingStepPolicy.swift` (`OnboardingCopy`), `macos/Screencap/Controllers/CloudAuthController.swift`, `macos/Screencap/.../AuthStatus.swift`; `macos/ScreencapTests/OnboardingStepPolicyTests.swift`, `CloudAuthControllerTests.swift`.
 - **Approach:** Replace the single Personal-cloud card with Local Pro + Cloud cards behind `auth.paywallEnabled`; source prices from one place (config/whoami), not a duplicated literal (KTD-7). Pass `tier` to the checkout-url call (price-selection only; the webhook is the entitlement authority). Read `tier` + `trial_end` into `CloudAuthController`. **Enumerate the states the implementer must build** (the existing `AuthStatus` has no trial concept, so there is no precedent to copy):
   - **Trial lifecycle** from `trial_end`: active-trial (calm "N days left"), near-expiry (escalated conversion prompt), last-day/hours (urgent), expired (transition into the U12 lapsed state). Disclose auto-conversion + cancellation before charge (R12).
   - **Post-checkout pending** state — carry forward the existing `upgradePanel`'s spinner + "Unlocks automatically once payment completes" + "I've paid — check now" reconcile + `didBecomeActiveNotification` re-check, for **both** tiers, so returning from Stripe never looks like a failed payment.
@@ -413,7 +413,7 @@ Backend entitlement seam first (U1 prices/env → U2 webhook tier → U3 checkou
 - **Goal:** A lapsed user sees their library (browse + export) but recording and search show an upgrade prompt, never a lockout of their own data.
 - **Requirements:** R7, R8.
 - **Dependencies:** U8, U9, U11.
-- **Files:** the Library/Review, Search, menu-bar, and RecordingHUD views + record/search affordances under `macos/ScreenCap/Views/`; `macos/ScreenCap/Views/Search/SearchViewModel.swift`; `CloudAuthController` gating state; matching Swift tests where feasible.
+- **Files:** the Library/Review, Search, menu-bar, and RecordingHUD views + record/search affordances under `macos/Screencap/Views/`; `macos/Screencap/Views/Search/SearchViewModel.swift`; `CloudAuthController` gating state; matching Swift tests where feasible.
 - **Approach:** Gate the record and in-app search/recall affordances on the active-tier state; keep the recording list, day view, and reveal/export actions available regardless. **Enumerate the interaction states** (a bare "shows an upgrade prompt" leaves the form undefined):
   - **Gated record affordance** — the New-recording control gets a distinct disabled/gated appearance whose press surfaces the upgrade prompt (a sheet, mirroring `SignInPromptView`), not a silent no-op. Cover **all** start entry points — the menu bar and RecordingHUD also POST `/v0/recording.start` (U8), so gate those too, not just the Library.
   - **Gated search** — add a `SearchViewModel.Phase.subscriptionRequired` case that the fetch helpers map the daemon `SubscriptionRequiredError` onto, distinct from `.daemonDown` and per-stream `.unavailable`, so lapsed search reads as "upgrade to search," not "search is broken." Render its upgrade-CTA state.

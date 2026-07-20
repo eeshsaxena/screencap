@@ -7,15 +7,15 @@ topic: ask-your-history-search
 
 ## Summary
 
-An in-app Search surface in the ScreenCap macOS app: one box that interprets a question with **light local parsing** (time/app/text → filters), runs the **existing on-device index** across all three local streams, and returns **verifiable, pointer-only results plotted on a scrubbable per-day timeline** that jump straight into the Review window. Fully local, no egress, no generated prose. v1 validates the bet on the lowest-lift surface; the global overlay, an on-device intent model, and cited summaries are the documented destination, deliberately out of v1.
+An in-app Search surface in the Screencap macOS app: one box that interprets a question with **light local parsing** (time/app/text → filters), runs the **existing on-device index** across all three local streams, and returns **verifiable, pointer-only results plotted on a scrubbable per-day timeline** that jump straight into the Review window. Fully local, no egress, no generated prose. v1 validates the bet on the lowest-lift surface; the global overlay, an on-device intent model, and cited summaries are the documented destination, deliberately out of v1.
 
 ---
 
 ## Problem Frame
 
-ScreenCap continuously records the screen and already ships a powerful **local** retrieval backend — daemon verbs over an on-device content/transcript/timeline index (SCR-118), today reachable only by agents (MCP), never by the person whose screen it is. The SwiftUI app's sidebar is Calendar / Recordings / Privacy; there is **no way for a human to search their own history at all**. A non-technical operator who remembers *"I saw that error in the vendor portal yesterday afternoon"* can only scroll a date-grouped list and hope.
+Screencap continuously records the screen and already ships a powerful **local** retrieval backend — daemon verbs over an on-device content/transcript/timeline index (SCR-118), today reachable only by agents (MCP), never by the person whose screen it is. The SwiftUI app's sidebar is Calendar / Recordings / Privacy; there is **no way for a human to search their own history at all**. A non-technical operator who remembers *"I saw that error in the vendor portal yesterday afternoon"* can only scroll a date-grouped list and hope.
 
-The two reference points frame the gap. **Rewind** proved consumers want "ask your history," but its natural-language answers shipped retrieved text to a cloud LLM — splitting the product into a trustworthy keyword tier and an untrustworthy "magic" tier, and the privacy promise died on acquisition. **Screen Pipe** has the same local FTS substrate but gates every answer behind BYO-LLM ceremony (pipes, cron files, API keys), which blocks the non-technical user before their first result. ScreenCap already owns the substrate both rely on; what's missing is the human front door and a result experience that is fast, local, and verifiable.
+The two reference points frame the gap. **Rewind** proved consumers want "ask your history," but its natural-language answers shipped retrieved text to a cloud LLM — splitting the product into a trustworthy keyword tier and an untrustworthy "magic" tier, and the privacy promise died on acquisition. **Screen Pipe** has the same local FTS substrate but gates every answer behind BYO-LLM ceremony (pipes, cron files, API keys), which blocks the non-technical user before their first result. Screencap already owns the substrate both rely on; what's missing is the human front door and a result experience that is fast, local, and verifiable.
 
 ---
 
@@ -79,7 +79,7 @@ The two reference points frame the gap. **Rewind** proved consumers want "ask yo
 
 ## Success Criteria
 
-- **Human outcome:** a non-technical operator gets from a vague recollection to the right captured moment in a few seconds, with **zero setup** and no developer ceremony — and can see that it never left their Mac. This is the bar that tells us "ask-your-history" is worth investing further in for ScreenCap.
+- **Human outcome:** a non-technical operator gets from a vague recollection to the right captured moment in a few seconds, with **zero setup** and no developer ceremony — and can see that it never left their Mac. This is the bar that tells us "ask-your-history" is worth investing further in for Screencap.
 - **Trust outcome:** every answer is a verifiable pointer to a real moment; there is no path by which search produces an unsourced claim or sends anything off-device.
 - **Downstream handoff:** ce-plan has the surface (in-app Search view), the v1 query model boundary (local parsing, no model), the result UX (timeline-anchored, pointer cards, jump-to-Review), the privacy invariants, the coverage/indexing dependency, and the explicitly deferred destination — without needing to invent product behavior.
 

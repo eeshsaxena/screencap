@@ -17,7 +17,7 @@ deepened: 2026-07-17
 
 - **Objective:** On-device day-split segmentation produces model-named tasks for recordings of any length by replacing the single day-sized guided-generation call with bounded, window-scoped model calls over heuristic-proposed boundaries.
 - **Product authority:** The Product Contract below (from the SCR-275 brainstorm, 2026-07-17). The Planning Contract governs the technical approach; repo conventions (CLAUDE.md, SECURITY.md) override where they conflict.
-- **Execution profile:** Two-track change — Python (`src/screencap/segmentation/`, `src/screencap/terminal_stage.py`, `src/screencap/pipeline_state.py`) plus Swift (`macos/IntelligenceHelper/main.swift`, honest-status surface in `macos/ScreenCap/`). Swift helper behavior is verified Python-side via the fake-helper pattern plus a manual macOS-26 eval; Swift builds are compile-only from this worktree.
+- **Execution profile:** Two-track change — Python (`src/screencap/segmentation/`, `src/screencap/terminal_stage.py`, `src/screencap/pipeline_state.py`) plus Swift (`macos/IntelligenceHelper/main.swift`, honest-status surface in `macos/Screencap/`). Swift helper behavior is verified Python-side via the fake-helper pattern plus a manual macOS-26 eval; Swift builds are compile-only from this worktree.
 - **Open blockers:** The R11-strip orphan-flagging fix (branch `claude/apple-intelligence-naming-segmentation-0ad808`, one commit) must merge before or with this work — without it, activity summaries come back empty and no segmentation runs at all.
 - **Stop conditions:** Surface as a blocker rather than guessing if FoundationModels behavior deviates from the documented contract this plan relies on (fresh-session-per-call isolation, `maximumResponseTokens` early-stop semantics), or if preserving the provider tri-state contract (KTD-1) proves impossible without touching the degrade ladder.
 
@@ -114,7 +114,7 @@ flowchart TB
 - `macos/IntelligenceHelper/main.swift` — instructions, guided schema, the catch that collapses every model error to `respond-failed` (line ~222), the stdin `task` discriminator for verbs, and the working plain-text answer path; no output-length cap exists anywhere in the helper today.
 - `src/screencap/segmentation/providers/ondevice.py` — envelope mapping that makes `respond-failed` indistinguishable from Apple Intelligence off; `_parse_envelope` logs and then discards the helper's reason string; the stripped-marker fail-closed gate; helper discovery (env-var first, bundle-walk fallback) to preserve.
 - `src/screencap/segmentation/degrade.py` and `src/screencap/terminal_stage.py` — the degradation ladder (cloud-summary fallback fires only in the HEURISTIC branch), the idle-gap heuristic (`task_manifest._segment_tasks`), code-owned branch classification, and the monotonic never-overwrite gate.
-- `src/screencap/segmentation/outcome.py` — the monotonic honest-status outcome reasons R9 extends; surfaced via the daemon `tasks_list` verb → `macos/ScreenCap/Models/IntelligenceVerdict.swift` → `macos/ScreenCap/Views/Journal/JournalView.swift`.
+- `src/screencap/segmentation/outcome.py` — the monotonic honest-status outcome reasons R9 extends; surfaced via the daemon `tasks_list` verb → `macos/Screencap/Models/IntelligenceVerdict.swift` → `macos/Screencap/Views/Journal/JournalView.swift`.
 - `src/screencap/segmentation/activity_summary.py` — entry caps (`MAX_ACTIVITY_ENTRIES = 200`, per-entry field caps) and the stripping primitives digests reuse; digests must not be sliced from the capped whole-day summary or late windows on long days starve.
 - `src/screencap/index_core.py` — the wall-clock `budget_s` + stop-event pattern the pass budget mirrors.
 - `src/screencap/pipeline_state.py` — `replace_task_segments` scoped replace (only unedited `source='agent'` rows), the persistence seam the cache and partial-keep ride on.
@@ -268,11 +268,11 @@ The exterior of this whole diagram is one provider call: `terminal_stage` still 
 - **Goal:** The Journal says why naming degraded — including "partially named" and "session too long for the on-device model".
 - **Requirements:** R9; KTD-8.
 - **Dependencies:** U6.
-- **Files:** `macos/ScreenCap/Models/IntelligenceVerdict.swift` (`RecordingHonestState.resolve`), `macos/ScreenCap/Models/RecordingTasks.swift` (decode the reason detail if added), `macos/ScreenCap/Views/Journal/JournalView.swift` (copy), `macos/ScreenCapTests/IntelligenceVerdictTests.swift`.
+- **Files:** `macos/Screencap/Models/IntelligenceVerdict.swift` (`RecordingHonestState.resolve`), `macos/Screencap/Models/RecordingTasks.swift` (decode the reason detail if added), `macos/Screencap/Views/Journal/JournalView.swift` (copy), `macos/ScreencapTests/IntelligenceVerdictTests.swift`.
 - **Approach:** Map `produced_tasks_partial` to a new honest state with copy acknowledging the mix (exact wording at implementation); surface the context-window detail on the degraded states so a too-long-session day reads differently from intelligence-off. Unknown reason strings keep falling to `.unknown` (old-app compatibility already works this way).
 - **Test scenarios:**
   - `IntelligenceVerdictTests`: new reason maps to the new state; unknown strings still fall to `.unknown`; existing mappings unchanged.
-- **Verification:** ScreenCapTests pass via the documented macOS build/test flow — run from the main checkout or CI, not this worktree (test runs launch a host app; worktree launches TCC-brick the session). Compile-only from the worktree.
+- **Verification:** ScreencapTests pass via the documented macOS build/test flow — run from the main checkout or CI, not this worktree (test runs launch a host app; worktree launches TCC-brick the session). Compile-only from the worktree.
 
 ---
 
@@ -283,7 +283,7 @@ The exterior of this whole diagram is one provider call: `terminal_stage` still 
 | Python suite (local) | `PYTHONPATH=src pytest tests/segmentation/ tests/test_terminal_stage_degradation.py tests/test_incremental_segmentation.py` | U1, U3, U4, U6 |
 | CI privacy lane | new behavior-bearing tests carry `@pytest.mark.privacy` and stay Vision-free (CI runs only `pytest -m privacy`) | U1, U3, U4, U6 |
 | Swift compile | `xcodebuild build` (compile-only, sources copied to `/private/tmp`, signing off, never run) | U2, U7 |
-| Swift unit tests | `ScreenCapTests` from the main checkout or CI (not the worktree) | U7 |
+| Swift unit tests | `ScreencapTests` from the main checkout or CI (not the worktree) | U7 |
 | Manual macOS-26 eval | pipe a real short recording's summary through the new pipeline repeatedly (determinism), a 2h+ recording end-to-end (AE1), and a CJK-content recording (script-aware budgets); inspect Journal status states | whole plan |
 
 Environment gotchas: run with `SCREENCAP_LOCAL_PAYWALL_ENFORCE=0` where daemon verbs are touched; the privacy lane has known pre-existing failures on this checkout (corpus_migration ×2, frame_read_verb) — verify against base before attributing them to this diff.

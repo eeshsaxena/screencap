@@ -1,4 +1,4 @@
-"""Uvicorn server orchestration for the ScreenCap daemon."""
+"""Uvicorn server orchestration for the Screencap daemon."""
 
 from __future__ import annotations
 

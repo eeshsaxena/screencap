@@ -11,7 +11,7 @@ origin: docs/brainstorms/2026-06-05-mcp-agent-memory-retrieval-requirements.md
 
 ## Summary
 
-Add a queryable retrieval surface over ScreenCap recordings: a new global FTS5 content-index sidecar fed by an OCR pass that runs inline in chunk processing immediately after scrub completes, three read-only daemon `/v0/*` query verbs (on-screen content, transcript, timeline), and a thin `screencap mcp` stdio server that forwards agent tool calls to those verbs. The agent receives ranked text snippets plus recording/timestamp pointers — never frame pixels — and the privacy pipeline runs byte-identically whether indexing is on or off.
+Add a queryable retrieval surface over Screencap recordings: a new global FTS5 content-index sidecar fed by an OCR pass that runs inline in chunk processing immediately after scrub completes, three read-only daemon `/v0/*` query verbs (on-screen content, transcript, timeline), and a thin `screencap mcp` stdio server that forwards agent tool calls to those verbs. The agent receives ranked text snippets plus recording/timestamp pointers — never frame pixels — and the privacy pipeline runs byte-identically whether indexing is on or off.
 
 ---
 
@@ -45,13 +45,13 @@ Add a queryable retrieval surface over ScreenCap recordings: a new global FTS5 c
 
 ## Problem Frame
 
-ScreenCap captures rich signal but exposes none of it back to an agent — the catalog is raw SQLite, replay is a static viewer, and the strategy's data-flywheel / MCP track has no surface to land on. Meanwhile OCR already runs inside the privacy scrubber to *destroy* sensitive text, and the recognized text that would answer a content query is computed and discarded. This plan builds the retrieval surface and stops throwing that signal away — see origin doc for the full problem narrative and strategic framing (`docs/brainstorms/2026-06-05-mcp-agent-memory-retrieval-requirements.md`).
+Screencap captures rich signal but exposes none of it back to an agent — the catalog is raw SQLite, replay is a static viewer, and the strategy's data-flywheel / MCP track has no surface to land on. Meanwhile OCR already runs inside the privacy scrubber to *destroy* sensitive text, and the recognized text that would answer a content query is computed and discarded. This plan builds the retrieval surface and stops throwing that signal away — see origin doc for the full problem narrative and strategic framing (`docs/brainstorms/2026-06-05-mcp-agent-memory-retrieval-requirements.md`).
 
 ---
 
 ## Requirements
 
-- R1. ScreenCap exposes a local MCP server; the server is a thin wrapper over the daemon's local API holding no query logic beyond protocol translation. *(origin R1)*
+- R1. Screencap exposes a local MCP server; the server is a thin wrapper over the daemon's local API holding no query logic beyond protocol translation. *(origin R1)*
 - R2. The query surface spans three streams through one coherent interface: structured metadata (apps/windows/URLs/action timeline), audio transcript text, on-screen content text. *(origin R2)*
 - R3. Queries answerable from natural language for a non-technical operator, while presenting a stable typed contract an agent-builder can rely on. *(origin R3)*
 - R4. A content index makes on-screen text searchable, built by an OCR pass over each recording's **redacted** frames, persisting only post-redaction text + locating metadata (recording, timestamp). *(origin R4)*
@@ -62,7 +62,7 @@ ScreenCap captures rich signal but exposes none of it back to an agent — the c
 - R9. Index coverage is a retrieval decision independent of which frames the privacy scrubber OCR'd; the index is not sourced from the sparse privacy OCR pass. *(origin R9)*
 - R10. v1 search is keyword/exact matching; the store must not foreclose a later semantic/embedding graduation but need not implement it. *(origin R10)*
 
-**Origin actors:** A1 (developer / agent-builder, MCP client author), A2 (non-technical operator on a consumer agent app), A3 (the querying agent), A4 (ScreenCap engineer maintaining index + query surface).
+**Origin actors:** A1 (developer / agent-builder, MCP client author), A2 (non-technical operator on a consumer agent app), A3 (the querying agent), A4 (Screencap engineer maintaining index + query surface).
 **Origin flows:** F1 (a recording becomes queryable — index build), F2 (agent answers a content question), F3 (agent answers a metadata/timeline question).
 **Origin acceptance examples:** AE1 (covers R5, R7), AE2 (covers R6), AE3 (covers R8), AE4 (covers R2, R4), AE5 (covers R2, R3).
 

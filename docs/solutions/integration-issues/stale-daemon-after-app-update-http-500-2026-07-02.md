@@ -6,7 +6,7 @@ module: macos-app-shell
 problem_type: integration_issue
 component: daemon
 symptoms:
-  - "macOS app shows \"Couldn't load recordings — ScreenCap daemon returned HTTP 500: Internal Server Error\" with an empty menu, right after installing a new release"
+  - "macOS app shows \"Couldn't load recordings — Screencap daemon returned HTTP 500: Internal Server Error\" with an empty menu, right after installing a new release"
   - "recording.list, apps.list, content.search, transcript.search, timeline.query all 500; daemon.info, auth.whoami, session.snapshot stay 200"
   - "apps.list response body reveals \"reason\":\"ImportError\"; recording.list returns bare text \"Internal Server Error\""
 root_cause: stale_process_after_bundle_swap
@@ -31,7 +31,7 @@ tags:
 
 ## Problem
 
-After installing a new ScreenCap release, the app shows "Couldn't load recordings — ScreenCap daemon returned HTTP 500" and an empty menu. It happens on **every** update, even with an empty recordings directory.
+After installing a new Screencap release, the app shows "Couldn't load recordings — Screencap daemon returned HTTP 500" and an empty menu. It happens on **every** update, even with an empty recordings directory.
 
 ## Symptoms
 
@@ -48,11 +48,11 @@ After installing a new ScreenCap release, the app shows "Couldn't load recording
 
 ## Solution (PR #319)
 
-The trigger is the **runtime state of the specific long-running daemon process**, not code or data. The daemon process (an SMAppService LoginItem) started hours before the app bundle on disk was replaced by the update. It keeps running while `/Applications/ScreenCap.app/...` is rewritten underneath it. PyInstaller resolves **deferred (lazy) imports from the on-disk archive at request time**, so once the bundle is swapped, any not-yet-loaded module raises `ImportError` → HTTP 500. Modules imported at daemon startup stay in `sys.modules` and keep working, which is why only the lazy-import verbs fail.
+The trigger is the **runtime state of the specific long-running daemon process**, not code or data. The daemon process (an SMAppService LoginItem) started hours before the app bundle on disk was replaced by the update. It keeps running while `/Applications/Screencap.app/...` is rewritten underneath it. PyInstaller resolves **deferred (lazy) imports from the on-disk archive at request time**, so once the bundle is swapped, any not-yet-loaded module raises `ImportError` → HTTP 500. Modules imported at daemon startup stay in `sys.modules` and keep working, which is why only the lazy-import verbs fail.
 
 `launchctl kickstart -k gui/<uid>/com.screencap.daemon` restarts the daemon; against identical data all verbs then return 200 — confirming the diagnosis.
 
-Durable fix, in `macos/ScreenCap/Controllers/DaemonInstallController.swift` (`restartStaleDaemonIfNeeded`), wired into `AppDelegate.applicationDidFinishLaunching`:
+Durable fix, in `macos/Screencap/Controllers/DaemonInstallController.swift` (`restartStaleDaemonIfNeeded`), wired into `AppDelegate.applicationDidFinishLaunching`:
 
 ```swift
 // On launch: if a reachable daemon's process start predates the installed

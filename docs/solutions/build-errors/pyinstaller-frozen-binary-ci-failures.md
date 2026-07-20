@@ -29,7 +29,7 @@ time_to_resolve: medium
 
 ## Context
 
-ScreenCap is a macOS screen recording CLI distributed as a PyInstaller frozen binary (a self-contained executable that bundles Python, all dependencies, and data files into a single directory). The `_smoke-test` hidden CLI command validates that 9 critical subsystems (Presidio PII detection, GLiNER NER, detect-secrets, spaCy NLP, ffmpeg/av, pynput, sounddevice, UT1 domain data, and onnxruntime exclusion) actually load inside the frozen binary. It runs in CI on every PR and release build.
+Screencap is a macOS screen recording CLI distributed as a PyInstaller frozen binary (a self-contained executable that bundles Python, all dependencies, and data files into a single directory). The `_smoke-test` hidden CLI command validates that 9 critical subsystems (Presidio PII detection, GLiNER NER, detect-secrets, spaCy NLP, ffmpeg/av, pynput, sounddevice, UT1 domain data, and onnxruntime exclusion) actually load inside the frozen binary. It runs in CI on every PR and release build.
 
 These three issues were discovered during the first CI runs of the smoke test — each fix revealed the next failure, peeling back layers of PyInstaller/frozen-binary incompatibilities.
 

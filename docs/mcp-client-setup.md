@@ -1,14 +1,14 @@
-# Connecting an agent to ScreenCap (MCP)
+# Connecting an agent to Screencap (MCP)
 
 `screencap mcp` is a local [Model Context Protocol](https://modelcontextprotocol.io)
-server that lets an AI agent **search your ScreenCap recordings** — on-screen
+server that lets an AI agent **search your Screencap recordings** — on-screen
 text, audio transcripts, and an app/window timeline. It runs on your machine,
-talks only to the local ScreenCap daemon over its UNIX socket, and returns **text
+talks only to the local Screencap daemon over its UNIX socket, and returns **text
 snippets plus `(recording, timestamp)` pointers — never screenshots or video**.
 
 ## Prerequisites
 
-- ScreenCap installed and on your `PATH` (`screencap --version` works).
+- Screencap installed and on your `PATH` (`screencap --version` works).
 - At least one recording. On-screen **content** search additionally requires the
   content index to be enabled and recordings made while it was on — see
   [Enabling on-screen content search](#enabling-on-screen-content-search).
@@ -131,6 +131,6 @@ disable an app. Recordings made *before* enabling it are not retro-indexed
 - **`search_screen_content` always returns `not_indexed`.** The content index is
   off, or the recording predates enabling it. See
   [Enabling on-screen content search](#enabling-on-screen-content-search).
-- **Tools error with "could not reach the ScreenCap daemon."** A LaunchAgent is
+- **Tools error with "could not reach the Screencap daemon."** A LaunchAgent is
   installed but its daemon is not running — kickstart it (`screencap serve
   --status` to check), or remove the LaunchAgent so the CLI can auto-spawn.

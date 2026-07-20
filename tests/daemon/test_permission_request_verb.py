@@ -47,7 +47,7 @@ def _stub_peer(monkeypatch: pytest.MonkeyPatch) -> None:
         "derive_peer_descriptor_from_asgi_scope",
         lambda _scope: provenance.PeerDescriptor(
             pid=4242,
-            path="/Applications/ScreenCap.app/Contents/MacOS/screencap",
+            path="/Applications/Screencap.app/Contents/MacOS/screencap",
             classification=provenance.STARTED_BY_SWIFTUI,
         ),
     )

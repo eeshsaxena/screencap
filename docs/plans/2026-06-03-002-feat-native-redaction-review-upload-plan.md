@@ -65,12 +65,12 @@ Today the review window renders the **raw original** recording dir and plays a l
 
 ### Relevant Code and Patterns
 
-- **Review envelope + consumer:** `src/screencap/review.py` (`prepare_review_data`, `REVIEW_SCHEMA_VERSION`, `ReviewPrepareError`); `src/screencap/cli/__init__.py` (`review_data_cmd` ~:1641); `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift` (`ReviewDataEnvelope`, `ReviewData`, `ReviewState`, `LiveReviewDataLoader` using `CLIClient.runJSONRaw(["review-data","--json","--",name], timeout: 60)`).
+- **Review envelope + consumer:** `src/screencap/review.py` (`prepare_review_data`, `REVIEW_SCHEMA_VERSION`, `ReviewPrepareError`); `src/screencap/cli/__init__.py` (`review_data_cmd` ~:1641); `macos/Screencap/Views/Review/ReviewWindowViewModel.swift` (`ReviewDataEnvelope`, `ReviewData`, `ReviewState`, `LiveReviewDataLoader` using `CLIClient.runJSONRaw(["review-data","--json","--",name], timeout: 60)`).
 - **Scrub pipeline:** `src/screencap/scrubber.py` (`scrub_recording` ~:2703 → `<name>-scrubbed` dir; `ScrubResult` ~:58; `_write_audit_log` ~:2596 → `privacy_audit.json`; `BlockedInterval` ~:69 / `ScrubContext.blocked_intervals` ~:100; `scrub_text` `<SCRUB_FAILED>` ~:113; `_SKIP_EXTENSIONS` ~:2206); `src/screencap/privacy/reasons.py` (`AuditEntry` ~:49 — export-safe, per-timestamp + category, never the value; `ReasonCode`).
 - **Upload:** `src/screencap/cli/__init__.py` upload loop (`_recover_chunk_metadata(..., cloud_bound=True)` ~:2849 — **load-bearing ordering**; "Always scrub before upload" ~:2913 → `d = scrub_result.output_dir` ~:2924 → `upload_recording` ~:2934); `src/screencap/upload.py` (`upload_recording`, `list_recording_files`, `is_uploaded`).
 - **Event content reference:** `src/screencap/engine/visualize/html.py` (`create_html` event_dict ~:160-252) is the canonical field set the native content view should mirror; `src/screencap/engine/events.py` (`KeyTypeEvent.text`, `WindowSwitchEvent.app_name/window_title/domain`, `NetworkRequestEvent.host/url`); `src/screencap/exporter.py` (`export_recording`, `build_export_metadata` — `exclude_moves`, `include_network` flags).
-- **Visual prep (video):** `src/screencap/engine/video.py` (`remediate_pixfmt_for_review` → sibling review-only file; `concat_video_chunks`); `macos/ScreenCap/Views/Review/VideoPlayerPane.swift` (AVKit via NSViewRepresentable). Screenshots live in `<rec_dir>/screenshots/*.jpg` (timestamp-named).
-- **Bridge:** `macos/ScreenCap/Controllers/CLIClient.swift` (`runJSONRaw`, `spawn`, `mergedEnv` — no PATH augmentation, so all processing stays in-process); `src/screencap/_stderr_events.py` (`emit_event`).
+- **Visual prep (video):** `src/screencap/engine/video.py` (`remediate_pixfmt_for_review` → sibling review-only file; `concat_video_chunks`); `macos/Screencap/Views/Review/VideoPlayerPane.swift` (AVKit via NSViewRepresentable). Screenshots live in `<rec_dir>/screenshots/*.jpg` (timestamp-named).
+- **Bridge:** `macos/Screencap/Controllers/CLIClient.swift` (`runJSONRaw`, `spawn`, `mergedEnv` — no PATH augmentation, so all processing stays in-process); `src/screencap/_stderr_events.py` (`emit_event`).
 
 ### Institutional Learnings
 
@@ -311,8 +311,8 @@ graph TD
 **Dependencies:** U3
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift` (`ReviewDataEnvelope`, `ReviewData`: add optional `screenshots`, `redaction`, `coverage`; raise/scale the `LiveReviewDataLoader` `review-data` timeout well above 60s — or make it duration-aware — since the command now scrubs; keep `.ready`/`.failed` gated on `ok` + core paths)
-- Test: `macos/ScreenCapTests/ReviewWindowViewModelTests.swift`
+- Modify: `macos/Screencap/Views/Review/ReviewWindowViewModel.swift` (`ReviewDataEnvelope`, `ReviewData`: add optional `screenshots`, `redaction`, `coverage`; raise/scale the `LiveReviewDataLoader` `review-data` timeout well above 60s — or make it duration-aware — since the command now scrubs; keep `.ready`/`.failed` gated on `ok` + core paths)
+- Test: `macos/ScreencapTests/ReviewWindowViewModelTests.swift`
 
 **Approach:**
 - Decode additively; default to "no markers / unknown coverage" when fields are absent so a minimal envelope still produces a usable `.ready`.
@@ -341,9 +341,9 @@ graph TD
 **Dependencies:** U5
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Review/ScreenshotTruthPane.swift`
-- Modify: `macos/ScreenCap/Views/Review/ReviewWindow.swift` (compose the screenshot pane as the primary visual beside `VideoPlayerPane`; persistent labels)
-- Test: `macos/ScreenCapTests/ReviewWindowViewModelTests.swift` (screenshot-selection logic; AE5 regression)
+- Create: `macos/Screencap/Views/Review/ScreenshotTruthPane.swift`
+- Modify: `macos/Screencap/Views/Review/ReviewWindow.swift` (compose the screenshot pane as the primary visual beside `VideoPlayerPane`; persistent labels)
+- Test: `macos/ScreencapTests/ReviewWindowViewModelTests.swift` (screenshot-selection logic; AE5 regression)
 
 **Approach:**
 - **Layout/primacy:** the masked-screenshot pane is the primary "what uploads" surface; the video is the secondary navigation aid. Persistent labels: video footer "Local preview — not uploaded"; screenshot pane "What actually uploads."
@@ -373,9 +373,9 @@ graph TD
 **Dependencies:** U5
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Review/EventContentPane.swift`
-- Modify: `macos/ScreenCap/Views/Review/TimelineEvent.swift` (carry content fields: window/app, typed text, URL/domain, transcript snippet; network host only when present), `TimelinePane.swift` (selection → content)
-- Test: `macos/ScreenCapTests/TimelineEventParsingTests.swift`
+- Create: `macos/Screencap/Views/Review/EventContentPane.swift`
+- Modify: `macos/Screencap/Views/Review/TimelineEvent.swift` (carry content fields: window/app, typed text, URL/domain, transcript snippet; network host only when present), `TimelinePane.swift` (selection → content)
+- Test: `macos/ScreencapTests/TimelineEventParsingTests.swift`
 
 **Approach:**
 - Extend `TimelineEvent` parsing to retain the content fields `create_html` renders, parsed from the scrubbed event file set. Network destinations appear only if present in that set (off by default — see R5).
@@ -406,9 +406,9 @@ graph TD
 **Dependencies:** U5, U7
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Review/RedactionEvidenceView.swift`
-- Modify: `macos/ScreenCap/Views/Review/TimelinePane.swift` (risky-moment + redaction markers), `ReviewWindow.swift` (summary header, coverage strip, preparing + failed copy)
-- Test: `macos/ScreenCapTests/TimelinePaneScrubTests.swift`, `macos/ScreenCapTests/ReviewWindowViewModelTests.swift`
+- Create: `macos/Screencap/Views/Review/RedactionEvidenceView.swift`
+- Modify: `macos/Screencap/Views/Review/TimelinePane.swift` (risky-moment + redaction markers), `ReviewWindow.swift` (summary header, coverage strip, preparing + failed copy)
+- Test: `macos/ScreencapTests/TimelinePaneScrubTests.swift`, `macos/ScreencapTests/ReviewWindowViewModelTests.swift`
 
 **Approach:**
 - **Two-level evidence:** per-recording summary (entity categories/counts + hidden-segment count) framed as protection ("removed"/"protected"); per-moment markers drawn on the timeline at audit timestamps.
@@ -472,5 +472,5 @@ graph TD
 - **Origin document:** [docs/brainstorms/2026-06-03-native-redaction-review-before-upload-requirements.md](docs/brainstorms/2026-06-03-native-redaction-review-before-upload-requirements.md)
 - Related brainstorms: [docs/brainstorms/2026-05-27-upload-review-screen-requirements.md](docs/brainstorms/2026-05-27-upload-review-screen-requirements.md) (built base), [docs/brainstorms/2026-05-29-pyav-review-pipeline-requirements.md](docs/brainstorms/2026-05-29-pyav-review-pipeline-requirements.md) (video prep)
 - Related plan: [docs/plans/2026-05-27-002-feat-upload-review-screen-plan.md](docs/plans/2026-05-27-002-feat-upload-review-screen-plan.md)
-- Key code: `src/screencap/review.py`, `src/screencap/scrubber.py`, `src/screencap/cli/__init__.py` (upload loop ~:2913, recovery ~:2849), `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift`
+- Key code: `src/screencap/review.py`, `src/screencap/scrubber.py`, `src/screencap/cli/__init__.py` (upload loop ~:2913, recovery ~:2849), `macos/Screencap/Views/Review/ReviewWindowViewModel.swift`
 - Learnings: `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md`, `docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md`, `docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md`, `SECURITY.md`

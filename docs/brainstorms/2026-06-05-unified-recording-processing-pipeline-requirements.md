@@ -13,7 +13,7 @@ Replace the two divergent processing paths (live cloud chunk-processing vs. post
 
 ## Problem Frame
 
-Today ScreenCap has two separate ways of turning a recording into processed, possibly-uploaded artifacts, and they were built at different times for different reasons. The **live path** (`src/screencap/chunk_processor.py`) runs only when a recording is cloud-bound: at each video auto-cut it transcribes, exports events, builds a manifest, scrubs (forced to the strict `PUBLIC` privacy policy), uploads the chunk, and deletes old chunks once they are confirmed uploaded. The **local path** does almost none of this — a local-only recording just writes chunks to disk and keeps them all, with scrubbing and any export happening lazily and only if the user asks.
+Today Screencap has two separate ways of turning a recording into processed, possibly-uploaded artifacts, and they were built at different times for different reasons. The **live path** (`src/screencap/chunk_processor.py`) runs only when a recording is cloud-bound: at each video auto-cut it transcribes, exports events, builds a manifest, scrubs (forced to the strict `PUBLIC` privacy policy), uploads the chunk, and deletes old chunks once they are confirmed uploaded. The **local path** does almost none of this — a local-only recording just writes chunks to disk and keeps them all, with scrubbing and any export happening lazily and only if the user asks.
 
 The fork happens at recording start, keyed off `.recording_intent`. From that single branch, two whole worlds of behavior diverge: scrubbing runs in the live path and again in the full scrubber (`src/screencap/scrubber.py`), screenshot masking and event-JSONL sanitization run in both, `recording.db` is uploaded in one path and skipped in the other, and privacy policy is forced in one and user-configured in the other. Each new feature has to be reasoned about — and often implemented — twice, in two places that keep drifting apart. The lived cost is cognitive: it is hard to know what you are touching and where a given behavior actually lives.
 
@@ -25,7 +25,7 @@ This matters now because the per-user GCP isolation has shipped (the signing lay
 
 - A1. **Local-only operator:** records for personal/local use and never uploads. Cares about low overhead, rich local signal, and not having an all-day habit silently fill the disk.
 - A2. **Cloud operator:** signed-in; uploads recordings and may reclaim local disk on a retention policy. Cares that cloud-bound data is scrubbed, that local stays private and rich, and that a recording is never lost mid-upload.
-- A3. **ScreenCap engineer:** adds processing and cloud features and maintains the pipeline. The primary beneficiary of consolidation — wants one place to change behavior and a guarantee that local/cloud stay consistent.
+- A3. **Screencap engineer:** adds processing and cloud features and maintains the pipeline. The primary beneficiary of consolidation — wants one place to change behavior and a guarantee that local/cloud stay consistent.
 - A4. **Processing pipeline (system actor):** the staged processor plus the terminal routing/lifecycle stage that converges on-disk artifacts toward the recording's declared destination and retention.
 
 ---

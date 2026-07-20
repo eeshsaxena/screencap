@@ -30,7 +30,7 @@ A conversational **Chat** destination in the macOS app — separate from Search 
 
 ### Problem Frame
 
-ScreenCap ships a local, pointer-only retrieval backend (content index, transcript, timeline, `frame.nearest`) reachable today only by agents over MCP. The in-app Search surface (SCR-174, shipped) gives a human a fast keyword front door — but by design it returns pointers only, no generated prose, to protect the "no hallucinated history" promise. Both the ask-your-history brainstorm and the local-first-intelligence plan named a generative, conversational recall layer as the *destination* and explicitly deferred it: the plan built the provider adapter but left "the generative *answers Recall searches* step itself" as net-new work riding that adapter later.
+Screencap ships a local, pointer-only retrieval backend (content index, transcript, timeline, `frame.nearest`) reachable today only by agents over MCP. The in-app Search surface (SCR-174, shipped) gives a human a fast keyword front door — but by design it returns pointers only, no generated prose, to protect the "no hallucinated history" promise. Both the ask-your-history brainstorm and the local-first-intelligence plan named a generative, conversational recall layer as the *destination* and explicitly deferred it: the plan built the provider adapter but left "the generative *answers Recall searches* step itself" as net-new work riding that adapter later.
 
 The gap this closes: an operator who wants to *ask* rather than *skim* — "recap my morning," "which vendor portal had that refund error Tuesday" — has no conversational surface, and the naive way to add one (free prose from a cloud LLM over screen content) is exactly the trust-and-privacy failure the product exists to avoid.
 
@@ -209,7 +209,7 @@ sequenceDiagram
 - On-device generation prerequisite: SCR-243.
 - Retrieval verbs + `frame.nearest`: `src/screencap/daemon/app.py`, `src/screencap/frame_resolve.py`, `src/screencap/frame_blocked.py`.
 - Provider + consent substrate: `src/screencap/segmentation/provider.py`, `src/screencap/segmentation/consent.py`, `src/screencap/segmentation/sanitize.py`.
-- Search components to reuse: `macos/ScreenCap/Views/Search/SnippetHighlighter.swift`, `macos/ScreenCap/Views/Library/RecordingCardThumbnail.swift`, `macos/ScreenCap/State/InspectWindowOpener.swift`, `macos/ScreenCap/Controllers/DaemonClient.swift`, `macos/ScreenCap/Controllers/IntelligenceController.swift`.
+- Search components to reuse: `macos/Screencap/Views/Search/SnippetHighlighter.swift`, `macos/Screencap/Views/Library/RecordingCardThumbnail.swift`, `macos/Screencap/State/InspectWindowOpener.swift`, `macos/Screencap/Controllers/DaemonClient.swift`, `macos/Screencap/Controllers/IntelligenceController.swift`.
 
 ---
 
@@ -350,7 +350,7 @@ SCR-243 (on-device `answer()` backend) gates U1's on-device path — land it fir
 - **Goal:** Add the Chat sidebar destination and the client/model plumbing to call the verb.
 - **Requirements:** R1
 - **Dependencies:** U5
-- **Files:** modify `macos/ScreenCap/Views/Shell/ShellSidebar.swift` (add `case chat` + nav item; it holds `ShellRoute` and `ShellSidebarModel`), `macos/ScreenCap/Views/MainWindow.swift` (detail switch → `ChatView`), `macos/ScreenCap/Controllers/DaemonClient.swift` (add `chatAnswer(...)`); create `macos/ScreenCap/Models/ChatRecall.swift` (pointer-only request/response, including transcript-hit `timestampMs` so transcript sources are jumpable); add a model/decoding test in `macos/ScreenCapTests/`.
+- **Files:** modify `macos/Screencap/Views/Shell/ShellSidebar.swift` (add `case chat` + nav item; it holds `ShellRoute` and `ShellSidebarModel`), `macos/Screencap/Views/MainWindow.swift` (detail switch → `ChatView`), `macos/Screencap/Controllers/DaemonClient.swift` (add `chatAnswer(...)`); create `macos/Screencap/Models/ChatRecall.swift` (pointer-only request/response, including transcript-hit `timestampMs` so transcript sources are jumpable); add a model/decoding test in `macos/ScreencapTests/`.
 - **Approach:** Chat is a **new `ShellRoute` sidebar destination** — the first search-like sidebar route. Search is **not** a sidebar destination to mirror: it is the `RecallPaletteView` overlay palette, so reuse Search's *result components* (`SnippetHighlighter`, `RecordingCardThumbnail`), not a destination pattern. Add `case chat` to `ShellRoute`, a nav item, and a `MainWindow` detail-switch case; call the verb via the `DaemonClient` async-UDS method pattern (with the CLI-fallback shape used by `RecordingsIndex`). Decode nullable/optional response fields as optional (the nullable-timing lesson). Reconcile the transcript-hit contract so transcript-sourced answers carry a resolvable timestamp.
 - **Patterns to follow:** `ShellSidebarModel` / `ShellRoute` in `ShellSidebar.swift`, `MainWindow` detail switch, `DaemonClient.recordingList`, `SearchResult.swift` models.
 - **Test scenarios:**
@@ -363,7 +363,7 @@ SCR-243 (on-device `answer()` backend) gates U1's on-device path — land it fir
 - **Goal:** Build the multi-turn Chat surface with grounded answers and a reused sources panel.
 - **Requirements:** R2, R3, R12, R13, R14
 - **Dependencies:** U7
-- **Files:** create `macos/ScreenCap/Views/Chat/ChatView.swift`, `macos/ScreenCap/Views/Chat/ChatViewModel.swift`; reuse `SnippetHighlighter`, `RecordingCardThumbnail`, `InspectWindowOpener`, the OCR-off/backfill consent banners, and `IntelligenceController` (recall-consent surfacing); create `macos/ScreenCapTests/ChatViewModelTests.swift`.
+- **Files:** create `macos/Screencap/Views/Chat/ChatView.swift`, `macos/Screencap/Views/Chat/ChatViewModel.swift`; reuse `SnippetHighlighter`, `RecordingCardThumbnail`, `InspectWindowOpener`, the OCR-off/backfill consent banners, and `IntelligenceController` (recall-consent surfacing); create `macos/ScreencapTests/ChatViewModelTests.swift`.
 - **Approach:** `@MainActor ObservableObject` holding session-scoped turn history; each send calls `DaemonClient.chatAnswer` with prior turns as context (KTD6), appends the answer + sources. Resolve the interaction states this surface commits to:
   - **In-flight answer:** on-device generation can take seconds — specify whether the answer streams incrementally (ChatViewModel appends partial text) or renders whole after a thinking indicator; sources appear when the answer completes.
   - **Layout / citations:** a scrolling multi-turn transcript where each turn shows the answer prose with its sources; decide sources placement (a collapsible sources strip below each turn scales better than one side panel across many turns), a source cap with "show more", and whether citations are inline markers (prose→source) or a panel-only list — inline requires `ChatAnswerResponse` to carry claim→source spans and the generation seam to emit them; if panel-only, state per-claim mapping is out of v1.

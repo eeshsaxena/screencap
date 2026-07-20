@@ -17,7 +17,7 @@ Make the macOS app drive onboarding off the daemon's *real* TCC grant state: the
 
 ## Problem Frame
 
-The app's onboarding assumes "daemon socket reachable ⟹ permissions are fine." That assumption is false: the walkthrough is gated on the daemon being *unreachable* (`macos/ScreenCap/Views/MainWindow.swift`, `transport == .cliFallback`), the app has no visibility into the daemon's grant state (`daemon.info` carries no permission fields), and a daemon-backed start that lacks the Screen Recording grant produces a **confusing two-phase failure**, not a clean one.
+The app's onboarding assumes "daemon socket reachable ⟹ permissions are fine." That assumption is false: the walkthrough is gated on the daemon being *unreachable* (`macos/Screencap/Views/MainWindow.swift`, `transport == .cliFallback`), the app has no visibility into the daemon's grant state (`daemon.info` carries no permission fields), and a daemon-backed start that lacks the Screen Recording grant produces a **confusing two-phase failure**, not a clean one.
 
 **Corrected failure model (verified against code — the origin doc's "silent SystemExit into an empty `serve.log`" describes the *standalone-CLI* path, not the app-connected daemon path):** On the daemon path the worker emits `EVENT_STARTED` *before* running its preflight (`src/screencap/cli/__init__.py` `_engine_worker_cmd` emits `started` then calls `run_recording_worker`), and the explicit Screen-Recording check (`src/screencap/session.py` `run_recording_worker`, `emit_event(permission_lost) → raise SystemExit(3)`) runs *after* that. So `Supervisor.spawn`'s `_wait_on_subscription(EVENT_STARTED)` **succeeds**, `recording.start` returns **200 OK**, and only then does the worker emit `permission_lost` and exit non-zero → `_handle_engine_exit` synthesizes `engine_crashed` + `recording_finalized` over the event stream. The user gets a *successful* start that immediately collapses into a crash. Two further gaps compound it: the daemon path preflights **Screen Recording only** (`PermNoop` disables the policy preflight; Accessibility / Input Monitoring are never start-gated), and the failure is delivered as an asynchronous event rather than a structured result on the `recording.start` call itself. A developer or tester whose daemon grant was orphaned is stranded with no in-product recovery path. Full pain narrative and actor/flow analysis live in the origin doc (see Sources & References).
 
@@ -39,7 +39,7 @@ Carried from the origin requirements doc (lightly condensed; origin is authorita
 - R8. First-run (never granted) and recovery (previously granted, then lost) resolve through the same detection → surfacing → registration path; no manual reset or stop-the-daemon ritual in a shipped build.
 - R9. The state the daemon reports must reflect **live** TCC state, not a value cached at daemon-process launch.
 
-**Origin actors:** A1 (User / developer / tester), A2 (ScreenCap app `com.screencap.macos`), A3 (ScreenCap daemon `com.screencap.daemon` — TCC subject), A4 (macOS TCC / System Settings).
+**Origin actors:** A1 (User / developer / tester), A2 (Screencap app `com.screencap.macos`), A3 (Screencap daemon `com.screencap.daemon` — TCC subject), A4 (macOS TCC / System Settings).
 **Origin flows:** F1 (first-run grant, daemon reachable), F2 (recovery / re-grant of orphaned grant), F3 (start attempted while a grant is missing).
 **Origin acceptance examples:** AE1 (covers R1, R2, R3), AE2 (covers R5, R6), AE3 (covers R4, R7), AE4 (covers R8, R9).
 
@@ -56,7 +56,7 @@ Carried from the origin requirements doc (lightly condensed; origin is authorita
 
 ### Deferred to Follow-Up Work
 
-- **Orphaned-vs-revoked disambiguation copy:** distinct walkthrough copy ("remove the stale ScreenCap helper entry and re-add it") for the ad-hoc-dev case where a denied grant means "binary identity unrecognized," not "user revoked." A shipped Developer-ID build re-grants cleanly (TCC keys on `bundle-id` + `team-id`), so this is a dev-experience nicety, not on the product path. The daemon *identity* signal that would power it (see U2) is cheap and may be added now; the branching copy is deferred. — *Separate follow-up; revisit after the Developer-ID plan lands.*
+- **Orphaned-vs-revoked disambiguation copy:** distinct walkthrough copy ("remove the stale Screencap helper entry and re-add it") for the ad-hoc-dev case where a denied grant means "binary identity unrecognized," not "user revoked." A shipped Developer-ID build re-grants cleanly (TCC keys on `bundle-id` + `team-id`), so this is a dev-experience nicety, not on the product path. The daemon *identity* signal that would power it (see U2) is cheap and may be added now; the branching copy is deferred. — *Separate follow-up; revisit after the Developer-ID plan lands.*
 - **Sequoia monthly re-auth avoidance / `com.apple.developer.persistent-content-capture` entitlement:** the only first-party path to unattended recording without periodic re-auth, but it requires an Apple developer-form request (not self-service). — *Noted as a risk only; out of this plan's reach.*
 - **"Quit & Relaunch" affordance cleanup:** the button exists for the app-process TCC cache and is vestigial on the daemon-driven path (the daemon needs no app restart). Removing or relabeling it is a UX cleanup beyond this plan's detection/surfacing/registration scope. — *U5 only avoids presenting it as a required daemon-path step; the actual removal/relabel is a follow-up.*
 
@@ -78,16 +78,16 @@ Carried from the origin requirements doc (lightly condensed; origin is authorita
 - `src/screencap/daemon/supervisor.py` — `Supervisor.spawn` (line ~271): claims lock, spawns engine, awaits `EVENT_STARTED` via `_wait_on_subscription(..., timeout=self._startup_timeout)` (~340); on exception terminates + releases lock + re-raises. The seam where a pre-spawn preflight should raise the typed error *before* the timeout.
 
 **Surfacing & registration (Swift):**
-- `macos/ScreenCap/Views/MainWindow.swift` — `FirstRunSetupPresentationPolicy.shouldPresentOnLaunch` (the gate, currently `transport == .cliFallback`), `updateFirstRunSheetPresentation()`, the `.sheet` lifecycle and the active-recording guard.
-- `macos/ScreenCap/Controllers/RecorderController.swift` — `start(name:)` gate (line ~180, CLI-only today), `probeDaemon()` (line ~194, calls `daemonInfo()` indirectly via the session service and discards grant data), transport enum, `applyDaemonFailureOutcome` / `handlePermissionLost` presentation routing.
-- `macos/ScreenCap/Controllers/PermissionController.swift` — `requestAndOpenSettings(for:subject:)` (the `subject == .daemon` **no-op** branch at ~273), `PrivacyPane` (deep links + `from(permissionString:)`), `PermissionSubject`, `startWatching` (1Hz app-process poll + `didActivateApplicationNotification` refresh), `allRequiredGranted`.
-- `macos/ScreenCap/Controllers/DaemonClient.swift` — `DaemonInfoResponse` decode (snake_case CodingKeys, tolerant of extra fields), `daemonInfo()`, `decodeResponse` + `envelopeError(code:rawBody:)` (the typed-error decode path), `DaemonClientError`.
-- `macos/ScreenCap/Controllers/DaemonSessionService.swift` — `probe()` (discards the `daemonInfo()` payload today), `translateFailure` + `DaemonErrorCode` (the branch point for a `permission_required` case).
-- `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` — `daemonPermissionRow` (neutral "visited" icons because there was no real per-pane daemon state — rewired by this plan), dismissal buttons (`Skip for now` / `Done` / `Quit & Relaunch`).
+- `macos/Screencap/Views/MainWindow.swift` — `FirstRunSetupPresentationPolicy.shouldPresentOnLaunch` (the gate, currently `transport == .cliFallback`), `updateFirstRunSheetPresentation()`, the `.sheet` lifecycle and the active-recording guard.
+- `macos/Screencap/Controllers/RecorderController.swift` — `start(name:)` gate (line ~180, CLI-only today), `probeDaemon()` (line ~194, calls `daemonInfo()` indirectly via the session service and discards grant data), transport enum, `applyDaemonFailureOutcome` / `handlePermissionLost` presentation routing.
+- `macos/Screencap/Controllers/PermissionController.swift` — `requestAndOpenSettings(for:subject:)` (the `subject == .daemon` **no-op** branch at ~273), `PrivacyPane` (deep links + `from(permissionString:)`), `PermissionSubject`, `startWatching` (1Hz app-process poll + `didActivateApplicationNotification` refresh), `allRequiredGranted`.
+- `macos/Screencap/Controllers/DaemonClient.swift` — `DaemonInfoResponse` decode (snake_case CodingKeys, tolerant of extra fields), `daemonInfo()`, `decodeResponse` + `envelopeError(code:rawBody:)` (the typed-error decode path), `DaemonClientError`.
+- `macos/Screencap/Controllers/DaemonSessionService.swift` — `probe()` (discards the `daemonInfo()` payload today), `translateFailure` + `DaemonErrorCode` (the branch point for a `permission_required` case).
+- `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` — `daemonPermissionRow` (neutral "visited" icons because there was no real per-pane daemon state — rewired by this plan), dismissal buttons (`Skip for now` / `Done` / `Quit & Relaunch`).
 
 **Test patterns:**
 - Python: `tests/daemon/test_read_only_verbs.py` (`daemon.info` shape via `httpx.ASGITransport(build_app())`), `tests/daemon/test_schema_envelope.py`, `tests/test_session_daemon_permission_preflight.py` (the existing screen-recording-only preflight contract).
-- Swift: `macos/ScreenCapTests/DaemonClientTests.swift` (`UnixHTTPTestServer` + `SCREENCAP_DAEMON_SOCKET`), `PermissionControllerTests.swift` (gate + subject behavior), `RecorderControllerDaemonTests.swift`, `DaemonSessionServiceTests.swift`.
+- Swift: `macos/ScreencapTests/DaemonClientTests.swift` (`UnixHTTPTestServer` + `SCREENCAP_DAEMON_SOCKET`), `PermissionControllerTests.swift` (gate + subject behavior), `RecorderControllerDaemonTests.swift`, `DaemonSessionServiceTests.swift`.
 
 ### Institutional Learnings
 
@@ -284,11 +284,11 @@ This plan modifies existing files and adds focused new modules/tests; it does no
 **Dependencies:** U2
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/DaemonClient.swift` — add the optional grant fields to `DaemonInfoResponse` (snake_case CodingKeys, optional so absent fields decode to indeterminate).
-- Modify: `macos/ScreenCap/Controllers/DaemonSessionService.swift` — `probe()` returns the decoded grant state alongside the probe outcome (today it discards `daemonInfo()`).
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` — `probeDaemon()` threads the grant state to where the gate/start-block read it; expose a published daemon-grant snapshot.
-- Modify: `macos/ScreenCap/Controllers/PermissionController.swift` — represent daemon-subject grant state (tri-state per pane) distinctly from the app-process `PermissionStatus`; compute "all required daemon grants present" excluding microphone.
-- Test: `macos/ScreenCapTests/DaemonClientTests.swift`
+- Modify: `macos/Screencap/Controllers/DaemonClient.swift` — add the optional grant fields to `DaemonInfoResponse` (snake_case CodingKeys, optional so absent fields decode to indeterminate).
+- Modify: `macos/Screencap/Controllers/DaemonSessionService.swift` — `probe()` returns the decoded grant state alongside the probe outcome (today it discards `daemonInfo()`).
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` — `probeDaemon()` threads the grant state to where the gate/start-block read it; expose a published daemon-grant snapshot.
+- Modify: `macos/Screencap/Controllers/PermissionController.swift` — represent daemon-subject grant state (tri-state per pane) distinctly from the app-process `PermissionStatus`; compute "all required daemon grants present" excluding microphone.
+- Test: `macos/ScreencapTests/DaemonClientTests.swift`
 
 **Approach:**
 - Map the wire tri-state to a Swift enum (granted / denied / indeterminate); absent fields ⇒ indeterminate.
@@ -316,10 +316,10 @@ This plan modifies existing files and adds focused new modules/tests; it does no
 **Dependencies:** U3
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/MainWindow.swift` — `FirstRunSetupPresentationPolicy.shouldPresentOnLaunch` keys on "daemon reachable AND any required daemon grant denied"; preserve the active-recording guard and the `.daemon`-transport force-close behavior's intent (now driven by grant state, not transport alone).
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` — extend the `start(name:)` gate so the `.daemon` path blocks on daemon-reported missing grant; reuse `requiredPermissionsErrorMessage` (or a daemon-specific variant) and route to the grant flow.
+- Modify: `macos/Screencap/Views/MainWindow.swift` — `FirstRunSetupPresentationPolicy.shouldPresentOnLaunch` keys on "daemon reachable AND any required daemon grant denied"; preserve the active-recording guard and the `.daemon`-transport force-close behavior's intent (now driven by grant state, not transport alone).
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` — extend the `start(name:)` gate so the `.daemon` path blocks on daemon-reported missing grant; reuse `requiredPermissionsErrorMessage` (or a daemon-specific variant) and route to the grant flow.
 - Create/Modify: a persisted "permission setup dismissed" flag — likely on `PermissionController` or a small helper. (Persistence mechanism is an implementation choice: a plain `UserDefaults`/`@AppStorage` flag is the simplest fit. Note: `PrivacyController.markSetupComplete` is **not** a UserDefaults analogy — it is CLI/config-backed via `settings privacy setup_skipped`; do not cite it as the precedent unless you intend the same config round-trip. Decide per-device vs. per-install: a dev who reinstalls and re-orphans the grant (F2) should see the walkthrough again, so the flag should not outlive an app reinstall.)
-- Test: `macos/ScreenCapTests/PermissionControllerTests.swift` (gate), `macos/ScreenCapTests/RecorderControllerDaemonTests.swift` (start-block).
+- Test: `macos/ScreencapTests/PermissionControllerTests.swift` (gate), `macos/ScreencapTests/RecorderControllerDaemonTests.swift` (start-block).
 
 **Approach:**
 - Required set = screen recording + accessibility + input monitoring (microphone excluded).
@@ -351,9 +351,9 @@ This plan modifies existing files and adds focused new modules/tests; it does no
 **Dependencies:** U3 (state), U4 (gate)
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` — `daemonPermissionRow` renders state from the daemon-grant snapshot; per-pane in-flight state on the Grant button. (The "Quit & Relaunch" rework is **deferred to follow-up** — see Scope Boundaries. U5 must only avoid *misleading* the user: do not present "Quit & Relaunch" as a required step on the daemon path, since the daemon needs no app restart. Removing/relabeling the affordance is its own cleanup.)
-- Modify: `macos/ScreenCap/Controllers/PermissionController.swift` — a daemon-grant refresh method + lifecycle: re-probe on `didActivateApplicationNotification` and on a ~5s timer while the sheet is visible; stop the timer on dismiss. Distinct from the existing 1Hz app-process `startWatching`.
-- Test: `macos/ScreenCapTests/PermissionControllerTests.swift` (refresh cadence/lifecycle where testable; rest is manual-QA).
+- Modify: `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` — `daemonPermissionRow` renders state from the daemon-grant snapshot; per-pane in-flight state on the Grant button. (The "Quit & Relaunch" rework is **deferred to follow-up** — see Scope Boundaries. U5 must only avoid *misleading* the user: do not present "Quit & Relaunch" as a required step on the daemon path, since the daemon needs no app restart. Removing/relabeling the affordance is its own cleanup.)
+- Modify: `macos/Screencap/Controllers/PermissionController.swift` — a daemon-grant refresh method + lifecycle: re-probe on `didActivateApplicationNotification` and on a ~5s timer while the sheet is visible; stop the timer on dismiss. Distinct from the existing 1Hz app-process `startWatching`.
+- Test: `macos/ScreencapTests/PermissionControllerTests.swift` (refresh cadence/lifecycle where testable; rest is manual-QA).
 
 **Approach:**
 - Row icons map from tri-state: granted (positive), denied (needs-action), indeterminate (neutral) — never claim a state the daemon didn't confirm. **Indeterminate is "couldn't verify," not "granted" or "denied":** a neutral/muted icon with a distinct accessibility label (the current row has only a two-value `accessibilityLabel`; add a third). It must not read as a green check or a red needs-action.
@@ -389,9 +389,9 @@ This plan modifies existing files and adds focused new modules/tests; it does no
 - Modify: `src/screencap/daemon/supervisor.py` — in `spawn` (before claiming the engine spawn / before `_wait_on_subscription`), run U1's preflight across all three permissions; raise `PermissionRequiredError` when a required grant is denied (indeterminate ⇒ proceed, defer to the engine backstop).
 - Modify: `src/screencap/daemon/app.py` — ensure `recording_start`'s typed-error path carries the new error (it already re-raises `DaemonAPIError` to `_api_error_response`).
 - Modify (defense-in-depth): `src/screencap/session.py` — keep the worker's own preflight as a backstop; ensure it does not regress the daemon path now that the daemon preflights first. Optionally extend the worker preflight beyond screen-recording for the standalone path.
-- Modify: `macos/ScreenCap/Controllers/DaemonSessionService.swift` — add a `permission_required` branch in `DaemonErrorCode` + `translateFailure` → a `FailureOutcome.permissionRequired([String])`.
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` — map the new failure outcome into the existing `handlePermissionLost`-style presentation (surface the missing permissions, route to the grant flow); the daemon error's `missing[]` is decoded off `rawBody`.
-- Test: `tests/test_session_daemon_permission_preflight.py`, `tests/daemon/test_read_only_verbs.py` or a new `tests/daemon/test_recording_start_permission_required.py`, `macos/ScreenCapTests/RecorderControllerDaemonTests.swift`, `macos/ScreenCapTests/DaemonClientTests.swift`.
+- Modify: `macos/Screencap/Controllers/DaemonSessionService.swift` — add a `permission_required` branch in `DaemonErrorCode` + `translateFailure` → a `FailureOutcome.permissionRequired([String])`.
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` — map the new failure outcome into the existing `handlePermissionLost`-style presentation (surface the missing permissions, route to the grant flow); the daemon error's `missing[]` is decoded off `rawBody`.
+- Test: `tests/test_session_daemon_permission_preflight.py`, `tests/daemon/test_read_only_verbs.py` or a new `tests/daemon/test_recording_start_permission_required.py`, `macos/ScreencapTests/RecorderControllerDaemonTests.swift`, `macos/ScreencapTests/DaemonClientTests.swift`.
 
 **Approach:**
 - Raising in the daemon **before** the engine spawn makes the failure a synchronous, structured result on `recording.start` instead of a 200-OK-then-crash. The preflight **must call U1's fresh-subprocess probe**, never an in-process `is_*_enabled()` check — an in-process check in the long-lived daemon reads launch-cached state and would block every start forever after a post-launch grant (the exact bug this feature exists to fix). Reuse U2's cached probe result so detection and start-gating share one truth source and the start path does not pay a second fresh spawn.
@@ -431,7 +431,7 @@ This plan modifies existing files and adds focused new modules/tests; it does no
 3. Responsible-code / bundle-placement angle — verify where the daemon binary physically lives in the shipped `.app` (`Contents/MacOS/` vs `Contents/Resources/...`) and whether that placement is why registration fails; note `responsibility_spawnattrs_setdisclaim()` as a deeper option.
 4. Post-grant: after toggling on, does a *new* recording (fresh worker) succeed **without** a daemon `launchctl kickstart`? (Expected yes — confirms R8 / the "no restart" decision.)
 5. Version deltas: record behavior on the target macOS (Sequoia 15.x; Tahoe 26.1 regression if reachable).
-6. **Explicit no-registration exit branch.** External research flags that Tahoe 26.1 can stop a bare Unix executable from appearing in the Screen Recording list *at all* — which would defeat **both** the request-API and the real-capture paths (same bare daemon identity). If the spike concludes no self-service mechanism registers a toggleable entry from the daemon's current binary placement, then: (a) **U8 is blocked** and a true fix depends on the Developer-ID / bundle-placement work (daemon embedded at `App.app/Contents/MacOS/` with a responsible-code ancestor) owned by the Developer-ID distribution plan; and (b) the **detection (U1–U3), surfacing (U4–U5), and structured-failure (U6) halves of this plan still ship independently** — the Grant button degrades to an honest "open Settings and enable ScreenCap helper manually" affordance instead of daemon-driven registration. Record which outcome holds so U8 is built, deferred, or degraded accordingly.
+6. **Explicit no-registration exit branch.** External research flags that Tahoe 26.1 can stop a bare Unix executable from appearing in the Screen Recording list *at all* — which would defeat **both** the request-API and the real-capture paths (same bare daemon identity). If the spike concludes no self-service mechanism registers a toggleable entry from the daemon's current binary placement, then: (a) **U8 is blocked** and a true fix depends on the Developer-ID / bundle-placement work (daemon embedded at `App.app/Contents/MacOS/` with a responsible-code ancestor) owned by the Developer-ID distribution plan; and (b) the **detection (U1–U3), surfacing (U4–U5), and structured-failure (U6) halves of this plan still ship independently** — the Grant button degrades to an honest "open Settings and enable Screencap helper manually" affordance instead of daemon-driven registration. Record which outcome holds so U8 is built, deferred, or degraded accordingly.
 
 **Execution note:** This is execution-time discovery (Core Principle 5) — its job is to produce a decision, not production code. U8 consumes the decision.
 
@@ -454,10 +454,10 @@ This plan modifies existing files and adds focused new modules/tests; it does no
 - Modify: `src/screencap/daemon/schema.py` / `errors.py` — request/response (or error) models for the new verb, including the `permission` allowlist validation.
 - Modify: `src/screencap/daemon/audit_log.py` (or its caller) — record the new mutating verb alongside `recording.start` / `recording.stop`.
 - Modify: `src/screencap/engine/platform/darwin.py` — if the real-capture fallback is chosen, a minimal capture-touch helper used for registration (reusing existing capture primitives).
-- Modify: `macos/ScreenCap/Controllers/DaemonClient.swift` — a typed client call for the new verb.
-- Modify: `macos/ScreenCap/Controllers/PermissionController.swift` — replace the `subject == .daemon` no-op in `requestAndOpenSettings`: call the daemon verb, await the ack, then `openSystemSettings(for:)`.
-- Modify: `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` — the Grant button drives the daemon round-trip with the per-pane in-flight guard from U5.
-- Test: `tests/daemon/test_permission_request_verb.py`, `macos/ScreenCapTests/PermissionControllerTests.swift`, `macos/ScreenCapTests/DaemonClientTests.swift`.
+- Modify: `macos/Screencap/Controllers/DaemonClient.swift` — a typed client call for the new verb.
+- Modify: `macos/Screencap/Controllers/PermissionController.swift` — replace the `subject == .daemon` no-op in `requestAndOpenSettings`: call the daemon verb, await the ack, then `openSystemSettings(for:)`.
+- Modify: `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` — the Grant button drives the daemon round-trip with the per-pane in-flight guard from U5.
+- Test: `tests/daemon/test_permission_request_verb.py`, `macos/ScreencapTests/PermissionControllerTests.swift`, `macos/ScreencapTests/DaemonClientTests.swift`.
 
 **Approach:**
 - The verb is per-permission (screen recording / accessibility / input monitoring), matching each permission's request mechanism (R6) — not screen-recording only.
@@ -562,6 +562,6 @@ graph TD
 - **Origin document:** `docs/brainstorms/2026-06-05-daemon-tcc-permission-visibility-onboarding-requirements.md`
 - Related plan (dependency — grant persistence): `docs/plans/2026-06-03-001-feat-macos-app-developer-id-notarized-distribution-plan.md`
 - Predecessor spec (superseded decision): `docs/superpowers/specs/2026-05-15-scr-54-macos-permission-ownership-design.md`
-- Key code: `src/screencap/recorder.py` (`_check_permission_fresh`), `src/screencap/session.py` (worker preflight), `src/screencap/engine/platform/darwin.py`, `src/screencap/daemon/{app,schema,errors,supervisor}.py`, `macos/ScreenCap/Views/MainWindow.swift`, `macos/ScreenCap/Controllers/{PermissionController,RecorderController,DaemonClient,DaemonSessionService}.swift`, `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift`
+- Key code: `src/screencap/recorder.py` (`_check_permission_fresh`), `src/screencap/session.py` (worker preflight), `src/screencap/engine/platform/darwin.py`, `src/screencap/daemon/{app,schema,errors,supervisor}.py`, `macos/Screencap/Views/MainWindow.swift`, `macos/Screencap/Controllers/{PermissionController,RecorderController,DaemonClient,DaemonSessionService}.swift`, `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift`
 - Institutional learnings: `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md`, `docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md`, `docs/solutions/build-errors/env-export-prefix-silently-disables-team-signing.md`, `docs/solutions/runtime-errors/capture-health-nonscreen-attribution-terminal-stop-2026-06-01.md`, `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md`
 - External: Apple Developer Forums thread/694948, thread/692758, thread/732726, thread/807323, thread/760112, thread/706187 (Quinn "The Eskimo!" — responsible-code model, LaunchAgent TCC); Qt blog (`responsibility_spawnattrs_setdisclaim`); ryanthomson.net / nonstrict.eu (capture-attempt registration); mjtsai.com / lapcatsoftware.com (Sequoia re-auth, `persistent-content-capture`)

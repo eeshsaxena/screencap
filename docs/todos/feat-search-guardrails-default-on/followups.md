@@ -77,8 +77,8 @@ crypto/gating core (U6 core) landed. Plan:
   so run it only with the user's explicit go-ahead. Machinery is unit + E2E tested.
 
 ## Remaining — U6 app provisioning (Swift) — the release blocker
-- **EMPIRICALLY CONFIRMED:** adding `keychain-access-groups` to `ScreenCap.entitlements`
-  **breaks the ad-hoc-signed dev/test build** — `xcodebuild` fails with *"ScreenCap has
+- **EMPIRICALLY CONFIRMED:** adding `keychain-access-groups` to `Screencap.entitlements`
+  **breaks the ad-hoc-signed dev/test build** — `xcodebuild` fails with *"Screencap has
   entitlements that require signing with a development certificate."* So it cannot be
   committed until the app is signed with a Developer-ID cert + a provisioning profile
   that authorizes the group; it was reverted to keep the build green. `CorpusCrypto`

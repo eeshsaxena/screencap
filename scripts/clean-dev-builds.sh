@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 #
-# clean-dev-builds.sh — sweep stray ScreenCap dev/build artifacts so the only
-# ScreenCap.app left on the machine is the installed /Applications one.
+# clean-dev-builds.sh — sweep stray Screencap dev/build artifacts so the only
+# Screencap.app left on the machine is the installed /Applications one.
 #
 # WHY THIS EXISTS
 #   Every git worktree that builds the macOS app makes Xcode create a *new*
-#   ~/Library/Developer/Xcode/DerivedData/ScreenCap-<hash> tree (the hash is
+#   ~/Library/Developer/Xcode/DerivedData/Screencap-<hash> tree (the hash is
 #   derived from the project's absolute path). When the worktree is removed the
 #   DerivedData is orphaned but never cleaned, and macOS 26's Apps window indexes
 #   every .app on disk — so those leftover Debug/Release bundles show up as
-#   duplicate "ScreenCap" icons and the daemon bundle shows up as "ScreencapDaemon".
+#   duplicate "Screencap" icons and the daemon bundle shows up as "ScreencapDaemon".
 #   This script removes those strays and re-registers the real app with Launch
 #   Services so the ghosts disappear.
 #
 # SAFETY
-#   * NEVER touches /Applications/ScreenCap.app (the installed / released app).
+#   * NEVER touches /Applications/Screencap.app (the installed / released app).
 #   * A DerivedData folder is only deleted whole when its recorded WorkspacePath
 #     no longer exists (i.e. its worktree was removed) — so a worktree you are
 #     actively building in Xcode is never nuked. Pass --deep to override.
@@ -25,7 +25,7 @@
 # USAGE
 #   scripts/clean-dev-builds.sh              # normal sweep
 #   scripts/clean-dev-builds.sh --dry-run    # show what would be removed
-#   scripts/clean-dev-builds.sh --deep       # also remove ALL ScreenCap DerivedData
+#   scripts/clean-dev-builds.sh --deep       # also remove ALL Screencap DerivedData
 #
 set -euo pipefail
 
@@ -43,7 +43,7 @@ done
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DD="$HOME/Library/Developer/Xcode/DerivedData"
 LSR="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-KEEP="/Applications/ScreenCap.app"
+KEEP="/Applications/Screencap.app"
 
 removed=0
 freed_note=""
@@ -60,19 +60,19 @@ act()  { # act <human-msg> <cmd...>
 
 unregister() { [[ -x "$LSR" && -e "$1" ]] && "$LSR" -u "$1" >/dev/null 2>&1 || true; }
 
-say "==> ScreenCap dev-build sweep$([[ "$DRY_RUN" == 1 ]] && echo ' (dry-run)')"
+say "==> Screencap dev-build sweep$([[ "$DRY_RUN" == 1 ]] && echo ' (dry-run)')"
 say "    keeping: $KEEP"
 
 # 1. Orphaned / live DerivedData -------------------------------------------------
 if [[ -d "$DD" ]]; then
-  for d in "$DD"/ScreenCap-*; do
+  for d in "$DD"/Screencap-*; do
     [[ -d "$d" ]] || continue
     wp="$(/usr/libexec/PlistBuddy -c 'Print WorkspacePath' "$d/info.plist" 2>/dev/null || true)"
     stale=0
     { [[ "$DEEP" == 1 ]] || [[ -z "$wp" ]] || [[ ! -e "$wp" ]]; } && stale=1
     # unregister any .app bundles inside before deleting
     while IFS= read -r app; do unregister "$app"; done \
-      < <(find "$d/Build/Products" -maxdepth 2 -iname 'ScreenCap*.app' -prune 2>/dev/null || true)
+      < <(find "$d/Build/Products" -maxdepth 2 -iname 'Screencap*.app' -prune 2>/dev/null || true)
     if [[ "$stale" == 1 ]]; then
       act "orphaned DerivedData $(basename "$d")  (src: ${wp:-unknown})" rm -rf "$d"
       removed=$((removed+1))
@@ -81,7 +81,7 @@ if [[ -d "$DD" ]]; then
       while IFS= read -r app; do
         act "built bundle in live worktree cache ($app)" rm -rf "$app"
         removed=$((removed+1))
-      done < <(find "$d/Build/Products" -maxdepth 2 -iname 'ScreenCap*.app' -prune 2>/dev/null || true)
+      done < <(find "$d/Build/Products" -maxdepth 2 -iname 'Screencap*.app' -prune 2>/dev/null || true)
     fi
   done
 fi
@@ -98,14 +98,14 @@ done
 while IFS= read -r app; do
   unregister "$app"; act "in-repo bundle ($app)" rm -rf "$app"; removed=$((removed+1))
 done < <(find "$REPO/macos" \( -name .build -o -name DerivedData \) -type d -prune -exec \
-          find {} -iname 'ScreenCap*.app' -prune \; 2>/dev/null || true)
+          find {} -iname 'Screencap*.app' -prune \; 2>/dev/null || true)
 
-# 3. Catch-all: any other ScreenCap*.app outside /Applications -------------------
+# 3. Catch-all: any other Screencap*.app outside /Applications -------------------
 while IFS= read -r app; do
   [[ "$app" == "$KEEP" ]] && continue
   case "$app" in "$DD"/*|"$REPO"/*) continue ;; esac   # already handled above
   unregister "$app"; act "stray bundle ($app)" rm -rf "$app"; removed=$((removed+1))
-done < <(mdfind -name 'ScreenCap.app' 2>/dev/null || true)
+done < <(mdfind -name 'Screencap.app' 2>/dev/null || true)
 
 # 4. Re-register the real app so Launch Services drops the ghosts ----------------
 if [[ "$DRY_RUN" != 1 && -x "$LSR" && -d "$KEEP" ]]; then

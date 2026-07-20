@@ -31,21 +31,21 @@ origin: https://claude.ai/design/p/54740ac3-4af5-4c85-8508-a39947e9e8e0?file=App
 
 ### Summary
 
-Bring the recording toolbar's hide affordance to full design fidelity. Today the pill can be hidden (icon button) and restored only from the menu bar. The design adds three more ways to live with a hidden toolbar and one visual refinement: pressing **⌘⇧H** anywhere toggles it (even while you're working in the recorded app); **resting the cursor on the bottom screen edge** peeks a slim "Show controls" bar that pins the toolbar back; the **first** time you hide, a **one-time hint** points at the menu bar where the recording status and Stop now live; and the pill's hide affordance becomes a plain **"Hide"** button sitting alongside Draw and Mute. All of this must continue to leave capture untouched, keep every ScreenCap surface out of the recording, and — by design — introduce no new permission prompt.
+Bring the recording toolbar's hide affordance to full design fidelity. Today the pill can be hidden (icon button) and restored only from the menu bar. The design adds three more ways to live with a hidden toolbar and one visual refinement: pressing **⌘⇧H** anywhere toggles it (even while you're working in the recorded app); **resting the cursor on the bottom screen edge** peeks a slim "Show controls" bar that pins the toolbar back; the **first** time you hide, a **one-time hint** points at the menu bar where the recording status and Stop now live; and the pill's hide affordance becomes a plain **"Hide"** button sitting alongside Draw and Mute. All of this must continue to leave capture untouched, keep every Screencap surface out of the recording, and — by design — introduce no new permission prompt.
 
 ### Problem Frame
 
 The shipped hide feature has one restore path: open the menu-bar dropdown and choose *Show recording controls*. That's a deliberate, discoverable fallback, but it's slow and modal — you have to leave what you're doing, travel to the menu bar, and drill into a menu. The design's intent is that a hidden toolbar should feel *reversible in place*: a muscle-memory keystroke (⌘⇧H) that works without leaving the recorded app, and a "swipe to the bottom edge" reveal that mirrors how the Dock and auto-hiding menu bar behave. The one-time hint closes the discoverability gap the first hide creates — when the pill vanishes, a first-time user needs to be told once where "recording" and "Stop" went. And the "Hide" label makes the affordance legible instead of relying on an icon whose meaning must be inferred.
 
-The hard part is that two of these — ⌘⇧H-while-hidden and the edge peek — must react to input **while the user's keyboard/mouse focus is in the app being recorded**, not in ScreenCap. That is exactly the boundary the shipped plan declined to cross (it deferred a hotkey, and the app has never installed a global input path — see KTD-13 below). This plan crosses it deliberately, but with the lightest-footprint mechanisms available so that no new permission prompt appears.
+The hard part is that two of these — ⌘⇧H-while-hidden and the edge peek — must react to input **while the user's keyboard/mouse focus is in the app being recorded**, not in Screencap. That is exactly the boundary the shipped plan declined to cross (it deferred a hotkey, and the app has never installed a global input path — see KTD-13 below). This plan crosses it deliberately, but with the lightest-footprint mechanisms available so that no new permission prompt appears.
 
 ### Requirements
 
 **Keyboard toggle (⌘⇧H)**
 
 - R1. A **⌘⇧H** shortcut toggles the recording toolbar's visibility: it hides the toolbar when shown and restores it when hidden.
-- R2. ⌘⇧H fires while focus is in the **recorded app** (global reach), not only when ScreenCap is frontmost.
-- R3. ⌘⇧H is active **only during a recording**. When no recording is active, ScreenCap does not reserve ⌘⇧H — the combo reaches the frontmost app normally.
+- R2. ⌘⇧H fires while focus is in the **recorded app** (global reach), not only when Screencap is frontmost.
+- R3. ⌘⇧H is active **only during a recording**. When no recording is active, Screencap does not reserve ⌘⇧H — the combo reaches the frontmost app normally.
 
 **Bottom-edge peek**
 
@@ -63,15 +63,15 @@ The hard part is that two of these — ⌘⇧H-while-hidden and the edge peek �
 
 **Invariants (carried from the shipped baseline)**
 
-- R9. Every hide/restore path leaves **capture untouched** — the recording continues uninterrupted — and **every** floating ScreenCap surface (toolbar pill, peek bar, hint) is **excluded from the capture** (`sharingType = .none`), so none appears inside the recording.
+- R9. Every hide/restore path leaves **capture untouched** — the recording continues uninterrupted — and **every** floating Screencap surface (toolbar pill, peek bar, hint) is **excluded from the capture** (`sharingType = .none`), so none appears inside the recording.
 
 ### Acceptance Examples
 
 - AE1. **Covers R1, R2.** Recording in progress with focus in a browser; the user presses ⌘⇧H → the toolbar hides; presses ⌘⇧H again → it reappears bottom-center. The elapsed timer kept advancing throughout and focus never left the browser.
-- AE2. **Covers R3.** No recording active; the user presses ⌘⇧H → nothing happens in ScreenCap and, if the frontmost app binds ⌘⇧H, that app receives it normally.
+- AE2. **Covers R3.** No recording active; the user presses ⌘⇧H → nothing happens in Screencap and, if the frontmost app binds ⌘⇧H, that app receives it normally.
 - AE3. **Covers R4, R5, R6.** Toolbar hidden; the user rests the cursor at the very bottom edge → after a brief dwell a slim "Show controls ⌘⇧H" bar appears; moving the cursor away from the edge hides it again without ever pinning; clicking it restores the full toolbar bottom-center.
 - AE4. **Covers R7.** The first time the user ever hides the toolbar → a one-time hint points to the menu bar; on every subsequent hide (same recording or a later one) no hint appears.
-- AE5. **Covers R9.** Across hide, ⌘⇧H toggle, edge peek, and hint display, none of the ScreenCap surfaces appears in the captured video and capture keeps writing to disk.
+- AE5. **Covers R9.** Across hide, ⌘⇧H toggle, edge peek, and hint display, none of the Screencap surfaces appears in the captured video and capture keeps writing to disk.
 - AE6. **Covers the no-new-permission property (KTD-1, KTD-2).** Using the ⌘⇧H and edge-peek features triggers **no** Accessibility or Input Monitoring permission dialog beyond what recording already required.
 
 ### Scope Boundaries
@@ -87,26 +87,26 @@ The hard part is that two of these — ⌘⇧H-while-hidden and the edge peek �
 **Outside this product's identity**
 
 - Making **Draw / Mute** functional (SCR-217 / SCR-218) — this plan does not touch them.
-- ScreenCap reserving **⌘⇧H when idle** — the hotkey is registered only during a recording (R3); the app is not a global-hotkey utility.
+- Screencap reserving **⌘⇧H when idle** — the hotkey is registered only during a recording (R3); the app is not a global-hotkey utility.
 - The **minimize-to-a-dot / dock-to-edge** hide *shapes* — rejected in the baseline in favor of full dismiss. The edge peek is a *reveal* affordance; the pill still fully dismisses.
 
 ### Dependencies and Assumptions
 
 - **Baseline is shipped.** `RecorderController.hudHidden`, `hideRecordingHUD()`, `showRecordingHUD()`, `MenuBarMenuPolicy.showRecordingControlsVisible`, and the capture-excluded HUD panel already exist (PR #338). This plan builds directly on them.
 - **`hudHidden` reset lives at the `.idle` chokepoint.** The shipped code resets `hudHidden = false` in `RecorderController.state.didSet` when `state` becomes `.idle` (not at the effect-drains the original baseline plan text described — commit `430082ac` moved it). Everything here must respect that single chokepoint.
-- **App process, not a helper, owns the monitoring.** The ⌘⇧H registration and the cursor-edge detector run **in the ScreenCap.app process** so they ride on the app's own identity. The app is **not sandboxed** and its target entitlements declare only `com.apple.security.device.audio-input` (`macos/ScreenCap/ScreenCap.entitlements`) — the recording-engine TCC grants (Screen Recording / Accessibility / Input Monitoring) are held by the spawned CLI/daemon, not necessarily by the app process. The chosen mechanisms are selected precisely so the app process needs **no** grant it doesn't already have (KTD-1, KTD-2).
+- **App process, not a helper, owns the monitoring.** The ⌘⇧H registration and the cursor-edge detector run **in the Screencap.app process** so they ride on the app's own identity. The app is **not sandboxed** and its target entitlements declare only `com.apple.security.device.audio-input` (`macos/Screencap/Screencap.entitlements`) — the recording-engine TCC grants (Screen Recording / Accessibility / Input Monitoring) are held by the spawned CLI/daemon, not necessarily by the app process. The chosen mechanisms are selected precisely so the app process needs **no** grant it doesn't already have (KTD-1, KTD-2).
 - **Capture exclusion must extend to new surfaces.** The existing HUD panel is capture-excluded (`sharingType = .none`). The peek bar and the hint are new floating panels over arbitrary recorded content and must carry the same exclusion (R9).
-- **KTD-13 precedent.** The app deliberately kept ⌘⇧F window-scoped ("no global tap", documented in `macos/ScreenCap/Views/MenuBarMenu.swift` and the QA runbook §7). This plan is the first global input path; KTD-3 justifies the scoped exception.
+- **KTD-13 precedent.** The app deliberately kept ⌘⇧F window-scoped ("no global tap", documented in `macos/Screencap/Views/MenuBarMenu.swift` and the QA runbook §7). This plan is the first global input path; KTD-3 justifies the scoped exception.
 
 ### Sources
 
-- `macos/ScreenCap/Controllers/RecorderController.swift` — `hudHidden`, `hideRecordingHUD()` / `showRecordingHUD()`, the `.idle` reset chokepoint (`state.didSet`), the effect switch that drains `.showHUD` / `.hideHUD`, and the injected `windowLifecycle` seam (`init(windowLifecycle:)`).
-- `macos/ScreenCap/Controllers/WindowLifecycle.swift` — the injected AppKit seam pattern (`WindowLifecycle` protocol + `LiveWindowLifecycle` + `NoopWindowLifecycle` + `WindowLifecycleFactory.makeDefault()` XCTest gate) that the new input-monitor seam mirrors.
-- `macos/ScreenCap/Views/Record/RecordingHUDPanel.swift` — the pill sub-views (`stub(...)`, `stopButton`, `hideButton`), `RecordingHUDModel` accessibility labels, and `RecordingHUDPanelController` (capture-excluded non-activating `NSPanel`, `fittingSize` panel sizing, bottom-center `reposition`).
-- `macos/ScreenCap/Views/MenuBarMenu.swift` + `macos/ScreenCap/Views/MenuBarMenuPolicy.swift` — the *Show recording controls* item, the `*Policy` predicate pattern, and the KTD-13 "no global tap" note.
-- `macos/ScreenCap/AppDelegate.swift` — `@MainActor` app-level AppKit owner (`bind(recorder:)`, `applicationDidFinishLaunching`, window-close observer) — the natural home to install/tear down app-lifetime monitors.
-- `macos/ScreenCap/Controllers/OnboardingMarkerStore.swift` — the injectable `UserDefaults`-backed once-flag store pattern for the one-time hint.
-- `macos/ScreenCapTests/RecorderControllerTests.swift` — `FakeWindowLifecycle` (`showHUDCount` / `hideHUDCount` / `hideMainWindowCount` / `restoreMainWindowCount`) and the `recordingController(_:)` helper driving `.starting → started`; the test-double template for the new seam.
+- `macos/Screencap/Controllers/RecorderController.swift` — `hudHidden`, `hideRecordingHUD()` / `showRecordingHUD()`, the `.idle` reset chokepoint (`state.didSet`), the effect switch that drains `.showHUD` / `.hideHUD`, and the injected `windowLifecycle` seam (`init(windowLifecycle:)`).
+- `macos/Screencap/Controllers/WindowLifecycle.swift` — the injected AppKit seam pattern (`WindowLifecycle` protocol + `LiveWindowLifecycle` + `NoopWindowLifecycle` + `WindowLifecycleFactory.makeDefault()` XCTest gate) that the new input-monitor seam mirrors.
+- `macos/Screencap/Views/Record/RecordingHUDPanel.swift` — the pill sub-views (`stub(...)`, `stopButton`, `hideButton`), `RecordingHUDModel` accessibility labels, and `RecordingHUDPanelController` (capture-excluded non-activating `NSPanel`, `fittingSize` panel sizing, bottom-center `reposition`).
+- `macos/Screencap/Views/MenuBarMenu.swift` + `macos/Screencap/Views/MenuBarMenuPolicy.swift` — the *Show recording controls* item, the `*Policy` predicate pattern, and the KTD-13 "no global tap" note.
+- `macos/Screencap/AppDelegate.swift` — `@MainActor` app-level AppKit owner (`bind(recorder:)`, `applicationDidFinishLaunching`, window-close observer) — the natural home to install/tear down app-lifetime monitors.
+- `macos/Screencap/Controllers/OnboardingMarkerStore.swift` — the injectable `UserDefaults`-backed once-flag store pattern for the one-time hint.
+- `macos/ScreencapTests/RecorderControllerTests.swift` — `FakeWindowLifecycle` (`showHUDCount` / `hideHUDCount` / `hideMainWindowCount` / `restoreMainWindowCount`) and the `recordingController(_:)` helper driving `.starting → started`; the test-double template for the new seam.
 - `docs/runbooks/new-ui-manual-qa.md` — §4 (recording lifecycle + HUD) and §7 (KTD-13 window-scoped ⌘⇧F) — the manual-QA home for the paths unit tests cannot reach.
 - External research (2026): Carbon `RegisterEventHotKey` (no TCC grant, consumes the combo system-wide, macOS-15 Option-only-modifier bug does not affect ⌘⇧H); `NSEvent.mouseLocation` polling (zero-permission cursor position) vs. `addGlobalMonitorForEvents(.mouseMoved)` (Accessibility-gated); recommended ~300–400 ms hover dwell. Sindre Sorhus's `KeyboardShortcuts` package wraps the same Carbon API (MIT) — noted as a future option, not adopted (the app has no SPM dependencies today).
 
@@ -116,11 +116,11 @@ The hard part is that two of these — ⌘⇧H-while-hidden and the edge peek �
 
 ### Key Technical Decisions
 
-- **KTD-1 — ⌘⇧H via raw Carbon `RegisterEventHotKey`, registered only during a recording.** Carbon's `RegisterEventHotKey` / `InstallEventHandler` is the one API that binds a single fixed combo **system-wide with no TCC permission** and *consumes* the keystroke (it does not merely observe it), so ⌘⇧H fires regardless of which app is frontmost (R2) and the recorded app does not double-handle it. Registration is scoped to the recording lifecycle: install on the recording-start edge, unregister on every teardown edge — so ScreenCap does not reserve ⌘⇧H when idle (R3) and there is no global conflict outside a recording. Raw Carbon (~40 lines: one `EventHotKeyRef`, one event handler on `GetApplicationEventTarget()`) is chosen over the `KeyboardShortcuts` SPM package because the app currently has **zero third-party runtime dependencies** and this is a single fixed combo — adding a dependency to a privacy-sensitive recorder is not justified for ~40 lines. `NSEvent.addGlobalMonitorForEvents(.keyDown)` is rejected: it needs Accessibility and cannot prevent the recorded app from also receiving ⌘⇧H. (macOS-15 caveat: modifier-*only* hotkeys can silently fail; ⌘⇧H uses Command+Shift and is unaffected.)
+- **KTD-1 — ⌘⇧H via raw Carbon `RegisterEventHotKey`, registered only during a recording.** Carbon's `RegisterEventHotKey` / `InstallEventHandler` is the one API that binds a single fixed combo **system-wide with no TCC permission** and *consumes* the keystroke (it does not merely observe it), so ⌘⇧H fires regardless of which app is frontmost (R2) and the recorded app does not double-handle it. Registration is scoped to the recording lifecycle: install on the recording-start edge, unregister on every teardown edge — so Screencap does not reserve ⌘⇧H when idle (R3) and there is no global conflict outside a recording. Raw Carbon (~40 lines: one `EventHotKeyRef`, one event handler on `GetApplicationEventTarget()`) is chosen over the `KeyboardShortcuts` SPM package because the app currently has **zero third-party runtime dependencies** and this is a single fixed combo — adding a dependency to a privacy-sensitive recorder is not justified for ~40 lines. `NSEvent.addGlobalMonitorForEvents(.keyDown)` is rejected: it needs Accessibility and cannot prevent the recorded app from also receiving ⌘⇧H. (macOS-15 caveat: modifier-*only* hotkeys can silently fail; ⌘⇧H uses Command+Shift and is unaffected.)
 
 - **KTD-2 — Bottom-edge peek via zero-permission cursor polling, not a global mouse monitor.** The edge detector reads the public `NSEvent.mouseLocation` on a lightweight `Timer` (~60–100 ms), **active only while a recording is live AND `hudHidden`**, and reveals the peek bar after a ~300–400 ms dwell in the bottom edge band; it hides the bar when the cursor leaves the band (with a short anti-flicker delay). `NSEvent.mouseLocation` is readable by any process with **no TCC grant**, which is decisive here: the app process is not known to hold Accessibility, so the event-driven `addGlobalMonitorForEvents(.mouseMoved)` path (Accessibility-gated) would risk a *new* permission prompt or silently no-op. Polling trades marginal latency for the "no new permission" guarantee (KTD's headline property, AE6); perceptible dwell time dominates the latency budget anyway. `NSTrackingArea` is not viable — it cannot see the cursor while it is over another app's window. The event-driven monitor is recorded as a deferred upgrade (Alternatives) for the day the app already holds Accessibility.
 
-- **KTD-3 — Scoped exception to KTD-13 ("no global tap"), justified by the requirement.** KTD-13 kept ⌘⇧F window-scoped because focusing a window is meaningful only when ScreenCap is (or becomes) frontmost. ⌘⇧H is the opposite: its entire purpose (R2) is to work *without* leaving the recorded app, so a window-scoped shortcut would be useless. The exception is narrow — a single fixed combo, registered only during recording — and, critically, the mechanisms chosen (Carbon hotkey + `mouseLocation` polling) are **not** a general input tap/monitor: they read a scoped system hotkey and a public cursor property, not the user's keystroke stream. The trust-boundary footprint is therefore far lighter than the "global tap" KTD-13 avoided. Document this exception inline where KTD-13 is noted.
+- **KTD-3 — Scoped exception to KTD-13 ("no global tap"), justified by the requirement.** KTD-13 kept ⌘⇧F window-scoped because focusing a window is meaningful only when Screencap is (or becomes) frontmost. ⌘⇧H is the opposite: its entire purpose (R2) is to work *without* leaving the recorded app, so a window-scoped shortcut would be useless. The exception is narrow — a single fixed combo, registered only during recording — and, critically, the mechanisms chosen (Carbon hotkey + `mouseLocation` polling) are **not** a general input tap/monitor: they read a scoped system hotkey and a public cursor property, not the user's keystroke stream. The trust-boundary footprint is therefore far lighter than the "global tap" KTD-13 avoided. Document this exception inline where KTD-13 is noted.
 
 - **KTD-4 — One shared, recording-lifecycle-coupled input-monitor seam, mirroring `WindowLifecycle`.** Introduce a single injected `@MainActor` seam — `HUDInputMonitor` (protocol + `LiveHUDInputMonitor` + `NoopHUDInputMonitor` + a factory that returns Noop under XCTest, exactly like `WindowLifecycleFactory`). It owns **both** the Carbon hotkey (KTD-1) and the cursor-edge detector (KTD-2), because both share the same lifecycle ("active only during a recording") and the same driver (`RecorderController`). `RecorderController` injects it (like `windowLifecycle`) and calls `startMonitoring(for:)` / `stopMonitoring()` at the same recording-start and teardown edges it already drives `showHUD` / `hideHUD` from. The live monitor calls back into the recorder (`toggleRecordingHUD()` for the hotkey; a restore for the peek click) via a thin callback/delegate set at start. A `FakeHUDInputMonitor` counting `startCount` / `stopCount` makes the lifecycle coupling a unit test; the actual hotkey/cursor delivery is manual QA.
 
@@ -128,7 +128,7 @@ The hard part is that two of these — ⌘⇧H-while-hidden and the edge peek �
 
 - **KTD-6 — Peek reveal/hide gating and hint gating are pure, testable policies.** The peek's reveal decision (`state == .recording` AND `hudHidden` AND cursor in the bottom edge band for ≥ dwell) is factored into a `HUDPeekPolicy` pure predicate, and the one-time-hint decision into a `HUDHintPolicy.shouldShow(hasHiddenBefore:)` + an injectable `UserDefaults`-backed `HUDHintStore` (the `OnboardingMarkerStore` idiom). This follows the app's `*Policy`-struct convention (`MenuBarMenuPolicy`, `NewRecordingSheetPolicy`, `OnboardingStepPolicy`), turning the risky/branchy logic into unit tests and leaving only panel presentation + real input delivery to manual QA.
 
-- **KTD-7 — Every new floating surface is capture-excluded, presented via the same panel idiom.** The peek bar and the hint are new non-activating, capture-excluded (`sharingType = .none`) floating panels, built with the `RecordingHUDPanelController` idiom (non-activating `NSPanel`, `.floating`, all-Spaces, `hasShadow = false`, `panel.sharingType = .none`). This is a hard invariant (R9): a ScreenCap surface leaking into the recording is a blocker, not a styling bug.
+- **KTD-7 — Every new floating surface is capture-excluded, presented via the same panel idiom.** The peek bar and the hint are new non-activating, capture-excluded (`sharingType = .none`) floating panels, built with the `RecordingHUDPanelController` idiom (non-activating `NSPanel`, `.floating`, all-Spaces, `hasShadow = false`, `panel.sharingType = .none`). This is a hard invariant (R9): a Screencap surface leaking into the recording is a blocker, not a styling bug.
 
 ### High-Level Technical Design
 
@@ -188,7 +188,7 @@ Corrections applied to the units below after the doc-review pass; each is baked 
 - **Peek band must clear the Dock (P1, adversarial).** The shipped pill repositions to `visibleFrame.minY + 34` to clear the Dock; the peek band and panel must likewise anchor on `visibleFrame` (not the full `frame.minY`), or the dwell zone and bar sit under a bottom Dock in the default config.
 - **One-time hint: mark shown after display, not at presentation (P1, design).** Persist the `HUDHintStore` once-flag only after the hint has been visibly shown for its dwell (or on explicit dismissal), so a distracted first-time user is not silently robbed of the one guidance moment. The hint copy teaches ⌘⇧H ("⌘⇧H brings the toolbar back"), matching design 8a's tooltip (extends R7).
 - **Accessibility parity (P1, design).** The shipped HUD labels every control for VoiceOver. The peek bar and hint carry VoiceOver labels/announcements, and ⌘⇧H is the documented keyboard-equivalent restore for users who cannot trigger the cursor-dwell peek; add a VoiceOver manual-QA line.
-- **SECURITY.md trust-boundary note (P2, security).** Document two boundaries in `SECURITY.md`: the capture-exclusion invariant (every ScreenCap floating surface is `sharingType = .none`; a leak is a blocker) and the global-input footprint (one recording-scoped Carbon hotkey + public `NSEvent.mouseLocation` polling, no keystroke tap, unregistered when idle). Added to the Definition of Done.
+- **SECURITY.md trust-boundary note (P2, security).** Document two boundaries in `SECURITY.md`: the capture-exclusion invariant (every Screencap floating surface is `sharingType = .none`; a leak is a blocker) and the global-input footprint (one recording-scoped Carbon hotkey + public `NSEvent.mouseLocation` polling, no keystroke tap, unregistered when idle). Added to the Definition of Done.
 
 ---
 
@@ -197,7 +197,7 @@ Corrections applied to the units below after the doc-review pass; each is baked 
 New files this plan introduces (existing files are modified in place per each unit's **Files**):
 
 ```
-macos/ScreenCap/
+macos/Screencap/
   Controllers/
     HUDInputMonitor.swift        # U2 — seam: protocol + Live (Carbon hotkey; U3 adds edge detector) + Noop + factory
     HUDHintStore.swift           # U5 — injectable UserDefaults-backed one-time-hint flag
@@ -207,7 +207,7 @@ macos/ScreenCap/
   Views/
     HUDPeekPolicy.swift          # U3 — pure reveal/hide predicate
     HUDHintPolicy.swift          # U5 — pure shouldShow predicate
-macos/ScreenCapTests/
+macos/ScreencapTests/
     HUDInputMonitorLifecycleTests.swift   # U2 — start/stop coupled to recording (Fake seam)
     HUDPeekPolicyTests.swift              # U3
     HUDHintPolicyTests.swift              # U5
@@ -225,7 +225,7 @@ This tree is a scope declaration, not a constraint — the executor may fold `HU
 - **Goal.** Add the single bidirectional toggle entry point that ⌘⇧H (and any future command) routes through, reusing the shipped hide/show methods.
 - **Requirements.** R1 (toggle semantics).
 - **Dependencies.** None.
-- **Files.** `macos/ScreenCap/Controllers/RecorderController.swift`, `macos/ScreenCapTests/RecorderControllerTests.swift`.
+- **Files.** `macos/Screencap/Controllers/RecorderController.swift`, `macos/ScreencapTests/RecorderControllerTests.swift`.
 - **Approach.**
   - Add `func toggleRecordingHUD()`: `guard case .recording = state else { return }`; if `hudHidden` call `showRecordingHUD()`, else `hideRecordingHUD()`. No new state — it composes the two shipped methods, which already own the `windowLifecycle` calls and the `hudHidden` mutation, so the single `hudHidden` source of truth is preserved.
   - Keep the guard symmetric with `hideRecordingHUD()` / `showRecordingHUD()` so a toggle raced onto the `.recording → .idle` edge is a safe no-op.
@@ -242,7 +242,7 @@ This tree is a scope declaration, not a constraint — the executor may fold `HU
 - **Goal.** Introduce the injected input-monitor seam and its live Carbon-hotkey implementation, registered only during a recording, firing `toggleRecordingHUD()` from anywhere.
 - **Requirements.** R1, R2, R3.
 - **Dependencies.** U1.
-- **Files.** new `macos/ScreenCap/Controllers/HUDInputMonitor.swift`, `macos/ScreenCap/Controllers/RecorderController.swift`, `macos/ScreenCapTests/RecorderControllerTests.swift` (or new `macos/ScreenCapTests/HUDInputMonitorLifecycleTests.swift`).
+- **Files.** new `macos/Screencap/Controllers/HUDInputMonitor.swift`, `macos/Screencap/Controllers/RecorderController.swift`, `macos/ScreencapTests/RecorderControllerTests.swift` (or new `macos/ScreencapTests/HUDInputMonitorLifecycleTests.swift`).
 - **Approach.**
   - Define `@MainActor protocol HUDInputMonitor: AnyObject` with `startMonitoring(for recorder: RecorderController)` and `stopMonitoring()`; provide `LiveHUDInputMonitor`, `NoopHUDInputMonitor`, and a `HUDInputMonitorFactory.makeDefault()` that returns Noop under the XCTest host (mirror `WindowLifecycleFactory` exactly — same `XCTestConfigurationFilePath` gate).
   - `LiveHUDInputMonitor.startMonitoring` registers a Carbon hotkey for **⌘⇧H** (`RegisterEventHotKey` + one `InstallEventHandler` on `GetApplicationEventTarget()`, keeping the `EventHotKeyRef`); the handler dispatches to the main actor and calls back to `recorder.toggleRecordingHUD()`. `stopMonitoring` calls `UnregisterEventHotKey` and removes the handler. Idempotent: double-start does not double-register; stop before start is a no-op.
@@ -263,7 +263,7 @@ This tree is a scope declaration, not a constraint — the executor may fold `HU
 - **Goal.** Reveal a capture-excluded slim "Show controls" bar when the cursor dwells at the bottom screen edge while the toolbar is hidden, restoring the toolbar on click or ⌘⇧H.
 - **Requirements.** R4, R5, R6 (and preserves R9).
 - **Dependencies.** U1, U2.
-- **Files.** `macos/ScreenCap/Controllers/HUDInputMonitor.swift` (extend `LiveHUDInputMonitor` with the cursor-edge detector), new `macos/ScreenCap/Views/Record/HUDPeekPanel.swift`, new `macos/ScreenCap/Views/HUDPeekPolicy.swift`, new `macos/ScreenCapTests/HUDPeekPolicyTests.swift`.
+- **Files.** `macos/Screencap/Controllers/HUDInputMonitor.swift` (extend `LiveHUDInputMonitor` with the cursor-edge detector), new `macos/Screencap/Views/Record/HUDPeekPanel.swift`, new `macos/Screencap/Views/HUDPeekPolicy.swift`, new `macos/ScreencapTests/HUDPeekPolicyTests.swift`.
 - **Approach.**
   - Extend `LiveHUDInputMonitor` with a cursor-edge detector: a `Timer` (~60–100 ms) that reads `NSEvent.mouseLocation`, running **only while a recording is live AND `hudHidden`** (the monitor already knows both via the bound recorder / start-stop lifecycle; start the timer when entering hidden, stop it on show/teardown). Keep the tick body cheap — compare against the bottom edge band of the recorded/main screen's frame only.
   - Gate reveal/hide through a pure `HUDPeekPolicy`: reveal when `state == .recording` AND `hudHidden` AND the cursor has been within the bottom edge band (e.g. `y <= screen.minY + band`) for ≥ a dwell (~300–400 ms); hide when the cursor leaves the band (short anti-flicker delay). The dwell/anti-flicker timers live in the detector; the boolean decision lives in the policy.
@@ -282,7 +282,7 @@ This tree is a scope declaration, not a constraint — the executor may fold `HU
 - **Goal.** Replace the pill's icon-only chevron hide affordance with a labeled **"Hide"** control alongside Draw and Mute, surfacing ⌘⇧H, per design 8a.
 - **Requirements.** R8.
 - **Dependencies.** U1.
-- **Files.** `macos/ScreenCap/Views/Record/RecordingHUDPanel.swift`, `macos/ScreenCapTests/RecordingHUDModelTests.swift`.
+- **Files.** `macos/Screencap/Views/Record/RecordingHUDPanel.swift`, `macos/ScreencapTests/RecordingHUDModelTests.swift`.
 - **Approach.**
   - Change the `hideButton` from the trailing `chevron.down` icon to a text **"Hide"** control placed **before** Stop & save, styled consistently with the Draw/Mute stubs (design 8a shows `Draw · Mute · Hide · [Stop & save]`). Keep its action on `recorder.hideRecordingHUD()` (or `toggleRecordingHUD()` for symmetry).
   - Surface the ⌘⇧H hint in the control's `.help(...)` tooltip and keep the `hideAccessibilityLabel` ("Hide recording controls") on `RecordingHUDModel`; extend the label or tooltip to mention the shortcut.
@@ -298,7 +298,7 @@ This tree is a scope declaration, not a constraint — the executor may fold `HU
 - **Goal.** The first time the user ever hides the toolbar, show a one-time hint pointing to the menu bar; never show it again.
 - **Requirements.** R7.
 - **Dependencies.** U1.
-- **Files.** new `macos/ScreenCap/Controllers/HUDHintStore.swift`, new `macos/ScreenCap/Views/HUDHintPolicy.swift`, new `macos/ScreenCap/Views/Record/HUDHintPanel.swift`, `macos/ScreenCap/Controllers/RecorderController.swift` (fire the hint on the hide edge), new `macos/ScreenCapTests/HUDHintPolicyTests.swift`, new `macos/ScreenCapTests/HUDHintStoreTests.swift`.
+- **Files.** new `macos/Screencap/Controllers/HUDHintStore.swift`, new `macos/Screencap/Views/HUDHintPolicy.swift`, new `macos/Screencap/Views/Record/HUDHintPanel.swift`, `macos/Screencap/Controllers/RecorderController.swift` (fire the hint on the hide edge), new `macos/ScreencapTests/HUDHintPolicyTests.swift`, new `macos/ScreencapTests/HUDHintStoreTests.swift`.
 - **Approach.**
   - `HUDHintStore` — an injectable `UserDefaults`-backed once-flag (`hasShownHideHint`), following the `OnboardingMarkerStore` in-progress-flag idiom (`init(defaults: UserDefaults = .standard)`).
   - `HUDHintPolicy.shouldShow(hasShownBefore:) -> Bool` — pure: true only when the store has never recorded a prior hide-hint.
@@ -340,14 +340,14 @@ Run the macOS app unit suite from `macos/`. New source/test files require regene
 ```bash
 cd macos
 xcodegen generate
-xcodebuild test -only-testing:ScreenCapTests -project ScreenCap.xcodeproj -scheme ScreenCap
+xcodebuild test -only-testing:ScreencapTests -project Screencap.xcodeproj -scheme Screencap
 ```
 
 Gates:
 
 - **Unit tests pass:** the new `RecorderControllerTests` toggle cases (U1), `HUDInputMonitor` lifecycle cases with `FakeHUDInputMonitor` (U2), `HUDPeekPolicyTests` (U3), `RecordingHUDModelTests` label case (U4), and `HUDHintPolicyTests` + `HUDHintStoreTests` (U5). Existing HUD/recorder/menu tests stay green — no regression to the shipped hide/restore/reset baseline behavior (the prior plan's R1–R7, defined in `docs/plans/2026-07-06-001-...`, distinct from this plan's R-IDs). The known-flaky daemon-reconnect test is unrelated; re-run to confirm if it appears.
 - **Manual QA** per `docs/runbooks/new-ui-manual-qa.md` §4 — add and pass entries for: ⌘⇧H toggle while a *different* app is focused (AE1); ⌘⇧H does nothing / passes through when idle (AE2); bottom-edge dwell reveals the peek, leaving hides it, click/⌘⇧H restores bottom-center (AE3); first-ever hide shows the one-time menu-bar hint and never again (AE4); the "Hide" label reads beside Draw/Mute (U4).
-- **Capture-exclusion spot check (R9, load-bearing):** across hide, ⌘⇧H toggle, peek reveal, and hint display, no ScreenCap surface (pill, peek bar, hint) appears in a captured frame, and capture keeps writing (AE5) — the `sharingType = .none` guarantee (KTD-4 of the prototype-UI plan, `docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md`).
+- **Capture-exclusion spot check (R9, load-bearing):** across hide, ⌘⇧H toggle, peek reveal, and hint display, no Screencap surface (pill, peek bar, hint) appears in a captured frame, and capture keeps writing (AE5) — the `sharingType = .none` guarantee (KTD-4 of the prototype-UI plan, `docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md`).
 - **No new permission prompt (AE6):** exercising ⌘⇧H and the edge peek on a clean machine triggers no Accessibility / Input Monitoring dialog beyond the recording grants.
 
 ---
@@ -358,7 +358,7 @@ Gates:
 - Unit tests written and green: U1 toggle, U2 monitor lifecycle (Fake seam), U3 `HUDPeekPolicy`, U4 accessibility-label, U5 hint policy + store; existing suite unchanged.
 - The new global input path is the sole KTD-13 exception, documented inline next to the existing "no global tap" note; ⌘⇧H is not reserved when idle.
 - Every new floating surface (peek bar, hint) is capture-excluded and verified not to appear in a recording.
-- `xcodegen generate` re-run so the new seam/policy/store/test files are in the project; the `xcodebuild test` command above passes for `ScreenCapTests`.
+- `xcodegen generate` re-run so the new seam/policy/store/test files are in the project; the `xcodebuild test` command above passes for `ScreencapTests`.
 - Manual-QA runbook §4 updated with the ⌘⇧H / edge-peek / one-time-hint / "Hide"-label entries, a VoiceOver pass for the peek/hint surfaces, and the capture-exclusion spot-check.
 - `SECURITY.md` updated with the capture-exclusion invariant and the global-input footprint (recording-scoped Carbon hotkey + `NSEvent.mouseLocation` polling, no keystroke tap), cross-referencing the KTD-13 exception.
 - No dead code or abandoned-approach remnants; the pill "Hide" button, ⌘⇧H, the peek bar, and the menu item all read the single `hudHidden` source of truth via `toggleRecordingHUD()` / `showRecordingHUD()`.

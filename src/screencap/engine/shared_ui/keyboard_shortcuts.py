@@ -14,7 +14,7 @@ def get_keyboard_shortcuts_js() -> str:
         JavaScript code that implements standardized keyboard shortcuts.
     """
     return """
-// Unified ScreenCap Keyboard Shortcuts
+// Unified Screencap Keyboard Shortcuts
 // Standard shortcuts for consistent UX across all viewers
 
 const KeyboardShortcuts = {

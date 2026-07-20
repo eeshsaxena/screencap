@@ -41,13 +41,13 @@ Nothing below blocks on more client/app work.
   argv) with a re-mint timer; `screencap upload` refuses with a sign-in prompt when
   not signed in and touches nothing on disk; the retired `--remote`/`--sessions`
   session surfaces and the public `screencap.sh` viewer URLs are gone.
-- **U6** `macos/ScreenCap/` — a `CloudAuthController` shells out to `screencap
+- **U6** `macos/Screencap/` — a `CloudAuthController` shells out to `screencap
   login`/`logout`/`whoami --json` (all token handling stays in Python). The menu
   bar shows the signed-in account + Sign In / Sign Out (Sign Out disabled while an
   upload is in flight); the review-window Upload affordance gates on auth state and
   presents an async, cancellable "Sign in to upload" sheet when signed out instead
   of an opaque CLI refusal. `whoami` decode is drift-resilient; local recording is
-  never gated (R3). Tested in `macos/ScreenCapTests/CloudAuthControllerTests.swift`.
+  never gated (R3). Tested in `macos/ScreencapTests/CloudAuthControllerTests.swift`.
 
 ## Decisions already resolved (do not re-litigate)
 

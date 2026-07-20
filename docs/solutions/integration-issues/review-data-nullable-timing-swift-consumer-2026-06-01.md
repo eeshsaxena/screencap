@@ -52,7 +52,7 @@ if db_path is not None:
 return {"ok": True, ..., "started_at": started_at, "duration_seconds": duration_seconds}
 ```
 
-Swift consumer (`macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift`) — drop the timing fields from the guard and fall back to safe defaults:
+Swift consumer (`macos/Screencap/Views/Review/ReviewWindowViewModel.swift`) — drop the timing fields from the guard and fall back to safe defaults:
 
 ```swift
 // Before — null in either field → .failed, video never shows

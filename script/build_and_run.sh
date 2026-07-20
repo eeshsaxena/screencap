@@ -4,13 +4,13 @@ set -euo pipefail
 MODE="${1:-run}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MACOS_DIR="$ROOT_DIR/macos"
-PROJECT_FILE="$MACOS_DIR/ScreenCap.xcodeproj"
+PROJECT_FILE="$MACOS_DIR/Screencap.xcodeproj"
 PROJECT_YML="$MACOS_DIR/project.yml"
-SCHEME="ScreenCap"
+SCHEME="Screencap"
 CONFIGURATION="Debug"
-APP_NAME="ScreenCap"
+APP_NAME="Screencap"
 BUNDLE_ID="com.screencap.macos"
-DERIVED_DATA="$ROOT_DIR/.build/ScreenCapDerivedData"
+DERIVED_DATA="$ROOT_DIR/.build/ScreencapDerivedData"
 APP_BUNDLE="$DERIVED_DATA/Build/Products/$CONFIGURATION/$APP_NAME.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 CLI_BUNDLE="$ROOT_DIR/dist/screencap"
@@ -268,7 +268,7 @@ generate_project_if_needed() {
     should_generate=1
   elif [[ "$PROJECT_YML" -nt "$PROJECT_FILE/project.pbxproj" ]]; then
     should_generate=1
-  elif [[ -n "$(find "$MACOS_DIR/ScreenCap" "$MACOS_DIR/ScreenCapTests" -type d -newer "$PROJECT_FILE/project.pbxproj" -print -quit 2>/dev/null)" ]]; then
+  elif [[ -n "$(find "$MACOS_DIR/Screencap" "$MACOS_DIR/ScreencapTests" -type d -newer "$PROJECT_FILE/project.pbxproj" -print -quit 2>/dev/null)" ]]; then
     # xcodegen globs sources at generation time, so adding/removing/renaming a
     # source file changes the project's file list without touching project.yml.
     # Those operations bump the containing directory's mtime (plain content
@@ -385,7 +385,7 @@ running_daemon_version() {
 
 cli_version_from_binary() {
   # parse must match daemon.info.daemon_version; keep in sync with the sibling
-  # script's copy (macos/ScreenCap/Scripts/embed-cli.sh `cli_version_from_binary`).
+  # script's copy (macos/Screencap/Scripts/embed-cli.sh `cli_version_from_binary`).
   "$1" --version 2>/dev/null | awk 'NF {print $NF}'
 }
 
@@ -398,7 +398,7 @@ fresh_daemon_version() {
 }
 
 reconcile_daemon_version() {
-  # SCR-121: a stale/foreign daemon (e.g. an older ScreenCap.app build) can be
+  # SCR-121: a stale/foreign daemon (e.g. an older Screencap.app build) can be
   # registered under com.screencap.daemon and squatting api.sock. `kickstart`
   # only respawns whatever bundle the label is pinned to (the old one), and the
   # app treats "socket reachable" as "installed", so the freshly built app would
@@ -423,7 +423,7 @@ reconcile_daemon_version() {
   fi
 
   uid="$(id -u)"
-  echo "warning: a stale ScreenCap daemon (version $running) is running, but this" >&2
+  echo "warning: a stale Screencap daemon (version $running) is running, but this" >&2
   echo "warning: build bundles version $fresh. Dislodging the stale helper so the" >&2
   echo "warning: freshly built app reinstalls its own daemon on launch." >&2
   # `launchctl bootout` returns non-zero when the label simply isn't loaded —

@@ -40,7 +40,7 @@ The trap to avoid is a dishonest privacy claim. The design cards pitch "keys sta
 
 - **Server-readable paid cloud, not E2EE.** The paid tier monetizes the cloud path exactly as it works today. This ships in a day and keeps the training-corpus bet open, at the cost of no "we can't watch" claim on the paid tier. The E2EE-vs-training strategy fork is deliberately not resolved here.
 - **Both gates, with the signer as the real one.** Enforcement lives server-side at the URL signer (non-bypassable); the app also hides cloud upload for non-subscribers so it never dangles a control that would fail server-side. The UI gate is UX, not security.
-- **Hosted Stripe Checkout, not native in-app purchase.** Because ScreenCap ships as a Developer-ID DMG rather than through the Mac App Store, Stripe is permitted and is the fastest legal path to taking money. (Mac App Store distribution would force StoreKit/IAP and invalidate this decision.) Billing is greenfield — no account wiring exists — so standing up the Stripe product, $5/mo price, webhook endpoint, and launch promo code is part of this slice.
+- **Hosted Stripe Checkout, not native in-app purchase.** Because Screencap ships as a Developer-ID DMG rather than through the Mac App Store, Stripe is permitted and is the fastest legal path to taking money. (Mac App Store distribution would force StoreKit/IAP and invalidate this decision.) Billing is greenfield — no account wiring exists — so standing up the Stripe product, $5/mo price, webhook endpoint, and launch promo code is part of this slice.
 - **Comp internal accounts out-of-band, not through Stripe.** Internal/demo accounts are comped by setting the entitlement directly (a manual allowlist), not by a discounted Checkout, so the launch-day seatbelt does not depend on the Stripe path — the riskiest, latest-built part — being green. An external-comp coupon can come later once billing is stable.
 - **Straight $5/mo, no trial.** A single price with an optional promo code has the fewest Stripe states to get right before a same-day launch — no trial expiry, no `past_due`-during-trial edge cases. The promo code carries the launch hook.
 - **One entitlement signal as the seam.** A single "subscribed" signal, derived from Stripe subscription state, is the source of truth both the signer and the app read. This decouples the payment provider from enforcement and keeps the two gates consistent.
@@ -168,8 +168,8 @@ flowchart TB
 - Parent work: the single-user E2EE cloud-onboarding slice (PR #344) — its trust-claim-honesty stance and the device-key crypto machinery this plan sits alongside. (That plan doc lives on the PR branch, not yet merged into `docs/plans/`, so it is referenced by PR rather than path.)
 - Enforcement point and namespace: the Cloud Function signer at `scripts/cloud-function/main.py` (verifies bearer, signs URLs, never reads bytes) and the single key builder `resolve_prefix` in `scripts/cloud-function/paths.py` (`users/{uid}/…`).
 - Auth identity: `src/screencap/auth.py` (Firebase login/token, Keychain-stored refresh token).
-- Onboarding surface and current honest-by-omission copy: card strings live in the `OnboardingCopy` enum inside `macos/ScreenCap/Views/Onboarding/OnboardingStepPolicy.swift` (`:242-256`) plus `OnboardingStorageSteps.swift`; tier persistence in `src/screencap/config.py` (`get_upload_default`).
-- Verified surfaces (this planning pass): signer entry `get_upload_urls` + `_handle_upload` PUT-signing at `scripts/cloud-function/main.py:372-428`; Firebase Admin SDK already initialized at `scripts/cloud-function/main.py:136`; `verify_bearer` at `scripts/cloud-function/auth.py`; app entitlement read via `whoami()` at `src/screencap/auth.py:714` bridged by `CloudAuthController.fetchWhoAmI()`; card copy at `macos/ScreenCap/Views/Onboarding/OnboardingStepPolicy.swift:242-256`; flag pattern `_parse_bool_env` at `src/screencap/config.py:46`.
+- Onboarding surface and current honest-by-omission copy: card strings live in the `OnboardingCopy` enum inside `macos/Screencap/Views/Onboarding/OnboardingStepPolicy.swift` (`:242-256`) plus `OnboardingStorageSteps.swift`; tier persistence in `src/screencap/config.py` (`get_upload_default`).
+- Verified surfaces (this planning pass): signer entry `get_upload_urls` + `_handle_upload` PUT-signing at `scripts/cloud-function/main.py:372-428`; Firebase Admin SDK already initialized at `scripts/cloud-function/main.py:136`; `verify_bearer` at `scripts/cloud-function/auth.py`; app entitlement read via `whoami()` at `src/screencap/auth.py:714` bridged by `CloudAuthController.fetchWhoAmI()`; card copy at `macos/Screencap/Views/Onboarding/OnboardingStepPolicy.swift:242-256`; flag pattern `_parse_bool_env` at `src/screencap/config.py:46`.
 
 ---
 
@@ -332,7 +332,7 @@ U1 (flags) and U11 (Stripe provisioning) are independent and land first. The ent
 - **Goal:** The Personal card shows $5/mo with truthful copy; the Team card reads "coming soon"; local stays free.
 - **Requirements:** R1, R2, R3, R11.
 - **Dependencies:** none (gated behind the client flag for the live price display).
-- **Files:** `macos/ScreenCap/Views/Onboarding/OnboardingStepPolicy.swift` (the `OnboardingCopy` enum copy at `:242-256`), `macos/ScreenCap/Views/Onboarding/OnboardingStorageSteps.swift`; `macos/ScreenCapTests/OnboardingStepPolicyTests.swift`.
+- **Files:** `macos/Screencap/Views/Onboarding/OnboardingStepPolicy.swift` (the `OnboardingCopy` enum copy at `:242-256`), `macos/Screencap/Views/Onboarding/OnboardingStorageSteps.swift`; `macos/ScreencapTests/OnboardingStepPolicyTests.swift`.
 - **Approach:** Set `personalCardMeta` to the $5/mo price and keep bullets free of any end-to-end / "we can't watch" claim. Mark the Team card "coming soon". Keep local copy unchanged. Update the string-assertion test to reflect the new honest copy and to assert no forbidden E2EE/price-for-team strings.
 - **Test scenarios:**
   - Covers AE2. Personal card copy contains the $5/mo price and no E2EE / "we can't watch" claim.
@@ -345,7 +345,7 @@ U1 (flags) and U11 (Stripe provisioning) are independent and land first. The ent
 - **Goal:** The app reads `subscribed` and hides/disables cloud upload for non-subscribers.
 - **Requirements:** R7, R9.
 - **Dependencies:** U5.
-- **Files:** `macos/ScreenCap/Controllers/CloudAuthController.swift` (extend `AuthStatus` with `subscribed`; read from `whoami`), `macos/ScreenCap/Views/Onboarding/OnboardingStorageSteps.swift` (gate the `.personalCloud`/`.teamCloud` selection), and any post-onboarding cloud-upload affordance (e.g. the Review screen's upload control); `macos/ScreenCapTests/CloudAuthControllerTests.swift`.
+- **Files:** `macos/Screencap/Controllers/CloudAuthController.swift` (extend `AuthStatus` with `subscribed`; read from `whoami`), `macos/Screencap/Views/Onboarding/OnboardingStorageSteps.swift` (gate the `.personalCloud`/`.teamCloud` selection), and any post-onboarding cloud-upload affordance (e.g. the Review screen's upload control); `macos/ScreencapTests/CloudAuthControllerTests.swift`.
 - **Approach:** Add `subscribed: Bool` to `AuthStatus`, populated from the extended `whoami` JSON. Gate the Personal cloud selection and cloud-upload actions on `isSignedIn && isSubscribed` when the client flag is on; unsubscribed users see the upgrade path, not a dangling cloud control.
 - **Test scenarios:**
   - `whoami` reports `subscribed:true` → cloud upload offered.
@@ -358,7 +358,7 @@ U1 (flags) and U11 (Stripe provisioning) are independent and land first. The ent
 - **Goal:** The app opens hosted Checkout and, on return, force-refreshes the token so the new subscription is reflected without re-login.
 - **Requirements:** R4, R6.
 - **Dependencies:** U3, U5, U8.
-- **Files:** `macos/ScreenCap/Controllers/CloudAuthController.swift` and the onboarding/upgrade view that triggers checkout; a checkout-launch helper.
+- **Files:** `macos/Screencap/Controllers/CloudAuthController.swift` and the onboarding/upgrade view that triggers checkout; a checkout-launch helper.
 - **Approach:** On "upgrade", call `create-checkout-session`, open the returned URL in the browser. On return to the app (foreground or an explicit "I've paid / refresh" affordance), call the force-refresh path (U5) and re-`refresh()` auth status; poll a bounded number of times to absorb webhook lag before showing "still processing".
 - **Test scenarios:**
   - After a simulated successful checkout + claim set, a forced refresh flips the app to subscribed without a re-login.
@@ -370,7 +370,7 @@ U1 (flags) and U11 (Stripe provisioning) are independent and land first. The ent
 - **Goal:** The Team card captures an email waitlist signup instead of entering a team flow.
 - **Requirements:** R11.
 - **Dependencies:** none.
-- **Files:** the Team card action in `macos/ScreenCap/Views/Onboarding/OnboardingStorageSteps.swift` / related onboarding view.
+- **Files:** the Team card action in `macos/Screencap/Views/Onboarding/OnboardingStorageSteps.swift` / related onboarding view.
 - **Approach:** Wire the Team card's CTA to open a hosted waitlist form URL in the browser (KTD-7). No new backend.
 - **Test expectation:** none — opens an external URL; assert the CTA is wired to the waitlist action rather than a team-setup route (covered by the U7 policy test's coming-soon assertion).
 - **Verification:** selecting Team opens the waitlist form, not a team-setup step.

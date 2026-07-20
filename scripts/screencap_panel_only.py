@@ -75,7 +75,7 @@ class Driver(NSObject):
         panel.setLevel_(NSStatusWindowLevel)
         panel.setHidesOnDeactivate_(False)
         panel.setReleasedWhenClosed_(False)
-        panel.setTitle_("ScreenCap")
+        panel.setTitle_("Screencap")
         panel.setFloatingPanel_(True)
         panel.setBecomesKeyOnlyIfNeeded_(True)
 

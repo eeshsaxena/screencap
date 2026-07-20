@@ -1297,7 +1297,7 @@ def test_entitlement_group_matches_auth_constant():
     if os.environ.get("SCREENCAP_KEYCHAIN_ACCESS_GROUP"):
         pytest.skip("access group overridden via env; drift guard checks the shipped default")
     root = Path(__file__).resolve().parents[1]
-    ent = plistlib.loads((root / "macos/ScreenCap/Scripts/screencap-cli.entitlements").read_bytes())
+    ent = plistlib.loads((root / "macos/Screencap/Scripts/screencap-cli.entitlements").read_bytes())
     groups = ent.get("keychain-access-groups", [])
     assert a.KEYCHAIN_ACCESS_GROUP in groups, (
         f"auth.KEYCHAIN_ACCESS_GROUP={a.KEYCHAIN_ACCESS_GROUP!r} not in entitlement {groups!r}"

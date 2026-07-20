@@ -19,7 +19,7 @@ user was left with no SR row to enable, so recording silently degraded (SCR-201)
 
 ## Symptoms
 
-- Screen Recording pane shows no ScreenCap/daemon row after onboarding, but the audit log shows `screen_recording → permission.request → ok`.
+- Screen Recording pane shows no Screencap/daemon row after onboarding, but the audit log shows `screen_recording → permission.request → ok`.
 - Accessibility pane shows a working `ScreencapDaemon` row in the same run — an asymmetry between the two panes.
 - `daemon.info` may still report `screen_recording: granted` (stale — see the per-process TCC cache note below), masking the missing row.
 
@@ -28,11 +28,11 @@ user was left with no SR row to enable, so recording silently degraded (SCR-201)
 macOS attributes a **Screen Recording** TCC request/capture to the **responsible
 host application**, not to the process that calls the API — when that process is
 a **LoginItem nested inside an app bundle**. Since the SCR-196 migration the
-daemon ships at `ScreenCap.app/Contents/Library/LoginItems/ScreencapDaemon.app`,
+daemon ships at `Screencap.app/Contents/Library/LoginItems/ScreencapDaemon.app`,
 so `com.screencap.macos` (the app) is its responsible ancestor. Result:
 
 - The daemon's `CGRequestScreenCaptureAccess()` registers the SR row under
-  **`com.screencap.macos`** (the app), rendered under the app's name "ScreenCap"
+  **`com.screencap.macos`** (the app), rendered under the app's name "Screencap"
   — **not** `com.screencap.daemon`.
 - **Accessibility does not roll up.** `AXIsProcessTrustedWithOptions` attributes
   to the calling process's own code identity, so it correctly registers
@@ -48,7 +48,7 @@ This overturns the SCR-196/200 mental model that assumed all three daemon-owned
 permissions (SR, Accessibility, Input Monitoring) attribute to the daemon helper.
 Only Accessibility and Input Monitoring do. The rollup was not new — the ad-hoc
 signing treadmill doc already recorded that "Screen Recording attributes to the
-containing bundle" (shown as "ScreenCap") while Accessibility/IM attribute to the
+containing bundle" (shown as "Screencap") while Accessibility/IM attribute to the
 helper (`docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md`,
 quirk #3). That was pre-SCR-196 (bare `screencap` helper); this doc confirms the
 rollup **persisted** across the migration, now with `com.screencap.daemon` /
@@ -91,8 +91,8 @@ return [
 
 The Accessibility app-reset stays — that decoy *is* real (confirmed on-device:
 the Accessibility pane shows both a real `ScreencapDaemon` row and a stray
-`ScreenCap` app decoy). Onboarding copy (`PermissionController.helperSettingsEntryName`)
-was also made per-pane: "ScreenCap" for Screen Recording/Microphone,
+`Screencap` app decoy). Onboarding copy (`PermissionController.helperSettingsEntryName`)
+was also made per-pane: "Screencap" for Screen Recording/Microphone,
 "ScreencapDaemon" for Accessibility/Input Monitoring. Fixed in
 [PR #323](https://github.com/proteus-computer-use/screencap/pull/323).
 

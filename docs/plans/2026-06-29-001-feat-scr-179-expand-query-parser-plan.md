@@ -59,13 +59,13 @@ A second, structural gap surfaced during planning: the current `knownApps` list 
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/Controllers/QueryParser.swift` — the pure, synchronous, `now`-injected parser. Current shape: `parse(_ raw:, now:) -> ParsedQuery { timeWindow?, appFilter?, freeText }`; private static `knownApps`/`partsOfDay`/`weekdays` tables; `extractTimeWindow` / `extractApp` strip recognized phrases and return the remainder. This is the table-driven pattern to extend.
-- `macos/ScreenCapTests/QueryParserTests.swift` — table-driven tests using a fixed UTC `Calendar` + injected `now` (2026-06-24 15:30 UTC), with **independently computed** expected windows (not re-running parser phrase logic). Mirror this for all new cases.
+- `macos/Screencap/Controllers/QueryParser.swift` — the pure, synchronous, `now`-injected parser. Current shape: `parse(_ raw:, now:) -> ParsedQuery { timeWindow?, appFilter?, freeText }`; private static `knownApps`/`partsOfDay`/`weekdays` tables; `extractTimeWindow` / `extractApp` strip recognized phrases and return the remainder. This is the table-driven pattern to extend.
+- `macos/ScreencapTests/QueryParserTests.swift` — table-driven tests using a fixed UTC `Calendar` + injected `now` (2026-06-24 15:30 UTC), with **independently computed** expected windows (not re-running parser phrase logic). Mirror this for all new cases.
 - `src/screencap/daemon/app.py` `_run_timeline_query` (lines ~850–911) — builds `LIKE %token%` clauses against `app_name` / `app_bundle_id`, schema-tolerant via `has_column`. The single seam to extend for `browser_url` domain matching. Uses `escape_like` from `screencap.content_index`.
 - `src/screencap/engine/convert.py` (lines ~178–195) — existing precedent for deriving `app_name` from `app_bundle_id` (last component titlecased) and extracting `domain = urlparse(browser_url).hostname`. Reuse this hostname-extraction approach in the daemon match path and the vocabulary verb.
 - `src/screencap/daemon/schema.py` — `TimelineQueryRequest` / `TimelineRow` / `TimelineQueryResponse` models; `TimelineRow` docstring documents *why* `browser_url` is omitted. New `apps.list` request/response models go here.
-- `macos/ScreenCap/Controllers/DaemonClient.swift` (`timelineQuery`, `TimelineQueryRequest`), `macos/ScreenCap/Controllers/SearchService.swift` (`SearchService` protocol + `LiveSearchService`), `macos/ScreenCap/Models/SearchResult.swift` (`TimelineRow` decodable) — the Swift seam for adding the vocabulary fetch and threading it into the parser.
-- `macos/ScreenCap/Views/Search/SearchViewModel.swift` (init ~line 110, `parser: QueryParser = QueryParser()`) — where the parser is constructed and where an index-sourced vocabulary would be injected.
+- `macos/Screencap/Controllers/DaemonClient.swift` (`timelineQuery`, `TimelineQueryRequest`), `macos/Screencap/Controllers/SearchService.swift` (`SearchService` protocol + `LiveSearchService`), `macos/Screencap/Models/SearchResult.swift` (`TimelineRow` decodable) — the Swift seam for adding the vocabulary fetch and threading it into the parser.
+- `macos/Screencap/Views/Search/SearchViewModel.swift` (init ~line 110, `parser: QueryParser = QueryParser()`) — where the parser is constructed and where an index-sourced vocabulary would be injected.
 
 ### Institutional Learnings
 
@@ -236,8 +236,8 @@ The privacy invariant is the single load-bearing constraint: `browser_url` is re
 **Dependencies:** None (pure Swift; can land in parallel with U1/U2)
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/QueryParser.swift` (extend `extractTimeWindow` + add month/explicit-date/relative/range helpers; keep most-specific-first ordering)
-- Test: `macos/ScreenCapTests/QueryParserTests.swift` (extend, table-driven)
+- Modify: `macos/Screencap/Controllers/QueryParser.swift` (extend `extractTimeWindow` + add month/explicit-date/relative/range helpers; keep most-specific-first ordering)
+- Test: `macos/ScreencapTests/QueryParserTests.swift` (extend, table-driven)
 
 **Approach:**
 - Add, ordered most-specific-first so longer phrases win before shorter ones:
@@ -278,8 +278,8 @@ The privacy invariant is the single load-bearing constraint: `browser_url` is re
 **Dependencies:** U1 (vocabulary data shape), U3 (shared `QueryParser` internals — sequence to avoid conflict)
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/QueryParser.swift` (accept an optional injected vocabulary at construction; expand the static table; add domain→token normalization + a curated synonym map; apply the exclusion guard to all sources; support multi-word app names)
-- Test: `macos/ScreenCapTests/QueryParserTests.swift` (extend)
+- Modify: `macos/Screencap/Controllers/QueryParser.swift` (accept an optional injected vocabulary at construction; expand the static table; add domain→token normalization + a curated synonym map; apply the exclusion guard to all sources; support multi-word app names)
+- Test: `macos/ScreencapTests/QueryParserTests.swift` (extend)
 
 **Approach:**
 - Add an `init(calendar:, knownApps:)`-style seam: **change `QueryParser.knownApps` from a `private static let` to instance state seeded via the initializer** (the expanded static table becomes the default argument). The parser takes a vocabulary set (normalized tokens). Default = the expanded static table; live wiring (U5) passes the index-sourced set unioned with the static seed. Because the exclusion guard was implicitly a property of the curated static list, it must move to instance logic that runs over the injected set too (already required below).
@@ -313,11 +313,11 @@ The privacy invariant is the single load-bearing constraint: `browser_url` is re
 **Dependencies:** U1 (verb), U4 (parser accepts injected vocabulary)
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/DaemonClient.swift` (`appsList` method + `AppsListRequest`/`AppsListResponse` request types)
-- Modify: `macos/ScreenCap/Controllers/SearchService.swift` (`SearchService` protocol + `LiveSearchService` forwarding)
-- Modify: `macos/ScreenCap/Models/SearchResult.swift` (decodable `AppsListResponse` / entry model)
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (fetch vocabulary, normalize via U4 helpers, build/refresh the parser; fall back to a static-only parser on throw; cache for the session)
-- Test: `macos/ScreenCapTests/SearchViewModelTests.swift` (extend or create — drive via the mock `SearchService` seam)
+- Modify: `macos/Screencap/Controllers/DaemonClient.swift` (`appsList` method + `AppsListRequest`/`AppsListResponse` request types)
+- Modify: `macos/Screencap/Controllers/SearchService.swift` (`SearchService` protocol + `LiveSearchService` forwarding)
+- Modify: `macos/Screencap/Models/SearchResult.swift` (decodable `AppsListResponse` / entry model)
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (fetch vocabulary, normalize via U4 helpers, build/refresh the parser; fall back to a static-only parser on throw; cache for the session)
+- Test: `macos/ScreencapTests/SearchViewModelTests.swift` (extend or create — drive via the mock `SearchService` seam)
 
 **Approach:**
 - Add `appsList` to the `SearchService` seam mirroring `timelineQuery` so the view model is testable without a live daemon.
@@ -378,7 +378,7 @@ The privacy invariant is the single load-bearing constraint: `browser_url` is re
 
 - **Origin issue:** [SCR-179 — Expand local query parser](https://linear.app/zk-email/issue/SCR-179/expand-local-query-parser-time-expressions-app-coverage)
 - **Parent feature:** [SCR-174 — Ask-Your-History Search](https://linear.app/zk-email/issue/SCR-174/ask-your-history-search-in-app-v1) (PR #283); plan `docs/plans/2026-06-24-002-feat-ask-your-history-search-plan.md` (U3 deferred parser-breadth note), requirements `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md` (R2).
-- Parser: `macos/ScreenCap/Controllers/QueryParser.swift`, `macos/ScreenCapTests/QueryParserTests.swift`
+- Parser: `macos/Screencap/Controllers/QueryParser.swift`, `macos/ScreencapTests/QueryParserTests.swift`
 - Daemon timeline: `src/screencap/daemon/app.py` (`_run_timeline_query`), `src/screencap/daemon/schema.py` (`TimelineRow`)
 - Domain extraction precedent: `src/screencap/engine/convert.py`
 - Privacy boundary: `SECURITY.md` (browser_url omission rationale; same-EUID trust boundary)

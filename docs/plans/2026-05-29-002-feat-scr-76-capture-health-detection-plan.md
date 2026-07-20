@@ -17,7 +17,7 @@ Detect silently-broken recordings from inside the engine by watching, per reader
 
 ## Problem Frame
 
-Daemon recordings in the bundled `ScreenCap.app` have been silently producing useless captures — audio records fine, but the screen-side event tables (action, window, screenshot) come back empty even when the user was actively interacting. The user lives through the whole failure with no signal. The daemon recording path runs the engine with `PermNoop` (`src/screencap/session.py:222`), so the standalone CLI's mid-recording revocation watcher (`MacOSTCC.poll`, which spawns a subprocess TCC probe that is broken in the frozen binary) never runs there at all — the daemon path has **no mid-recording health mechanism**. The underlying cause of a silent failure can be TCC denial, a Quartz hiccup, a dead reader/listener, or a fresh-build-identity-invalidated TCC grant; a permission probe is a proxy for one cause rather than an observation of the symptom. See origin: [docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md](docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md).
+Daemon recordings in the bundled `Screencap.app` have been silently producing useless captures — audio records fine, but the screen-side event tables (action, window, screenshot) come back empty even when the user was actively interacting. The user lives through the whole failure with no signal. The daemon recording path runs the engine with `PermNoop` (`src/screencap/session.py:222`), so the standalone CLI's mid-recording revocation watcher (`MacOSTCC.poll`, which spawns a subprocess TCC probe that is broken in the frozen binary) never runs there at all — the daemon path has **no mid-recording health mechanism**. The underlying cause of a silent failure can be TCC denial, a Quartz hiccup, a dead reader/listener, or a fresh-build-identity-invalidated TCC grant; a permission probe is a proxy for one cause rather than an observation of the symptom. See origin: [docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md](docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md).
 
 This work serves the **Capture engine: quality & performance** strategy track (the "floor" — `STRATEGY.md`) and its **Capture reliability rate ≥98%** metric: a recording that yields only audio is a reliability failure the product currently cannot even see.
 
@@ -78,7 +78,7 @@ This work serves the **Capture engine: quality & performance** strategy track (t
 - **Labeller building blocks** (`src/screencap/engine/platform/darwin.py`, `DarwinPlatform`): `is_screen_recording_enabled()` (`Quartz.CGPreflightScreenCaptureAccess`), `is_input_monitoring_enabled()` (`Quartz.CGPreflightListenEventAccess`), `is_accessibility_enabled()` (`AXIsProcessTrustedWithOptions`). All fail-open (return `True` on import/attr error).
 - **Event protocol** (`src/screencap/_stderr_events.py`): `emit_event(type, **fields)` writes one JSON line to stderr; event-type constants in `__all__`; `permission_lost` carries `permission=` ∈ {`screen_recording`, `accessibility`, `input_monitoring`} and `elapsed=`. Cross-language contract: `docs/research/2026-04-28-stderr-event-schema.md`.
 - **Frozen dispatch** (`src/screencap/daemon/supervisor.py` `_default_engine_command`; `src/screencap/cli/__init__.py` `_engine-worker` hidden command): the daemon spawns the engine via the `_engine-worker` Click entry; tests override via `SCREENCAP_DAEMON_ENGINE_COMMAND` / `engine_command_factory` with the `fake_engine_script` fixture (`tests/daemon/test_supervisor.py`).
-- **Shell contract** (`macos/ScreenCap/Controllers/RecordingStateMachine.swift` `reduce`, `RecorderController.swift` `handlePermissionLost`, `RecorderAlertPresenter.swift`): `RecorderEventLine` already decodes `permission`, `reason`, `ts`; unknown event types hit a tolerant `default:` no-op. `permission_lost` → `handlePermissionLost(permission:)`.
+- **Shell contract** (`macos/Screencap/Controllers/RecordingStateMachine.swift` `reduce`, `RecorderController.swift` `handlePermissionLost`, `RecorderAlertPresenter.swift`): `RecorderEventLine` already decodes `permission`, `reason`, `ts`; unknown event types hit a tolerant `default:` no-op. `permission_lost` → `handlePermissionLost(permission:)`.
 
 ### Institutional Learnings
 
@@ -413,10 +413,10 @@ flowchart LR
 **Dependencies:** U5
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/RecordingStateMachine.swift` (`reduce` — add `case "capture_unhealthy"`; new `Effect` case)
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (new handler in `apply()`; add a `reader` field to `RecorderEventLine` — the new event carries `reader`, which is NOT currently decoded; the "no struct change needed" assumption was wrong, per design review)
-- Modify: `macos/ScreenCap/Controllers/RecorderAlertPresenter.swift` (distinct advisory presentation, separate from the per-permission deny path)
-- Test: `macos/ScreenCapTests/` (XCTest for the new reduce case and the state guard)
+- Modify: `macos/Screencap/Controllers/RecordingStateMachine.swift` (`reduce` — add `case "capture_unhealthy"`; new `Effect` case)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (new handler in `apply()`; add a `reader` field to `RecorderEventLine` — the new event carries `reader`, which is NOT currently decoded; the "no struct change needed" assumption was wrong, per design review)
+- Modify: `macos/Screencap/Controllers/RecorderAlertPresenter.swift` (distinct advisory presentation, separate from the per-permission deny path)
+- Test: `macos/ScreencapTests/` (XCTest for the new reduce case and the state guard)
 
 **Approach (these UX decisions are not yet settled — defaults recommended, confirm at implementation; design review flagged all five as undecided):**
 - **Widget type:** recommend a **non-blocking, persistent indicator** (menu-bar/popover banner), NOT a blocking `NSAlert` modal like the `permission_lost` path — a modal would contradict the advisory/non-terminal intent, and a bare `lastError` string is too easily missed during an active recording.
@@ -487,7 +487,7 @@ flowchart LR
 
 - **Origin document:** [docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md](docs/brainstorms/2026-05-28-scr-76-mid-recording-capture-health-requirements.md)
 - Strategy: `STRATEGY.md` (Capture engine track; Capture reliability rate ≥98%)
-- Related code: `src/screencap/engine/recorder.py`, `src/screencap/engine/screen_recorder.py`, `src/screencap/engine/permission_policy.py`, `src/screencap/engine/platform/darwin.py`, `src/screencap/_stderr_events.py`, `src/screencap/session.py`, `src/screencap/daemon/supervisor.py`, `src/screencap/cli/__init__.py`, `macos/ScreenCap/Controllers/`
+- Related code: `src/screencap/engine/recorder.py`, `src/screencap/engine/screen_recorder.py`, `src/screencap/engine/permission_policy.py`, `src/screencap/engine/platform/darwin.py`, `src/screencap/_stderr_events.py`, `src/screencap/session.py`, `src/screencap/daemon/supervisor.py`, `src/screencap/cli/__init__.py`, `macos/Screencap/Controllers/`
 - Related PRs/issues: PR #193 (`0813db56`, SCR-69 in-process Quartz preflight — the pattern to mirror), SCR-69, SCR-54 (permission ownership)
 - Learnings: `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md`, `docs/solutions/runtime-errors/eventbus-late-listener-replay-2026-05-12.md`, `docs/solutions/runtime-errors/cgeventtap-disabled-sentinel-assertion-failure.md`, `docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md`, `docs/tickets/2026-05-09-fix-stderr-bridge-backpressure.md`
 - Event schema: `docs/research/2026-04-28-stderr-event-schema.md`

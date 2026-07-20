@@ -235,7 +235,7 @@ async def test_recording_start_emits_ok_audit_line(
         monkeypatch,
         provenance.PeerDescriptor(
             pid=4242,
-            path="/Applications/ScreenCap.app/Contents/MacOS/screencap",
+            path="/Applications/Screencap.app/Contents/MacOS/screencap",
             classification=provenance.STARTED_BY_SWIFTUI,
         ),
     )

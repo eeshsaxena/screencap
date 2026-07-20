@@ -37,7 +37,7 @@ The SwiftUI shell ships with no upload affordance today — the only retry path 
 - R12. Upload executes by shelling out to `screencap upload <name>`; no signed-URL handling in Swift.
 - R13. The HTML viewer (`screencap view`) is unchanged. CLI users keep using it.
 
-**Origin actors:** Operator (single persona — internal-tool-heavy user running ScreenCap in the SwiftUI app).
+**Origin actors:** Operator (single persona — internal-tool-heavy user running Screencap in the SwiftUI app).
 **Origin flows:** F1 (review and upload), F2 (review and cancel).
 **Origin acceptance examples:** AE1 (Covers R2), AE2 (Covers R2), AE3 (Covers R5), AE4 (Covers R7, R10), AE5 (Covers R11).
 
@@ -68,16 +68,16 @@ The SwiftUI shell ships with no upload affordance today — the only retry path 
 
 ### Relevant Code and Patterns
 
-- **List + row UI:** `macos/ScreenCap/Views/RecordingsListView.swift` — already date-grouped, already drives a row-click action (`openInBrowser`) via `CLIClient.runAwaitingExit`. Insert the Upload affordance alongside the existing `play.circle` trailing icon.
-- **Recording model:** `macos/ScreenCap/Models/RecordingSummary.swift` — already decodes `uploaded` and `isStub` from `screencap list --json`. The eligibility predicate is a derived property, not a new field.
-- **CLI subprocess wrapper:** `macos/ScreenCap/Controllers/CLIClient.swift` — owns binary resolution, process spawning, line-buffered stderr streaming, and timeout-with-SIGKILL escalation. The `runJSON` and `spawn` entry points are the two reuse seams for U2 (one-shot JSON) and U7 (long-lived stderr-event stream).
-- **Recorder-event parser pattern:** `macos/ScreenCap/Controllers/CLIRecorderService.swift:28-33` and `macos/ScreenCap/Controllers/RecorderController.swift:38-63` — drift-resilient `RecorderEventLine` decoder that returns nil on non-JSON lines and tolerates unknown fields. Mirror this for upload events.
+- **List + row UI:** `macos/Screencap/Views/RecordingsListView.swift` — already date-grouped, already drives a row-click action (`openInBrowser`) via `CLIClient.runAwaitingExit`. Insert the Upload affordance alongside the existing `play.circle` trailing icon.
+- **Recording model:** `macos/Screencap/Models/RecordingSummary.swift` — already decodes `uploaded` and `isStub` from `screencap list --json`. The eligibility predicate is a derived property, not a new field.
+- **CLI subprocess wrapper:** `macos/Screencap/Controllers/CLIClient.swift` — owns binary resolution, process spawning, line-buffered stderr streaming, and timeout-with-SIGKILL escalation. The `runJSON` and `spawn` entry points are the two reuse seams for U2 (one-shot JSON) and U7 (long-lived stderr-event stream).
+- **Recorder-event parser pattern:** `macos/Screencap/Controllers/CLIRecorderService.swift:28-33` and `macos/Screencap/Controllers/RecorderController.swift:38-63` — drift-resilient `RecorderEventLine` decoder that returns nil on non-JSON lines and tolerates unknown fields. Mirror this for upload events.
 - **Stderr event emitter:** `src/screencap/_stderr_events.py` — `emit_event(type, **fields)` writes a line-buffered JSON object to stderr with `schema_version` baked in. Add upload event-type constants here.
 - **ffmpeg concat helper:** `src/screencap/viewer.py:21-75` (`_ensure_single_video`) — idempotent (checks `video.mp4` exists first), uses ffmpeg concat demuxer with stream copy, handles the 1-chunk symlink case. Reusable as-is from the new CLI subcommand.
 - **Events exporter:** `src/screencap/exporter.py` — `export_recording(rec_dir, output_path, exclude_moves=True)` writes a `.tmp` then atomically renames. The upload command already auto-exports `events.jsonl` when missing (`src/screencap/cli/__init__.py:2773-2786`); mirror that pattern in the new subcommand.
 - **JSON CLI envelope:** `screencap list --json` / `screencap info --json` / `screencap status --json` all return `{ok, schema_version, ...}` with stdout-non-TTY auto-detect. Follow the same shape.
-- **Window scene precedent:** `macos/ScreenCap/ScreenCapApp.swift:24` (`Window(...)` singleton) vs the new requirement for multi-window — the main window stays a singleton `Window`, the review surface is a separate `WindowGroup`.
-- **`screencap view` retire-ready path:** `macos/ScreenCap/Views/RecordingsListView.swift:9` already documents that row-click will be "replaced by the native viewer in v1.1" — this plan ships that v1.1 surface (gated by the explicit Upload button rather than row click, so the existing browser link-out continues to work for non-upload review).
+- **Window scene precedent:** `macos/Screencap/ScreencapApp.swift:24` (`Window(...)` singleton) vs the new requirement for multi-window — the main window stays a singleton `Window`, the review surface is a separate `WindowGroup`.
+- **`screencap view` retire-ready path:** `macos/Screencap/Views/RecordingsListView.swift:9` already documents that row-click will be "replaced by the native viewer in v1.1" — this plan ships that v1.1 surface (gated by the explicit Upload button rather than row click, so the existing browser link-out continues to work for non-upload review).
 
 ### Institutional Learnings
 
@@ -193,7 +193,7 @@ sequenceDiagram
 
 **Patterns to follow:**
 - `src/screencap/_stderr_events.py:65-75` — `emit_event(type, **fields)` and the existing `EVENT_*` constants.
-- Drift-resilient parser shape on the consumer side (`macos/ScreenCap/Controllers/CLIRecorderService.swift:28-33`) — no required fields beyond `type`.
+- Drift-resilient parser shape on the consumer side (`macos/Screencap/Controllers/CLIRecorderService.swift:28-33`) — no required fields beyond `type`.
 
 **Test scenarios:**
 - Happy path: `upload_recording` with one file succeeds → emits `upload_started`, `upload_file_done`, `upload_finished` in order.
@@ -263,20 +263,20 @@ sequenceDiagram
 **Dependencies:** None (parallel to U1/U2 — the window can compile and open without backend data).
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Review/ReviewWindow.swift`
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` (register the new scene)
-- Test: `macos/ScreenCapTests/ReviewWindowOpenerTests.swift` (new)
+- Create: `macos/Screencap/Views/Review/ReviewWindow.swift`
+- Modify: `macos/Screencap/ScreencapApp.swift` (register the new scene)
+- Test: `macos/ScreencapTests/ReviewWindowOpenerTests.swift` (new)
 
 **Approach:**
-- Define `ReviewWindowID = "review"` constant. Add a `WindowGroup("Review", id: ReviewWindowID, for: String.self) { name in ... }` scene to `ScreenCapApp.body`. The `String` payload is the recording name.
+- Define `ReviewWindowID = "review"` constant. Add a `WindowGroup("Review", id: ReviewWindowID, for: String.self) { name in ... }` scene to `ScreencapApp.body`. The `String` payload is the recording name.
 - `ReviewWindow` body: stub with the recording name in a `Text`, `frame(minWidth:minHeight:)` sized for the eventual video+timeline composition.
 - Closing the window emits no upload action — Cancel is the default exit, per R7. Verify via the `dismiss` environment chain.
 - Window title binds to the recording name so multiple open windows are distinguishable in the Window menu.
 - Multi-window per R3 is the entire reason this is `WindowGroup` rather than the singleton `Window` used for `MainWindowID`. The institutional learning in `docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md` documents this explicitly.
 
 **Patterns to follow:**
-- `macos/ScreenCap/ScreenCapApp.swift:24` — `Window(..., id:)` registration pattern; mirror with `WindowGroup`.
-- `macos/ScreenCap/State/WindowOpener.swift` — the bridge pattern if a non-SwiftUI caller (e.g. AppDelegate) ever needs to open a review window. Not required for U3 since the trigger is in-SwiftUI from the list row.
+- `macos/Screencap/ScreencapApp.swift:24` — `Window(..., id:)` registration pattern; mirror with `WindowGroup`.
+- `macos/Screencap/State/WindowOpener.swift` — the bridge pattern if a non-SwiftUI caller (e.g. AppDelegate) ever needs to open a review window. Not required for U3 since the trigger is in-SwiftUI from the list row.
 
 **Test scenarios:**
 - Happy path: `WindowOpener`-style helper opens a review window for a given name → window count increments by 1 (assert via a test-injectable opener seam).
@@ -299,9 +299,9 @@ sequenceDiagram
 **Dependencies:** U3 (window opener target).
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/RecordingsListView.swift`
-- Modify: `macos/ScreenCap/Models/RecordingSummary.swift` (add `isUploadEligible` derived property)
-- Test: `macos/ScreenCapTests/RecordingSummaryEligibilityTests.swift` (new)
+- Modify: `macos/Screencap/Views/RecordingsListView.swift`
+- Modify: `macos/Screencap/Models/RecordingSummary.swift` (add `isUploadEligible` derived property)
+- Test: `macos/ScreencapTests/RecordingSummaryEligibilityTests.swift` (new)
 
 **Approach:**
 - `RecordingSummary.isUploadEligible: Bool { !uploaded && !isStub }` — a derived property keeps the rule in one place.
@@ -311,8 +311,8 @@ sequenceDiagram
 - Row click behavior is unchanged: clicking the row body still opens the browser viewer (existing `openInBrowser` path). The Upload button is a discrete affordance within the row.
 
 **Patterns to follow:**
-- `macos/ScreenCap/Views/RecordingsListView.swift:117-154` — the row composition pattern with trailing icons.
-- `macos/ScreenCap/Views/MenuBarMenu.swift:10` — `@Environment(\.openWindow)` usage from a non-app-root view.
+- `macos/Screencap/Views/RecordingsListView.swift:117-154` — the row composition pattern with trailing icons.
+- `macos/Screencap/Views/MenuBarMenu.swift:10` — `@Environment(\.openWindow)` usage from a non-app-root view.
 
 **Test scenarios:**
 - Eligibility / Covers AE1: `RecordingSummary` with `uploaded=true, isStub=false` → `isUploadEligible == false`.
@@ -336,8 +336,8 @@ sequenceDiagram
 **Dependencies:** U2 (video path source), U3 (host window).
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Review/VideoPlayerPane.swift`
-- Test: `macos/ScreenCapTests/VideoPlayerPaneTests.swift` (new — logic-only, no media assets)
+- Create: `macos/Screencap/Views/Review/VideoPlayerPane.swift`
+- Test: `macos/ScreencapTests/VideoPlayerPaneTests.swift` (new — logic-only, no media assets)
 
 **Approach:**
 - Use SwiftUI's `VideoPlayer` (AVKit) initialized from an `AVPlayer` over the resolved `video_path`. Avoid building a custom `AVPlayerView` wrapper unless `VideoPlayer` lacks a needed control.
@@ -369,10 +369,10 @@ sequenceDiagram
 **Dependencies:** U2 (events.jsonl source), U3 (host window), U5 (currentTime / seek bindings).
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Review/TimelinePane.swift`
-- Create: `macos/ScreenCap/Views/Review/TimelineEvent.swift` (event model + parser)
-- Test: `macos/ScreenCapTests/TimelineEventParsingTests.swift` (new)
-- Test: `macos/ScreenCapTests/TimelinePaneScrubTests.swift` (new — logic-only)
+- Create: `macos/Screencap/Views/Review/TimelinePane.swift`
+- Create: `macos/Screencap/Views/Review/TimelineEvent.swift` (event model + parser)
+- Test: `macos/ScreencapTests/TimelineEventParsingTests.swift` (new)
+- Test: `macos/ScreencapTests/TimelinePaneScrubTests.swift` (new — logic-only)
 
 **Approach:**
 - `TimelineEvent` is a small Swift struct with `timestamp: Double` (absolute or recording-relative — pick one and document it; reuse `started_at` from U2 to convert if needed) and `type: String` (`mouse.click`, `key.type`, `window.switch`, etc.). Decoder reads `events.jsonl` line-by-line, skips the `_meta` header line, decodes the rest with a tolerant decoder that ignores unknown fields.
@@ -407,10 +407,10 @@ sequenceDiagram
 **Dependencies:** U1 (event contract), U3 (host window).
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/UploadController.swift`
-- Create: `macos/ScreenCap/Models/UploadEventLine.swift`
-- Test: `macos/ScreenCapTests/UploadEventParsingTests.swift` (new)
-- Test: `macos/ScreenCapTests/UploadControllerTests.swift` (new — uses a `SpawnedProcessHandle` fake)
+- Create: `macos/Screencap/Controllers/UploadController.swift`
+- Create: `macos/Screencap/Models/UploadEventLine.swift`
+- Test: `macos/ScreencapTests/UploadEventParsingTests.swift` (new)
+- Test: `macos/ScreencapTests/UploadControllerTests.swift` (new — uses a `SpawnedProcessHandle` fake)
 
 **Approach:**
 - `UploadEventLine` mirrors `RecorderEventLine`: drift-resilient `JSONDecoder` parse, returns nil for non-JSON or blank lines, tolerates unknown fields. Decodes `upload_started`, `upload_file_done`, `upload_finished`, `upload_failed` — the v1 event set emitted by U1. Unknown event types fall through the drift-resilient path silently, so a future `upload_progress` (or any other addition) does not require a Swift-side bump to be parsed-and-ignored.
@@ -418,13 +418,13 @@ sequenceDiagram
 - `start(name:)` calls `CLIClient.spawn(args: ["upload", "--", name])` with `onStderrLine` translating each line into an `UploadEventLine` and dispatching to a state-transition method. `onTerminated` cross-checks the terminal event against the exit code (a `upload_failed` with exit code 0 is a contract violation worth logging).
 - `cancel()` calls `terminate()` on the held `SpawnedProcessHandle`. The Python side's `KeyboardInterrupt` handler (added in U1) emits `upload_failed` with `error: "interrupted"` and exits cleanly.
 - Window-close handling: the review window's `.onDisappear` (or the `dismiss` environment chain) calls `cancel()` unconditionally — Python ignores SIGTERM on an idle process, so calling cancel on a never-started or already-finished upload is safe.
-- The `--` separator before `name` matches the existing pattern at `macos/ScreenCap/Views/RecordingsListView.swift:197` for Click positional-arg safety.
+- The `--` separator before `name` matches the existing pattern at `macos/Screencap/Views/RecordingsListView.swift:197` for Click positional-arg safety.
 
 **Execution note:** Start with a failing test that drives a fake `SpawnedProcessHandle` through the documented stderr-event sequence and asserts the published state transitions. The state machine is the unit's core complexity.
 
 **Patterns to follow:**
-- `macos/ScreenCap/Controllers/CLIRecorderService.swift:24-77` — drift-resilient parse + spawn pattern, `MainActor.assumeIsolated` dispatch from GCD main, `SpawnedProcessHandle` injection seam.
-- `macos/ScreenCap/Controllers/RecorderController.swift:38-63` — `@Published` state, schema-version drift warning via OSLog.
+- `macos/Screencap/Controllers/CLIRecorderService.swift:24-77` — drift-resilient parse + spawn pattern, `MainActor.assumeIsolated` dispatch from GCD main, `SpawnedProcessHandle` injection seam.
+- `macos/Screencap/Controllers/RecorderController.swift:38-63` — `@Published` state, schema-version drift warning via OSLog.
 
 **Test scenarios:**
 - Happy path: feed `upload_started`, `upload_file_done` (x3), `upload_finished` → published state transitions `idle → uploading → uploading → uploading → uploading → succeeded`.
@@ -454,9 +454,9 @@ sequenceDiagram
 **Dependencies:** U2, U5, U6, U7.
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Review/ReviewWindow.swift` (replace stub body)
-- Create: `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift`
-- Test: `macos/ScreenCapTests/ReviewWindowViewModelTests.swift` (new)
+- Modify: `macos/Screencap/Views/Review/ReviewWindow.swift` (replace stub body)
+- Create: `macos/Screencap/Views/Review/ReviewWindowViewModel.swift`
+- Test: `macos/ScreencapTests/ReviewWindowViewModelTests.swift` (new)
 
 **Approach:**
 - `ReviewWindowViewModel` is `@MainActor`, owns a `state: ReviewState` (`preparing | ready(ReviewData) | uploading | succeeded | failed(error)`), and holds an `UploadController` instance.
@@ -469,8 +469,8 @@ sequenceDiagram
 - A "View on web" link is intentionally NOT included in v1 (open question).
 
 **Patterns to follow:**
-- `macos/ScreenCap/Controllers/RecorderController.swift` — `@MainActor`, `@Published` state, controller-owned lifecycle.
-- `macos/ScreenCap/Views/RecordingsListView.swift:25-29` — `.alert(...)` pattern for surface-error flows; the failure state may render inline rather than an alert here.
+- `macos/Screencap/Controllers/RecorderController.swift` — `@MainActor`, `@Published` state, controller-owned lifecycle.
+- `macos/Screencap/Views/RecordingsListView.swift:25-29` — `.alert(...)` pattern for surface-error flows; the failure state may render inline rather than an alert here.
 
 **Test scenarios:**
 - Happy path: viewmodel constructed → `state == .preparing`; `runJSON` returns a valid review-data envelope → `state == .ready(data)`.
@@ -497,9 +497,9 @@ sequenceDiagram
 **Dependencies:** U7 (`upload_finished` event), U8 (knows when state transitions to `.succeeded`).
 
 **Files:**
-- Modify: `macos/ScreenCap/State/RecordingsIndex.swift` (if a public refresh seam is missing — re-use the recorder's existing reload path if it exists)
-- Modify: `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift` (call refresh on `.succeeded` transition)
-- Test: `macos/ScreenCapTests/RecordingsIndexRefreshOnUploadTests.swift` (new)
+- Modify: `macos/Screencap/State/RecordingsIndex.swift` (if a public refresh seam is missing — re-use the recorder's existing reload path if it exists)
+- Modify: `macos/Screencap/Views/Review/ReviewWindowViewModel.swift` (call refresh on `.succeeded` transition)
+- Test: `macos/ScreencapTests/RecordingsIndexRefreshOnUploadTests.swift` (new)
 
 **Approach:**
 - Inspect `RecordingsIndex` for an existing refresh API. If present, call it from the viewmodel on `.succeeded` before scheduling auto-close. If absent, add a single `refresh() async` method that re-invokes the existing `screencap list --json` load path.
@@ -507,8 +507,8 @@ sequenceDiagram
 - No coalescing logic needed — concurrent successful uploads of distinct recordings each trigger one refresh, and `RecordingsIndex` is a single shared source of truth.
 
 **Patterns to follow:**
-- `macos/ScreenCap/State/RecordingsIndex.swift` — existing loading entry points. The recorder already triggers an index reload after a recording stops; reuse that path.
-- `macos/ScreenCap/Controllers/RecorderController.swift:91-110` — `bindIndex` pattern for shared `RecordingsIndex` injection.
+- `macos/Screencap/State/RecordingsIndex.swift` — existing loading entry points. The recorder already triggers an index reload after a recording stops; reuse that path.
+- `macos/Screencap/Controllers/RecorderController.swift:91-110` — `bindIndex` pattern for shared `RecordingsIndex` injection.
 
 **Test scenarios:**
 - Happy path: viewmodel transitions to `.succeeded` → `RecordingsIndex.refresh()` is called exactly once (assert via a fake).
@@ -594,11 +594,11 @@ sequenceDiagram
   - `src/screencap/viewer.py` — `_ensure_single_video` (reused by U2)
   - `src/screencap/exporter.py` — `export_recording` (reused by U2)
   - `src/screencap/cli/__init__.py` — CLI command registration (modified by U2)
-  - `macos/ScreenCap/Views/RecordingsListView.swift` — list row composition (modified by U4)
-  - `macos/ScreenCap/Models/RecordingSummary.swift` — recording model (modified by U4)
-  - `macos/ScreenCap/Controllers/CLIClient.swift` — subprocess primitives (reused by U2 and U7)
-  - `macos/ScreenCap/Controllers/CLIRecorderService.swift` — drift-resilient parse + spawn pattern (mirrored by U7)
-  - `macos/ScreenCap/ScreenCapApp.swift` — scene registration (modified by U3)
+  - `macos/Screencap/Views/RecordingsListView.swift` — list row composition (modified by U4)
+  - `macos/Screencap/Models/RecordingSummary.swift` — recording model (modified by U4)
+  - `macos/Screencap/Controllers/CLIClient.swift` — subprocess primitives (reused by U2 and U7)
+  - `macos/Screencap/Controllers/CLIRecorderService.swift` — drift-resilient parse + spawn pattern (mirrored by U7)
+  - `macos/Screencap/ScreencapApp.swift` — scene registration (modified by U3)
 - **Institutional learnings:**
   - [docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md](../solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md)
   - [docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md](../solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md)

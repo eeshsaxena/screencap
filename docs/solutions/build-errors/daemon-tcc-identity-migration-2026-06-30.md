@@ -9,10 +9,10 @@ problem_type: migration
 ## What changed (SCR-196)
 
 The recording daemon used to ship as a **bare Mach-O** at
-`ScreenCap.app/Contents/Resources/screencap/screencap` whose code-signing
+`Screencap.app/Contents/Resources/screencap/screencap` whose code-signing
 identifier was the PyInstaller default `screencap` (no `Info.plist`, no bundle
 id). It now ships as a proper helper **`.app` bundle** at
-`ScreenCap.app/Contents/Library/LoginItems/ScreencapDaemon.app` with
+`Screencap.app/Contents/Library/LoginItems/ScreencapDaemon.app` with
 `CFBundleIdentifier=com.screencap.daemon`, so macOS treats it as a first-class
 TCC subject (`tccutil`-targetable, persistent across rebuilds).
 
@@ -20,7 +20,7 @@ TCC subject (`tccutil`-targetable, persistent across rebuilds).
 > only.** Those attribute to the helper's own identity. **Screen Recording does
 > not** — macOS rolls a nested LoginItem's SR request/capture up to the
 > responsible host app (`com.screencap.macos`), so the SR row lists under the
-> app ("ScreenCap"), not the helper. See
+> app ("Screencap"), not the helper. See
 > `docs/solutions/integration-issues/macos-screen-recording-tcc-host-app-rollup-2026-07-02.md`.
 
 The launchd **Label** is unchanged (`com.screencap.daemon` — it always was), so
@@ -38,11 +38,11 @@ identity. This is a one-time, deliberate re-grant, communicated in advance.
 
 ## Tester upgrade steps (one time)
 
-1. Quit ScreenCap and replace `/Applications/ScreenCap.app` with the new build.
+1. Quit Screencap and replace `/Applications/Screencap.app` with the new build.
    (Replacing the bundle removes the old bare exec, so the headless auto-spawn
    path — `screencap status` → `posix_spawn` — cannot resurrect the old-identity
    daemon.)
-2. Launch ScreenCap. The first-run walkthrough / "Finish setup" banner will show
+2. Launch Screencap. The first-run walkthrough / "Finish setup" banner will show
    the three permissions as **not granted** (expected — the grants were orphaned).
    The daemon-install flow's existing bootout + version reconciliation
    (SCR-121/135) evicts any surviving old daemon and binds the new helper
@@ -51,9 +51,9 @@ identity. This is a one-time, deliberate re-grant, communicated in advance.
    SCR-201). In **Accessibility** and **Input Monitoring** the daemon's row reads
    **"ScreencapDaemon"** (the helper bundle's `.app` filename — `CFBundleDisplayName`
    does not override it; SCR-200 U2 / SCR-201 U1) — enable that one; the app's
-   stray **"ScreenCap"** row in Accessibility is a decoy. In **Screen Recording**
+   stray **"Screencap"** row in Accessibility is a decoy. In **Screen Recording**
    there is no helper row: the grant rolls up to the host app, so enable the
-   **"ScreenCap"** row (that same app identity owns Microphone too).
+   **"Screencap"** row (that same app identity owns Microphone too).
 4. If macOS prompts to approve a new Login Item / background item, approve it
    (SMAppService may re-flag the helper under its new identity).
 5. Use **Restart to apply permissions** (or quit + reopen) so the per-process TCC

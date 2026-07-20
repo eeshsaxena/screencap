@@ -128,8 +128,8 @@ The requirements-only questions are resolved in the Planning Contract: time-reso
 - `src/screencap/segmentation/providers/ondevice.py:283` — `OnDeviceProvider.answer` is a complete on-device answer path via the Swift helper (`task: "answer"`).
 - `src/screencap/segmentation/recall.py:29` — `answer_recall`, the on-device-then-consented-cloud chain.
 - `src/screencap/segmentation/consent.py:117` — `ConsentPolicy.resolve`; RECALL_ANSWER reaches cloud only with consent + a configured provider.
-- `macos/ScreenCap/Views/Chat/ChatViewModel.swift:170` — the client builds the request without `window_ms`.
-- `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift` — the existing consent matrix, including the `recall_cloud_consent` ("Answering Recall searches") toggle.
+- `macos/Screencap/Views/Chat/ChatViewModel.swift:170` — the client builds the request without `window_ms`.
+- `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift` — the existing consent matrix, including the `recall_cloud_consent` ("Answering Recall searches") toggle.
 - `tests/recall/test_evidence_bundle.py` — the privacy-marked strip tests; no existing case exercises timeline-stream survival.
 
 ---
@@ -236,7 +236,7 @@ U1 and U2 are independent and can land in either order; U3 follows (touches the 
 - Goal: replace the single misleading refusal with distinct states — a transparent no-backend state that guides the user to both paths, a distinct no-matching-moments state, and a demoted not-indexed hint.
 - Requirements: R5, R6, R7.
 - Dependencies: U2 (consumes the refusal-reason wire field).
-- Files: `macos/ScreenCap/Models/ChatRecall.swift`, `macos/ScreenCap/Views/Chat/ChatView.swift`, `macos/ScreenCap/Views/MainWindow.swift`, `macos/ScreenCapTests/ChatViewModelTests.swift`.
+- Files: `macos/Screencap/Models/ChatRecall.swift`, `macos/Screencap/Views/Chat/ChatView.swift`, `macos/Screencap/Views/MainWindow.swift`, `macos/ScreencapTests/ChatViewModelTests.swift`.
 - Approach:
   - **Decode + unify.** Add the refusal-reason to `ChatAnswerResponse` (decode-tolerant). Introduce a single client-side `ChatHonestState` enum computed once per turn that unifies the three signals — the refusal-reason (`no_backend`/`no_evidence`/`unsupported`/`blocked`), `coverage.state`, and the transport-failure (`.failed`) turn state — into: `answered`, `noBackend`, `noMatchingMoments`, `safeRefusal` (unsupported/blocked), `daemonUnreachable`. Do not leave the mapping as ad-hoc boolean branching. Define an explicit **precedence**: transport failure → `daemonUnreachable`; else refusal-reason `no_backend` → `noBackend`; else `no_evidence`/coverage no-match → `noMatchingMoments`; else answered.
   - **Distinct rendering.** Each state gets a visually distinct treatment, not just different note text under the shared `coverageLine` (today every non-`ok` coverage state renders with the same info-circle + muted gray line). At minimum `noBackend` gets its own icon + the both-paths copy + a Settings call-to-action button, distinguishable at a glance from the single-line `noMatchingMoments`.

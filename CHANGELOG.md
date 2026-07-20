@@ -217,10 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   proactive install-time TCC registration with identity-scoped decoy cleanup
   (SCR-200). The PyInstaller spec now emits the `com.screencap.daemon` helper
   .app (SCR-196).
-- **Stable permissions across updates (macOS app).** ScreenCap now records
+- **Stable permissions across updates (macOS app).** Screencap now records
   through a background helper that owns the Screen Recording, Accessibility, and
   Input Monitoring permissions. Grant them once and they persist across all
-  future ScreenCap updates — no more re-granting on every update. Existing users
+  future Screencap updates — no more re-granting on every update. Existing users
   see a one-time explainer on first launch after upgrading, then complete the
   short helper setup once (SCR-49).
 - **Day timeline surface.** New day-segments daemon verb with an honest
@@ -403,7 +403,7 @@ Re-release of v0.17.0 — republished to retrigger the CI release workflow. Bina
 
 ### Added
 - **Back-to-back recordings:** `screencap start` is now a long-lived session — hit Start, Stop, Start again from the menu bar without restarting the CLI, while the previous recording transcribes and uploads quietly in the background
-- **Menu bar session controls:** The status-bar menu is now a full session UI with Start Recording, Stop Recording, and Quit ScreenCap items that swap in place as the session state changes
+- **Menu bar session controls:** The status-bar menu is now a full session UI with Start Recording, Stop Recording, and Quit Screencap items that swap in place as the session state changes
 - **Audio toggle in the menu bar:** Flip microphone capture on or off for the next recording straight from the menu bar — the choice is persisted to `config.toml` and applied to subsequent recordings in the current session without a restart
 - **First-seen app prompts:** The first time a new app or website appears on screen during a recording, the menu bar now pops up a prompt asking whether to allow, mask, or exclude it — and remembers your answer for next time
 - **Retroactive scrubbing:** When you toggle an app or domain to "exclude" mid-recording, a new sidecar worker reaches back into the capture DB and deletes everything already recorded for that target, not just future events
@@ -430,7 +430,7 @@ Re-release of v0.17.0 — republished to retrigger the CI release workflow. Bina
 
 ### Added
 - **Back-to-back recordings:** `screencap start` is now a long-lived session — hit Start, Stop, Start again from the menu bar without restarting the CLI, while the previous recording transcribes and uploads quietly in the background
-- **Menu bar session controls:** The status-bar menu is now a full session UI with Start Recording, Stop Recording, and Quit ScreenCap items that swap in place as the session state changes
+- **Menu bar session controls:** The status-bar menu is now a full session UI with Start Recording, Stop Recording, and Quit Screencap items that swap in place as the session state changes
 - **Audio toggle in the menu bar:** Flip microphone capture on or off for the next recording straight from the menu bar — the choice is persisted to `config.toml` and applied to subsequent recordings in the current session without a restart
 - **First-seen app prompts:** The first time a new app or website appears on screen during a recording, the menu bar now pops up a prompt asking whether to allow, mask, or exclude it — and remembers your answer for next time
 - **Retroactive scrubbing:** When you toggle an app or domain to "exclude" mid-recording, a new sidecar worker reaches back into the capture DB and deletes everything already recorded for that target, not just future events
@@ -914,7 +914,7 @@ Re-release of v0.17.0 — republished to retrigger the CI release workflow. Bina
 
 ### Added
 
-- Initial release of ScreenCap — macOS CLI for screen recording
+- Initial release of Screencap — macOS CLI for screen recording
 - Multi-process recording engine with mouse, keyboard, and screen capture
 - Time-aligned video and audio recording
 - Event processing pipeline (clicks, drags, typing detection)

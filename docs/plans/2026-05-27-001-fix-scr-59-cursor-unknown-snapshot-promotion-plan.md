@@ -17,10 +17,10 @@ Add an `onPromoteFromSnapshot(startedAt:)` callback to `DaemonSession.EventStrea
 
 PR #180 ce-code-review flagged this at P2 / confidence 50 / `pre_existing: true` — the reviewer wasn't sure it was real. A targeted TDD pass on `2026-05-27` confirmed it via a deterministic XCTest reproduction in the existing `UnixHTTPTestServer` mock harness. When the daemon's replay buffer evicts the start cursor *and* the `started` event has already aged past the fresh snapshot cursor, `RecorderController` hangs in `.starting` indefinitely because:
 
-1. The `cursor_unknown` catch in `consumeEventStream` clears `pendingStartCursor` and continues the loop with `snapshot.cursor` ([DaemonSessionService.swift:276-295](macos/ScreenCap/Controllers/DaemonSessionService.swift:276)).
+1. The `cursor_unknown` catch in `consumeEventStream` clears `pendingStartCursor` and continues the loop with `snapshot.cursor` ([DaemonSessionService.swift:276-295](macos/Screencap/Controllers/DaemonSessionService.swift:276)).
 2. The second subscribe at the fresh `snapshot.cursor` may not include `started` if it was already evicted — leaving the orchestrator's state machine waiting for an event that never arrives.
-3. `RecordingStateMachine.handle(event:)` only transitions `.starting → .recording` on a `started` event ([RecordingStateMachine.swift:170-179](macos/ScreenCap/Controllers/RecordingStateMachine.swift:170)). The only other promotion path — `observeActiveDaemonSession(startedAt:)` — is wired exclusively into `syncDaemonSnapshot()` ([RecorderController.swift:190-208](macos/ScreenCap/Controllers/RecorderController.swift:190)), never from inside `consumeEventStream`.
-4. `RecordingState.starting.isRecording == true` ([RecordingStateMachine.swift:18-23](macos/ScreenCap/Controllers/RecordingStateMachine.swift:18)), so the consume-loop's `while callbacks.isRecording()` predicate stays true; the loop never exits on its own.
+3. `RecordingStateMachine.handle(event:)` only transitions `.starting → .recording` on a `started` event ([RecordingStateMachine.swift:170-179](macos/Screencap/Controllers/RecordingStateMachine.swift:170)). The only other promotion path — `observeActiveDaemonSession(startedAt:)` — is wired exclusively into `syncDaemonSnapshot()` ([RecorderController.swift:190-208](macos/Screencap/Controllers/RecorderController.swift:190)), never from inside `consumeEventStream`.
+4. `RecordingState.starting.isRecording == true` ([RecordingStateMachine.swift:18-23](macos/Screencap/Controllers/RecordingStateMachine.swift:18)), so the consume-loop's `while callbacks.isRecording()` predicate stays true; the loop never exits on its own.
 
 The race condition is not deterministically reproducible against a live daemon (snapshot/replay timing), so the harness mock is the only realistic repro path.
 
@@ -42,7 +42,7 @@ The race condition is not deterministically reproducible against a live daemon (
 
 ### Deferred to Follow-Up Work
 
-- Stale `macos/ScreenCap.xcodeproj/project.pbxproj` from fresh clones — newer Swift source files (e.g., `RecordingStateMachine.swift`, `DaemonSessionService.swift`) are not in the checked-in/regenerated pbxproj, so `xcodebuild test` from a clean clone fails to compile until `xcodegen generate` is run. The pbxproj is gitignored ([macos/.gitignore:2](macos/.gitignore)), so the fix is either a README note, a pre-build script, or a CI step. **Out of SCR-59 scope** — surface separately (likely a `docs/tickets/` entry).
+- Stale `macos/Screencap.xcodeproj/project.pbxproj` from fresh clones — newer Swift source files (e.g., `RecordingStateMachine.swift`, `DaemonSessionService.swift`) are not in the checked-in/regenerated pbxproj, so `xcodebuild test` from a clean clone fails to compile until `xcodegen generate` is run. The pbxproj is gitignored ([macos/.gitignore:2](macos/.gitignore)), so the fix is either a README note, a pre-build script, or a CI step. **Out of SCR-59 scope** — surface separately (likely a `docs/tickets/` entry).
 
 ---
 
@@ -50,12 +50,12 @@ The race condition is not deterministically reproducible against a live daemon (
 
 ### Relevant Code and Patterns
 
-- **Buggy site:** `cursor_unknown` catch at [DaemonSessionService.swift:276-295](macos/ScreenCap/Controllers/DaemonSessionService.swift:276) — clears `pendingStartCursor`, applies backoff, `continue`s the loop. Snapshot from the current iteration is in scope at this point (fetched at the loop top, line 226).
-- **Callback shape to mirror:** `EventStreamCallbacks` struct at [DaemonSessionService.swift:61-67](macos/ScreenCap/Controllers/DaemonSessionService.swift:61). Existing fields use `@MainActor () -> Void` and similar — new field follows the same shape.
-- **Orchestrator callback site:** `RecorderController.attachDaemonEventStream` at [RecorderController.swift:455-468](macos/ScreenCap/Controllers/RecorderController.swift:455). Callbacks are constructed inline as a `DaemonSession.EventStreamCallbacks(...)` literal.
-- **Promotion mechanism to reuse:** `RecordingStateMachine.observeActiveDaemonSession(startedAt:)` at [RecordingStateMachine.swift:96-101](macos/ScreenCap/Controllers/RecordingStateMachine.swift:96) — already clears `pendingStartCursor`, sets `recordingStartedAt`, transitions to `.recording(elapsed:)`, and emits `.startElapsedTimer`. Exact semantics match what we need.
-- **Reference invocation pattern:** [`syncDaemonSnapshot()` at RecorderController.swift:190-208](macos/ScreenCap/Controllers/RecorderController.swift:190) — same mechanism, different trigger. Pattern: `apply(machine.observeActiveDaemonSession(startedAt: startedAt))`.
-- **Red test (already authored, on this branch, uncommitted):** [`testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast`](macos/ScreenCapTests/RecorderControllerDaemonTests.swift) — verified to fail on `main` (`Expected .recording (via snapshot promotion); got starting`). Includes a `secondSubscribeCount` guard that confirms the recovery branch executed, so the assertion fails for the right reason (stuck state) rather than a harness timeout.
+- **Buggy site:** `cursor_unknown` catch at [DaemonSessionService.swift:276-295](macos/Screencap/Controllers/DaemonSessionService.swift:276) — clears `pendingStartCursor`, applies backoff, `continue`s the loop. Snapshot from the current iteration is in scope at this point (fetched at the loop top, line 226).
+- **Callback shape to mirror:** `EventStreamCallbacks` struct at [DaemonSessionService.swift:61-67](macos/Screencap/Controllers/DaemonSessionService.swift:61). Existing fields use `@MainActor () -> Void` and similar — new field follows the same shape.
+- **Orchestrator callback site:** `RecorderController.attachDaemonEventStream` at [RecorderController.swift:455-468](macos/Screencap/Controllers/RecorderController.swift:455). Callbacks are constructed inline as a `DaemonSession.EventStreamCallbacks(...)` literal.
+- **Promotion mechanism to reuse:** `RecordingStateMachine.observeActiveDaemonSession(startedAt:)` at [RecordingStateMachine.swift:96-101](macos/Screencap/Controllers/RecordingStateMachine.swift:96) — already clears `pendingStartCursor`, sets `recordingStartedAt`, transitions to `.recording(elapsed:)`, and emits `.startElapsedTimer`. Exact semantics match what we need.
+- **Reference invocation pattern:** [`syncDaemonSnapshot()` at RecorderController.swift:190-208](macos/Screencap/Controllers/RecorderController.swift:190) — same mechanism, different trigger. Pattern: `apply(machine.observeActiveDaemonSession(startedAt: startedAt))`.
+- **Red test (already authored, on this branch, uncommitted):** [`testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast`](macos/ScreencapTests/RecorderControllerDaemonTests.swift) — verified to fail on `main` (`Expected .recording (via snapshot promotion); got starting`). Includes a `secondSubscribeCount` guard that confirms the recovery branch executed, so the assertion fails for the right reason (stuck state) rather than a harness timeout.
 - **Sibling test (must stay green):** `testCursorUnknown410FromEventsStreamFallsBackThroughSnapshotRefetch` in the same file — its mock at line 306 emits `started` on the second subscribe, so it exercises the event-driven recovery path, not the new snapshot-promotion path. Unaffected by the fix.
 
 ### Institutional Learnings
@@ -102,9 +102,9 @@ The race condition is not deterministically reproducible against a live daemon (
 **Dependencies:** None — the red test is already on disk and verifies the bug today.
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/DaemonSessionService.swift` (add callback field to `EventStreamCallbacks`; invoke from `cursor_unknown` catch)
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (add handler in `attachDaemonEventStream` callback bundle)
-- Test (verifies green): `macos/ScreenCapTests/RecorderControllerDaemonTests.swift::testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast`
+- Modify: `macos/Screencap/Controllers/DaemonSessionService.swift` (add callback field to `EventStreamCallbacks`; invoke from `cursor_unknown` catch)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (add handler in `attachDaemonEventStream` callback bundle)
+- Test (verifies green): `macos/ScreencapTests/RecorderControllerDaemonTests.swift::testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast`
 
 **Approach:**
 - Add `onPromoteFromSnapshot: @MainActor (Date) -> Void` to `DaemonSession.EventStreamCallbacks`.
@@ -124,14 +124,14 @@ The race condition is not deterministically reproducible against a live daemon (
 **Execution note:** TDD — the red test exists on disk and is failing on `main`. After implementing the fix, run only that test first and confirm it turns green before running the full suite. This is the verification of correctness.
 
 **Patterns to follow:**
-- `syncDaemonSnapshot()` at [RecorderController.swift:190-208](macos/ScreenCap/Controllers/RecorderController.swift:190) — same `apply(machine.observeActiveDaemonSession(startedAt:))` invocation, different trigger.
-- `EventStreamCallbacks` field shapes at [DaemonSessionService.swift:62-66](macos/ScreenCap/Controllers/DaemonSessionService.swift:62) — `@MainActor` closures, single-purpose.
+- `syncDaemonSnapshot()` at [RecorderController.swift:190-208](macos/Screencap/Controllers/RecorderController.swift:190) — same `apply(machine.observeActiveDaemonSession(startedAt:))` invocation, different trigger.
+- `EventStreamCallbacks` field shapes at [DaemonSessionService.swift:62-66](macos/Screencap/Controllers/DaemonSessionService.swift:62) — `@MainActor` closures, single-purpose.
 
 **Test scenarios:**
 - **Happy path (already authored):** `testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast` — 410 cursor_unknown, second subscribe returns `subscribed` only (no `started`), snapshot reports active daemon-owned session with `started_at=10.0`. After 800ms wait, assert `state == .recording`. **Currently red on `main`; turns green with U1.**
-- **Regression guard (already authored):** `testCursorUnknown410FromEventsStreamFallsBackThroughSnapshotRefetch` — same 410 trigger, but second subscribe emits `started`. With the fix, promotion may fire from the snapshot *or* the `started` event may arrive first — either path reaches `.recording`. Either is correct because the state machine's `started` handler is idempotent (`guard case .starting = state` at [RecordingStateMachine.swift:175](macos/ScreenCap/Controllers/RecordingStateMachine.swift:175) returns `[]` once already `.recording`). Test should continue to pass unchanged.
+- **Regression guard (already authored):** `testCursorUnknown410FromEventsStreamFallsBackThroughSnapshotRefetch` — same 410 trigger, but second subscribe emits `started`. With the fix, promotion may fire from the snapshot *or* the `started` event may arrive first — either path reaches `.recording`. Either is correct because the state machine's `started` handler is idempotent (`guard case .starting = state` at [RecordingStateMachine.swift:175](macos/Screencap/Controllers/RecordingStateMachine.swift:175) returns `[]` once already `.recording`). Test should continue to pass unchanged.
 - **Edge case — promotion no-op when not `.starting`:** Add an assertion-level check or a small unit test confirming that a `cursor_unknown` later in a session (after `started` already promoted to `.recording`) does NOT regress state. Acceptable forms: (a) extend an existing reconnect test to inject a 410 mid-recording and assert `recordingStartedAt` is unchanged, or (b) add a state-machine-level test that asserts `observeActiveDaemonSession` semantics. Implementer's choice; document the choice in the PR.
-- **Edge case — service-side guard:** Promotion is *not* triggered when `snapshot.daemonOwned == false`. This is structurally protected by the existing `if snapshot.isRecording == true, snapshot.daemonOwned == false { return .foreignClaimant }` check at [DaemonSessionService.swift:243-245](macos/ScreenCap/Controllers/DaemonSessionService.swift:243) — the loop returns before reaching the catch. No new test needed; covered by `testProbeDaemonSurfacesForeignRecordingAsLastError` (same shape, different trigger).
+- **Edge case — service-side guard:** Promotion is *not* triggered when `snapshot.daemonOwned == false`. This is structurally protected by the existing `if snapshot.isRecording == true, snapshot.daemonOwned == false { return .foreignClaimant }` check at [DaemonSessionService.swift:243-245](macos/Screencap/Controllers/DaemonSessionService.swift:243) — the loop returns before reaching the catch. No new test needed; covered by `testProbeDaemonSurfacesForeignRecordingAsLastError` (same shape, different trigger).
 
 **Verification:**
 - The red test `testCursorUnknownEvictsStartedThenStuckInStartingWhenReplayHasAgedPast` passes.
@@ -158,7 +158,7 @@ The race condition is not deterministically reproducible against a live daemon (
 | Risk | Mitigation |
 |------|------------|
 | Promotion fires from a stale snapshot and clobbers a real `.recording` elapsed value | `.starting`-only guard in the orchestrator handler — promotion is impossible once state is `.recording` or beyond. |
-| `started` event arrives via replay *after* promotion → state machine re-runs `.starting → .recording` | State machine's `started` handler at [RecordingStateMachine.swift:175](macos/ScreenCap/Controllers/RecordingStateMachine.swift:175) has `guard case .starting = state else { return [] }` — returns no-op effects once already `.recording`. Already covered by existing tests. |
+| `started` event arrives via replay *after* promotion → state machine re-runs `.starting → .recording` | State machine's `started` handler at [RecordingStateMachine.swift:175](macos/Screencap/Controllers/RecordingStateMachine.swift:175) has `guard case .starting = state else { return [] }` — returns no-op effects once already `.recording`. Already covered by existing tests. |
 | Snapshot's `started_at` differs from the daemon's actual record (e.g., engine-side clock drift) → UI elapsed displays slightly off | Negligible: same `started_at` value would be observed by `syncDaemonSnapshot()` at probe time, so the behavior is consistent across both promotion paths. Not worth complicating the fix. |
 
 ---

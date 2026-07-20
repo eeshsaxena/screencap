@@ -497,7 +497,7 @@ async def test_set_records_audit_line_on_ok_and_on_error(
         monkeypatch,
         provenance.PeerDescriptor(
             pid=4242,
-            path="/Applications/ScreenCap.app/Contents/MacOS/screencap",
+            path="/Applications/Screencap.app/Contents/MacOS/screencap",
             classification=provenance.STARTED_BY_SWIFTUI,
         ),
     )
