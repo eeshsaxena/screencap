@@ -46,8 +46,16 @@ Deploy (project: proteus-photos, region: southamerica-east1):
     # Generate the HMAC secret with real entropy (a weak value makes claims
     # offline-forgeable):  openssl rand -base64 32 | gcloud secrets create FEEDBACK_HMAC_KEY --data-file=-
     #
-    # Resolve the routing ids once against the workspace (dedicated account key):
-    #   LINEAR_TEAM_ID / LINEAR_TRIAGE_STATE_ID / the three label ids.
+    # Routing ids resolved against the real Screencap team (SCR-281 U0). Issues
+    # land in Backlog and always carry the in-app-feedback source marker
+    # (SCREENCAP_LINEAR_LABEL_SOURCE) plus their per-type label. NOTE: the team
+    # has no "Triage" workflow state, so TRIAGE_STATE_ID points at Backlog.
+    #   SCREENCAP_LINEAR_TEAM_ID         = f3bbac41-0ec3-4f2e-ae0b-96fed6ff624f  (Screencap)
+    #   SCREENCAP_LINEAR_TRIAGE_STATE_ID = c825fa67-c31e-421c-a5f9-ab2aef7ef5f5  (Backlog)
+    #   SCREENCAP_LINEAR_LABEL_SOURCE    = b0a3860f-12cd-4831-ade2-a787f46729a3  (in-app-feedback)
+    #   SCREENCAP_LINEAR_LABEL_BUG       = fc126e8e-a621-4acb-b326-05f1c047dbf4  (Bug)
+    #   SCREENCAP_LINEAR_LABEL_FEEDBACK  = 5307398b-3a47-462b-be99-63a38b941001  (Feedback)
+    #   SCREENCAP_LINEAR_LABEL_FEATURE   = 0948a8cf-bb9b-4df4-a190-96b70ea3e905  (Feature)
     #
     gcloud functions deploy submit-feedback \
         --project proteus-photos --gen2 --runtime python312 \
@@ -58,17 +66,19 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --service-account screencap-feedback@proteus-photos.iam.gserviceaccount.com \
         --max-instances 2 --memory 256Mi \
         --set-secrets LINEAR_API_KEY=LINEAR_API_KEY:latest,FEEDBACK_HMAC_KEY=FEEDBACK_HMAC_KEY:latest \
-        --set-env-vars SCREENCAP_LINEAR_TEAM_ID=...,SCREENCAP_LINEAR_TRIAGE_STATE_ID=...,SCREENCAP_LINEAR_LABEL_BUG=...,SCREENCAP_LINEAR_LABEL_FEEDBACK=...,SCREENCAP_LINEAR_LABEL_FEATURE=...
+        --set-env-vars SCREENCAP_LINEAR_TEAM_ID=f3bbac41-0ec3-4f2e-ae0b-96fed6ff624f,SCREENCAP_LINEAR_TRIAGE_STATE_ID=c825fa67-c31e-421c-a5f9-ab2aef7ef5f5,SCREENCAP_LINEAR_LABEL_SOURCE=b0a3860f-12cd-4831-ade2-a787f46729a3,SCREENCAP_LINEAR_LABEL_BUG=fc126e8e-a621-4acb-b326-05f1c047dbf4,SCREENCAP_LINEAR_LABEL_FEEDBACK=5307398b-3a47-462b-be99-63a38b941001,SCREENCAP_LINEAR_LABEL_FEATURE=0948a8cf-bb9b-4df4-a190-96b70ea3e905
 
     # Runbook: rotate LINEAR_API_KEY via Linear settings + redeploy; rotating
     # FEEDBACK_HMAC_KEY voids unexpired claims (clients simply re-prepare).
     # Watch Linear storage usage — orphaned prepare-without-submit uploads are
     # the expected abuse signature.
 
-NOTE (U0 / KTD-3): the Linear upload-host allowlist and the ``fileUpload`` size
-acceptance are pending the U0 pre-flight spike against the real workspace. If the
-spike finds a different asset host or a hard size cap, update
-``LINEAR_UPLOAD_HOSTS`` / the caps here AND the mirror in
+U0 spike results (SCR-281, run 2026-07-20 against the real workspace): 25 MiB
+``.mov``, ``.png`` and ``.heic`` uploads all accepted, so the caps stand;
+assetUrls live on ``uploads.linear.app`` but signed PUT URLs are GCS
+path-style (``storage.googleapis.com/uploads.linear.app/...``) — see
+``_upload_target_allowed``; the signed upload URL expires 60 s after minting,
+which set ``CLAIM_TTL_SECONDS`` below. Constants stay mirrored in
 ``src/screencap/feedback.py`` (the CLI↔relay equality test pins them).
 """
 
@@ -111,9 +121,17 @@ ALLOWED_CONTENT_TYPES = frozenset(
     }
 )
 
-# Hosts an attachment assetUrl / uploadUrl may point at. Pending U0 confirmation
-# against the real workspace (Linear serves assets from uploads.linear.app).
+# Hosts an attachment assetUrl may point at. Confirmed by the U0 spike
+# (SCR-281) against the real workspace: assetUrls are served from
+# uploads.linear.app.
 LINEAR_UPLOAD_HOSTS = frozenset({"uploads.linear.app"})
+
+# U0 finding (SCR-281): the real workspace signs PUT URLs in GCS path style —
+# https://storage.googleapis.com/uploads.linear.app/<path> — so the upload
+# target is allowed EITHER on the Linear host or on GCS pinned to Linear's
+# bucket path. assetUrls stay uploads.linear.app-only (LINEAR_UPLOAD_HOSTS).
+LINEAR_UPLOAD_GCS_HOST = "storage.googleapis.com"
+LINEAR_UPLOAD_GCS_PREFIX = "/uploads.linear.app/"
 
 # Request-type enum -> the env var naming its Linear label id.
 REQUEST_TYPES = {
@@ -124,7 +142,16 @@ REQUEST_TYPES = {
 
 MAX_MESSAGE_CHARS = 10_000
 MAX_BODY_BYTES = 64 * 1024                  # JSON control plane only; no file bytes
-CLAIM_TTL_SECONDS = 60 * 60                 # 60 min (KTD-3) — honest slow-uplink path
+# U0 finding (SCR-281): Linear's signed upload URL must be USED within 60 s of
+# minting (X-Goog-Expires=60; GCS checks the signature when the PUT request
+# arrives, so an already-started slow stream may finish). A 60-min claim would
+# outlive that 60 s upload window by an hour for no benefit; 10 min bounds the
+# HMAC-claim replay window while still covering a client's prepare→submit round
+# trip. It does NOT rescue a slow multi-file upload — the signed URLs, not the
+# claim, are the 60 s constraint (see SCR-285: prepare batch-mints all URLs but
+# the CLI PUTs sequentially). ``expired`` stays retryable — the client
+# re-prepares.
+CLAIM_TTL_SECONDS = 10 * 60
 
 # Per-IP budgets (KTD-6). Best-effort per-instance-lifetime.
 RATE_WINDOW_SECONDS = 60 * 60
@@ -215,6 +242,29 @@ def _host_allowed(url: str) -> bool:
     except ValueError:
         return False
     return parts.scheme == "https" and parts.hostname in LINEAR_UPLOAD_HOSTS
+
+
+def _upload_target_allowed(url: str) -> bool:
+    """True iff ``url`` may receive attachment bytes: https on a Linear upload
+    host, or GCS path-style pinned to Linear's bucket (either way, bytes can
+    only land in Linear-controlled storage)."""
+    if _host_allowed(url):
+        return True
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return False
+    if not (parts.scheme == "https" and parts.hostname == LINEAR_UPLOAD_GCS_HOST):
+        return False
+    # Reject dot-segments before the prefix check: requests/urllib3 (and other
+    # RFC 3986 clients) collapse "/../" BEFORE sending, so a path that passes a
+    # raw prefix check (".../uploads.linear.app/../other-bucket/x") is rewritten
+    # to a DIFFERENT bucket by the time bytes go out. Linear's real signed URLs
+    # are all UUID path segments with no dot-segments, so this only rejects
+    # forged targets.
+    if any(seg in ("..", ".") for seg in parts.path.split("/")):
+        return False
+    return parts.path.startswith(LINEAR_UPLOAD_GCS_PREFIX)
 
 
 # --------------------------------------------------------------------------
@@ -455,8 +505,14 @@ def _linear_create_issue(title: str, description: str, label_id: str) -> dict:
         "title": title,
         "description": description,
     }
-    if label_id:
-        issue_input["labelIds"] = [label_id]
+    # Every relay-created issue carries the source marker label (so maintainers
+    # can see at a glance the issue came from a user's in-app submission, not an
+    # internally-filed ticket) plus its per-request-type label. Source first so
+    # it reads as the primary tag.
+    source_label = os.environ.get("SCREENCAP_LINEAR_LABEL_SOURCE", "")
+    label_ids = [lid for lid in (source_label, label_id) if lid]
+    if label_ids:
+        issue_input["labelIds"] = label_ids
     data = _linear_post(_ISSUE_CREATE_QUERY, {"input": issue_input})
     created = data.get("issueCreate") or {}
     if not created.get("success"):
@@ -479,7 +535,7 @@ def _handle_prepare(body: dict, ip: str, now: float) -> dict:
         upload_file = _linear_file_upload(entry["content_type"], filename, entry["size"])
         asset_url = upload_file.get("assetUrl", "")
         upload_url = upload_file.get("uploadUrl", "")
-        if not _host_allowed(asset_url) or not _host_allowed(upload_url):
+        if not _host_allowed(asset_url) or not _upload_target_allowed(upload_url):
             # Linear returned an unexpected host — fail rather than mint a claim.
             raise _err("server", "something went wrong", 502)
         uploads.append(

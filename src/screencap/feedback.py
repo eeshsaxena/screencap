@@ -42,6 +42,13 @@ ALLOWED_CONTENT_TYPES = frozenset(
 
 LINEAR_UPLOAD_HOSTS = frozenset({"uploads.linear.app"})
 
+# U0 finding (SCR-281): the real workspace signs PUT URLs in GCS path style —
+# https://storage.googleapis.com/uploads.linear.app/<path> — so the upload
+# target is allowed EITHER on the Linear host or on GCS pinned to Linear's
+# bucket path. assetUrls stay uploads.linear.app-only (LINEAR_UPLOAD_HOSTS).
+LINEAR_UPLOAD_GCS_HOST = "storage.googleapis.com"
+LINEAR_UPLOAD_GCS_PREFIX = "/uploads.linear.app/"
+
 # gen2 function deployed by name in the billing/signing project (mirrors the
 # cloudfunctions.net convention upload.py uses). Overridable for tests / staging.
 DEFAULT_FEEDBACK_URL = (
@@ -77,14 +84,31 @@ def _fail(kind: str, message: str, *, retryable: bool) -> dict:
 _RETRYABLE_KINDS = {"network", "server", "expired"}
 
 
-def _host_allowed(url: str) -> bool:
+def _upload_target_allowed(url: str) -> bool:
+    """True iff ``url`` may receive attachment bytes: https on a Linear upload
+    host, or GCS path-style pinned to Linear's bucket (either way, bytes can
+    only land in Linear-controlled storage)."""
     from urllib.parse import urlparse
 
     try:
         parts = urlparse(url)
     except ValueError:
         return False
-    return parts.scheme == "https" and parts.hostname in LINEAR_UPLOAD_HOSTS
+    if parts.scheme != "https":
+        return False
+    if parts.hostname in LINEAR_UPLOAD_HOSTS:
+        return True
+    if parts.hostname != LINEAR_UPLOAD_GCS_HOST:
+        return False
+    # Reject dot-segments before the prefix check: requests/urllib3 collapse
+    # "/../" per RFC 3986 BEFORE sending, so a path that passes a raw prefix
+    # check (".../uploads.linear.app/../other-bucket/x") is rewritten to a
+    # DIFFERENT bucket by the time bytes go out. Linear's real signed URLs are
+    # all UUID path segments with no dot-segments, so this only rejects forged
+    # targets.
+    if any(seg in ("..", ".") for seg in parts.path.split("/")):
+        return False
+    return parts.path.startswith(LINEAR_UPLOAD_GCS_PREFIX)
 
 
 def _validate_attachments(attachments: list[dict]) -> list[dict] | dict:
@@ -147,7 +171,7 @@ def _put_file(upload: dict, path: str) -> dict | None:
     """PUT one file's bytes to Linear's signed URL. Returns a fail envelope or
     None on success. The upload host is validated before any bytes are sent."""
     upload_url = upload.get("uploadUrl", "")
-    if not _host_allowed(upload_url):
+    if not _upload_target_allowed(upload_url):
         return _fail("server", "unexpected upload target", retryable=True)
     headers = {h["key"]: h["value"] for h in upload.get("headers", []) if "key" in h}
     try:

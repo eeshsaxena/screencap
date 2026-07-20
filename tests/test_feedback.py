@@ -161,6 +161,42 @@ def test_non_allowlisted_upload_url_sends_no_bytes(tmp_path):
     put.assert_not_called()             # no bytes left the machine
 
 
+def test_gcs_pathstyle_upload_url_allowed_but_foreign_bucket_rejected(tmp_path):
+    # U0 (SCR-281): the real workspace signs PUT URLs as
+    # storage.googleapis.com/uploads.linear.app/<path>; any other GCS bucket
+    # stays rejected.
+    f1 = _png(tmp_path)
+
+    def prep_for(upload_url):
+        return {"ok": True, "uploads": [{"uploadUrl": upload_url, "assetUrl": "https://uploads.linear.app/a/1", "claim": "c1", "headers": []}]}
+
+    ok_url = "https://storage.googleapis.com/uploads.linear.app/ws/att/1?X-Goog-Expires=60"
+    submit = {"ok": True, "issue_url": "https://linear.app/x/1"}
+    with mock.patch("screencap.feedback.requests.post", side_effect=[_Resp(prep_for(ok_url)), _Resp(submit)]), \
+        mock.patch("screencap.feedback.requests.put", return_value=_Resp({})) as put:
+        env = feedback.send_feedback(
+            {"type": "bug", "message": "hi", "attachments": [{"path": str(f1), "content_type": "image/png"}]}
+        )
+    assert env["ok"] is True
+    put.assert_called_once()
+
+    # Foreign bucket as the first path segment, and a dot-segment that a
+    # normalizing HTTP client (requests/urllib3 collapse "/../" per RFC 3986)
+    # would rewrite to another bucket after a naive prefix check passed. Both
+    # must send no bytes.
+    for evil_url in (
+        "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1",
+        "https://storage.googleapis.com/uploads.linear.app/../attacker-bucket/1",
+    ):
+        with mock.patch("screencap.feedback.requests.post", return_value=_Resp(prep_for(evil_url))), \
+            mock.patch("screencap.feedback.requests.put") as put:
+            env = feedback.send_feedback(
+                {"type": "bug", "message": "hi", "attachments": [{"path": str(f1), "content_type": "image/png"}]}
+            )
+        assert env["ok"] is False, evil_url
+        put.assert_not_called()         # no bytes left the machine
+
+
 # --------------------------------------------------------------------------
 # Privacy guard (R10) — runs on CI (privacy lane only)
 # --------------------------------------------------------------------------
@@ -206,6 +242,8 @@ def test_cli_and_relay_constants_match():
         "MAX_ATTACHMENTS",
         "ALLOWED_CONTENT_TYPES",
         "LINEAR_UPLOAD_HOSTS",
+        "LINEAR_UPLOAD_GCS_HOST",
+        "LINEAR_UPLOAD_GCS_PREFIX",
     }
     tree = ast.parse(relay_path.read_text())
     ns: dict = {}
@@ -221,6 +259,8 @@ def test_cli_and_relay_constants_match():
     assert feedback.MAX_ATTACHMENTS == ns["MAX_ATTACHMENTS"]
     assert feedback.ALLOWED_CONTENT_TYPES == ns["ALLOWED_CONTENT_TYPES"]
     assert feedback.LINEAR_UPLOAD_HOSTS == ns["LINEAR_UPLOAD_HOSTS"]
+    assert feedback.LINEAR_UPLOAD_GCS_HOST == ns["LINEAR_UPLOAD_GCS_HOST"]
+    assert feedback.LINEAR_UPLOAD_GCS_PREFIX == ns["LINEAR_UPLOAD_GCS_PREFIX"]
 
 
 # --------------------------------------------------------------------------

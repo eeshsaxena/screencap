@@ -27,6 +27,7 @@ def relay_env():
             "LINEAR_API_KEY": "lin_api_test",
             "SCREENCAP_LINEAR_TEAM_ID": "team-123",
             "SCREENCAP_LINEAR_TRIAGE_STATE_ID": "state-triage",
+            "SCREENCAP_LINEAR_LABEL_SOURCE": "label-source",
             "SCREENCAP_LINEAR_LABEL_BUG": "label-bug",
             "SCREENCAP_LINEAR_LABEL_FEEDBACK": "label-feedback",
             "SCREENCAP_LINEAR_LABEL_FEATURE": "label-feature",
@@ -117,9 +118,41 @@ def test_submit_text_only_creates_issue():
     variables = calls[0]["variables"]["input"]
     assert variables["teamId"] == "team-123"
     assert variables["stateId"] == "state-triage"
-    assert variables["labelIds"] == ["label-bug"]
+    # Source marker leads, then the per-type label.
+    assert variables["labelIds"] == ["label-source", "label-bug"]
     assert variables["title"] == "[Bug] It crashed"
     assert "Report metadata" in variables["description"]
+
+
+def test_source_marker_label_applied_to_every_type():
+    # Every relay-created issue carries the in-app-feedback source marker
+    # regardless of request type, so maintainers can filter user submissions.
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["input"] = json["variables"]["input"]
+        return _FakeResp({"issueCreate": {"success": True, "issue": {"id": "i", "url": "https://linear.app/x/i"}}})
+
+    for req_type, type_label in (("feature", "label-feature"), ("feedback", "label-feedback")):
+        with mock.patch("feedback.requests.post", side_effect=fake_post):
+            _invoke({"action": "submit", "type": req_type, "message": "hi"})
+        assert seen["input"]["labelIds"] == ["label-source", type_label], req_type
+
+
+def test_source_label_unset_falls_back_to_type_label_only():
+    # Backward-compat guard: with no source marker configured, labelIds must
+    # reduce to exactly the per-type label (the pre-source-marker contract).
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["input"] = json["variables"]["input"]
+        return _FakeResp({"issueCreate": {"success": True, "issue": {"id": "i", "url": "https://linear.app/x/i"}}})
+
+    with mock.patch.dict(os.environ, {}, clear=False):
+        del os.environ["SCREENCAP_LINEAR_LABEL_SOURCE"]
+        with mock.patch("feedback.requests.post", side_effect=fake_post):
+            _invoke({"action": "submit", "type": "bug", "message": "hi"})
+    assert seen["input"]["labelIds"] == ["label-bug"]
 
 
 def test_prepare_then_submit_embeds_both_attachments():
@@ -179,6 +212,56 @@ def test_prepare_rejects_disallowed_content_type():
     _, payload = _invoke(
         {"action": "prepare", "attachments": [{"filename": "x.txt", "content_type": "text/plain", "size": 10}]}
     )
+    assert payload["error_kind"] == "invalid"
+
+
+def test_prepare_gcs_pathstyle_upload_url_passes_but_foreign_bucket_fails():
+    # U0 (SCR-281): the real workspace signs PUT URLs as
+    # storage.googleapis.com/uploads.linear.app/<path>. Any other GCS bucket
+    # must not be handed to the client as an upload target.
+    def fake_post_for(upload_url):
+        def fake_post(url, json=None, headers=None, timeout=None):
+            body = _upload_file(1)
+            body["fileUpload"]["uploadFile"]["uploadUrl"] = upload_url
+            return _FakeResp(body)
+
+        return fake_post
+
+    manifest = [{"filename": "a.png", "content_type": "image/png", "size": 1000}]
+    ok_url = "https://storage.googleapis.com/uploads.linear.app/ws/att/1?X-Goog-Expires=60"
+    with mock.patch("feedback.requests.post", side_effect=fake_post_for(ok_url)):
+        _, payload = _invoke({"action": "prepare", "attachments": manifest})
+    assert payload["ok"] is True
+    assert payload["uploads"][0]["uploadUrl"] == ok_url
+
+    # Foreign bucket as first path segment, and a dot-segment an RFC-3986
+    # client would collapse to another bucket after a raw prefix check passed.
+    for evil_url in (
+        "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1",
+        "https://storage.googleapis.com/uploads.linear.app/../attacker-bucket/1",
+    ):
+        with mock.patch("feedback.requests.post", side_effect=fake_post_for(evil_url)):
+            _, payload = _invoke({"action": "prepare", "attachments": manifest})
+        assert payload["ok"] is False, evil_url
+
+
+def test_submit_keeps_asseturl_on_the_narrow_host_allowlist():
+    # assetUrl stays uploads.linear.app-only (_host_allowed) even though
+    # uploadUrl now accepts the wider GCS path-style form. A GCS path-style
+    # assetUrl — correctly bucket-pinned, so it would pass the LOOSER
+    # _upload_target_allowed — must still be rejected at submit, guarding
+    # against a future swap of the two guards in _handle_submit.
+    gcs_asset = "https://storage.googleapis.com/uploads.linear.app/ws/att/1"
+    claim = feedback.mint_claim(gcs_asset, exp=9_999_999_999)
+    _, payload = _invoke(
+        {
+            "action": "submit",
+            "type": "bug",
+            "message": "hi",
+            "attachments": [{"assetUrl": gcs_asset, "claim": claim}],
+        }
+    )
+    assert payload["ok"] is False
     assert payload["error_kind"] == "invalid"
 
 
