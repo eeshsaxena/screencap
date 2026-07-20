@@ -1247,13 +1247,18 @@ def _run_local_segmentation(
         _record(branch)
         return
 
-    # KTD3 carve-out — drop any fresh AGENT task overlapping a PROTECTED span
-    # (source='user' OR a user-edited agent row) so that, after the scoped agent
-    # replace, no source='agent' span overlaps a protected one (the "agent
-    # auto-splits, you curate" invariant, R8). A no-op when there are no protected
-    # rows (the common finalize case). This lives in the shared body so the
-    # finalize and incremental paths cannot drift on the invariant.
-    tasks = _carve_out_protected_spans(ledger, tasks)
+    # Day-diary consolidation (U2): fold the fine per-window fragments into a
+    # handful of coherent, named diary BLOCKS with stable identity + same-day
+    # thread links, clamped at local midnight (KTD-1/2/5). The consolidator also
+    # owns the KTD-7 carve-out UPGRADE: it TRIMS agent block boundaries to abut a
+    # protected (user-curated) span cleanly instead of DROPPING the whole block.
+    # Lives in this shared body so the live and finalize paths share ONE
+    # consolidation (parity). Strictly fail-open: on any error it falls back to
+    # the legacy drop carve-out so tasks still persist safely and terminal never
+    # blocks.
+    tasks = _consolidate_into_blocks(
+        recording_dir, ledger, tasks, is_live=is_live, stop_event=stop_event,
+    )
     try:
         n = _persist_local_tasks(recording_dir, ledger, tasks)
     except Exception as exc:  # noqa: BLE001 — a persistence failure must not block
@@ -1360,6 +1365,110 @@ def _carve_out_protected_spans(
         t for t in task_list if isinstance(t, dict) and not _overlaps_protected(t)
     ]
     return {**tasks, "tasks": kept}
+
+
+def _local_tz_offset_s(ts: float) -> int:
+    """Seconds EAST of UTC for the machine's local tz at ``ts`` (DST-aware).
+
+    Matches ``day_segments.day_bounds``'s ``tz_offset_seconds`` convention so the
+    diary's midnight clamp (KTD-5) files a midnight-spanning block into the same
+    two days the day strip would. Fails open to UTC (offset 0) on any error.
+    """
+    try:
+        import datetime as _dt
+
+        off = _dt.datetime.fromtimestamp(ts).astimezone().utcoffset()
+        return int(off.total_seconds()) if off is not None else 0
+    except Exception:  # noqa: BLE001 — tz derivation must never block segmentation
+        return 0
+
+
+def _build_block_namer(recording_dir: Path):
+    """The on-device seam that names a MERGED diary block (U2, KTD-4).
+
+    Block consolidation rides the existing ON-DEVICE-only posture (consented
+    cloud is U3's DIARY_PROSE kind, not this). Only the Apple Foundation Models
+    backend exposes the ``call_name_window`` verb the block namer reuses, so this
+    returns an :class:`OnDeviceProvider` ONLY when the active provider is
+    on-device; otherwise ``None`` — merged blocks then take the honest UNNAMED
+    state (KTD-10). A ``None`` namer never spawns a helper. Test seam: patched in
+    the parity/wiring tests.
+    """
+    try:
+        from screencap import config
+
+        if config.get_llm_provider() != "on-device":
+            return None
+        from screencap.segmentation.providers.ondevice import OnDeviceProvider
+
+        return OnDeviceProvider(recording_dir=recording_dir)
+    except Exception as exc:  # noqa: BLE001 — namer build must never block segmentation
+        logger.debug(
+            "terminal_stage: block namer unavailable for %s (%s)",
+            recording_dir.name, exc,
+        )
+        return None
+
+
+def _consolidate_into_blocks(
+    recording_dir: Path,
+    ledger: "PipelineLedger | None",
+    tasks: dict,
+    *,
+    is_live: bool,
+    stop_event: "threading.Event | None" = None,
+) -> dict:
+    """Fold fine per-window fragments into named diary blocks (U2, the shared body).
+
+    Reads the recording's prior task rows (for the KTD-2 stable-identity match)
+    and its protected user/edited spans (for the KTD-7 trim), derives the local
+    tz offset for the KTD-5 midnight clamp, and runs the pure
+    :func:`screencap.segmentation.consolidate.consolidate` core with the
+    on-device block namer. Returns the tasks dict with its ``tasks`` list
+    replaced by the consolidated BLOCK dicts (``block_id`` / ``thread_id`` /
+    ``is_open`` set). Strictly fail-open: any error falls back to the legacy drop
+    carve-out (:func:`_carve_out_protected_spans`) so tasks still persist and
+    terminal never blocks.
+    """
+    if not isinstance(tasks, dict):
+        return tasks
+    task_list = tasks.get("tasks")
+    if not isinstance(task_list, list) or not task_list:
+        return tasks
+    try:
+        from screencap.pipeline_state import task_row_is_protected
+        from screencap.segmentation.consolidate import consolidate
+
+        prior_rows: list = []
+        protected: list[tuple[float, float]] = []
+        if ledger is not None:
+            prior_rows = ledger.read_task_segments()
+            protected = [
+                (r.start_ts, r.end_ts)
+                for r in prior_rows
+                if task_row_is_protected(r)
+            ]
+        tz_offset = _local_tz_offset_s(
+            float(min(t.get("start_ts", 0.0) for t in task_list if isinstance(t, dict)))
+        )
+        blocks = consolidate(
+            task_list,
+            prior_rows=prior_rows,
+            protected_spans=protected,
+            tz_offset_s=tz_offset,
+            is_live=is_live,
+            recording_name=recording_dir.name,
+            namer=_build_block_namer(recording_dir),
+            stop_event=stop_event,
+        )
+        return {**tasks, "tasks": blocks}
+    except Exception as exc:  # noqa: BLE001 — consolidation must never block terminal
+        logger.warning(
+            "terminal_stage: block consolidation failed for %s (%s); "
+            "falling back to the drop carve-out",
+            recording_dir.name, exc,
+        )
+        return _carve_out_protected_spans(ledger, tasks)
 
 
 def _segment_local_tasks(
@@ -1732,11 +1841,17 @@ def _persist_local_tasks(
                 confidence=t.get("confidence"),
                 metadata=json.dumps({
                     k: t[k]
-                    for k in ("description", "apps_used", "derived_name")
+                    for k in ("description", "apps_used", "derived_name",
+                              "name_fallback")
                     if k in t
                 }) or None,
                 source=TASK_SOURCE_AGENT,
                 edited=False,
+                # Day-diary block columns (U2): opaque stable identity, same-day
+                # thread membership, and the STORED live-trailing flag.
+                block_id=t.get("block_id"),
+                thread_id=t.get("thread_id"),
+                is_open=bool(t.get("is_open")),
             )
             for i, t in enumerate(task_list)
         ]

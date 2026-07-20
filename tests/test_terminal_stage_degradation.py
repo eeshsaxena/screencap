@@ -320,7 +320,7 @@ def test_unavailable_no_cloud_falls_back_to_heuristic(tmp_path, monkeypatch):
     assert tasks_path.is_file()
     persisted = json.loads(tasks_path.read_text())
     assert len(persisted["tasks"]) == 2
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     assert persisted["summary"]["source"] == "idle_gap_heuristic"
     # Boundaries reflect the two seeded clusters (base=1000 + offsets).
     assert persisted["tasks"][0]["start_ts"] == 1000.0 + _CLUSTER_A[0]
@@ -328,7 +328,7 @@ def test_unavailable_no_cloud_falls_back_to_heuristic(tmp_path, monkeypatch):
 
     ledger = PipelineLedger(rec_dir / "recording.db")
     segs = ledger.read_task_segments()
-    assert [s.name for s in segs] == ["task_1", "task_2"]
+    assert [s.name for s in segs] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     assert [s.task_index for s in segs] == [0, 1]
 
     assert result.tasks_persisted == 2
@@ -379,7 +379,7 @@ def test_unavailable_summary_consent_off_stays_heuristic_never_cloud(
     # Heuristic produced the tasks; provider consulted exactly once (on-device).
     assert len(fake.calls) == 1
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     assert persisted["summary"]["source"] == "idle_gap_heuristic"
     assert result.tasks_persisted == 2
 
@@ -574,7 +574,7 @@ def test_summary_cloud_declines_falls_through_to_heuristic(tmp_path, monkeypatch
     assert len(cloud.calls) == 1  # the cloud path WAS tried first.
     persisted = json.loads((rec_dir / "tasks.json").read_text())
     # Fell through to the heuristic's mechanical names.
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     assert persisted["summary"]["source"] == "idle_gap_heuristic"
     assert result.tasks_persisted == 2
 
@@ -594,7 +594,7 @@ def test_summary_cloud_unavailable_falls_through_to_heuristic(tmp_path, monkeypa
     result = _run_terminal(rec_dir)
 
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     assert persisted["summary"]["source"] == "idle_gap_heuristic"
     assert result.tasks_persisted == 2
 
@@ -618,7 +618,7 @@ def test_summary_cloud_provider_raising_fails_open_to_heuristic(tmp_path, monkey
     result = _run_terminal(rec_dir)
 
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     assert result.tasks_persisted == 2
 
 
@@ -861,7 +861,7 @@ def test_day_split_heuristic_builds_no_frames(tmp_path, monkeypatch):
     _run_terminal(rec_dir)
 
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
 
 
 @pytest.mark.privacy
@@ -980,7 +980,7 @@ def test_partial_pass_records_partial_with_detail_and_skips_cloud_fallback(
 
     assert cloud.calls == []  # partial ≠ unavailable → no cloud-summary fallback.
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["Draft launch email", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["Draft launch email", ""]  # U2: the mechanical fill is an UNNAMED block
     ledger = PipelineLedger(rec_dir / "recording.db")
     assert ledger.get_recording_outcome() == "produced_tasks_partial"
     assert ledger.get_recording_outcome_detail() == "context-window"
@@ -1025,7 +1025,7 @@ def test_unavailable_sentinel_records_mechanical_with_distinct_detail(
 
     assert len(cloud.calls) == 1  # true unavailability DOES consult cloud.
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["task_1", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["", ""]  # U2: mechanical task_N never surfaces; honest UNNAMED blocks
     ledger = PipelineLedger(rec_dir / "recording.db")
     assert ledger.get_recording_outcome() == "mechanical_only"
     assert ledger.get_recording_outcome_detail() == "context-window"
@@ -1153,7 +1153,7 @@ def test_live_sequence_produced_then_mixed_recomputes_to_partial(
     assert ledger.get_recording_outcome_detail() == "decoding-failure"
     # The mixed pass IS persisted (partial keeps its model names + mechanical fill).
     persisted = json.loads((rec_dir / "tasks.json").read_text())
-    assert [t["name"] for t in persisted["tasks"]] == ["Draft launch email", "task_2"]
+    assert [t["name"] for t in persisted["tasks"]] == ["Draft launch email", ""]  # U2: the mechanical fill is an UNNAMED block
 
 
 @pytest.mark.privacy
@@ -1174,7 +1174,7 @@ def test_mechanical_pass_never_overwrites_partial_rows(tmp_path, monkeypatch):
     ts.run_incremental_segmentation(rec_dir)
     assert ledger.get_recording_outcome() == "produced_tasks_partial"
     rows_before = [s.name for s in ledger.read_task_segments()]
-    assert rows_before == ["Draft launch email", "task_2"]
+    assert rows_before == ["Draft launch email", ""]  # U2: the mechanical fill is an UNNAMED block
 
     # Next live tick degrades all the way to the heuristic (provider unavailable).
     _install_provider(

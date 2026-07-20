@@ -520,6 +520,12 @@ class Supervisor:
         # unreadable) fails OPEN — the pass runs — so we only skip on positive
         # evidence nothing changed.
         self._last_segmentation_key: tuple[Any, ...] | None = None
+        # Day-diary consolidation (U2, KTD-6) rides the SAME tick but with its OWN
+        # staleness key, distinct from the per-window-naming key above: consolidation
+        # re-runs when completed-manifest state or kept-curation state changes, and
+        # must NOT re-run on an unchanged tick. (U4's narrative fingerprint is a
+        # further, separate seam layered on top of this.)
+        self._last_consolidation_key: tuple[Any, ...] | None = None
         # Set at the top of ``shutdown`` so a torn-down daemon never re-arms.
         self._shutting_down = False
 
@@ -2307,11 +2313,23 @@ class Supervisor:
         recording_dir = self._active_ambient_dir()
         if recording_dir is None:
             return
+        # Two staleness keys ride this one tick, each fail-open (``None`` -> run):
+        # the per-window-naming key AND the day-diary consolidation key (KTD-6).
+        # The shared incremental pass (which runs BOTH naming and consolidation)
+        # runs when EITHER changed, and both are skipped only when BOTH are
+        # positively unchanged — so an unchanged tick never re-runs consolidation.
         key = self._segmentation_fingerprint(recording_dir)
-        if key is not None and key == self._last_segmentation_key:
+        consolidation_key = self._consolidation_fingerprint(recording_dir)
+        seg_unchanged = key is not None and key == self._last_segmentation_key
+        cons_unchanged = (
+            consolidation_key is not None
+            and consolidation_key == self._last_consolidation_key
+        )
+        if seg_unchanged and cons_unchanged:
             return
         await self._run_incremental_segmentation(recording_dir)
         self._last_segmentation_key = key
+        self._last_consolidation_key = consolidation_key
 
     def _segmentation_fingerprint(
         self, recording_dir: Path
@@ -2341,6 +2359,31 @@ class Supervisor:
         except (OSError, ValueError, IndexError):
             return None
         return (recording_dir.name, count, highest_index, max_mtime, kept)
+
+    def _consolidation_fingerprint(
+        self, recording_dir: Path
+    ) -> "tuple[Any, ...] | None":
+        """The day-diary consolidation staleness key (U2, KTD-6).
+
+        Delegates to the pure :func:`screencap.segmentation.consolidate.
+        consolidation_fingerprint` so the cadence rule is unit-tested there and
+        cannot drift from the consolidator. Distinct from
+        :meth:`_segmentation_fingerprint` (KTD-6): today the two share the same
+        completed-manifest + kept-curation shape, but keeping a SEPARATE key +
+        tracker leaves U4's narrative fingerprint a clean seam and lets
+        consolidation's cadence evolve independently of per-window naming.
+        ``None`` fails open (run the pass).
+        """
+        try:
+            from screencap.segmentation.consolidate import consolidation_fingerprint
+
+            return consolidation_fingerprint(recording_dir)
+        except Exception:  # noqa: BLE001 — a fingerprint error fails open (run the pass)
+            logger.debug(
+                "consolidation fingerprint failed open for %s", recording_dir,
+                exc_info=True,
+            )
+            return None
 
     def _kept_task_row_count(self, recording_dir: Path) -> int:
         """Count the recording's KEPT (user/edited) task rows for the change-key (U6).
