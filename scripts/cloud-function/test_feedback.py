@@ -182,6 +182,31 @@ def test_prepare_rejects_disallowed_content_type():
     assert payload["error_kind"] == "invalid"
 
 
+def test_prepare_gcs_pathstyle_upload_url_passes_but_foreign_bucket_fails():
+    # U0 (SCR-281): the real workspace signs PUT URLs as
+    # storage.googleapis.com/uploads.linear.app/<path>. Any other GCS bucket
+    # must not be handed to the client as an upload target.
+    def fake_post_for(upload_url):
+        def fake_post(url, json=None, headers=None, timeout=None):
+            body = _upload_file(1)
+            body["fileUpload"]["uploadFile"]["uploadUrl"] = upload_url
+            return _FakeResp(body)
+
+        return fake_post
+
+    manifest = [{"filename": "a.png", "content_type": "image/png", "size": 1000}]
+    ok_url = "https://storage.googleapis.com/uploads.linear.app/ws/att/1?X-Goog-Expires=60"
+    with mock.patch("feedback.requests.post", side_effect=fake_post_for(ok_url)):
+        _, payload = _invoke({"action": "prepare", "attachments": manifest})
+    assert payload["ok"] is True
+    assert payload["uploads"][0]["uploadUrl"] == ok_url
+
+    evil_url = "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1"
+    with mock.patch("feedback.requests.post", side_effect=fake_post_for(evil_url)):
+        _, payload = _invoke({"action": "prepare", "attachments": manifest})
+    assert payload["ok"] is False
+
+
 # --------------------------------------------------------------------------
 # Transport guard (KTD-6)
 # --------------------------------------------------------------------------

@@ -65,10 +65,12 @@ Deploy (project: proteus-photos, region: southamerica-east1):
     # Watch Linear storage usage — orphaned prepare-without-submit uploads are
     # the expected abuse signature.
 
-NOTE (U0 / KTD-3): the Linear upload-host allowlist and the ``fileUpload`` size
-acceptance are pending the U0 pre-flight spike against the real workspace. If the
-spike finds a different asset host or a hard size cap, update
-``LINEAR_UPLOAD_HOSTS`` / the caps here AND the mirror in
+U0 spike results (SCR-281, run 2026-07-20 against the real workspace): 25 MiB
+``.mov``, ``.png`` and ``.heic`` uploads all accepted, so the caps stand;
+assetUrls live on ``uploads.linear.app`` but signed PUT URLs are GCS
+path-style (``storage.googleapis.com/uploads.linear.app/...``) — see
+``_upload_target_allowed``; the signed upload URL expires 60 s after minting,
+which set ``CLAIM_TTL_SECONDS`` below. Constants stay mirrored in
 ``src/screencap/feedback.py`` (the CLI↔relay equality test pins them).
 """
 
@@ -111,9 +113,17 @@ ALLOWED_CONTENT_TYPES = frozenset(
     }
 )
 
-# Hosts an attachment assetUrl / uploadUrl may point at. Pending U0 confirmation
-# against the real workspace (Linear serves assets from uploads.linear.app).
+# Hosts an attachment assetUrl may point at. Confirmed by the U0 spike
+# (SCR-281) against the real workspace: assetUrls are served from
+# uploads.linear.app.
 LINEAR_UPLOAD_HOSTS = frozenset({"uploads.linear.app"})
+
+# U0 finding (SCR-281): the real workspace signs PUT URLs in GCS path style —
+# https://storage.googleapis.com/uploads.linear.app/<path> — so the upload
+# target is allowed EITHER on the Linear host or on GCS pinned to Linear's
+# bucket path. assetUrls stay uploads.linear.app-only (LINEAR_UPLOAD_HOSTS).
+LINEAR_UPLOAD_GCS_HOST = "storage.googleapis.com"
+LINEAR_UPLOAD_GCS_PREFIX = "/uploads.linear.app/"
 
 # Request-type enum -> the env var naming its Linear label id.
 REQUEST_TYPES = {
@@ -124,7 +134,13 @@ REQUEST_TYPES = {
 
 MAX_MESSAGE_CHARS = 10_000
 MAX_BODY_BYTES = 64 * 1024                  # JSON control plane only; no file bytes
-CLAIM_TTL_SECONDS = 60 * 60                 # 60 min (KTD-3) — honest slow-uplink path
+# U0 finding (SCR-281): Linear's signed upload URL must be USED within 60 s of
+# minting (X-Goog-Expires=60; GCS checks the signature when the PUT request
+# arrives, so an already-started slow stream may finish). A 60-min claim would
+# outlive the upload session by an hour for no benefit; 10 min covers the PUT
+# start window + streaming + submit retries. ``expired`` stays retryable — the
+# client re-prepares.
+CLAIM_TTL_SECONDS = 10 * 60
 
 # Per-IP budgets (KTD-6). Best-effort per-instance-lifetime.
 RATE_WINDOW_SECONDS = 60 * 60
@@ -215,6 +231,23 @@ def _host_allowed(url: str) -> bool:
     except ValueError:
         return False
     return parts.scheme == "https" and parts.hostname in LINEAR_UPLOAD_HOSTS
+
+
+def _upload_target_allowed(url: str) -> bool:
+    """True iff ``url`` may receive attachment bytes: https on a Linear upload
+    host, or GCS path-style pinned to Linear's bucket (either way, bytes can
+    only land in Linear-controlled storage)."""
+    if _host_allowed(url):
+        return True
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "https"
+        and parts.hostname == LINEAR_UPLOAD_GCS_HOST
+        and parts.path.startswith(LINEAR_UPLOAD_GCS_PREFIX)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -479,7 +512,7 @@ def _handle_prepare(body: dict, ip: str, now: float) -> dict:
         upload_file = _linear_file_upload(entry["content_type"], filename, entry["size"])
         asset_url = upload_file.get("assetUrl", "")
         upload_url = upload_file.get("uploadUrl", "")
-        if not _host_allowed(asset_url) or not _host_allowed(upload_url):
+        if not _host_allowed(asset_url) or not _upload_target_allowed(upload_url):
             # Linear returned an unexpected host — fail rather than mint a claim.
             raise _err("server", "something went wrong", 502)
         uploads.append(
