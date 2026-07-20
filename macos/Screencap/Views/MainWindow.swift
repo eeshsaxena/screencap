@@ -273,11 +273,11 @@ struct MainWindow: View {
         }
         .onChange(of: route) { newValue in
             // U4 (origin-aware back): remember the primary surface a day page can
-            // be opened FROM — Days, Tasks, or Chat — so `onBack` returns there.
+            // be opened FROM — Days, Moments, or Chat — so `onBack` returns there.
             // The day page (`.timeline`) and the settings routes never become an
             // origin, so a back-out never lands on a settings pane.
             switch newValue {
-            case .days, .tasks, .chat:
+            case .days, .moments, .chat:
                 lastNonTimelineRoute = newValue
             default:
                 break
@@ -700,21 +700,18 @@ struct MainWindow: View {
                 onOpenSearch: { showingPalette = true },
                 onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs, highlight: nil) }
             )
-        case .tasks:
-            // U6: the cross-day Tasks surface — reverse-chronological named task
-            // segments (R4), a local free-tier filter, inline curation (R12), and
-            // honest zero states (R21). A row click opens its day page seeked to
-            // the task span with the band highlighted (AE3).
-            TasksView(
+        case .moments:
+            // Moments — the merged surface (Tasks + Clips): one cross-day list of
+            // app-detected spans and the ranges you clipped, interleaved by footage
+            // time, with the clipped ones marked and filterable (R1–R7). A row click
+            // opens its day page seeked to the span with the band highlighted (AE3);
+            // clipped rows play / export / share / delete in place (R4).
+            MomentsView(
                 onOpenTimeline: { day, seekMs, highlight in
                     route = .timeline(day: day, seekMs: seekMs, highlight: highlight)
                 },
                 onOpenIntelligence: { route = .intelligence }
             )
-        case .clips:
-            // U11: the Clips surface — durable clips kept from a day's range, with
-            // local playback, Export a copy, Share, and a no-undo Delete (R11/R20).
-            ClipsView()
         case .appRules:
             // U13: the prototype App rules pane.
             AppRulesView()

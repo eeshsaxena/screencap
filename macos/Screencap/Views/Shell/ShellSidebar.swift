@@ -6,13 +6,14 @@ import SwiftUI
 /// `timeline` has no sidebar row — it is reached from Days cards and citations,
 /// optionally carrying a wall-clock seek anchor.
 ///
-/// Day-first restructure (R1): the four primary destinations are Days · Tasks ·
-/// Clips · Chat. `tasks` and `clips` render honest placeholders until their
-/// surfaces land (U6/U11); `days` is the default landing surface (R2).
+/// Day-first restructure (R1): the three primary destinations are Days ·
+/// Moments · Chat. `moments` merges the former Tasks and Clips surfaces into one
+/// cross-day list; `days` is the default landing surface (R2).
 enum ShellRoute: Hashable {
     case days
-    case tasks
-    case clips
+    /// The merged Moments surface (Tasks + Clips): one cross-day list of
+    /// app-detected spans and the ranges the user clipped (R1).
+    case moments
     /// The Account & Plan pane (account-sheet U5, KTD-4): the Settings entry
     /// renders the shared `AccountSheetView` as an embedded pane — sheet
     /// presentation is reserved for the gate and upload entries.
@@ -72,13 +73,14 @@ struct ShellNavItem: Identifiable, Hashable {
 /// out of the view so U4's routing / stub / footer rules are directly assertable.
 enum ShellSidebarModel {
 
-    /// The four primary destinations (R1): Days · Tasks · Clips · Chat. Days is
-    /// the default landing surface (R2); Tasks and Clips render honest "coming in
-    /// this update" placeholders until U6/U11 land.
+    /// The three primary destinations (R1): Days · Moments · Chat. Days is the
+    /// default landing surface (R2); Moments merges the former Tasks and Clips
+    /// surfaces into one cross-day list.
     static let primaryNav: [ShellNavItem] = [
         ShellNavItem(id: "days", label: "Days", route: .days, availability: .enabled),
-        ShellNavItem(id: "tasks", label: "Tasks", route: .tasks, availability: .enabled),
-        ShellNavItem(id: "clips", label: "Clips", route: .clips, availability: .enabled),
+        // Moments — app-detected task spans and the ranges you clipped, in one
+        // cross-day list interleaved by footage time (R1–R7).
+        ShellNavItem(id: "moments", label: "Moments", route: .moments, availability: .enabled),
         // Chat — ask about your recorded history and get a grounded answer with
         // the real moments as sources.
         ShellNavItem(id: "chat", label: "Chat", route: .chat, availability: .enabled),
