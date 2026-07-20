@@ -27,6 +27,7 @@ def relay_env():
             "LINEAR_API_KEY": "lin_api_test",
             "SCREENCAP_LINEAR_TEAM_ID": "team-123",
             "SCREENCAP_LINEAR_TRIAGE_STATE_ID": "state-triage",
+            "SCREENCAP_LINEAR_LABEL_SOURCE": "label-source",
             "SCREENCAP_LINEAR_LABEL_BUG": "label-bug",
             "SCREENCAP_LINEAR_LABEL_FEEDBACK": "label-feedback",
             "SCREENCAP_LINEAR_LABEL_FEATURE": "label-feature",
@@ -117,9 +118,25 @@ def test_submit_text_only_creates_issue():
     variables = calls[0]["variables"]["input"]
     assert variables["teamId"] == "team-123"
     assert variables["stateId"] == "state-triage"
-    assert variables["labelIds"] == ["label-bug"]
+    # Source marker leads, then the per-type label.
+    assert variables["labelIds"] == ["label-source", "label-bug"]
     assert variables["title"] == "[Bug] It crashed"
     assert "Report metadata" in variables["description"]
+
+
+def test_source_marker_label_applied_to_every_type():
+    # Every relay-created issue carries the in-app-feedback source marker
+    # regardless of request type, so maintainers can filter user submissions.
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["input"] = json["variables"]["input"]
+        return _FakeResp({"issueCreate": {"success": True, "issue": {"id": "i", "url": "https://linear.app/x/i"}}})
+
+    for req_type, type_label in (("feature", "label-feature"), ("feedback", "label-feedback")):
+        with mock.patch("feedback.requests.post", side_effect=fake_post):
+            _invoke({"action": "submit", "type": req_type, "message": "hi"})
+        assert seen["input"]["labelIds"] == ["label-source", type_label], req_type
 
 
 def test_prepare_then_submit_embeds_both_attachments():

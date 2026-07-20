@@ -28,12 +28,24 @@ be done. They are ordered by what unblocks what.
 
 - **U6 — Deploy + configure.** Provision the dedicated least-privilege Linear
   account + scoped API key, the `screencap-feedback` runtime service account, and
-  `FEEDBACK_HMAC_KEY` (`openssl rand -base64 32`); resolve `teamId`, Triage
-  `stateId`, and the three label ids; deploy per the docstring in `feedback.py`
-  (`--max-instances=2`, `--set-secrets`, `--service-account`); add the runbook
-  lines (key revocation, HMAC rotation, storage-abuse watch). Needs GCP deploy
-  access + Linear admin. The operational half depends only on the relay (U1,
-  done) — it can run in parallel with the Swift work.
+  `FEEDBACK_HMAC_KEY` (`openssl rand -base64 32`); deploy per the docstring in
+  `feedback.py` (`--max-instances=2`, `--set-secrets`, `--service-account`); add
+  the runbook lines (key revocation, HMAC rotation, storage-abuse watch). Needs
+  GCP deploy access + Linear admin. The operational half depends only on the
+  relay (U1, done) — it can run in parallel with the Swift work.
+
+  **Config ids resolved (SCR-281, 2026-07-20).** All routing ids are pinned in
+  `feedback.py`'s deploy docstring. Two real-workspace gotchas were handled:
+  (1) the Screencap team has **no "Triage" workflow state**, so issues land in
+  **Backlog** (`SCREENCAP_LINEAR_TRIAGE_STATE_ID` = the Backlog state id);
+  (2) there was **no "Feedback" label** and no source marker — a `Feedback`
+  type label and an `in-app-feedback` source-marker label were created, and the
+  relay now applies the source marker (`SCREENCAP_LINEAR_LABEL_SOURCE`) to
+  **every** relay issue alongside its Bug/Feedback/Feature type label. Remaining
+  human-only steps: create the Linear account+key, `printf … | gcloud secrets
+  create LINEAR_API_KEY` (so the key never transits a tool), then run the
+  docstring deploy. The SA + `FEEDBACK_HMAC_KEY` secret + IAM bindings + deploy
+  are scriptable once the key secret exists.
 
 ## Swift UI units (were blocked on a safe build environment)
 

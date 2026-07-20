@@ -46,8 +46,16 @@ Deploy (project: proteus-photos, region: southamerica-east1):
     # Generate the HMAC secret with real entropy (a weak value makes claims
     # offline-forgeable):  openssl rand -base64 32 | gcloud secrets create FEEDBACK_HMAC_KEY --data-file=-
     #
-    # Resolve the routing ids once against the workspace (dedicated account key):
-    #   LINEAR_TEAM_ID / LINEAR_TRIAGE_STATE_ID / the three label ids.
+    # Routing ids resolved against the real Screencap team (SCR-281 U0). Issues
+    # land in Backlog and always carry the in-app-feedback source marker
+    # (SCREENCAP_LINEAR_LABEL_SOURCE) plus their per-type label. NOTE: the team
+    # has no "Triage" workflow state, so TRIAGE_STATE_ID points at Backlog.
+    #   SCREENCAP_LINEAR_TEAM_ID         = f3bbac41-0ec3-4f2e-ae0b-96fed6ff624f  (Screencap)
+    #   SCREENCAP_LINEAR_TRIAGE_STATE_ID = c825fa67-c31e-421c-a5f9-ab2aef7ef5f5  (Backlog)
+    #   SCREENCAP_LINEAR_LABEL_SOURCE    = b0a3860f-12cd-4831-ade2-a787f46729a3  (in-app-feedback)
+    #   SCREENCAP_LINEAR_LABEL_BUG       = fc126e8e-a621-4acb-b326-05f1c047dbf4  (Bug)
+    #   SCREENCAP_LINEAR_LABEL_FEEDBACK  = 5307398b-3a47-462b-be99-63a38b941001  (Feedback)
+    #   SCREENCAP_LINEAR_LABEL_FEATURE   = 0948a8cf-bb9b-4df4-a190-96b70ea3e905  (Feature)
     #
     gcloud functions deploy submit-feedback \
         --project proteus-photos --gen2 --runtime python312 \
@@ -58,7 +66,7 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --service-account screencap-feedback@proteus-photos.iam.gserviceaccount.com \
         --max-instances 2 --memory 256Mi \
         --set-secrets LINEAR_API_KEY=LINEAR_API_KEY:latest,FEEDBACK_HMAC_KEY=FEEDBACK_HMAC_KEY:latest \
-        --set-env-vars SCREENCAP_LINEAR_TEAM_ID=...,SCREENCAP_LINEAR_TRIAGE_STATE_ID=...,SCREENCAP_LINEAR_LABEL_BUG=...,SCREENCAP_LINEAR_LABEL_FEEDBACK=...,SCREENCAP_LINEAR_LABEL_FEATURE=...
+        --set-env-vars SCREENCAP_LINEAR_TEAM_ID=f3bbac41-0ec3-4f2e-ae0b-96fed6ff624f,SCREENCAP_LINEAR_TRIAGE_STATE_ID=c825fa67-c31e-421c-a5f9-ab2aef7ef5f5,SCREENCAP_LINEAR_LABEL_SOURCE=b0a3860f-12cd-4831-ade2-a787f46729a3,SCREENCAP_LINEAR_LABEL_BUG=fc126e8e-a621-4acb-b326-05f1c047dbf4,SCREENCAP_LINEAR_LABEL_FEEDBACK=5307398b-3a47-462b-be99-63a38b941001,SCREENCAP_LINEAR_LABEL_FEATURE=0948a8cf-bb9b-4df4-a190-96b70ea3e905
 
     # Runbook: rotate LINEAR_API_KEY via Linear settings + redeploy; rotating
     # FEEDBACK_HMAC_KEY voids unexpired claims (clients simply re-prepare).
@@ -497,8 +505,14 @@ def _linear_create_issue(title: str, description: str, label_id: str) -> dict:
         "title": title,
         "description": description,
     }
-    if label_id:
-        issue_input["labelIds"] = [label_id]
+    # Every relay-created issue carries the source marker label (so maintainers
+    # can see at a glance the issue came from a user's in-app submission, not an
+    # internally-filed ticket) plus its per-request-type label. Source first so
+    # it reads as the primary tag.
+    source_label = os.environ.get("SCREENCAP_LINEAR_LABEL_SOURCE", "")
+    label_ids = [lid for lid in (source_label, label_id) if lid]
+    if label_ids:
+        issue_input["labelIds"] = label_ids
     data = _linear_post(_ISSUE_CREATE_QUERY, {"input": issue_input})
     created = data.get("issueCreate") or {}
     if not created.get("success"):
