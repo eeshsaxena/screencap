@@ -304,6 +304,26 @@ def select_mic_source(
     return Selection(ACTION_SKIP, None, REASON_FALLBACK_SKIP)
 
 
+def resolve_open_target(
+    devices: list[InputDevice], default_index: int | None, prefer_builtin: bool
+) -> tuple[int | None, bool, str]:
+    """Combine :func:`select_mic_source` with concrete-default-index pinning.
+
+    Returns ``(device_index_or_None, skip, reason)`` for the stream factory. When
+    the policy says "use the OS default", this pins to the default's *concrete*
+    index if it is visible in the classified list — so an already-open stream
+    cannot drift onto a newly-connected AirPods (KTD-3) — falling back to the true
+    default (``None``) only when the index is unknown (e.g. fail-open).
+    """
+    sel = select_mic_source(devices, default_index, prefer_builtin)
+    if sel.action == ACTION_SKIP:
+        return (None, True, sel.reason)
+    if sel.action == ACTION_DEVICE:
+        return (sel.index, False, sel.reason)
+    known = default_index is not None and any(d.index == default_index for d in devices)
+    return (default_index if known else None, False, sel.reason)
+
+
 def _find(devices: list[InputDevice], index: int | None) -> InputDevice | None:
     if index is None:
         return None

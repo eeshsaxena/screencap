@@ -109,6 +109,30 @@ def test_virtual_device_is_not_a_redirect_target():
     assert sel == ad.Selection(ACTION_SKIP, None, REASON_FALLBACK_SKIP)
 
 
+# --- resolve_open_target: selection + concrete-index pinning ----------------
+
+def test_resolve_open_target_redirect_returns_device_index():
+    devices = [_dev(2, "bluetooth"), _dev(1, "builtin")]
+    assert ad.resolve_open_target(devices, 2, True) == (1, False, REASON_REDIRECT)
+
+
+def test_resolve_open_target_skip():
+    devices = [_dev(2, "bluetooth")]
+    assert ad.resolve_open_target(devices, 2, True) == (None, True, REASON_FALLBACK_SKIP)
+
+
+def test_resolve_open_target_pins_concrete_default_index():
+    """R2/KTD-3: the non-Bluetooth default is opened by its concrete index, not None,
+    so an already-open stream can't drift onto a newly-connected AirPods."""
+    devices = [_dev(1, "builtin")]
+    assert ad.resolve_open_target(devices, 1, True) == (1, False, REASON_DEFAULT)
+
+
+def test_resolve_open_target_falls_back_to_true_default_when_index_unknown():
+    """Fail-open (empty classification / unknown default) → device=None (true default)."""
+    assert ad.resolve_open_target([], 1, True) == (None, False, REASON_DEFAULT)
+
+
 # --- classify_input_devices: the CoreAudio -> PortAudio join ----------------
 
 def test_classify_joins_portaudio_and_coreaudio(monkeypatch):

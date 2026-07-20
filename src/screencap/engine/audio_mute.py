@@ -68,9 +68,25 @@ class AudioStreamController:
         started with audio on (and is not paused). If it started muted or paused,
         acquire nothing."""
         if not self._muted and not self._paused:
-            self._stream = self._make_stream()
-            self._stream.start()
-            self._capturing = True
+            self._open_and_start()
+
+    def _open_and_start(self) -> bool:
+        """Construct + start a stream; return True if capturing, False if the
+        mic-source policy chose to skip (the factory returned ``None``).
+
+        A skip leaves the controller not-capturing with no stream — the same
+        shape as a muted / audio-off recording (SCR-288 KTD-4) — so callers report
+        no confirmed transition and any open muted interval stays open. A factory
+        that *raises* (denied device) propagates, leaving state unchanged."""
+        stream = self._make_stream()
+        if stream is None:
+            self._stream = None
+            self._capturing = False
+            return False
+        self._stream = stream
+        self._stream.start()
+        self._capturing = True
+        return True
 
     def apply_muted(self, muted: bool) -> str | None:
         """Idempotently drive the stream toward ``muted``.
@@ -98,15 +114,24 @@ class AudioStreamController:
         if self._paused:
             self._muted = False
             return None
-        # Acquire lazily on first use, then start. If _make_stream raises,
-        # _muted is left unchanged (still muted) — no partial "unmuted" state.
+        # Acquire on unmute. Re-run the factory whenever there is no live stream
+        # (first unmute, or a prior open that skipped) so the SCR-288 mic-source
+        # policy is re-evaluated at each open (R7). A retained *stopped* stream
+        # (a plain mute→unmute) is reused as-is — already bound to the right
+        # device. If _make_stream raises, _muted is left unchanged (still muted).
         if not self._capturing:
-            if self._stream is None:
-                self._stream = self._make_stream()  # opens the device (may raise)
-            self._stream.start()
-            self._capturing = True
+            if self._stream is not None:
+                self._stream.start()
+                self._capturing = True
+                self._muted = False
+                return EVENT_UNMUTED
+            if self._open_and_start():
+                self._muted = False
+                return EVENT_UNMUTED
+            # Policy skipped: clear the mute intent but report no transition —
+            # capture stays off (protect Bluetooth playback).
             self._muted = False
-            return EVENT_UNMUTED
+            return None
         self._muted = False
         return None
 
@@ -135,12 +160,17 @@ class AudioStreamController:
             self._paused = False
             return None
         if not self._capturing:
-            if self._stream is None:
-                self._stream = self._make_stream()  # opens the device (may raise)
-            self._stream.start()
-            self._capturing = True
+            if self._stream is not None:
+                self._stream.start()
+                self._capturing = True
+                self._paused = False
+                return EVENT_RESUMED
+            if self._open_and_start():
+                self._paused = False
+                return EVENT_RESUMED
+            # Policy skipped on resume: stay not-capturing, report no transition.
             self._paused = False
-            return EVENT_RESUMED
+            return None
         self._paused = False
         return None
 
