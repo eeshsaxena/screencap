@@ -206,6 +206,9 @@ struct ShellLogoMark: View {
 struct ShellSidebarView: View {
     @Binding var route: ShellRoute
     let recordings: [RecordingSummary]
+    /// Feedback U5: presents the in-app feedback sheet (owned by MainWindow,
+    /// KTD-8) — the main-window sibling of the menu-bar "Send Feedback…" item.
+    var onSendFeedback: () -> Void
     var onReplayOnboarding: () -> Void
 
     /// Injected app-wide (ScreenCapApp) — drives the SCR-239 local-intelligence
@@ -382,6 +385,13 @@ struct ShellSidebarView: View {
             Text(ShellSidebarModel.storageFooter(recordings).line)
                 .font(SCTypography.mono(size: 11))
                 .foregroundStyle(Color.scInkMuted)
+            Button(action: onSendFeedback) {
+                Text("Send feedback")
+                    .font(SCTypography.sans(size: 12))
+                    .underline()
+                    .foregroundStyle(Color.scInkMuted)
+            }
+            .buttonStyle(.plain)
             Button(action: onReplayOnboarding) {
                 Text("Replay onboarding")
                     .font(SCTypography.sans(size: 12))

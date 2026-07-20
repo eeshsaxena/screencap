@@ -21,6 +21,12 @@ extension Notification.Name {
     /// `.account` sidebar route (the embedded Account & Plan pane — no
     /// menu-bar sheet).
     static let screenCapOpenAccountPane = Notification.Name("com.screencap.accountPane.open")
+
+    /// Feedback U5 (KTD-8) — posted by the menu-bar "Send Feedback…" item after
+    /// focusing/opening the main window; MainWindow observes it and presents
+    /// the feedback sheet. Same bridge pattern as the Search item — no new
+    /// window scene (the `WindowGroup` singleton pitfall).
+    static let screenCapOpenFeedbackForm = Notification.Name("com.screencap.feedbackForm.open")
 }
 
 /// Menu bar dropdown — Start Recording, Stop, account, Open ScreenCap,
@@ -130,6 +136,14 @@ struct MenuBarMenu: View {
             NotificationCenter.default.post(name: .screenCapOpenRecallPalette, object: nil)
         }
         .keyboardShortcut("f", modifiers: [.command, .shift])
+
+        Button("Send Feedback…") {
+            // Feedback U5: open (or focus) the main window, then present the
+            // feedback sheet via the notification bridge (KTD-8) — works from
+            // the zero-window .accessory state like the Search item.
+            openMainWindow()
+            NotificationCenter.default.post(name: .screenCapOpenFeedbackForm, object: nil)
+        }
 
         Divider()
 

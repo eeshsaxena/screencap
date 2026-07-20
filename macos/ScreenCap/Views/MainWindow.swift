@@ -217,6 +217,13 @@ struct MainWindow: View {
     @State private var didEvaluateSearchDisclosure = false
     @State private var searchRetentionDays = 30
     @StateObject private var searchDisclosure = SearchDisclosureController()
+    /// Feedback U4/U5 (KTD-8): the in-app feedback sheet. The controller is
+    /// owned here — above the sheet — so the draft survives dismissal for the
+    /// session (no disk persistence, deliberate v1 exclusion). Presented from
+    /// the sidebar affordance and the menu-bar "Send Feedback…" item (via
+    /// notification); no new window scene.
+    @StateObject private var feedback = FeedbackController()
+    @State private var showingFeedback = false
 
     var body: some View {
         Group {
@@ -427,6 +434,17 @@ struct MainWindow: View {
                 onDismiss: { presentedAccountContext = nil }
             )
         }
+        .sheet(isPresented: $showingFeedback) {
+            // Feedback U4 (KTD-8): the in-app feedback form. Dismissal in the
+            // draft state is harmless (the controller keeps the draft for the
+            // session); the sheet itself disables interactive dismissal while
+            // sending.
+            FeedbackSheetView(
+                controller: feedback,
+                auth: auth,
+                onDismiss: { showingFeedback = false }
+            )
+        }
         .overlay {
             // U10: the Recall palette overlay (the prototype's z-40/41 scrim +
             // panel). ↵ on a hit routes to the Day timeline at that moment.
@@ -459,6 +477,12 @@ struct MainWindow: View {
             // Account-sheet U5 (KTD-4): the menu-bar "Account…" item — select
             // the embedded Account & Plan pane route.
             route = .account
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .screenCapOpenFeedbackForm)) { _ in
+            // Feedback U5 (KTD-8): the menu-bar "Send Feedback…" item routed
+            // here after focusing/opening the window — same bridge pattern as
+            // the Search and account-gate items.
+            showingFeedback = true
         }
     }
 
@@ -626,6 +650,9 @@ struct MainWindow: View {
         ShellSidebarView(
             route: $route,
             recordings: index.recordings,
+            // Feedback U5: the main-window entry point — same sheet as the
+            // menu-bar item (KTD-8).
+            onSendFeedback: { showingFeedback = true },
             onReplayOnboarding: {
                 // U11: re-enter the wizard read-only — live grant states,
                 // current storage selection, finish writes nothing (KTD-10).
