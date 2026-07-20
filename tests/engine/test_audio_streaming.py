@@ -186,6 +186,25 @@ class TestBufferDrainLogic:
 class TestRecordAudioIntegration:
     """Integration tests for record_audio() with mocked sounddevice."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_capture_rate(self):
+        """Pin the mic capture rate to 16 kHz so these tests are device-free.
+
+        ``record_audio`` now resolves the capture rate from the real default
+        input device and resamples to 16 kHz in software. These tests mock
+        ``InputStream`` and feed 16 kHz frames (``_make_audio_chunk``), so the
+        resampler must stay OFF or the mock's frames would be misinterpreted as
+        the host's native rate and downsampled — making the suite fail on any
+        machine whose mic isn't natively 16 kHz. Forcing ``CAPTURE_RATE == 16000``
+        keeps the mock's frames flowing 1:1, exactly as before the resampler
+        existed. (The native-rate + resample path is covered by
+        ``tests/test_audio_capture_rate.py``.)
+        """
+        with patch(
+            "screencap.engine.recorder.resolve_capture_rate", return_value=SAMPLERATE
+        ):
+            yield
+
     def _make_mock_stream(self, callback_fn, duration_secs=2.0):
         """Create a mock InputStream that feeds chunks to the callback."""
         mock_stream = MagicMock()
