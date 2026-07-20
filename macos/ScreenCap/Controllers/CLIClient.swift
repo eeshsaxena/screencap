@@ -325,11 +325,26 @@ enum CLIClient {
 
             return (stdoutBytes, stderrBytes)
         } onCancel: {
+            // SIGTERM, then escalate to SIGKILL after the same bounded grace
+            // as raceExitAgainstTimeout — a child that ignores SIGTERM (stuck
+            // syscall, blocked signal) would otherwise keep the pipe drains,
+            // and the awaiting caller, blocked. onCancel is synchronous, so
+            // the grace wait runs in a detached task capturing only the pid;
+            // a SIGKILL to an already-reaped pid is a harmless ESRCH.
             if pid > 0 {
                 kill(pid, SIGTERM)
+                Task.detached {
+                    let nanos = UInt64(CLIClient.terminateGraceSeconds * 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: nanos)
+                    kill(pid, SIGKILL)
+                }
             }
         }
     }
+
+    /// Grace period between SIGTERM and SIGKILL, shared by the timeout race
+    /// and the task-cancellation path so the two escalations can't drift.
+    private static let terminateGraceSeconds: TimeInterval = 2.0
 
     /// Reads `handle` to EOF on a background queue. The continuation resumes
     /// once the child closes its end of the pipe (typically on exit).
@@ -351,7 +366,7 @@ enum CLIClient {
     private static func raceExitAgainstTimeout(
         process: Process,
         timeout: TimeInterval,
-        terminateGrace: TimeInterval = 2.0
+        terminateGrace: TimeInterval = CLIClient.terminateGraceSeconds
     ) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask {
