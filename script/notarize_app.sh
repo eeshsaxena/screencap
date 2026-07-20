@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Notarize a Developer-ID-signed ScreenCap.app, staple it, package it into a
+# Notarize a Developer-ID-signed Screencap.app, staple it, package it into a
 # signed + notarized + stapled DMG, and emit a checksum. The result opens with
 # no Gatekeeper friction, even offline.
 #
@@ -15,7 +15,7 @@
 #   APPLE_NOTARY_KEY_ID=XXXXXXXXXX \
 #   APPLE_NOTARY_ISSUER_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
 #   MACOS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-#     script/notarize_app.sh path/to/ScreenCap.app [version]
+#     script/notarize_app.sh path/to/Screencap.app [version]
 #
 # Environment:
 #   APPLE_NOTARY_KEY_P8          Path to the App Store Connect API key (.p8).
@@ -142,7 +142,7 @@ ln -s /Applications "${STAGING_DIR}/Applications"
 # survive `hdiutil create -srcfolder ... -format UDZO` onto the read-only
 # volume. So build UDRW, attach, place .VolumeIcon.icns + set the icon bit on
 # the volume root, detach, then convert to the final compressed UDZO.
-VOLUME_ICON="${REPO_ROOT}/macos/branding/ScreenCap.icns"
+VOLUME_ICON="${REPO_ROOT}/macos/branding/Screencap.icns"
 [ -f "${VOLUME_ICON}" ] || { echo "error: volume icon not found at ${VOLUME_ICON}" >&2; exit 1; }
 
 RW_DMG_PATH="${OUTPUT_DIR}/${APP_NAME}-${VERSION}-rw.dmg"
@@ -189,4 +189,4 @@ echo
 echo "Done."
 echo "  DMG:      ${DMG_PATH}"
 echo "  Checksum: ${DMG_PATH}.sha256"
-echo "Send testers the DMG; tell them to drag ScreenCap to Applications and open from there."
+echo "Send testers the DMG; tell them to drag Screencap to Applications and open from there."

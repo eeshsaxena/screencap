@@ -19,7 +19,7 @@ class Screencap < Formula
 
   def caveats
     <<~EOS
-      ScreenCap requires macOS permissions to function:
+      Screencap requires macOS permissions to function:
 
       1. Screen Recording — System Settings > Privacy & Security > Screen Recording
          Grant access to your terminal app (Terminal, iTerm2, etc.)

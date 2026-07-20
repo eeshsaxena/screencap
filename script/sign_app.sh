@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sign a built ScreenCap.app inside-out under a Developer ID Application identity
+# Sign a built Screencap.app inside-out under a Developer ID Application identity
 # (hardened runtime) so it is ready for notarization (script/notarize_app.sh).
 #
 # Xcode signs the .app wrapper + main executable but does NOT recurse into
@@ -10,11 +10,11 @@
 # embedded `screencap` CLI/daemon binary, then the outer bundle last.
 #
 # Mirrors the proven nested-signing approach in
-# macos/ScreenCap/Scripts/embed-cli.sh, but as a standalone, CI-invocable step.
+# macos/Screencap/Scripts/embed-cli.sh, but as a standalone, CI-invocable step.
 #
 # Usage:
 #   MACOS_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-#     script/sign_app.sh path/to/ScreenCap.app
+#     script/sign_app.sh path/to/Screencap.app
 #
 # Environment:
 #   MACOS_SIGN_IDENTITY   Required. The Developer ID Application identity, either
@@ -34,8 +34,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_ENTITLEMENTS="${REPO_ROOT}/macos/ScreenCap/ScreenCap.entitlements"
-CLI_ENTITLEMENTS="${REPO_ROOT}/macos/ScreenCap/Scripts/screencap-cli.entitlements"
+APP_ENTITLEMENTS="${REPO_ROOT}/macos/Screencap/Screencap.entitlements"
+CLI_ENTITLEMENTS="${REPO_ROOT}/macos/Screencap/Scripts/screencap-cli.entitlements"
 
 usage() {
   echo "usage: MACOS_SIGN_IDENTITY=\"Developer ID Application: ... (TEAMID)\" $0 <path-to-.app>" >&2

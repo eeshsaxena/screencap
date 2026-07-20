@@ -94,7 +94,7 @@ def build_configuration_payload(
     """Build the ``billing_portal.Configuration.create`` kwargs (U7 scoping)."""
     return {
         "business_profile": {
-            "headline": "ScreenCap billing",
+            "headline": "Screencap billing",
         },
         "features": {
             "subscription_update": {

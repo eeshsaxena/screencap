@@ -184,7 +184,7 @@ write_dev_env_file
 
 if [ ! -d "${SOURCE_APP}" ]; then
     echo "warning: dist/ScreencapDaemon.app not found at ${SOURCE_APP}"
-    echo "warning: ScreenCap.app will NOT have a bundled daemon helper."
+    echo "warning: Screencap.app will NOT have a bundled daemon helper."
     echo "warning: Set SCREENCAP_CLI_APP_DIR or run \`pyinstaller pyinstaller/screencap.spec\` from the repo root."
     exit 0
 fi
@@ -268,7 +268,7 @@ sign_embedded_helper() {
         return
     fi
 
-    local entitlements="${SRCROOT}/ScreenCap/Scripts/screencap-cli.entitlements"
+    local entitlements="${SRCROOT}/Screencap/Scripts/screencap-cli.entitlements"
     # --timestamp needs the network and is required for notarized release builds;
     # skip it for Debug so local rebuilds stay fast and work offline.
     local timestamp_flag="--timestamp"
