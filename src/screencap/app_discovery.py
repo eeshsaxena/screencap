@@ -350,7 +350,7 @@ _SPOTLIGHT_EXCLUDE_PREFIXES = (
     "/Library/Apple/",
     # Framework-embedded runtimes — not user-facing apps.
     # Python.app is the interpreter itself; blocking it would break
-    # any Python-based tool (including ScreenCap).
+    # any Python-based tool (including Screencap).
     "/Library/Frameworks/",
     "/Library/Developer/",
 )
@@ -419,7 +419,7 @@ def discover_installed_apps(
             continue
         # Skip language runtimes — they're not user-facing apps.
         # org.python.* is the Python interpreter; blocking it would
-        # break ScreenCap and any other Python tool.
+        # break Screencap and any other Python tool.
         if meta.bundle_id.startswith("org.python."):
             continue
         seen_bundle_ids.add(meta.bundle_id)

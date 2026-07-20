@@ -46,7 +46,7 @@ subjects — not fallback comments.
 | App signing identity | **Apple Development** — `Apple Development: rute.figueiredo92@gmail.com (YL664A67R4)`, hardened runtime; Team `2A8S6MV8DZ`. NOT Developer ID / notarized. |
 | Daemon binary signing identity | **ad-hoc** — `screencap` binary `flags=0x2(adhoc)`, `TeamIdentifier=not set`, **no entitlements** |
 | `DEVELOPMENT_TEAM` set? | yes (app), but the nested daemon binary is still ad-hoc |
-| Run context | Debug `ScreenCap.app` under `.build/ScreenCapDerivedData/…/Debug/`, daemon launched by **launchd via SMAppService** (`submitted by smd.515`) |
+| Run context | Debug `Screencap.app` under `.build/ScreencapDerivedData/…/Debug/`, daemon launched by **launchd via SMAppService** (`submitted by smd.515`) |
 | Daemon version running | **0.12.7** (stale — predates U2; `daemon.info` reports no grant block). Identity, not Python version, is what this spike turns on. |
 
 > ⚠️ **This machine is macOS Tahoe (Darwin 25.x / MacOSX26 SDK).** The plan's
@@ -62,7 +62,7 @@ The placement prior is now **confirmed against the actual built+running app**, n
 just the repo plist. The running daemon (pid 1418) is:
 
 ```
-.../Debug/ScreenCap.app/Contents/Resources/screencap-daemon-launcher   (POSIX /bin/sh script)
+.../Debug/Screencap.app/Contents/Resources/screencap-daemon-launcher   (POSIX /bin/sh script)
   └─ exec → Contents/Resources/screencap/screencap serve                (PyInstaller binary)
 launchd: program identifier = Contents/Resources/screencap-daemon-launcher (SMAppService)
 ```
@@ -71,7 +71,7 @@ launchd: program identifier = Contents/Resources/screencap-daemon-launcher (SMAp
 
 | Artifact | Identifier | Signature | Team | Entitlements |
 |---|---|---|---|---|
-| App (`Contents/MacOS/ScreenCap`) | `com.screencap.macos` | Apple Development, hardened runtime | `2A8S6MV8DZ` | (app) |
+| App (`Contents/MacOS/Screencap`) | `com.screencap.macos` | Apple Development, hardened runtime | `2A8S6MV8DZ` | (app) |
 | `screencap-daemon-launcher` | — (shell script, not Mach-O) | — | — | — |
 | `screencap` (the capture/daemon binary) | `screencap-55554944…` | **ad-hoc** (`flags=0x2`) | **not set** | **none** |
 
@@ -138,7 +138,7 @@ launchctl kickstart -kp gui/$(id -u)/com.screencap.daemon
 ```
 
 For each mechanism: run it, then open the matching pane and record whether a
-**`ScreenCap helper` / `screencap-daemon-launcher` entry appears** and whether it
+**`Screencap helper` / `screencap-daemon-launcher` entry appears** and whether it
 is **toggleable**.
 
 ```bash
@@ -175,7 +175,7 @@ Confirm where the daemon binary lives in the built `.app` and its code identity.
 ```bash
 PYTHONPATH=src python docs/research/2026-06-05-daemon-tcc-registration-spike.py placement
 # and, against a built app:
-codesign -dvvv "/path/to/ScreenCap.app/Contents/Resources/screencap-daemon-launcher" 2>&1 | sed -n '1,20p'
+codesign -dvvv "/path/to/Screencap.app/Contents/Resources/screencap-daemon-launcher" 2>&1 | sed -n '1,20p'
 ```
 
 ### Running as the daemon (representative identity) — METHOD ACTUALLY USED
@@ -294,7 +294,7 @@ exact configuration the external research warned would fail.
 |---|---|---|
 | **screen_recording** | Daemon calls `CGRequestScreenCaptureAccess()` in-process → toggleable SR entry appears (default OFF). App awaits ack, opens `Privacy_ScreenCapture`. | High — directly observed (clean launchd identity). |
 | **accessibility** | Daemon calls `AXIsProcessTrustedWithOptions({prompt:true})` → toggleable Accessibility entry appears (default OFF). | High — observed twice (clean identity + the real running daemon's pre-existing row). |
-| **input_monitoring** | `IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)` **alone did not register** an entry under launchd. U8 should trigger the **real event-tap path** (a `CGEventTapCreate`/`pynput` listener touch — the capture primitive the engine already uses) to force the IM row, **or** degrade IM's Grant to the manual "open Input Monitoring and add ScreenCap" affordance. IM is advisory (not capture-fatal per `capture-health-nonscreen-attribution…`), so a manual fallback here does not block recording. | Medium — request-API path disproven; real-capture path for IM is the open implementation choice for U8. |
+| **input_monitoring** | `IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)` **alone did not register** an entry under launchd. U8 should trigger the **real event-tap path** (a `CGEventTapCreate`/`pynput` listener touch — the capture primitive the engine already uses) to force the IM row, **or** degrade IM's Grant to the manual "open Input Monitoring and add Screencap" affordance. IM is advisory (not capture-fatal per `capture-health-nonscreen-attribution…`), so a manual fallback here does not block recording. | Medium — request-API path disproven; real-capture path for IM is the open implementation choice for U8. |
 
 **Why this overturns the structural prior:** the placement/identity facts (bare
 ad-hoc executable under `Resources/`, no responsible code) created a strong prior

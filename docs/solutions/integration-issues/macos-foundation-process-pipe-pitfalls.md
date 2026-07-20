@@ -6,8 +6,8 @@ category: integration-issues
 severity: high
 problem_type: integration-issues
 modules:
-  - macos/ScreenCap/Controllers/CLIClient.swift
-  - macos/ScreenCap/Controllers/PermissionController.swift
+  - macos/Screencap/Controllers/CLIClient.swift
+  - macos/Screencap/Controllers/PermissionController.swift
 tags:
   - macos
   - foundation
@@ -90,7 +90,7 @@ Cause: when `Process.run()` `exec`s a binary directly, macOS attributes the spaw
 
 ### 4. Timer-driven Process spawn is a fork-bomb
 
-The same broken attempt above hit a worse failure mode: a 1Hz timer spawned 4 helper subprocesses per tick. The helpers each took ~1.7s to exit (AVFoundation initialization in particular drags). Spawn rate exceeded exit rate; subprocesses piled up. After 60 seconds the user had ~50 ScreenCap helpers in the dock and the process table was filling.
+The same broken attempt above hit a worse failure mode: a 1Hz timer spawned 4 helper subprocesses per tick. The helpers each took ~1.7s to exit (AVFoundation initialization in particular drags). Spawn rate exceeded exit rate; subprocesses piled up. After 60 seconds the user had ~50 Screencap helpers in the dock and the process table was filling.
 
 **Lesson:** any periodic Process spawn needs *both* a known-bounded execution time *and* an explicit guard that doesn't start a new spawn while the previous one is still running. "Just throw it on a timer" is a fork-bomb generator.
 

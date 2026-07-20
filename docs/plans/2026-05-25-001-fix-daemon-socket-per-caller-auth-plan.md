@@ -18,7 +18,7 @@ Ratify same-EUID + filesystem permissions as the daemon socket's documented trus
 
 PR #180 (SCR-54 — macOS helper permission ownership) made the daemon the sole in-app authority for recording-permission gating. Before PR #180, the SwiftUI app pre-checked TCC state before any daemon recording attempt; after the merge, the daemon-side `PeerCheckingUnixSocket.accept()` EUID check is the only boundary between a same-UID process and `/v0/recording.start`. This was true before PR #180 too (the daemon socket has always been same-UID trust), but PR #180 concentrated responsibility there, which made the absence of any explicit threat-model statement load-bearing.
 
-SCR-64's actual ask is a **decision** the codebase has not formally taken: is same-UID-trust acceptable for ScreenCap, or do we want one of two alternative auth surfaces (audit-token-style peer check, bearer token co-installed via SMAppService)? Both Phase 1 and Phase 2 daemon plans named these as deferred — Phase 1's `## Scope Boundaries` → `Deferred to Follow-Up Work` flagged future MCP introducing a second caller; Phase 2's `## Scope Boundaries` named "server-validated peer identity as auth gate" as a future iteration. This plan resolves the deferred question, documents it, and ships the defense-in-depth hygiene that comes with treating same-UID as the explicit boundary instead of an unstated default.
+SCR-64's actual ask is a **decision** the codebase has not formally taken: is same-UID-trust acceptable for Screencap, or do we want one of two alternative auth surfaces (audit-token-style peer check, bearer token co-installed via SMAppService)? Both Phase 1 and Phase 2 daemon plans named these as deferred — Phase 1's `## Scope Boundaries` → `Deferred to Follow-Up Work` flagged future MCP introducing a second caller; Phase 2's `## Scope Boundaries` named "server-validated peer identity as auth gate" as a future iteration. This plan resolves the deferred question, documents it, and ships the defense-in-depth hygiene that comes with treating same-UID as the explicit boundary instead of an unstated default.
 
 ---
 
@@ -36,7 +36,7 @@ SCR-64's actual ask is a **decision** the codebase has not formally taken: is sa
 ## Scope Boundaries
 
 - Implementing a per-call bearer token or any in-band auth header — explicitly rejected in this plan; see `## Alternative Approaches Considered`. Revisitable via a follow-up ticket if the threat model changes.
-- Implementing code-signing requirement verification (`SecCodeCopyGuestWithAttributes` + Team-ID anchors) — the only mechanism that meaningfully raises the bar against a same-UID attacker, but it's blocked by ScreenCap's mixed distribution model (CLI may be unsigned/ad-hoc-signed in Homebrew/dev paths) and demands its own design pass.
+- Implementing code-signing requirement verification (`SecCodeCopyGuestWithAttributes` + Team-ID anchors) — the only mechanism that meaningfully raises the bar against a same-UID attacker, but it's blocked by Screencap's mixed distribution model (CLI may be unsigned/ad-hoc-signed in Homebrew/dev paths) and demands its own design pass.
 - Promoting `derive_started_by_from_asgi_scope` from advisory provenance into an enforcement gate — explicitly considered and rejected (see Alternatives). Provenance stays advisory.
 - TCC / permission-controller logic — orthogonal; lives under SCR-54 and the `docs/superpowers/specs/2026-05-15-scr-54-macos-permission-ownership-design.md` design.
 - MCP server (`screencap mcp`) auth wiring — the binary doesn't exist yet; this plan defines the auth surface MCP will inherit on arrival but adds no MCP code.
@@ -352,7 +352,7 @@ This section was an explicit user-requested deliverable: compare all three SCR-6
 - **Phase 1 plan line 73 already predicted this and Phase 2 plan line 669 already rejected it:** "Promoting peer-PID to auth would require addressing PID reuse / TOCTOU and would block on a credential model not yet designed."
 - **Dev-mode ad-hoc-signed builds and any non-bundled binary would fail the allowlist** (see `docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md`). The plan would constantly break developers running locally-built CLIs or the source-mode `script/build_and_run.sh` helper.
 - **Locks out power-user automation that runs as the same user** (cron, ad-hoc scripts, future MCP-style tools that don't yet exist).
-- **The threat it defends against** ("a same-UID process that isn't a known ScreenCap binary calls `/v0/recording.start`") is already trivially defeated by the attacker invoking the bundled CLI binary directly. The gate provides the illusion of a boundary without the substance.
+- **The threat it defends against** ("a same-UID process that isn't a known Screencap binary calls `/v0/recording.start`") is already trivially defeated by the attacker invoking the bundled CLI binary directly. The gate provides the illusion of a boundary without the substance.
 
 **What it would take to revisit:** A move to a single signed-binary distribution model + adopting `SecCodeCopyGuestWithAttributes(kSecGuestAttributePid)` with explicit acknowledgement of the residual TOCTOU window. Or migrating from AF_UNIX to XPC (Apple's recommended mechanism for code-signing-verified peer auth).
 
@@ -373,7 +373,7 @@ This section was an explicit user-requested deliverable: compare all three SCR-6
 
 **What:** Per-call code-signing verification via `SecCodeCopyGuestWithAttributes(kSecGuestAttributePid)` + `SecCodeCheckValidityWithErrors` against a Team-ID / bundle-identifier requirement string.
 
-**Why out of scope for this plan:** Genuinely raises the bar against a same-UID attacker (forcing a Developer ID signature forgery, which requires Apple's private key). But it presupposes a single-signed-binary distribution model that ScreenCap doesn't have today (CLI may be unsigned or ad-hoc-signed via Homebrew, source builds, dev rebuilds). The mixed distribution model would either break developer workflows or require maintaining per-distribution-channel requirement strings, both of which are substantial design questions beyond SCR-64's scope.
+**Why out of scope for this plan:** Genuinely raises the bar against a same-UID attacker (forcing a Developer ID signature forgery, which requires Apple's private key). But it presupposes a single-signed-binary distribution model that Screencap doesn't have today (CLI may be unsigned or ad-hoc-signed via Homebrew, source builds, dev rebuilds). The mixed distribution model would either break developer workflows or require maintaining per-distribution-channel requirement strings, both of which are substantial design questions beyond SCR-64's scope.
 
 ---
 
@@ -402,7 +402,7 @@ This section was an explicit user-requested deliverable: compare all three SCR-6
 - **Upstream PR:** [proteus-computer-use/screencap#180](https://github.com/proteus-computer-use/screencap/pull/180)
 - **Related design:** `docs/superpowers/specs/2026-05-15-scr-54-macos-permission-ownership-design.md`
 - **Prior daemon plans:** `docs/plans/2026-05-08-001-feat-daemon-architecture-phase-1-plan.md`, `docs/plans/2026-05-08-002-feat-daemon-architecture-phase-2-plan.md`
-- **Relevant code:** `src/screencap/daemon/socket.py`, `src/screencap/daemon/app.py`, `src/screencap/daemon/provenance.py`, `src/screencap/daemon/launchagent.py`, `src/screencap/cli/_autospawn.py`, `src/screencap/cli/_daemon_client.py`, `macos/ScreenCap/Controllers/DaemonClient.swift`
+- **Relevant code:** `src/screencap/daemon/socket.py`, `src/screencap/daemon/app.py`, `src/screencap/daemon/provenance.py`, `src/screencap/daemon/launchagent.py`, `src/screencap/cli/_autospawn.py`, `src/screencap/cli/_daemon_client.py`, `macos/Screencap/Controllers/DaemonClient.swift`
 - **Institutional learnings:** `docs/solutions/runtime-errors/eventbus-late-listener-replay-2026-05-12.md`, `docs/solutions/runtime-errors/launchd-plist-tilde-expansion-2026-05-09.md`, `docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md`, `docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md`
 - **Apple primary sources:** Apple Platform Security Guide (March 2026 edition); [Apple DevForums thread 74498](https://developer.apple.com/forums/thread/74498); [TN3127 — Inside Code Signing: Requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements); [xpc_connection_set_peer_code_signing_requirement docs](https://developer.apple.com/documentation/xpc/3755524-xpc_connection_set_peer_code_sig/)
 - **PID-reuse exploit references:** [Scott Knight — Audit tokens explained](https://knight.sc/reverse%20engineering/2020/03/20/audit-tokens-explained.html); [Quarkslab — Intego LPE writeup](https://blog.quarkslab.com/intego_lpe_macos_2.html)

@@ -16,7 +16,7 @@ Extract `RecorderController`'s transport, stop-policy, permission-watchdog, and 
 
 ## Problem Frame
 
-`macos/ScreenCap/Controllers/RecorderController.swift` is now 926 lines (grew past the 860 noted in SCR-58) and owns: UI-facing recording state, daemon transport probe and event-stream consumption with reconnect/backoff, CLI fallback subprocess spawning and stderr parsing, stop/quit policy (30s in-app, 300s Cmd+Q with SIGKILL escape), permission watchdog (`Timer` + `NSWorkspace` observer), schema-drift logging, and two `NSAlert` modal flows. This is architecture debt, not a user-visible bug — but it makes every future macOS feature riskier (any new responsibility lands in the same file, every new contributor reads 900 lines before touching it) and prevents focused unit tests of the state machine and reconnect logic.
+`macos/Screencap/Controllers/RecorderController.swift` is now 926 lines (grew past the 860 noted in SCR-58) and owns: UI-facing recording state, daemon transport probe and event-stream consumption with reconnect/backoff, CLI fallback subprocess spawning and stderr parsing, stop/quit policy (30s in-app, 300s Cmd+Q with SIGKILL escape), permission watchdog (`Timer` + `NSWorkspace` observer), schema-drift logging, and two `NSAlert` modal flows. This is architecture debt, not a user-visible bug — but it makes every future macOS feature riskier (any new responsibility lands in the same file, every new contributor reads 900 lines before touching it) and prevents focused unit tests of the state machine and reconnect logic.
 
 See [origin Linear ticket SCR-58](https://linear.app/zk-email/issue/SCR-58/split-recordercontroller-into-state-machine-and-transportservices).
 
@@ -26,7 +26,7 @@ See [origin Linear ticket SCR-58](https://linear.app/zk-email/issue/SCR-58/split
 
 - R1. `RecorderController` is reduced to a small orchestrator/store with explicit collaborator dependencies; its file no longer hosts transport, process, stop-policy, watchdog, or AppKit-modal code.
 - R2. The public API consumed by SwiftUI views and `AppDelegate` is preserved with no view-side changes required (`state`, `lastError`, `matrixDisclosure`, `transport`, `daemonProbeCompleted`, `schemaMismatchDetected`, `quitProgressSecondsRemaining`, `start(name:)`, `stop()`, `probeDaemon()`, `confirmQuitWhileRecording()`, `dismissMatrixDisclosure()`, `bindIndex(_:)`, `bindPermissions(_:)`, `reloadDaemon()`, `smokeStatus()`).
-- R3. Existing tests in `macos/ScreenCapTests/RecorderControllerTests.swift` and `macos/ScreenCapTests/RecorderControllerDaemonTests.swift` pass unchanged (no production-side `#if DEBUG` shim removed without an equivalent injection point).
+- R3. Existing tests in `macos/ScreencapTests/RecorderControllerTests.swift` and `macos/ScreencapTests/RecorderControllerDaemonTests.swift` pass unchanged (no production-side `#if DEBUG` shim removed without an equivalent injection point).
 - R4. Each extracted unit (state machine, daemon session service, CLI recorder service, stop policy coordinator, permission watchdog + alert presenter) is independently exercised by focused tests that do not require the full `RecorderController`.
 - R5. Behavior is preserved exactly — no new event types, no new error wording, no changed timeouts, no changed FIFO dispatch ordering, no changed cursor-replay semantics. Inline rationale comments carry forward to the unit that now owns each behavior.
 
@@ -36,7 +36,7 @@ See [origin Linear ticket SCR-58](https://linear.app/zk-email/issue/SCR-58/split
 
 - No changes to `CLIClient`, `DaemonClient`, `PermissionController`, `RecordingsIndex`, or the `RecorderEventLine` / `CLIStatus` / `PrivacyMatrixDisclosure` / `RecordingState` / `RecorderTransport` public types.
 - No changes to view files (`MenuBarMenu.swift`, `RecordingBanner.swift`, `MainWindow.swift`, `CalendarView.swift`, `PrivacyMatrixDisclosureView.swift`, `FirstRunPermissionsView.swift`).
-- No changes to `AppDelegate.applicationShouldTerminate` flow or `ScreenCapApp.swift` wiring.
+- No changes to `AppDelegate.applicationShouldTerminate` flow or `ScreencapApp.swift` wiring.
 - No new event types or stderr contract changes (the `_stderr_events.py` schema-v1 contract is preserved).
 - No changes to AppKit modal copy, button labels, timeouts (30s / 300s), backoff curve, or SIGKILL behavior.
 - No migration off `Timer` to Combine / async sequences for the elapsed/watchdog timers.
@@ -54,13 +54,13 @@ See [origin Linear ticket SCR-58](https://linear.app/zk-email/issue/SCR-58/split
 
 ### Relevant Code and Patterns
 
-- [macos/ScreenCap/Controllers/RecorderController.swift](macos/ScreenCap/Controllers/RecorderController.swift) — current 926-line controller; every responsibility called out in the ticket lives here.
-- [macos/ScreenCap/Controllers/DaemonInstallController.swift](macos/ScreenCap/Controllers/DaemonInstallController.swift) — establishes the protocol-injected-collaborator pattern this refactor extends. Defines `DaemonRegistrationService` and `DaemonProbe` as `@MainActor protocol`s with live implementations (`SMAppServiceRegistration`, `LiveDaemonProbe`) and test substitutes. **This is the precedent to mirror.**
-- [macos/ScreenCap/Controllers/QuitProgressCountdown.swift](macos/ScreenCap/Controllers/QuitProgressCountdown.swift) — already-extracted helper that demonstrates the "free-function/enum with injectable sleep" shape we want for the stop-policy coordinator's one-shot await.
-- [macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift) — collaborator the CLI recorder service wraps; its `SpawnedProcess` handle, `spawn(args:onStderrLine:onTerminated:)`, `runDetached(["stop"])`, and `runJSON` are the API surface the service consumes.
-- [macos/ScreenCap/Controllers/DaemonClient.swift](macos/ScreenCap/Controllers/DaemonClient.swift) — collaborator the daemon session service wraps. The `subscribe(sinceCursor:)` AsyncThrowingStream, `daemonInfo()`, `sessionSnapshot()`, `recordingStart()`, `recordingStop()` are the API surface.
-- [macos/ScreenCapTests/RecorderControllerDaemonTests.swift](macos/ScreenCapTests/RecorderControllerDaemonTests.swift) — uses `UnixHTTPTestServer` to mock the daemon socket. Existing five tests exercise the daemon transport end-to-end; they should keep passing without changes by going through the orchestrator.
-- [macos/ScreenCapTests/RecorderControllerTests.swift](macos/ScreenCapTests/RecorderControllerTests.swift) — exercises stderr-line handling and process-termination handling via `_testHandleStderrLine` / `_testHandleProcessTerminated` shims.
+- [macos/Screencap/Controllers/RecorderController.swift](macos/Screencap/Controllers/RecorderController.swift) — current 926-line controller; every responsibility called out in the ticket lives here.
+- [macos/Screencap/Controllers/DaemonInstallController.swift](macos/Screencap/Controllers/DaemonInstallController.swift) — establishes the protocol-injected-collaborator pattern this refactor extends. Defines `DaemonRegistrationService` and `DaemonProbe` as `@MainActor protocol`s with live implementations (`SMAppServiceRegistration`, `LiveDaemonProbe`) and test substitutes. **This is the precedent to mirror.**
+- [macos/Screencap/Controllers/QuitProgressCountdown.swift](macos/Screencap/Controllers/QuitProgressCountdown.swift) — already-extracted helper that demonstrates the "free-function/enum with injectable sleep" shape we want for the stop-policy coordinator's one-shot await.
+- [macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift) — collaborator the CLI recorder service wraps; its `SpawnedProcess` handle, `spawn(args:onStderrLine:onTerminated:)`, `runDetached(["stop"])`, and `runJSON` are the API surface the service consumes.
+- [macos/Screencap/Controllers/DaemonClient.swift](macos/Screencap/Controllers/DaemonClient.swift) — collaborator the daemon session service wraps. The `subscribe(sinceCursor:)` AsyncThrowingStream, `daemonInfo()`, `sessionSnapshot()`, `recordingStart()`, `recordingStop()` are the API surface.
+- [macos/ScreencapTests/RecorderControllerDaemonTests.swift](macos/ScreencapTests/RecorderControllerDaemonTests.swift) — uses `UnixHTTPTestServer` to mock the daemon socket. Existing five tests exercise the daemon transport end-to-end; they should keep passing without changes by going through the orchestrator.
+- [macos/ScreencapTests/RecorderControllerTests.swift](macos/ScreencapTests/RecorderControllerTests.swift) — exercises stderr-line handling and process-termination handling via `_testHandleStderrLine` / `_testHandleProcessTerminated` shims.
 
 ### Institutional Learnings
 
@@ -82,7 +82,7 @@ See [origin Linear ticket SCR-58](https://linear.app/zk-email/issue/SCR-58/split
 - **State machine is a value-type, no `@MainActor`, no Combine**: the transition logic (handling the 9 stderr event types and the `recording_failed` / `started` / `stopped` / `recording_finalized` paths) is pure mapping from `(currentState, event)` to `(newState, effects)`. Effects are values the controller acts on. Rationale: the most valuable test target in this file is "given state X and event Y, the machine moves to state Z" — that test should not need a `@MainActor` or any of the surrounding infrastructure.
 - **One-shot await (`waitForOneShot`) moves into the stop-policy coordinator**: it is intrinsically a stop-policy concern (timeout race + `awaitingFinalized` / `awaitingStopped` continuations). Rationale: every caller of `waitForOneShot` is in the stop policy; the abstraction belongs with its only client.
 - **No new schema fields, no new public types except the collaborator protocols**: any structural type that views see today (`RecordingState`, `RecorderTransport`, `PrivacyMatrixDisclosure`, `CLIStatus`, `RecorderEventLine`) stays put. New types are internal to the controller package.
-- **File-per-collaborator**: each extracted unit lands at `macos/ScreenCap/Controllers/Recorder<Name>.swift`. Rationale: searchability and matches the existing controller folder layout.
+- **File-per-collaborator**: each extracted unit lands at `macos/Screencap/Controllers/Recorder<Name>.swift`. Rationale: searchability and matches the existing controller folder layout.
 
 ---
 
@@ -205,9 +205,9 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/RecordingStateMachine.swift` (also home for the moved `RecordingState` enum and `DaemonErrorCode` constants)
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (delegate `handleRecorderEvent`, `handleProcessTerminated`, and state-flag computations to the machine; keep the published `state` mirroring `machine.state`)
-- Test: `macos/ScreenCapTests/RecordingStateMachineTests.swift`
+- Create: `macos/Screencap/Controllers/RecordingStateMachine.swift` (also home for the moved `RecordingState` enum and `DaemonErrorCode` constants)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (delegate `handleRecorderEvent`, `handleProcessTerminated`, and state-flag computations to the machine; keep the published `state` mirroring `machine.state`)
+- Test: `macos/ScreencapTests/RecordingStateMachineTests.swift`
 
 **Approach:**
 - Define `struct RecordingStateMachine` with internal `state`, `pendingStartCursor`, `recordingStartedAt` storage.
@@ -229,7 +229,7 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 - Edge case: `.starting` + `recording_failed` (reason "engine crashed") → state `.idle`, effect `surfaceError("engine crashed")`, both await arrays resolved (finalized=true, stopped=false), `pendingStartCursor` cleared.
 - Edge case: unknown event type → no state change, debug log only (no effects).
 - Edge case: schema drift (`schema_version` != 1) → warning logged, event still processed.
-- Process termination — clean exit (0/130/143) preserves prior `lastError`; exit code 2 sets "ScreenCap is already recording."; exit code 3 sets permission revoke message; exit code 4 sets disk-full message; other sets generic "Recorder exited with code N."
+- Process termination — clean exit (0/130/143) preserves prior `lastError`; exit code 2 sets "Screencap is already recording."; exit code 3 sets permission revoke message; exit code 4 sets disk-full message; other sets generic "Recorder exited with code N."
 - Edge case: `permission_lost` event yields the effects the controller needs to drive the modal flow (effect carries permission name).
 - Edge case: `matrix_disclosure_required` event yields `setMatrixDisclosure` effect carrying the `changes` and `optOutCommandExamples`.
 
@@ -248,11 +248,11 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/PermissionWatchdog.swift` (protocol + live implementation)
-- Create: `macos/ScreenCap/Controllers/RecorderAlertPresenter.swift` (protocol + live implementation)
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (inject collaborators, remove inline timer / NSAlert code)
-- Test: `macos/ScreenCapTests/PermissionWatchdogTests.swift`
-- Test: `macos/ScreenCapTests/RecorderAlertPresenterTests.swift` (lightweight — most coverage of the alert flow remains in `RecorderControllerTests`)
+- Create: `macos/Screencap/Controllers/PermissionWatchdog.swift` (protocol + live implementation)
+- Create: `macos/Screencap/Controllers/RecorderAlertPresenter.swift` (protocol + live implementation)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (inject collaborators, remove inline timer / NSAlert code)
+- Test: `macos/ScreencapTests/PermissionWatchdogTests.swift`
+- Test: `macos/ScreencapTests/RecorderAlertPresenterTests.swift` (lightweight — most coverage of the alert flow remains in `RecorderControllerTests`)
 
 **Approach:**
 - `PermissionWatchdog` protocol exposes `start(check: @escaping @MainActor () -> Void)` and `stop()`. Live implementation owns the `Timer` + `NSWorkspace` observer. The "should I check?" gating (transport == cliFallback, state == .recording) stays in the orchestrator's check closure.
@@ -283,9 +283,9 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Dependencies:** U1 (state machine returns the resolve-await effects), U2 (presenter for the Cmd+Q failure path)
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/StopPolicyCoordinator.swift`
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (delegate `stop()` and post-confirm Cmd+Q flow to the coordinator)
-- Test: `macos/ScreenCapTests/StopPolicyCoordinatorTests.swift`
+- Create: `macos/Screencap/Controllers/StopPolicyCoordinator.swift`
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (delegate `stop()` and post-confirm Cmd+Q flow to the coordinator)
+- Test: `macos/ScreencapTests/StopPolicyCoordinatorTests.swift`
 
 **Approach:**
 - Coordinator is `@MainActor` and holds the `awaitingFinalized` / `awaitingStopped` continuation arrays. Exposes `resolveFinalized(_: Bool)` / `resolveStopped(_: Bool)` so the orchestrator can flush them when the state machine emits the corresponding effect.
@@ -321,9 +321,9 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Dependencies:** U1 (state machine consumes stderr events and exit codes)
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/CLIRecorderService.swift`
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (delegate CLI start + own `SpawnedProcess`-derived `pid` lookup for the SIGKILL path through a small accessor)
-- Test: `macos/ScreenCapTests/CLIRecorderServiceTests.swift`
+- Create: `macos/Screencap/Controllers/CLIRecorderService.swift`
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (delegate CLI start + own `SpawnedProcess`-derived `pid` lookup for the SIGKILL path through a small accessor)
+- Test: `macos/ScreencapTests/CLIRecorderServiceTests.swift`
 
 **Approach:**
 - Service exposes `start(args: [String], onEvent: @escaping @MainActor (RecorderEventLine) -> Void, onTerminated: @escaping @MainActor (Int32) -> Void) throws` and `currentProcess: SpawnedProcess?` (read by U3 for the SIGKILL guard).
@@ -357,9 +357,9 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Dependencies:** U1 (state machine handles incoming events), U3 (stop policy invokes `recordingStop` via the service)
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/DaemonSessionService.swift`
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (delegate probe and start-via-daemon; receive event stream callbacks)
-- Test: `macos/ScreenCapTests/DaemonSessionServiceTests.swift`
+- Create: `macos/Screencap/Controllers/DaemonSessionService.swift`
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (delegate probe and start-via-daemon; receive event stream callbacks)
+- Test: `macos/ScreencapTests/DaemonSessionServiceTests.swift`
 
 **Approach:**
 - Service owns the `daemonEventTask: Task<Void, Never>?` and the cursor handling (`pendingStartCursor`). Exposes `probe() async -> ProbeResult` (returns `.daemon` / `.cliFallback(reason:)` / `.schemaMismatch`), `start(name:) async throws -> Cursor`, `stop(force:) async throws`, `attachEventStream(sinceCursor:)`, `cancel()`, and a snapshot-sync entry point used by `probe`.
@@ -397,9 +397,9 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Dependencies:** U1, U2, U3, U4, U5
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/RecorderController.swift` (final shrink)
-- Modify: `macos/ScreenCapTests/RecorderControllerTests.swift` (only if a `#if DEBUG` shim must change shape; prefer keeping shims identical)
-- Modify: `macos/ScreenCapTests/RecorderControllerDaemonTests.swift` (only if a `#if DEBUG` shim must change shape; prefer keeping shims identical)
+- Modify: `macos/Screencap/Controllers/RecorderController.swift` (final shrink)
+- Modify: `macos/ScreencapTests/RecorderControllerTests.swift` (only if a `#if DEBUG` shim must change shape; prefer keeping shims identical)
+- Modify: `macos/ScreencapTests/RecorderControllerDaemonTests.swift` (only if a `#if DEBUG` shim must change shape; prefer keeping shims identical)
 
 **Approach:**
 - Initializer takes optional collaborators with live defaults: `init(stateMachine: ... = .init(), daemonService: DaemonSessionService = LiveDaemonSessionService(), cliService: CLIRecorderService = LiveCLIRecorderService(), stopPolicy: StopPolicyCoordinator = .init(), watchdog: PermissionWatchdog = LivePermissionWatchdog(), alertPresenter: RecorderAlertPresenter = LiveRecorderAlertPresenter())`.
@@ -421,7 +421,7 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 **Verification:**
 - `RecorderController.swift` line count is materially reduced (target band 200–300 lines).
 - No view file is modified.
-- `git grep -n "Timer\|NSAlert\|NSWorkspace\|CLIClient\.spawn\|DaemonClient\." -- macos/ScreenCap/Controllers/RecorderController.swift` returns no hits (every concern delegated).
+- `git grep -n "Timer\|NSAlert\|NSWorkspace\|CLIClient\.spawn\|DaemonClient\." -- macos/Screencap/Controllers/RecorderController.swift` returns no hits (every concern delegated).
 - Full Xcode test suite passes.
 
 ---
@@ -462,13 +462,13 @@ View          Controller        StateMachine     DaemonSessionSvc    DaemonClien
 
 - **Origin Linear ticket:** [SCR-58 — Split RecorderController into state machine and transport/services](https://linear.app/zk-email/issue/SCR-58/split-recordercontroller-into-state-machine-and-transportservices) (parent: SCR-13, project: MacOS, label: Improvement, priority: Medium)
 - **Related code:**
-  - [macos/ScreenCap/Controllers/RecorderController.swift](macos/ScreenCap/Controllers/RecorderController.swift)
-  - [macos/ScreenCap/Controllers/DaemonInstallController.swift](macos/ScreenCap/Controllers/DaemonInstallController.swift) (pattern reference)
-  - [macos/ScreenCap/Controllers/CLIClient.swift](macos/ScreenCap/Controllers/CLIClient.swift)
-  - [macos/ScreenCap/Controllers/DaemonClient.swift](macos/ScreenCap/Controllers/DaemonClient.swift)
-  - [macos/ScreenCap/Controllers/QuitProgressCountdown.swift](macos/ScreenCap/Controllers/QuitProgressCountdown.swift)
-  - [macos/ScreenCapTests/RecorderControllerTests.swift](macos/ScreenCapTests/RecorderControllerTests.swift)
-  - [macos/ScreenCapTests/RecorderControllerDaemonTests.swift](macos/ScreenCapTests/RecorderControllerDaemonTests.swift)
+  - [macos/Screencap/Controllers/RecorderController.swift](macos/Screencap/Controllers/RecorderController.swift)
+  - [macos/Screencap/Controllers/DaemonInstallController.swift](macos/Screencap/Controllers/DaemonInstallController.swift) (pattern reference)
+  - [macos/Screencap/Controllers/CLIClient.swift](macos/Screencap/Controllers/CLIClient.swift)
+  - [macos/Screencap/Controllers/DaemonClient.swift](macos/Screencap/Controllers/DaemonClient.swift)
+  - [macos/Screencap/Controllers/QuitProgressCountdown.swift](macos/Screencap/Controllers/QuitProgressCountdown.swift)
+  - [macos/ScreencapTests/RecorderControllerTests.swift](macos/ScreencapTests/RecorderControllerTests.swift)
+  - [macos/ScreencapTests/RecorderControllerDaemonTests.swift](macos/ScreencapTests/RecorderControllerDaemonTests.swift)
 - **Prior plans (architectural context):**
   - [docs/plans/2026-05-08-002-feat-daemon-architecture-phase-2-plan.md](docs/plans/2026-05-08-002-feat-daemon-architecture-phase-2-plan.md)
 - **Institutional learnings:**

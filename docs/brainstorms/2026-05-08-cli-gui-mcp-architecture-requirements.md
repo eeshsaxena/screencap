@@ -7,13 +7,13 @@ topic: cli-gui-mcp-architecture
 
 ## Summary
 
-ScreenCap will refactor toward a single long-lived `screencap serve` daemon (per-user `LaunchAgent`) that owns the recording engine, with the CLI, the SwiftUI app, and a future MCP server all becoming thin clients of one local API. The change is staged in two phases — Phase 1 extracts the API and routes the SwiftUI shell through it; Phase 2 consolidates the engine into the daemon and lands MCP as a separate-process client.
+Screencap will refactor toward a single long-lived `screencap serve` daemon (per-user `LaunchAgent`) that owns the recording engine, with the CLI, the SwiftUI app, and a future MCP server all becoming thin clients of one local API. The change is staged in two phases — Phase 1 extracts the API and routes the SwiftUI shell through it; Phase 2 consolidates the engine into the daemon and lands MCP as a separate-process client.
 
 ---
 
 ## Problem Frame
 
-ScreenCap today runs a CLI-as-engine + SwiftUI-shells-CLI architecture: the SwiftUI app spawns the bundled `screencap` binary as a long-lived subprocess for recordings and short-lived subprocesses for `status`/`list`, parsing versioned JSON on stdout and line-buffered structured events on stderr. This shape is a textbook subprocess-per-call pattern — the same one Tailscale, Docker, Ollama, Syncthing, rclone, and Mullvad all started with and refactored away from once a third surface arrived.
+Screencap today runs a CLI-as-engine + SwiftUI-shells-CLI architecture: the SwiftUI app spawns the bundled `screencap` binary as a long-lived subprocess for recordings and short-lived subprocesses for `status`/`list`, parsing versioned JSON on stdout and line-buffered structured events on stderr. This shape is a textbook subprocess-per-call pattern — the same one Tailscale, Docker, Ollama, Syncthing, rclone, and Mullvad all started with and refactored away from once a third surface arrived.
 
 The third surface is now arriving. The strategy doc treats UX & native experience as load-bearing this quarter, and MCP for computer-use agents is a near-term commitment, not a long-horizon bet. With three surfaces (CLI, GUI, MCP) needing to drive the same recording engine, the subprocess pattern stops scaling: MCP cannot meaningfully query a *live* recording session through per-call subprocesses, the GUI and MCP would otherwise see two divergent contracts (live stderr stream vs. catalog-DB reads), and TCC grants tied to an ad-hoc-signed SwiftUI build keep getting clobbered on rebuild.
 
@@ -26,7 +26,7 @@ The cost of staying on the current shape is paid in two places. First, every new
 - A1. **Power-user / scriptable CLI caller**: invokes `screencap` from a terminal or shell script. Cares about command exit codes, JSON output, and being able to run things headlessly without the GUI installed or open.
 - A2. **Non-technical operator (GUI user)**: launches the SwiftUI app, records, browses recordings. Per the strategy doc, this is the primary persona. Cares about install friction, "it just works," low daily-use overhead.
 - A3. **Computer-use agent (MCP client)**: a remote or local agent connected via MCP that needs to start, query, pause, and stop recordings, and read recording metadata while a session is live. Cares about a stable typed contract and live event streaming.
-- A4. **ScreenCap engineer**: maintains the engine, the API contract, and the daemon. Cares about contract stability, debuggability of the local socket, and not having two divergent IPC paths to keep in sync.
+- A4. **Screencap engineer**: maintains the engine, the API contract, and the daemon. Cares about contract stability, debuggability of the local socket, and not having two divergent IPC paths to keep in sync.
 
 ---
 
@@ -110,7 +110,7 @@ The cost of staying on the current shape is paid in two places. First, every new
 - A non-technical operator (A2) can install the SwiftUI app on a fresh macOS machine and produce a recording without re-granting TCC permissions across subsequent app updates.
 - An agent (A3) can start, query, pause, and stop a recording over MCP, observing the same live state the GUI would see, without the GUI being open.
 - A power user (A1) running `screencap record …` from a terminal continues to work after Phase 2 without the SwiftUI app being installed.
-- A future ScreenCap engineer (A4) implementing a new verb adds it once on the daemon API and gets CLI / GUI / MCP support automatically — no per-surface plumbing.
+- A future Screencap engineer (A4) implementing a new verb adds it once on the daemon API and gets CLI / GUI / MCP support automatically — no per-surface plumbing.
 - The downstream `ce-plan` run for Phase 1 does not need to re-invent which surfaces talk to which contract, what runs in-process vs. in the daemon, or what TCC grants live where.
 
 ---
@@ -132,7 +132,7 @@ The cost of staying on the current shape is paid in two places. First, every new
 
 ## Key Decisions
 
-- **Daemon over GUI-as-engine.** The strategic bet on computer-use agents requires that automation work without the GUI being open. GUI-as-engine (OBS / 1Password posture) would foreclose that. Rationale: research showed every durable 3-surface tool consolidates on either GUI-as-engine or daemon, and ScreenCap's strategy points at daemon.
+- **Daemon over GUI-as-engine.** The strategic bet on computer-use agents requires that automation work without the GUI being open. GUI-as-engine (OBS / 1Password posture) would foreclose that. Rationale: research showed every durable 3-surface tool consolidates on either GUI-as-engine or daemon, and Screencap's strategy points at daemon.
 
 - **`LaunchAgent`, not `LaunchDaemon`.** Screen recording requires the user's GUI session and prompts via TCC, neither of which a system `LaunchDaemon` can do. A per-user `LaunchAgent` matches every macOS recorder precedent and avoids the Docker-Desktop-4.15 anti-pattern of a permanent privileged process.
 
@@ -144,7 +144,7 @@ The cost of staying on the current shape is paid in two places. First, every new
 
 - **TCC grants migrate to the daemon's bundled binary.** Side effect: the SwiftUI shell stops carrying screen-recording grants on an ad-hoc dev signature, which solves the rebuild-clobbers-grants pain documented in `CLAUDE.md`. The daemon's PyInstaller bundle has a stable signing identity; SwiftUI's dev signature drift no longer matters for permissions.
 
-- **No auto-shutdown on idle.** The strategy positions ScreenCap as "low enough to run all day." A daemon that idles cheaply is on-strategy; one that constantly tears down and re-prompts for TCC is not.
+- **No auto-shutdown on idle.** The strategy positions Screencap as "low enough to run all day." A daemon that idles cheaply is on-strategy; one that constantly tears down and re-prompts for TCC is not.
 
 ---
 

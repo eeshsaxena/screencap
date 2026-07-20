@@ -10,7 +10,7 @@ origin: linear SCR-184 (https://linear.app/zk-email/issue/SCR-184)
 
 ## Summary
 
-Add view-rendering tests for the macOS `SearchView` that fail if the results pane collapses to zero size when results exist (the SCR-174 blank/frozen-detail regression class), and that structurally cover the core Search states. Implemented natively with `NSHostingView` inside the existing `ScreenCapTests` unit-test target — no new SPM dependency, no new test target, no pixel-diff golden images. A small behavior-preserving extraction makes the phase-driven content hostable without a live daemon or socket.
+Add view-rendering tests for the macOS `SearchView` that fail if the results pane collapses to zero size when results exist (the SCR-174 blank/frozen-detail regression class), and that structurally cover the core Search states. Implemented natively with `NSHostingView` inside the existing `ScreencapTests` unit-test target — no new SPM dependency, no new test target, no pixel-diff golden images. A small behavior-preserving extraction makes the phase-driven content hostable without a live daemon or socket.
 
 ---
 
@@ -24,7 +24,7 @@ The SwiftUI Search views (SCR-174, PR #283) are build-plus-manual-QA only. A lay
 
 - R1. Structurally cover the core `SearchView` states: idle, searching, daemon-down, loaded-with-results (multi-day), empty ("Nothing recorded then" and "No matches"), and the consent banner.
 - R2. A test fails if the results region renders empty / zero-size when `phase == .loaded` with results — guarding the exact regression class, not just view-model output.
-- R3. Use the lightest viable approach for this repo: native `NSHostingView` hosting in the existing `ScreenCapTests` unit-test target. No new SPM dependency, no new target, no pixel/image golden files.
+- R3. Use the lightest viable approach for this repo: native `NSHostingView` hosting in the existing `ScreencapTests` unit-test target. No new SPM dependency, no new target, no pixel/image golden files.
 - R4. Tests are deterministic and CI-robust: no live socket/daemon, no embedded-CLI process spawn, no font/anti-aliasing pixel flakiness.
 
 ---
@@ -47,15 +47,15 @@ The SwiftUI Search views (SCR-174, PR #283) are build-plus-manual-QA only. A lay
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/Views/Search/SearchView.swift` — the view under test. Self-constructs `@StateObject private var model = SearchViewModel()` (not injectable), depends on `@EnvironmentObject RecordingsIndex` and `@Environment(\.openWindow)`, and runs `.task { loadSettings() }` (spawns the embedded CLI). The phase rendering lives in the `content` computed property (switch over `model.phase`) and `resultsList(_:)`.
-- `macos/ScreenCap/Views/Search/SearchViewModel.swift` — defines `SearchViewModel.Phase` (`.idle`, `.searching`, `.loaded(SearchResults)`, `.daemonDown`) and the view-facing value types `SearchResults`, `SearchResultItem` (incl. `.anchorMs`, `.stream`), `CoverageReport`, `StreamState`. All are plain `Equatable`/`Sendable` structs/enums constructible directly in a test — the seam that makes phase-driven hosting possible without running a real search.
-- `macos/ScreenCap/Views/RecordingsListView.swift` — the native List-as-detail-root + `.safeAreaInset` pattern the fix mirrored; reference for the correct composition.
-- `macos/ScreenCapTests/SearchViewModelTests.swift`, `macos/ScreenCapTests/SearchAccessibilityTests.swift` — existing test style: `import XCTest` + `@testable import ScreenCap`, `final class …: XCTestCase`. All current tests are pure logic/string tests — **none host a SwiftUI view**, so this plan establishes the first view-hosting test pattern in the repo.
-- `macos/project.yml` — single `ScreenCapTests` target of type `bundle.unit-test`; **no `packages:` section (zero SPM dependencies)**; macOS 13.0 floor, Swift 5.9, `SWIFT_STRICT_CONCURRENCY: complete`. Test sources are a path glob (`path: ScreenCapTests`), so a new file is picked up on the next `xcodegen generate`.
+- `macos/Screencap/Views/Search/SearchView.swift` — the view under test. Self-constructs `@StateObject private var model = SearchViewModel()` (not injectable), depends on `@EnvironmentObject RecordingsIndex` and `@Environment(\.openWindow)`, and runs `.task { loadSettings() }` (spawns the embedded CLI). The phase rendering lives in the `content` computed property (switch over `model.phase`) and `resultsList(_:)`.
+- `macos/Screencap/Views/Search/SearchViewModel.swift` — defines `SearchViewModel.Phase` (`.idle`, `.searching`, `.loaded(SearchResults)`, `.daemonDown`) and the view-facing value types `SearchResults`, `SearchResultItem` (incl. `.anchorMs`, `.stream`), `CoverageReport`, `StreamState`. All are plain `Equatable`/`Sendable` structs/enums constructible directly in a test — the seam that makes phase-driven hosting possible without running a real search.
+- `macos/Screencap/Views/RecordingsListView.swift` — the native List-as-detail-root + `.safeAreaInset` pattern the fix mirrored; reference for the correct composition.
+- `macos/ScreencapTests/SearchViewModelTests.swift`, `macos/ScreencapTests/SearchAccessibilityTests.swift` — existing test style: `import XCTest` + `@testable import Screencap`, `final class …: XCTestCase`. All current tests are pure logic/string tests — **none host a SwiftUI view**, so this plan establishes the first view-hosting test pattern in the repo.
+- `macos/project.yml` — single `ScreencapTests` target of type `bundle.unit-test`; **no `packages:` section (zero SPM dependencies)**; macOS 13.0 floor, Swift 5.9, `SWIFT_STRICT_CONCURRENCY: complete`. Test sources are a path glob (`path: ScreencapTests`), so a new file is picked up on the next `xcodegen generate`.
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/xcodegen-stale-project-missing-new-sources.md` — `macos/ScreenCap.xcodeproj` is git-ignored and generated from `project.yml`; the build script does **not** detect added source files. A new test file will silently not compile until `xcodegen generate` is re-run. Must regenerate after adding the new test file(s); call this out in verification.
+- `docs/solutions/build-errors/xcodegen-stale-project-missing-new-sources.md` — `macos/Screencap.xcodeproj` is git-ignored and generated from `project.yml`; the build script does **not** detect added source files. A new test file will silently not compile until `xcodegen generate` is re-run. Must regenerate after adding the new test file(s); call this out in verification.
 - Memory: macOS app build/test runs via XcodeGen + `xcodebuild`; there is a known-flaky daemon-reconnect test unrelated to this work. Strict-concurrency-complete means all hosting/layout/assertions run `@MainActor`.
 
 ### External References
@@ -79,7 +79,7 @@ The SwiftUI Search views (SCR-174, PR #283) are build-plus-manual-QA only. A lay
 ### Resolved During Planning
 
 - Snapshot library vs native vs XCUITest: native `NSHostingView` (user-confirmed; see Key Technical Decisions).
-- Where the tests live: the existing `ScreenCapTests` unit-test target — no new target.
+- Where the tests live: the existing `ScreencapTests` unit-test target — no new target.
 - How to drive states without a daemon: construct `Phase`/`SearchResults` values directly and host a pure extracted view.
 
 ### Deferred to Implementation
@@ -137,8 +137,8 @@ NavigationSplitView {
 **Dependencies:** None
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift`
-- Create: `macos/ScreenCap/Views/Search/SearchResultsView.swift` (extracted pure view + `searchDetailLayout` seam; exact file split is the implementer's call)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift`
+- Create: `macos/Screencap/Views/Search/SearchResultsView.swift` (extracted pure view + `searchDetailLayout` seam; exact file split is the implementer's call)
 
 **Approach:**
 - Extract the `content` switch, `resultsList(_:)`, and their helpers (`stateMessage`, `coverageRow`/`coverageChip`, `consentBanner`, `emptyRow`, `interpretationText`, `returnKeyHandler`) into a new `SearchResultsView: View`.
@@ -171,8 +171,8 @@ NavigationSplitView {
 **Dependencies:** U1
 
 **Files:**
-- Create: `macos/ScreenCapTests/SearchViewHostingHarness.swift` (or a shared `ViewHostingHarness` helper)
-- Modify: `macos/ScreenCap/Views/Search/SearchResultsView.swift` (add `.accessibilityIdentifier`s)
+- Create: `macos/ScreencapTests/SearchViewHostingHarness.swift` (or a shared `ViewHostingHarness` helper)
+- Modify: `macos/Screencap/Views/Search/SearchResultsView.swift` (add `.accessibilityIdentifier`s)
 
 **Approach:**
 - Harness (`@MainActor`): host any `some View` in an `NSHostingView`, set a fixed `frameSize`, force layout (`layoutSubtreeIfNeeded()`; attach an offscreen `NSWindow` only if measurements require it), and expose helpers to (a) find a descendant `NSView` by `accessibilityIdentifier`, and (b) return its rendered size. Include a class-based fallback finder (e.g. nearest `NSScrollView`) for when identifier propagation is unreliable.
@@ -180,7 +180,7 @@ NavigationSplitView {
 - Provide a `makeResults(...)` factory to build `SearchResults`/`SearchResultItem` fixtures (multi-day anchored items, unanchored audio item, empty + timeWindow, consent-needed) so each test reads as one clear arrange step.
 - Add stable identifiers to `SearchResultsView` regions: e.g. `search.state.idle`, `search.state.searching`, `search.state.daemonDown`, `search.results.list`, `search.results.empty`, `search.consentBanner`.
 
-**Patterns to follow:** `@testable import ScreenCap`; existing test fixtures' construction style in `SearchViewModelTests`.
+**Patterns to follow:** `@testable import Screencap`; existing test fixtures' construction style in `SearchViewModelTests`.
 
 **Test scenarios:**
 - Happy path: harness hosts a trivial identified view and returns a non-zero size for that identifier — proves the find-and-measure path works before relying on it in U3/U4. (Smoke test for the harness itself.)
@@ -200,7 +200,7 @@ NavigationSplitView {
 **Dependencies:** U1, U2
 
 **Files:**
-- Create: `macos/ScreenCapTests/SearchViewLayoutTests.swift`
+- Create: `macos/ScreencapTests/SearchViewLayoutTests.swift`
 
 **Approach:**
 - Host the content through the shared `searchDetailLayout` seam (dummy top bar + `SearchResultsView(phase: .loaded(results), …)`) **inside U2's `hostInDetailColumn` wrapper** at a fixed size (e.g. 800×600), force layout, locate `search.results.list`, and assert its rendered height ≥ a non-collapsed threshold and that row content is present.
@@ -229,7 +229,7 @@ NavigationSplitView {
 **Dependencies:** U1, U2
 
 **Files:**
-- Modify: `macos/ScreenCapTests/SearchViewLayoutTests.swift` (or a sibling `SearchViewStateTests.swift`)
+- Modify: `macos/ScreencapTests/SearchViewLayoutTests.swift` (or a sibling `SearchViewStateTests.swift`)
 
 **Approach:**
 - One test per state: build the phase fixture, host `SearchResultsView` (idle/searching/daemon-down need no results), force layout, assert the state's identifier region is present and renders at non-zero size with no crash. For multi-state distinctions, also assert a discriminating marker (e.g. day section headers for multi-day; "Nothing recorded then" vs "No matches"; the consent banner's two buttons).
@@ -241,7 +241,7 @@ NavigationSplitView {
 **Test scenarios:**
 - Happy path: idle → `search.state.idle` present, renders non-zero, no crash.
 - Happy path: searching → `search.state.searching` (progress) present, renders non-zero.
-- Happy path: daemon-down → `search.state.daemonDown` present; carries the "ScreenCap isn't running" message.
+- Happy path: daemon-down → `search.state.daemonDown` present; carries the "Screencap isn't running" message.
 - Happy path: loaded multi-day with results → multiple day `Section` headers render; rows present (overlaps U3 but asserts the multi-day grouping specifically).
 - Edge case: authoritative empty (timeWindow + activity `.empty`) → `search.results.empty` shows "Nothing recorded then".
 - Edge case: non-authoritative empty (no timeWindow) → `search.results.empty` shows "No matches".
@@ -290,6 +290,6 @@ NavigationSplitView {
 - **Origin issue:** [SCR-184 — Snapshot/UI tests for Search views (layout regression guard)](https://linear.app/zk-email/issue/SCR-184)
 - **Parent / context:** [SCR-174 — Ask-Your-History Search (in-app, v1)](https://linear.app/zk-email/issue/SCR-174); `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`
 - **Regression fix being guarded:** commit `995af6c7` — "fix(scr-174): render search results as a List to fix blank/frozen detail"
-- Code under test: `macos/ScreenCap/Views/Search/SearchView.swift`, `macos/ScreenCap/Views/Search/SearchViewModel.swift`
-- Test conventions: `macos/ScreenCapTests/SearchViewModelTests.swift`, `macos/ScreenCapTests/SearchAccessibilityTests.swift`; `macos/project.yml`
+- Code under test: `macos/Screencap/Views/Search/SearchView.swift`, `macos/Screencap/Views/Search/SearchViewModel.swift`
+- Test conventions: `macos/ScreencapTests/SearchViewModelTests.swift`, `macos/ScreencapTests/SearchAccessibilityTests.swift`; `macos/project.yml`
 - Learning: `docs/solutions/build-errors/xcodegen-stale-project-missing-new-sources.md`

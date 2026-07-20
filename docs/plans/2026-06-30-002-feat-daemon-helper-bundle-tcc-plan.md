@@ -57,13 +57,13 @@ The daemon ships as a bare Mach-O (`Contents/Resources/screencap/screencap`, cod
 ### Relevant Code and Patterns
 
 - `pyinstaller/screencap.spec` — produces the `--onedir` `COLLECT` named `screencap` (→ `dist/screencap/`). `EXE(... console=True)` + `COLLECT(...)`. `--onedir` is deliberate: `multiprocessing.spawn` re-execs the binary per child and onefile would re-extract ~100 MB each time (spec L4-5). No `BUNDLE()` step today.
-- `macos/ScreenCap/Scripts/embed-cli.sh` — `ditto`s `dist/screencap/` → `Contents/Resources/screencap/` (L115); writes `Contents/Resources/screencap-daemon-launcher` (Debug dev-source aware / Release exec-only, L16-83); stamps `Contents/Resources/screencap-cli-version` (L125-149); signs inside-out via `sign_embedded_cli()` using `EXPANDED_CODE_SIGN_IDENTITY` + `screencap-cli.entitlements` (L151-193).
+- `macos/Screencap/Scripts/embed-cli.sh` — `ditto`s `dist/screencap/` → `Contents/Resources/screencap/` (L115); writes `Contents/Resources/screencap-daemon-launcher` (Debug dev-source aware / Release exec-only, L16-83); stamps `Contents/Resources/screencap-cli-version` (L125-149); signs inside-out via `sign_embedded_cli()` using `EXPANDED_CODE_SIGN_IDENTITY` + `screencap-cli.entitlements` (L151-193).
 - `macos/project.yml` — `preBuildScripts` runs `embed-cli.sh` (L57-61); `postBuildScripts` copies `com.screencap.daemon.plist` → `Contents/Library/LaunchAgents/` (L63-71); `ENABLE_HARDENED_RUNTIME: YES`, `CODE_SIGN_STYLE: Automatic`, `DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}`.
-- `macos/ScreenCap/Resources/com.screencap.daemon.plist` — `Label=com.screencap.daemon` (note: launchd label ≠ TCC subject), `BundleProgram=Contents/Resources/screencap-daemon-launcher`, `RunAtLoad`, `ExitTimeOut=30`, `PATH` env only (no `~` keys).
+- `macos/Screencap/Resources/com.screencap.daemon.plist` — `Label=com.screencap.daemon` (note: launchd label ≠ TCC subject), `BundleProgram=Contents/Resources/screencap-daemon-launcher`, `RunAtLoad`, `ExitTimeOut=30`, `PATH` env only (no `~` keys).
 - `src/screencap/daemon/launchagent.py` `render_plist(...)` — generates the plist; `bundle_program` param controls the `BundleProgram` key. Pinned byte-for-byte against the bundled plist by `tests/daemon/test_launchagent.py::test_bundled_macos_launchagent_plist_matches_renderer`.
 - `script/sign_app.sh` — authoritative inside-out signing (dylibs → CLI binary w/ `screencap-cli.entitlements` → Frameworks → outer app), `--options runtime --timestamp`, no `--deep`; verifies with `codesign --verify --strict`. `script/notarize_app.sh` — `notarytool` + `stapler`.
-- `macos/ScreenCap/Controllers/CLIClient.swift` `resolveBinary()` (L103-139) — resolves `Bundle.main.resourceURL/screencap/screencap`; precedence: `SCREENCAP_CLI_PATH` env → bundled → Debug dev fallback.
-- `macos/ScreenCap/Controllers/DaemonInstallController.swift` — `SMAppService.agent(plistName: "com.screencap.daemon.plist")`; `requiresApproval` → Login Items path; `bootout` of `gui/<uid>/com.screencap.daemon` + version reconciliation (SCR-121/135); `BundledDaemonVersion.resourceName = "screencap-cli-version"`.
+- `macos/Screencap/Controllers/CLIClient.swift` `resolveBinary()` (L103-139) — resolves `Bundle.main.resourceURL/screencap/screencap`; precedence: `SCREENCAP_CLI_PATH` env → bundled → Debug dev fallback.
+- `macos/Screencap/Controllers/DaemonInstallController.swift` — `SMAppService.agent(plistName: "com.screencap.daemon.plist")`; `requiresApproval` → Login Items path; `bootout` of `gui/<uid>/com.screencap.daemon` + version reconciliation (SCR-121/135); `BundledDaemonVersion.resourceName = "screencap-cli-version"`.
 - `src/screencap/daemon/permission_register.py` + `app.py` (`/v0/permission.request`) + `src/screencap/engine/platform/darwin.py` (`request_screen_recording_access` / `request_accessibility_access` / `register_input_monitoring_access`) — the retained self-registration mechanisms.
 
 ### Institutional Learnings
@@ -119,9 +119,9 @@ The daemon ships as a bare Mach-O (`Contents/Resources/screencap/screencap`, cod
 
 > *This illustrates the intended approach and is directional guidance for review, not implementation specification. The implementing agent should treat it as context, not code to reproduce.*
 
-Target bundle layout (inside the outer `ScreenCap.app`):
+Target bundle layout (inside the outer `Screencap.app`):
 
-    ScreenCap.app/Contents/
+    Screencap.app/Contents/
       Library/LaunchAgents/com.screencap.daemon.plist     # Release: BundleProgram → nested .app exec directly
       Library/LoginItems/ (or Helpers/) ScreencapDaemon.app/
         Contents/
@@ -134,7 +134,7 @@ Target bundle layout (inside the outer `ScreenCap.app`):
         screencap-daemon-launcher   # Debug dev-source only (Release execs the nested exec directly)
         screencap-cli-version        # version stamp (path preserved or relocated + consumer updated)
 
-Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so` → `ScreencapDaemon.app/Contents/MacOS/screencap` (w/ CPython entitlements) → `ScreencapDaemon.app` (w/ Info.plist) → outer `ScreenCap.app` → `notarytool` + `stapler`.
+Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so` → `ScreencapDaemon.app/Contents/MacOS/screencap` (w/ CPython entitlements) → `ScreencapDaemon.app` (w/ Info.plist) → outer `Screencap.app` → `notarytool` + `stapler`.
 
 ---
 
@@ -180,7 +180,7 @@ Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so`
 **Dependencies:** U1
 
 **Files:**
-- Modify: `macos/ScreenCap/Scripts/embed-cli.sh`
+- Modify: `macos/Screencap/Scripts/embed-cli.sh`
 - Modify: `macos/project.yml` (pre/post-build script paths if the embed destination or plist copy changes)
 
 **Approach:**
@@ -208,7 +208,7 @@ Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so`
 **Dependencies:** U2
 
 **Files:**
-- Modify: `macos/ScreenCap/Resources/com.screencap.daemon.plist`
+- Modify: `macos/Screencap/Resources/com.screencap.daemon.plist`
 - Modify: `src/screencap/daemon/launchagent.py`
 - Test: `tests/daemon/test_launchagent.py`
 
@@ -238,7 +238,7 @@ Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so`
 
 **Files:**
 - Modify: `script/sign_app.sh`
-- Modify: `macos/ScreenCap/Scripts/embed-cli.sh` (`sign_embedded_cli` for the Xcode-build signing path)
+- Modify: `macos/Screencap/Scripts/embed-cli.sh` (`sign_embedded_cli` for the Xcode-build signing path)
 - Modify (if needed): `script/notarize_app.sh`
 - Modify: `SECURITY.md` (record the accepted residual — CPython entitlements on the new TCC subject)
 
@@ -271,9 +271,9 @@ Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so`
 **Dependencies:** U2
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/CLIClient.swift` (`resolveBinary()`)
-- Modify (if version stamp relocated): `macos/ScreenCap/Controllers/DaemonInstallController.swift` (`BundledDaemonVersion`)
-- Test: `macos/ScreenCapTests/CLIRecorderServiceTests.swift` / `DaemonInstallControllerTests.swift`
+- Modify: `macos/Screencap/Controllers/CLIClient.swift` (`resolveBinary()`)
+- Modify (if version stamp relocated): `macos/Screencap/Controllers/DaemonInstallController.swift` (`BundledDaemonVersion`)
+- Test: `macos/ScreencapTests/CLIRecorderServiceTests.swift` / `DaemonInstallControllerTests.swift`
 
 **Approach:**
 - Update the bundled-path branch to the nested `.app` exec; keep `SCREENCAP_CLI_PATH` override and Debug dev fallback precedence.
@@ -300,8 +300,8 @@ Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so`
 
 **Files:**
 - Verify (likely no logic change): `src/screencap/daemon/permission_register.py`, `src/screencap/daemon/app.py`, `src/screencap/engine/platform/darwin.py`
-- Modify (copy): `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift`, `macos/ScreenCap/Controllers/PermissionController.swift` (helper-entry-name strings now that the entry is `com.screencap.daemon`)
-- Test: `macos/ScreenCapTests/PermissionControllerTests.swift`
+- Modify (copy): `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift`, `macos/Screencap/Controllers/PermissionController.swift` (helper-entry-name strings now that the entry is `com.screencap.daemon`)
+- Test: `macos/ScreencapTests/PermissionControllerTests.swift`
 
 **Approach:**
 - Keep the three registration mechanisms; they now run as the bundled agent.
@@ -328,9 +328,9 @@ Signing order (authoritative pass, inside-out): nested `Frameworks/*.dylib|*.so`
 **Dependencies:** U3, U5
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/DaemonInstallController.swift` (cutover/bootout sequencing for the identity change)
+- Modify: `macos/Screencap/Controllers/DaemonInstallController.swift` (cutover/bootout sequencing for the identity change)
 - Create: `docs/solutions/build-errors/daemon-tcc-identity-migration-2026-06-30.md` (standalone migration note + tester comms, incl. the orphaned-row cleanup instruction)
-- Test: `macos/ScreenCapTests/DaemonInstallControllerTests.swift`
+- Test: `macos/ScreencapTests/DaemonInstallControllerTests.swift`
 
 **Approach:**
 - Reuse the existing `bootout` of `gui/<uid>/com.screencap.daemon` + socket cleanup + version reconciliation so the new helper binds cleanly instead of racing a surviving old daemon.

@@ -15,7 +15,7 @@ execution: code
 
 - **Objective:** When a user subscribes from the paywall gate, turn the sheet into a clear "you're all set" confirmation instead of one that still asks them to subscribe, and give its plan info and actions a real hierarchy.
 - **Product authority:** Rute (rfigueiredo.dev@gmail.com).
-- **Execution profile:** Standard, three units — two in the account-sheet policy/copy layer, one in the sheet view. Swift / SwiftUI under `macos/ScreenCap/`. Single `fix` PR.
+- **Execution profile:** Standard, three units — two in the account-sheet policy/copy layer, one in the sheet view. Swift / SwiftUI under `macos/Screencap/`. Single `fix` PR.
 - **Stop conditions:** `AccountSheetPolicyTests` green, the manual gate→subscribe→success smoke passes, and non-entitled gate states are visibly unchanged.
 - **Tail ownership:** Implementer runs the macOS test scheme and the manual smoke before opening the PR.
 - **Open blockers:** None. Copy wording and exact SwiftUI styling are deferred to implementation.
@@ -136,10 +136,10 @@ Deferred to implementation:
 
 ### Sources
 
-- `macos/ScreenCap/Views/Account/AccountSheetView.swift` — render tree: `header` (:117), `stateContent` (:143, trial/subscribed branch identical across contexts), `plansSection`/`tierRow` (:219), `tierSwitchButton` → `beginManage` (:270, :489), `accountActionsSection` (:401), `dismissFooter` (:469).
-- `macos/ScreenCap/Views/Account/AccountSheetPolicy.swift` — state derivation (:78), `headline`/`subcopy` fixed by context (:247, :265), `dismissTitle` (:286), `tierAffordance` cross-tier `switchViaPortal` (:188), copy catalog incl. `gateHeadline`, `switchPlanDetail`, `manageSubscription`, `renderedStrings` (:295).
-- `macos/ScreenCap/Views/MainWindow.swift:375` — gate sheet presentation; `onDismiss` supplied only for presented contexts; no auto-dismiss on subscribe; `context` fixed at present time.
-- `macos/ScreenCapTests/AccountSheetPolicyTests.swift` — the string-assertion test pattern; existing pins `testGateContextSelectsGateFramingAccountContextNeutral`, `testGateDismissTitleIsNotNow`, `testHeldTierRendersCurrentPlanOtherTierSwitchRouted`, `testNoRenderedStringInstructsTerminalUse`.
+- `macos/Screencap/Views/Account/AccountSheetView.swift` — render tree: `header` (:117), `stateContent` (:143, trial/subscribed branch identical across contexts), `plansSection`/`tierRow` (:219), `tierSwitchButton` → `beginManage` (:270, :489), `accountActionsSection` (:401), `dismissFooter` (:469).
+- `macos/Screencap/Views/Account/AccountSheetPolicy.swift` — state derivation (:78), `headline`/`subcopy` fixed by context (:247, :265), `dismissTitle` (:286), `tierAffordance` cross-tier `switchViaPortal` (:188), copy catalog incl. `gateHeadline`, `switchPlanDetail`, `manageSubscription`, `renderedStrings` (:295).
+- `macos/Screencap/Views/MainWindow.swift:375` — gate sheet presentation; `onDismiss` supplied only for presented contexts; no auto-dismiss on subscribe; `context` fixed at present time.
+- `macos/ScreencapTests/AccountSheetPolicyTests.swift` — the string-assertion test pattern; existing pins `testGateContextSelectsGateFramingAccountContextNeutral`, `testGateDismissTitleIsNotNow`, `testHeldTierRendersCurrentPlanOtherTierSwitchRouted`, `testNoRenderedStringInstructsTerminalUse`.
 - Reported screen = the `.trial` body rendered in `.gate` context.
 
 ---
@@ -176,7 +176,7 @@ U1 and U2 are independent policy changes and can land in either order. U3 (view)
 - **Goal:** Gate + entitled renders success framing (header + subcopy) and a Done dismiss, instead of the subscribe/"Not now" gate framing.
 - **Requirements:** R1, R2; preserves R9.
 - **Dependencies:** none.
-- **Files:** `macos/ScreenCap/Views/Account/AccountSheetPolicy.swift`, `macos/ScreenCapTests/AccountSheetPolicyTests.swift`.
+- **Files:** `macos/Screencap/Views/Account/AccountSheetPolicy.swift`, `macos/ScreencapTests/AccountSheetPolicyTests.swift`.
 - **Approach:** Add success copy to `AccountSheetCopy`: a success headline, a `.subscribed` (paid) success subcopy, a **distinct `.trial` success subcopy** that keeps the cancel-before-charge caveat in primary framing (state-asserting, never event-asserting, per R1), and the Done label. Branch `headline` and `subcopy` so that in `.gate` context with state ∈ {`.trial`, `.subscribed`} they return the success copy (trial vs paid subcopy differ); every other context/state path is unchanged (keep the existing `neutral`-first guard). Add a `state` parameter to `dismissTitle`: gate + entitled → Done, gate + other → "Not now", account/upload → "Close". Add the new strings to `renderedStrings`.
 - **Patterns to follow:** the existing context/state branching in `headline`/`subcopy`; the `AccountSheetCopy` catalog + `renderedStrings` audit-list pattern.
 - **Test scenarios (extend `AccountSheetPolicyTests`):**
@@ -191,7 +191,7 @@ U1 and U2 are independent policy changes and can land in either order. U3 (view)
 - **Goal:** The cross-tier switch is prominent only when it is an upgrade; a downgrade renders quiet.
 - **Requirements:** R5, R6, R11.
 - **Dependencies:** none.
-- **Files:** `macos/ScreenCap/Views/Account/AccountSheetPolicy.swift`, `macos/ScreenCapTests/AccountSheetPolicyTests.swift`.
+- **Files:** `macos/Screencap/Views/Account/AccountSheetPolicy.swift`, `macos/ScreencapTests/AccountSheetPolicyTests.swift`.
 - **Approach:** Add a policy helper that returns prominent when the held tier is `.localPro` (switch target Cloud, an upgrade), quiet when the held tier is `.cloud` (switch target Local Pro, a downgrade), and not-prominent when the held tier is `.none` (unresolved — no confident upgrade to push; see R11). Do not change `tierAffordance` or the `TierAffordance` enum — the helper is orthogonal to which tier is portal-routed.
 - **Patterns to follow:** the pure-function + `heldTier`-parameter shape of `tierAffordance`.
 - **Test scenarios:**
@@ -204,7 +204,7 @@ U1 and U2 are independent policy changes and can land in either order. U3 (view)
 - **Goal:** Restructure the trial/subscribed rendering into one plan card, a Done primary, a prominent Switch (upgrade only), and quiet links (Manage Subscription, Sign Out, and the downgrade Switch); remove the redundant "Plan changes happen in Manage Subscription" caption.
 - **Requirements:** R2, R3, R4, R7, R8, R11; preserves R10.
 - **Dependencies:** U1, U2.
-- **Files:** `macos/ScreenCap/Views/Account/AccountSheetView.swift`.
+- **Files:** `macos/Screencap/Views/Account/AccountSheetView.swift`.
 - **Approach:** In the `stateContent` `.trial`/`.subscribed` branch, replace `planStatusSection` + `plansSection` + `accountActionsSection` with: the identity line, a plan card (name, current-plan badge, price, and trial-only days-left + cancel-before-charge lines), a prominent primary **Done** button (default-action treatment) placed above the Switch, the prominent Switch button when the U2 helper returns prominent, and quiet links for Manage Subscription and Sign Out (plus the Switch when the helper returns quiet). Because Done is rendered here as the primary action, suppress the shared bottom `dismissFooter` in this state so there is no duplicate dismiss. Apply `.accessibilityElement(children: .combine)` (or a composed label) to the plan card, mirroring the existing `tierRow(.currentPlan)` / `checkoutPendingSection` grouping. Keep the `if auth.tier != .none` guard: when the held tier is unresolved (R11), fall back to today's rendering (no plan-name card, no prominent switch) rather than an empty "No plan" card. Drop the `switchPlanDetail` caption. Leave the `neutral`, `lapsed`, `signedOut`, and `checkoutPending` branches unchanged, and preserve the Sign-Out-disabled-during-upload and error-seam behavior.
 - **Patterns to follow:** `.borderedProminent` + `.keyboardShortcut(.defaultAction)` for the prominent Done and Switch (as `signInSection` uses for Sign In); a low-emphasis style (e.g. `.plain` / `.borderless`) for the quiet links; `.accessibilityElement(children: .combine)` for the card (as `tierRow(.currentPlan)` and `checkoutPendingSection` do); existing `identitySection`, `OnboardingCopy.trialBanner`, `currentPlanBadge`, and the `PricingCatalog` price line.
 - **Execution note:** Verify visually — reach the gate, subscribe (or drive a trial/subscribed state), and confirm the success screen and the Account-pane rendering; check the Cloud-subscriber case shows a quiet "Switch to Local Pro."
@@ -217,8 +217,8 @@ U1 and U2 are independent policy changes and can land in either order. U3 (view)
 
 | Gate | What it proves | Applies to |
 |---|---|---|
-| ScreenCap macOS test scheme — `AccountSheetPolicyTests` | Success framing (trial vs paid subcopy distinct, state-asserting), state-aware dismiss label, switch prominence incl. the `.none` fallback, and the no-terminal sweep all hold; non-entitled framing unchanged | U1, U2 |
-| App build (ScreenCap scheme) | The view restructure compiles | U3 |
+| Screencap macOS test scheme — `AccountSheetPolicyTests` | Success framing (trial vs paid subcopy distinct, state-asserting), state-aware dismiss label, switch prominence incl. the `.none` fallback, and the no-terminal sweep all hold; non-entitled framing unchanged | U1, U2 |
+| App build (Screencap scheme) | The view restructure compiles | U3 |
 | Manual smoke: gate → subscribe → success | The reported screen is fixed — success header, one card (read as a single VoiceOver stop), a prominent Done above a prominent Switch to Cloud, quiet Manage/Sign Out | U3 |
 | Manual smoke: Account pane + Cloud-subscriber cases | Account-pane parity (AE4); downgrade Switch is quiet (AE3) | U3 |
 

@@ -16,7 +16,7 @@ Replace the recency-only `SearchViewModel.rank` with a **blended relevance + rec
 
 ## Problem Frame
 
-`SearchViewModel.rank` (`macos/ScreenCap/Views/Search/SearchViewModel.swift:509`) sorts strictly by `anchorMs` descending, using the bm25 `score` only to break ties among same-instant hits. The consequence (origin R4 gap): a strong on-screen-text or transcript match for a free-text query sits **below** an unrelated-but-newer timeline/activity row, because timeline rows carry `score: 0` and the relevance signal never participates in cross-stream ordering. There is no real relevance blend — only chronology. For a question-driven query ("refund macro"), the most relevant moment should lead, not whatever happened most recently. (see origin: `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`, R4 + deferred-blend note)
+`SearchViewModel.rank` (`macos/Screencap/Views/Search/SearchViewModel.swift:509`) sorts strictly by `anchorMs` descending, using the bm25 `score` only to break ties among same-instant hits. The consequence (origin R4 gap): a strong on-screen-text or transcript match for a free-text query sits **below** an unrelated-but-newer timeline/activity row, because timeline rows carry `score: 0` and the relevance signal never participates in cross-stream ordering. There is no real relevance blend — only chronology. For a question-driven query ("refund macro"), the most relevant moment should lead, not whatever happened most recently. (see origin: `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`, R4 + deferred-blend note)
 
 ---
 
@@ -54,12 +54,12 @@ Replace the recency-only `SearchViewModel.rank` with a **blended relevance + rec
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/Views/Search/SearchViewModel.swift`
+- `macos/Screencap/Views/Search/SearchViewModel.swift`
   - `rank(_:)` (line 509) — the function being replaced; current recency-first comparator with bm25 tiebreak.
   - Item construction (lines 187–232): timeline/activity → `score: 0`; content/screen → `score: hit.score` (bm25); transcript/audio → `score: 0` (**no wire score**), `anchorMs` may be `nil` (unanchored), `approximate: true`.
   - `SearchResultItem` (line 555) — `stream: Stream {screen, audio, activity}`, `anchorMs: Int?`, `score: Double`. **`score == 0` is overloaded** between activity (no relevance) and transcript (text match) — relevance must be assigned per-`stream`, never inferred from `score` alone.
-- `macos/ScreenCap/Models/SearchResult.swift` — `ContentHit.score` (bm25, more-negative = better, unbounded); `TranscriptHit` has **no** score; `TimelineRow` has no score.
-- `macos/ScreenCapTests/SearchViewModelTests.swift` — `FakeSearchService` seam + `makeVM`; `testAllStreamsMergeAndRankByRecency` (line 83) currently asserts the recency-only order `[3000, 2000, 1000]` = `[.activity, .screen, .audio]` — this is the OLD behavior and **will deliberately flip** under the blend.
+- `macos/Screencap/Models/SearchResult.swift` — `ContentHit.score` (bm25, more-negative = better, unbounded); `TranscriptHit` has **no** score; `TimelineRow` has no score.
+- `macos/ScreencapTests/SearchViewModelTests.swift` — `FakeSearchService` seam + `makeVM`; `testAllStreamsMergeAndRankByRecency` (line 83) currently asserts the recency-only order `[3000, 2000, 1000]` = `[.activity, .screen, .audio]` — this is the OLD behavior and **will deliberately flip** under the blend.
 
 ### Institutional Learnings
 
@@ -81,7 +81,7 @@ Replace the recency-only `SearchViewModel.rank` with a **blended relevance + rec
 - **Default weights:** `relevanceWeight = 0.75`, `recencyWeight = 0.25`, `textFloor = 0.5`, `transcriptRelevance = 0.6`. Check: `0.75 * 0.5 = 0.375 > 0.25 * 1.0 = 0.25` ✓. These are the tunable knobs (R6); final values tuned against real data (deferred).
 - **Unanchored text hits stay in the text tier.** An unanchored transcript hit (anchor `nil`) gets `recencyNorm = 0` (oldest) but keeps its text relevance — so it still ranks **above** zero-relevance activity (consistent with R3), but **below** anchored text hits. This is a deliberate change from "unanchored sorts dead last overall." Alternative considered: keep unanchored last globally — rejected because it would push a relevant transcript match below an unrelated activity row, violating R3.
 - **Deterministic total order.** Swift's `sort` is not guaranteed stable; the comparator ends with a stable tiebreak on `id` so equal-blend items order deterministically (required for testable ordering).
-- **Pure, tunable core in its own file.** Extract the scoring into an internal, side-effect-free helper (`macos/ScreenCap/Views/Search/SearchRanking.swift`) that takes the item list and weights and returns the ordered list. Rationale: directly unit-testable (normalization edges, dominance invariant) without driving the whole async fan-out; keeps `SearchViewModel` focused; tuning = editing constants in one place.
+- **Pure, tunable core in its own file.** Extract the scoring into an internal, side-effect-free helper (`macos/Screencap/Views/Search/SearchRanking.swift`) that takes the item list and weights and returns the ordered list. Rationale: directly unit-testable (normalization edges, dominance invariant) without driving the whole async fan-out; keeps `SearchViewModel` focused; tuning = editing constants in one place.
 
 ---
 
@@ -148,9 +148,9 @@ Degenerate-bounds rule: when a normalization band has `min == max` (single hit, 
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Search/SearchRanking.swift`
-- Create: `macos/ScreenCapTests/SearchRankingTests.swift`
-- Modify: `macos/ScreenCap/project.yml` or the XcodeGen sources config **only if** new files under existing source roots are not auto-globbed (verify first; most likely no change needed)
+- Create: `macos/Screencap/Views/Search/SearchRanking.swift`
+- Create: `macos/ScreencapTests/SearchRankingTests.swift`
+- Modify: `macos/Screencap/project.yml` or the XcodeGen sources config **only if** new files under existing source roots are not auto-globbed (verify first; most likely no change needed)
 
 **Approach:**
 - Define an internal `BlendWeights` struct (or static constants) with documented defaults: `relevanceWeight = 0.75`, `recencyWeight = 0.25`, `textFloor = 0.5`, `transcriptRelevance = 0.6`. Include a comment stating the dominance invariant `relevanceWeight * textFloor > recencyWeight`.
@@ -162,8 +162,8 @@ Degenerate-bounds rule: when a normalization band has `min == max` (single hit, 
 **Technical design:** see High-Level Technical Design above — same structure, scoped to this pure function. Directional, not implementation spec.
 
 **Patterns to follow:**
-- `SearchResultItem` shape and the existing `rank` comparator's nil-handling in `macos/ScreenCap/Views/Search/SearchViewModel.swift:509`.
-- Existing Swift test style in `macos/ScreenCapTests/SearchViewModelTests.swift` (XCTest, `@testable import ScreenCap`, plain struct fixtures).
+- `SearchResultItem` shape and the existing `rank` comparator's nil-handling in `macos/Screencap/Views/Search/SearchViewModel.swift:509`.
+- Existing Swift test style in `macos/ScreencapTests/SearchViewModelTests.swift` (XCTest, `@testable import Screencap`, plain struct fixtures).
 
 **Test scenarios:**
 - Happy path: a content hit (bm25 `-2.0`) + a newer activity row → content ranks first (Covers R3 / origin R4 acceptance).
@@ -189,8 +189,8 @@ Degenerate-bounds rule: when a normalization band has `min == max` (single hit, 
 **Dependencies:** U1
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (`rank(_:)` at line 509; update its doc comment from "Recency-first" to the blend description)
-- Modify: `macos/ScreenCapTests/SearchViewModelTests.swift`
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (`rank(_:)` at line 509; update its doc comment from "Recency-first" to the blend description)
+- Modify: `macos/ScreencapTests/SearchViewModelTests.swift`
 
 **Approach:**
 - `rank` becomes a thin delegate to `rankBlended(_:weights:)` from U1 — no scoring logic left in the view model.
@@ -199,7 +199,7 @@ Degenerate-bounds rule: when a normalization band has `min == max` (single hit, 
 - Add a focused end-to-end ordering test for an unrelated-newer-activity scenario driven through `vm.search()` against the `FakeSearchService`.
 
 **Patterns to follow:**
-- `FakeSearchService` + `makeVM` + `loaded(_:)` helpers already in `macos/ScreenCapTests/SearchViewModelTests.swift`.
+- `FakeSearchService` + `makeVM` + `loaded(_:)` helpers already in `macos/ScreencapTests/SearchViewModelTests.swift`.
 - Time-filter and correlation tests remain valid as-is — confirm they still pass (only ordering semantics changed, not membership/filtering).
 
 **Test scenarios:**
@@ -239,5 +239,5 @@ Degenerate-bounds rule: when a normalization band has `min == max` (single hit, 
 
 - **Origin document:** [docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md](docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md) — R4 (relevance+recency ranking) + deferred-blend open question.
 - Parent plan (blend deferred to implementation): [docs/plans/2026-06-24-002-feat-ask-your-history-search-plan.md](docs/plans/2026-06-24-002-feat-ask-your-history-search-plan.md) (U4, line 144).
-- Code under change: [macos/ScreenCap/Views/Search/SearchViewModel.swift](macos/ScreenCap/Views/Search/SearchViewModel.swift) (`rank`, line 509); [macos/ScreenCap/Models/SearchResult.swift](macos/ScreenCap/Models/SearchResult.swift); [macos/ScreenCapTests/SearchViewModelTests.swift](macos/ScreenCapTests/SearchViewModelTests.swift).
+- Code under change: [macos/Screencap/Views/Search/SearchViewModel.swift](macos/Screencap/Views/Search/SearchViewModel.swift) (`rank`, line 509); [macos/Screencap/Models/SearchResult.swift](macos/Screencap/Models/SearchResult.swift); [macos/ScreencapTests/SearchViewModelTests.swift](macos/ScreencapTests/SearchViewModelTests.swift).
 - Linear: [SCR-180](https://linear.app/zk-email/issue/SCR-180/search-ranking-blend-relevance-recency-across-streams) (related: [SCR-174](https://linear.app/zk-email/issue/SCR-174/ask-your-history-search-in-app-v1)).

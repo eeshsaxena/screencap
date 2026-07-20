@@ -124,7 +124,7 @@ _AMBIENT_SET_API_VERSION = 1
 
 @cache
 def daemon_version() -> str:
-    """Return the installed ScreenCap package version used by this daemon."""
+    """Return the installed Screencap package version used by this daemon."""
     from screencap import __version__
 
     return str(__version__)

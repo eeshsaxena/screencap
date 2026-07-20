@@ -62,20 +62,20 @@ The technical crux this plan must solve: the native review path **always scrubs*
 
 ### Relevant Code and Patterns
 
-- **Window scene + opener pattern to mirror exactly:** the per-recording `ReviewWindow` `WindowGroup` keyed `for: String.self` at `macos/ScreenCap/ScreenCapApp.swift:99-113`; the `ReviewWindowID` constant co-located at `macos/ScreenCap/Views/Review/ReviewWindow.swift:6`; the `ReviewWindowOpener` singleton (with `openReview` closure + out-of-band `pendingSeekMs` seek + `open(recordingName:) -> Bool`) at `macos/ScreenCap/State/ReviewWindowOpener.swift`; and the zero-frame `OpenWindowBridge` that registers the closure inside the main `Window` body at `macos/ScreenCap/ScreenCapApp.swift:179-192`.
-- **Playback panes reusable as-is (no review/upload coupling):** `VideoPlayerPane` + `VideoPlayerPaneModel` (protocol-seamed via `VideoPlaybackEngine` / `LiveVideoPlaybackEngine(url:)`), `TimelinePane` (its `riskyIntervals`/`redactionMarkers` inputs are defaulted empty — omit them and it draws event ticks + cursor only), `EventContentPane`, `TimelineEvent` / `TimelineEventParser` (pure JSONL decoder), and `SearchSeek.relativeSeconds(...)` (pure). All under `macos/ScreenCap/Views/Review/` + `macos/ScreenCap/Controllers/SearchSeek.swift`.
-- **Review-only surfaces to exclude from inspect:** `ScreenshotTruthPane` ("What actually uploads" / green-shield framing — drop entirely; the AVKit video already shows frames), and `RedactionEvidenceView` / `FailClosedCallout` / `CoverageStrip` in `macos/ScreenCap/Views/Review/RedactionEvidenceView.swift`. `TimingUnavailableCallout` (same file) is worth keeping — it advises when the timeline can't be drawn.
-- **The scrub-on-load path (the thing inspect must NOT do):** `LiveReviewDataLoader.load` runs `review-data --json` with a 600s timeout (`macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift:186-192`); Python `prepare_review_data` holds `recording_scrub_lock` and runs `_prepare_scrubbed_copy` (export → recovery → `scrub_recording`), then resolves events/screenshots from the `-scrubbed` dir (`src/screencap/review.py:182`, `:272-299`). Video + timing come from the **original** dir (`_ensure_single_video` + `catalog._read_recording_meta`) — those sub-steps are the reusable half.
+- **Window scene + opener pattern to mirror exactly:** the per-recording `ReviewWindow` `WindowGroup` keyed `for: String.self` at `macos/Screencap/ScreencapApp.swift:99-113`; the `ReviewWindowID` constant co-located at `macos/Screencap/Views/Review/ReviewWindow.swift:6`; the `ReviewWindowOpener` singleton (with `openReview` closure + out-of-band `pendingSeekMs` seek + `open(recordingName:) -> Bool`) at `macos/Screencap/State/ReviewWindowOpener.swift`; and the zero-frame `OpenWindowBridge` that registers the closure inside the main `Window` body at `macos/Screencap/ScreencapApp.swift:179-192`.
+- **Playback panes reusable as-is (no review/upload coupling):** `VideoPlayerPane` + `VideoPlayerPaneModel` (protocol-seamed via `VideoPlaybackEngine` / `LiveVideoPlaybackEngine(url:)`), `TimelinePane` (its `riskyIntervals`/`redactionMarkers` inputs are defaulted empty — omit them and it draws event ticks + cursor only), `EventContentPane`, `TimelineEvent` / `TimelineEventParser` (pure JSONL decoder), and `SearchSeek.relativeSeconds(...)` (pure). All under `macos/Screencap/Views/Review/` + `macos/Screencap/Controllers/SearchSeek.swift`.
+- **Review-only surfaces to exclude from inspect:** `ScreenshotTruthPane` ("What actually uploads" / green-shield framing — drop entirely; the AVKit video already shows frames), and `RedactionEvidenceView` / `FailClosedCallout` / `CoverageStrip` in `macos/Screencap/Views/Review/RedactionEvidenceView.swift`. `TimingUnavailableCallout` (same file) is worth keeping — it advises when the timeline can't be drawn.
+- **The scrub-on-load path (the thing inspect must NOT do):** `LiveReviewDataLoader.load` runs `review-data --json` with a 600s timeout (`macos/Screencap/Views/Review/ReviewWindowViewModel.swift:186-192`); Python `prepare_review_data` holds `recording_scrub_lock` and runs `_prepare_scrubbed_copy` (export → recovery → `scrub_recording`), then resolves events/screenshots from the `-scrubbed` dir (`src/screencap/review.py:182`, `:272-299`). Video + timing come from the **original** dir (`_ensure_single_video` + `catalog._read_recording_meta`) — those sub-steps are the reusable half.
 - **Raw-local readers that don't scrub but don't return the envelope:** `screencap view` → `open_viewer` reads the raw original dir and opens `viewer.html` (`src/screencap/cli/__init__.py:1045`, `src/screencap/viewer.py:230`); `exporter.ensure_canonical_events` produces canonical `events.jsonl` from the original dir cheaply with no scrub (`src/screencap/review.py:84`). Recorder writes raw frames as flat `screenshots/{ts:.6f}.jpg` (`recorder.py:761`).
-- **Stub handling to replicate:** `RecordingSummary.isStub` (`macos/ScreenCap/Models/RecordingSummary.swift`), `isUploadEligible = !uploaded && !isStub`, and the friendly pre-check alert in `RecordingsListView.openInBrowser` (`macos/ScreenCap/Views/RecordingsListView.swift:213-225`).
-- **Two callsites to re-point:** `SearchView.openReview` (`macos/ScreenCap/Views/Search/SearchView.swift:246-251`) and the row-body `openInBrowser` in `RecordingsListView` (`macos/ScreenCap/Views/RecordingsListView.swift:118-225`). The per-row Upload button (`:167-177`) stays pointed at `ReviewWindowID`.
-- **Test seams:** `ReviewWindowOpenerTests` (opener-closure seam, no-dedupe pin, ID-stability pin), `ReviewWindowViewModelTests` (`FakeReviewDataLoader` with `nextEnvelope`/`nextError`/`loadCallCount`; `makeModel` injection), `VideoPlayerPaneTests` (`FakeVideoPlaybackEngine` records `seekRequests`, fires completions), and the pure-logic suites (`ReviewSeekTargetTests` over `SearchSeek`, `TimelineEventParsingTests`). The `isRunningUnderTests` guard gates scene-level `.task` side effects (`ScreenCapApp.swift:36-38`).
+- **Stub handling to replicate:** `RecordingSummary.isStub` (`macos/Screencap/Models/RecordingSummary.swift`), `isUploadEligible = !uploaded && !isStub`, and the friendly pre-check alert in `RecordingsListView.openInBrowser` (`macos/Screencap/Views/RecordingsListView.swift:213-225`).
+- **Two callsites to re-point:** `SearchView.openReview` (`macos/Screencap/Views/Search/SearchView.swift:246-251`) and the row-body `openInBrowser` in `RecordingsListView` (`macos/Screencap/Views/RecordingsListView.swift:118-225`). The per-row Upload button (`:167-177`) stays pointed at `ReviewWindowID`.
+- **Test seams:** `ReviewWindowOpenerTests` (opener-closure seam, no-dedupe pin, ID-stability pin), `ReviewWindowViewModelTests` (`FakeReviewDataLoader` with `nextEnvelope`/`nextError`/`loadCallCount`; `makeModel` injection), `VideoPlayerPaneTests` (`FakeVideoPlaybackEngine` records `seekRequests`, fires completions), and the pure-logic suites (`ReviewSeekTargetTests` over `SearchSeek`, `TimelineEventParsingTests`). The `isRunningUnderTests` guard gates scene-level `.task` side effects (`ScreencapApp.swift:36-38`).
 
 ### Institutional Learnings
 
 - **SCR-55 — `WindowGroup` vs `Window` (`docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md`).** `WindowGroup` is multi-window by contract; `openWindow(value:)` for a *new* value materializes a fresh window, for the *same* value focuses the existing one. Inspect-per-recording from two entry points is genuinely "one window per recording" → `WindowGroup` keyed `for: String.self` is correct (matches `ReviewWindow`). Keep a WHY comment on the scene so a later contributor doesn't flip it. `MenuBarExtra`/`OpenWindowAction` paths aren't unit-testable here — only the opener-closure seam is.
 - **SCR-102 — nullable review-data timing (`docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md`).** `started_at`/`duration_seconds` serialize as JSON `null` for a playable recording with no action events. Gate readiness on `ok` + paths only; default timing to `0`. Copy the corrected guard (`ReviewWindowViewModel.swift:335-341`), add the regression test, and do NOT re-introduce a timing gate when forking the loader.
-- **XcodeGen stale project (`docs/solutions/build-errors/xcodegen-stale-project-missing-new-sources.md`).** `macos/ScreenCap.xcodeproj` is git-ignored and globbed from `macos/project.yml` at generation time. Adding new `.swift` files without regenerating yields `cannot find 'InspectWindow' in scope`. Fix: `cd macos && xcodegen generate` (the build script's directory-mtime freshness check usually handles it).
+- **XcodeGen stale project (`docs/solutions/build-errors/xcodegen-stale-project-missing-new-sources.md`).** `macos/Screencap.xcodeproj` is git-ignored and globbed from `macos/project.yml` at generation time. Adding new `.swift` files without regenerating yields `cannot find 'InspectWindow' in scope`. Fix: `cd macos && xcodegen generate` (the build script's directory-mtime freshness check usually handles it).
 - **Foundation.Process/Pipe pitfalls (`docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md`).** Reusing `CLIClient` as-is inherits the drain/termination fixes for free; only revisit if a new spawn is introduced (none is — inspect reuses `CLIClient.runJSONRaw`).
 
 ### External References
@@ -179,8 +179,8 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 **Dependencies:** U1
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Inspect/InspectWindowViewModel.swift` (the `InspectData` resolved model, `InspectDataLoader` protocol, `LiveInspectDataLoader` calling `inspect-data --json`, and the read-only state enum)
-- Test: `macos/ScreenCapTests/InspectWindowViewModelTests.swift`
+- Create: `macos/Screencap/Views/Inspect/InspectWindowViewModel.swift` (the `InspectData` resolved model, `InspectDataLoader` protocol, `LiveInspectDataLoader` calling `inspect-data --json`, and the read-only state enum)
+- Test: `macos/ScreencapTests/InspectWindowViewModelTests.swift`
 
 **Approach:**
 - `InspectData` carries `videoURL`, `eventsURLs`, `startedAt`, `durationSeconds`, `timingStatus` — and deliberately NOT `redaction`/`coverage`/`screenshotURLs` (drop the upload-truth fields).
@@ -190,7 +190,7 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 
 **Execution note:** Implement the loader/state machine test-first against the `FakeInspectDataLoader` seam; the SCR-102 guard is the regression most likely to be reintroduced wrongly.
 
-**Patterns to follow:** `ReviewWindowViewModel` + `ReviewDataLoader`/`LiveReviewDataLoader` (`macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift`), but strip every upload/effects branch; `FakeReviewDataLoader` + `makeModel` injection in `ReviewWindowViewModelTests`.
+**Patterns to follow:** `ReviewWindowViewModel` + `ReviewDataLoader`/`LiveReviewDataLoader` (`macos/Screencap/Views/Review/ReviewWindowViewModel.swift`), but strip every upload/effects branch; `FakeReviewDataLoader` + `makeModel` injection in `ReviewWindowViewModelTests`.
 
 **Test scenarios:**
 - Happy path: `ok` envelope with video + events paths → `.ready` with those URLs.
@@ -212,11 +212,11 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 **Dependencies:** U2
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Inspect/InspectWindow.swift` (the `InspectWindowID` constant + the view: video + `TimelinePane` + `EventContentPane` + `TimingUnavailableCallout`, shared `currentTime`/seek wiring; a secondary toolbar "Share / Upload…" item)
-- Create: `macos/ScreenCap/State/InspectWindowOpener.swift` (singleton mirroring `ReviewWindowOpener`: `openInspect` closure, `pendingSeekMs`, `open(recordingName:) -> Bool`)
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` (declare the `InspectWindow` `WindowGroup` injecting only `index`; register `InspectWindowOpener.shared.openInspect` in `OpenWindowBridge`)
+- Create: `macos/Screencap/Views/Inspect/InspectWindow.swift` (the `InspectWindowID` constant + the view: video + `TimelinePane` + `EventContentPane` + `TimingUnavailableCallout`, shared `currentTime`/seek wiring; a secondary toolbar "Share / Upload…" item)
+- Create: `macos/Screencap/State/InspectWindowOpener.swift` (singleton mirroring `ReviewWindowOpener`: `openInspect` closure, `pendingSeekMs`, `open(recordingName:) -> Bool`)
+- Modify: `macos/Screencap/ScreencapApp.swift` (declare the `InspectWindow` `WindowGroup` injecting only `index`; register `InspectWindowOpener.shared.openInspect` in `OpenWindowBridge`)
 - Modify: `macos/project.yml` only if needed; run `xcodegen generate` after adding files
-- Test: `macos/ScreenCapTests/InspectWindowOpenerTests.swift`
+- Test: `macos/ScreencapTests/InspectWindowOpenerTests.swift`
 
 **Approach:**
 - Body is essentially `ReviewWindow.panesIfAvailable` minus the redaction/coverage/screenshot-truth rows and minus `bottomActions` (no Upload/Cancel row — a read-only window). `TimelinePane` is given empty `riskyIntervals`/`redactionMarkers` (its defaults), so it renders event ticks + cursor only.
@@ -226,7 +226,7 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 
 **Technical design:** *(directional)* `InspectWindow` body ≈ `VStack { TimingUnavailableCallout; HStack{ VideoPlayerPane } ; EventContentPane(onSeek:); TimelinePane(onScrub:) }` sharing one `@State currentTime`; toolbar carries the single secondary upload item. No bottom action row.
 
-**Patterns to follow:** `ReviewWindow` composition (`macos/ScreenCap/Views/Review/ReviewWindow.swift:266-326`), the `WindowGroup`/`OpenWindowBridge` declaration (`ScreenCapApp.swift:99-113`, `:179-192`), and `ReviewWindowOpener` (`macos/ScreenCap/State/ReviewWindowOpener.swift`); `ReviewWindowOpenerTests` for the opener test shape.
+**Patterns to follow:** `ReviewWindow` composition (`macos/Screencap/Views/Review/ReviewWindow.swift:266-326`), the `WindowGroup`/`OpenWindowBridge` declaration (`ScreencapApp.swift:99-113`, `:179-192`), and `ReviewWindowOpener` (`macos/Screencap/State/ReviewWindowOpener.swift`); `ReviewWindowOpenerTests` for the opener test shape.
 
 **Test scenarios:**
 - Opener dispatch: assigning `InspectWindowOpener.shared.openInspect` and calling `open(recordingName:)` invokes it with the name; returns `false` when unregistered (mirror `ReviewWindowOpenerTests`).
@@ -248,17 +248,17 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 **Dependencies:** U3
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (`openReview` → open inspect: set `InspectWindowOpener.shared.pendingSeekMs[recording]` then `openWindow(id: InspectWindowID, value:)`)
-- Modify: `macos/ScreenCap/Views/RecordingsListView.swift` (row-body click → open inspect instead of `screencap view`; keep the per-row Upload button pointed at `ReviewWindowID`; reuse the `isStub` pre-check + friendly download alert)
-- Test: `macos/ScreenCapTests/SearchViewInspectRoutingTests.swift` (or extend `SearchViewModelTests`) and a Recordings-list routing test
-- Test: extend `macos/ScreenCapTests/RecordingsIndexRefreshOnUploadTests.swift` area only if a shared seam is touched (otherwise a focused new test file)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (`openReview` → open inspect: set `InspectWindowOpener.shared.pendingSeekMs[recording]` then `openWindow(id: InspectWindowID, value:)`)
+- Modify: `macos/Screencap/Views/RecordingsListView.swift` (row-body click → open inspect instead of `screencap view`; keep the per-row Upload button pointed at `ReviewWindowID`; reuse the `isStub` pre-check + friendly download alert)
+- Test: `macos/ScreencapTests/SearchViewInspectRoutingTests.swift` (or extend `SearchViewModelTests`) and a Recordings-list routing test
+- Test: extend `macos/ScreencapTests/RecordingsIndexRefreshOnUploadTests.swift` area only if a shared seam is touched (otherwise a focused new test file)
 
 **Approach:**
 - Search: on result tap, set the pending seek on `InspectWindowOpener` (not `ReviewWindowOpener`) and open the inspect scene; anchored vs unanchored results behave as today (anchored → seek, unanchored → open at start).
 - Recordings list: the row-body click opens the inspect window for the recording; the browser link-out (`CLIClient.runAwaitingExit(["view", ...])`) is removed from the in-app path (the CLI command itself stays). The per-row Upload button is unchanged.
 - Stub guard: at both sites, pre-check `rec.isStub` and show the existing "uploaded; local copy deleted — run `screencap download`" alert rather than opening an inspect window that would fail to load. For Search results, apply the same guard against the result's recording.
 
-**Patterns to follow:** the current `SearchView.openReview` (`macos/ScreenCap/Views/Search/SearchView.swift:246-251`), `RecordingsListView.openInBrowser` stub pre-check + `.alert` plumbing (`:213-225`, `:24-30`).
+**Patterns to follow:** the current `SearchView.openReview` (`macos/Screencap/Views/Search/SearchView.swift:246-251`), `RecordingsListView.openInBrowser` stub pre-check + `.alert` plumbing (`:213-225`, `:24-30`).
 
 **Test scenarios:**
 - Search routing: tapping an anchored result sets `InspectWindowOpener.pendingSeekMs` for that recording and opens the inspect scene (asserted via the opener seam) — and does NOT open `ReviewWindowID`. Covers AE1, AE5.
@@ -273,7 +273,7 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 
 ## System-Wide Impact
 
-- **Interaction graph:** two entry-point callsites switch openers (`SearchView`, `RecordingsListView`); `OpenWindowBridge` gains one registration; `ScreenCapApp` gains one scene. `ReviewWindow`/`ReviewWindowOpener` and the Upload button are untouched.
+- **Interaction graph:** two entry-point callsites switch openers (`SearchView`, `RecordingsListView`); `OpenWindowBridge` gains one registration; `ScreencapApp` gains one scene. `ReviewWindow`/`ReviewWindowOpener` and the Upload button are untouched.
 - **Error propagation:** `inspect-data` failures surface as `.failed` in the inspect view model (friendly message), and stub recordings are intercepted *before* window open via the click-site guard — no broken/empty window.
 - **State lifecycle risks:** `inspect-data` must not create or touch the `-scrubbed` dir or hold `recording_scrub_lock`; the no-scrub invariant is asserted in U1 so a future refactor can't silently start scrubbing on the looking path.
 - **API surface parity:** `inspect-data` joins `review-data` as a sibling CLI verb; both must keep the shared video/timing core in lockstep (the U1 extraction enforces this).
@@ -301,4 +301,4 @@ Recordings 'Upload' button ──▶ ReviewWindow (consent, UNCHANGED) ─▶ re
 - Related ask-your-history search origin: [docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md](docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md)
 - Related native-review origin: [docs/brainstorms/2026-06-03-native-redaction-review-before-upload-requirements.md](docs/brainstorms/2026-06-03-native-redaction-review-before-upload-requirements.md)
 - Learnings: `docs/solutions/ui-bugs/swiftui-windowgroup-vs-window-singleton-scene-2026-05-18.md`, `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md`, `docs/solutions/build-errors/xcodegen-stale-project-missing-new-sources.md`
-- Key code: `macos/ScreenCap/ScreenCapApp.swift`, `macos/ScreenCap/Views/Review/ReviewWindow.swift`, `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift`, `macos/ScreenCap/State/ReviewWindowOpener.swift`, `macos/ScreenCap/Views/Search/SearchView.swift`, `macos/ScreenCap/Views/RecordingsListView.swift`, `src/screencap/review.py`, `src/screencap/cli/__init__.py`
+- Key code: `macos/Screencap/ScreencapApp.swift`, `macos/Screencap/Views/Review/ReviewWindow.swift`, `macos/Screencap/Views/Review/ReviewWindowViewModel.swift`, `macos/Screencap/State/ReviewWindowOpener.swift`, `macos/Screencap/Views/Search/SearchView.swift`, `macos/Screencap/Views/RecordingsListView.swift`, `src/screencap/review.py`, `src/screencap/cli/__init__.py`

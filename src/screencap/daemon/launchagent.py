@@ -1,4 +1,4 @@
-"""LaunchAgent install/uninstall for the ScreenCap daemon."""
+"""LaunchAgent install/uninstall for the Screencap daemon."""
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def render_plist(
           into the bundled plist.
         - Any path-like value: emit it verbatim into the path keys. Used
           by `install()` below to pass an absolute path resolved at
-          install time (`str(Path.home() / "Library" / "Logs" / "ScreenCap")`)
+          install time (`str(Path.home() / "Library" / "Logs" / "Screencap")`)
           so file-based logs work on the per-user CLI install path.
 
     `SCREENCAP_RUN_DIR` is intentionally absent from the default
@@ -144,7 +144,7 @@ def install(
     plist_path: Path | None = None,
     timeout_seconds: float = 10.0,
 ) -> InstallResult:
-    """Install and start the per-user ScreenCap LaunchAgent."""
+    """Install and start the per-user Screencap LaunchAgent."""
     resolved_plist_path = (plist_path or default_plist_path()).expanduser()
     resolved_program, args = _resolve_program_arguments(program)
     # Per-user CLI install: bake the absolute log dir into the plist (launchd
@@ -153,7 +153,7 @@ def install(
     # invoking the install, so we resolve their home and create the log
     # directory before launchctl bootstraps the agent and tries to open()
     # the path keys (a missing parent directory yields EX_CONFIG on spawn).
-    log_dir = Path.home() / "Library" / "Logs" / "ScreenCap"
+    log_dir = Path.home() / "Library" / "Logs" / "Screencap"
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:

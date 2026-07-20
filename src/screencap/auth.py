@@ -84,7 +84,7 @@ SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 KEYCHAIN_SERVICE = "screencap-auth"
 KEYCHAIN_ACCOUNT = "default"
 
-# Shared Keychain access group (SCR-241). Every same-Team-signed ScreenCap binary
+# Shared Keychain access group (SCR-241). Every same-Team-signed Screencap binary
 # carrying the ``keychain-access-groups`` entitlement (the app's embedded daemon +
 # bundled CLI) reads the refresh token from this group without a prompt; binaries
 # that are not entitled for it (the pip/pyenv terminal CLI, the Debug fallback)
@@ -92,7 +92,7 @@ KEYCHAIN_ACCOUNT = "default"
 # below. The literal team prefix is required because ``codesign --entitlements``
 # does not expand Xcode's ``$(TeamIdentifierPrefix)`` (KTD-3); the env override
 # exists for dev/testing. It MUST match the value in
-# ``macos/ScreenCap/Scripts/screencap-cli.entitlements`` exactly.
+# ``macos/Screencap/Scripts/screencap-cli.entitlements`` exactly.
 KEYCHAIN_ACCESS_GROUP = os.environ.get(
     "SCREENCAP_KEYCHAIN_ACCESS_GROUP", "2A8S6MV8DZ.com.screencap.shared"
 )

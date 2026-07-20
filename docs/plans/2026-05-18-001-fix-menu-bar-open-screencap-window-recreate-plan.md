@@ -1,28 +1,28 @@
 ---
-title: "fix: Make menu bar Open ScreenCap recreate the main window after close (SCR-55)"
+title: "fix: Make menu bar Open Screencap recreate the main window after close (SCR-55)"
 type: fix
 status: completed
 date: 2026-05-18
 origin: https://linear.app/zk-email/issue/SCR-55/make-menu-bar-open-screencap-recreate-the-main-window-after-close
 ---
 
-# fix: Make menu bar Open ScreenCap recreate the main window after close (SCR-55)
+# fix: Make menu bar Open Screencap recreate the main window after close (SCR-55)
 
 ## Summary
 
-Switch the menu bar's `Open ScreenCap` action from iterating `NSApp.windows` to invoking SwiftUI's `openWindow(id:)`, so the action recreates the main window after `WindowGroup` has destroyed it. Add a tiny SwiftUI-to-AppKit bridge so `AppDelegate.applicationShouldHandleReopen` (Dock/relaunch path) shares the same recreate behavior.
+Switch the menu bar's `Open Screencap` action from iterating `NSApp.windows` to invoking SwiftUI's `openWindow(id:)`, so the action recreates the main window after `WindowGroup` has destroyed it. Add a tiny SwiftUI-to-AppKit bridge so `AppDelegate.applicationShouldHandleReopen` (Dock/relaunch path) shares the same recreate behavior.
 
 ---
 
 ## Problem Frame
 
-When the user closes the last main window, `AppDelegate` flips the activation policy to `.accessory` and SwiftUI tears down the `WindowGroup` window. The menu bar item stays alive, but `MenuBarMenu.openMainWindow()` only scans `NSApp.windows` and calls `makeKeyAndOrderFront` on whatever it finds — so once the window is destroyed, the `Open ScreenCap` button silently no-ops (or surfaces a stray panel via the `NSApp.windows.first` fallback). Same hazard applies to `AppDelegate.applicationShouldHandleReopen`, which also iterates `NSApp.windows` without a recreate fallback.
+When the user closes the last main window, `AppDelegate` flips the activation policy to `.accessory` and SwiftUI tears down the `WindowGroup` window. The menu bar item stays alive, but `MenuBarMenu.openMainWindow()` only scans `NSApp.windows` and calls `makeKeyAndOrderFront` on whatever it finds — so once the window is destroyed, the `Open Screencap` button silently no-ops (or surfaces a stray panel via the `NSApp.windows.first` fallback). Same hazard applies to `AppDelegate.applicationShouldHandleReopen`, which also iterates `NSApp.windows` without a recreate fallback.
 
 ---
 
 ## Requirements
 
-- R1. Choosing `Open ScreenCap` from the menu bar after the last main window is closed shows the main `WindowGroup` window (Linear AC #1).
+- R1. Choosing `Open Screencap` from the menu bar after the last main window is closed shows the main `WindowGroup` window (Linear AC #1).
 - R2. Reopen from Dock / app relaunch while the app is in `.accessory` mode continues to show the main window (Linear AC #2).
 - R3. Behavior is covered by either an automated window-management test or a manual QA note (Linear AC #3).
 - R4. No regression to the existing close-to-accessory flow in `AppDelegate.applicationDidFinishLaunching` (the `willCloseNotification` observer must still flip to `.accessory` only when no real titled windows remain).
@@ -42,11 +42,11 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/ScreenCapApp.swift` — defines `WindowGroup("ScreenCap")` (no id) and the `MenuBarExtra`.
-- `macos/ScreenCap/AppDelegate.swift` — `applicationDidFinishLaunching` installs the close observer; `applicationShouldHandleReopen` handles Dock/relaunch and iterates `NSApp.windows`.
-- `macos/ScreenCap/Views/MenuBarMenu.swift:42-53` — current `openMainWindow()` iterates `NSApp.windows` by title and falls back to `NSApp.windows.first`.
-- `macos/ScreenCap/Views/MainWindow.swift` — top-level `WindowGroup` content; an in-body helper view is a natural place to capture the `openWindow` environment value.
-- No existing test file for menu bar / window plumbing — `macos/ScreenCapTests/` covers `RecorderController`, `PermissionController`, `DaemonClient`, `DaemonInstallController`, `QuitProgressCountdown`. A new small test file is appropriate.
+- `macos/Screencap/ScreencapApp.swift` — defines `WindowGroup("Screencap")` (no id) and the `MenuBarExtra`.
+- `macos/Screencap/AppDelegate.swift` — `applicationDidFinishLaunching` installs the close observer; `applicationShouldHandleReopen` handles Dock/relaunch and iterates `NSApp.windows`.
+- `macos/Screencap/Views/MenuBarMenu.swift:42-53` — current `openMainWindow()` iterates `NSApp.windows` by title and falls back to `NSApp.windows.first`.
+- `macos/Screencap/Views/MainWindow.swift` — top-level `WindowGroup` content; an in-body helper view is a natural place to capture the `openWindow` environment value.
+- No existing test file for menu bar / window plumbing — `macos/ScreencapTests/` covers `RecorderController`, `PermissionController`, `DaemonClient`, `DaemonInstallController`, `QuitProgressCountdown`. A new small test file is appropriate.
 
 ### Institutional Learnings
 
@@ -54,7 +54,7 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 
 ### External References
 
-- Deployment target is macOS 13.0 (`macos/ScreenCap.xcodeproj/project.pbxproj`), so `WindowGroup(_:id:)` and `@Environment(\.openWindow)` (both macOS 13+) are available without availability guards.
+- Deployment target is macOS 13.0 (`macos/Screencap.xcodeproj/project.pbxproj`), so `WindowGroup(_:id:)` and `@Environment(\.openWindow)` (both macOS 13+) are available without availability guards.
 
 ---
 
@@ -63,7 +63,7 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 - **Use SwiftUI's `openWindow(id:)` rather than AppKit `NSApp.windows` iteration.** The ticket prescribes this direction; it is the canonical SwiftUI 13+ mechanism to materialize a `WindowGroup` window that has been torn down.
 - **Bridge SwiftUI's `openWindow` action to AppDelegate via a small shared holder.** `AppDelegate.applicationShouldHandleReopen` runs in an AppKit context with no access to `@Environment(\.openWindow)`. A minimal `WindowOpener` `ObservableObject` (or `@MainActor` final class) with a `var openMain: (() -> Void)?` closure, populated by a hidden helper view inside the `WindowGroup` body, gives the AppDelegate a reliable call site without depending on undocumented AppKit default-reopen behavior. Alternative considered: relying on AppKit to recreate the `WindowGroup` window when `applicationShouldHandleReopen` returns `true` — rejected as too dependent on framework specifics, especially with `CommandGroup(replacing: .newItem) {}` explicitly removing the standard New Window pathway.
 - **Keep the activation-policy flip (`.regular`) and `NSApp.activate` calls at both entry points.** Required to bring the app back to the foreground when it was in `.accessory`. The `openWindow` call is additive, not a replacement, for the activation-policy fix.
-- **Constant for the window id.** Define `MainWindowID = "main"` as a single source of truth (in `ScreenCapApp.swift` or a small constants file) so the producer (`WindowGroup`) and consumers (`MenuBarMenu`, `WindowOpener` bridge) cannot drift.
+- **Constant for the window id.** Define `MainWindowID = "main"` as a single source of truth (in `ScreencapApp.swift` or a small constants file) so the producer (`WindowGroup`) and consumers (`MenuBarMenu`, `WindowOpener` bridge) cannot drift.
 
 ---
 
@@ -92,11 +92,11 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 **Dependencies:** None
 
 **Files:**
-- Modify: `macos/ScreenCap/ScreenCapApp.swift`
+- Modify: `macos/Screencap/ScreencapApp.swift`
 
 **Approach:**
-- Add a top-level constant (or `enum` namespace) `MainWindowID = "main"` near `ScreenCapApp` so producers and consumers share one symbol.
-- Change `WindowGroup("ScreenCap")` to `WindowGroup("ScreenCap", id: MainWindowID)`.
+- Add a top-level constant (or `enum` namespace) `MainWindowID = "main"` near `ScreencapApp` so producers and consumers share one symbol.
+- Change `WindowGroup("Screencap")` to `WindowGroup("Screencap", id: MainWindowID)`.
 - No other behavior change in this unit.
 
 **Patterns to follow:**
@@ -111,7 +111,7 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 
 ---
 
-### U2. Wire menu bar `Open ScreenCap` to `openWindow(id:)`
+### U2. Wire menu bar `Open Screencap` to `openWindow(id:)`
 
 **Goal:** Replace the `NSApp.windows`-iteration logic in `MenuBarMenu.openMainWindow()` with SwiftUI's environment-provided `openWindow` action so the window is recreated when needed.
 
@@ -120,7 +120,7 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 **Dependencies:** U1
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/MenuBarMenu.swift`
+- Modify: `macos/Screencap/Views/MenuBarMenu.swift`
 
 **Approach:**
 - Add `@Environment(\.openWindow) private var openWindow` to `MenuBarMenu`.
@@ -128,15 +128,15 @@ When the user closes the last main window, `AppDelegate` flips the activation po
   1. Set activation policy to `.regular` (unchanged — needed when coming from `.accessory`).
   2. `NSApp.activate(ignoringOtherApps: true)` (unchanged).
   3. Call `openWindow(id: MainWindowID)` — SwiftUI either focuses the existing window or creates one if `WindowGroup` torn it down.
-- Remove the `for window in NSApp.windows where window.title == "ScreenCap"` loop and the `NSApp.windows.first` fallback — both become dead code with `openWindow` in place.
+- Remove the `for window in NSApp.windows where window.title == "Screencap"` loop and the `NSApp.windows.first` fallback — both become dead code with `openWindow` in place.
 
 **Patterns to follow:**
 - `MenuBarMenu` already uses `@EnvironmentObject` for `RecorderController`; `@Environment(\.openWindow)` is the same general pattern.
 
 **Test scenarios:**
 - Test expectation: none automated — `MenuBarExtra` content is a SwiftUI view tree without a unit-test seam in this codebase, and `OpenWindowAction` cannot be invoked in a pure XCTest harness. Covered by manual QA below and the bridge test in U3.
-- **Manual QA (covers AE#1):** Launch app → close the main window (app flips to `.accessory`) → click menu bar icon → click `Open ScreenCap` → main window appears and becomes key.
-- **Manual QA (regression):** With the main window already visible, click `Open ScreenCap` → window comes to front without duplication.
+- **Manual QA (covers AE#1):** Launch app → close the main window (app flips to `.accessory`) → click menu bar icon → click `Open Screencap` → main window appears and becomes key.
+- **Manual QA (regression):** With the main window already visible, click `Open Screencap` → window comes to front without duplication.
 
 **Verification:**
 - The two manual QA scenarios above both pass.
@@ -153,10 +153,10 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 **Dependencies:** U1, U2
 
 **Files:**
-- Create: `macos/ScreenCap/State/WindowOpener.swift`
-- Create: `macos/ScreenCapTests/WindowOpenerTests.swift`
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` — add a tiny helper subview inside the `WindowGroup` body that captures `openWindow` into `WindowOpener.shared`.
-- Modify: `macos/ScreenCap/AppDelegate.swift`
+- Create: `macos/Screencap/State/WindowOpener.swift`
+- Create: `macos/ScreencapTests/WindowOpenerTests.swift`
+- Modify: `macos/Screencap/ScreencapApp.swift` — add a tiny helper subview inside the `WindowGroup` body that captures `openWindow` into `WindowOpener.shared`.
+- Modify: `macos/Screencap/AppDelegate.swift`
 
 **Approach:**
 - Introduce `@MainActor final class WindowOpener: ObservableObject` exposing `static let shared = WindowOpener()` and `var openMain: (() -> Void)?` (settable). Keeping this an `ObservableObject` is forward-compatible if any view ever wants to observe state, but the load-bearing surface is the closure.
@@ -190,7 +190,7 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 
 ## System-Wide Impact
 
-- **Interaction graph:** Two entry points (menu bar `Open ScreenCap`, AppDelegate reopen) converge on the same `openWindow(id: MainWindowID)` action via the new `WindowOpener` bridge. Activation policy flip remains at both call sites.
+- **Interaction graph:** Two entry points (menu bar `Open Screencap`, AppDelegate reopen) converge on the same `openWindow(id: MainWindowID)` action via the new `WindowOpener` bridge. Activation policy flip remains at both call sites.
 - **Error propagation:** No new error surface. `openWindow` either focuses an existing window or instantiates one; failure modes are SwiftUI-internal.
 - **State lifecycle risks:** `WindowOpener.shared.openMain` lifetime is tied to whether any `WindowGroup` window has been materialized at least once. If the first-ever reopen fires before any window has appeared (cold launch into accessory mode — not currently possible since `applicationDidFinishLaunching` sets `.regular`), the closure is `nil`. Guarded by the optional chaining in U3's edge-case test.
 - **API surface parity:** Both surfaces (menu bar, AppDelegate) now recreate the window. The dock-click-while-window-exists path is unchanged (handled by AppKit + the early-return in U3).
@@ -223,7 +223,7 @@ When the user closes the last main window, `AppDelegate` flips the activation po
 - **Origin ticket:** [Linear SCR-55](https://linear.app/zk-email/issue/SCR-55/make-menu-bar-open-screencap-recreate-the-main-window-after-close)
 - **Parent ticket:** SCR-13 (MacOS app shell)
 - Related code:
-  - `macos/ScreenCap/ScreenCapApp.swift`
-  - `macos/ScreenCap/AppDelegate.swift`
-  - `macos/ScreenCap/Views/MenuBarMenu.swift`
+  - `macos/Screencap/ScreencapApp.swift`
+  - `macos/Screencap/AppDelegate.swift`
+  - `macos/Screencap/Views/MenuBarMenu.swift`
 - Apple docs: `WindowGroup(_:id:content:)`, `EnvironmentValues.openWindow`, `OpenWindowAction` (macOS 13+).

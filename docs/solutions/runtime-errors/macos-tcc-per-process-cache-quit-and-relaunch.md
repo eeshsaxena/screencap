@@ -6,8 +6,8 @@ category: runtime-errors
 severity: medium
 problem_type: runtime-behavior
 modules:
-  - macos/ScreenCap/Controllers/PermissionController.swift
-  - macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift
+  - macos/Screencap/Controllers/PermissionController.swift
+  - macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift
   - src/screencap/recorder.py
 tags:
   - macos
@@ -43,7 +43,7 @@ TCC checks the bundle's code-signing identity against its database the *first* t
 
 The Python CLI sidesteps the cache by spawning a fresh `python3` subprocess for each check (`_check_permission_fresh` in `src/screencap/recorder.py`). That works because each spawned `python3` process gets its own TCC identity (Python is a separate signed binary), and that identity reads its own fresh entry from the TCC db.
 
-The SwiftUI shell can't do the same trick: spawning the .app's own binary via `Process.run()` *does not* preserve the bundle's TCC identity. macOS attributes the spawned child to whatever process started it (here, the spawning ScreenCap.app — but with a different security context). Sub-binaries get sub-binary TCC identity, which is "no entry yet" for any TCC pane the bundle has been granted.
+The SwiftUI shell can't do the same trick: spawning the .app's own binary via `Process.run()` *does not* preserve the bundle's TCC identity. macOS attributes the spawned child to whatever process started it (here, the spawning Screencap.app — but with a different security context). Sub-binaries get sub-binary TCC identity, which is "no entry yet" for any TCC pane the bundle has been granted.
 
 ## Solution
 

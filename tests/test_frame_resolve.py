@@ -1,6 +1,6 @@
 """SCR-186 U1 — pure nearest-frame resolution core.
 
-Mirrors ``macos/ScreenCapTests/RecordingFrameIndexTests.swift`` for selection,
+Mirrors ``macos/ScreencapTests/RecordingFrameIndexTests.swift`` for selection,
 listing, and cap semantics, and adds the two cases the Swift suite cannot cover:
 the round-half-away-from-zero rule (Swift fixtures all land on whole ms) and the
 injected ALLOW-only blocked-frame filter (SCR-186 R8, Python-only).

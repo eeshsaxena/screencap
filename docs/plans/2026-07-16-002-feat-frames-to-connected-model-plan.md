@@ -31,7 +31,7 @@ Add a default-off capability that sends masked screen frames to the Intelligence
 
 ### Problem Frame
 
-Screen frames are the most sensitive data ScreenCap holds. Masking, per-app blocking, the encrypted vault, and `masked_video_upload` (default off) all exist to keep pixels from leaving, and "nothing leaves" is the pitch. Today that promise is airtight for cloud models: the one code path that used to send screenshots (the legacy auto-namer) was deleted, so the segmentation `FRAMES → NEVER` guard is now the *only* thing governing frame egress. The Intelligence pane reflects this — "Screen frames or images → Always off" renders as a fixed badge, not a toggle.
+Screen frames are the most sensitive data Screencap holds. Masking, per-app blocking, the encrypted vault, and `masked_video_upload` (default off) all exist to keep pixels from leaving, and "nothing leaves" is the pitch. Today that promise is airtight for cloud models: the one code path that used to send screenshots (the legacy auto-namer) was deleted, so the segmentation `FRAMES → NEVER` guard is now the *only* thing governing frame egress. The Intelligence pane reflects this — "Screen frames or images → Always off" renders as a fixed badge, not a toggle.
 
 The text path (app and window titles plus transcript snippets) carries a lot, but it loses what the pixels hold: the shape of a dashboard trend, a red error state, the structure of a diagram or mockup. The product owner wants to close that gap so the connected model can reason over what the operator actually saw.
 
@@ -40,7 +40,7 @@ The cost is that this is the one boundary the product is built around. Making it
 ### Key Decisions
 
 - **Full breadth across Intelligence tasks.** Frames are available to summaries, recall answers, and day-split alike — not a narrow per-query wedge. This accepts background and bulk frame egress (day-summaries run without a human reviewing each frame) and the larger masking surface it creates, in exchange for the strongest value across the operator's use cases.
-- **Destination is the user's connected model (BYO).** Frames go to whatever Intelligence model the user has configured, matching how the rest of Intelligence already works. This is what makes the promise defensible: frames go to the model the user connected, under their own account — not to a ScreenCap-hosted destination.
+- **Destination is the user's connected model (BYO).** Frames go to whatever Intelligence model the user has configured, matching how the rest of Intelligence already works. This is what makes the promise defensible: frames go to the model the user connected, under their own account — not to a Screencap-hosted destination.
 - **The guarantee is destination-dependent.** When the connected model resolves on-device, no frame attaches and nothing leaves the Mac — the "nothing leaves" promise stays fully intact for that user (on-device *understanding* of frames by a local vision model is follow-up). When it runs in the cloud, masked frames egress under the user's own account. The path is destination-agnostic; the destination decides the guarantee, the same pattern the recording pipeline already uses.
 - **Two-tier guarantee: structural blocked-app boundary, best-effort residual masking.** The blocked-app boundary is structural and provable — only `ALLOW`-classified frames are eligible (`build_is_blocked`, fail-closed on any derivation gap), so a blocked-app frame is never sent. Residual masking *within* an ALLOW frame is best-effort OCR — it can miss content OCR does not detect — and is labeled as such, never as a coverage guarantee. Only the structural tier mirrors `masked_video_upload`'s provable gate; the residual tier does not, because OCR gives no positive coverage proof the way window geometry does.
 - **Default off, independently gated.** The frames switch is off by default and orthogonal to "is a model connected" and to the sibling "cloud tasks run by default" work. Neither connecting a model nor those default-on cloud tasks may start frame egress on their own.
@@ -51,7 +51,7 @@ The cost is that this is the one boundary the product is built around. Making it
 **Capability and scope**
 
 - R1. Frames can be sent to the user's connected Intelligence model for three task kinds: summaries, recall answers, and day-split.
-- R2. The capability rides whatever model the user has connected; it introduces no ScreenCap-hosted frame destination.
+- R2. The capability rides whatever model the user has connected; it introduces no Screencap-hosted frame destination.
 - R3. When the connected model resolves on-device, no frame attaches and no frame bytes leave the Mac. On-device *frame understanding* by a local vision model is follow-up work; day one, a local model receives no frames.
 
 **Consent and gating**
@@ -102,7 +102,7 @@ The cost is that this is the one boundary the product is built around. Making it
 **Outside this product's identity**
 
 - Sending raw or unmasked pixels — never, in any state.
-- A ScreenCap-hosted frame destination — frames only ever go to the user's own connected model.
+- A Screencap-hosted frame destination — frames only ever go to the user's own connected model.
 
 **Deferred to follow-up work**
 
@@ -285,9 +285,9 @@ flowchart TB
 - **Requirements:** R4, R6.
 - **Dependencies:** U2.
 - **Files:**
-  - `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift` — replace the frames `fixedRow` (lines ~631-636) with an interactive toggle row bound to the frames consent state.
-  - `macos/ScreenCap/Controllers/IntelligenceController.swift` — wire `setConsent(row: "frames_cloud_consent", enabled:)` (the existing, currently-unwired seam at ~219-245) and read the value from `settings intelligence --json`.
-  - `macos/ScreenCap/Views/Settings/IntelligenceSelectionModel.swift` — update `framesRowCaption` / chip for on/off states and add the disclosure copy naming what leaves (masked, ALLOW-only frames, to the connected model).
+  - `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift` — replace the frames `fixedRow` (lines ~631-636) with an interactive toggle row bound to the frames consent state.
+  - `macos/Screencap/Controllers/IntelligenceController.swift` — wire `setConsent(row: "frames_cloud_consent", enabled:)` (the existing, currently-unwired seam at ~219-245) and read the value from `settings intelligence --json`.
+  - `macos/Screencap/Views/Settings/IntelligenceSelectionModel.swift` — update `framesRowCaption` / chip for on/off states and add the disclosure copy naming what leaves (masked, ALLOW-only frames, to the connected model).
 - **Approach:** Default off. Toggling on presents the consequence disclosure before persisting, mirroring the consent posture used for consequential choices elsewhere (SCR-235 / `masked_video_upload`). Persist via the CLI subprocess seam.
 - **Test scenarios:**
   - The toggle defaults off on a fresh install.
@@ -302,8 +302,8 @@ flowchart TB
 - **Requirements:** R7, R12, R13.
 - **Dependencies:** U6.
 - **Files:**
-  - `macos/ScreenCap/Views/Review/ReviewWindow.swift` (label ~426), `macos/ScreenCap/Views/Review/ReviewWindowViewModel.swift` (~201), `macos/ScreenCap/Views/Review/ScreenshotTruthPane.swift` (~77) — update the "local-only, not uploaded" framing to reflect that masked frames may be sent when the toggle is on.
-  - `macos/ScreenCap/Views/Settings/IntelligenceSelectionModel.swift` — make `consentTrustFooter`, the frames caption, **and the per-task captions that currently assert "Never screen images"** (`summaryConsentRowCaption`, `recallConsentRowCaption`, `daySplitRowCaption`, ~lines 222/227/233) state-keyed; update their pinning honesty-gate assertions (`IntelligenceSettingsTests.swift` ~515-523) so the "Never screen images" expectation holds only in the toggle-off state.
+  - `macos/Screencap/Views/Review/ReviewWindow.swift` (label ~426), `macos/Screencap/Views/Review/ReviewWindowViewModel.swift` (~201), `macos/Screencap/Views/Review/ScreenshotTruthPane.swift` (~77) — update the "local-only, not uploaded" framing to reflect that masked frames may be sent when the toggle is on.
+  - `macos/Screencap/Views/Settings/IntelligenceSelectionModel.swift` — make `consentTrustFooter`, the frames caption, **and the per-task captions that currently assert "Never screen images"** (`summaryConsentRowCaption`, `recallConsentRowCaption`, `daySplitRowCaption`, ~lines 222/227/233) state-keyed; update their pinning honesty-gate assertions (`IntelligenceSettingsTests.swift` ~515-523) so the "Never screen images" expectation holds only in the toggle-off state.
   - `SECURITY.md` — add the masked-frames "what leaves" boundary section: the blocked-app boundary is structural/provable (mirrors `masked_video_upload`), while residual within-frame masking is **best-effort OCR, not a coverage guarantee** — distinct from `masked_video_upload`'s geometry-based provable gate; default off.
 - **Approach:** Copy binds to the runtime `frames_cloud_consent` state (honesty-gate). Off → "frames not sent" stays true and is shown; on → the copy names exactly what leaves — *best-effort masked* frames of ALLOW-only activity, not a guarantee of complete masking.
 - **Test scenarios:**
@@ -353,8 +353,8 @@ flowchart TB
 - Builder-guard precedent: `tests/segmentation/test_generation.py` — the enforced `Evidence(stripped=True)` AST/call-graph guard (KTD11) the `MaskedFrame` provenance guard mirrors.
 - ALLOW-only fail-closed eligibility (the reusable seam): `src/screencap/frame_blocked.py` — `build_is_blocked` (48-137); `src/screencap/backfill/skip_intervals.py` — `derive_skip_intervals(require_canonical=True)` (260+), `CanonicalDerivationError` (112); `src/screencap/index_core.py` — `index_range` skip filtering (126-235).
 - Masking primitives: `src/screencap/redaction/masking.py` — `mask_screenshot` (in-place, 78-152); `src/screencap/scrubber.py` — `ocr_mask_screenshot` returns regions (1551), `mask_screenshots` batch (1736); `src/screencap/redaction/ocr.py` — Vision OCR (35-90).
-- Swift UI + persistence: `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift` (`fixedRow` frames row 631-636, `infoRow` 652+), `macos/ScreenCap/Views/Settings/IntelligenceSelectionModel.swift` (frames strings 240-250), `macos/ScreenCap/Controllers/IntelligenceController.swift` (`setConsent` write seam 219-245).
-- "What leaves" surfaces: `macos/ScreenCap/Views/Review/ReviewWindow.swift` (426), `ReviewWindowViewModel.swift` (201), `ScreenshotTruthPane.swift` (77); `SECURITY.md` — `masked_video_upload` precedent + outstanding consent-surface reconciliation (59-75).
+- Swift UI + persistence: `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift` (`fixedRow` frames row 631-636, `infoRow` 652+), `macos/Screencap/Views/Settings/IntelligenceSelectionModel.swift` (frames strings 240-250), `macos/Screencap/Controllers/IntelligenceController.swift` (`setConsent` write seam 219-245).
+- "What leaves" surfaces: `macos/Screencap/Views/Review/ReviewWindow.swift` (426), `ReviewWindowViewModel.swift` (201), `ScreenshotTruthPane.swift` (77); `SECURITY.md` — `masked_video_upload` precedent + outstanding consent-surface reconciliation (59-75).
 - Institutional learning: `docs/solutions/workflow-issues/privacy-guards-deselected-on-ci-silently-rot-2026-06-10.md` — privacy guards gated behind environment-only markers silently rot on CI; the new frame-egress guards must live in the enforced privacy lane.
 - Sibling work (preserves the `FRAMES → NEVER` guard verbatim): `docs/plans/2026-07-16-001-feat-cloud-tasks-run-by-default-plan.md`.
 - Product positioning: `STRATEGY.md` — "win on privacy"; privacy incidents per 1k recordings held near zero.

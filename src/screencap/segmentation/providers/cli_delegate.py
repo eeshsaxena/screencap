@@ -2,7 +2,7 @@
 
 Delegates a cloud-eligible task to the vendor's **own installed CLI** —
 ``codex`` (OpenAI), ``claude`` (Anthropic), ``gemini`` (Google) — which the user
-has already signed into. ScreenCap holds no OAuth/subscription token: it shells
+has already signed into. Screencap holds no OAuth/subscription token: it shells
 out to the real binary and reads only stdout, so subscription reuse rides each
 vendor's sanctioned non-interactive surface (KTD1). Anthropic explicitly
 sanctions subprocess use of the real ``claude`` binary; Codex documents the same
@@ -48,7 +48,7 @@ Availability (KTD1)
 -------------------
 :meth:`CliDelegateProvider.available` is an **existence/stat-only** check —
 binary resolvable + a vendor auth artifact present on disk. It NEVER opens or
-parses the vendor's auth files: ScreenCap never reads the vendor's stored
+parses the vendor's auth files: Screencap never reads the vendor's stored
 credentials, only observes that the CLI is set up.
 """
 
@@ -258,7 +258,7 @@ def _resolve_binary(spec: _VendorSpec) -> str | None:
 def _auth_artifact_present(spec: _VendorSpec) -> bool:
     """Return whether any vendor auth artifact exists — stat only, never read (KTD1).
 
-    ScreenCap never opens or parses the vendor's credential files; it only
+    Screencap never opens or parses the vendor's credential files; it only
     observes (via :meth:`Path.exists`, a stat) that the CLI has been set up.
     """
     return any(p.exists() for p in spec.auth_artifacts)

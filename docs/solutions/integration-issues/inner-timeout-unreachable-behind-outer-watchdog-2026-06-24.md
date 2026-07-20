@@ -77,7 +77,7 @@ def run_terminal_stage(..., lock_timeout: float = _DEFAULT_LOCK_TIMEOUT, ...):
     with terminal_lock(name, non_blocking=non_blocking, timeout=lock_timeout):
 ```
 
-**Swift — interactive spawn passes a short timeout via a testable argv helper** (`macos/ScreenCap/Controllers/UploadController.swift`):
+**Swift — interactive spawn passes a short timeout via a testable argv helper** (`macos/Screencap/Controllers/UploadController.swift`):
 
 ```swift
 final class LiveUploadService: UploadService {

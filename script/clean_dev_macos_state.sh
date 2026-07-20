@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Tear down macOS DEV-build state for ScreenCap so dev artifacts stop
+# Tear down macOS DEV-build state for Screencap so dev artifacts stop
 # masquerading as — or conflicting with — the shipped /Applications install.
 #
 # WHY THIS EXISTS: dev builds (Xcode Cmd+R, script/build_and_run.sh) drop
-# ad-hoc-signed ScreenCap.app copies into DerivedData / macos/.build and
+# ad-hoc-signed Screencap.app copies into DerivedData / macos/.build and
 # register the com.screencap.daemon LaunchAgent against a dev identity.
 # (Older build_and_run.sh versions also left dev env vars —
 # SCREENCAP_DAEMON_USE_DEV_SOURCE, etc. — global in the launchd session; the
 # unsetenv step below clears any such leftovers.)
-# Spotlight/Launchpad then index EVERY copy under the same name "ScreenCap", so
+# Spotlight/Launchpad then index EVERY copy under the same name "Screencap", so
 # launching it can hit an ad-hoc dev build instead of the signed install — which
 # fails helper registration ("macOS rejected the helper signature"), shows the
 # orange "Ad-hoc dev build" banner, and tangles TCC across the two identities.
@@ -17,7 +17,7 @@
 # docs/solutions/workflow-issues/macos-shipped-vs-dev-build-confusion.md.
 #
 # SAFE BY DEFAULT:
-#   - NEVER touches /Applications/ScreenCap.app (the shipped install).
+#   - NEVER touches /Applications/Screencap.app (the shipped install).
 #   - Moves stray dev app copies to ~/.Trash (reversible) — never `rm`.
 #   - TCC reset is OPT-IN (--reset-tcc): the dev and shipped app share bundle id
 #     com.screencap.macos, so a blanket reset also drops the SHIPPED app's grants.
@@ -41,7 +41,7 @@ for arg in "$@"; do
   esac
 done
 
-SHIPPED="/Applications/ScreenCap.app"
+SHIPPED="/Applications/Screencap.app"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TRASH="${HOME}/.Trash"
 
@@ -55,11 +55,11 @@ run() {
   fi
 }
 
-echo "==> ScreenCap dev-state teardown$([ "$DRY_RUN" -eq 1 ] && echo ' (dry-run — no changes)')"
+echo "==> Screencap dev-state teardown$([ "$DRY_RUN" -eq 1 ] && echo ' (dry-run — no changes)')"
 
-# 1. Quit any running ScreenCap.
-echo "==> Quitting ScreenCap (if running)"
-if [ "$DRY_RUN" -eq 1 ]; then echo "  [dry-run] pkill -x ScreenCap"; else pkill -x ScreenCap 2>/dev/null || true; fi
+# 1. Quit any running Screencap.
+echo "==> Quitting Screencap (if running)"
+if [ "$DRY_RUN" -eq 1 ]; then echo "  [dry-run] pkill -x Screencap"; else pkill -x Screencap 2>/dev/null || true; fi
 
 # 2. Boot out the daemon LaunchAgent + remove its stale socket. (Re-registers
 #    cleanly next time you run the shipped app's setup.)
@@ -77,15 +77,15 @@ for v in SCREENCAP_CLI_PATH SCREENCAP_DEV_REPO_ROOT SCREENCAP_DEV_PYTHON SCREENC
   if [ "$DRY_RUN" -eq 1 ]; then echo "  [dry-run] launchctl unsetenv $v"; else launchctl unsetenv "$v" || true; fi
 done
 
-# 4. Move stray dev ScreenCap.app copies to Trash — NEVER the shipped one, and
+# 4. Move stray dev Screencap.app copies to Trash — NEVER the shipped one, and
 #    never the Xcode index-only builds (under .noindex, not launchable).
-echo "==> Trashing stray dev ScreenCap.app build copies (keeping ${SHIPPED})"
+echo "==> Trashing stray dev Screencap.app build copies (keeping ${SHIPPED})"
 found_stray=0
 # Combine Spotlight's view with a direct scan of the build dirs, dedup by path.
 {
-  mdfind "kMDItemKind == 'Application'" 2>/dev/null | grep -i "ScreenCap.app" || true
+  mdfind "kMDItemKind == 'Application'" 2>/dev/null | grep -i "Screencap.app" || true
   find "${HOME}/Library/Developer/Xcode/DerivedData" "${REPO_ROOT}/macos" \
-    -name "ScreenCap.app" -type d 2>/dev/null || true
+    -name "Screencap.app" -type d 2>/dev/null || true
 } | sort -u | while IFS= read -r app; do
   [ -n "$app" ] || continue
   [ -d "$app" ] || continue                       # already moved this run
@@ -93,7 +93,7 @@ found_stray=0
   case "$app" in *"/Index.noindex/"*) continue ;; esac   # Xcode index build
   found_stray=1
   hash="$(printf '%s' "$app" | md5 -q 2>/dev/null | cut -c1-8)"
-  dest="${TRASH}/ScreenCap-stray-${hash:-$$}.app"
+  dest="${TRASH}/Screencap-stray-${hash:-$$}.app"
   echo "  stray: $app"
   run mv "$app" "$dest"
 done
@@ -125,5 +125,5 @@ fi
 
 echo
 echo "Done.$([ "$DRY_RUN" -eq 1 ] && echo ' (dry-run — nothing was changed)')"
-echo "Spotlight should now show a single ScreenCap (the shipped install)."
+echo "Spotlight should now show a single Screencap (the shipped install)."
 echo "Re-run the app's setup to re-register the daemon cleanly."

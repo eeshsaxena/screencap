@@ -1,4 +1,4 @@
-# ScreenCap Pilot Outreach Strategy — B2B SaaS Ops / CS-Ops
+# Screencap Pilot Outreach Strategy — B2B SaaS Ops / CS-Ops
 
 *Working draft. A few decisions are yours to make — flagged inline as **[your call]**.*
 
@@ -8,13 +8,13 @@
 
 ## 1. What this push is actually for
 
-This is **not** a feedback beta. The goal is to sign a small set of pilots whose ops/CS-ops teams run ScreenCap daily, so you simultaneously (a) prove capture and redaction work in the real world and (b) start accumulating high-value computer-use traces for the agent-training corpus.
+This is **not** a feedback beta. The goal is to sign a small set of pilots whose ops/CS-ops teams run Screencap daily, so you simultaneously (a) prove capture and redaction work in the real world and (b) start accumulating high-value computer-use traces for the agent-training corpus.
 
-Every pilot is framed as a **value exchange**, never a favor. They run ScreenCap; you get the corpus as a byproduct.
+Every pilot is framed as a **value exchange**, never a favor. They run Screencap; you get the corpus as a byproduct.
 
 **Suggested success definition for the first ~8 weeks [your call]:**
 - 5–8 pilots signed
-- Each pilot = 3–10 operator seats running ScreenCap a few hours/day for 3–4 weeks
+- Each pilot = 3–10 operator seats running Screencap a few hours/day for 3–4 weeks
 - Enough consented traces from **one recurring multi-tool workflow** (see §3) to validate that the corpus is actually trainable
 
 Lock these numbers before sending anything — they decide how many companies you need in the funnel.
@@ -58,7 +58,7 @@ How that sorts the options we discussed:
 
 The #1 reason an ops leader says no: *"you want my team to run an always-on screen recorder over company data."*
 
-Put the answer **in the outreach itself**. ScreenCap's architecture is your best sales asset:
+Put the answer **in the outreach itself**. Screencap's architecture is your best sales asset:
 - **Local-first** — capture and processing happen on-device.
 - **Capture-time redaction** — PII is filtered *before* anything hits disk (two-level, fail-closed).
 - **Per-recording opt-in** — nothing leaves the device for the corpus without explicit consent on that recording.
@@ -124,19 +124,19 @@ Email-first, 3 steps over ~10 days. You're not at a volume that needs heavy mult
 
 ---
 
-## 7. Messaging — how to relate Proteus + ScreenCap
+## 7. Messaging — how to relate Proteus + Screencap
 
 **The product relationship (your internal source of truth):**
 - **Proteus** — the company; builds computer-use AI agents (the model). *Your sender / sending domain.*
-- **ScreenCap** — Proteus's on-device macOS tool that captures and maps real workflows. *What the recipient runs.*
+- **Screencap** — Proteus's on-device macOS tool that captures and maps real workflows. *What the recipient runs.*
 - **Pilot deliverables** — a workflow/time map + draft agents. *What the recipient gets.*
 - **The corpus** — consented traces that train Proteus's agents. *What you get.*
 
 **The one-sentence spine** (use a version of this in every email so the relationship is always clear without a lecture):
 
-> "Proteus builds AI agents that take over repetitive, cross-tool software work — and ScreenCap is our on-device macOS tool that maps how your team actually works, so we can show you where the time goes and train agents on it."
+> "Proteus builds AI agents that take over repetitive, cross-tool software work — and Screencap is our on-device macOS tool that maps how your team actually works, so we can show you where the time goes and train agents on it."
 
-**Principles:** lead with the recipient's outcome, not your product names; introduce Proteus and ScreenCap only once, in that single spine sentence; one short specific ask; privacy in the body, not buried; name the *cross-tool* pain specifically (your differentiator); no "revolutionary AI platform" language.
+**Principles:** lead with the recipient's outcome, not your product names; introduce Proteus and Screencap only once, in that single spine sentence; one short specific ask; privacy in the body, not buried; name the *cross-tool* pain specifically (your differentiator); no "revolutionary AI platform" language.
 
 ### Email 1 — the hook (day 1)
 
@@ -146,7 +146,7 @@ Email-first, 3 steps over ~10 days. You're not at a volume that needs heavy mult
 >
 > I'm {name}, from Proteus — we build AI agents that take over repetitive, cross-tool software work.
 >
-> To train them, we first map how a team really moves across its tools — Salesforce, the warehouse, Looker, admin panels — using **ScreenCap**, our macOS tool that runs entirely on-device with capture-time redaction, so nothing leaves your team's machines.
+> To train them, we first map how a team really moves across its tools — Salesforce, the warehouse, Looker, admin panels — using **Screencap**, our macOS tool that runs entirely on-device with capture-time redaction, so nothing leaves your team's machines.
 >
 > The pilot trade: your ops team runs it for a few weeks, and you get (1) a map of where their time actually goes and (2) draft agents for your most repetitive workflows. We get consented data to improve our models.
 >
@@ -160,7 +160,7 @@ Email-first, 3 steps over ~10 days. You're not at a volume that needs heavy mult
 >
 > Hi {first} — quick follow-up.
 >
-> The usual hesitation is "you want my team to run a screen recorder over company data." Fair — so to be precise: with ScreenCap, capture and redaction happen on-device, PII is filtered *before* anything is written to disk, and nothing reaches Proteus unless someone explicitly opts in a specific recording. Your team stays in control the whole way.
+> The usual hesitation is "you want my team to run a screen recorder over company data." Fair — so to be precise: with Screencap, capture and redaction happen on-device, PII is filtered *before* anything is written to disk, and nothing reaches Proteus unless someone explicitly opts in a specific recording. Your team stays in control the whole way.
 >
 > (Context: since Rewind shut down, there's no trustworthy local-first option left for this — exactly the gap we're built for.)
 >

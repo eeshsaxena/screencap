@@ -28,7 +28,7 @@ Wire the delivered brand icon (the corner-brackets-plus-teal-dot mark on a warm-
 
 ### Problem Frame
 
-The app icon slots are declared but empty: [`AppIcon.appiconset/Contents.json`](macos/ScreenCap/Assets.xcassets/AppIcon.appiconset/Contents.json) lists all ten macOS sizes but the folder contains no images, so Finder, the Dock, Launchpad, and the DMG install window all fall back to the generic placeholder tile. The embedded daemon is worse than generic: its `.app` is built with `icon=None` ([`screencap.spec:283`](pyinstaller/screencap.spec:283)), so System Settings → Login Items shows PyInstaller's own default icon under the name "ScreenCap". This lands right after a run of window-chrome fidelity work — the unbranded icon is now the most visible rough edge on an otherwise polished shell, and it's the first thing a tester sees when mounting the DMG.
+The app icon slots are declared but empty: [`AppIcon.appiconset/Contents.json`](macos/Screencap/Assets.xcassets/AppIcon.appiconset/Contents.json) lists all ten macOS sizes but the folder contains no images, so Finder, the Dock, Launchpad, and the DMG install window all fall back to the generic placeholder tile. The embedded daemon is worse than generic: its `.app` is built with `icon=None` ([`screencap.spec:283`](pyinstaller/screencap.spec:283)), so System Settings → Login Items shows PyInstaller's own default icon under the name "Screencap". This lands right after a run of window-chrome fidelity work — the unbranded icon is now the most visible rough edge on an otherwise polished shell, and it's the first thing a tester sees when mounting the DMG.
 
 ### Key Decisions
 
@@ -59,14 +59,14 @@ The app icon slots are declared but empty: [`AppIcon.appiconset/Contents.json`](
 
 - AE1. **Covers R1.** On a clean machine, after installing from the DMG, the app in `/Applications` and in the Dock shows the brand mark at every zoom level — no generic placeholder tile anywhere.
 - AE2. **Covers R3.** On macOS 15+ set to dark appearance with dark app icons enabled, the app icon shows the dark tile; switching the system to light appearance shows the light tile. On macOS 13–14 the light tile is always used (no regression).
-- AE3. **Covers R4.** After first launch registers the login item, System Settings → Login Items shows the "ScreenCap" helper row carrying the brand mark rather than the PyInstaller default icon.
+- AE3. **Covers R4.** After first launch registers the login item, System Settings → Login Items shows the "Screencap" helper row carrying the brand mark rather than the PyInstaller default icon.
 - AE4. **Covers R5.** Double-clicking the release `.dmg` opens a Finder window whose volume icon is the brand mark.
 
 ### Scope Boundaries
 
 **Deferred for later**
 
-- The menu-bar icon. The `MenuBarExtra` label is currently the `record.circle` SF Symbol ([`ScreenCapApp.swift:145`](macos/ScreenCap/ScreenCapApp.swift:145)); a monochrome/template rendering of the mark could replace it, but that needs a separate single-color asset the brand set doesn't include yet.
+- The menu-bar icon. The `MenuBarExtra` label is currently the `record.circle` SF Symbol ([`ScreencapApp.swift:145`](macos/Screencap/ScreencapApp.swift:145)); a monochrome/template rendering of the mark could replace it, but that needs a separate single-color asset the brand set doesn't include yet.
 - Other in-app iconography (notifications, empty states, onboarding art).
 
 **Outside this work**
@@ -85,10 +85,10 @@ The app icon slots are declared but empty: [`AppIcon.appiconset/Contents.json`](
 
 ### Key Technical Decisions
 
-- KTD-1. **Single source of truth under `macos/branding/`.** The delivered masters live in one committed directory, and a small generator produces every derived artifact from them: one `ScreenCap.icns` (reused by both the daemon bundle and the DMG volume) and the downscaled dark PNG ladder for the appiconset. Derived outputs are committed and authoritative — the Xcode/PyInstaller/DMG builds never invoke the generator; it exists for reproducible regeneration when the logo changes.
+- KTD-1. **Single source of truth under `macos/branding/`.** The delivered masters live in one committed directory, and a small generator produces every derived artifact from them: one `Screencap.icns` (reused by both the daemon bundle and the DMG volume) and the downscaled dark PNG ladder for the appiconset. Derived outputs are committed and authoritative — the Xcode/PyInstaller/DMG builds never invoke the generator; it exists for reproducible regeneration when the logo changes.
 - KTD-2. **Dark icon via the classic multi-size appiconset plus `luminosity: dark` appearance entries**, with the dark ladder downscaled (`sips`) from the delivered dark 1024 — not a conversion to Xcode 16's single-size format. Reuses the delivered full light ladder and keeps explicit control of every slot. Local Xcode 26.4.1 compiles the appearance entries; the dark variant activates on macOS 15+ and falls back to the light tile on macOS 13–14 (deployment target [`project.yml`](macos/project.yml) macOS 13.0), so there is no regression below 15.
-- KTD-3. **Daemon icon by setting the PyInstaller `BUNDLE(icon=…)`** to the generated `.icns`, resolved through the spec's existing repo-root join (`_root` at [`screencap.spec:187`](pyinstaller/screencap.spec:187)) → `macos/branding/ScreenCap.icns`. This replaces PyInstaller's default icon; the existing `--version` launch guard in [`embed-cli.sh`](macos/ScreenCap/Scripts/embed-cli.sh) still fails the build loud if the bundle breaks.
-- KTD-4. **DMG volume icon via a read-write staging image, not `-srcfolder` directly.** Setting the custom-icon bit on the source folder before `hdiutil create -srcfolder … -format UDZO` does **not** survive onto the read-only volume — the volume root's icon bit ends up cleared (empirically reproduced on macOS 26.5.1). Instead, in [`script/notarize_app.sh`](script/notarize_app.sh) step 2: build the image as `-format UDRW`, `hdiutil attach` it, copy `macos/branding/ScreenCap.icns` to `<mounted-volume>/.VolumeIcon.icns` and run `xcrun SetFile -a C` on the **mounted volume root**, `hdiutil detach`, then `hdiutil convert … -format UDZO` to the final compressed image. The existing sign → notarize → staple steps run after the convert, unchanged.
+- KTD-3. **Daemon icon by setting the PyInstaller `BUNDLE(icon=…)`** to the generated `.icns`, resolved through the spec's existing repo-root join (`_root` at [`screencap.spec:187`](pyinstaller/screencap.spec:187)) → `macos/branding/Screencap.icns`. This replaces PyInstaller's default icon; the existing `--version` launch guard in [`embed-cli.sh`](macos/Screencap/Scripts/embed-cli.sh) still fails the build loud if the bundle breaks.
+- KTD-4. **DMG volume icon via a read-write staging image, not `-srcfolder` directly.** Setting the custom-icon bit on the source folder before `hdiutil create -srcfolder … -format UDZO` does **not** survive onto the read-only volume — the volume root's icon bit ends up cleared (empirically reproduced on macOS 26.5.1). Instead, in [`script/notarize_app.sh`](script/notarize_app.sh) step 2: build the image as `-format UDRW`, `hdiutil attach` it, copy `macos/branding/Screencap.icns` to `<mounted-volume>/.VolumeIcon.icns` and run `xcrun SetFile -a C` on the **mounted volume root**, `hdiutil detach`, then `hdiutil convert … -format UDZO` to the final compressed image. The existing sign → notarize → staple steps run after the convert, unchanged.
 - KTD-5. **Verification is build-warning + visual/runtime smoke; no new automated unit tests.** This is pure asset/config/build work — a Swift test asserting an icon "looks right" would be test theater. The safety nets are `actool`'s missing-image warnings at build time and the daemon bundle's existing `--version` launch guard.
 
 ### High-Level Technical Design
@@ -98,7 +98,7 @@ One set of masters fans out to four surfaces through the generator:
 ```mermaid
 flowchart TB
   M[macos/branding/masters/<br/>light ladder + dark 1024] --> G[generate-icons.sh]
-  G --> ICNS[macos/branding/ScreenCap.icns]
+  G --> ICNS[macos/branding/Screencap.icns]
   G --> DARK[dark PNG ladder]
   M --> LIGHT[light PNG ladder]
   LIGHT --> AC[AppIcon.appiconset<br/>U2]
@@ -126,17 +126,17 @@ flowchart TB
 **Files:**
 - `macos/branding/masters/` — the delivered light ladder PNGs (16/32/64/128/256/512/1024 with `-2x` variants) plus `icon_1024x1024.png` and `icon_1024x1024_dark.png`, copied from the delivered `app-icon/` set.
 - `macos/branding/generate-icons.sh` — new generator.
-- `macos/branding/ScreenCap.icns` — generated, committed (consumed by U3 and U4).
+- `macos/branding/Screencap.icns` — generated, committed (consumed by U3 and U4).
 
-**Approach:** The script assembles a standard `.iconset` (Apple's `icon_16x16.png` … `icon_512x512@2x.png` naming) from the light masters and runs `iconutil -c icns` to emit `ScreenCap.icns`. It also downscales `icon_1024x1024_dark.png` with `sips -z` into the dark size ladder used by U2. The delivered masters use `-2x` suffixes; the generator renames them explicitly to the `@2x` names Apple's tooling expects rather than assuming the delivered filenames drop in verbatim. Idempotent and safe to re-run when the logo changes. Follows the `set -euo pipefail` style of [`embed-cli.sh`](macos/ScreenCap/Scripts/embed-cli.sh).
+**Approach:** The script assembles a standard `.iconset` (Apple's `icon_16x16.png` … `icon_512x512@2x.png` naming) from the light masters and runs `iconutil -c icns` to emit `Screencap.icns`. It also downscales `icon_1024x1024_dark.png` with `sips -z` into the dark size ladder used by U2. The delivered masters use `-2x` suffixes; the generator renames them explicitly to the `@2x` names Apple's tooling expects rather than assuming the delivered filenames drop in verbatim. Idempotent and safe to re-run when the logo changes. Follows the `set -euo pipefail` style of [`embed-cli.sh`](macos/Screencap/Scripts/embed-cli.sh).
 
-**Execution note:** Mostly asset/tooling — verify by running the script and confirming `file macos/branding/ScreenCap.icns` reports an Apple icon and every expected dark ladder size exists.
+**Execution note:** Mostly asset/tooling — verify by running the script and confirming `file macos/branding/Screencap.icns` reports an Apple icon and every expected dark ladder size exists.
 
-**Patterns to follow:** Repo shell-script conventions in [`script/`](script/) and [`macos/ScreenCap/Scripts/`](macos/ScreenCap/Scripts/).
+**Patterns to follow:** Repo shell-script conventions in [`script/`](script/) and [`macos/Screencap/Scripts/`](macos/Screencap/Scripts/).
 
 **Test scenarios:** Test expectation: none — generator/asset unit. Smoke: script exits 0; `iconutil` produces a valid `.icns`; the dark ladder PNG sizes are all present.
 
-**Verification:** `macos/branding/ScreenCap.icns` exists and is a valid `.icns`; the dark ladder is complete.
+**Verification:** `macos/branding/Screencap.icns` exists and is a valid `.icns`; the dark ladder is complete.
 
 ### U2. Wire light + dark app icon into the asset catalog
 
@@ -147,7 +147,7 @@ flowchart TB
 **Dependencies:** U1.
 
 **Files:**
-- `macos/ScreenCap/Assets.xcassets/AppIcon.appiconset/Contents.json`
+- `macos/Screencap/Assets.xcassets/AppIcon.appiconset/Contents.json`
 - The 10 light PNGs and the dark ladder PNGs, placed inside the appiconset directory.
 
 **Approach:** Copy the light ladder into the appiconset and add a `filename` to each of the ten existing slots. For dark, add a parallel per-slot entry carrying `"appearances": [{"appearance": "luminosity", "value": "dark"}]` referencing the dark PNGs (KTD-2). `actool` compiles the appearance entries under the local Xcode. Dark activates on macOS 15+; below that the light entry is used (deployment target macOS 13.0) with no regression.
@@ -171,7 +171,7 @@ flowchart TB
 
 **Files:** `pyinstaller/screencap.spec`.
 
-**Approach:** Change the `BUNDLE(...)` `icon=None` at [`screencap.spec:283`](pyinstaller/screencap.spec:283) to reference the generated icns via the spec's existing repo-root resolution — `icon=os.path.join(_root, 'macos', 'branding', 'ScreenCap.icns')` (KTD-3). PyInstaller copies it into the bundle in place of its default icon. [`embed-cli.sh`](macos/ScreenCap/Scripts/embed-cli.sh)'s `--version` guard still runs, so a broken bundle fails loud.
+**Approach:** Change the `BUNDLE(...)` `icon=None` at [`screencap.spec:283`](pyinstaller/screencap.spec:283) to reference the generated icns via the spec's existing repo-root resolution — `icon=os.path.join(_root, 'macos', 'branding', 'Screencap.icns')` (KTD-3). PyInstaller copies it into the bundle in place of its default icon. [`embed-cli.sh`](macos/Screencap/Scripts/embed-cli.sh)'s `--version` guard still runs, so a broken bundle fails loud.
 
 **Execution note:** Rebuild the PyInstaller bundle (`pyinstaller pyinstaller/screencap.spec`); confirm the branded `.icns` is in `dist/ScreencapDaemon.app/Contents/Resources/` and the helper still launches (`--version`). The Login Items row may need a fresh helper registration / icon-cache refresh to show the new icon on an already-installed machine.
 
@@ -191,7 +191,7 @@ flowchart TB
 
 **Files:** `script/notarize_app.sh` (DMG build step, [lines ~133–146](script/notarize_app.sh:133)).
 
-**Approach:** Restructure the DMG build — currently a single `hdiutil create -srcfolder … -format UDZO` at [`script/notarize_app.sh:141`](script/notarize_app.sh:141) — into the read-write-then-convert flow required to carry a volume icon (KTD-4): `hdiutil create -format UDRW` → `hdiutil attach` → copy `macos/branding/ScreenCap.icns` to `<mounted-volume>/.VolumeIcon.icns` and `xcrun SetFile -a C` the **mounted volume root** → `hdiutil detach` → `hdiutil convert -format UDZO` to the final image. Setting the bit on the source staging folder does not survive onto the read-only volume, so it must be set on the mounted volume. The subsequent sign → notarize → staple steps are unchanged.
+**Approach:** Restructure the DMG build — currently a single `hdiutil create -srcfolder … -format UDZO` at [`script/notarize_app.sh:141`](script/notarize_app.sh:141) — into the read-write-then-convert flow required to carry a volume icon (KTD-4): `hdiutil create -format UDRW` → `hdiutil attach` → copy `macos/branding/Screencap.icns` to `<mounted-volume>/.VolumeIcon.icns` and `xcrun SetFile -a C` the **mounted volume root** → `hdiutil detach` → `hdiutil convert -format UDZO` to the final image. Setting the bit on the source staging folder does not survive onto the read-only volume, so it must be set on the mounted volume. The subsequent sign → notarize → staple steps are unchanged.
 
 **Execution note:** Release-only — verify by producing a DMG and mounting it; Finder shows the branded volume icon. This path runs only during the `macos-app-release` flow.
 
@@ -207,11 +207,11 @@ flowchart TB
 
 | Gate | Command / action | Applies to | Done signal |
 |---|---|---|---|
-| App builds clean | `xcodebuild -scheme ScreenCap -configuration Release build` (after `xcodegen generate`) | U2 | Build succeeds with no asset-catalog / missing-image warnings |
+| App builds clean | `xcodebuild -scheme Screencap -configuration Release build` (after `xcodegen generate`) | U2 | Build succeeds with no asset-catalog / missing-image warnings |
 | App icon visual | Inspect Finder, Dock, Launchpad (light; and dark on macOS 15+) | U2 | Brand mark at every size; dark tile on 15+, light on 13–14 |
 | Daemon rebuild | `pyinstaller pyinstaller/screencap.spec`; `dist/ScreencapDaemon.app/Contents/MacOS/screencap --version` | U3 | Bundle carries branded `.icns`; helper exits 0; Login Items row shows the mark |
 | DMG volume icon | Run [`script/notarize_app.sh`](script/notarize_app.sh) (or the `macos-app-release` skill); mount the DMG | U4 | Mounted volume shows the mark; `stapler validate` + `spctl --assess` still pass |
-| Generator sanity | `macos/branding/generate-icons.sh`; `file macos/branding/ScreenCap.icns` | U1 | Valid `.icns` emitted; dark ladder complete |
+| Generator sanity | `macos/branding/generate-icons.sh`; `file macos/branding/Screencap.icns` | U1 | Valid `.icns` emitted; dark ladder complete |
 
 ---
 
@@ -221,7 +221,7 @@ flowchart TB
 - No new asset-catalog build warnings.
 - The daemon bundle still launches after the icon change (existing `--version` guard green).
 - DMG signing / notarization / stapling unaffected.
-- Branding masters, generator, and generated `ScreenCap.icns` committed under `macos/branding/`.
+- Branding masters, generator, and generated `Screencap.icns` committed under `macos/branding/`.
 
 ---
 
@@ -238,10 +238,10 @@ flowchart TB
 
 ## Sources & Research
 
-- Empty app icon set — ten declared slots, zero images: [`AppIcon.appiconset/Contents.json`](macos/ScreenCap/Assets.xcassets/AppIcon.appiconset/Contents.json).
+- Empty app icon set — ten declared slots, zero images: [`AppIcon.appiconset/Contents.json`](macos/Screencap/Assets.xcassets/AppIcon.appiconset/Contents.json).
 - App consumes this set: `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon` in [`project.yml`](macos/project.yml); deployment target macOS 13.0.
 - Daemon ships PyInstaller's default icon: `BUNDLE(..., icon=None, ...)` at [`screencap.spec:283`](pyinstaller/screencap.spec:283); repo-root resolution via `_root` at [`screencap.spec:187`](pyinstaller/screencap.spec:187).
-- DMG built via `hdiutil create -srcfolder` at [`script/notarize_app.sh:141`](script/notarize_app.sh:141); embedded-daemon `--version` launch guard in [`embed-cli.sh`](macos/ScreenCap/Scripts/embed-cli.sh).
-- Menu-bar glyph is an SF Symbol, not the mark: [`ScreenCapApp.swift:145`](macos/ScreenCap/ScreenCapApp.swift:145) — deferred (Scope Boundaries).
+- DMG built via `hdiutil create -srcfolder` at [`script/notarize_app.sh:141`](script/notarize_app.sh:141); embedded-daemon `--version` launch guard in [`embed-cli.sh`](macos/Screencap/Scripts/embed-cli.sh).
+- Menu-bar glyph is an SF Symbol, not the mark: [`ScreencapApp.swift:145`](macos/Screencap/ScreencapApp.swift:145) — deferred (Scope Boundaries).
 - Delivered artwork (external to the repo, to be committed under `macos/branding/masters/`): `Screen recording tool brand direction.zip` → `app-icon/`, containing light PNGs at 16/32/64/128/256/512/1024 px (with `-2x` variants) plus `icon_1024x1024_dark.png`; all ten macOS app-icon pixel sizes covered exactly.
 - Dark macOS app icons: asset-catalog `luminosity: dark` appearance entries require Xcode 16+ to compile and activate on macOS 15+ (fall back to light on 14 and below). Local toolchain Xcode 26.4.1 satisfies the build requirement.

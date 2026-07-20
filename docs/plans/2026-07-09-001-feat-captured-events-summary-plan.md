@@ -31,7 +31,7 @@ A collapsed-by-default "what was recorded" summary inside the recording viewer t
 
 ### Problem Frame
 
-Today the app surfaces capture only as a spatial summary: colored event ticks on the viewer's scrub bar and coverage bands on the day timeline. The older browser viewer that once listed captured events was retired. A user who wants to answer "what did ScreenCap actually record about me here?" has no readable, plain-language account — they must interpret ticks or trust coverage bands. The cost is a trust gap: the person recording their own screen cannot easily verify what was and wasn't captured.
+Today the app surfaces capture only as a spatial summary: colored event ticks on the viewer's scrub bar and coverage bands on the day timeline. The older browser viewer that once listed captured events was retired. A user who wants to answer "what did Screencap actually record about me here?" has no readable, plain-language account — they must interpret ticks or trust coverage bands. The cost is a trust gap: the person recording their own screen cannot easily verify what was and wasn't captured.
 
 ### Key Decisions
 
@@ -98,7 +98,7 @@ flowchart TB
 
 ### Success Criteria
 
-- **Human outcome:** a non-technical user can answer "what did ScreenCap record about me here?" from inside the viewer, in plain language, without interpreting ticks or leaving the surface.
+- **Human outcome:** a non-technical user can answer "what did Screencap record about me here?" from inside the viewer, in plain language, without interpreting ticks or leaving the surface.
 - **Trust outcome:** the view honestly shows what was captured and where capture was blocked, never implies the local copy is masked, never counts or reveals content from blocked intervals, and never lets the user alter the record.
 
 ### Scope Boundaries
@@ -191,25 +191,25 @@ The two changed surfaces: `prepare_inspect_data` gains a `blocked_intervals` fie
 - **Goal:** A pure function mapping `([TimelineEvent], blocked intervals, duration)` to a `RecordedSummary` model: per-app counts (carry-forward attribution), meaningful-event-kind counts, blocked count/span, and an `isEmpty` flag.
 - **Requirements:** R3, R4, R5, R7; AE2, AE3, AE5.
 - **Dependencies:** none (pure; blocked intervals passed in).
-- **Files:** `macos/ScreenCap/Views/Inspect/RecordedSummary.swift` (new — model + builder); `macos/ScreenCapTests/RecordedSummaryTests.swift` (new).
+- **Files:** `macos/Screencap/Views/Inspect/RecordedSummary.swift` (new — model + builder); `macos/ScreencapTests/RecordedSummaryTests.swift` (new).
 - **Approach:** Drop any event whose timestamp falls inside a **protected interval** (`protected_intervals`). Filter the rest by `type` to the meaningful set (KTD4; use `mouse.singleclick`, not `mouse.click`). Attribute each event to the app of the nearest preceding `window.switch`/`state` (running-current-app fold over the time-sorted stream); pre-first-switch events go to "unknown". Count per app and per kind (friendly labels). Fold the narrower `blocked_intervals` (excluded-only) into a count + total span for the "not captured" line. Set `isEmpty` when there are zero meaningful events after the protected-interval skip.
-- **Patterns to follow:** pure-helper testable pattern in `macos/ScreenCapTests/SearchRankingTests.swift`, `QueryParserTests.swift`.
+- **Patterns to follow:** pure-helper testable pattern in `macos/ScreencapTests/SearchRankingTests.swift`, `QueryParserTests.swift`.
 - **Test scenarios:**
   - Covers AE2. Input mixing raw (`mouse.move`, `key.down`) and meaningful (`mouse.singleclick`, `key.type`, `window.switch`, `network.request`) → counts include only meaningful kinds; raw excluded; `mouse.singleclick` is counted as a click.
   - Carry-forward attribution: a `window.switch` to Safari followed by clicks and a `key.type`, then a switch to Mail followed by clicks → the Safari and Mail per-app counts include those clicks/typing; events before the first switch land in "unknown".
   - Covers AE3. A meaningful event whose timestamp lands inside a protected interval is excluded from both the counts and its app group; the "not captured" line reflects the excluded-only `blocked_intervals`.
   - Covers AE5. Zero meaningful events after the blocked skip (only raw, or none) → `isEmpty` is true.
-- **Verification:** `RecordedSummaryTests` pass in the `ScreenCap` test scheme.
+- **Verification:** `RecordedSummaryTests` pass in the `Screencap` test scheme.
 
 ### U3. Recorded-events summary pane (collapsed-by-default view)
 
 - **Goal:** A SwiftUI view rendering `RecordedSummary` as a collapsed-by-default "What was recorded" disclosure, expandable to the digest, with each app group expandable to its underlying meaningful events; a blocked reassurance line; honest empty and loading states; strictly read-only and accessible.
 - **Requirements:** R1, R2, R3, R5, R6, R7, R8.
 - **Dependencies:** U2.
-- **Files:** `macos/ScreenCap/Views/Inspect/RecordedSummaryPane.swift` (new).
+- **Files:** `macos/Screencap/Views/Inspect/RecordedSummaryPane.swift` (new).
 - **Approach:** Outer `DisclosureGroup` collapsed by default (`@State expanded = false`). Digest rows: per-app groups ordered by descending meaningful-event count with "unknown" pinned last, friendly per-kind labels, and a blocked line ("N blocked intervals — Xm Ys not captured") with `HH:MM–HH:MM` ranges on drill-down. A nested per-app `DisclosureGroup` reveals the underlying meaningful events, reusing the read-only row style from `EventContentPane`. Show a brief "reading captured events" placeholder while parsing is in flight; show the empty state only after parsing completes with `isEmpty`. Give the disclosures and the blocked row `accessibilityLabel`s mirroring `DayStripAccessibility`. No mutating controls.
 - **Execution note:** Read-only invariant (R8) — verify in review that the pane exposes no mutating affordance.
-- **Patterns to follow:** `DisclosureGroup` usage in `InspectWindow.swift` (error-details section); row rendering in `macos/ScreenCap/Views/Review/EventContentPane.swift`; accessibility strings in `DayStripAccessibility` (`macos/ScreenCap/Views/Timeline/`).
+- **Patterns to follow:** `DisclosureGroup` usage in `InspectWindow.swift` (error-details section); row rendering in `macos/Screencap/Views/Review/EventContentPane.swift`; accessibility strings in `DayStripAccessibility` (`macos/Screencap/Views/Timeline/`).
 - **Test scenarios:**
   - Covers AE1. The pane's initial expanded state is collapsed (false).
   - Covers AE3. Given a summary with blocked intervals, the pane renders a blocked reassurance line indicating time was not captured.
@@ -222,7 +222,7 @@ The two changed surfaces: `prepare_inspect_data` gains a `blocked_intervals` fie
 - **Goal:** Insert `RecordedSummaryPane` after `TimelinePane` in the inspect window's ready layout; decode the payload's `blocked_intervals`; rebuild `RecordedSummary` whenever `timelineEvents` changes; never gate readiness on it.
 - **Requirements:** R1, R2, R6, R7; AE1, AE4, AE5.
 - **Dependencies:** U1, U2, U3.
-- **Files:** `macos/ScreenCap/Views/Inspect/InspectWindow.swift` (ready-state `VStack`); the `InspectData` model/decoder (add optional `blockedIntervals` + `protectedIntervals` — in `InspectWindowViewModel` or the `InspectData` struct); `macos/ScreenCapTests/InspectWindowViewModelTests.swift`.
+- **Files:** `macos/Screencap/Views/Inspect/InspectWindow.swift` (ready-state `VStack`); the `InspectData` model/decoder (add optional `blockedIntervals` + `protectedIntervals` — in `InspectWindowViewModel` or the `InspectData` struct); `macos/ScreencapTests/InspectWindowViewModelTests.swift`.
 - **Approach:** Extend `InspectData` decoding with optional `blockedIntervals` (excluded-only, for the reassurance line) and `protectedIntervals` (full set, for the digest skip) arrays, each absent → empty. Both are `[{start_ms, end_ms}]` from U1's schema-4 payload. Recompute `RecordedSummary` (U2) on `timelineEvents` change (inside/after the main-actor assignment), not on the `ready` transition, and pass it plus a parse-in-flight flag to `RecordedSummaryPane`. Insert the pane below `TimelinePane` in the ready `VStack`. Do not gate `ready` on `started_at`/`duration_seconds` or on summary presence.
 - **Patterns to follow:** existing `.task`/`Task.detached` event-parse-then-`MainActor.run` flow in `InspectWindow.swift`; `FakeInspectDataLoader` in `InspectWindowViewModelTests.swift`.
 - **Test scenarios:**
@@ -238,7 +238,7 @@ The two changed surfaces: `prepare_inspect_data` gains a `blocked_intervals` fie
 
 | Gate | Command / action | Applies to |
 |---|---|---|
-| Swift unit tests | Build + test the `ScreenCap` scheme (XcodeGen `macos/project.yml`); run `RecordedSummaryTests`, `InspectWindowViewModelTests` | U2, U3, U4 |
+| Swift unit tests | Build + test the `Screencap` scheme (XcodeGen `macos/project.yml`); run `RecordedSummaryTests`, `InspectWindowViewModelTests` | U2, U3, U4 |
 | Python privacy lane | `pytest -m privacy tests/test_cli_inspect_data.py` (blocked-sourcing test is `@pytest.mark.privacy`, Vision-free) | U1 |
 | Python local run | `PYTHONPATH=src pytest tests/test_cli_inspect_data.py` (worktree convention) | U1 |
 | Manual smoke | Open a recording in the viewer; expand "What was recorded"; verify apps/counts (carry-forward attribution), a blocked interval line for an excluded app, drill-down, and the empty/loading states | R1–R8 |
@@ -274,11 +274,11 @@ The two changed surfaces: `prepare_inspect_data` gains a `blocked_intervals` fie
 
 ## Sources / Research
 
-- Viewer / inspect surface: `macos/ScreenCap/Views/Inspect/InspectWindow.swift`, `macos/ScreenCap/State/InspectWindowOpener.swift`; local unmasked data via `screencap inspect-data` in `src/screencap/cli/__init__.py` and `src/screencap/review.py` (`prepare_inspect_data`).
+- Viewer / inspect surface: `macos/Screencap/Views/Inspect/InspectWindow.swift`, `macos/Screencap/State/InspectWindowOpener.swift`; local unmasked data via `screencap inspect-data` in `src/screencap/cli/__init__.py` and `src/screencap/review.py` (`prepare_inspect_data`).
 - Event vocabulary + emitted types: `src/screencap/engine/events.py` (`EventType`, `EVENT_TYPE_MAP` — note `mouse.singleclick`, not `mouse.click`).
-- Swift event model + parser: `macos/ScreenCap/Views/Review/TimelineEvent.swift` (`TimelineEvent`, `TimelineEventContent`, `RedactableField`, `TimelineEventParser`; only `window.*` events carry `app_name`).
+- Swift event model + parser: `macos/Screencap/Views/Review/TimelineEvent.swift` (`TimelineEvent`, `TimelineEventContent`, `RedactableField`, `TimelineEventParser`; only `window.*` events carry `app_name`).
 - Per-chunk events export: `src/screencap/exporter.py` (`ensure_canonical_events`); `events.jsonl` / `events_NNNN.jsonl`.
-- Blocked-interval derivation (post-hoc, on-disk): `src/screencap/backfill/skip_intervals.py` (`derive_skip_intervals`, `build_classifier_evaluator`) as used day-scoped by `src/screencap/day_segments.py`; rendered by `macos/ScreenCap/Views/Timeline/DayStripView.swift`; exercised by `tests/test_day_segments.py`. Not `recorder_enforcement.get_blocked_intervals` (live in-memory tracker).
+- Blocked-interval derivation (post-hoc, on-disk): `src/screencap/backfill/skip_intervals.py` (`derive_skip_intervals`, `build_classifier_evaluator`) as used day-scoped by `src/screencap/day_segments.py`; rendered by `macos/Screencap/Views/Timeline/DayStripView.swift`; exercised by `tests/test_day_segments.py`. Not `recorder_enforcement.get_blocked_intervals` (live in-memory tracker).
 - ALLOW-only skip discipline precedent: `content_index` / `backfill` / `frame.nearest` skip all policy-flagged intervals.
 - Accessibility precedent: `DayStripAccessibility` blocked-label strings.
 - Nullable-timing tolerance for Swift consumers: `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md`.

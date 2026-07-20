@@ -29,7 +29,7 @@ time_to_resolve: large
 
 ## Context
 
-ScreenCap is a macOS screen recording CLI. It's distributed as a pre-built PyInstaller binary via `curl -sSfL https://get.screencap.sh | sh`, which downloads an architecture-specific tarball (ARM64 or x86_64) from GCS, verifies the checksum, and extracts it to `~/.screencap/bin/`. The binary bundles Python, all dependencies, and native libraries into a single `--onedir` directory.
+Screencap is a macOS screen recording CLI. It's distributed as a pre-built PyInstaller binary via `curl -sSfL https://get.screencap.sh | sh`, which downloads an architecture-specific tarball (ARM64 or x86_64) from GCS, verifies the checksum, and extracts it to `~/.screencap/bin/`. The binary bundles Python, all dependencies, and native libraries into a single `--onedir` directory.
 
 ## Problem
 

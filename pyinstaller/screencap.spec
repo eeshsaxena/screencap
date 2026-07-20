@@ -283,29 +283,29 @@ app = BUNDLE(
     # Brand mark for the System Settings -> Login Items row (and anywhere else
     # macOS renders the helper bundle). Generated from the branding masters by
     # macos/branding/generate-icons.sh — same source as the app icon.
-    icon=os.path.join(_root, 'macos', 'branding', 'ScreenCap.icns'),
+    icon=os.path.join(_root, 'macos', 'branding', 'Screencap.icns'),
     bundle_identifier='com.screencap.daemon',
     info_plist={
         'CFBundleExecutable': 'screencap',
         'CFBundleIdentifier': 'com.screencap.daemon',
-        'CFBundleName': 'ScreenCap',
+        'CFBundleName': 'Screencap',
         # Display name is what System Settings *should* render for the helper's
-        # TCC row. Set it to "ScreenCap" (matching the app's recognizable name)
+        # TCC row. Set it to "Screencap" (matching the app's recognizable name)
         # so a non-technical user toggles one obvious row — the onboarding copy
         # in PermissionController.helperSettingsEntryName names this exact string
         # (SCR-200 R3). Safe because the app never appears in the SR/Accessibility
-        # panes (R6), so there is no duplicate "ScreenCap" row to confuse.
+        # panes (R6), so there is no duplicate "Screencap" row to confuse.
         #
         # SHIP GATE (SCR-200 U1): the display-name keys are the documented lever
         # (CFBundleDisplayName > CFBundleName > .app filename, per QA1544), but a
         # dev-machine observation suggested the *filename* ("ScreencapDaemon")
         # wins instead. That observation is unconfirmed (polluted TCC state), so
-        # confirm on a CLEAN machine (U7 runbook) that the row renders "ScreenCap"
+        # confirm on a CLEAN machine (U7 runbook) that the row renders "Screencap"
         # in BOTH the Screen Recording and Accessibility panes before release. If
         # the filename proves to be the true lever, the contingency is the nested
-        # same-name `ScreenCap.app` rename branch (U2 rename branch) — NOT taken
+        # same-name `Screencap.app` rename branch (U2 rename branch) — NOT taken
         # here. Bundle id stays com.screencap.daemon either way, so grants survive.
-        'CFBundleDisplayName': 'ScreenCap',
+        'CFBundleDisplayName': 'Screencap',
         'CFBundlePackageType': 'APPL',
         'LSUIElement': True,
         # Microphone usage description (SCR-254 / Risk R-B). The daemon is a
@@ -320,7 +320,7 @@ app = BUNDLE(
         # clients are terminated outright), so declaring it is the prerequisite
         # for the daemon to prompt/acquire the mic under its own identity.
         'NSMicrophoneUsageDescription':
-            'ScreenCap records microphone audio alongside your screen capture '
+            'Screencap records microphone audio alongside your screen capture '
             'when you enable audio or unmute during a recording.',
     },
 )

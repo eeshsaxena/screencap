@@ -51,7 +51,7 @@ The capture subject is **not** the `.app` — it is the nested
 - An App Store Connect API key (`.p8` + key-id + issuer-id) for `notarytool`
   (per the distribution plan's Key Technical Decisions).
 - A **clean macOS 13+ machine** (or a VM / a fresh user account) for Step 3 — "clean"
-  means ScreenCap has never been installed and has no leftover TCC rows. A reused
+  means Screencap has never been installed and has no leftover TCC rows. A reused
   machine carries stale grants that mask the very treadmill this gate checks for.
 - `DEVELOPMENT_TEAM` set to the Developer ID Team ID. **Watch the `.env` foot-gun:**
   an `export ` prefix on the `.env` line silently drops the variable and lands you
@@ -68,7 +68,7 @@ identity. Signing the app but not the nested binary is the most common silent fa
 only when `EXPANDED_CODE_SIGN_IDENTITY` resolves to a real identity).
 
 ```bash
-APP=/path/to/ScreenCap.app
+APP=/path/to/Screencap.app
 CLI="$APP/Contents/Resources/screencap/screencap"
 
 # Both must show "TeamIdentifier=<your team>" and NOT "Signature=adhoc".
@@ -100,9 +100,9 @@ bundled-binary-only daemon launcher, the shape shipped to users):
 #
 # Until then, the explicit path:
 #   1. Build Release (PyInstaller CLI → xcodegen → xcodebuild -configuration Release)
-#   2. ditto -c -k --keepParent ScreenCap.app ScreenCap.zip
-#   3. xcrun notarytool submit ScreenCap.zip --key … --key-id … --issuer … --wait
-#   4. xcrun stapler staple ScreenCap.app
+#   2. ditto -c -k --keepParent Screencap.app Screencap.zip
+#   3. xcrun notarytool submit Screencap.zip --key … --key-id … --issuer … --wait
+#   4. xcrun stapler staple Screencap.app
 ```
 
 Confirm notarization actually succeeded (a stapled app is the only thing that
@@ -120,8 +120,8 @@ do not ship un-notarized. Resolve before continuing.
 
 ## Step 2 — Install on the clean machine and grant Screen Recording
 
-1. Copy the stapled `ScreenCap.app` to the clean macOS 13+ machine and launch it.
-2. Run the first-run flow: approve the **ScreenCap helper** (daemon) install, then
+1. Copy the stapled `Screencap.app` to the clean macOS 13+ machine and launch it.
+2. Run the first-run flow: approve the **Screencap helper** (daemon) install, then
    **Grant** Screen Recording for the helper.
 3. Read **ground truth from the daemon**, not System Settings (System Settings can
    show a granted row for the wrong subject — see the learning's "three quirks"):
@@ -134,7 +134,7 @@ curl -s --unix-socket ~/.screencap/run/api.sock http://localhost/v0/daemon.info 
 
 Gotchas that make a *correct* grant look broken (do not mistake these for a treadmill
 failure — they are UI quirks documented in the learning):
-- **Per-pane name divergence:** Screen Recording shows as **"ScreenCap"**;
+- **Per-pane name divergence:** Screen Recording shows as **"Screencap"**;
   Accessibility / Input Monitoring show as lowercase **`screencap`**.
 - **Default-OFF + stale pane:** a freshly-registered Screen Recording row is OFF and
   the pane does not live-refresh — `Cmd+Q` System Settings and reopen to toggle it.
@@ -154,7 +154,7 @@ This is the actual gate.
    (same Team ID, same cert). Re-notarize + staple as in Step 1.
 2. Confirm the nested binary still carries the team identity (Step 0 commands).
    The cdhash will differ from the first build; the **Team ID and DR must not**.
-3. Reinstall over the clean machine's existing install (replace `ScreenCap.app`,
+3. Reinstall over the clean machine's existing install (replace `Screencap.app`,
    restart the helper):
 
 ```bash

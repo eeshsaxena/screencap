@@ -28,7 +28,7 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 - R4. Opening the Search surface moves keyboard focus to the search field. (Ticket: focus the search field on open.)
 - R5. Results are navigable by arrow keys; Return opens the focused result in the Review window at its moment. (Ticket: arrow through results, Return to open in Review.)
 - R6. Dynamic Type / larger accessibility text sizes do not break result-row layout (no clipping, overlap, or lost time/snippet). Verify first; harden the row layout only if it breaks. (Ticket: verify Dynamic Type doesn't break the rows.)
-- R7. The **non-result states** are accessible, not just the result rows: decorative-only icons across the surface are hidden from VoiceOver (search-field magnifying glass, consent-banner viewfinder, interpretation wand, lock); the searching, empty / "nothing recorded", idle, and daemon-down states each read as **one coherent message**; and a **search-outcome change** (results ready / no matches / ScreenCap not running) is **announced** to VoiceOver so a user who can't see the screen learns the result of their search. (Derived from completing "fully operable with VoiceOver" — without this, a blind user presses Return and hears only silence or "progress indicator".)
+- R7. The **non-result states** are accessible, not just the result rows: decorative-only icons across the surface are hidden from VoiceOver (search-field magnifying glass, consent-banner viewfinder, interpretation wand, lock); the searching, empty / "nothing recorded", idle, and daemon-down states each read as **one coherent message**; and a **search-outcome change** (results ready / no matches / Screencap not running) is **announced** to VoiceOver so a user who can't see the screen learns the result of their search. (Derived from completing "fully operable with VoiceOver" — without this, a blind user presses Return and hears only silence or "progress indicator".)
 - R8. Acceptance: the Search surface is fully operable end-to-end with VoiceOver + keyboard, and result rows announce meaningful labels.
 
 **Origin actors:** A1 (Operator — the non-technical internal-tool user searching their own history), carried from SCR-174. This work is squarely in service of A1's operability.
@@ -49,12 +49,12 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/Views/Search/SearchView.swift` — owns the search field (`searchField`), `coverageChip` / `coverageRow` / `coverageText` / `coverageColor`, the `consentBanner`, the results `List` (`resultsList`), and the idle/empty/daemon-down state messages. All target elements live here except the row.
-- `macos/ScreenCap/Views/Search/SearchTimelineView.swift` — holds `ResultRow` (the result cell) plus the `SearchResultItem` display extension (`primaryText`, `secondaryText`, `timeLabel`, `streamIcon`, `streamTint`) and the day-grouping helpers. The thumbnail cell is already `.accessibilityHidden(true)` with a comment noting "the Button already announces the row's text + time" — R3 makes that announcement real and combined.
-- `macos/ScreenCap/Views/Search/SearchViewModel.swift` — defines `StreamState` (the enum coverage chips render), `CoverageReport`, and `SearchResultItem` (`stream`, `app`, `title`, `snippet`, `anchorMs`, `approximate`). Pure data; no view changes needed here, but the label helpers read these types.
-- `macos/ScreenCap/Views/MainWindow.swift` — hosts Search: `detail` returns a fresh `SearchView()` whenever `section == .search` (so `.onAppear`/`.task` fire on each open — the natural hook for R4 focus-on-open). The sidebar itself is a `List(selection: $section)` (the one existing `List(selection:)` precedent in the app).
-- `macos/ScreenCap/ScreenCapApp.swift:140-170` — the canonical existing accessibility pattern to mirror: decorative sub-views get `.accessibilityHidden(true)`, the composite element gets one `.accessibilityLabel(...)` whose text is built by a pure `private var`/function (`accessibilityDescription`). Replicate this shape for chips and rows.
-- `macos/ScreenCapTests/PrivacyBadgeStyleTests.swift` and `SnippetHighlighterTests.swift` — the testable-view-logic pattern: display logic lives in a pure helper (`PrivacyBadgeStyle.derive(for:)`, `SnippetHighlighter.attributed(...)`) and tests assert on its output. Accessibility-label helpers follow the same shape.
+- `macos/Screencap/Views/Search/SearchView.swift` — owns the search field (`searchField`), `coverageChip` / `coverageRow` / `coverageText` / `coverageColor`, the `consentBanner`, the results `List` (`resultsList`), and the idle/empty/daemon-down state messages. All target elements live here except the row.
+- `macos/Screencap/Views/Search/SearchTimelineView.swift` — holds `ResultRow` (the result cell) plus the `SearchResultItem` display extension (`primaryText`, `secondaryText`, `timeLabel`, `streamIcon`, `streamTint`) and the day-grouping helpers. The thumbnail cell is already `.accessibilityHidden(true)` with a comment noting "the Button already announces the row's text + time" — R3 makes that announcement real and combined.
+- `macos/Screencap/Views/Search/SearchViewModel.swift` — defines `StreamState` (the enum coverage chips render), `CoverageReport`, and `SearchResultItem` (`stream`, `app`, `title`, `snippet`, `anchorMs`, `approximate`). Pure data; no view changes needed here, but the label helpers read these types.
+- `macos/Screencap/Views/MainWindow.swift` — hosts Search: `detail` returns a fresh `SearchView()` whenever `section == .search` (so `.onAppear`/`.task` fire on each open — the natural hook for R4 focus-on-open). The sidebar itself is a `List(selection: $section)` (the one existing `List(selection:)` precedent in the app).
+- `macos/Screencap/ScreencapApp.swift:140-170` — the canonical existing accessibility pattern to mirror: decorative sub-views get `.accessibilityHidden(true)`, the composite element gets one `.accessibilityLabel(...)` whose text is built by a pure `private var`/function (`accessibilityDescription`). Replicate this shape for chips and rows.
+- `macos/ScreencapTests/PrivacyBadgeStyleTests.swift` and `SnippetHighlighterTests.swift` — the testable-view-logic pattern: display logic lives in a pure helper (`PrivacyBadgeStyle.derive(for:)`, `SnippetHighlighter.attributed(...)`) and tests assert on its output. Accessibility-label helpers follow the same shape.
 
 ### Institutional Learnings
 
@@ -107,9 +107,9 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Search/SearchAccessibility.swift` (pure label-builder helpers shared across units — e.g. `coverageChipAccessibilityLabel(stream:state:)`)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (apply `.accessibilityElement`/`.accessibilityLabel` on `coverageChip` and `consentBanner`; mark decorative glyphs hidden)
-- Test: `macos/ScreenCapTests/SearchAccessibilityTests.swift`
+- Create: `macos/Screencap/Views/Search/SearchAccessibility.swift` (pure label-builder helpers shared across units — e.g. `coverageChipAccessibilityLabel(stream:state:)`)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (apply `.accessibilityElement`/`.accessibilityLabel` on `coverageChip` and `consentBanner`; mark decorative glyphs hidden)
+- Test: `macos/ScreencapTests/SearchAccessibilityTests.swift`
 
 **Approach:**
 - Add a pure helper that maps `(streamLabel, StreamState)` → spoken string, reusing the existing `coverageText` phrasing ("not indexed", "no matches", "limited", "unavailable", "{count} results"). The visible chip keeps its compact text; the accessibility label spells out the count as "N results" and never relies on color.
@@ -119,8 +119,8 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 - Give the search `TextField` an `.accessibilityLabel("Search your history")` so the focused field (U3) announces meaningfully — the placeholder is illustrative, not a label.
 
 **Patterns to follow:**
-- `ScreenCapApp.swift:140-170` (decorative-hidden + one composite label, label text from a pure helper).
-- `PrivacyBadgeStyle` (`macos/ScreenCap/Views/Privacy/PrivacyBadgeStyle.swift`) for the pure-derive-then-assert shape.
+- `ScreencapApp.swift:140-170` (decorative-hidden + one composite label, label text from a pure helper).
+- `PrivacyBadgeStyle` (`macos/Screencap/Views/Privacy/PrivacyBadgeStyle.swift`) for the pure-derive-then-assert shape.
 
 **Test scenarios:**
 - Happy path: `coverageChipAccessibilityLabel(stream: "On screen", state: .ok(count: 3))` → "On screen: 3 results" (and singular "1 result" for count 1).
@@ -145,9 +145,9 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 **Dependencies:** U1 (shares `SearchAccessibility.swift`)
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchTimelineView.swift` (`ResultRow.body`: wrap as one accessibility element with a computed label)
-- Modify: `macos/ScreenCap/Views/Search/SearchAccessibility.swift` (add `resultRowAccessibilityLabel(item:)`)
-- Test: `macos/ScreenCapTests/SearchAccessibilityTests.swift`
+- Modify: `macos/Screencap/Views/Search/SearchTimelineView.swift` (`ResultRow.body`: wrap as one accessibility element with a computed label)
+- Modify: `macos/Screencap/Views/Search/SearchAccessibility.swift` (add `resultRowAccessibilityLabel(item:)`)
+- Test: `macos/ScreencapTests/SearchAccessibilityTests.swift`
 
 **Approach:**
 - Add `resultRowAccessibilityLabel(_ item: SearchResultItem) -> String` that composes the existing display fields: stream phrasing ("On screen" / "Heard in audio" / the app name for activity), the primary text (snippet or app), the secondary text (window title for activity), and `timeLabel` — with an "approximate, from audio" suffix when `item.approximate`, and a graceful form when `anchorMs`/snippet are missing ("(no preview)", "time unknown").
@@ -181,7 +181,7 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 **Dependencies:** None
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (`@FocusState` + `.focused()` on the field; set focus in `.task`/`.onAppear`)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (`@FocusState` + `.focused()` on the field; set focus in `.task`/`.onAppear`)
 - Test: none (behavioral focus has no unit-test seam) — manual verification.
 
 **Approach:**
@@ -210,8 +210,8 @@ The Search surface was built fast as the v1 "ask your history" wedge (SCR-174, P
 **Dependencies:** U2 (combined row label makes the selected row announce coherently), U3 (field focus is the entry point of the keyboard flow)
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (`resultsList`: add selection state + binding, tag rows, wire Return-to-open)
-- Test: `macos/ScreenCapTests/SearchKeyboardNavTests.swift` (pure selection→action resolution only)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (`resultsList`: add selection state + binding, tag rows, wire Return-to-open)
+- Test: `macos/ScreencapTests/SearchKeyboardNavTests.swift` (pure selection→action resolution only)
 
 **Approach:**
 - Introduce `@State private var selectedResultID: SearchResultItem.ID?` and convert the results `List` to `List(selection: $selectedResultID)`, tagging each row with `.tag(item.id)` so macOS 13 gives arrow-key navigation for free. The current per-row `Button` may need to become a selectable row (a Button inside a selectable List can fight selection) — reconcile during implementation.
@@ -254,24 +254,24 @@ The two Return meanings never apply at once because focus is in exactly one plac
 **Dependencies:** U1 (shares `SearchAccessibility.swift`)
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (`.searching` `ProgressView` label; combine `emptyRow` and `stateMessage` into single accessibility elements; fire an announcement on `model.phase` change)
-- Modify: `macos/ScreenCap/Views/Search/SearchAccessibility.swift` (pure `searchOutcomeAnnouncement(for:)` builder mapping a phase/results to the spoken string)
-- Test: `macos/ScreenCapTests/SearchAccessibilityTests.swift`
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (`.searching` `ProgressView` label; combine `emptyRow` and `stateMessage` into single accessibility elements; fire an announcement on `model.phase` change)
+- Modify: `macos/Screencap/Views/Search/SearchAccessibility.swift` (pure `searchOutcomeAnnouncement(for:)` builder mapping a phase/results to the spoken string)
+- Test: `macos/ScreencapTests/SearchAccessibilityTests.swift`
 
 **Approach:**
 - **Searching label (D5):** give the `.searching` `ProgressView` a label — `ProgressView("Searching…")` or `.accessibilityLabel("Searching your history")` — so VoiceOver announces the searching state instead of a bare "progress indicator".
 - **Combined state messages (D3):** apply `.accessibilityElement(children: .ignore)` + one `.accessibilityLabel` to `emptyRow` (both the "No matches…" and "Nothing recorded then…" variants) and to `stateMessage` (idle and daemon-down), composing headline + detail into one sentence. Today each is a `VStack` of `Text` that VoiceOver reads as disconnected fragments.
-- **Outcome announcement (D1 — the headline gap):** on `model.phase` transition to `.loaded`/`.daemonDown`, post an announcement (e.g. "12 results", "No matches", "ScreenCap isn't running"). Use the macOS-13-available `NSAccessibility.post(element:notification:)` with an announcement (or the SwiftUI `AccessibilityNotification.Announcement` equivalent) via `.onChange(of: model.phase)` in `SearchView.body`. Build the spoken string from a pure `searchOutcomeAnnouncement(for:)` helper so it is unit-testable; the posting itself is the thin untestable shell.
+- **Outcome announcement (D1 — the headline gap):** on `model.phase` transition to `.loaded`/`.daemonDown`, post an announcement (e.g. "12 results", "No matches", "Screencap isn't running"). Use the macOS-13-available `NSAccessibility.post(element:notification:)` with an announcement (or the SwiftUI `AccessibilityNotification.Announcement` equivalent) via `.onChange(of: model.phase)` in `SearchView.body`. Build the spoken string from a pure `searchOutcomeAnnouncement(for:)` helper so it is unit-testable; the posting itself is the thin untestable shell.
 
 **Execution note:** Confirm the announcement API used is available and actually speaks on macOS 13 (announcement posting has had quirks across releases) — verify by ear with VoiceOver, not just by compiling.
 
 **Patterns to follow:**
-- Same pure-helper-then-apply shape as U1/U2; `ScreenCapApp.swift` decorative-hidden + composite-label precedent.
+- Same pure-helper-then-apply shape as U1/U2; `ScreencapApp.swift` decorative-hidden + composite-label precedent.
 
 **Test scenarios:**
 - Happy path: `searchOutcomeAnnouncement(for: .loaded(results-with-12))` → "12 results" (and "1 result" singular).
 - Edge case: `.loaded` with zero items → "No matches" (and the authoritative-empty variant → "Nothing recorded then" if that distinction is surfaced).
-- Edge case: `.daemonDown` → "ScreenCap isn't running".
+- Edge case: `.daemonDown` → "Screencap isn't running".
 - Edge case: combined empty-state label for both `isAuthoritativeEmpty` true ("Nothing recorded then. No activity was recorded in that time range.") and false ("No matches. Try different words…").
 - Manual: with VoiceOver on, running a search announces the outcome; the searching, empty, idle, and daemon-down states each read as one sentence.
 
@@ -290,7 +290,7 @@ The two Return meanings never apply at once because focus is in exactly one plac
 **Dependencies:** U2, U4, U6 (verify the final rows, keyboard behavior, and non-result states together)
 
 **Files:**
-- Modify (conditional): `macos/ScreenCap/Views/Search/SearchTimelineView.swift` (`ResultRow` layout — only if verification finds clipping/overlap)
+- Modify (conditional): `macos/Screencap/Views/Search/SearchTimelineView.swift` (`ResultRow` layout — only if verification finds clipping/overlap)
 - Test: none (layout-under-Dynamic-Type has no unit-test seam) — manual verification + a recorded checklist.
 
 **Approach:**
@@ -347,6 +347,6 @@ The two Return meanings never apply at once because focus is in exactly one plac
 - **Origin issue:** [SCR-183 — Accessibility for Search (VoiceOver labels + keyboard navigation)](https://linear.app/zk-email/issue/SCR-183/accessibility-for-search-voiceover-labels-keyboard-navigation)
 - **Parent feature:** [SCR-174 — Ask-Your-History Search (in-app, v1)](https://linear.app/zk-email/issue/SCR-174/ask-your-history-search-in-app-v1), requirements at `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`, plan at `docs/plans/2026-06-24-001-feat-ask-your-history-search-plan.md`
 - **Related (recent search work):** `docs/plans/2026-06-26-002-feat-search-result-thumbnails-highlighting-plan.md` (SCR-177 — added the thumbnail/highlight to `ResultRow`)
-- Code: `macos/ScreenCap/Views/Search/SearchView.swift`, `macos/ScreenCap/Views/Search/SearchTimelineView.swift`, `macos/ScreenCap/Views/Search/SearchViewModel.swift`, `macos/ScreenCap/Views/MainWindow.swift`, `macos/ScreenCap/ScreenCapApp.swift`
+- Code: `macos/Screencap/Views/Search/SearchView.swift`, `macos/Screencap/Views/Search/SearchTimelineView.swift`, `macos/Screencap/Views/Search/SearchViewModel.swift`, `macos/Screencap/Views/MainWindow.swift`, `macos/Screencap/ScreencapApp.swift`
 - Constraint: `macos/project.yml` (`deploymentTarget.macOS: "13.0"`)
-- Test pattern: `macos/ScreenCapTests/PrivacyBadgeStyleTests.swift`, `macos/ScreenCapTests/SnippetHighlighterTests.swift`
+- Test pattern: `macos/ScreencapTests/PrivacyBadgeStyleTests.swift`, `macos/ScreencapTests/SnippetHighlighterTests.swift`

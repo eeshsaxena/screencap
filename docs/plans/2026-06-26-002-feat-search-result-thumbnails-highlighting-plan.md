@@ -16,7 +16,7 @@ Close the R6 polish gap in the in-app Ask-Your-History Search (SCR-174, shipped 
 
 ## Problem Frame
 
-SCR-174 shipped a working in-app Search surface but with **text-only result rows** (`ResultRow` in `macos/ScreenCap/Views/Search/SearchTimelineView.swift`): a stream icon + app/snippet + time. The origin requirements doc's **R6** explicitly asked for recognizable, verifiable result cards with a screenshot thumbnail and the matched text highlighted (see origin: `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`). The ticket (SCR-177) frames this as "the single biggest perceived-quality gap vs Rewind/Day Flow" — a text row makes the operator read and guess; a thumbnail of the real captured frame lets them recognize the moment at a glance, which is the whole promise of the feature (F1: ask → recognize → jump to the moment).
+SCR-174 shipped a working in-app Search surface but with **text-only result rows** (`ResultRow` in `macos/Screencap/Views/Search/SearchTimelineView.swift`): a stream icon + app/snippet + time. The origin requirements doc's **R6** explicitly asked for recognizable, verifiable result cards with a screenshot thumbnail and the matched text highlighted (see origin: `docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md`). The ticket (SCR-177) frames this as "the single biggest perceived-quality gap vs Rewind/Day Flow" — a text row makes the operator read and guess; a thumbnail of the real captured frame lets them recognize the moment at a glance, which is the whole promise of the feature (F1: ask → recognize → jump to the moment).
 
 ---
 
@@ -54,11 +54,11 @@ SCR-174 shipped a working in-app Search surface but with **text-only result rows
 
 ### Relevant Code and Patterns
 
-- **`macos/ScreenCap/Views/Review/ScreenshotTruthPane.swift`** — the canonical pattern to mirror. `ScreenshotTruth` is a pure, unit-tested enum (`screenshots(from:startedAt:)`, `selection(at:screenshots:)`) that parses `{epoch}.jpg` filenames (`Double(url.deletingPathExtension().lastPathComponent)`) into timestamped frames and maps a time to a frame. The view loads the JPEG via `.task(id: currentFrameURL)` + `Task.detached` decode, with loading/loaded/failed states. SCR-177's frame-selection and lazy-load layers should follow this shape (the key difference: **nearest** frame, not nearest-prior, and the **raw** `screenshots/` dir, not the scrubbed copy).
-- **`macos/ScreenCap/Views/Search/SearchViewModel.swift`** — produces `SearchResults` and `SearchResultItem` (already carries `recording`, `anchorMs`, `snippet`, `stream`). `parsed.freeText` is the residual free-text after time/app stripping — the source of the highlight terms. `SearchResults` already carries `timeWindow` / `appFilter`; adding `queryTerms` there is the natural seam.
-- **`macos/ScreenCap/Views/Search/SearchTimelineView.swift`** — `ResultRow` is the integration point (leading icon → primary/secondary text → trailing time). `SearchView.swift` builds rows inside a `List` and owns the per-search lifecycle.
+- **`macos/Screencap/Views/Review/ScreenshotTruthPane.swift`** — the canonical pattern to mirror. `ScreenshotTruth` is a pure, unit-tested enum (`screenshots(from:startedAt:)`, `selection(at:screenshots:)`) that parses `{epoch}.jpg` filenames (`Double(url.deletingPathExtension().lastPathComponent)`) into timestamped frames and maps a time to a frame. The view loads the JPEG via `.task(id: currentFrameURL)` + `Task.detached` decode, with loading/loaded/failed states. SCR-177's frame-selection and lazy-load layers should follow this shape (the key difference: **nearest** frame, not nearest-prior, and the **raw** `screenshots/` dir, not the scrubbed copy).
+- **`macos/Screencap/Views/Search/SearchViewModel.swift`** — produces `SearchResults` and `SearchResultItem` (already carries `recording`, `anchorMs`, `snippet`, `stream`). `parsed.freeText` is the residual free-text after time/app stripping — the source of the highlight terms. `SearchResults` already carries `timeWindow` / `appFilter`; adding `queryTerms` there is the natural seam.
+- **`macos/Screencap/Views/Search/SearchTimelineView.swift`** — `ResultRow` is the integration point (leading icon → primary/secondary text → trailing time). `SearchView.swift` builds rows inside a `List` and owns the per-search lifecycle.
 - **Frame filename contract** — `src/screencap/engine/recorder.py:761` writes `f"{ts:.6f}.jpg"` into `screenshots/` (mode `0o600`); the content index derives `timestamp_ms = round(ts*1000)` (`src/screencap/chunk_processor.py:1298`). So content-hit timestamps map ~exactly to a frame; timeline/audio anchors are snapped to a captured-moment event time that may sit between frames — hence **nearest-frame** resolution via a directory listing, not filename reconstruction.
-- **App is not sandboxed** — `macos/ScreenCap/ScreenCap.entitlements` declares only `device.audio-input` (no `app-sandbox`), which is what makes direct reads of `~/.screencap/recordings/<name>/screenshots/` feasible with no security-scoped bookmark. Be precise about the precedent, though: the Review window only reads bytes from a **daemon-supplied, scrubbed-copy** path (`Data(contentsOf:)` on an absolute URL returned by `review-data`); **no existing app code enumerates a recordings directory**. U1's listing of the raw screenshots tree is genuinely new filesystem-enumeration I/O built on an app-constructed path from a daemon-sourced recording name — hence the path-containment guard in U1.
+- **App is not sandboxed** — `macos/Screencap/Screencap.entitlements` declares only `device.audio-input` (no `app-sandbox`), which is what makes direct reads of `~/.screencap/recordings/<name>/screenshots/` feasible with no security-scoped bookmark. Be precise about the precedent, though: the Review window only reads bytes from a **daemon-supplied, scrubbed-copy** path (`Data(contentsOf:)` on an absolute URL returned by `review-data`); **no existing app code enumerates a recordings directory**. U1's listing of the raw screenshots tree is genuinely new filesystem-enumeration I/O built on an app-constructed path from a daemon-sourced recording name — hence the path-containment guard in U1.
 
 ### Institutional Learnings
 
@@ -156,8 +156,8 @@ graph TD
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/RecordingFrameIndex.swift` (path resolution + per-recording cached listing; the pure `FrameSelection` type lives here or in its own file)
-- Test: `macos/ScreenCapTests/RecordingFrameIndexTests.swift`
+- Create: `macos/Screencap/Controllers/RecordingFrameIndex.swift` (path resolution + per-recording cached listing; the pure `FrameSelection` type lives here or in its own file)
+- Test: `macos/ScreencapTests/RecordingFrameIndexTests.swift`
 
 **Approach:**
 - Resolve the screenshots dir as `FileManager.default.homeDirectoryForCurrentUser` + `.screencap/recordings/<name>/screenshots/` (canonical per CLAUDE.md; note the assumption that the recordings root is the default).
@@ -168,7 +168,7 @@ graph TD
 - All disk work happens off the main actor; the pure selection and the staleness check are synchronous and disk-free.
 
 **Patterns to follow:**
-- `ScreenshotTruth` (pure enum + filename-stem parse) in `macos/ScreenCap/Views/Review/ScreenshotTruthPane.swift`.
+- `ScreenshotTruth` (pure enum + filename-stem parse) in `macos/Screencap/Views/Review/ScreenshotTruthPane.swift`.
 - Daemon-side `resolve_recording_dir` / `validate_recording_name` traversal guards (mirror their containment posture app-side).
 
 **Test scenarios:**
@@ -195,8 +195,8 @@ graph TD
 **Dependencies:** U1
 
 **Files:**
-- Create: `macos/ScreenCap/Controllers/ThumbnailLoader.swift`
-- Test: `macos/ScreenCapTests/ThumbnailLoaderTests.swift`
+- Create: `macos/Screencap/Controllers/ThumbnailLoader.swift`
+- Test: `macos/ScreencapTests/ThumbnailLoaderTests.swift`
 
 **Approach:**
 - `thumbnail(for url: URL) async -> NSImage?` — return the `NSCache` entry if present; otherwise decode via `CGImageSourceCreateThumbnailAtIndex` with `kCGImageSourceThumbnailMaxPixelSize` + `kCGImageSourceCreateThumbnailFromImageAlways`, on a detached/background task, then cache by URL and return.
@@ -226,9 +226,9 @@ graph TD
 **Dependencies:** None
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Search/SnippetHighlighter.swift` (pure `attributed(snippet:terms:) -> AttributedString`)
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (add `queryTerms: [String]` to `SearchResults`, populated from `parsed.freeText`)
-- Test: `macos/ScreenCapTests/SnippetHighlighterTests.swift`
+- Create: `macos/Screencap/Views/Search/SnippetHighlighter.swift` (pure `attributed(snippet:terms:) -> AttributedString`)
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (add `queryTerms: [String]` to `SearchResults`, populated from `parsed.freeText`)
+- Test: `macos/ScreencapTests/SnippetHighlighterTests.swift`
 
 **Approach:**
 - Tokenize `parsed.freeText` on whitespace into terms; carry them on `SearchResults.queryTerms` (alongside `timeWindow` / `appFilter`).
@@ -259,9 +259,9 @@ graph TD
 **Dependencies:** U1, U2, U3
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchTimelineView.swift` (`ResultRow` — thumbnail cell + highlighted primary text + load state)
-- Modify: `macos/ScreenCap/Views/Search/SearchView.swift` (inject the shared `RecordingFrameIndex` + `ThumbnailLoader`; pass `results.queryTerms` to rows)
-- Test: `macos/ScreenCapTests/SearchTimelineViewTests.swift` (test the extracted pure row-mapping helper, if any; view rendering is covered via U1–U3)
+- Modify: `macos/Screencap/Views/Search/SearchTimelineView.swift` (`ResultRow` — thumbnail cell + highlighted primary text + load state)
+- Modify: `macos/Screencap/Views/Search/SearchView.swift` (inject the shared `RecordingFrameIndex` + `ThumbnailLoader`; pass `results.queryTerms` to rows)
+- Test: `macos/ScreencapTests/SearchTimelineViewTests.swift` (test the extracted pure row-mapping helper, if any; view rendering is covered via U1–U3)
 
 - **Committed thumbnail cell layout:** a fixed ~56pt-wide, 16:9 leading cell (matching a screen capture's aspect), corner-rounded, replacing the existing 18pt stream-icon column when a frame is loaded. The stream type stays readable via the secondary text (`On screen` / `Heard in audio` / activity). This is a layout decision that affects every row in a 200-item list, so it is committed here rather than deferred (the implementer may fine-tune the exact points against a real list).
 - Load lazily with `.task(id:)` keyed on the row's `(recording, anchorMs)` so it loads when the row appears and cancels on scroll-away (mirrors `ScreenshotTruthPane`).
@@ -274,7 +274,7 @@ graph TD
 
 **Patterns to follow:**
 - `ScreenshotTruthPane.maskedFrame` loading/loaded/failed branching.
-- Existing `ResultRow` HStack layout in `macos/ScreenCap/Views/Search/SearchTimelineView.swift`.
+- Existing `ResultRow` HStack layout in `macos/Screencap/Views/Search/SearchTimelineView.swift`.
 
 **Test scenarios:**
 - Happy path: a row whose pointer resolves to a frame shows the loaded thumbnail; the snippet renders with highlighted terms.
@@ -297,7 +297,7 @@ graph TD
 **Dependencies:** U4
 
 **Files:**
-- Create: `macos/ScreenCapTests/ThumbnailPointerOnlyGuardTests.swift`
+- Create: `macos/ScreencapTests/ThumbnailPointerOnlyGuardTests.swift`
 
 **Approach:**
 - **Assert against the struct's declared properties, not a decode round-trip.** A decode round-trip cannot catch the regression it claims to guard: Swift `Decodable` silently ignores unknown JSON keys, so a daemon that starts emitting `image_path` would decode cleanly into the unchanged `ContentHit` and a "decode yields only pointer fields" assertion would still pass. Instead, enumerate each model's stored properties via `Mirror(reflecting:)` and assert no child label contains a known-bad substring (`image`, `photo`, `thumbnail`, `path`, `url`, `file`, `bytes`, `data`).
@@ -306,7 +306,7 @@ graph TD
 - Keep this test in the default XCTest target so CI runs it on every build — not behind any opt-in marker (learning #3). **Confirm the macOS XCTest suite actually runs on every PR** (not only on tagged/release builds); if CI only runs it on release, this guard provides weaker protection than learning #3 intends — flag that as a CI gap to fix.
 
 **Patterns to follow:**
-- Existing `macos/ScreenCapTests/SearchServiceTests.swift` / `SearchViewModelTests.swift` XCTest style.
+- Existing `macos/ScreencapTests/SearchServiceTests.swift` / `SearchViewModelTests.swift` XCTest style.
 
 **Test scenarios:**
 - Happy path: `Mirror` over `ContentHit` / `TranscriptHit` / `TimelineRow` shows no property whose label contains a known-bad media/path substring.
@@ -350,7 +350,7 @@ graph TD
 
 - **Origin document:** [docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md](docs/brainstorms/2026-06-24-ask-your-history-search-requirements.md) (R6 thumbnail/highlight, R8 pointer-only)
 - **Ticket:** [SCR-177](https://linear.app/zk-email/issue/SCR-177/search-results-screenshot-thumbnails-matched-text-highlighting) — related to [SCR-174](https://linear.app/zk-email/issue/SCR-174/ask-your-history-search-in-app-v1) (shipped in PR #283)
-- Related code: `macos/ScreenCap/Views/Review/ScreenshotTruthPane.swift`, `macos/ScreenCap/Views/Search/SearchTimelineView.swift`, `macos/ScreenCap/Views/Search/SearchViewModel.swift`, `macos/ScreenCap/Models/SearchResult.swift`
+- Related code: `macos/Screencap/Views/Review/ScreenshotTruthPane.swift`, `macos/Screencap/Views/Search/SearchTimelineView.swift`, `macos/Screencap/Views/Search/SearchViewModel.swift`, `macos/Screencap/Models/SearchResult.swift`
 - Frame contract: `src/screencap/engine/recorder.py:761`, `src/screencap/chunk_processor.py:1298`, `src/screencap/enforcement/recorder_enforcement.py`
 - Learnings: `docs/solutions/integration-issues/macos-foundation-process-pipe-pitfalls.md`, `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md`, `docs/solutions/workflow-issues/privacy-guards-deselected-on-ci-silently-rot-2026-06-10.md`
 - Privacy boundary: `SECURITY.md` (narrowed-R7 rationale)

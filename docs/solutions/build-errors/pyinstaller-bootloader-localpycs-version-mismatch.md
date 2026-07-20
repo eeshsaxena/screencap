@@ -29,7 +29,7 @@ time_to_resolve: medium
 
 ## Context
 
-ScreenCap ships its CLI as a PyInstaller `--onedir` frozen bundle (`dist/screencap/`) that the macOS app shell embeds and execs. After a routine rebuild, the bundled CLI stopped launching: the app's Recordings/Calendar views showed "Couldn't load recordings" and every CLI command exited 1. The failure was **in the bundle, not the app** — running `dist/screencap/screencap --version` straight from the terminal reproduced it identically.
+Screencap ships its CLI as a PyInstaller `--onedir` frozen bundle (`dist/screencap/`) that the macOS app shell embeds and execs. After a routine rebuild, the bundled CLI stopped launching: the app's Recordings/Calendar views showed "Couldn't load recordings" and every CLI command exited 1. The failure was **in the bundle, not the app** — running `dist/screencap/screencap --version` straight from the terminal reproduced it identically.
 
 ## Symptoms
 
@@ -95,7 +95,7 @@ if ! "$CLI_BINARY" --version >/dev/null 2>&1; then
 fi
 ```
 
-`macos/ScreenCap/Scripts/embed-cli.sh` — refuse to embed a binary that doesn't run (the old check only tested the executable bit):
+`macos/Screencap/Scripts/embed-cli.sh` — refuse to embed a binary that doesn't run (the old check only tested the executable bit):
 
 ```bash
 if ! "${SOURCE_DIR}/screencap" --version >/dev/null 2>&1; then

@@ -246,11 +246,11 @@ U1 (storage) → U2 (catalog read) and U3 (verb). U3 → U4 (CLI) and U6 (Swift)
 - **Requirements:** R8.
 - **Dependencies:** U3, U2.
 - **Files:**
-  - `macos/ScreenCap/Models/RecordingSummary.swift` — add `titleIsUserSet: Bool?` + CodingKey `title_is_user_set` (`:34-45`, `:87+`).
-  - `macos/ScreenCap/Controllers/DaemonClient.swift` — add `recordingRename(recording:title:)` → POST `/v0/recording.rename`, mirroring `contentSearch` (`:809-811`), plus request/response Codable structs.
-  - `macos/ScreenCap/Views/Library/LibraryCard.swift` — add a "Rename…" button to `contextMenu` (`:121-137`), disabled on the in-progress card; it presents a small rename sheet prefilled with the current title.
-  - `macos/ScreenCap/Views/Library/LibraryModel.swift` — ensure `JournalModel.displayTitle` prefers the server-resolved `title`; optionally style default vs user-set via `titleIsUserSet`.
-  - `macos/ScreenCapTests/DaemonClientRenameTests.swift`, `macos/ScreenCapTests/LibraryCardRenameTests.swift` — new.
+  - `macos/Screencap/Models/RecordingSummary.swift` — add `titleIsUserSet: Bool?` + CodingKey `title_is_user_set` (`:34-45`, `:87+`).
+  - `macos/Screencap/Controllers/DaemonClient.swift` — add `recordingRename(recording:title:)` → POST `/v0/recording.rename`, mirroring `contentSearch` (`:809-811`), plus request/response Codable structs.
+  - `macos/Screencap/Views/Library/LibraryCard.swift` — add a "Rename…" button to `contextMenu` (`:121-137`), disabled on the in-progress card; it presents a small rename sheet prefilled with the current title.
+  - `macos/Screencap/Views/Library/LibraryModel.swift` — ensure `JournalModel.displayTitle` prefers the server-resolved `title`; optionally style default vs user-set via `titleIsUserSet`.
+  - `macos/ScreencapTests/DaemonClientRenameTests.swift`, `macos/ScreencapTests/LibraryCardRenameTests.swift` — new.
 - **Approach:** Commit to a modal **rename sheet** (cleanest Cancel + submit-then-refresh) prefilled with the current title, with a 200-char cap enforced live in the field. On submit call `DaemonClient.recordingRename`, then refresh. **No-op on unchanged default:** if the submitted text equals the current title AND that title is not already user-set (i.e. it's the derived default), skip the write — so opening Rename… and submitting unchanged does not freeze the date/time default as a permanent user title (preserves R7). **Error state:** on any `/v0/recording.rename` failure (validation or daemon/network error), show inline error text beneath the field and keep the sheet open until corrected or cancelled — never a silent no-op. Empty submission clears → default. `displayTitle` uses the server `title`.
 - **Patterns to follow:** `DaemonClient.contentSearch`; `LibraryCard.contextMenu`; `DaemonClientBackfillTests` (fake-daemon request-path assertions).
 - **Test scenarios:**
@@ -324,6 +324,6 @@ Repo-relative breadcrumbs (verified `file:line`):
 - Search: `content_index.search` + `SearchHit` `src/screencap/content_index.py:135-146,595-632`; `content.search` handler + index-existence early return + `_QUERY_MAX_RECORDINGS` `src/screencap/daemon/app.py:1043-1127`; `content_index_enabled` default-off `src/screencap/config.py:214-232`.
 - Retention (recording.db never touched): `src/screencap/retention.py:144`.
 - Upload exclusion (recording.db rejected two ways): `src/screencap/upload.py` (`list_recording_files` denylist, `assert_uploadable`).
-- macOS: `DaemonClient` verb pattern `macos/ScreenCap/Controllers/DaemonClient.swift:809-811`; `RecordingSummary.swift:7-52`; `LibraryCard.swift` contextMenu `:121-137`; `LibraryModel` `JournalModel.displayTitle`.
+- macOS: `DaemonClient` verb pattern `macos/Screencap/Controllers/DaemonClient.swift:809-811`; `RecordingSummary.swift:7-52`; `LibraryCard.swift` contextMenu `:121-137`; `LibraryModel` `JournalModel.displayTitle`.
 - Collision check: `docs/plans/2026-07-11-001-chore-remove-legacy-auto-naming-plan.md` (task_description + `_humanize_name` stay live; recording.db schema untouched).
 - CLI envelope pitfall: `docs/solutions/integration-issues/cli-json-envelope-nonzero-exit-discards-stdout-2026-07-02.md`.

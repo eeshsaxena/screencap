@@ -27,7 +27,7 @@ execution: code
 
 ### Summary
 
-ScreenCap's cloud onboarding pivots to end-to-end encryption. The first build is a single-user vertical slice: recordings encrypted on-device before upload with a device-held key so the server stores only ciphertext, decrypted transparently on download by the macOS app. It reuses the AES-GCM + Keychain-key machinery already in the repo, needs no backend change, and ships behind a default-off flag. Team setup, billing, and Apple/email auth are drawn in the design but deferred until the crypto path is proven.
+Screencap's cloud onboarding pivots to end-to-end encryption. The first build is a single-user vertical slice: recordings encrypted on-device before upload with a device-held key so the server stores only ciphertext, decrypted transparently on download by the macOS app. It reuses the AES-GCM + Keychain-key machinery already in the repo, needs no backend change, and ships behind a default-off flag. Team setup, billing, and Apple/email auth are drawn in the design but deferred until the crypto path is proven.
 
 ### Problem Frame
 
@@ -234,7 +234,7 @@ U1 gates everything. U4 (flag + foreground key creation + engine key delivery) m
 - **Goal:** No onboarding screen claims E2EE / "we can't watch" / pricing that isn't yet true, and the cloud-E2EE posture (including lost-key risk) is documented.
 - **Requirements:** R1, R2, R3, R4, R6, R11, R12.
 - **Dependencies:** none (can land first/parallel); the final "encryption" wording is restored only once U2/U4 make it true.
-- **Files:** `macos/ScreenCap/Views/Onboarding/OnboardingStorageSteps.swift` (and an onboarding-copy string source if one is introduced for the honesty gate); `macos/ScreenCap/Views/Onboarding/OnboardingStepPolicy.swift` (Team-cloud routing); `macos/ScreenCapTests/OnboardingStepPolicyTests.swift`; `SECURITY.md`.
+- **Files:** `macos/Screencap/Views/Onboarding/OnboardingStorageSteps.swift` (and an onboarding-copy string source if one is introduced for the honesty gate); `macos/Screencap/Views/Onboarding/OnboardingStepPolicy.swift` (Team-cloud routing); `macos/ScreencapTests/OnboardingStepPolicyTests.swift`; `SECURITY.md`.
 - **Approach:** Audit the storage/account/team card copy. Until the flag ships on, soften any encryption / "we can't watch" claim on the Personal-cloud path. The Team-cloud card and its team-setup step have no backend — disable them ("coming soon") and remove pricing rather than routing users into a non-functional flow (R1/R2). Confirm the account step shows only the working Google path (R6). Add a string-level honesty-gate test asserting the onboarding copy carries no forbidden encryption/pricing claims for not-yet-true tiers. The restored "encryption" wording is bound to the **runtime** encryption state, not the ship phase: the copy asserting encryption renders only when the same signal that gates encryption (`cloud_e2ee_enabled`, surfaced from the daemon/config to the app) is on for this user — so a flag-off build never shows "we can't watch" while uploading plaintext (R11). The exact mechanism by which the Swift layer reads that flag state is an implementation detail. Add a `SECURITY.md` cloud-E2EE section: what it protects (the server cannot read encrypted uploads), device-key custody, lost-key-unrecoverable, that encrypted recordings are viewable only in the app, and that it is flag-gated.
 - **Execution note:** Copy/UX changes plus a runtime binding; the proof is the honesty-gate test plus the doc section.
 - **Test scenarios:**
@@ -294,6 +294,6 @@ U1 gates everything. U4 (flag + foreground key creation + engine key delivery) m
 
 - Design screens: `App Screens.dc.html` 7a (Plans), 7b (Account), 7c (Team Setup) — in the Claude Design project (not in-repo).
 - Upload/crypto insertion points: `src/screencap/upload.py` `_upload_with_progress` (~712–745) and the `_is_raw_artifact` exclusion gate; `src/screencap/download.py` `_download_file_with_progress` (~212–232); `src/screencap/network/crypto.py` `get_or_create_kek()` + `AESGCM` usage; `scripts/cloud-function/main.py` (signs URLs only, never reads bytes).
-- Onboarding surface: `macos/ScreenCap/Views/Onboarding/OnboardingWizard.swift`, `OnboardingStorageSteps.swift`, `OnboardingStepPolicy.swift`; `macos/ScreenCap/Controllers/CloudAuthController.swift`; design tokens in `macos/ScreenCap/Theme/`.
+- Onboarding surface: `macos/Screencap/Views/Onboarding/OnboardingWizard.swift`, `OnboardingStorageSteps.swift`, `OnboardingStepPolicy.swift`; `macos/Screencap/Controllers/CloudAuthController.swift`; design tokens in `macos/Screencap/Theme/`.
 - Existing cloud-storage decision: [docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requirements.md](docs/brainstorms/2026-05-29-per-user-cloud-storage-isolation-requirements.md) (line ~121 rejects client-side encryption for the training bet).
 - Adjacent plan: [docs/plans/2026-07-06-001-feat-scr-236-encrypt-recordings-at-rest-plan.md](docs/plans/2026-07-06-001-feat-scr-236-encrypt-recordings-at-rest-plan.md).

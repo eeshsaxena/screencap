@@ -13,7 +13,7 @@ Replace the broken subprocess-based TCC probe in the daemon's mid-recording revo
 
 ## Problem Frame
 
-Daemon recordings in the bundled `ScreenCap.app` have been silently producing useless captures — audio captures correctly but the screen-side event tables (action, window, screenshot) are empty across recent recordings where the user was actively interacting. The user has lived through this failure mode without any signal from the app.
+Daemon recordings in the bundled `Screencap.app` have been silently producing useless captures — audio captures correctly but the screen-side event tables (action, window, screenshot) are empty across recent recordings where the user was actively interacting. The user has lived through this failure mode without any signal from the app.
 
 The proximate cause for the mid-recording watcher's silence is documented in SCR-76: the watcher's TCC probe spawns `sys.executable -c <code>`, but in the frozen daemon `sys.executable` is the bundled Click CLI which rejects `-c`, returns an empty stdout, and the probe falls back to its tri-state "couldn't determine" result. The watcher's fail-open policy then skips the tick, silently. The same class of broken-in-frozen-but-green-in-tests defect already produced SCR-69 — the existing test machinery never exercises the actual entry point under frozen-mode dispatch, so probe-shape failures don't surface in CI.
 

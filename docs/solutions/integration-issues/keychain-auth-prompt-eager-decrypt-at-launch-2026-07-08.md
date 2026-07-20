@@ -8,7 +8,7 @@ component: authentication
 platform: macos
 severity: medium
 symptoms:
-  - "A macOS system dialog pops the instant ScreenCap opens: \"ScreenCap wants to use your confidential information stored in 'screencap-auth' in your keychain.\""
+  - "A macOS system dialog pops the instant Screencap opens: \"Screencap wants to use your confidential information stored in 'screencap-auth' in your keychain.\""
   - "The prompt appears before the user touches anything cloud-related (no sign-in, no upload)"
   - "It recurs on every launch even after clicking \"Always Allow\" — common on a dev machine after each rebuild"
 root_cause: "Eager `whoami` probe at app launch decrypts the Keychain refresh token, and the decrypt hits macOS's per-binary ACL authorization prompt whenever the reading binary's code identity differs from the one that ran `login`"
@@ -31,8 +31,8 @@ related_components:
 
 ## Problem
 
-Opening the ScreenCap macOS app popped a system Keychain authorization dialog
-(*"ScreenCap wants to use your confidential information stored in
+Opening the Screencap macOS app popped a system Keychain authorization dialog
+(*"Screencap wants to use your confidential information stored in
 'screencap-auth'"*) the instant the window appeared — before the user did
 anything cloud-related. Clicking "Always Allow" did not make it stick; it
 returned on the next launch (especially after a dev rebuild).
@@ -91,7 +91,7 @@ lazily, only when a surface that needs it actually appears.**
 Removed the launch `.task` probe and added a coalesced lazy resolver that cloud
 surfaces call on-appear (menu-bar account section, Upload gate, cloud
 onboarding). See PR #350; key file
-`macos/ScreenCap/Controllers/CloudAuthController.swift`.
+`macos/Screencap/Controllers/CloudAuthController.swift`.
 
 ```swift
 // CloudAuthController (@MainActor). Coalesced two ways:
@@ -166,7 +166,7 @@ future macOS pre-rendered the menu at launch, no decrypt would occur.
 - Add a test pinning the invariant that constructing the auth controller does
   **no** auth work (`status == .unknown`, `whoamiCallCount == 0`) — the launch
   contract the fix rests on. See
-  `macos/ScreenCapTests/CloudAuthControllerTests.swift`
+  `macos/ScreencapTests/CloudAuthControllerTests.swift`
   (`testInitialStateDoesNoAuthWork`).
 - When deferring eager state, refresh **before** any gate that reads it
   (`attemptUpload` refreshes before checking `isSignedIn`) so a still-`.unknown`
@@ -182,5 +182,5 @@ future macOS pre-rendered the menu at launch, no decrypt would occur.
 - Follow-up (durable storage-layer fix — shared Keychain access group so
   re-signed / cross-binary reads never prompt): SCR-241
 - Same dev-build signing-churn root cause (TCC dimension): SCR-157
-- Key files: `macos/ScreenCap/Controllers/CloudAuthController.swift`,
-  `macos/ScreenCap/ScreenCapApp.swift`, `src/screencap/auth.py`
+- Key files: `macos/Screencap/Controllers/CloudAuthController.swift`,
+  `macos/Screencap/ScreencapApp.swift`, `src/screencap/auth.py`

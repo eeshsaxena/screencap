@@ -6,7 +6,7 @@ module: macos-app-shell
 problem_type: integration_issue
 component: daemon
 symptoms:
-  - "Onboarding 'ScreenCap helper' card shows \"daemon did not respond within 30s\" (red) with an 'Approve helper' button; Screen & Accessibility rows stay 'approve the helper above first'"
+  - "Onboarding 'Screencap helper' card shows \"daemon did not respond within 30s\" (red) with an 'Approve helper' button; Screen & Accessibility rows stay 'approve the helper above first'"
   - "launchctl print gui/<uid>/com.screencap.daemon shows state = not running, runs = 0, last exit code = (never exited), job state = uninitialized"
   - "~/.screencap/run/ has no api.sock; the daemon binary runs fine when executed directly and its signature verifies (valid notarized Developer ID)"
 root_cause: registered_but_unspawned_daemon
@@ -50,9 +50,9 @@ Launching the app, onboarding's helper card dead-ends at **"daemon did not respo
 
 ## Solution (PR #393)
 
-Root cause: the login item's on-disk executable was **replaced in place after registration** — a dev re-embed into the installed `/Applications/ScreenCap.app`, or an app update (the code already notes SMAppService does not restart the LoginItem on update, see `restartStaleDaemonIfNeeded`'s comment in `DaemonInstallController.swift`). Replacing a registered login item's Mach-O leaves launchd holding the job `uninitialized`; it will not auto-respawn the modified binary, while `SMAppService.status` still returns `.enabled`.
+Root cause: the login item's on-disk executable was **replaced in place after registration** — a dev re-embed into the installed `/Applications/Screencap.app`, or an app update (the code already notes SMAppService does not restart the LoginItem on update, see `restartStaleDaemonIfNeeded`'s comment in `DaemonInstallController.swift`). Replacing a registered login item's Mach-O leaves launchd holding the job `uninitialized`; it will not auto-respawn the modified binary, while `SMAppService.status` still returns `.enabled`.
 
-Why onboarding could not self-heal it, in `macos/ScreenCap/Controllers/DaemonInstallController.swift`:
+Why onboarding could not self-heal it, in `macos/Screencap/Controllers/DaemonInstallController.swift`:
 
 - `SMAppServiceRegistration.register()` early-returns when `service.status == .enabled` — it does **not** kickstart, so `install()` never asks launchd to start the wedged process.
 - The poll-timeout path ran `refreshRegistrationAfterFailedPoll` → `refresh()` (unregister + register of the **same, still-valid bundle path**), which re-registers but does not respawn the process.

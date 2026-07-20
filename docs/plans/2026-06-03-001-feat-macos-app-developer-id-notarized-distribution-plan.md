@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-06-03-individual-apple-dev-membership-tester-distr
 
 ## Summary
 
-Build a manually-triggered CI workflow that signs the `ScreenCap.app` inside-out under an individual Developer ID (hardened runtime), notarizes it with `notarytool`, and ships a stapled DMG to testers — assembled from reusable local scripts, with the GitHub secret names as the single swap-surface so the later individual→org Team ID switch is a secrets change plus one planned permission re-grant.
+Build a manually-triggered CI workflow that signs the `Screencap.app` inside-out under an individual Developer ID (hardened runtime), notarizes it with `notarytool`, and ships a stapled DMG to testers — assembled from reusable local scripts, with the GitHub secret names as the single swap-surface so the later individual→org Team ID switch is a secrets change plus one planned permission re-grant.
 
 ---
 
@@ -27,7 +27,7 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 - R3. Distribution stays direct (downloadable notarized DMG); no Mac App Store / App Store Connect record under the individual account. *(origin R3)*
 - R4. Signing identity (Team ID), Developer ID certificate, and notary credentials are supplied via CI secrets / environment, never hardcoded — switching accounts changes no application source. *(origin R4, AE2)*
 - R5. No team-scoped Apple capabilities (CloudKit, push, app groups, Sign in with Apple) are adopted while on the individual Team ID. *(origin R5)*
-- R6. The org switchover ships as one deliberate "re-grant" release: testers are warned in advance and re-grant the three TCC permissions once via the existing walkthrough. The grants are **daemon-helper-owned** (`com.screencap.daemon`), not app-owned — re-signing the embedded daemon with the org Team ID orphans them and may also require re-approving the ScreenCap helper in Login Items (SMAppService). *(origin R6, F1, AE3)*
+- R6. The org switchover ships as one deliberate "re-grant" release: testers are warned in advance and re-grant the three TCC permissions once via the existing walkthrough. The grants are **daemon-helper-owned** (`com.screencap.daemon`), not app-owned — re-signing the embedded daemon with the org Team ID orphans them and may also require re-approving the Screencap helper in Login Items (SMAppService). *(origin R6, F1, AE3)*
 
 **Origin actors:** A1 (sole developer), A2 (tester cohort), A3 (individual Apple account), A4 (org Apple account)
 **Origin flows:** F1 (org Team-ID flip, one-time)
@@ -55,10 +55,10 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 - `.github/workflows/release.yml` — tag-driven (`v*`) CLI release: macOS build matrix (`macos-14`/arm64, `macos-15-intel`/x86_64), PyInstaller build (`pyinstaller/screencap.spec`), `_smoke-test` gate, **minos verification step**, GCS auth via `secrets.GCP_SA_KEY`, upload to `gs://screencap-releases/releases/v<version>/`, GitHub Release with CHANGELOG extraction. Mirror its secret-wiring and GCS-upload conventions.
 - `macos/project.yml` — xcodegen source of truth. `ENABLE_HARDENED_RUNTIME: YES` already set; `DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}`; `CODE_SIGN_STYLE: Automatic`; bundle id `com.screencap.macos`; `CFBundleShortVersionString: "0.1.0"` / `CFBundleVersion: "1"` (hardcoded, not synced to CLI version or tag).
-- `macos/ScreenCap/ScreenCap.entitlements` — minimal: only `com.apple.security.device.audio-input`. No sandbox, no team-scoped capabilities.
-- `macos/ScreenCap/Scripts/embed-cli.sh` — preBuild phase: `ditto`s `dist/screencap/` (PyInstaller `--onedir`, many `.dylib`/`.so` + the `screencap` Mach-O) into `Contents/Resources/screencap/`, and writes a `screencap-daemon-launcher` shell script (Release variant execs only the bundled binary).
-- `script/build_and_run.sh` — local build path: `xcodegen generate` → `xcodebuild build` into `.build/ScreenCapDerivedData/Build/Products/<config>/ScreenCap.app`. Plain `build` (no `archive`, no exportOptions.plist, no DMG). Reads `DEVELOPMENT_TEAM` from env / repo-root `.env`.
-- `macos/ScreenCap/Controllers/CLIClient.swift` (per README) — `resolveBinary()` resolves `Contents/Resources/screencap/screencap` inside the bundle; the daemon launcher execs the bundled binary. Signing must preserve this path; App Translocation must be avoided.
+- `macos/Screencap/Screencap.entitlements` — minimal: only `com.apple.security.device.audio-input`. No sandbox, no team-scoped capabilities.
+- `macos/Screencap/Scripts/embed-cli.sh` — preBuild phase: `ditto`s `dist/screencap/` (PyInstaller `--onedir`, many `.dylib`/`.so` + the `screencap` Mach-O) into `Contents/Resources/screencap/`, and writes a `screencap-daemon-launcher` shell script (Release variant execs only the bundled binary).
+- `script/build_and_run.sh` — local build path: `xcodegen generate` → `xcodebuild build` into `.build/ScreencapDerivedData/Build/Products/<config>/Screencap.app`. Plain `build` (no `archive`, no exportOptions.plist, no DMG). Reads `DEVELOPMENT_TEAM` from env / repo-root `.env`.
+- `macos/Screencap/Controllers/CLIClient.swift` (per README) — `resolveBinary()` resolves `Contents/Resources/screencap/screencap` inside the bundle; the daemon launcher execs the bundled binary. Signing must preserve this path; App Translocation must be avoided.
 - `.claude/skills/local-release`, `.claude/commands/release.md` — existing release orchestration (version bump + tag, or local build) to mirror, not duplicate.
 
 ### Institutional Learnings
@@ -114,7 +114,7 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 ### U1. Local Developer ID signing script (inside-out, hardened runtime)
 
-**Goal:** A script that signs a built `ScreenCap.app` — every embedded Mach-O/dylib in `Contents/Resources/screencap/` first, then the outer bundle — with a Developer ID identity supplied via env, producing a `codesign --verify --strict`- and `spctl`-clean app.
+**Goal:** A script that signs a built `Screencap.app` — every embedded Mach-O/dylib in `Contents/Resources/screencap/` first, then the outer bundle — with a Developer ID identity supplied via env, producing a `codesign --verify --strict`- and `spctl`-clean app.
 
 **Requirements:** R1, R2, R4, R5
 
@@ -123,15 +123,15 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 **Files:**
 - Create: `script/sign_app.sh`
 - Reference / reuse: `pyinstaller/entitlements.plist` (existing — the embedded CLI's known starting entitlement set: `cs.allow-jit` + `cs.disable-library-validation`); only fork a macOS-app-specific copy if the org-app build genuinely diverges
-- Reference: `macos/ScreenCap/ScreenCap.entitlements` (outer app, stays minimal — audio-input only)
+- Reference: `macos/Screencap/Screencap.entitlements` (outer app, stays minimal — audio-input only)
 
 **Approach:**
 - Take the `.app` path and a signing identity (Developer ID Application) from env; never hardcode the Team ID.
-- Enumerate and sign inner Mach-O/dylibs inside-out (`--options runtime --timestamp`), applying the embedded-CLI entitlements (`pyinstaller/entitlements.plist`) to the bundled `screencap` binary (which is also the daemon helper's exec target), then sign the outer `.app` with `--entitlements ScreenCap.entitlements`. Never `--deep`. Attempt to sign *all* nested dylibs with the same Developer ID so library validation can be satisfied without `cs.disable-library-validation` (see Key Technical Decisions).
+- Enumerate and sign inner Mach-O/dylibs inside-out (`--options runtime --timestamp`), applying the embedded-CLI entitlements (`pyinstaller/entitlements.plist`) to the bundled `screencap` binary (which is also the daemon helper's exec target), then sign the outer `.app` with `--entitlements Screencap.entitlements`. Never `--deep`. Attempt to sign *all* nested dylibs with the same Developer ID so library validation can be satisfied without `cs.disable-library-validation` (see Key Technical Decisions).
 - Leave the `screencap-daemon-launcher` shell script unsigned (scripts aren't Mach-O); confirm it still execs the bundled binary post-sign.
 - Verify: `codesign --verify --deep --strict` and `spctl --assess --type exec`.
 
-**Patterns to follow:** env-driven identity like `script/build_and_run.sh`'s `DEVELOPMENT_TEAM` handling; `ditto`/bundle-layout assumptions from `macos/ScreenCap/Scripts/embed-cli.sh`.
+**Patterns to follow:** env-driven identity like `script/build_and_run.sh`'s `DEVELOPMENT_TEAM` handling; `ditto`/bundle-layout assumptions from `macos/Screencap/Scripts/embed-cli.sh`.
 
 **Test scenarios:**
 - Happy path: after signing a built app, `codesign --verify --deep --strict` exits 0 and `spctl --assess --type exec` reports `accepted`.
@@ -145,7 +145,7 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 ### U2. Local notarize + staple + DMG packaging script
 
-**Goal:** A script that notarizes the signed app via `notarytool`, staples it, builds a DMG, and signs + notarizes + staples the DMG — yielding a `ScreenCap-<version>.dmg` that opens with no Gatekeeper friction offline.
+**Goal:** A script that notarizes the signed app via `notarytool`, staples it, builds a DMG, and signs + notarizes + staples the DMG — yielding a `Screencap-<version>.dmg` that opens with no Gatekeeper friction offline.
 
 **Requirements:** R1, R3
 
@@ -155,9 +155,9 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 - Create: `script/notarize_app.sh`
 
 **Approach:**
-- `ditto -c -k --keepParent ScreenCap.app ScreenCap.zip`; `xcrun notarytool submit --wait` with API-key env vars; on failure, fetch and print `notarytool log` for diagnosis.
-- `xcrun stapler staple ScreenCap.app`; build DMG (`hdiutil`, UDZO); `codesign --timestamp` the DMG; notarize + `stapler staple` the DMG.
-- Emit a `ScreenCap-<version>.dmg.sha256` checksum alongside the DMG (mirrors the CLI release's per-arch checksum convention) so testers/the runbook can verify the download out-of-band.
+- `ditto -c -k --keepParent Screencap.app Screencap.zip`; `xcrun notarytool submit --wait` with API-key env vars; on failure, fetch and print `notarytool log` for diagnosis.
+- `xcrun stapler staple Screencap.app`; build DMG (`hdiutil`, UDZO); `codesign --timestamp` the DMG; notarize + `stapler staple` the DMG.
+- Emit a `Screencap-<version>.dmg.sha256` checksum alongside the DMG (mirrors the CLI release's per-arch checksum convention) so testers/the runbook can verify the download out-of-band.
 - Credentials (`.p8` content, key id, issuer id) read from env only.
 
 **Patterns to follow:** GCS/secret-driven conventions from `.github/workflows/release.yml`; keep the script CI-invocable and locally runnable like `local-release`.
@@ -181,7 +181,7 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 **Files:**
 - Create: `.github/workflows/release-macos-app.yml`
-- Modify: `macos/project.yml` (drive `CFBundleShortVersionString`/`CFBundleVersion` from the workflow input — stamp the `info.properties` block, since `GENERATE_INFOPLIST_FILE: NO` means xcodegen merges those into the on-disk `macos/ScreenCap/Info.plist`; do not leave the stale `0.1.0`/`1` literal able to ship). `CFBundleVersion` must be **monotonically increasing** so the org build is treated as an update, not a side-by-side install.
+- Modify: `macos/project.yml` (drive `CFBundleShortVersionString`/`CFBundleVersion` from the workflow input — stamp the `info.properties` block, since `GENERATE_INFOPLIST_FILE: NO` means xcodegen merges those into the on-disk `macos/Screencap/Info.plist`; do not leave the stale `0.1.0`/`1` literal able to ship). `CFBundleVersion` must be **monotonically increasing** so the org build is treated as an update, not a side-by-side install.
 
 **Approach:**
 - Steps, in order (minos gate before any binary-touching sign step): build PyInstaller CLI → **minos verify** → `xcodegen generate` + `xcodebuild -configuration Release` (Release is required so `embed-cli.sh` emits the bundled-binary-only daemon launcher, not the Debug dev-source variant) → import Developer ID cert into a temp keychain (`security create-keychain` + **`set-key-partition-list`**, or `apple-actions/import-codesign-certs`) → `script/sign_app.sh` → `script/notarize_app.sh` → **exercise the real daemon-launch path** (register the helper via SMAppService / launchctl-bootstrap the plist and probe `/v0/daemon.info`, not just direct `_smoke-test` exec) → upload DMG **+ `.sha256`** to `gs://screencap-releases/app/` (a path prefix isolated from the CLI installer) and optionally attach to a GitHub **pre-release**.
@@ -197,7 +197,7 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 **Test scenarios:**
 - Test expectation: none (CI config) — verification is a green manual run.
-- Integration: a `workflow_dispatch` run produces a stapled `ScreenCap-<version>.dmg` + `.sha256` under `gs://screencap-releases/app/`; `stapler validate` and `spctl --assess` pass on the downloaded artifact.
+- Integration: a `workflow_dispatch` run produces a stapled `Screencap-<version>.dmg` + `.sha256` under `gs://screencap-releases/app/`; `stapler validate` and `spctl --assess` pass on the downloaded artifact.
 - Integration: the registered daemon helper actually starts from the signed/stapled app (SMAppService register succeeds and `/v0/daemon.info` responds) — proving the launchd path, not just direct exec, survives hardened-runtime signing.
 - Integration: Covers AE2. The run uses only secrets/inputs for identity — `git grep` confirms no Team ID or notary credential is committed to source.
 - Edge case: the built app's `Info.plist` `CFBundleShortVersionString` equals the workflow `version` input and `CFBundleVersion` is greater than the prior build's (monotonic stamping works).
@@ -220,9 +220,9 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 **Approach:**
 - Document: creating a Developer ID Application cert + App Store Connect API key; exporting each into the secret-name contract from U3; running the local scripts; triggering the CI workflow.
-- **Org-flip section (F1):** the precise swap (replace `MACOS_CERT_P12_BASE64` / `MACOS_CERT_PASSWORD` / `MACOS_SIGN_IDENTITY` with org values; notary key if the account changes), re-run the workflow, then post the tester heads-up. Document that the org Team ID **re-signs the embedded daemon helper**, so testers must: (1) re-approve the ScreenCap helper in Login Items (SMAppService may flag `requiresApproval` / signing-invalid), and (2) re-grant the three **daemon-owned** permissions (`com.screencap.daemon`: Screen Recording + Accessibility + Input Monitoring) via **Quit & Relaunch** (per the per-process-TCC-cache learning). Include a step to quit the app and stop/unregister the old daemon and remove the stale `~/.screencap/run/api.sock` before first launch of the org build, so the new helper registers cleanly instead of racing a surviving individual-signed daemon. Provide a copy-paste Slack template referencing the **helper**, not just the app.
+- **Org-flip section (F1):** the precise swap (replace `MACOS_CERT_P12_BASE64` / `MACOS_CERT_PASSWORD` / `MACOS_SIGN_IDENTITY` with org values; notary key if the account changes), re-run the workflow, then post the tester heads-up. Document that the org Team ID **re-signs the embedded daemon helper**, so testers must: (1) re-approve the Screencap helper in Login Items (SMAppService may flag `requiresApproval` / signing-invalid), and (2) re-grant the three **daemon-owned** permissions (`com.screencap.daemon`: Screen Recording + Accessibility + Input Monitoring) via **Quit & Relaunch** (per the per-process-TCC-cache learning). Include a step to quit the app and stop/unregister the old daemon and remove the stale `~/.screencap/run/api.sock` before first launch of the org build, so the new helper registers cleanly instead of racing a surviving individual-signed daemon. Provide a copy-paste Slack template referencing the **helper**, not just the app.
 - State the macOS-14 floor decision from Risks (default: raise `LSMinimumSystemVersion` to 14.0) and how testers are told.
-- **Tester-facing org-flip notes:** the Slack template should tell testers that (a) stale individual-signed entries for ScreenCap / its helper may remain visible in System Settings → Privacy after the flip and are harmless (toggling them does nothing — grant against the *new* entries), and (b) the one-time cost is "re-grant 3 permissions + re-approve the helper in Login Items," not just three permissions.
+- **Tester-facing org-flip notes:** the Slack template should tell testers that (a) stale individual-signed entries for Screencap / its helper may remain visible in System Settings → Privacy after the flip and are harmless (toggling them does nothing — grant against the *new* entries), and (b) the one-time cost is "re-grant 3 permissions + re-approve the helper in Login Items," not just three permissions.
 - **License-clean note:** record that the individual membership fully covers signing both identities + SMAppService + notarization (nothing is org-gated), and that the helper must stay a plain LaunchAgent — not a System/Endpoint-Security Extension — to keep the migration a pure re-sign.
 
 **Test scenarios:** Test expectation: none (documentation). Reviewer check: the runbook lists every secret U3 consumes and the swap procedure references no source edits (validates R4's "secrets swap, no source"); a real Developer ID build is used to confirm the System Settings → Privacy entry shows a sensible helper name and SMAppService re-approval behaves as expected after a Team-ID change.
@@ -240,7 +240,7 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 **Dependencies:** None (can run parallel to U1–U3)
 
 **Files:**
-- Modify (only if a gap is found): `macos/ScreenCap/Views/Privacy/` walkthrough view(s) and/or `macos/ScreenCap/Controllers/PermissionController.swift`
+- Modify (only if a gap is found): `macos/Screencap/Views/Privacy/` walkthrough view(s) and/or `macos/Screencap/Controllers/PermissionController.swift`
 - Else: capture the "works as-is" finding in the U4 runbook.
 
 **Approach:**
@@ -292,6 +292,6 @@ The `.app` has no distribution path today: it is dev-only, signed per-developer 
 
 - **Origin document:** `docs/brainstorms/2026-06-03-individual-apple-dev-membership-tester-distribution-requirements.md`
 - Current release pipeline: `.github/workflows/release.yml`
-- App build + embed: `script/build_and_run.sh`, `macos/ScreenCap/Scripts/embed-cli.sh`, `macos/project.yml`
+- App build + embed: `script/build_and_run.sh`, `macos/Screencap/Scripts/embed-cli.sh`, `macos/project.yml`
 - Learnings: `docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md`, `docs/solutions/build-errors/macos-pre14-binary-install-failure.md`, `docs/solutions/build-errors/pyinstaller-frozen-binary-ci-failures.md`, `docs/solutions/runtime-errors/macos-tcc-per-process-cache-quit-and-relaunch.md`
 - External: Apple TN3147 (notarytool), TN3127 (code signing requirements / TCC DR), TN2206 (code signing in depth); notarytool man page; Eclectic Light Co. (Gatekeeper in Sequoia)

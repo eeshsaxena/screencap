@@ -5,15 +5,15 @@
 # (light ladder at 16/32/64/128/256/512/1024 px with -2x variants, plus a
 # single dark 1024 px master). This script fans them out to:
 #
-#   1. macos/branding/ScreenCap.icns
+#   1. macos/branding/Screencap.icns
 #      Assembled from the light masters via a standard .iconset + iconutil.
 #      Consumed by the PyInstaller daemon BUNDLE (pyinstaller/screencap.spec)
 #      and the release DMG volume icon (script/notarize_app.sh).
-#   2. macos/ScreenCap/Assets.xcassets/AppIcon.appiconset/
+#   2. macos/Screencap/Assets.xcassets/AppIcon.appiconset/
 #      The ten light slot PNGs (copied, renamed -2x -> @2x). The appiconset's
 #      Contents.json references these names and is maintained by hand, not by
 #      this script. This is the app-icon fallback for macOS 13-15.
-#   3. macos/ScreenCap/AppIcon.icon/Assets/
+#   3. macos/Screencap/AppIcon.icon/Assets/
 #      The light + dark 1024 masters, referenced by the hand-authored Icon
 #      Composer document (icon.json) that gives macOS 26+ the light/dark app
 #      icon. The classic appiconset's `luminosity: dark` appearance entries
@@ -30,9 +30,9 @@ set -euo pipefail
 
 BRANDING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MASTERS_DIR="${BRANDING_DIR}/masters"
-APPICONSET_DIR="${BRANDING_DIR}/../ScreenCap/Assets.xcassets/AppIcon.appiconset"
-ICON_DOC_ASSETS_DIR="${BRANDING_DIR}/../ScreenCap/AppIcon.icon/Assets"
-ICNS_PATH="${BRANDING_DIR}/ScreenCap.icns"
+APPICONSET_DIR="${BRANDING_DIR}/../Screencap/Assets.xcassets/AppIcon.appiconset"
+ICON_DOC_ASSETS_DIR="${BRANDING_DIR}/../Screencap/AppIcon.icon/Assets"
+ICNS_PATH="${BRANDING_DIR}/Screencap.icns"
 DARK_MASTER="${MASTERS_DIR}/icon_1024x1024_dark.png"
 
 # The ten macOS app-icon slots as "size scale" pairs. The delivered masters
@@ -73,9 +73,9 @@ for pair in "${SLOTS[@]}"; do
 done
 [ -f "${DARK_MASTER}" ] || { echo "error: missing dark master ${DARK_MASTER}" >&2; exit 1; }
 
-# ---- 1. ScreenCap.icns from the light masters --------------------------------
-echo "==> Assembling ScreenCap.icns"
-ICONSET_DIR="$(mktemp -d)/ScreenCap.iconset"
+# ---- 1. Screencap.icns from the light masters --------------------------------
+echo "==> Assembling Screencap.icns"
+ICONSET_DIR="$(mktemp -d)/Screencap.iconset"
 mkdir -p "${ICONSET_DIR}"
 trap 'rm -rf "$(dirname "${ICONSET_DIR}")"' EXIT
 

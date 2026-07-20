@@ -177,17 +177,17 @@ U1 → U2 → U3 → U5 → U6 form the provenance chain; U4 (rendering fixes) i
 - **Goal:** The app reads the new fields and treats their absence as unknown provenance.
 - **Requirements:** R4, R7 (client side).
 - **Dependencies:** U2.
-- **Files:** `macos/ScreenCap/Controllers/DaemonClient.swift`; `macos/ScreenCapTests/DayTimelineTaskBandsTests.swift` (decode-test template lives here).
+- **Files:** `macos/Screencap/Controllers/DaemonClient.swift`; `macos/ScreencapTests/DayTimelineTaskBandsTests.swift` (decode-test template lives here).
 - **Approach:** Extend `DaySegmentRecording` (and response model) with `decodeIfPresent(...) ?? default` in `init(from:)` **and** defaulted parameters in the memberwise init, or every existing test fixture breaks. Field absent → end status unknown; rendering must not gate on the new fields (readiness gates only on `ok` + required paths, per the nullable-timing learning).
 - **Test scenarios:** decodes a fixture with the new fields; decodes an older-daemon fixture without them (mirror `testTimelineDayDecodesWithoutTasksFieldFromOlderDaemon`); absent fields yield unknown, not a decode error.
-- **Verification:** `xcodebuild test -only-testing:ScreenCapTests/DayTimelineTaskBandsTests` green.
+- **Verification:** `xcodebuild test -only-testing:ScreencapTests/DayTimelineTaskBandsTests` green.
 
 ### U4. Layout extraction and the three rendering fixes
 
 - **Goal:** R1–R3 fixed via testable geometry, not Canvas pixel spelunking.
 - **Requirements:** R1, R2, R3.
 - **Dependencies:** none (independent track).
-- **Files:** `macos/ScreenCap/Views/Timeline/DayStripView.swift` (`DayStripLayout` + the Canvas closures at the label/caption/tick sites); `macos/ScreenCapTests/DayStripLayoutTests.swift`.
+- **Files:** `macos/Screencap/Views/Timeline/DayStripView.swift` (`DayStripLayout` + the Canvas closures at the label/caption/tick sites); `macos/ScreencapTests/DayStripLayoutTests.swift`.
 - **Approach:** Extract three pure functions into `DayStripLayout`: task-label placement (greedy left-to-right with ellipsis truncation instead of hard clip, with the full task name exposed via the label region's hover and accessibility label per R1), caption clustering over class-tagged bands (blocked and purged; single-linkage like the existing `clusterXs`, one overlap guard across all caption classes), and hour-tick label x-positions (measured centering with first/last edge clamp). Canvas draws from the returned geometry.
 - **Test scenarios:** narrow band label truncates but never disappears below the minimum hint width; a truncated task label exposes the full task name via hover and its accessibility label; two bands within caption width produce one caption position (AE6); far-apart bands produce two; a blocked band and a purged band within caption-width produce non-overlapping captions; tick labels center on ticks with edge labels clamped inside strip bounds; existing layout tests stay green.
 - **Verification:** `DayStripLayoutTests` green; visual smoke via build-and-run.
@@ -197,7 +197,7 @@ U1 → U2 → U3 → U5 → U6 form the provenance chain; U4 (rendering fixes) i
 - **Goal:** Every stretch answers "why is this here / empty" on hover and via VoiceOver.
 - **Requirements:** R4, R6, R7, R10, R11, R12, R13.
 - **Dependencies:** U3.
-- **Files:** `macos/ScreenCap/Views/Timeline/DayStripView.swift` (overlay layer, `DayStripAccessibility` cause strings); `macos/ScreenCapTests/DayStripLayoutTests.swift` for the copy + region mapping.
+- **Files:** `macos/Screencap/Views/Timeline/DayStripView.swift` (overlay layer, `DayStripAccessibility` cause strings); `macos/ScreencapTests/DayStripLayoutTests.swift` for the copy + region mapping.
 - **Approach:** Map each axis gap to a cause from adjacent recordings' end status (still-recording between last data and now, nothing for future time); gate all provenance on the day being fully loaded — while the day query hasn't returned or has failed, gap regions carry no cause claim and accessibility reads a neutral loading/unavailable string; add `.help` to the existing gap/blocked overlays and new purged/unverifiable overlays with most-specific-region-on-top z-order (purged/blocked/unverifiable above base tracks and task bands, for hover and accessibility); widen hover hit targets to a minimum width with smaller-region priority at boundaries (R13); route the same strings into accessibility labels (R12). All cause strings live in `DayStripAccessibility`.
 - **Test scenarios:** gap-to-cause mapping for each end status (clean → nothing on file, interrupted → cut short with time, live → still recording, unknown → can't verify); trailing stretch between last data and now reads still recording while future time claims nothing (AE7); a strip rendered before the day query returns (or after it fails) makes no cause claims; a purged region under a task band still surfaces its purge hover (z-order); purged span copy names the rule when identity present (AE3) and degrades without it (AE4); unverifiable copy (AE5); hit-target minimum and boundary priority as pure-geometry tests; accessibility label equals hover copy for each region class.
 - **Verification:** layout/copy tests green; manual hover pass on a day containing all five region classes, including a purged span that lies under a task band.
@@ -207,7 +207,7 @@ U1 → U2 → U3 → U5 → U6 form the provenance chain; U4 (rendering fixes) i
 - **Goal:** One honest vocabulary everywhere the day's states are described.
 - **Requirements:** R8, R9, R10 (wording side).
 - **Dependencies:** U5.
-- **Files:** `macos/ScreenCap/Views/Timeline/DayStripView.swift` (`DayStripLegend.items`, `DayStripAccessibility`); `macos/ScreenCap/Views/Inspect/RecordedSummaryPane.swift` (both wording sites); pinned string tests in `macos/ScreenCapTests/DayStripLayoutTests.swift` and `macos/ScreenCapTests/RecordedSummaryTests.swift`. (The Journal "unsplit — still searchable" label is task-naming vocabulary owned by the in-flight SCR-275 work — not touched here.)
+- **Files:** `macos/Screencap/Views/Timeline/DayStripView.swift` (`DayStripLegend.items`, `DayStripAccessibility`); `macos/Screencap/Views/Inspect/RecordedSummaryPane.swift` (both wording sites); pinned string tests in `macos/ScreencapTests/DayStripLayoutTests.swift` and `macos/ScreencapTests/RecordedSummaryTests.swift`. (The Journal "unsplit — still searchable" label is task-naming vocabulary owned by the in-flight SCR-275 work — not touched here.)
 - **Approach:** Rewrite legend entries in plain language (empty entry signals hover); add the purged-class entry; update `RecordedSummaryPane`, which already delegates time formatting to `DayStripAccessibility` — extend that coupling for the new wording rather than duplicating strings; update the pinned `hasPrefix`/`contains` string tests in the same change.
 - **Test scenarios:** legend contains the purged entry with a swatch pinned unequal to the blocked swatch; the legend no longer pairs "blocked" with "nothing captured" for purges (AE10); accessibility and summary-pane strings match the legend vocabulary; pinned string tests updated to the new wording and green.
 - **Verification:** the Verification Contract's Swift command (including `RecordedSummaryTests`) green; manual read of the three surfaces on one purge-bearing day.
@@ -220,7 +220,7 @@ U1 → U2 → U3 → U5 → U6 form the provenance chain; U4 (rendering fixes) i
 |---|---|---|
 | Daemon provenance + wire tests (privacy lane — what CI runs) | `PYTHONPATH=src SCREENCAP_LOCAL_PAYWALL_ENFORCE=0 pytest tests/test_day_segments.py tests/test_timeline_day_tasks.py -m privacy` | U1, U2 |
 | Package-boundary guard | `PYTHONPATH=src pytest tests/test_package_boundary_call_graph.py` | U1 |
-| Swift layout/decode/copy tests | `cd macos && xcodegen generate && xcodebuild test -scheme ScreenCap -destination 'platform=macOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO -only-testing:ScreenCapTests/DayStripLayoutTests -only-testing:ScreenCapTests/DayTimelineTaskBandsTests -only-testing:ScreenCapTests/RecordedSummaryTests` | U3, U4, U5, U6 |
+| Swift layout/decode/copy tests | `cd macos && xcodegen generate && xcodebuild test -scheme Screencap -destination 'platform=macOS' -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO -only-testing:ScreencapTests/DayStripLayoutTests -only-testing:ScreencapTests/DayTimelineTaskBandsTests -only-testing:ScreencapTests/RecordedSummaryTests` | U3, U4, U5, U6 |
 | Full privacy lane before PR | `PYTHONPATH=src SCREENCAP_LOCAL_PAYWALL_ENFORCE=0 pytest tests/ -m privacy` | all |
 
 Quality gates: honesty-bearing Python tests must carry `@pytest.mark.privacy` and stay Vision-free (unmarked privacy tests never run on CI). Known environmental Swift failures (`RecorderControllerDaemonTests`, `DaemonClientTests`, `DaemonInstallControllerTests`) are pre-existing when the diff against base doesn't touch them. Do not launch a built app from a worktree under `~/Documents` (TCC hazard); compile/test is fine.
@@ -251,10 +251,10 @@ None of these block implementation — the plan as written stands on the default
 
 ## Sources / Research
 
-- Strip rendering and defects: `macos/ScreenCap/Views/Timeline/DayStripView.swift:304-338` (label clipping, per-band captions), `:472-477` (tick offset), `:226-232` (legend), `:171-203` (gap complement), `:400-450` (overlay layer — the hover extension point), `clusterXs` (caption-clustering model).
+- Strip rendering and defects: `macos/Screencap/Views/Timeline/DayStripView.swift:304-338` (label clipping, per-band captions), `:472-477` (tick offset), `:226-232` (legend), `:171-203` (gap complement), `:400-450` (overlay layer — the hover extension point), `clusterXs` (caption-clustering model).
 - Data path: `src/screencap/daemon/app.py:2999-3041` (verb + `extra="ignore"` round-trip), `src/screencap/daemon/schema.py:34-38, 586-656` (additive-evolution comment, models), `src/screencap/day_segments.py:45-53, 89-130, 154-228` (`_UNVERIFIABLE_REASONS` excludes `RETROACTIVE_PURGE`; reason discarded; span derivation), `src/screencap/catalog.py` (`_derive_state`, live span end = last action event, 500ms lock-timeout skip).
 - Clean-stop artifacts: `src/screencap/session.py:157-190` (best-effort `.recording_ready`), `src/screencap/engine/screen_recorder.py:1150-1170` (stop meta with `terminated_reason`), `src/screencap/daemon/supervisor.py:1591` (daemon exit path writes nothing — the dirty-death case).
 - Purge provenance: `src/screencap/enforcement/scrub_worker.py:381-400, 588-635, 785-787` (log entry shape, `purged_interval` writes, shared `ts_unix`), `src/screencap/enforcement/disable_log.py` (not crash-durable), `src/screencap/backfill/skip_intervals.py:138, 559-599` (`RETROACTIVE_PURGE`, identity-blind reader).
 - Institutional learnings applied: `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md` (optional decode), `docs/solutions/integration-issues/stale-daemon-after-app-update-http-500-2026-07-02.md` (version skew), `docs/solutions/runtime-errors/capture-health-nonscreen-attribution-terminal-stop-2026-06-01.md` (heuristics never authoritative), `docs/solutions/runtime-errors/sigint-handler-timing-and-recording-stop-methods.md` (stop matrix), `docs/solutions/workflow-issues/privacy-guards-deselected-on-ci-silently-rot-2026-06-10.md` (privacy marker).
-- Wording surfaces: `macos/ScreenCap/Views/Inspect/RecordedSummaryPane.swift:42-60, 256`, `macos/ScreenCap/Views/Journal/JournalView.swift:537-540`, `DayStripAccessibility` at `DayStripView.swift:537-582`.
+- Wording surfaces: `macos/Screencap/Views/Inspect/RecordedSummaryPane.swift:42-60, 256`, `macos/Screencap/Views/Journal/JournalView.swift:537-540`, `DayStripAccessibility` at `DayStripView.swift:537-582`.
 - Lost-day diagnosis evidence (2026-07-17): four recordings on four daemon versions in one day; dirty-death recordings lacked all clean-stop artifacts while clean stops had them; no `purged_interval` table in any of the day's recordings; ambient capture absent from config (default off).

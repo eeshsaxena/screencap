@@ -1,4 +1,4 @@
-"""ScreenCap CLI — Click-based entry point."""
+"""Screencap CLI — Click-based entry point."""
 
 from __future__ import annotations
 
@@ -125,7 +125,7 @@ _RECORD_EXTRAS_MSG = (
               help="Skip auto-update check.")
 @click.pass_context
 def cli(ctx, no_update_check):
-    """ScreenCap — macOS screen capture."""
+    """Screencap — macOS screen capture."""
     if not no_update_check:
         from screencap.updater import maybe_check_for_update
         maybe_check_for_update()
@@ -209,7 +209,7 @@ def serve(
     show_status: bool,
     idle_shutdown: int | None,
 ) -> None:
-    """Run the ScreenCap daemon, or manage its LaunchAgent."""
+    """Run the Screencap daemon, or manage its LaunchAgent."""
     if sum(bool(flag) for flag in (install, uninstall, show_status)) > 1:
         raise click.UsageError("--install, --uninstall, and --status are mutually exclusive.")
 
@@ -283,7 +283,7 @@ def serve(
 def mcp() -> None:
     """Run the MCP stdio server (for Claude Desktop / Codex / other agents).
 
-    Exposes ScreenCap's retrieval surface as MCP tools that forward to the
+    Exposes Screencap's retrieval surface as MCP tools that forward to the
     daemon over its UNIX socket. Communicates over stdin/stdout via JSON-RPC,
     so it is launched as a subprocess by the MCP client, not run interactively.
     See ``docs/mcp-client-setup.md``.
@@ -1105,7 +1105,7 @@ def _list_json(recordings, store_state: str | None) -> str:
     ``{"store_state": "locked", "recordings": []}`` so the consumer can render a
     "vault locked" state instead of a misleading empty grid.
 
-    TODO(U10): macos/ScreenCap/State/RecordingsIndex.swift currently decodes this
+    TODO(U10): macos/Screencap/State/RecordingsIndex.swift currently decodes this
     as a bare ``[RecordingSummary]``; it must be taught to decode the store_state
     envelope (a non-mounted state currently surfaces as a decode error, which the
     Library treats as a generic load error rather than a locked-vault state).
@@ -1968,7 +1968,7 @@ def clip_cmd(name, start_ms, end_ms, out_path, lock_timeout, as_json):
               default=lambda: _should_default_to_json(),
               help="Output as JSON. Auto-detected when stdout is not a TTY.")
 def login_cmd(as_json):
-    """Sign in to your ScreenCap cloud account (opens your browser).
+    """Sign in to your Screencap cloud account (opens your browser).
 
     Local recording, scrubbing, and playback never require sign-in — this is
     only needed to upload to the cloud. The long-lived refresh token is stored
@@ -2689,7 +2689,7 @@ def status(as_json, no_nlp_check):
     if store_state == "locked":
         console.print(
             "  store: [yellow]locked[/yellow] — unlock with "
-            "[bold]screencap storage unlock[/bold] (or the ScreenCap app)."
+            "[bold]screencap storage unlock[/bold] (or the Screencap app)."
         )
     elif store_state == "absent":
         console.print(
@@ -2707,7 +2707,7 @@ def status(as_json, no_nlp_check):
     if payload["filevault"] == "off":
         console.print(
             "[yellow]Warning:[/yellow] FileVault is off. Recordings are encrypted at "
-            "rest in ScreenCap's container, but turning on FileVault (System Settings "
+            "rest in Screencap's container, but turning on FileVault (System Settings "
             "> Privacy & Security) adds full-disk encryption."
         )
 
@@ -3566,7 +3566,7 @@ def scrub(name: str, pii_engine: str | None) -> None:
               help="Emit settings as JSON. Auto-detected when stdout is not a TTY (todo 012).")
 @click.pass_context
 def settings(ctx, set_pair, as_json):
-    """Show or change ScreenCap configuration.
+    """Show or change Screencap configuration.
 
     \b
     View all settings:
@@ -3727,7 +3727,7 @@ def settings(ctx, set_pair, as_json):
     else:
         chunk_str = "disabled (legacy single-file)"
 
-    console.print("\n[bold]ScreenCap Settings[/bold]\n")
+    console.print("\n[bold]Screencap Settings[/bold]\n")
     console.print(f"  Show on website:          {'yes' if show else 'no'}")
     console.print(f"  Upload default:           {get_upload_default()}")
     console.print(f"  Audio default:            {'enabled' if get_audio_default() else 'disabled'}")
@@ -5035,7 +5035,7 @@ def _backfill_call_or_exit(call) -> dict[str, Any]:
         return call()
     except DaemonUnreachableError as exc:
         console.print(
-            f"[red]Error:[/red] could not reach the ScreenCap daemon: "
+            f"[red]Error:[/red] could not reach the Screencap daemon: "
             f"{escape(str(exc))}"
         )
         raise SystemExit(1) from exc
@@ -5358,7 +5358,7 @@ def _store_state_guidance(state, reason):  # noqa: ANN001
         return (
             "The encrypted store is locked.",
             "Unlock it first: run [bold]screencap storage unlock[/bold] "
-            "(or open the ScreenCap app in a local session and unlock there).",
+            "(or open the Screencap app in a local session and unlock there).",
         )
     if state is _sl.StoreState.ABSENT:
         return (
@@ -5371,7 +5371,7 @@ def _store_state_guidance(state, reason):  # noqa: ANN001
             "The encrypted store's key exists but this binary is not entitled to "
             "read it.",
             "This is NOT data loss — the store and its key are intact. Use the "
-            "entitled ScreenCap app or its bundled CLI (a pip/pyenv or Debug CLI "
+            "entitled Screencap app or its bundled CLI (a pip/pyenv or Debug CLI "
             "is an unsupported vault consumer).",
         )
     if reason == _sl.ERROR_KEYCHAIN_LOCKED:
@@ -5619,7 +5619,7 @@ def storage_migrate_cmd(path: str, as_json: bool) -> None:
             payload = client.storage_migrate(target)
         except DaemonUnreachableError as exc:
             console.print(
-                f"[red]Error:[/red] could not reach the ScreenCap daemon: "
+                f"[red]Error:[/red] could not reach the Screencap daemon: "
                 f"{escape(str(exc))}"
             )
             raise SystemExit(1) from exc
@@ -5719,7 +5719,7 @@ def storage_init_cmd() -> None:
         console.print(
             "[red]Error:[/red] the store key exists in the shared Keychain group "
             "but this binary is not entitled to read it. Run the entitled "
-            "ScreenCap app or its bundled CLI."
+            "Screencap app or its bundled CLI."
         )
         raise SystemExit(1)
     except container.KeychainLockedError:
@@ -5905,7 +5905,7 @@ def storage_unlock_cmd() -> None:
     # auth of its own — it trusts the same-EUID caller — so the gate lives here.
     try:
         _evaluate_local_authentication(
-            "Unlock your ScreenCap encrypted recordings store"
+            "Unlock your Screencap encrypted recordings store"
         )
     except _NoLocalAuthSurface as exc:
         console.print(
@@ -5916,7 +5916,7 @@ def storage_unlock_cmd() -> None:
         )
         console.print(
             "Unlock from a local login session on this Mac (or Screen Sharing to "
-            "the ScreenCap app) — the store stays sealed."
+            "the Screencap app) — the store stays sealed."
         )
         raise SystemExit(1) from exc
     except PermissionError as exc:
@@ -6013,7 +6013,7 @@ def storage_encrypt_start_cmd() -> None:
         try:
             snap = client.storage_encrypt_start()
         except DaemonUnreachableError as exc:
-            console.print(f"[red]Error:[/red] could not reach the ScreenCap daemon: {escape(str(exc))}")
+            console.print(f"[red]Error:[/red] could not reach the Screencap daemon: {escape(str(exc))}")
             raise SystemExit(1) from exc
         except DaemonClientError as exc:
             env = exc.envelope

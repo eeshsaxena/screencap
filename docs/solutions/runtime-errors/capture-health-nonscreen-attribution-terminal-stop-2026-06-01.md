@@ -23,7 +23,7 @@ modules:
   - src/screencap/engine/recorder.py
   - src/screencap/engine/window/_macos.py
   - src/screencap/_stderr_events.py
-  - macos/ScreenCap/Controllers/RecorderController.swift
+  - macos/Screencap/Controllers/RecorderController.swift
 tags:
   - macos
   - tcc
@@ -49,7 +49,7 @@ if label is not None:
     return EVENT_PERMISSION_LOST
 ```
 
-`permission_lost` is terminal by contract. The Swift shell's `handlePermissionLost` (`macos/ScreenCap/Controllers/RecorderController.swift:576`) calls `stop()` on ANY permission while in the `.recording` state:
+`permission_lost` is terminal by contract. The Swift shell's `handlePermissionLost` (`macos/Screencap/Controllers/RecorderController.swift:576`) calls `stop()` on ANY permission while in the `.recording` state:
 
 ```swift
 if case .recording = state {

@@ -43,7 +43,7 @@ The unified pipeline already routes cloud chunk video through a post-hoc masker 
 
 ### Deferred to Follow-Up Work
 
-- **Swift native-redaction-review consent-gate** (SCR-126 prerequisite #2 — `macos/ScreenCap/Views/Review/ReviewWindow.swift:317` "Local preview — not uploaded"): deferred to the future flag-flip ticket. While the flag is OFF the label is accurate; changing it now would mislead operators. Related origin context: `docs/brainstorms/2026-06-03-native-redaction-review-before-upload-requirements.md`.
+- **Swift native-redaction-review consent-gate** (SCR-126 prerequisite #2 — `macos/Screencap/Views/Review/ReviewWindow.swift:317` "Local preview — not uploaded"): deferred to the future flag-flip ticket. While the flag is OFF the label is accurate; changing it now would mislead operators. Related origin context: `docs/brainstorms/2026-06-03-native-redaction-review-before-upload-requirements.md`.
 - **`/ce-compound` capture** of three documented-learning gaps after this lands: masked-video coverage-gate design, recovery↔terminal chunk-range reconciliation, and scrubbed-copy reuse/provenance correctness (none currently exist in `docs/solutions/`).
 
 ---

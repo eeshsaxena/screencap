@@ -1,9 +1,9 @@
 ---
-name: ScreenCap
+name: Screencap
 last_updated: 2026-05-08
 ---
 
-# ScreenCap Strategy
+# Screencap Strategy
 
 ## Target problem
 
@@ -19,7 +19,7 @@ Win on privacy and performance. Local-first capture with capture-time filtering 
 
 ## Who it's for
 
-**Primary:** The internal-tool-heavy operator — customer success managers, ops analysts, sales engineers, support leads working across many internal dashboards. They're hiring ScreenCap to stop losing the thread when switching between Salesforce, the data warehouse, Looker, and internal admin panels — and eventually, to let an agent do the next round of the workflow for them.
+**Primary:** The internal-tool-heavy operator — customer success managers, ops analysts, sales engineers, support leads working across many internal dashboards. They're hiring Screencap to stop losing the thread when switching between Salesforce, the data warehouse, Looker, and internal admin panels — and eventually, to let an agent do the next round of the workflow for them.
 
 ## Key metrics
 

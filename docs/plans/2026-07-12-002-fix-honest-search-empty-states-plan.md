@@ -14,9 +14,9 @@ execution: code
 
 - **Objective:** Fix [SCR-261](https://linear.app/zk-email/issue/SCR-261/search-shows-definitive-no-matches-on-this-mac-when-the-content-index): the macOS recall palette's search empty state must name the real cause (consent never given, index not built, stream unavailable/degraded) instead of the definitive "No matches on this Mac", with working recovery actions.
 - **Authority:** The Linear ticket, adjusted by two user decisions made during planning: empty states carry actionable CTAs (not copy-only), and the locked corpus is **not** an empty-state cause (no Unlock affordance on empty — see KTD2).
-- **Execution profile:** Swift-only, confined to `macos/ScreenCap` (palette model + view + view-model CTA plumbing). No Python/daemon changes.
+- **Execution profile:** Swift-only, confined to `macos/Screencap` (palette model + view + view-model CTA plumbing). No Python/daemon changes.
 - **Stop conditions:** Stop and surface if the fix appears to require daemon `/v0` response changes, changes to `SearchViewModel.Phase` / `SearchResults` public shape (breaks the second consumer, `DayTimelineView`), or new lock/unlock mechanics.
-- **Tail ownership:** Unit verification via `ScreenCapTests`; manual QA reproduces the ticket's observed case.
+- **Tail ownership:** Unit verification via `ScreencapTests`; manual QA reproduces the ticket's observed case.
 
 ---
 
@@ -99,7 +99,7 @@ Two prior institutional learnings frame this as a known failure class: overloadi
 
 ### High-Level Technical Design
 
-Data flow today: daemon `index_state` → `ContentIndexState` (`macos/ScreenCap/Models/SearchResult.swift`) → per-stream `StreamState` → `CoverageReport` inside `SearchResults` (`macos/ScreenCap/Views/Search/SearchViewModel.swift`) → `RecallPalette.state(...)` (`macos/ScreenCap/Views/Palette/RecallPaletteModel.swift`) → `RecallPaletteContent.bodyContent` (`macos/ScreenCap/Views/Palette/RecallPaletteView.swift`). The last hop currently reads only `items.isEmpty`; this plan replaces that hop with the derivation below (directional sketch — exact enum shape is the implementer's):
+Data flow today: daemon `index_state` → `ContentIndexState` (`macos/Screencap/Models/SearchResult.swift`) → per-stream `StreamState` → `CoverageReport` inside `SearchResults` (`macos/Screencap/Views/Search/SearchViewModel.swift`) → `RecallPalette.state(...)` (`macos/Screencap/Views/Palette/RecallPaletteModel.swift`) → `RecallPaletteContent.bodyContent` (`macos/Screencap/Views/Palette/RecallPaletteView.swift`). The last hop currently reads only `items.isEmpty`; this plan replaces that hop with the derivation below (directional sketch — exact enum shape is the implementer's):
 
 ```mermaid
 flowchart TB
@@ -123,12 +123,12 @@ flowchart TB
 
 ### Sources & Research
 
-- Swallow point and seam: `macos/ScreenCap/Views/Palette/RecallPaletteModel.swift` (`state(...)`, `showsConsentBanner`); rendering switch and copy: `macos/ScreenCap/Views/Palette/RecallPaletteView.swift` (empty body, footer, `message()` helper, `enableConsent()`, backfill section).
-- Stream states and mapping: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (`StreamState`, `mapContentState`, `CoverageReport`, `consentNeeded`, `BackfillUIState`, `offerBackfill`/`acceptBackfill`); wire enum: `macos/ScreenCap/Models/SearchResult.swift` (`ContentIndexState`, pessimistic default to store-unavailable).
-- Lock architecture (why locked is not a cause): `macos/ScreenCap/Controllers/PresenceGate.swift`, `macos/ScreenCap/Views/PresenceGatedContent.swift`, `SECURITY.md` (daemon holds the corpus key; the app-side gate is display-only).
-- Settings signals: `macos/ScreenCap/Models/PrivacyStatus.swift` (`content_index_enabled`, `corpus_encrypted`).
+- Swallow point and seam: `macos/Screencap/Views/Palette/RecallPaletteModel.swift` (`state(...)`, `showsConsentBanner`); rendering switch and copy: `macos/Screencap/Views/Palette/RecallPaletteView.swift` (empty body, footer, `message()` helper, `enableConsent()`, backfill section).
+- Stream states and mapping: `macos/Screencap/Views/Search/SearchViewModel.swift` (`StreamState`, `mapContentState`, `CoverageReport`, `consentNeeded`, `BackfillUIState`, `offerBackfill`/`acceptBackfill`); wire enum: `macos/Screencap/Models/SearchResult.swift` (`ContentIndexState`, pessimistic default to store-unavailable).
+- Lock architecture (why locked is not a cause): `macos/Screencap/Controllers/PresenceGate.swift`, `macos/Screencap/Views/PresenceGatedContent.swift`, `SECURITY.md` (daemon holds the corpus key; the app-side gate is display-only).
+- Settings signals: `macos/Screencap/Models/PrivacyStatus.swift` (`content_index_enabled`, `corpus_encrypted`).
 - Institutional learnings applied: `docs/solutions/design-patterns/fallback-path-recovery-and-exit-code-signaling-2026-06-15.md` (distinct causes + reachable recovery affordances), `docs/solutions/integration-issues/review-data-nullable-timing-swift-consumer-2026-06-01.md` (absent-data ≠ terminal state; paired pin tests), `docs/solutions/integration-issues/keychain-auth-prompt-eager-decrypt-at-launch-2026-07-08.md` (unlock is click-initiated only — moot for empty states under KTD2 but binding on any future lock work), `docs/solutions/integration-issues/stale-daemon-after-app-update-http-500-2026-07-02.md` (search verbs 500 wholesale after stale-daemon app updates — the unavailable cause is reachable in the wild).
-- A related honest-coverage precedent already ships in chat recall: `ChatCoverageState` in `macos/ScreenCap/Models/ChatRecall.swift` treats not-indexed/degraded/store-unavailable uniformly as "coverage is limited".
+- A related honest-coverage precedent already ships in chat recall: `ChatCoverageState` in `macos/Screencap/Models/ChatRecall.swift` treats not-indexed/degraded/store-unavailable uniformly as "coverage is limited".
 
 ---
 
@@ -139,7 +139,7 @@ flowchart TB
 - **Goal:** Replace the lossy `items.isEmpty → .empty` mapping with an explicit cause-carrying empty variant derived from coverage, consent state, and backfill state.
 - **Requirements:** R1–R7, R10, R12 (derivation side), KTD1–KTD4, KTD6, KTD7.
 - **Dependencies:** none.
-- **Files:** `macos/ScreenCap/Views/Palette/RecallPaletteModel.swift`; `macos/ScreenCap/Views/Palette/RecallPaletteView.swift` (the sole `state(...)` call site passes a stopgap value for the new parameter so U1 compiles independently, ahead of U3's real settings wiring); `macos/ScreenCapTests/RecallPaletteStateTests.swift`; `macos/ScreenCapTests/ViewHostingHarness.swift` (new `SearchFixtures`).
+- **Files:** `macos/Screencap/Views/Palette/RecallPaletteModel.swift`; `macos/Screencap/Views/Palette/RecallPaletteView.swift` (the sole `state(...)` call site passes a stopgap value for the new parameter so U1 compiles independently, ahead of U3's real settings wiring); `macos/ScreencapTests/RecallPaletteStateTests.swift`; `macos/ScreencapTests/ViewHostingHarness.swift` (new `SearchFixtures`).
 - **Approach:** Extend `RecallPalette.State.Body` with cause-carrying empty variants (or one `.empty(cause:)` payload — implementer's call; the enum is `Equatable` and pin-tested). Inputs: the existing `SearchResults` (coverage, `consentNeeded`), `consentDeclined`, `backfillState`, and a now-optional content-indexing-enabled flag. Encode precedence per KTD3 and CTA stand-down per KTD4/R10 with the full `BackfillUIState` mapping: the body CTA stands down for offering/starting/indexing/paused/cancelled (the backfill section's Accept/Resume owns the ask) and returns for hidden and start-failed (whose section has no action button); done triggers the KTD9 re-run. Attach the optional secondary unavailable-note (KTD7) to the variant payload.
 - **Patterns to follow:** The existing pure `state(...)` derivation and its pin tests; wire-realistic fixtures (a free-text query has `activity: .notRun` per SCR-176 — the existing `noMatchesResults()` fixture uses `.empty` and must not be copied blindly for new cases).
 - **Test scenarios:**
@@ -161,7 +161,7 @@ flowchart TB
 - **Goal:** The palette body renders each cause with honest copy and an accessible CTA, and locked/presence behavior is visibly unchanged.
 - **Requirements:** R1–R6, R13, KTD2, KTD8.
 - **Dependencies:** U1.
-- **Files:** `macos/ScreenCap/Views/Palette/RecallPaletteView.swift`; `macos/ScreenCapTests/RecallPaletteStateTests.swift` (render smoke).
+- **Files:** `macos/Screencap/Views/Palette/RecallPaletteView.swift`; `macos/ScreencapTests/RecallPaletteStateTests.swift` (render smoke).
 - **Approach:** Extend the `bodyContent` switch per variant using the `message(icon:title:note:...)` helper. Parameterize its hardcoded accessibility hint so each CTA carries its own, on the retry path as well as the action path — today only the action-button path has a hint, so R4's Retry would otherwise silently miss R13 by inheriting the unparameterized daemon-down pattern. Give `message()` a distinct `secondaryNote` parameter rendered as a visually de-emphasized second line, used consistently by every variant carrying KTD7's secondary note (no per-variant concatenation). Copy follows the subscription-state tone: honest, reassuring, no blame; the declined-notice variant is button-free. No Unlock affordance on any empty variant (KTD2).
 - **Patterns to follow:** The `subscriptionRequired` empty state (prominent tinted CTA precedent); `PresenceGatedContent` copy tone for lock-adjacent wording if any caveat mentions history.
 - **Test scenarios:**
@@ -175,7 +175,7 @@ flowchart TB
 - **Goal:** Every CTA does what it says: Turn on enables + offers backfill, Index now starts backfill even for prior decliners, Retry re-runs, and backfill completion resolves the empty state.
 - **Requirements:** R8, R9, R10 (view side), R12 (settings-load side), KTD5, KTD6, KTD9.
 - **Dependencies:** U1, U2.
-- **Files:** `macos/ScreenCap/Views/Palette/RecallPaletteView.swift`; `macos/ScreenCap/Views/Search/SearchViewModel.swift`; `macos/ScreenCapTests/SearchViewModelBackfillTests.swift`; `macos/ScreenCapTests/RecallPaletteStateTests.swift`.
+- **Files:** `macos/Screencap/Views/Palette/RecallPaletteView.swift`; `macos/Screencap/Views/Search/SearchViewModel.swift`; `macos/ScreencapTests/SearchViewModelBackfillTests.swift`; `macos/ScreencapTests/RecallPaletteStateTests.swift`.
 - **Approach:** Wire Turn on to the existing `enableConsent()` path; wire Index now to `acceptBackfill()` directly, clearing the persisted backfill-declined flag on explicit accept (KTD5 — a small view-model addition mirroring the existing persist-declined closure); wire Retry to the existing retry affordance. Add the backfill-done completion hook on the view model (KTD9) and wire the palette's single non-debounced re-run of the current query into it. Make the view's content-indexing-enabled state optional (nil until settings resolve; load failure leaves it nil rather than false, and never sets declined) feeding U1's tri-state input.
 - **Execution note:** Start with a failing view-model test for the decliner-clicks-Index-now path — it pins the KTD5 routing decision that the obvious `offerBackfill` call would get wrong.
 - **Patterns to follow:** `enableConsent()` optimistic-flip-revert-and-re-run; `FakeBackfillService` with `AsyncStream` continuation and injected persistence closures in the backfill tests.
@@ -191,7 +191,7 @@ flowchart TB
 - **Goal:** The footer stops claiming "indexed on-device" when content indexing is off or unknown.
 - **Requirements:** R11.
 - **Dependencies:** U3 (tri-state flag).
-- **Files:** `macos/ScreenCap/Views/Palette/RecallPaletteView.swift`.
+- **Files:** `macos/Screencap/Views/Palette/RecallPaletteView.swift`.
 - **Approach:** Condition or reword the footer line on the tri-state enabled flag AND the content stream's not-indexed state (claim indexed coverage only when indexing is enabled and the index is built, per R11). Header "searching this Mac only" and the field accessibility label are locality claims — true in every state — and stay unchanged (avoids VoiceOver churn for no honesty gain).
 - **Test scenarios:** Test expectation: none — a small conditional on view chrome with no derivation logic; covered by the manual QA pass (AE1 includes the footer assertion).
 - **Verification:** With indexing off/unknown, or on with the index not yet built (content stream `.notIndexed`), the rendered footer makes no indexed-coverage claim; with indexing on and the index built, today's footer is preserved.
@@ -203,8 +203,8 @@ flowchart TB
 | Gate | Command / check | Notes |
 |---|---|---|
 | Project generation | `cd macos && xcodegen generate` | `.xcodeproj` is gitignored; re-run after adding files |
-| Compile (worktree-safe) | `xcodebuild build-for-testing -project ScreenCap.xcodeproj -scheme ScreenCap` | Compile-only is safe in this `~/Documents` worktree |
-| Unit tests | `xcodebuild test -only-testing:ScreenCapTests -project ScreenCap.xcodeproj -scheme ScreenCap` | Do NOT launch tests from this worktree — test-host launch TCC-bricks the session; run from the main checkout or a `/private/tmp` source copy, and kill stray orphaned test hosts before rerunning. A daemon-reconnect test is known-flaky: re-run before blaming the diff |
+| Compile (worktree-safe) | `xcodebuild build-for-testing -project Screencap.xcodeproj -scheme Screencap` | Compile-only is safe in this `~/Documents` worktree |
+| Unit tests | `xcodebuild test -only-testing:ScreencapTests -project Screencap.xcodeproj -scheme Screencap` | Do NOT launch tests from this worktree — test-host launch TCC-bricks the session; run from the main checkout or a `/private/tmp` source copy, and kill stray orphaned test hosts before rerunning. A daemon-reconnect test is known-flaky: re-run before blaming the diff |
 | Python lanes | none | Swift-only change; `pytest -m privacy` CI lane untouched |
 | Manual QA | Reproduce AE1 on a Mac with no index + locked corpus; walk AE2–AE5 | AE1 is the ticket's verified repro. Use query terms that appear in recorded on-screen content, not just recording titles — title-only hits stay hidden until SCR-256, so a title-term query would fail AE4 through no fault of the implementation |
 

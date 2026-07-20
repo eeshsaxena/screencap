@@ -7,8 +7,8 @@ severity: high
 problem_type: runtime-behavior
 modules:
   - src/screencap/daemon/permission_probe.py
-  - macos/ScreenCap/Controllers/RecorderController.swift
-  - macos/ScreenCap/Views/Onboarding/OnboardingPermissionsStep.swift
+  - macos/Screencap/Controllers/RecorderController.swift
+  - macos/Screencap/Views/Onboarding/OnboardingPermissionsStep.swift
 tags:
   - macos
   - tcc
@@ -37,7 +37,7 @@ root_cause: >
 
 ## Problem
 
-On macOS, a permission the user grants in System Settings **after** the ScreenCap
+On macOS, a permission the user grants in System Settings **after** the Screencap
 daemon has started is reported as `denied` by the daemon's `daemon.info` grant
 probe until the daemon process restarts. The onboarding UI renders that stale
 `denied`, stranding the user on `required · waiting` with no in-app way out —

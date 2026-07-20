@@ -32,7 +32,7 @@ Phase 1a/1b shipped the daemon as the recording TCC subject but left SwiftUI's o
 - R8. AE2 acceptance holds: TCC grants on the daemon binary persist across ≥5 consecutive SwiftUI+daemon rebuilds with the Developer ID identity, without re-prompt.
 - R9. Release notes call out the migration UX ("grant once, persists across updates"). *(origin: U9 acceptance)*
 
-**Origin actors:** A1 (existing ScreenCap user upgrading), A2 (sole developer / release engineer running the signing pipeline).
+**Origin actors:** A1 (existing Screencap user upgrading), A2 (sole developer / release engineer running the signing pipeline).
 **Origin flows:** F-upgrade (launch-after-upgrade migration sequence: marker check → banner → U8 install+grant → marker write → normal flow).
 **Origin acceptance examples:** AE2 (covers R5, R8 — TCC grants persist across rebuilds; the strategic payoff).
 
@@ -41,7 +41,7 @@ Phase 1a/1b shipped the daemon as the recording TCC subject but left SwiftUI's o
 ## Scope Boundaries
 
 - **Not** removing the app-process TCC probes (`checkScreenRecording` / `checkAccessibility` / `checkInputMonitoring`, `refresh()`, `allRequiredGranted`). They gate the still-supported CLI-fallback path. The original U9 "PermissionController cleanup removes the three probes" is **superseded** by this boundary (see Key Technical Decisions).
-- **Not** editing `Info.plist` / `ScreenCap.entitlements` to *remove* Screen Recording / Accessibility / Input Monitoring keys — they were never present. U4 verifies and documents this rather than editing.
+- **Not** editing `Info.plist` / `Screencap.entitlements` to *remove* Screen Recording / Accessibility / Input Monitoring keys — they were never present. U4 verifies and documents this rather than editing.
 - **Not** reworking the daemon's TCC registration, the U8 install flow, or the permission walkthrough rows — those shipped in Phase 1b and are reused as-is.
 - **Not** automating the AE2 smoke into CI — that remains a manual runbook step (a follow-up ticket already exists in the parent plan's Future Work for `tccutil`-based CI automation).
 - **Not** the daemon-mandatory architecture (dropping CLI-fallback entirely). Confirmed out of scope; CLI-fallback stays.
@@ -57,18 +57,18 @@ Phase 1a/1b shipped the daemon as the recording TCC subject but left SwiftUI's o
 
 ### Relevant Code and Patterns
 
-- `macos/ScreenCap/Controllers/PermissionController.swift` — owns app-process probes (`checkScreenRecording`/`checkAccessibility`/`checkInputMonitoring`, `refresh`, `allRequiredGranted`) **and** the daemon-grant snapshot path. The dead app-process *request* branch is `requestAndOpenSettings(for:subject:)`'s `.screenCapApp` case (lines ~537–554): `CGRequestScreenCaptureAccess` / `AXIsProcessTrustedWithOptions(prompt:true)` / `IOHIDRequestAccess`. Its only caller passes `.daemon`, so the branch is unreachable.
-- `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` — the U8 walkthrough: daemon-install step → three daemon-permission rows. No longer polls app-process TCC. The migration banner is a new step *before* this content on the upgrade path.
-- `macos/ScreenCap/Views/MainWindow.swift` — `FirstRunSetupPresentationPolicy` + `updateFirstRunSheetPresentation()` own when the first-run sheet shows/auto-closes, and already guard against popping over an active recording (`recorder.state.isRecording`). The migration banner integrates into this presentation policy, reusing the active-recording guard (R3).
-- `macos/ScreenCap/ScreenCapApp.swift` — `.task` after `probeDaemon()` runs `privacy.ensureFirstLaunchModeWritten()`, the model for a one-time on-disk first-launch action; mirror it for the marker.
-- `macos/ScreenCap/Controllers/PrivacyController.swift:169` — `ensureFirstLaunchModeWritten()` is the idempotent "probe disk, short-circuit if already done, else write" pattern to mirror for the marker store.
-- `macos/ScreenCap/Controllers/DaemonClient.swift:406` — `~/.screencap/...` paths are built ad hoc via `NSHomeDirectory()`; there is no central Swift `AppPaths` helper. The marker path follows the same idiom.
-- `macos/ScreenCap/Controllers/DaemonInstallController.swift` / `DaemonSessionService.swift` — `snapshot()` exposes `isRecording`, the signal for the R3 banner suppression (mirror `RecorderController.state.isRecording`, which `MainWindow` already uses).
+- `macos/Screencap/Controllers/PermissionController.swift` — owns app-process probes (`checkScreenRecording`/`checkAccessibility`/`checkInputMonitoring`, `refresh`, `allRequiredGranted`) **and** the daemon-grant snapshot path. The dead app-process *request* branch is `requestAndOpenSettings(for:subject:)`'s `.screenCapApp` case (lines ~537–554): `CGRequestScreenCaptureAccess` / `AXIsProcessTrustedWithOptions(prompt:true)` / `IOHIDRequestAccess`. Its only caller passes `.daemon`, so the branch is unreachable.
+- `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` — the U8 walkthrough: daemon-install step → three daemon-permission rows. No longer polls app-process TCC. The migration banner is a new step *before* this content on the upgrade path.
+- `macos/Screencap/Views/MainWindow.swift` — `FirstRunSetupPresentationPolicy` + `updateFirstRunSheetPresentation()` own when the first-run sheet shows/auto-closes, and already guard against popping over an active recording (`recorder.state.isRecording`). The migration banner integrates into this presentation policy, reusing the active-recording guard (R3).
+- `macos/Screencap/ScreencapApp.swift` — `.task` after `probeDaemon()` runs `privacy.ensureFirstLaunchModeWritten()`, the model for a one-time on-disk first-launch action; mirror it for the marker.
+- `macos/Screencap/Controllers/PrivacyController.swift:169` — `ensureFirstLaunchModeWritten()` is the idempotent "probe disk, short-circuit if already done, else write" pattern to mirror for the marker store.
+- `macos/Screencap/Controllers/DaemonClient.swift:406` — `~/.screencap/...` paths are built ad hoc via `NSHomeDirectory()`; there is no central Swift `AppPaths` helper. The marker path follows the same idiom.
+- `macos/Screencap/Controllers/DaemonInstallController.swift` / `DaemonSessionService.swift` — `snapshot()` exposes `isRecording`, the signal for the R3 banner suppression (mirror `RecorderController.state.isRecording`, which `MainWindow` already uses).
 - `docs/plans/2026-05-08-001-feat-daemon-architecture-phase-1-plan.md` — U9 scope (lines 663–710), the authoritative origin for this plan.
 
 ### Institutional Learnings
 
-- `docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md` — the load-bearing learning. TCC anchors grants on the code-signing identity; ad-hoc builds re-key on every rebuild. The **2026-06-08 update** is critical and refines the original U9 framing: `embed-cli.sh` now team-signs the *nested* `screencap` binary (the real TCC subject), and an **Apple Development** cert already stops the per-build dev treadmill (the Designated Requirement pins identifier + leaf cert CN). **Developer ID** is the distribution-grade anchor (team-anchored DR, survives cert rotation). The runbook (U1) builds directly on this. Per-pane name divergence ("ScreenCap" vs lowercase `screencap`), default-OFF + stale-pane, and Input-Monitoring-not-self-registering-under-launchd are documented gotchas the runbook must carry.
+- `docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md` — the load-bearing learning. TCC anchors grants on the code-signing identity; ad-hoc builds re-key on every rebuild. The **2026-06-08 update** is critical and refines the original U9 framing: `embed-cli.sh` now team-signs the *nested* `screencap` binary (the real TCC subject), and an **Apple Development** cert already stops the per-build dev treadmill (the Designated Requirement pins identifier + leaf cert CN). **Developer ID** is the distribution-grade anchor (team-anchored DR, survives cert rotation). The runbook (U1) builds directly on this. Per-pane name divergence ("Screencap" vs lowercase `screencap`), default-OFF + stale-pane, and Input-Monitoring-not-self-registering-under-launchd are documented gotchas the runbook must carry.
 - `docs/solutions/build-errors/env-export-prefix-silently-disables-team-signing.md` — a `.env` `export ` prefix silently dropping `DEVELOPMENT_TEAM` lands you back on ad-hoc; the runbook must warn about it.
 
 ### External References
@@ -184,13 +184,13 @@ Decision matrix for whether the migration banner shows on a given launch:
 **Dependencies:** U1 (gate passed).
 
 **Files:**
-- Create: `macos/ScreenCap/Views/Privacy/DaemonMigrationView.swift`
-- Create: `macos/ScreenCap/Controllers/MigrationMarkerStore.swift` (or a small marker helper — name settled in implementation)
-- Test: `macos/ScreenCapTests/MigrationMarkerStoreTests.swift` (and a `DaemonMigrationView` snapshot/logic test if the view carries non-trivial state)
+- Create: `macos/Screencap/Views/Privacy/DaemonMigrationView.swift`
+- Create: `macos/Screencap/Controllers/MigrationMarkerStore.swift` (or a small marker helper — name settled in implementation)
+- Test: `macos/ScreencapTests/MigrationMarkerStoreTests.swift` (and a `DaemonMigrationView` snapshot/logic test if the view carries non-trivial state)
 
 **Approach:**
 - `MigrationMarkerStore`: `isMigrated()` (probe `~/.screencap/.tcc-migrated-v1`) and `markMigrated()` (create `~/.screencap` if absent, write the marker). Mirror `PrivacyController.ensureFirstLaunchModeWritten`'s idempotent-disk-probe shape. Path via `NSHomeDirectory()` per `DaemonClient.swift:406`. Inject the base directory for tests (point at a temp dir) so tests never touch the real `~/.screencap`.
-- `DaemonMigrationView`: copy per origin — "ScreenCap now uses a background helper for stable permissions across updates. Grant permissions once and they'll persist across all future ScreenCap updates." A single "Continue" affordance that advances to the U8 install/walkthrough content. No grant logic of its own (R4 — marker ≠ grant proof).
+- `DaemonMigrationView`: copy per origin — "Screencap now uses a background helper for stable permissions across updates. Grant permissions once and they'll persist across all future Screencap updates." A single "Continue" affordance that advances to the U8 install/walkthrough content. No grant logic of its own (R4 — marker ≠ grant proof).
 
 **Patterns to follow:**
 - `PrivacyController.ensureFirstLaunchModeWritten()` (idempotent first-launch disk write).
@@ -217,10 +217,10 @@ Decision matrix for whether the migration banner shows on a given launch:
 **Dependencies:** U2.
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift` (insert the migration step as the leading phase before `daemonInstallStep`)
-- Modify: `macos/ScreenCap/Views/MainWindow.swift` (`FirstRunSetupPresentationPolicy` / `updateFirstRunSheetPresentation()` consult the marker; reuse the existing `recorder.state.isRecording` guard)
-- Modify: `macos/ScreenCap/ScreenCapApp.swift` (read the marker in the post-`probeDaemon` `.task`, alongside `ensureFirstLaunchModeWritten`, to decide migration state)
-- Test: `macos/ScreenCapTests/FirstRunSetupPresentationPolicyTests.swift` (extend existing presentation-policy tests with the marker dimension)
+- Modify: `macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift` (insert the migration step as the leading phase before `daemonInstallStep`)
+- Modify: `macos/Screencap/Views/MainWindow.swift` (`FirstRunSetupPresentationPolicy` / `updateFirstRunSheetPresentation()` consult the marker; reuse the existing `recorder.state.isRecording` guard)
+- Modify: `macos/Screencap/ScreencapApp.swift` (read the marker in the post-`probeDaemon` `.task`, alongside `ensureFirstLaunchModeWritten`, to decide migration state)
+- Test: `macos/ScreencapTests/FirstRunSetupPresentationPolicyTests.swift` (extend existing presentation-policy tests with the marker dimension)
 
 **Approach:**
 - Add a `migrationNeeded` (marker-absent) input to the first-run sheet content: when true and not recording, the sheet leads with `DaemonMigrationView`; "Continue" advances to the existing daemon-install content.
@@ -253,9 +253,9 @@ Decision matrix for whether the migration banner shows on a given launch:
 **Dependencies:** U1 (gate passed). Independent of U2/U3 — can land in parallel.
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/PermissionController.swift` (remove the unreachable `.screenCapApp` case body in `requestAndOpenSettings(for:subject:)` — `CGRequestScreenCaptureAccess` / `AXIsProcessTrustedWithOptions(prompt:true)` / `IOHIDRequestAccess`; collapse the signature to daemon-only if the `subject` param becomes vestigial). **Keep** `checkScreenRecording`/`checkAccessibility`/`checkInputMonitoring`, `refresh()`, `allRequiredGranted`.
-- Verify (no edit expected): `macos/ScreenCap/Info.plist`, `macos/ScreenCap/ScreenCap.entitlements`, `macos/project.yml` — confirm none declare the three TCC services.
-- Test: `macos/ScreenCapTests/PermissionControllerTests.swift` (assert CLI-fallback probe behavior intact; assert no app-process screen-recording request path remains)
+- Modify: `macos/Screencap/Controllers/PermissionController.swift` (remove the unreachable `.screenCapApp` case body in `requestAndOpenSettings(for:subject:)` — `CGRequestScreenCaptureAccess` / `AXIsProcessTrustedWithOptions(prompt:true)` / `IOHIDRequestAccess`; collapse the signature to daemon-only if the `subject` param becomes vestigial). **Keep** `checkScreenRecording`/`checkAccessibility`/`checkInputMonitoring`, `refresh()`, `allRequiredGranted`.
+- Verify (no edit expected): `macos/Screencap/Info.plist`, `macos/Screencap/Screencap.entitlements`, `macos/project.yml` — confirm none declare the three TCC services.
+- Test: `macos/ScreencapTests/PermissionControllerTests.swift` (assert CLI-fallback probe behavior intact; assert no app-process screen-recording request path remains)
 
 **Approach:**
 - Confirm via `requestAndOpenSettings`'s single caller (`FirstRunPermissionsView`, `subject: .daemon`) that the `.screenCapApp` branch is dead, then remove it. If `PermissionSubject`/the `subject` parameter is left with a single inhabitant, simplify rather than leave a vestigial enum — but only if it doesn't ripple into test seams; otherwise leave the enum and just empty/guard the dead branch.
@@ -268,7 +268,7 @@ Decision matrix for whether the migration banner shows on a given launch:
 **Test scenarios:**
 - Happy path: CLI-fallback start-gate still reads `allRequiredGranted` from the live probes (behavior unchanged) — assert via the existing `_testSetRequiredPermissionsGranted` seam.
 - Edge case: `requestAndOpenSettings(for:subject:.daemon)` still drives the daemon registration round-trip (unchanged); no app-process prompt API (`CGRequestScreenCaptureAccess` etc.) is reachable from any caller.
-- Verification (non-behavioral): `Info.plist` / `ScreenCap.entitlements` / `project.yml` declare none of the three TCC services — assert by inspection / a lightweight string-absence check if a plist test fixture exists.
+- Verification (non-behavioral): `Info.plist` / `Screencap.entitlements` / `project.yml` declare none of the three TCC services — assert by inspection / a lightweight string-absence check if a plist test fixture exists.
 
 **Verification:**
 - App declares and requests none of the three TCC services as its own subject on the daemon path; CLI-fallback probe gate unchanged; plist/entitlements confirmed clean with a documented rationale.
@@ -289,7 +289,7 @@ Decision matrix for whether the migration banner shows on a given launch:
 
 **Approach:**
 - Execute the AE2 smoke: rebuild the SwiftUI app + daemon binary five times in a row with the Developer ID identity; after each rebuild, confirm the daemon binary's Screen Recording / Accessibility / Input Monitoring grants persist without re-prompt (per the runbook's verification commands). Record the result in the runbook.
-- Write release notes: "ScreenCap now uses a background helper for stable permissions across updates. Grant permissions once and they'll persist across all future ScreenCap updates." Note the forward-only nature internally (not user-facing).
+- Write release notes: "Screencap now uses a background helper for stable permissions across updates. Grant permissions once and they'll persist across all future Screencap updates." Note the forward-only nature internally (not user-facing).
 
 **Patterns to follow:**
 - The parent plan's Success Metrics framing for AE2 (≥5 rebuilds, no re-prompt).
@@ -305,7 +305,7 @@ Decision matrix for whether the migration banner shows on a given launch:
 
 ## System-Wide Impact
 
-- **Interaction graph:** Adds one new on-disk artifact (`~/.screencap/.tcc-migrated-v1`) read at launch (`ScreenCapApp.task`) and written at install-complete (`FirstRunPermissionsView`). Touches the first-run sheet presentation policy (`MainWindow`) — the single highest-traffic onboarding surface — but only additively (a leading step when the marker is absent).
+- **Interaction graph:** Adds one new on-disk artifact (`~/.screencap/.tcc-migrated-v1`) read at launch (`ScreencapApp.task`) and written at install-complete (`FirstRunPermissionsView`). Touches the first-run sheet presentation policy (`MainWindow`) — the single highest-traffic onboarding surface — but only additively (a leading step when the marker is absent).
 - **Error propagation:** Marker read/write failures are non-fatal (R4) — a failed write means the banner re-shows once, a failed read defaults to "show the banner" (fail-toward-informing-the-user). The daemon's `permission_lost` event path is unchanged and remains the grant authority.
 - **State lifecycle risks:** Stale/spoofed marker → banner suppressed but grants independently verified (harmless). Marker written before grants complete → mitigated by writing only on `installedAndRunning` (U3 placement decision). User quits mid-install → no marker, banner eligible next launch.
 - **API surface parity:** No daemon API change, no CLI change, no recording-data-model change. Pure SwiftUI-shell + docs change.
@@ -347,4 +347,4 @@ Decision matrix for whether the migration banner shows on a given launch:
 - Upstream brainstorm: docs/brainstorms/2026-05-08-cli-gui-mcp-architecture-requirements.md (AE2 strategic payoff)
 - Related brainstorm (cert/notarization + future org switch): docs/brainstorms/2026-06-03-individual-apple-dev-membership-tester-distribution-requirements.md
 - Learnings: docs/solutions/build-errors/macos-ad-hoc-signing-tcc-rebuild-treadmill.md, docs/solutions/build-errors/env-export-prefix-silently-disables-team-signing.md
-- Key code: macos/ScreenCap/Controllers/PermissionController.swift, macos/ScreenCap/Views/Privacy/FirstRunPermissionsView.swift, macos/ScreenCap/Views/MainWindow.swift, macos/ScreenCap/ScreenCapApp.swift, macos/ScreenCap/Controllers/PrivacyController.swift
+- Key code: macos/Screencap/Controllers/PermissionController.swift, macos/Screencap/Views/Privacy/FirstRunPermissionsView.swift, macos/Screencap/Views/MainWindow.swift, macos/Screencap/ScreencapApp.swift, macos/Screencap/Controllers/PrivacyController.swift

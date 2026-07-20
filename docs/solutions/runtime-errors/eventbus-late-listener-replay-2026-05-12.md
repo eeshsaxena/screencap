@@ -9,7 +9,7 @@ modules:
   - src/screencap/daemon/event_bus.py
   - src/screencap/daemon/supervisor.py
   - src/screencap/daemon/app.py
-  - macos/ScreenCap/Controllers/RecorderController.swift
+  - macos/Screencap/Controllers/RecorderController.swift
 tags:
   - event-bus
   - race-condition

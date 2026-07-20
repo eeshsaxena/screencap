@@ -84,8 +84,8 @@ On-screen-text (OCR) Search shipped in SCR-174 (PR [#283](https://github.com/pro
 - `src/screencap/config.py` — `get_content_index_enabled()`, `get_content_index_consent_declined()`, `get_recordings_dir()`, `get_base_dir()`, `invalidate_config_cache()`. Settings read/write via CLI `settings` command (`src/screencap/cli/__init__.py`, `_BOOL_KEYS`); no dedicated `set_content_index_enabled()` setter exists.
 
 **Swift surface (SCR-174):**
-- `macos/ScreenCap/Controllers/DaemonClient.swift` — `request<T>(...)` one-shot + `subscribe(...)` events stream; existing typed methods (`contentSearch`, etc.).
-- `macos/ScreenCap/Views/Search/SearchViewModel.swift` — `consentNeeded`, `contentIndexEnabled` (consent CTA keys on the flag, not `index_state`); `macos/ScreenCap/Views/Search/SearchView.swift`; `macos/ScreenCap/Views/Search/SearchAccessibility.swift`.
+- `macos/Screencap/Controllers/DaemonClient.swift` — `request<T>(...)` one-shot + `subscribe(...)` events stream; existing typed methods (`contentSearch`, etc.).
+- `macos/Screencap/Views/Search/SearchViewModel.swift` — `consentNeeded`, `contentIndexEnabled` (consent CTA keys on the flag, not `index_state`); `macos/Screencap/Views/Search/SearchView.swift`; `macos/Screencap/Views/Search/SearchAccessibility.swift`.
 
 ### Institutional Learnings
 
@@ -413,14 +413,14 @@ graph LR
 **Dependencies:** U5
 
 **Files:**
-- Modify: `macos/ScreenCap/Controllers/DaemonClient.swift` (`backfillStart` / `backfillStatus` / `backfillCancel` + a typed progress-event decode in the events subscription)
-- Create: `macos/ScreenCap/Models/BackfillStatus.swift` (Codable status + progress models)
-- Test: `macos/ScreenCapTests/DaemonClientBackfillTests.swift`
+- Modify: `macos/Screencap/Controllers/DaemonClient.swift` (`backfillStart` / `backfillStatus` / `backfillCancel` + a typed progress-event decode in the events subscription)
+- Create: `macos/Screencap/Models/BackfillStatus.swift` (Codable status + progress models)
+- Test: `macos/ScreencapTests/DaemonClientBackfillTests.swift`
 
 **Approach:**
 - Add `static func backfillStart/Status/Cancel(...) async throws -> BackfillStatusResponse` using the existing `request<T>(...)` helper; decode `backfill.progress`/`backfill.completed`/`backfill.cancelled`/`backfill.paused` events in/alongside the existing `subscribe(...)` path. Pointer-only/local-only; the progress model carries `done/skipped/failed/total/currentUnitIndex` (an opaque ordinal) — **no recording name** (matches U5's payload).
 
-**Patterns to follow:** `macos/ScreenCap/Controllers/DaemonClient.swift` `contentSearch` + `subscribe`; existing Codable models under `macos/ScreenCap/Models/`.
+**Patterns to follow:** `macos/Screencap/Controllers/DaemonClient.swift` `contentSearch` + `subscribe`; existing Codable models under `macos/Screencap/Models/`.
 
 **Test scenarios:**
 - Decode a `backfill.status` envelope into `BackfillStatusResponse` (all states incl. `paused`).
@@ -441,8 +441,8 @@ graph LR
 **Dependencies:** U7
 
 **Files:**
-- Modify: `macos/ScreenCap/Views/Search/SearchViewModel.swift` (backfill trigger + progress state, alongside `consentNeeded`/`contentIndexEnabled`), `macos/ScreenCap/Views/Search/SearchView.swift` (the affordance + progress + cancel control), `macos/ScreenCap/Views/Search/SearchAccessibility.swift` (VoiceOver labels + keyboard control for the new controls)
-- Test: `macos/ScreenCapTests/SearchViewModelBackfillTests.swift`
+- Modify: `macos/Screencap/Views/Search/SearchViewModel.swift` (backfill trigger + progress state, alongside `consentNeeded`/`contentIndexEnabled`), `macos/Screencap/Views/Search/SearchView.swift` (the affordance + progress + cancel control), `macos/Screencap/Views/Search/SearchAccessibility.swift` (VoiceOver labels + keyboard control for the new controls)
+- Test: `macos/ScreencapTests/SearchViewModelBackfillTests.swift`
 
 **Approach:**
 - **Placement & modality:** when the user taps "Turn on" in the existing inline `consentBanner`, replace the banner body in place with the backfill offer ("Index your existing recordings now?" + Accept / Skip) before fully dismissing — one affordance slot, no new window. On Skip, dismiss to the normal post-consent state (no blank gap). Persist a Skip the same way `content_index_consent_declined` is persisted (a `content_index_backfill_declined`-style flag) so the offer doesn't re-nag every search; the user can still trigger it later from the same surface.
@@ -457,7 +457,7 @@ graph LR
 - **Return-key ownership:** while the affordance is in `indexing`/`starting` (cancel button prominent), stand down the existing `returnKeyHandler` (mirror the `results.consentNeeded && !consentDeclined` guard) so the hidden open-selected-result handler doesn't steal Return.
 - **Accessibility:** new controls get VoiceOver labels and are keyboard-operable (SCR-183). VoiceOver **announces terminal transitions only** (done / paused / cancelled / start-failed) via a `SearchAccessibility` builder mirroring `searchOutcomeAnnouncement` — in-progress `done/total` ticks do **not** announce (avoids flooding during a long run).
 
-**Patterns to follow:** SCR-174 consent CTA in `SearchViewModel`/`SearchView` (`consentBanner`, `enableConsent()`, `declineConsent()`); `macos/ScreenCap/Views/Search/SearchAccessibility.swift` `searchOutcomeAnnouncement`; the `subscribe(since:)` usage pattern; `content_index_consent_declined` persistence.
+**Patterns to follow:** SCR-174 consent CTA in `SearchViewModel`/`SearchView` (`consentBanner`, `enableConsent()`, `declineConsent()`); `macos/Screencap/Views/Search/SearchAccessibility.swift` `searchOutcomeAnnouncement`; the `subscribe(since:)` usage pattern; `content_index_consent_declined` persistence.
 
 **Test scenarios:**
 - Happy path: consenting + Accept calls `backfillStart` and moves the view model `starting → indexing → done`; progress events update done/total; "done" copy reflects failed==0.
@@ -560,5 +560,5 @@ graph LR
 - Live indexing path: `src/screencap/chunk_processor.py` (`_index_chunk_content`, `_do_index_chunk_content`)
 - Content index: `src/screencap/content_index.py`; skip set: `src/screencap/privacy/actions.py`, `src/screencap/scrubber.py`, `src/screencap/chunk_scrubber.py`
 - Job/lifecycle precedent: `src/screencap/daemon/supervisor.py`, `src/screencap/daemon/event_bus.py`, `src/screencap/daemon/_idle_shutdown.py`, `src/screencap/pipeline_state.py`
-- Swift surface: `macos/ScreenCap/Controllers/DaemonClient.swift`, `macos/ScreenCap/Views/Search/SearchViewModel.swift`
+- Swift surface: `macos/Screencap/Controllers/DaemonClient.swift`, `macos/Screencap/Views/Search/SearchViewModel.swift`
 - Learnings: `docs/solutions/runtime-errors/chunk-upload-sentinel-gating-and-data-loss.md`, `docs/solutions/workflow-issues/privacy-guards-deselected-on-ci-silently-rot-2026-06-10.md`, `docs/solutions/runtime-errors/sigint-handler-timing-and-recording-stop-methods.md`, `docs/solutions/integration-issues/inner-timeout-unreachable-behind-outer-watchdog-2026-06-24.md`, `docs/solutions/runtime-errors/eventbus-late-listener-replay-2026-05-12.md`

@@ -66,10 +66,10 @@ Helper discovery
 1. ``SCREENCAP_ONDEVICE_HELPER`` env var (an explicit path) — used first. It is
    both a test seam (point it at a fake helper) and the PRIMARY production
    channel: the daemon launcher inside the app bundle exports it at
-   ``…/ScreenCap.app/Contents/MacOS/IntelligenceHelper`` (the launcher knows the
+   ``…/Screencap.app/Contents/MacOS/IntelligenceHelper`` (the launcher knows the
    layout), covering both the nested-daemon bundle and dev-source runs.
 2. The bundled helper, discovered by walking up to the enclosing
-   ``ScreenCap.app/Contents/MacOS/IntelligenceHelper`` (see
+   ``Screencap.app/Contents/MacOS/IntelligenceHelper`` (see
    :func:`_find_bundled_helper`). This is the fallback when the env var is
    unset; it walks PAST the nested ``ScreencapDaemon.app`` Contents to the outer
    app. A source/dev checkout has no app-bundle ancestry, so this fallback finds
@@ -195,13 +195,13 @@ def _scrubbed_env() -> dict[str, str]:
 
 
 def _find_bundled_helper() -> Path | None:
-    """Return the helper inside the enclosing ``ScreenCap.app`` bundle, if any.
+    """Return the helper inside the enclosing ``Screencap.app`` bundle, if any.
 
     The helper is built into the OUTER app at
-    ``ScreenCap.app/Contents/MacOS/IntelligenceHelper`` (the app's "Embed
+    ``Screencap.app/Contents/MacOS/IntelligenceHelper`` (the app's "Embed
     IntelligenceHelper" build phase copies it there). The daemon that imports
     this module, though, runs from a NESTED helper bundle after SCR-196
-    (``ScreenCap.app/Contents/Library/LoginItems/ScreencapDaemon.app``), whose
+    (``Screencap.app/Contents/Library/LoginItems/ScreencapDaemon.app``), whose
     own ``Contents/MacOS`` carries no helper. So we walk up through EVERY
     ``…/Contents`` ancestor and take the first that has a runnable
     ``MacOS/IntelligenceHelper`` — skipping the nested bundle's helper-less
@@ -222,7 +222,7 @@ def _find_bundled_helper() -> Path | None:
                 return candidate
             # Not in THIS bundle's MacOS — keep walking up. The daemon runs from
             # a nested ScreencapDaemon.app whose Contents has no helper; the one
-            # it needs sits in an ANCESTOR bundle (the outer ScreenCap.app).
+            # it needs sits in an ANCESTOR bundle (the outer Screencap.app).
     return None
 
 

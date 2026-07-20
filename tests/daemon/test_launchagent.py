@@ -67,11 +67,11 @@ def test_render_plist_with_log_dir_sets_absolute_path_keys(tmp_path: Path):
 
     content = launchagent.render_plist(
         program="/usr/local/bin/screencap",
-        log_dir=str(tmp_path / "Library/Logs/ScreenCap"),
+        log_dir=str(tmp_path / "Library/Logs/Screencap"),
     )
     parsed = _parse_plist(content)
 
-    expected = str(tmp_path / "Library/Logs/ScreenCap")
+    expected = str(tmp_path / "Library/Logs/Screencap")
     assert parsed["StandardErrorPath"] == f"{expected}/daemon.err.log"
     assert parsed["StandardOutPath"] == f"{expected}/daemon.out.log"
 
@@ -107,7 +107,7 @@ def test_bundled_macos_launchagent_plist_matches_renderer():
     from screencap.daemon import launchagent
 
     repo_root = Path(__file__).resolve().parents[2]
-    bundled = repo_root / "macos" / "ScreenCap" / "Resources" / "com.screencap.daemon.plist"
+    bundled = repo_root / "macos" / "Screencap" / "Resources" / "com.screencap.daemon.plist"
 
     expected = launchagent.render_plist(
         program="screencap-daemon-launcher",
@@ -119,7 +119,7 @@ def test_bundled_macos_launchagent_plist_matches_renderer():
 
 def test_macos_embed_script_writes_dev_aware_daemon_launcher():
     repo_root = Path(__file__).resolve().parents[2]
-    embed_script = repo_root / "macos" / "ScreenCap" / "Scripts" / "embed-cli.sh"
+    embed_script = repo_root / "macos" / "Screencap" / "Scripts" / "embed-cli.sh"
 
     text = embed_script.read_text(encoding="utf-8")
 
@@ -192,7 +192,7 @@ def test_install_is_idempotent_when_existing_plist_has_same_content(
     # Match install()'s rendering: it bakes an absolute log dir under the
     # current user's home, so the idempotency check requires the same
     # log_dir argument to produce byte-identical content.
-    install_log_dir = str(Path.home() / "Library" / "Logs" / "ScreenCap")
+    install_log_dir = str(Path.home() / "Library" / "Logs" / "Screencap")
     expected_content = launchagent.render_plist(
         program="/bin/screencap", log_dir=install_log_dir
     )

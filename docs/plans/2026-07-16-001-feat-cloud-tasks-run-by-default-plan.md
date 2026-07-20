@@ -166,10 +166,10 @@ terminal_stage._finalize_local_tasks
 **Dependencies:** U1 (copy must describe the shipped behavior).
 
 **Files:**
-- `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift` — in `cloudTasksSection`, replace the two `consentToggleRow(...)` calls with informational rows (title + caption, no control); remove the `consentNudgeVisible` block; reframe the day-split `fixedRow` (drop the "On-device" chip or replace with model-agnostic framing); keep the frames `fixedRow` and the trust footer. Remove now-unused `toggleConsent`, `pendingConsentRows`, and the `consentToggleRow` helper if nothing else references them (keep `writeError` if still used by provider writes).
-- `macos/ScreenCap/Views/Settings/IntelligenceSelectionModel.swift` — update `summaryConsentRowCaption`, `recallConsentRowCaption`, `daySplitRowTitle`/`daySplitRowCaption`, and `daySplitChipLabel` (drop or repurpose); remove `consentNudgeCopy` and the `consentNudgeVisible(...)` predicate; update the `allAuditedCopy` corpus to add/remove exactly the strings changed.
-- `macos/ScreenCapTests/IntelligenceSelectionModelTests.swift` — remove the nudge tests; keep/extend the honest-copy audit test against the revised corpus.
-- `macos/ScreenCapTests/IntelligenceSettingsTests.swift` — the controller-level `setConsent` / decode / settable-rows tests stay valid (KTD4); adjust only if a test asserted the removed toggle rows render.
+- `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift` — in `cloudTasksSection`, replace the two `consentToggleRow(...)` calls with informational rows (title + caption, no control); remove the `consentNudgeVisible` block; reframe the day-split `fixedRow` (drop the "On-device" chip or replace with model-agnostic framing); keep the frames `fixedRow` and the trust footer. Remove now-unused `toggleConsent`, `pendingConsentRows`, and the `consentToggleRow` helper if nothing else references them (keep `writeError` if still used by provider writes).
+- `macos/Screencap/Views/Settings/IntelligenceSelectionModel.swift` — update `summaryConsentRowCaption`, `recallConsentRowCaption`, `daySplitRowTitle`/`daySplitRowCaption`, and `daySplitChipLabel` (drop or repurpose); remove `consentNudgeCopy` and the `consentNudgeVisible(...)` predicate; update the `allAuditedCopy` corpus to add/remove exactly the strings changed.
+- `macos/ScreencapTests/IntelligenceSelectionModelTests.swift` — remove the nudge tests; keep/extend the honest-copy audit test against the revised corpus.
+- `macos/ScreencapTests/IntelligenceSettingsTests.swift` — the controller-level `setConsent` / decode / settable-rows tests stay valid (KTD4); adjust only if a test asserted the removed toggle rows render.
 
 **Approach:** The section keeps its header and trust footer. Rows 1–3 (summaries, answers, day-split) render as `fixedRow`-style informational rows without a chip; row 4 (frames) keeps the "Always off" chip. New day-split caption states it runs on your connected model — on-device when available, your cloud model when there isn't one — text only, never screen images. Keep it honest and short.
 
@@ -238,5 +238,5 @@ terminal_stage._finalize_local_tasks
 - `src/screencap/terminal_stage.py` — `_finalize_local_tasks`, `_summary_cloud_fallback`, `_heuristic_local_tasks` (the degradation ladder).
 - `src/screencap/segmentation/recall.py` — the sanctioned consented-cloud dispatch pattern mirrored by the summary fallback.
 - `src/screencap/config.py` — `get_summary_cloud_consent` / `get_recall_cloud_consent` (default flip site).
-- `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift` + `IntelligenceSelectionModel.swift` — the pane and its copy/audit corpus.
+- `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift` + `IntelligenceSelectionModel.swift` — the pane and its copy/audit corpus.
 - `tests/segmentation/test_consent.py` — the privacy-lane consent matrix tests.

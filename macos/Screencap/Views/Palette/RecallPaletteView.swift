@@ -1,0 +1,973 @@
+import AppKit
+import SwiftUI
+
+// U10 — the Recall palette (design 554–597): a command-palette overlay over the
+// main window (KTD-4) re-presenting the existing search stack — SearchViewModel,
+// SearchService, SnippetHighlighter, ranking, recents — unchanged (KTD-2).
+// Dimmed scrim, 620pt panel at top-center, keyboard-first: ↑↓ browse (wrapping),
+// ↵ jumps to the Day timeline at the hit moment, esc dismisses and cancels the
+// in-flight query. Consent + backfill states embed inside the panel.
+
+/// The stateful overlay: owns the model, query lifecycle, selection, and
+/// dismissal; renders `RecallPaletteContent` (pure, hostable in tests).
+struct RecallPaletteView: View {
+    @Binding var isPresented: Bool
+    /// ↵ / click on a hit — MainWindow routes to the Day timeline (U9). `seekMs`
+    /// is nil for an UNANCHORED hit (U12/R13): the hit keeps its day (from the
+    /// recording's `startedAt`) and lands on the day page at the day's start
+    /// rather than being dropped.
+    var onJump: (Date, Int?) -> Void
+
+    @StateObject private var model = SearchViewModel()
+    @StateObject private var recentStore = RecentSearchesStore()
+    /// SCR-258 U10 (AE3/AE8): the store state gates the panel so a locked / absent
+    /// store shows the explicit state instead of a blank/empty result list.
+    @EnvironmentObject private var index: RecordingsIndex
+    @EnvironmentObject private var store: StoreController
+    @State private var runner: RecallPaletteQueryRunner?
+    @State private var frameIndex = RecordingFrameIndex()
+    @State private var thumbnailLoader = ThumbnailLoader()
+
+    /// Search U6 (R4): one shared present-user gate for every gated corpus surface
+    /// in this palette session, so the grace window is shared (not re-prompted per
+    /// result). Only handed to the content when the corpus is encrypted.
+    @StateObject private var presenceGate = PresenceGate()
+
+    @State private var query = ""
+    // nil = settings not yet loaded (or the load failed) — tri-state (SCR-261
+    // R12/KTD6) so an unresolved flag stays quiet in the empty-cause
+    // derivation instead of masquerading as a known "off".
+    @State private var contentIndexEnabled: Bool? = nil
+    // nil = not yet loaded. Treated as "gated" until loadSettings() positively
+    // resolves it, so recall results never render un-gated during the async load
+    // window (fail-closed on the presence gate).
+    @State private var corpusEncrypted: Bool? = nil
+    @State private var consentDeclined = false
+    @State private var backfillDeclined = false
+    @State private var selectedResultID: SearchResultItem.ID?
+    // nil = no `.loaded` phase observed yet this palette session — the footer's
+    // indexed badge stays quiet until a loaded result has positively reported
+    // the index built (SCR-261 R11).
+    @State private var lastKnownScreenNotIndexed: Bool? = nil
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            scrim
+            panel
+                .frame(width: 620)
+                .padding(.top, 60)
+        }
+        .task {
+            runner = RecallPaletteQueryRunner { [weak model] text in
+                // The view-model signature stays a plain Bool (DayTimelineView
+                // shares it); an unresolved flag searches as "off".
+                await model?.search(text, contentIndexEnabled: contentIndexEnabled ?? false)
+            }
+            // SCR-261 U3 (KTD9/R9): backfill finished (including with partial
+            // failures) → refresh a live query once, non-debounced, so results
+            // reflect the new index. Never for an empty/cleared query. Weak
+            // runner capture only — capturing the view struct here would cycle
+            // model → closure → view copy → @StateObject box → model.
+            model.onBackfillCompleted = { [weak runner] in
+                runner?.refreshIfNonEmpty()
+            }
+            // SCR-258 U10: refresh so the store state is current when the palette
+            // opens (a store locked from another surface flips this).
+            await index.refresh()
+            await loadSettings()
+            fieldFocused = true
+        }
+        .onChange(of: query) { _ in runner?.search(query, debounced: true) }
+        .onChange(of: model.phase) { phase in
+            if case .loaded(let results) = phase {
+                selectedResultID = nil
+                lastKnownScreenNotIndexed = results.coverage.screen == .notIndexed
+            }
+        }
+    }
+
+    private var scrim: some View {
+        Color.scDarkCanvas.opacity(0.35)
+            .ignoresSafeArea()
+            .contentShape(Rectangle())
+            .onTapGesture { dismiss() }
+            .accessibilityHidden(true)
+    }
+
+    private var panel: some View {
+        VStack(spacing: 0) {
+            header
+            if index.storeState.isMounted {
+                RecallPaletteContent(
+                    phase: model.phase,
+                    consentDeclined: consentDeclined,
+                    backfillState: model.backfillState,
+                    contentIndexEnabled: contentIndexEnabled,
+                    recentSearches: recentStore.recent,
+                    queryTerms: queryTerms,
+                    selectedResultID: selectedResultID,
+                    frameIndex: frameIndex,
+                    thumbnailLoader: thumbnailLoader,
+                    // U12/R13 — resolve a recording's day (from `startedAt`) so an
+                    // unanchored hit's title keeps its DAY instead of the retired
+                    // recording-name fallback. Index-backed; the pure test host
+                    // defaults it to nil.
+                    recordingDay: { name in
+                        index.recordings.first(where: { $0.name == name })?.startedDay
+                    },
+                    // Unknown (nil, pre-load) -> gated: default to requiring presence
+                    // until settings confirm the corpus is NOT encrypted.
+                    presenceGate: (corpusEncrypted ?? true) ? presenceGate : nil,
+                    onEnableConsent: enableConsent,
+                    onDeclineConsent: declineConsent,
+                    onAcceptBackfill: model.acceptBackfill,
+                    onSkipBackfill: skipBackfill,
+                    onCancelBackfill: model.cancelBackfill,
+                    onResumeBackfill: model.resumeBackfill,
+                    onStartBackfill: startBackfill,
+                    onRunChip: runChipQuery,
+                    onOpen: jump,
+                    onRetry: { runner?.search(query, debounced: false) },
+                    onUpgrade: upgrade
+                )
+            } else {
+                // SCR-258 U10 (AE3/AE8): a non-mounted store renders the explicit
+                // locked/absent/key-missing state, not an empty result list.
+                StoreStateView(
+                    storeState: index.storeState,
+                    onUnlock: { store.unlock() },
+                    onRetry: { Task { await index.refresh() } },
+                    onSetup: { store.initializeStore() },
+                    isBusy: store.phase != .idle,
+                    errorText: store.lastError,
+                    compact: true
+                )
+            }
+            footer
+        }
+        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+        )
+        .shadow(color: Color.scDarkCanvas.opacity(0.35), radius: 30, y: 24)
+        .onExitCommand { dismiss() }
+        .background(keyboardNav)
+    }
+
+    // MARK: - Header (design 557–562)
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.scTeal)
+                .accessibilityHidden(true)
+            TextField("Search any moment", text: $query)
+                .textFieldStyle(.plain)
+                .font(SCTypography.sans(size: 16))
+                .foregroundStyle(Color.scInk)
+                .focused($fieldFocused)
+                .onSubmit { submit() }
+                .accessibilityLabel("Search any moment. Searches only what's on this Mac.")
+            Spacer(minLength: 8)
+            Text("searching this Mac only")
+                .font(SCTypography.mono(size: 11))
+                .foregroundStyle(Color.scInkMuted)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+        .overlay(alignment: .bottom) { Divider().overlay(Color.scFillSubtle) }
+    }
+
+    // MARK: - Footer (design 591–594)
+
+    /// SCR-261 U4 (R11) — the footer claims indexed coverage only when
+    /// indexing is on AND the index was observed built by a loaded result.
+    /// Idle/searching inherit the last honest observation (the latch),
+    /// defaulting to no claim before any search has loaded. Off or unknown
+    /// settings drop the claim outright.
+    private var showsIndexedBadge: Bool {
+        contentIndexEnabled == true && lastKnownScreenNotIndexed == false
+    }
+
+    private var footer: some View {
+        HStack {
+            Text("↑↓ browse · ↵ jump to moment · esc close")
+                .font(SCTypography.mono(size: 10.5))
+                .foregroundStyle(Color.scInkMuted)
+            Spacer()
+            if showsIndexedBadge {
+                Text("indexed on-device")
+                    .font(SCTypography.mono(size: 10.5))
+                    .foregroundStyle(Color.scTeal)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(Color.scCanvas)
+        .overlay(alignment: .top) { Divider().overlay(Color.scFillSubtle) }
+    }
+
+    /// ↑↓ via invisible shortcut buttons — they fire while the text field holds
+    /// focus, moving the selection with wrap (RecallPalette.next/previous).
+    private var keyboardNav: some View {
+        Group {
+            Button("") { selectedResultID = RecallPalette.next(after: effectiveID, in: orderedItems) }
+                .keyboardShortcut(.downArrow, modifiers: [])
+            Button("") { selectedResultID = RecallPalette.previous(before: effectiveID, in: orderedItems) }
+                .keyboardShortcut(.upArrow, modifiers: [])
+        }
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
+    // MARK: - Derived
+
+    private var orderedItems: [SearchResultItem] {
+        guard case .loaded(let results) = model.phase else { return [] }
+        return RecallPalette.orderedItems(results)
+    }
+
+    private var effectiveID: SearchResultItem.ID? {
+        RecallPalette.effectiveSelection(selectedResultID, in: orderedItems)?.id
+    }
+
+    private var queryTerms: [String] {
+        guard case .loaded(let results) = model.phase else { return [] }
+        return results.queryTerms
+    }
+
+    // MARK: - Actions
+
+    /// ↵: jump to the selected (or first) hit; with no results yet, commit the
+    /// query immediately (bypassing the live debounce).
+    private func submit() {
+        if let item = RecallPalette.effectiveSelection(selectedResultID, in: orderedItems) {
+            jump(item)
+            return
+        }
+        recentStore.record(query)
+        runner?.search(query, debounced: false)
+    }
+
+    private func jump(_ item: SearchResultItem) {
+        // U12/R13 — an unanchored hit is NEVER dropped: fall back to the
+        // recording's day (from its `startedAt`), landing on the day page at the
+        // day's start (seek unknown). Only a truly unresolvable hit (no anchor
+        // AND no known recording day) has nowhere to land.
+        let day: Date
+        let seekMs: Int?
+        if let target = RecallPalette.timelineTarget(for: item) {
+            day = target.day
+            seekMs = target.seekMs
+        } else if let recDay = index.recordings.first(where: { $0.name == item.recording })?.startedDay {
+            day = recDay
+            seekMs = nil
+        } else {
+            return
+        }
+        recentStore.record(query)
+        dismiss()
+        onJump(day, seekMs)
+    }
+
+    private func runChipQuery(_ text: String) {
+        query = text
+        recentStore.record(text)
+        runner?.search(text, debounced: false)
+    }
+
+    /// esc / scrim-click: cancel the in-flight query, then close.
+    private func dismiss() {
+        runner?.cancel()
+        isPresented = false
+    }
+
+    /// U12: the subscription-required CTA — close the palette, then surface the
+    /// shared upgrade prompt (MainWindow observes the notification). The palette
+    /// overlays the shell, so dismissing it first prevents the sheet from
+    /// presenting under the scrim.
+    private func upgrade() {
+        dismiss()
+        NotificationCenter.default.post(name: .screenCapOpenAccountGate, object: nil)
+    }
+
+    // MARK: - Settings + consent (inherited from the retired SearchView, palette-scoped)
+
+    private func loadSettings() async {
+        do {
+            let data = try await CLIClient.runJSONRaw(["settings", "--json"])
+            let env = try JSONDecoder().decode(SettingsEnvelope.self, from: data)
+            contentIndexEnabled = env.settings.contentIndexEnabled ?? false
+            corpusEncrypted = env.settings.corpusEncrypted ?? false
+            consentDeclined = env.settings.contentIndexConsentDeclined ?? false
+            backfillDeclined = env.settings.contentIndexBackfillDeclined ?? false
+            if let dur = env.settings.chunkDuration { model.chunkDurationSeconds = dur }
+        } catch {
+            // SCR-261 R12: a failed settings read leaves the flag unresolved
+            // (nil) — never a fabricated "off", which would nag about consent
+            // the user may already have given.
+        }
+    }
+
+    /// Enable on-screen-text indexing going forward, then re-run the query —
+    /// optimistic with revert-on-failure (the retired SearchView's
+    /// enableConsent pattern).
+    private func enableConsent() {
+        let prior = contentIndexEnabled
+        contentIndexEnabled = true
+        model.offerBackfill(alreadyDeclined: backfillDeclined)
+        Task {
+            do {
+                _ = try await CLIClient.runJSONRaw(
+                    ["settings", "--set", "content_index_enabled=true", "--json"]
+                )
+            } catch {
+                // Revert to what we knew before the optimistic flip (false, or
+                // nil when the settings read never resolved — tri-state).
+                contentIndexEnabled = prior
+                model.dismissBackfillOffer()
+                return
+            }
+            runner?.search(query, debounced: false)
+        }
+    }
+
+    private func declineConsent() {
+        consentDeclined = true
+        Task {
+            do {
+                _ = try await CLIClient.runJSONRaw(
+                    ["settings", "--set", "content_index_consent_declined=true", "--json"]
+                )
+            } catch {
+                consentDeclined = false
+            }
+        }
+    }
+
+    private func skipBackfill() {
+        backfillDeclined = true
+        model.skipBackfill()
+    }
+
+    /// SCR-261 U3 (KTD5): the not-indexed empty body's "Index now" — an
+    /// explicit accept that must work for a prior decliner, so it goes to
+    /// `startBackfillFromEmptyState()` directly (never through
+    /// `offerBackfill(alreadyDeclined:)`, which no-ops). The view-local decline
+    /// memory resets too, so a same-session `enableConsent` doesn't consult a
+    /// stale decline; the model clears the persisted flag through its seam.
+    private func startBackfill() {
+        backfillDeclined = false
+        model.startBackfillFromEmptyState()
+    }
+}
+
+/// The palette's pure body: renders one `RecallPalette.State` variant plus the
+/// grouped result rows. No live model, no sockets — hostable by
+/// RecallPaletteStateTests with SearchFixtures.
+struct RecallPaletteContent: View {
+    let phase: SearchViewModel.Phase
+    let consentDeclined: Bool
+    let backfillState: SearchViewModel.BackfillUIState
+    /// Live settings flag (nil = not yet resolved / load failed) — drives the
+    /// SCR-261 empty-cause derivation. The hosting view's state is tri-state
+    /// too (U3), so an unresolved load flows through as nil.
+    var contentIndexEnabled: Bool? = nil
+    let recentSearches: [String]
+    let queryTerms: [String]
+    let selectedResultID: SearchResultItem.ID?
+    let frameIndex: RecordingFrameIndex?
+    let thumbnailLoader: ThumbnailLoader?
+    /// U12/R13 — resolve a recording name → its local calendar day, so an
+    /// unanchored hit's title keeps the DAY (never the recording name, R5).
+    /// Defaulted to nil-returning so the pure test host stays index-free.
+    var recordingDay: (String) -> Date? = { _ in nil }
+    /// Search U6 (R4): when set (corpus encrypted / guardrails on), the results list
+    /// — which carries still previews — reveals only after present-user auth. `nil`
+    /// (default / pre-flip) leaves results ungated, unchanged.
+    var presenceGate: PresenceGate? = nil
+    var onEnableConsent: () -> Void = {}
+    var onDeclineConsent: () -> Void = {}
+    var onAcceptBackfill: () -> Void = {}
+    var onSkipBackfill: () -> Void = {}
+    var onCancelBackfill: () -> Void = {}
+    var onResumeBackfill: () -> Void = {}
+    /// Start indexing existing recordings — the not-indexed empty state's CTA
+    /// (SCR-261). Wired by the hosting view to the explicit-accept path
+    /// (`startBackfillFromEmptyState`), which works for a prior decliner.
+    var onStartBackfill: () -> Void = {}
+    var onRunChip: (String) -> Void = { _ in }
+    var onOpen: (SearchResultItem) -> Void = { _ in }
+    /// Re-run the current query — the daemon-down state's retry affordance.
+    var onRetry: () -> Void = {}
+    /// Open the upgrade prompt — the subscription-required state's CTA (U12).
+    var onUpgrade: () -> Void = {}
+
+    private var state: RecallPalette.State {
+        RecallPalette.state(
+            phase: phase,
+            consentDeclined: consentDeclined,
+            backfillState: backfillState,
+            contentIndexEnabled: contentIndexEnabled,
+            recents: recentSearches
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if state.showsConsentBanner { consentBanner }
+            if state.backfill != .hidden { backfillSection }
+            bodyContent
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var bodyContent: some View {
+        switch state.body {
+        case .idle(let recents):
+            idleState(recents)
+        case .searching:
+            HStack {
+                Spacer()
+                ProgressView().controlSize(.small)
+                Spacer()
+            }
+            .padding(.vertical, 28)
+        case .daemonDown:
+            message(
+                icon: "bolt.horizontal.circle",
+                title: "Screencap isn't running",
+                note: "Start Screencap's background helper to search your history.",
+                retry: onRetry,
+                retryHint: RecallPaletteContent.retryAgainHint
+            )
+        case .subscriptionRequired:
+            // U12: lapsed / not-entitled. An upgrade CTA — NOT the error/retry
+            // treatment — so search reads as "upgrade to search", not broken. The
+            // reassurance mirrors the Library banner: existing recordings stay
+            // browsable + exportable on this Mac.
+            message(
+                icon: "lock.circle",
+                title: "Subscribe to search",
+                note: "Search needs an active subscription. Your recordings are safe on this Mac — you can still browse and export them.",
+                actionTitle: "Subscribe",
+                action: onUpgrade,
+                actionHint: "Opens the upgrade options."
+            )
+        case .empty(let cause, let showsUnavailableNote):
+            emptyState(cause: cause, showsUnavailableNote: showsUnavailableNote)
+        case .results:
+            resultsList
+        }
+    }
+
+    // MARK: - Results (design 564–590)
+
+    @ViewBuilder
+    private var resultsList: some View {
+        if case .loaded(let results) = phase {
+            if let gate = presenceGate {
+                // Search U6 (R4): one unlock reveals the whole results set (still
+                // previews + text) and opens the session grace window.
+                PresenceGatedContent(gate: gate, reason: "View your search results") {
+                    resultsScroll(results)
+                }
+                .frame(maxHeight: 420)
+            } else {
+                resultsScroll(results)
+                    .frame(maxHeight: 420)
+            }
+        }
+    }
+
+    private func resultsScroll(_ results: SearchResults) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(RecallPalette.groups(results), id: \.label) { group in
+                    Text(group.label)
+                        .font(SCTypography.mono(size: 10))
+                        .tracking(1.0)
+                        .foregroundStyle(Color.scInkMuted)
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(group.items, id: \.id) { item in
+                        RecallPaletteRow(
+                            item: item,
+                            queryTerms: queryTerms,
+                            isSelected: item.id == effectiveSelectedID(results),
+                            frameIndex: frameIndex,
+                            thumbnailLoader: thumbnailLoader,
+                            recordingDay: recordingDay(item.recording),
+                            onOpen: { onOpen(item) }
+                        )
+                    }
+                }
+            }
+            .padding(14)
+        }
+    }
+
+    private func effectiveSelectedID(_ results: SearchResults) -> SearchResultItem.ID? {
+        RecallPalette.effectiveSelection(selectedResultID, in: RecallPalette.orderedItems(results))?.id
+    }
+
+    // MARK: - Idle (recents, U10 test scenario)
+
+    private func idleState(_ recents: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Search everything you've recorded — words on screen, spoken audio, apps.")
+                .font(SCTypography.sans(size: 12.5))
+                .foregroundStyle(Color.scInkSecondary)
+            if !recents.isEmpty {
+                Text("RECENT")
+                    .font(SCTypography.mono(size: 10))
+                    .tracking(1.0)
+                    .foregroundStyle(Color.scInkMuted)
+                FlowChips(texts: recents, onTap: onRunChip)
+            }
+        }
+        .padding(20)
+    }
+
+    // MARK: - Consent banner (copy carried over from the retired Search pane)
+
+    private var consentBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Search on-screen text too?")
+                .font(SCTypography.sans(size: 13, weight: .semibold))
+                .foregroundStyle(Color.scInk)
+            Text("Turn this on to also search the text that was on your screen. Newly recorded screens become searchable — it all stays on this Mac and is never uploaded.")
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scInkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Not now", action: onDeclineConsent)
+                Button("Turn on", action: onEnableConsent)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.scTeal)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.scTealSoft.opacity(0.4))
+        .overlay(alignment: .bottom) { Divider().overlay(Color.scFillSubtle) }
+    }
+
+    // MARK: - Backfill affordance (SCR-178 states, palette-compact)
+
+    @ViewBuilder
+    private var backfillSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch state.backfill {
+            case .hidden:
+                EmptyView()
+            case .offering:
+                Text("Index your existing recordings now?")
+                    .font(SCTypography.sans(size: 13, weight: .semibold))
+                Text("Searches only cover what's been indexed. This runs on this Mac and can be paused anytime.")
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkSecondary)
+                HStack(spacing: 8) {
+                    Button("Skip", action: onSkipBackfill)
+                    Button("Index now", action: onAcceptBackfill)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.scTeal)
+                }
+            case .starting:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing to index…")
+                        .font(SCTypography.sans(size: 12))
+                    Spacer()
+                    Button("Cancel", action: onCancelBackfill)
+                }
+            case .indexing(let done, let total, _):
+                HStack(spacing: 8) {
+                    ProgressView(value: Double(done), total: Double(max(total, 1)))
+                        .frame(width: 140)
+                    Text("Indexed \(done) of \(total)")
+                        .font(SCTypography.sans(size: 12))
+                    Spacer()
+                    Button("Cancel", action: onCancelBackfill)
+                }
+            case .done(let done, let total, let failed):
+                Text(failed == 0 ? "All set — \(done) indexed." : "Indexing finished — \(done) of \(total), \(failed) failed.")
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkSecondary)
+            case .paused(let done, let total), .cancelled(let done, let total):
+                HStack(spacing: 8) {
+                    Text("Indexed \(done) of \(total) so far — resume to continue.")
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkSecondary)
+                    Spacer()
+                    Button("Resume", action: onResumeBackfill)
+                }
+            case .startFailed:
+                Text("Couldn't start indexing — try again later.")
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkSecondary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.scCanvas)
+        .overlay(alignment: .bottom) { Divider().overlay(Color.scFillSubtle) }
+    }
+
+    // MARK: - Empty causes (SCR-261)
+
+    /// Everything the empty body renders for one cause — icon, honest copy,
+    /// and which CTA (if any). Pure and equatable so RecallPaletteStateTests
+    /// can pin the copy and button presence without reading the render.
+    struct EmptySpec: Equatable {
+        enum CTA: Equatable {
+            /// "Turn on" → `onEnableConsent`.
+            case enableConsent(title: String, hint: String)
+            /// "Index now" → `onStartBackfill`.
+            case startBackfill(title: String, hint: String)
+            /// The daemon-down state's existing Retry mechanism → `onRetry`.
+            case retry(hint: String)
+        }
+        let icon: String
+        let title: String
+        let note: String
+        var cta: CTA? = nil
+    }
+
+    /// The one de-emphasized aside every consent/indexing-tier empty carries
+    /// when a *different* searched stream errored (`showsUnavailableNote`).
+    static let unavailableNote = "Some of this Mac couldn't be searched right now."
+
+    /// The retry CTA's VoiceOver hint, shared by every retry-bearing state.
+    static let retryAgainHint = "Searches again now."
+
+    static func emptySpec(for cause: RecallPalette.State.EmptyCause) -> EmptySpec {
+        switch cause {
+        case .noMatches:
+            // The legacy empty state, verbatim — a pinned regression surface.
+            return EmptySpec(
+                icon: "magnifyingglass",
+                title: "No matches on this Mac",
+                note: "Try different words, an app name, or a time like \u{201C}yesterday afternoon\u{201D}."
+            )
+        case .consentNeeded:
+            // "isn't being indexed", never "wasn't searched" — a stale index
+            // may well have been searched.
+            return EmptySpec(
+                icon: "doc.text.magnifyingglass",
+                title: "On-screen text isn't being indexed",
+                note: "Turn it on and Search can look through the text that was on your screen — it all stays on this Mac.",
+                cta: .enableConsent(title: "Turn on", hint: "Turns on on-screen text indexing.")
+            )
+        case .consentDeclined:
+            // The user said no — an honest notice, no nagging CTA.
+            return EmptySpec(
+                icon: "doc.text.magnifyingglass",
+                title: "Screen text isn't being indexed",
+                note: "Matches may exist on screen. You can turn on indexing anytime."
+            )
+        case .notIndexed(ctaAvailable: true):
+            return EmptySpec(
+                icon: "clock.arrow.circlepath",
+                title: "Your recordings aren't indexed for text search yet",
+                note: "Index your history to make the text that was on screen searchable — it all stays on this Mac.",
+                cta: .startBackfill(title: "Index now", hint: "Starts indexing your recordings.")
+            )
+        case .notIndexed(ctaAvailable: false):
+            // The backfill section above owns the ask — defer to it.
+            return EmptySpec(
+                icon: "clock.arrow.circlepath",
+                title: "Your recordings aren't indexed for text search yet",
+                note: "Indexing is available above."
+            )
+        case .degraded:
+            // A search DID run, just in a limited mode — softer than
+            // unavailable, and nothing to retry into a better mode.
+            return EmptySpec(
+                icon: "magnifyingglass",
+                title: "Results may be incomplete",
+                note: "Text search ran in a limited mode on this Mac, so some matches may not appear."
+            )
+        case .unavailable:
+            return EmptySpec(
+                icon: "exclamationmark.circle",
+                title: "Couldn't search everything",
+                note: "Part of search on this Mac isn't available right now. Your recordings are safe.",
+                cta: .retry(hint: retryAgainHint)
+            )
+        }
+    }
+
+    /// One empty cause → the message layout, with its CTA routed to the
+    /// matching callback. No Unlock/presence affordance on any empty variant
+    /// (KTD2).
+    @ViewBuilder
+    private func emptyState(
+        cause: RecallPalette.State.EmptyCause,
+        showsUnavailableNote: Bool
+    ) -> some View {
+        let spec = Self.emptySpec(for: cause)
+        let secondary = showsUnavailableNote ? Self.unavailableNote : nil
+        switch spec.cta {
+        case .enableConsent(let title, let hint):
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary,
+                    actionTitle: title, action: onEnableConsent, actionHint: hint)
+        case .startBackfill(let title, let hint):
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary,
+                    actionTitle: title, action: onStartBackfill, actionHint: hint)
+        case .retry(let hint):
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary, retry: onRetry, retryHint: hint)
+        case nil:
+            message(icon: spec.icon, title: spec.title, note: spec.note,
+                    secondaryNote: secondary)
+        }
+    }
+
+    // MARK: - Message state
+
+    private func message(
+        icon: String,
+        title: String,
+        note: String,
+        secondaryNote: String? = nil,
+        retry: (() -> Void)? = nil,
+        retryHint: String? = nil,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil,
+        actionHint: String? = nil
+    ) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 22))
+                .foregroundStyle(Color.scInkFaint)
+            Text(title)
+                .font(SCTypography.sans(size: 13, weight: .semibold))
+                .foregroundStyle(Color.scInk)
+            Text(note)
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scInkSecondary)
+                .multilineTextAlignment(.center)
+            // The "a different stream errored" aside (SCR-261) — one
+            // de-emphasized line below the primary note.
+            if let secondaryNote {
+                Text(secondaryNote)
+                    .font(SCTypography.sans(size: 11))
+                    .foregroundStyle(Color.scInkMuted)
+                    .multilineTextAlignment(.center)
+            }
+            // Give the retrying states a way to act on their own instruction:
+            // re-run the query, instead of a dead end.
+            if let retry {
+                Button("Retry") { retry() }
+                    .padding(.top, 4)
+                    .accessibilityHint(retryHint ?? Self.retryAgainHint)
+            }
+            // A labeled call-to-action (e.g. "Subscribe", "Turn on",
+            // "Index now") — prominent so it reads as the way forward, not an
+            // error acknowledgement.
+            if let actionTitle, let action {
+                Button(actionTitle) { action() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.scTeal)
+                    .padding(.top, 4)
+                    .accessibilityHint(actionHint ?? "")
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .padding(.horizontal, 20)
+    }
+}
+
+/// One palette result row (design 566–590): 128pt 16/9 thumbnail with a time
+/// chip, bold title, quoted snippet with highlighted terms, and stream + time
+/// chips. The selected row carries the teal tint + border.
+struct RecallPaletteRow: View {
+    let item: SearchResultItem
+    let queryTerms: [String]
+    let isSelected: Bool
+    let frameIndex: RecordingFrameIndex?
+    let thumbnailLoader: ThumbnailLoader?
+    /// U12/R13 — the hit recording's day (resolved by the palette from the
+    /// index), so an unanchored hit's title keeps the DAY. nil when unknown.
+    var recordingDay: Date? = nil
+    var onOpen: () -> Void
+
+    @State private var loaded: Loaded?
+
+    private struct Loaded: Equatable {
+        let key: String
+        let image: ThumbnailImage?
+        static func == (lhs: Loaded, rhs: Loaded) -> Bool {
+            lhs.key == rhs.key && (lhs.image?.cgImage === rhs.image?.cgImage)
+        }
+    }
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(alignment: .top, spacing: 12) {
+                thumbnail
+                info
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                    .fill(isSelected ? Color.scTeal.opacity(0.07) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                    .strokeBorder(isSelected ? Color.scTeal.opacity(0.27) : Color.scFillSubtle, lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(SearchAccessibility.resultRowLabel(item))
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .task(id: thumbKey) { await loadThumbnail() }
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            if loaded?.key == thumbKey, let image = loaded?.image {
+                Image(decorative: image.cgImage, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                CardHatchPlaceholder()
+            }
+        }
+        .frame(width: 128, height: 72)
+        .clipShape(RoundedRectangle(cornerRadius: SCMetrics.radiusSm))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusSm)
+                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+        )
+        .overlay(alignment: .bottomTrailing) {
+            if item.anchorMs != nil {
+                Text(item.timeLabel)
+                    .font(SCTypography.mono(size: 9))
+                    .foregroundStyle(Color.scCanvas)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.scInk.opacity(0.85), in: RoundedRectangle(cornerRadius: 3))
+                    .padding(5)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var info: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(titleText)
+                .font(SCTypography.sans(size: 13.5, weight: .semibold))
+                .foregroundStyle(Color.scInk)
+                .lineLimit(1)
+            if let snippet = snippetText {
+                Text(snippet)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkSecondary)
+                    .lineLimit(2)
+            }
+            HStack(spacing: 6) {
+                Text(streamChipText)
+                    .font(SCTypography.mono(size: 9.5))
+                    .foregroundStyle(Color.scInkMuted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: SCMetrics.radiusPill)
+                            .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+                    )
+                Text(timeChipText)
+                    .font(SCTypography.mono(size: 9.5))
+                    .foregroundStyle(Color.scInkMuted)
+            }
+            .padding(.top, 3)
+        }
+    }
+
+    /// Bold title: window title / app / the MOMENT (day + time) — never the
+    /// recording name (R5/R13). The retired `item.recording` fallback is replaced
+    /// by `CitationTarget.hitTitle`, which names the moment (or the day, for an
+    /// unanchored hit) instead of a `rec-<timestamp>` identifier.
+    private var titleText: String {
+        CitationTarget.hitTitle(
+            title: item.title,
+            app: item.app,
+            anchorMs: item.anchorMs,
+            recordingDay: recordingDay
+        )
+    }
+
+    /// Quoted snippet with the matched terms bolded (screen/audio only —
+    /// activity rows have no searchable snippet).
+    private var snippetText: AttributedString? {
+        guard item.stream != .activity, let raw = item.snippet, !raw.isEmpty else { return nil }
+        return SnippetHighlighter.attributed("\u{201C}\(raw)\u{201D}", terms: queryTerms)
+    }
+
+    /// The design's task-label chip claims task names that arrive with
+    /// SCR-214 — until then the chip states the hit's stream honestly.
+    private var streamChipText: String {
+        switch item.stream {
+        case .screen: return "on screen"
+        case .audio: return item.approximate ? "audio · time approximate" : "audio"
+        case .activity: return "activity"
+        }
+    }
+
+    private var timeChipText: String {
+        item.anchorMs == nil ? "time unknown" : "\(item.timeLabel) · moment"
+    }
+
+    private var thumbKey: String {
+        "\(item.recording)#\(item.anchorMs.map(String.init) ?? "-")"
+    }
+
+    private func loadThumbnail() async {
+        guard let frameIndex, let thumbnailLoader else { return }
+        let key = thumbKey
+        guard let url = await frameIndex.resolve(recording: item.recording, anchorMs: item.anchorMs) else {
+            if Task.isCancelled { return }
+            loaded = Loaded(key: key, image: nil)
+            return
+        }
+        let image = await thumbnailLoader.thumbnail(for: url)
+        if Task.isCancelled { return }
+        loaded = Loaded(key: key, image: image)
+    }
+}
+
+/// Recent-search chips, wrapping horizontally (idle state).
+private struct FlowChips: View {
+    let texts: [String]
+    var onTap: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(texts, id: \.self) { text in
+                Button {
+                    onTap(text)
+                } label: {
+                    Text(text)
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.scCanvas, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color.scBorderWarm, lineWidth: 1))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}

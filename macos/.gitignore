@@ -1,5 +1,5 @@
 # xcodegen generates this from project.yml; we don't check it in.
-ScreenCap.xcodeproj/
+Screencap.xcodeproj/
 
 # Xcode user data
 xcuserdata/

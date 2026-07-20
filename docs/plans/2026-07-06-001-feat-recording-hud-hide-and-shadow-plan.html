@@ -98,7 +98,7 @@
 <section id="goal-capsule">
 <h2>Goal Capsule</h2>
 <p><strong>Objective.</strong> Let the person recording get the floating HUD pill out of the way with a single hide action, and stop its drop shadow from reading as a heavy grey halo on light content.</p>
-<p><strong>Product authority.</strong> ScreenCap app owner (this brainstorm's requester).</p>
+<p><strong>Product authority.</strong> Screencap app owner (this brainstorm's requester).</p>
 <p><strong>Open blockers.</strong> None block planning. Two mechanism choices are deferred to planning (the shadow fix approach and the exact hide-control affordance) — see Outstanding Questions.</p>
 </section>
 
@@ -218,7 +218,7 @@
         <text class="wf-mut" x="186" y="58" text-anchor="end" style="font-family:var(--mono);font-size:10px">⇧⌘S</text>
         <rect x="6" y="70" width="188" height="24" rx="5" fill="#E1EFEC"/>
         <text class="wf-strong" x="14" y="86" fill="#0E7C6B">Show recording controls</text>
-        <text class="wf-mut" x="14" y="116">Open ScreenCap</text>
+        <text class="wf-mut" x="14" y="116">Open Screencap</text>
       </g>
     </g>
     <text class="wf-strong" x="753" y="16" text-anchor="middle">3 · Menu bar restores the pill</text>
@@ -250,7 +250,7 @@
   <p class="lbl">Deferred for later</p>
   <ul class="tight">
     <li>Making Draw and Mute functional (<code>SCR-217</code> / <code>SCR-218</code>) — the hide and shadow work does not touch them.</li>
-    <li>A global/system-wide hotkey to toggle the pill — ScreenCap's shortcuts are app-scoped, so one wouldn't fire while you're focused in the app being recorded.</li>
+    <li>A global/system-wide hotkey to toggle the pill — Screencap's shortcuts are app-scoped, so one wouldn't fire while you're focused in the app being recorded.</li>
     <li>A remembered "always start recordings hidden" preference.</li>
     <li>Restoring the pill to its last dragged position (restore is always bottom-center).</li>
     <li>The minimize-to-a-dot and dock-to-edge hide shapes — considered and rejected in favor of full dismiss.</li>
@@ -279,10 +279,10 @@
 
 <h3 id="sources">Sources and Research</h3>
 <ul class="tight">
-  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/Views/Record/RecordingHUDPanel.swift">macos/ScreenCap/Views/Record/RecordingHUDPanel.swift</a> — the HUD pill, its <code>.shadow(...)</code>, and the panel controller (show / hide / reposition, capture exclusion).</li>
-  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/Views/MenuBarMenu.swift">macos/ScreenCap/Views/MenuBarMenu.swift</a> — the menu-bar dropdown, Stop Recording, ⇧⌘S, and its recording-state gating.</li>
-  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/ScreenCapApp.swift">macos/ScreenCap/ScreenCapApp.swift</a> — <code>MenuBarLabel</code> swapping the glyph to <code>record.circle.fill</code> (amber) while recording.</li>
-  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/ScreenCap/Controllers/WindowLifecycle.swift">macos/ScreenCap/Controllers/WindowLifecycle.swift</a> — the <code>showHUD</code> / <code>hideHUD</code> seam the recording state machine drives.</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/Screencap/Views/Record/RecordingHUDPanel.swift">macos/Screencap/Views/Record/RecordingHUDPanel.swift</a> — the HUD pill, its <code>.shadow(...)</code>, and the panel controller (show / hide / reposition, capture exclusion).</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/Screencap/Views/MenuBarMenu.swift">macos/Screencap/Views/MenuBarMenu.swift</a> — the menu-bar dropdown, Stop Recording, ⇧⌘S, and its recording-state gating.</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/Screencap/ScreencapApp.swift">macos/Screencap/ScreencapApp.swift</a> — <code>MenuBarLabel</code> swapping the glyph to <code>record.circle.fill</code> (amber) while recording.</li>
+  <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/macos/Screencap/Controllers/WindowLifecycle.swift">macos/Screencap/Controllers/WindowLifecycle.swift</a> — the <code>showHUD</code> / <code>hideHUD</code> seam the recording state machine drives.</li>
   <li><a href="https://github.com/proteus-computer-use/screencap/blob/main/docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md">docs/plans/2026-07-03-001-feat-screencap-prototype-ui-plan.md</a> — U7, the origin of the HUD (Draw/Mute stubs, capture exclusion, hide-main-window lifecycle).</li>
 </ul>
 

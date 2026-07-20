@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# what-needs-releasing.sh — release preflight for ScreenCap's two tracks.
+# what-needs-releasing.sh — release preflight for Screencap's two tracks.
 #
-# ScreenCap ships two separately-versioned, independently-released artifacts:
+# Screencap ships two separately-versioned, independently-released artifacts:
 #
 #   • CLI / daemon (the engine)  — tag `vX.Y.Z`, consumed by the headless
 #     `install.sh` / `~/.screencap/bin` channel. Released via the `local-release`

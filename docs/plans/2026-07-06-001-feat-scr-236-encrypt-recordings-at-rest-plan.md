@@ -14,7 +14,7 @@ deepened: 2026-07-06
 
 ## Goal Capsule
 
-- **Objective:** Make "recordings are encrypted at rest" an honest, shippable claim by moving ScreenCap's local recording store into an app-managed **encrypted sparse bundle** — without changing any read contract and without regressing the capture-path performance envelope.
+- **Objective:** Make "recordings are encrypted at rest" an honest, shippable claim by moving Screencap's local recording store into an app-managed **encrypted sparse bundle** — without changing any read contract and without regressing the capture-path performance envelope.
 - **Product authority:** This document's Product Contract. `SECURITY.md` is the source of truth for all threat-model statements. Linear SCR-236 tracks the work.
 - **Stop conditions:** Stop and surface if the U1 spike refutes a load-bearing assumption (flock on the mounted bundle, crash-safety under `kill -9`, headless Keychain read from the LaunchAgent, mounted-era backup restorability, Keychain portability across machine restores, capture-shaped write performance within R7) — that invalidates KTD choices, not just a unit.
 - **Execution profile:** Units in dependency order; U1's empirical spike gates everything downstream. New tests that must run on CI carry `@pytest.mark.privacy` and stay Vision-free.
@@ -26,7 +26,7 @@ deepened: 2026-07-06
 
 ### Summary
 
-ScreenCap's local recording data plane (recordings tree, content index, backfill ledger) moves into an app-managed encrypted container keyed from the login Keychain and mounted transparently while the daemon runs. Everything that reads recordings today keeps working unchanged; the raw store on disk is ciphertext at all times. FileVault detection is added as a warn-only layer, and SECURITY.md documents exactly what the claim covers.
+Screencap's local recording data plane (recordings tree, content index, backfill ledger) moves into an app-managed encrypted container keyed from the login Keychain and mounted transparently while the daemon runs. Everything that reads recordings today keeps working unchanged; the raw store on disk is ciphertext at all times. FileVault detection is added as a warn-only layer, and SECURITY.md documents exactly what the claim covers.
 
 ### Problem Frame
 
@@ -34,7 +34,7 @@ Recording artifacts — screenshots, video chunks, `recording.db`, transcripts, 
 
 ### Key Decisions
 
-- **Encrypted container, not per-file encryption.** Recordings and sidecars live inside an encrypted volume the app creates and mounts; files stay readable in place through the mountpoint. This preserves two deliberate architecture contracts untouched — the pointer-only MCP surface (agents expand `frame.nearest` stems and read JPEGs directly off disk) and the Swift app's direct frame reads (`macos/ScreenCap/Controllers/RecordingFrameIndex.swift`) — and keeps encryption out of the hot capture path. Per-file envelope encryption would have forced every consumer through a decrypt seam for marginal real-attacker gain: the Keychain's headless-access posture is the shared security ceiling either way.
+- **Encrypted container, not per-file encryption.** Recordings and sidecars live inside an encrypted volume the app creates and mounts; files stay readable in place through the mountpoint. This preserves two deliberate architecture contracts untouched — the pointer-only MCP surface (agents expand `frame.nearest` stems and read JPEGs directly off disk) and the Swift app's direct frame reads (`macos/Screencap/Controllers/RecordingFrameIndex.swift`) — and keeps encryption out of the hot capture path. Per-file envelope encryption would have forced every consumer through a decrypt seam for marginal real-attacker gain: the Keychain's headless-access posture is the shared security ceiling either way.
 - **The deliverable is an honest claim, not a live-attacker defense.** The design target is "recordings are encrypted at rest" stated truthfully, in the SECURITY.md tradition of documenting postures honestly. A live same-EUID attacker is unaffected — the key is headlessly available by product necessity (all-day LaunchAgent recording) — and the doc says so. What changes is what an attacker gets from artifacts at rest: backups, copies, disk images, FileVault-off disks.
 - **Keychain-only key in v1, data-loss risk documented.** The container key lives solely in the login Keychain (same posture as the existing network-capture KEK). A lost Keychain entry means unrecoverable recordings; v1 documents this plainly rather than maintaining a second decryption path. A recovery code is a fast-follow candidate.
 - **Sidecar stores go inside; the run-dir stays outside.** The content index and backfill ledger are the same sensitivity class as recordings and move into the container. The daemon run-dir (socket, logs, audit log) must exist before any mount and stays outside as plaintext; the audit log is metadata-sensitive and this residual is documented.
@@ -81,7 +81,7 @@ flowchart TB
 
 **FileVault layer and claim documentation**
 
-- R11. ScreenCap detects FileVault status and warns — without blocking recording — when it is off.
+- R11. Screencap detects FileVault status and warns — without blocking recording — when it is off.
 - R12. SECURITY.md gains an encryption-at-rest section stating what the container protects and what it does not.
 
 ### Key Flows
@@ -98,11 +98,11 @@ flowchart TB
 - AE1. **Covers R2.** Given recordings exist in the store, When a backup tool copies the raw container artifact, Then the copy contains only ciphertext and yields no recording content without the key.
 - AE2. **Covers R5, R8.** Given the Keychain entry has been deleted, When the daemon starts, Then the mount fails with a clear error, nothing on disk is destroyed, and the recordings remain unrecoverable ciphertext as documented.
 - AE3. *(Deferred with R9/F2 — not v1.)*
-- AE4. **Covers R11.** Given FileVault is off, When ScreenCap performs its check, Then a warning is surfaced and recording proceeds.
+- AE4. **Covers R11.** Given FileVault is off, When Screencap performs its check, Then a warning is surfaced and recording proceeds.
 
 ### Success Criteria
 
-- The published claim ("ScreenCap stores recordings in an encrypted container; recording data is ciphertext at rest") survives SECURITY.md-grade scrutiny — every stated protection is structurally true.
+- The published claim ("Screencap stores recordings in an encrypted container; recording data is ciphertext at rest") survives SECURITY.md-grade scrutiny — every stated protection is structurally true.
 - p95 CPU and memory during active recording are unchanged within measurement noise.
 - Capture reliability (sessions completing without crash, dropped frames, or DB corruption — STRATEGY.md's ≥98% floor) stays at parity with a plaintext baseline.
 - No existing read-path contract changes: current consumers and their tests pass without modification.
@@ -116,7 +116,7 @@ Deferred to fast-follow (built when there is an installed base or the need is re
 
 Deferred for later:
 
-- Per-recording envelope encryption with all reads routed through ScreenCap (the "mandatory doorway"), including daemon byte-serving for MCP. Revisit if enterprise procurement rejects the container claim or crypto-shred deletion becomes a product requirement.
+- Per-recording envelope encryption with all reads routed through Screencap (the "mandatory doorway"), including daemon byte-serving for MCP. Revisit if enterprise procurement rejects the container claim or crypto-shred deletion becomes a product requirement.
 - A recovery code for Keychain loss — fast-follow candidate if v1's documented data-loss risk proves too harsh.
 - Encrypting the audit log or anything else in the run-dir (would force mount-before-daemon ordering changes).
 - Cloud-side encryption of uploaded artifacts — separate concern; this work is local-at-rest only.
@@ -135,7 +135,7 @@ Deferred for later:
 - Linear SCR-236 — https://linear.app/zk-email/issue/SCR-236/medium-encrypt-recordings-at-rest
 - `SECURITY.md` — trust boundary, sensitivity classes, the pointer-only MCP posture, threats in/out of scope.
 - `src/screencap/network/crypto.py` — the existing Keychain KEK pattern and its documented default-ACL posture.
-- `macos/ScreenCap/Controllers/RecordingFrameIndex.swift` — the Swift app's direct on-disk frame reads.
+- `macos/Screencap/Controllers/RecordingFrameIndex.swift` — the Swift app's direct on-disk frame reads.
 - `src/screencap/pipeline_state.py`, `src/screencap/content_index.py` — cross-process SQLite access patterns the container must not disturb.
 - `STRATEGY.md` — the privacy-and-performance positioning and the p95 overhead metric constraining this work.
 - Time Machine treats a mounted disk image as removable (skips it) and backs up the unmounted bundle as opaque encrypted bands — FileVault 1 was built on this mechanism; a mounted APFS volume is backed up as plaintext by default (Pondini TM reference; Bombich CCC KB; Apple `tmutil` man page).

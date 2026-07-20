@@ -26,12 +26,12 @@ uses `keychain-access-groups` as its worked example. See also
 > **Alternative if a profile is ever undesirable:** drop `keychain-access-groups`
 > from `screencap-cli.entitlements` (and its two build-time assertions). The daemon
 > then launches and auth falls back to the legacy `keyring` path — but the
-> "ScreenCap wants to use screencap-auth" prompt SCR-241 killed (R4) returns on app
+> "Screencap wants to use screencap-auth" prompt SCR-241 killed (R4) returns on app
 > updates. That is SCR-242 Option B; this runbook is Option A.
 
 ## What the code already does (this branch)
 
-- `macos/ScreenCap/Scripts/screencap-cli.entitlements` declares, alongside
+- `macos/Screencap/Scripts/screencap-cli.entitlements` declares, alongside
   `keychain-access-groups`, the two entitlements the profile must match:
   `com.apple.application-identifier = 2A8S6MV8DZ.com.screencap.daemon` and
   `com.apple.developer.team-identifier = 2A8S6MV8DZ`.
@@ -41,7 +41,7 @@ uses `keychain-access-groups` as its worked example. See also
   wrapper, seals the wrapper **with** `--entitlements` (so the entitlement survives
   the seal), then hard-asserts both the entitlement and the embedded profile and
   smoke-launches the entitled binary (an AMFI check — exit 137 fails the build).
-- `macos/ScreenCap/Scripts/embed-cli.sh` (the Xcode build phase, which runs under
+- `macos/Screencap/Scripts/embed-cli.sh` (the Xcode build phase, which runs under
   Apple Development — where restricted entitlements are stripped) **defers** the
   whole keychain authorization to `sign_app.sh`; it no longer hard-asserts the group
   (that assertion failed every build — SCR-242 secondary bug #1). The release re-sign
@@ -64,7 +64,7 @@ at it.
 Certificates, Identifiers & Profiles → **Identifiers** → **+**:
 
 - Type: **App IDs** → **App**.
-- Description: `ScreenCap Daemon`.
+- Description: `Screencap Daemon`.
 - Bundle ID: **Explicit** → `com.screencap.daemon` (must be explicit, **not** a
   wildcard — a wildcard App ID cannot authorize a restricted entitlement).
 - **Leave Capabilities / App Services alone — there is NO "Keychain Sharing"
@@ -83,14 +83,14 @@ Profiles → **+**:
   is the one that works for a non-sandboxed, notarized helper).
 - App ID: **`com.screencap.daemon`** (the explicit App ID from Step 1).
 - Certificate: your **Developer ID Application** certificate.
-- Name it e.g. `ScreenCap Daemon Developer ID` and **Generate** → **Download** the
+- Name it e.g. `Screencap Daemon Developer ID` and **Generate** → **Download** the
   `.provisionprofile`.
 
 Store it outside the repo (it is a signing input, not source). Verify it authorizes
 the group:
 
 ```bash
-security cms -D -i ~/path/to/ScreenCap_Daemon_Developer_ID.provisionprofile \
+security cms -D -i ~/path/to/Screencap_Daemon_Developer_ID.provisionprofile \
   | plutil -extract Entitlements xml1 -o - -
 # expect entries for:
 #   application-identifier            = 2A8S6MV8DZ.com.screencap.daemon
@@ -104,9 +104,9 @@ security cms -D -i ~/path/to/ScreenCap_Daemon_Developer_ID.provisionprofile \
 ## Step 3 — Point the build at it and sign
 
 ```bash
-export SCREENCAP_DAEMON_PROVISION_PROFILE=~/path/to/ScreenCap_Daemon_Developer_ID.provisionprofile
+export SCREENCAP_DAEMON_PROVISION_PROFILE=~/path/to/Screencap_Daemon_Developer_ID.provisionprofile
 export MACOS_SIGN_IDENTITY="Developer ID Application: Rute Figueiredo (2A8S6MV8DZ)"
-script/sign_app.sh /path/to/ScreenCap.app
+script/sign_app.sh /path/to/Screencap.app
 ```
 
 `sign_app.sh` fails loudly if the var is unset/missing, embeds the profile, and its
@@ -116,7 +116,7 @@ export `SCREENCAP_DAEMON_PROVISION_PROFILE` before it calls `sign_app.sh`.
 Confirm the profile shipped in the bundle:
 
 ```bash
-CLI_DIR=/path/to/ScreenCap.app/Contents/Library/LoginItems/ScreencapDaemon.app
+CLI_DIR=/path/to/Screencap.app/Contents/Library/LoginItems/ScreencapDaemon.app
 test -f "$CLI_DIR/Contents/embedded.provisionprofile" && echo "profile embedded ✓"
 codesign -d --entitlements :- "$CLI_DIR/Contents/MacOS/screencap" 2>/dev/null \
   | grep -q "2A8S6MV8DZ.com.screencap.shared" && echo "entitlement present ✓"
@@ -141,7 +141,7 @@ tail -n 40 ~/.screencap/run/serve.log
 ```
 
 Then verify the **keychain path** works end-to-end and prompt-free: `screencap login`
-via the app, restart the daemon, confirm auth persists with **no** "ScreenCap wants to
+via the app, restart the daemon, confirm auth persists with **no** "Screencap wants to
 use screencap-auth" prompt (the SCR-241 payoff). A frozen build that falls back logs a
 WARN — `grep "fell back to legacy keyring" ~/.screencap/run/serve.log` should be empty.
 
@@ -155,7 +155,7 @@ Steps 1–3 (explicit App ID, group registered, profile matches the cert, no `--
   and can strip the embedded profile.
 - **Cert / Team rotation** re-issues the profile; regenerate it (Step 2) and it flows
   through unchanged. The daemon's DR still pins the leaf cert (see the TCC runbook).
-- The **outer app** (`ScreenCap.entitlements`) deliberately does **not** declare
+- The **outer app** (`Screencap.entitlements`) deliberately does **not** declare
   `keychain-access-groups` (KTD-6), so it needs no profile — only the helper does.
 
 ## Related

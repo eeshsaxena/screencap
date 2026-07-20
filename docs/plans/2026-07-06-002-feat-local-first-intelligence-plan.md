@@ -109,7 +109,7 @@ flowchart TB
 **Outside this product's identity**
 
 - Non-macOS platforms (per `STRATEGY.md`).
-- Shipping a ScreenCap-owned bundled model as the default — considered and set aside in favor of the OS model; it may return only as a degradation fallback if the coverage data warrants it.
+- Shipping a Screencap-owned bundled model as the default — considered and set aside in favor of the OS model; it may return only as a degradation fallback if the coverage data warrants it.
 
 #### Deferred to Follow-Up Work
 
@@ -203,8 +203,8 @@ Python core first (U1→U3), then the local segmentation stage (U4) and the on-d
 | U6 | Per-task consent policy (Python) | `src/screencap/segmentation/consent.py`, `config.py` | U2 |
 | U7 | Graceful degradation ladder | `src/screencap/segmentation/` | U4,U5,U6 |
 | U8 | `screencap settings intelligence` CLI verb | `src/screencap/cli/` | U6 |
-| U9 | Intelligence settings pane (Swift) | `macos/ScreenCap/Views/Settings/`, `Controllers/` | U8 |
-| U10 | Surface named tasks in the app | `macos/ScreenCap/Models/`, `Views/Journal/`, `Views/Library/` | U4 |
+| U9 | Intelligence settings pane (Swift) | `macos/Screencap/Views/Settings/`, `Controllers/` | U8 |
+| U10 | Surface named tasks in the app | `macos/Screencap/Models/`, `Views/Journal/`, `Views/Library/` | U4 |
 
 ### U1. Extract segmentation core into `src/screencap/segmentation/`
 
@@ -331,7 +331,7 @@ Python core first (U1→U3), then the local segmentation stage (U4) and the on-d
 - **Goal:** Build the Intelligence pane — model picker plus per-task cloud-consent matrix — persisting through the new CLI verb.
 - **Requirements:** R2, R6, R7, R8, R9
 - **Dependencies:** U8
-- **Files:** create `macos/ScreenCap/Views/Settings/IntelligenceSettingsView.swift`, `macos/ScreenCap/Controllers/IntelligenceController.swift`; wire into the settings nav; create `macos/ScreenCapTests/IntelligenceSettingsTests.swift`.
+- **Files:** create `macos/Screencap/Views/Settings/IntelligenceSettingsView.swift`, `macos/Screencap/Controllers/IntelligenceController.swift`; wire into the settings nav; create `macos/ScreencapTests/IntelligenceSettingsTests.swift`.
 - **Approach:** Follow `PrivacySettingsView` layout (title, subtitle, divider rows) and the `AppRulesView` optimistic pending-state pattern for the consent toggles. The model picker selects on-device (default) / a cloud provider / "add provider". The frames/images row renders as a fixed "always off" (non-interactive). `IntelligenceController` writes via `screencap settings intelligence` and reads `--json`, mirroring `PrivacyController`. No Keychain — cloud keys are daemon-owned.
 - **Patterns to follow:** `PrivacySettingsView.swift`, `AppRulesView.swift` (tri-state + `pendingSegments`), `PrivacyController.swift` (CLI bridge).
 - **Test scenarios:**
@@ -346,7 +346,7 @@ Python core first (U1→U3), then the local segmentation stage (U4) and the on-d
 - **Goal:** Ensure locally generated named tasks flow to the same UI surfaces as cloud-derived tasks.
 - **Requirements:** R4
 - **Dependencies:** U4
-- **Files:** modify `macos/ScreenCap/Models/RecordingSummary.swift` (read local tasks) and the daemon read surface it depends on; modify `macos/ScreenCap/Views/Journal/JournalView.swift`, `macos/ScreenCap/Views/Library/LibraryCard.swift` as needed; add a model test.
+- **Files:** modify `macos/Screencap/Models/RecordingSummary.swift` (read local tasks) and the daemon read surface it depends on; modify `macos/Screencap/Views/Journal/JournalView.swift`, `macos/Screencap/Views/Library/LibraryCard.swift` as needed; add a model test.
 - **Approach:** Point the recording-summary/task read path at the local tasks store (U4) so Journal's day-grouped task breakdown and Library card titles/summaries populate for local recordings without a cloud round-trip. No new UI shape — reuse the existing task/summary rendering.
 - **Test scenarios:**
   - A local recording with a persisted tasks store shows named tasks in the Journal day view.
@@ -407,7 +407,7 @@ Note: CI runs `pytest -m privacy` (plus the lock-policy test) — privacy-bearin
 - Config pattern: `src/screencap/config.py:396-410` (`get_segmentation_mode`, `get_rest_threshold`), `_load_toml`.
 - Privacy strip reuse: `src/screencap/backfill/skip_intervals.py` (`derive_skip_intervals`), `src/screencap/frame_blocked.py:48-100` (`build_is_blocked`).
 - Upload guardrails: `src/screencap/upload.py` (`assert_uploadable`, `list_recording_files`) — `recording.db` never uploaded.
-- macOS settings pattern: `macos/ScreenCap/Views/Settings/PrivacySettingsView.swift`, `AppRulesView.swift` (per-app tri-state + optimistic pending state), `macos/ScreenCap/Controllers/PrivacyController.swift` (CLI settings bridge), `CloudAuthController.swift` (secrets stay in Python).
+- macOS settings pattern: `macos/Screencap/Views/Settings/PrivacySettingsView.swift`, `AppRulesView.swift` (per-app tri-state + optimistic pending state), `macos/Screencap/Controllers/PrivacyController.swift` (CLI settings bridge), `CloudAuthController.swift` (secrets stay in Python).
 - Deployment target: `macos/project.yml:4-5` (macOS 13.0) — Foundation Models needs macOS 26+, hence the `#available` guard and heuristic fallback.
-- Task/label UI surfaces: `macos/ScreenCap/Models/RecordingSummary.swift`, `Views/Journal/JournalView.swift`, `Views/Library/LibraryCard.swift`.
+- Task/label UI surfaces: `macos/Screencap/Models/RecordingSummary.swift`, `Views/Journal/JournalView.swift`, `Views/Library/LibraryCard.swift`.
 - Strategy grounding: `STRATEGY.md` (local-first/privacy bet; "run all day").

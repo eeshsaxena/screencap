@@ -26,10 +26,10 @@ Dev builds churn TCC: each rebuild is a new code signature, so
 Screen Recording / Accessibility / Input Monitoring grants silently go stale
 and permission-flow bugs become unreproducible noise. Before a QA pass:
 
-1. Quit ScreenCap; `screencap stop` any live recording; uninstall the
+1. Quit Screencap; `screencap stop` any live recording; uninstall the
    LaunchAgent if present (`launchctl bootout gui/$UID/com.screencap.daemon`
    — label per `screencap setup` output).
-2. Sweep stray app copies — `mdfind "kMDItemFSName == 'ScreenCap.app'"` —
+2. Sweep stray app copies — `mdfind "kMDItemFSName == 'Screencap.app'"` —
    and delete every copy except the build under test. TCC resolves grants per
    *path+signature*; a stray copy answering the daemon socket or holding a
    grant poisons the pass.
@@ -81,9 +81,9 @@ the previous release first; completion marker absent.
 ## 3. Duplicate-window guards (SCR-55)
 
 - [ ] Close the main window (app stays in menu bar) → menu bar "Open
-      ScreenCap" restores the **same** window; repeat 5× rapidly — never a
+      Screencap" restores the **same** window; repeat 5× rapidly — never a
       second main window.
-- [ ] With the window already open, "Open ScreenCap" focuses it (no new
+- [ ] With the window already open, "Open Screencap" focuses it (no new
       instance); with the permissions sheet attached, focusing targets the
       parent window, not the sheet.
 - [ ] Dock-icon reopen (click the Dock icon after closing the window) goes
@@ -128,7 +128,7 @@ genuinely exercised — a window-scoped shortcut would pass this only by acciden
       chevron icon); clicking it dismisses the pill and the recording continues.
 - [ ] With focus in the recorded app, **⌘⇧H** hides the pill; **⌘⇧H** again
       restores it bottom-center. The elapsed timer keeps advancing throughout.
-- [ ] With **no** recording active, ⌘⇧H does nothing in ScreenCap and reaches
+- [ ] With **no** recording active, ⌘⇧H does nothing in Screencap and reaches
       the frontmost app normally (the hotkey is registered only while recording).
 - [ ] While hidden, rest the cursor at the **bottom screen edge** → after a brief
       dwell a slim "Show controls ⌘⇧H" bar appears; move away and it hides without
@@ -141,14 +141,14 @@ genuinely exercised — a window-scoped shortcut would pass this only by acciden
       `defaults delete com.screencap.app com.screencap.macos.hasShownHideHint`
       (or the test host's domain) to re-arm.
 - [ ] **Capture exclusion (blocker if it fails):** across hide, ⌘⇧H, the peek
-      bar, and the hint, none of these ScreenCap surfaces appears in the captured
+      bar, and the hint, none of these Screencap surfaces appears in the captured
       video, and capture keeps writing (`sharingType = .none`).
 - [ ] **No new permission prompt:** exercising ⌘⇧H and the edge peek triggers no
       Accessibility / Input Monitoring dialog beyond what recording already needs.
 - [ ] **VoiceOver:** the peek bar reads as "Show recording controls"; the hint is
       announced; ⌘⇧H restores the toolbar for a keyboard-only user.
 - [ ] **⌘⇧H collision:** register ⌘⇧H in another app first, start a recording →
-      ScreenCap logs the registration failure and the menu-bar "Show recording
+      Screencap logs the registration failure and the menu-bar "Show recording
       controls" item still restores the pill (graceful degradation, no dead hotkey).
 
 ### 4b. Mid-recording mic mute (SCR-254 / SCR-218)
@@ -212,7 +212,7 @@ mute control is inert). Rebuild the embedded daemon (PyInstaller) so it carries 
 
 ## 7. Search: consent, backfill, palette (U10)
 
-- [ ] ⌘⇧F opens the Recall palette **only when the ScreenCap window is key**
+- [ ] ⌘⇧F opens the Recall palette **only when the Screencap window is key**
       (window-scoped, KTD-13); menu bar "Search…" opens/focuses the window
       with the palette pre-opened.
 - [ ] With `content_index_enabled` off: free-text search shows the consent

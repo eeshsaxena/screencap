@@ -93,7 +93,7 @@ mode: repo-grounded
 **Complexity:** High (depends on #1)
 **Status:** Unexplored
 
-### 7. ScreenCap as a local MCP server (agent-memory retrieval)
+### 7. Screencap as a local MCP server (agent-memory retrieval)
 **Description:** Expose the SQLite catalog as a local MCP server so any agent (Claude Desktop, Cursor, internal copilots) can query "what dashboards did I touch this morning" or "find the screen where the invoice total was wrong." The daemon already speaks HTTP over a UNIX socket, so the MCP surface is a thin adapter.
 **Axis:** A4
 **Basis:** `direct:` existing daemon `/v0/*` API + raw sqlite catalog; `reasoned:` MCP is named in the strategy's flywheel track but absent from the entire backlog.
