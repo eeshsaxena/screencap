@@ -672,9 +672,18 @@ def _load_models() -> dict[str, Any]:
 
         Shared between ``tasks.list`` (per-recording) and the day-level ``tasks``
         band nested on :class:`DaySegmentRecording` (U9) — one wire shape, so the
-        strip and the per-recording view can't drift. ``source`` / ``edited``
-        (KTD3) are deliberately NOT exposed: task ownership is an internal store
-        concern, not part of the read wire shape.
+        strip and the per-recording view can't drift. ``source`` / ``edited`` /
+        ``edited_fields`` (KTD3) are deliberately NOT exposed: task ownership is an
+        internal store concern, not part of the read wire shape.
+
+        Day-diary fields (U1/KTD-9, additive): ``bullets`` are the block's short
+        topic summaries (parsed from the store's ``metadata`` blob); ``block_id`` is
+        the opaque stable identity a consolidation pass assigns so deep links /
+        threads survive ``task_index`` renumbering; ``thread_id`` links same-work
+        blocks within a day; ``is_open`` marks the live trailing block. All default
+        to empty/None so an older daemon that never emits them still validates and
+        the Swift side decodes with ``decodeIfPresent``. Thread rollups (total
+        minutes, sitting count) are NOT here — ``tasks_query`` computes those (U7).
         """
 
         task_index: int
@@ -683,6 +692,10 @@ def _load_models() -> dict[str, Any]:
         name: str
         category: str | None = None
         confidence: str | None = None
+        bullets: list[str] = []
+        block_id: str | None = None
+        thread_id: str | None = None
+        is_open: bool = False
 
     class DaySegmentRecording(_DaemonModel):
         """One recording's day-clamped span + honest blocked-interval split (U3).

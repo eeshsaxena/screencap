@@ -1686,13 +1686,22 @@ async def test_tasks_list_returns_persisted_segments(
     assert payload["recording"] == "demo"
     assert len(payload["tasks"]) == 2
     first = payload["tasks"][0]
+    # The typed ``TaskSegment`` model carries the original six fields PLUS the
+    # day-diary fields (U1/KTD-9), which ``model_dump`` always emits with
+    # empty/None defaults; older clients simply ignore the extras.
     assert set(first) == {
         "task_index", "start_ts", "end_ts", "name", "category", "confidence",
+        "bullets", "block_id", "thread_id", "is_open",
     }
     assert first["task_index"] == 0
     assert first["name"] == "Payroll run in Gusto"
     assert first["category"] == "finance"
     assert first["confidence"] == "high"
+    # A non-diary agent row carries the diary fields at their neutral defaults.
+    assert first["bullets"] == []
+    assert first["block_id"] is None
+    assert first["thread_id"] is None
+    assert first["is_open"] is False
     # Heuristic-style task carries no category/confidence — null, not absent.
     assert payload["tasks"][1]["name"] == "Email triage"
     assert payload["tasks"][1]["category"] is None

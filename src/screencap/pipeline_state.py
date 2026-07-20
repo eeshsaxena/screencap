@@ -83,6 +83,7 @@ coexistence story) for the same reason ``scrub_worker`` does.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
@@ -116,9 +117,18 @@ __all__ = [
     "read_task_segments_wire",
     "spans_overlap",
     "task_row_is_protected",
+    "task_field_is_protected",
     "USER_TASK_INDEX_BASE",
     "TASK_SOURCE_AGENT",
     "TASK_SOURCE_USER",
+    "TASK_FIELD_NAME",
+    "TASK_FIELD_CATEGORY",
+    "TASK_FIELD_TIME",
+    "TASK_FIELD_BULLETS",
+    "EDITED_FIELD_NAME",
+    "EDITED_FIELD_CATEGORY",
+    "EDITED_FIELD_TIME",
+    "EDITED_FIELD_BULLETS",
 ]
 
 # Match the engine writer's busy_timeout (privacy/scrub_worker.py:471) so a
@@ -145,6 +155,36 @@ _BUSY_TIMEOUT_MS = 10000
 TASK_SOURCE_AGENT = "agent"
 TASK_SOURCE_USER = "user"
 USER_TASK_INDEX_BASE = 1_000_000
+
+# Field-scoped edit protection (U1/KTD-3). The single ``edited`` boolean froze
+# the WHOLE row against both re-segmentation and the retroactive purge. The day
+# diary splits that: ``edited_fields`` is a BITMASK recording WHICH fields a user
+# curated, so a user-RENAMED block keeps its name protected while its
+# agent-written bullets stay purge-eligible and regeneratable (AE5). ``edited``
+# still exists and still carries the row-level meaning ``task_row_is_protected``
+# uses for the agent re-carve (a user-touched row is never bulk-deleted); the
+# bitmask is the NEW axis the purge (U5) and bullet-regeneration (U3) paths
+# consult via :func:`task_field_is_protected`.
+#
+# The field NAMES are the vocabulary those callers pass; the bit VALUES are the
+# stored ``edited_fields`` column. ``time`` covers a span edit (start_ts/end_ts);
+# ``bullets`` covers the topic bullets carried inside ``metadata``.
+TASK_FIELD_NAME = "name"
+TASK_FIELD_CATEGORY = "category"
+TASK_FIELD_TIME = "time"
+TASK_FIELD_BULLETS = "bullets"
+
+EDITED_FIELD_NAME = 1 << 0
+EDITED_FIELD_CATEGORY = 1 << 1
+EDITED_FIELD_TIME = 1 << 2
+EDITED_FIELD_BULLETS = 1 << 3
+
+_EDITED_FIELD_BITS: dict[str, int] = {
+    TASK_FIELD_NAME: EDITED_FIELD_NAME,
+    TASK_FIELD_CATEGORY: EDITED_FIELD_CATEGORY,
+    TASK_FIELD_TIME: EDITED_FIELD_TIME,
+    TASK_FIELD_BULLETS: EDITED_FIELD_BULLETS,
+}
 
 
 def spans_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
@@ -277,6 +317,16 @@ class TaskSegmentRow:
     ``'agent'`` or ``'user'``; ``edited`` marks a user-curated agent row. Both
     default to the agent-unedited state so a row constructed the old way (or read
     back from a pre-U5 DB migrated in place) reads as an agent row.
+
+    Day-diary columns (U1, KTD-2/KTD-3): ``block_id`` is the opaque stable
+    identity a consolidation pass (U2) assigns to a user-facing work block so deep
+    links / threads survive ``task_index`` renumbering; ``thread_id`` links
+    same-work blocks within a day; ``is_open`` marks the live trailing block during
+    a live pass (STORED, cleared at finalize — never derived at read time);
+    ``edited_fields`` is the field-scoped protection bitmask (see
+    :func:`task_field_is_protected`). All default to the neutral empty state so a
+    row constructed the old way, or read back from a pre-U1 DB migrated in place,
+    reads as a plain non-diary agent row.
     """
 
     task_index: int
@@ -288,6 +338,10 @@ class TaskSegmentRow:
     metadata: str | None = None
     source: str = TASK_SOURCE_AGENT
     edited: bool = False
+    block_id: str | None = None
+    thread_id: str | None = None
+    is_open: bool = False
+    edited_fields: int = 0
 
 
 def task_row_is_protected(row: TaskSegmentRow) -> bool:
@@ -299,8 +353,43 @@ def task_row_is_protected(row: TaskSegmentRow) -> bool:
     terminal-stage carve-out so the two can never disagree on what counts as
     protected. Only the predicate is shared — each caller keeps its own span
     assembly.
+
+    ROW-LEVEL by design (KTD-3): it stays the re-carve gate — a user-touched row is
+    never bulk-deleted. The FIELD-level purge/regeneration question ("is *this*
+    field protected?") is :func:`task_field_is_protected`, a distinct axis.
     """
     return row.source == TASK_SOURCE_USER or bool(row.edited)
+
+
+def task_field_is_protected(row: TaskSegmentRow, field: str) -> bool:
+    """True iff the user curated ``field`` on ``row`` (field-scoped, U1/KTD-3).
+
+    The load-bearing privacy predicate the retroactive purge (U5) and bullet
+    regeneration (U3) consult so protection is per FIELD, not per row (AE5): a
+    user-RENAMED agent block protects its ``name`` while its agent-written
+    ``bullets`` stay purge-eligible and regeneratable. ``field`` is one of
+    :data:`TASK_FIELD_NAME` / ``…_CATEGORY`` / ``…_TIME`` / ``…_BULLETS``; an
+    unknown field is a programming error (``KeyError``), never a silent ``False``
+    that would leak protection.
+
+    Rules:
+
+    * ``source='user'`` — the whole row is user-authored content, so EVERY field
+      is protected (a user-created block is untouched by the purge).
+    * agent row with a non-zero ``edited_fields`` bitmask — only the flagged bits
+      are protected (the field-scoped split).
+    * agent row with ``edited=1`` but ``edited_fields=0`` — a LEGACY row curated
+      before the split existed. We can't tell which field was edited, so we
+      conservatively protect EVERY field: the pre-split whole-row protection the
+      user already saw. New writes always set the precise bit, so this fallback
+      only ever covers migrated pre-U1 rows.
+    """
+    bit = _EDITED_FIELD_BITS[field]  # KeyError on an unknown field — never silent
+    if row.source == TASK_SOURCE_USER:
+        return True
+    if row.edited_fields:
+        return bool(row.edited_fields & bit)
+    return bool(row.edited)
 
 
 def from_chunk_status(status: "ChunkStatus") -> UploadState:
@@ -340,21 +429,35 @@ CREATE TABLE IF NOT EXISTS pipeline_task_segments (
     metadata TEXT,
     source TEXT NOT NULL DEFAULT 'agent',
     edited INTEGER NOT NULL DEFAULT 0,
+    block_id TEXT,
+    thread_id TEXT,
+    is_open INTEGER NOT NULL DEFAULT 0,
+    edited_fields INTEGER NOT NULL DEFAULT 0,
     updated_at REAL,
     UNIQUE (recording_id, task_index)
 )
 """
 
-# Guarded ALTER-ADD migration for the U5 source/edited columns. ``CREATE TABLE
-# IF NOT EXISTS`` above does NOT add columns to an already-existing raw-DDL
-# table, so an EXISTING recording.db captured before U5 keeps the old shape
-# unless we ALTER it here. Each entry is ``(column_name, column_ddl)``; existing
-# rows take the ``DEFAULT`` (agent/unedited), so a migrated DB reads back exactly
-# like a fresh one. Mirrors ``engine.db._migrate_schema``'s PRAGMA-check +
+# Guarded ALTER-ADD migration for the columns added after the initial raw DDL.
+# ``CREATE TABLE IF NOT EXISTS`` above does NOT add columns to an already-existing
+# raw-DDL table, so an EXISTING recording.db captured before a given column keeps
+# the old shape unless we ALTER it here. Each entry is ``(column_name,
+# column_ddl)``; existing rows take the ``DEFAULT``, so a migrated DB reads back
+# exactly like a fresh one. Mirrors ``engine.db._migrate_schema``'s PRAGMA-check +
 # duplicate-column tolerance.
+#
+#   * U5: ``source`` / ``edited`` (task ownership).
+#   * U1 day diary (KTD-2/KTD-3): ``block_id`` / ``thread_id`` (stable identity +
+#     thread membership, both nullable), ``is_open`` (STORED live-trailing flag),
+#     ``edited_fields`` (field-scoped protection bitmask). Existing rows default
+#     to the neutral empty state — a plain non-diary agent row.
 _TASK_SEGMENTS_ADDED_COLUMNS = (
     ("source", "source TEXT NOT NULL DEFAULT 'agent'"),
     ("edited", "edited INTEGER NOT NULL DEFAULT 0"),
+    ("block_id", "block_id TEXT"),
+    ("thread_id", "thread_id TEXT"),
+    ("is_open", "is_open INTEGER NOT NULL DEFAULT 0"),
+    ("edited_fields", "edited_fields INTEGER NOT NULL DEFAULT 0"),
 )
 
 # U2 (honest status). One row per recording holding the segmentation OUTCOME
@@ -1220,13 +1323,16 @@ class PipelineLedger:
                         "INSERT INTO pipeline_task_segments "
                         "(recording_id, task_index, start_ts, end_ts, name, "
                         " category, confidence, metadata, source, edited, "
+                        " block_id, thread_id, is_open, edited_fields, "
                         " updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             self._recording_id, seg.task_index,
                             seg.start_ts, seg.end_ts, seg.name,
                             seg.category, seg.confidence, seg.metadata,
-                            seg.source, int(seg.edited), now,
+                            seg.source, int(seg.edited),
+                            seg.block_id, seg.thread_id, int(seg.is_open),
+                            int(seg.edited_fields), now,
                         ),
                     )
                 conn.commit()
@@ -1606,6 +1712,24 @@ class PipelineLedger:
                 if mark_edited:
                     sets.append("edited=?")
                     params.append(1)
+                    # Field-scoped protection (U1/KTD-3): OR in the bit for each
+                    # field this edit actually changed, so a rename-only edit
+                    # protects ``name`` while leaving agent-written ``bullets``
+                    # purge-eligible (AE5). Accumulates with prior edits (RHS reads
+                    # the existing column), never clobbers them. ``bullets`` live in
+                    # the ``metadata`` blob, so a metadata write records the
+                    # bullets bit.
+                    new_bits = 0
+                    if name is not None:
+                        new_bits |= EDITED_FIELD_NAME
+                    if category is not None:
+                        new_bits |= EDITED_FIELD_CATEGORY
+                    if start_ts is not None or end_ts is not None:
+                        new_bits |= EDITED_FIELD_TIME
+                    if metadata is not None:
+                        new_bits |= EDITED_FIELD_BULLETS
+                    sets.append("edited_fields = edited_fields | ?")
+                    params.append(new_bits)
                     # Re-home an unedited agent row out of the agent's LOW range
                     # so a later scoped replace can't collide with it.
                     already_edited = int(row["edited"]) == 1
@@ -1664,7 +1788,8 @@ class PipelineLedger:
         try:
             rows = conn.execute(
                 "SELECT task_index, start_ts, end_ts, name, category, "
-                "confidence, metadata, source, edited FROM pipeline_task_segments "
+                "confidence, metadata, source, edited, block_id, thread_id, "
+                "is_open, edited_fields FROM pipeline_task_segments "
                 "WHERE recording_id=? ORDER BY task_index",
                 (self._recording_id,),
             ).fetchall()
@@ -1679,6 +1804,10 @@ class PipelineLedger:
                     metadata=r["metadata"],
                     source=r["source"] if r["source"] is not None else TASK_SOURCE_AGENT,
                     edited=bool(r["edited"]),
+                    block_id=r["block_id"],
+                    thread_id=r["thread_id"],
+                    is_open=bool(r["is_open"]),
+                    edited_fields=int(r["edited_fields"] or 0),
                 )
                 for r in rows
             ]
@@ -1826,14 +1955,46 @@ class PipelineLedger:
                 conn.close()
 
 
+def _parse_wire_bullets(metadata: str | None) -> list | None:
+    """Extract the topic ``bullets`` list from a task row's ``metadata`` JSON blob.
+
+    Bullets (U1/U3) ride the free-text ``metadata`` blob (alongside
+    description/apps_used/derived_name) rather than a dedicated column. Returns
+    the list when the blob parses and carries a non-empty list-typed ``bullets``
+    key; ``None`` otherwise — a missing/``None``/unparseable blob, a blob without
+    a ``bullets`` key, or a non-list / empty value. Strictly non-fabricating: a
+    row with no real bullets never grows an empty list, and a malformed blob never
+    raises (fail-open read surface).
+    """
+    if not metadata:
+        return None
+    try:
+        blob = json.loads(metadata)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(blob, dict):
+        return None
+    bullets = blob.get("bullets")
+    if isinstance(bullets, list) and bullets:
+        return bullets
+    return None
+
+
 def read_task_segments_wire(rec_dir: Path) -> list[dict]:
-    """Read a recording's named task segments as the 6-field ``TaskSegment`` wire shape.
+    """Read a recording's named task segments as the ``TaskSegment`` wire shape.
 
     The single shared read path behind ``tasks.list`` (daemon) and the day-level
     ``tasks`` band (``day_segments``): reads ``read_task_segments`` off the
     recording's local-only ``recording.db`` (never uploaded — R4/R8) and projects
-    each row to ``{task_index, start_ts, end_ts, name, category, confidence}`` — the
-    store's ``source`` / ``edited`` ownership columns stay internal.
+    each row to ``{task_index, start_ts, end_ts, name, category, confidence}`` plus
+    the day-diary fields (U1/KTD-9) — ``bullets`` (parsed from the ``metadata``
+    blob), ``thread_id``, ``block_id``, ``is_open`` — carried ADDITIVELY: each
+    diary key is present only when the row actually holds that data, so a plain
+    non-diary row projects the original six-field shape unchanged and an
+    older-daemon consumer sees no new keys (forward compat; the Swift side decodes
+    with ``decodeIfPresent``). Thread rollups (total minutes, sitting count) are
+    NOT computed here — that is ``tasks_query``'s job (U7). The store's ``source`` /
+    ``edited`` / ``edited_fields`` ownership columns stay internal.
 
     READ-FIRST: reads directly and only migrates
     (``ensure_pipeline_state_schema``) on a missing-table / missing-column
@@ -1850,8 +2011,9 @@ def read_task_segments_wire(rec_dir: Path) -> list[dict]:
     try:
         segments = PipelineLedger(db_path).read_task_segments()
     except sqlite3.OperationalError:
-        # Legacy DB missing the task table / pre-U5 source/edited columns → migrate
-        # once (idempotent, creates the table on an old DB), then retry the read.
+        # Legacy DB missing the task table / pre-diary columns → migrate once
+        # (idempotent, creates the table / ALTER-adds the columns on an old DB),
+        # then retry the read.
         try:
             ensure_pipeline_state_schema(db_path)
             segments = PipelineLedger(db_path).read_task_segments()
@@ -1860,8 +2022,9 @@ def read_task_segments_wire(rec_dir: Path) -> list[dict]:
     except (LedgerError, sqlite3.Error):
         # No recording row / unreadable DB → treat as "no tasks" rather than raise.
         return []
-    return [
-        {
+    out: list[dict] = []
+    for seg in segments:
+        row: dict = {
             "task_index": seg.task_index,
             "start_ts": seg.start_ts,
             "end_ts": seg.end_ts,
@@ -1869,8 +2032,19 @@ def read_task_segments_wire(rec_dir: Path) -> list[dict]:
             "category": seg.category,
             "confidence": seg.confidence,
         }
-        for seg in segments
-    ]
+        # Diary fields are additive: only present when the row carries them, so a
+        # non-diary row (and an older consumer) sees exactly the six-field shape.
+        if seg.block_id is not None:
+            row["block_id"] = seg.block_id
+        if seg.thread_id is not None:
+            row["thread_id"] = seg.thread_id
+        if seg.is_open:
+            row["is_open"] = True
+        bullets = _parse_wire_bullets(seg.metadata)
+        if bullets is not None:
+            row["bullets"] = bullets
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------
