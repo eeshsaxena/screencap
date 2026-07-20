@@ -20,6 +20,9 @@ Usage:
     # One-off grandfather backfill (legacy subscribed=true -> tier=cloud, KTD-6;
     # idempotent + re-runnable):
     python scripts/set_entitlement.py --backfill-grandfathered
+    # Count-only preview of the backfill (writes NOTHING) — run this BEFORE the
+    # real backfill to see how many accounts the irreversible bulk write touches:
+    python scripts/set_entitlement.py --backfill-grandfathered --dry-run
 
 Requires Firebase Admin credentials for the target project
 (``GOOGLE_APPLICATION_CREDENTIALS`` or ADC). Never routes through Stripe.
@@ -64,23 +67,32 @@ def set_entitlement(
     return user.uid
 
 
-def backfill_grandfathered(*, project_id: str) -> list[str]:
+def backfill_grandfathered(*, project_id: str, dry_run: bool = False) -> list[str]:
     """Migrate legacy ``subscribed=true`` accounts to ``tier=cloud`` (KTD-6).
 
     Idempotent + re-runnable: only accounts carrying ``subscribed=true`` but no
     ``tier`` are written (an already-migrated account carrying ``tier=cloud`` is
     skipped), so a partial run can be safely re-run. Preserves other claims.
-    Returns the list of uids migrated this pass.
+
+    Iterates ALL users via ``iterate_all()`` (which pages through the whole
+    project), not just the first ``list_users()`` page — otherwise both the
+    write and any count derived from it would silently cap at ~1000 accounts.
+
+    With ``dry_run=True`` it enumerates the accounts that WOULD be migrated and
+    writes NOTHING: this is the count-preview to run before the irreversible
+    bulk write. Returns the list of uids migrated (or, in a dry run, the uids
+    that would be migrated).
     """
     _ensure_app(project_id)
-    migrated: list[str] = []
-    for user in fb_auth.list_users().users:
+    matched: list[str] = []
+    for user in fb_auth.list_users().iterate_all():
         claims = dict(user.custom_claims or {})
         if claims.get("subscribed") and not claims.get("tier"):
-            claims["tier"] = "cloud"
-            fb_auth.set_custom_user_claims(user.uid, claims)
-            migrated.append(user.uid)
-    return migrated
+            if not dry_run:
+                claims["tier"] = "cloud"
+                fb_auth.set_custom_user_claims(user.uid, claims)
+            matched.append(user.uid)
+    return matched
 
 
 def main(argv=None) -> int:
@@ -108,15 +120,30 @@ def main(argv=None) -> int:
         help="One-off: set tier=cloud for all legacy subscribed=true accounts.",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --backfill-grandfathered: count the accounts that WOULD be "
+        "migrated and write nothing (the pre-write count preview).",
+    )
+    parser.add_argument(
         "--project",
         default=os.environ.get("SCREENCAP_PROJECT_ID", "proteus-photos"),
         help="Firebase project id (default: SCREENCAP_PROJECT_ID or proteus-photos).",
     )
     args = parser.parse_args(argv)
 
+    if args.dry_run and not args.backfill_grandfathered:
+        parser.error("--dry-run is only supported with --backfill-grandfathered")
+
     if args.backfill_grandfathered:
-        migrated = backfill_grandfathered(project_id=args.project)
-        print(f"Grandfather backfill: migrated {len(migrated)} account(s) to tier=cloud")
+        matched = backfill_grandfathered(project_id=args.project, dry_run=args.dry_run)
+        if args.dry_run:
+            print(
+                f"Grandfather backfill (dry-run): {len(matched)} account(s) WOULD "
+                f"be migrated to tier=cloud in project {args.project}; no writes made"
+            )
+        else:
+            print(f"Grandfather backfill: migrated {len(matched)} account(s) to tier=cloud")
         return 0
 
     if args.uid and args.email:
