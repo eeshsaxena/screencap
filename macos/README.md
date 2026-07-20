@@ -1,4 +1,4 @@
-# ScreenCap macOS app (SwiftUI)
+# Screencap macOS app (SwiftUI)
 
 Native SwiftUI shell that drives the bundled `screencap` CLI. Targets macOS 13+, bundle id `com.screencap.macos`.
 
@@ -13,7 +13,7 @@ Native SwiftUI shell that drives the bundled `screencap` CLI. Targets macOS 13+,
 ```bash
 cd macos
 DEVELOPMENT_TEAM=YOURTEAMID xcodegen generate
-open ScreenCap.xcodeproj
+open Screencap.xcodeproj
 ```
 
 The `.xcodeproj` is generated from `project.yml` and is gitignored. Re-run `xcodegen generate` after editing `project.yml`.
@@ -49,23 +49,23 @@ Without `DEVELOPMENT_TEAM` set, xcodegen leaves the placeholder in `project.pbxp
 
 > **Note:** On a fresh clone, run `xcodegen generate` from `macos/` before any `xcodebuild` command — the `.xcodeproj` is gitignored and only exists locally. Install xcodegen first if you haven't: `brew install xcodegen`. See [Generate the Xcode project](#generate-the-xcode-project) above.
 
-From Xcode: select the `ScreenCap` scheme and **Product → Build** (`Cmd+B`).
+From Xcode: select the `Screencap` scheme and **Product → Build** (`Cmd+B`).
 
 From the command line:
 
 ```bash
 cd macos
-xcodebuild -project ScreenCap.xcodeproj -scheme ScreenCap -configuration Debug build
+xcodebuild -project Screencap.xcodeproj -scheme Screencap -configuration Debug build
 ```
 
 ### Run tests
 
-The Swift test target lives at `macos/ScreenCapTests/`. To run it from the command line:
+The Swift test target lives at `macos/ScreencapTests/`. To run it from the command line:
 
 ```bash
 cd macos
-xcodebuild test -only-testing:ScreenCapTests \
-  -project ScreenCap.xcodeproj -scheme ScreenCap
+xcodebuild test -only-testing:ScreencapTests \
+  -project Screencap.xcodeproj -scheme Screencap
 ```
 
 If the build fails with errors like `cannot find type 'RecordingState' in scope`, the `.xcodeproj` is missing files that were added since the last `xcodegen generate`. Re-run `xcodegen generate` from `macos/` (after `brew install xcodegen` if needed) and try again.
@@ -80,9 +80,9 @@ DEVELOPMENT_TEAM=YOURTEAMID ./script/build_and_run.sh
 
 This script:
 
-1. Regenerates `macos/ScreenCap.xcodeproj` from `macos/project.yml` when needed.
+1. Regenerates `macos/Screencap.xcodeproj` from `macos/project.yml` when needed.
 2. Rebuilds `dist/screencap/` with PyInstaller when the bundled CLI is missing or too old to expose `screencap serve`.
-3. Builds the `ScreenCap` scheme into a deterministic local DerivedData path.
+3. Builds the `Screencap` scheme into a deterministic local DerivedData path.
 4. Publishes the local launch environment to `launchd`, then opens the signed `.app` bundle through LaunchServices so macOS permission prompts match the app shown in System Settings.
 
 Useful variants:
@@ -109,7 +109,7 @@ For day-to-day SwiftUI development, use `./script/build_and_run.sh`; it refreshe
 
 ## Launching with env vars (the part that bites everyone)
 
-`open ScreenCap.app` does **not** propagate your shell environment. The .app launches via LaunchServices, which uses launchd's environment, which by default doesn't inherit your shell. So `SCREENCAP_DEV_REPO_ROOT` from `~/.zshrc` won't reach the app.
+`open Screencap.app` does **not** propagate your shell environment. The .app launches via LaunchServices, which uses launchd's environment, which by default doesn't inherit your shell. So `SCREENCAP_DEV_REPO_ROOT` from `~/.zshrc` won't reach the app.
 
 Three ways around it:
 
@@ -156,10 +156,10 @@ The .app is ad-hoc signed by Xcode (`TeamIdentifier=not set`). macOS TCC tracks 
 
 Recovering after a rebuild:
 
-ScreenCap has **two distinct TCC subjects**, and a rebuild can orphan grants for either:
+Screencap has **two distinct TCC subjects**, and a rebuild can orphan grants for either:
 
 - the **app bundle** `com.screencap.macos` — the identity used on the CLI-fallback path (daemon unreachable), and
-- the embedded **`screencap` helper binary** — the daemon's identity, which is what `daemon.info` and the walkthrough's "for ScreenCap helper" rows reflect. It is a *separate* identity (a bare signed tool with no bundle id), so resetting the app does **not** reset it.
+- the embedded **`screencap` helper binary** — the daemon's identity, which is what `daemon.info` and the walkthrough's "for Screencap helper" rows reflect. It is a *separate* identity (a bare signed tool with no bundle id), so resetting the app does **not** reset it.
 
 Reset both:
 
@@ -167,7 +167,7 @@ Reset both:
 # App bundle (CLI-fallback path):
 tccutil reset All com.screencap.macos
 
-# Daemon/helper (the "ScreenCap helper" rows + daemon.info) — target the bare
+# Daemon/helper (the "Screencap helper" rows + daemon.info) — target the bare
 # `screencap` tool per service. If tccutil reports no match, remove every
 # `screencap` / `screencapspike` row in each pane with the "−" button instead.
 tccutil reset ScreenCapture screencap
@@ -186,7 +186,7 @@ If a rebuild leaves the walkthrough's app-process indicators stale, click **Skip
 
 ### Why `Info.plist` has no Screen Recording / Accessibility / Input Monitoring keys
 
-There is intentionally **nothing to "drop"** from `Info.plist` or `ScreenCap.entitlements` for these three services, and there never was. Unlike Camera / Microphone / Photos — which require an `NS*UsageDescription` string — macOS gates Screen Recording, Accessibility, and Input Monitoring through **TCC at request time** (`CGRequestScreenCaptureAccess`, `AXIsProcessTrustedWithOptions`, `IOHIDRequestAccess`), not through a declared plist key. So the app declaring none of them already means "the app does not pre-declare these permissions."
+There is intentionally **nothing to "drop"** from `Info.plist` or `Screencap.entitlements` for these three services, and there never was. Unlike Camera / Microphone / Photos — which require an `NS*UsageDescription` string — macOS gates Screen Recording, Accessibility, and Input Monitoring through **TCC at request time** (`CGRequestScreenCaptureAccess`, `AXIsProcessTrustedWithOptions`, `IOHIDRequestAccess`), not through a declared plist key. So the app declaring none of them already means "the app does not pre-declare these permissions."
 
 Phase 1c (SCR-49) completes the consolidation in *code*: `PermissionController.requestAndOpenSettings` no longer issues the app-process registration calls for the three services, so the daemon helper is the sole TCC subject for them on the recording path. The app-process **probes** (`CGPreflightScreenCaptureAccess` etc. in `refresh()`) deliberately stay — the CLI-fallback path still gates recording on them when the daemon is unreachable. Do not "fix" the absent plist keys or re-add the app-process request calls; both are correct as-is.
 
@@ -195,7 +195,7 @@ Phase 1c (SCR-49) completes the consolidation in *code*: `PermissionController.r
 Ad-hoc dev builds occasionally end up in uninterruptible sleep or stack instances when relaunching. To clean up:
 
 ```bash
-ps aux | grep "ScreenCap.app/Contents/MacOS/ScreenCap" | grep -v grep | awk '{print $2}' | xargs -I {} kill -9 {} 2>/dev/null
+ps aux | grep "Screencap.app/Contents/MacOS/Screencap" | grep -v grep | awk '{print $2}' | xargs -I {} kill -9 {} 2>/dev/null
 ```
 
 ## Layout
@@ -203,15 +203,15 @@ ps aux | grep "ScreenCap.app/Contents/MacOS/ScreenCap" | grep -v grep | awk '{pr
 | Path | Owner |
 |---|---|
 | `project.yml` | xcodegen source of truth for the project file |
-| `ScreenCap/ScreenCapApp.swift` | App entry, scenes, environment objects |
-| `ScreenCap/AppDelegate.swift` | Activation policy, terminate semantics |
-| `ScreenCap/Controllers/CLIClient.swift` | Process spawn, stderr line streaming, JSON parsing |
-| `ScreenCap/Controllers/PermissionController.swift` | Silent TCC checks, deep links, request APIs, relaunch helper |
-| `ScreenCap/Controllers/RecorderController.swift` | Recording lifecycle (Unit 13 fills in) |
-| `ScreenCap/State/RecordingsIndex.swift` | Cached `screencap list --json` output |
-| `ScreenCap/Views/` | SwiftUI views |
-| `ScreenCap/Scripts/embed-cli.sh` | Xcode build phase: `dist/screencap/` → `Contents/Resources/screencap/` |
-| `ScreenCap/Info.plist` | Bundle metadata (regenerated by xcodegen) |
-| `ScreenCap/ScreenCap.entitlements` | Hardened-runtime entitlements for the outer .app |
+| `Screencap/ScreencapApp.swift` | App entry, scenes, environment objects |
+| `Screencap/AppDelegate.swift` | Activation policy, terminate semantics |
+| `Screencap/Controllers/CLIClient.swift` | Process spawn, stderr line streaming, JSON parsing |
+| `Screencap/Controllers/PermissionController.swift` | Silent TCC checks, deep links, request APIs, relaunch helper |
+| `Screencap/Controllers/RecorderController.swift` | Recording lifecycle (Unit 13 fills in) |
+| `Screencap/State/RecordingsIndex.swift` | Cached `screencap list --json` output |
+| `Screencap/Views/` | SwiftUI views |
+| `Screencap/Scripts/embed-cli.sh` | Xcode build phase: `dist/screencap/` → `Contents/Resources/screencap/` |
+| `Screencap/Info.plist` | Bundle metadata (regenerated by xcodegen) |
+| `Screencap/Screencap.entitlements` | Hardened-runtime entitlements for the outer .app |
 
 See `docs/plans/2026-04-28-001-feat-native-macos-ui-v1-plan.md` for the v1 design.

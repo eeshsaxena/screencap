@@ -1,4 +1,4 @@
-name: ScreenCap
+name: Screencap
 
 options:
   deploymentTarget:
@@ -19,18 +19,18 @@ settings:
     CODE_SIGN_STYLE: Automatic
 
 targets:
-  ScreenCap:
+  Screencap:
     type: application
     platform: macOS
     sources:
-      - path: ScreenCap
+      - path: Screencap
         excludes:
           - "Scripts/**"
           - "Resources/com.screencap.daemon.plist"
           - "Resources/Fonts"
           - "Resources/Fonts/**"
           - "Info.plist"
-          - "ScreenCap.entitlements"
+          - "Screencap.entitlements"
           - "AppIcon.icon"
           - "AppIcon.icon/**"
       # Bundled typefaces (KTD-3) as a `type: folder` folder-reference (blue
@@ -39,7 +39,7 @@ targets:
       # default flat resource handling would scatter them into
       # `Contents/Resources/` and leave `ATSApplicationFontsPath: Fonts` pointing
       # at a nonexistent directory — making registration a silent no-op.
-      - path: ScreenCap/Resources/Fonts
+      - path: Screencap/Resources/Fonts
         type: folder
         buildPhase: resources
       # Icon Composer document: macOS 26+ renders the app icon (light + dark)
@@ -47,11 +47,11 @@ targets:
       # macOS 13-15. The basename must match ASSETCATALOG_COMPILER_APPICON_NAME
       # for the build system to pick it up. `type: file` keeps the package a
       # single file reference (like .xcassets), not a loose-file group.
-      - path: ScreenCap/AppIcon.icon
+      - path: Screencap/AppIcon.icon
         type: file
         buildPhase: resources
     resources:
-      - path: ScreenCap/Assets.xcassets
+      - path: Screencap/Assets.xcassets
     dependencies:
       # Build the on-device segmentation helper alongside the app; the
       # post-build script below copies its product into Contents/MacOS.
@@ -60,9 +60,9 @@ targets:
       - target: IntelligenceHelper
         embed: false
     info:
-      path: ScreenCap/Info.plist
+      path: Screencap/Info.plist
       properties:
-        CFBundleDisplayName: ScreenCap
+        CFBundleDisplayName: Screencap
         CFBundleShortVersionString: "0.18.0"
         CFBundleVersion: "31"
         LSMinimumSystemVersion: "13.0"
@@ -71,8 +71,8 @@ targets:
         # above). macOS registers them at launch; SCFonts.registerBundledFonts()
         # is the belt-and-suspenders programmatic path (KTD-3).
         ATSApplicationFontsPath: Fonts
-        NSMicrophoneUsageDescription: "ScreenCap can record audio alongside your screen capture."
-        NSCameraUsageDescription: "ScreenCap does not use the camera; this entry exists for permission-pane completeness."
+        NSMicrophoneUsageDescription: "Screencap can record audio alongside your screen capture."
+        NSCameraUsageDescription: "Screencap does not use the camera; this entry exists for permission-pane completeness."
         # NSAppleEventsUsageDescription is intentionally absent — PR1 doesn't send
         # Apple events. Re-add in PR2/Unit 14a when `screencap view` opens
         # viewer.html via a real Apple event path.
@@ -80,9 +80,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screencap.macos
-        PRODUCT_NAME: ScreenCap
+        PRODUCT_NAME: Screencap
         ENABLE_HARDENED_RUNTIME: YES
-        CODE_SIGN_ENTITLEMENTS: ScreenCap/ScreenCap.entitlements
+        CODE_SIGN_ENTITLEMENTS: Screencap/Screencap.entitlements
         # FoundationModels is weak-linked (mirrors the IntelligenceHelper target)
         # so the app loads on its macOS-13 floor where the framework is absent; the
         # on-device availability probe (`OnDeviceModelStatus.probe`) is
@@ -99,7 +99,7 @@ targets:
     preBuildScripts:
       - name: Embed screencap CLI
         script: |
-          "${SRCROOT}/ScreenCap/Scripts/embed-cli.sh"
+          "${SRCROOT}/Screencap/Scripts/embed-cli.sh"
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false
     postBuildScripts:
@@ -108,7 +108,7 @@ targets:
           set -euo pipefail
           DEST_DIR="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
           mkdir -p "${DEST_DIR}"
-          cp "${SRCROOT}/ScreenCap/Resources/com.screencap.daemon.plist" "${DEST_DIR}/com.screencap.daemon.plist"
+          cp "${SRCROOT}/Screencap/Resources/com.screencap.daemon.plist" "${DEST_DIR}/com.screencap.daemon.plist"
         basedOnDependencyAnalysis: false
         showEnvVarsInLog: false
       # Place the on-device segmentation helper at Contents/MacOS/IntelligenceHelper
@@ -156,24 +156,24 @@ targets:
         # any macOS-26 symbol from being touched below the floor.
         OTHER_LDFLAGS: "-weak_framework FoundationModels"
 
-  ScreenCapTests:
+  ScreencapTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - path: ScreenCapTests
+      - path: ScreencapTests
     dependencies:
-      - target: ScreenCap
+      - target: Screencap
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screencap.macos.tests
         GENERATE_INFOPLIST_FILE: YES
 
 schemes:
-  ScreenCap:
+  Screencap:
     build:
       targets:
-        ScreenCap: all
-        ScreenCapTests: [test]
+        Screencap: all
+        ScreencapTests: [test]
     run:
       config: Debug
       # Baked into the scheme so it survives `xcodegen generate` — Xcode-UI
@@ -194,7 +194,7 @@ schemes:
     test:
       config: Debug
       targets:
-        - name: ScreenCapTests
+        - name: ScreencapTests
     profile:
       config: Release
     analyze:
