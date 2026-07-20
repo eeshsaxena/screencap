@@ -2961,8 +2961,15 @@ def _make_set_paused_handler(pause_state: "_CapturePauseState", pause_control_q)
 # transcription target in software instead.
 
 
-def resolve_capture_rate(target_rate: int = 16000) -> int:
-    """Return the default input device's native sample rate.
+def resolve_capture_rate(target_rate: int = 16000, device: int | None = None) -> int:
+    """Return the native sample rate of the input device we will actually open.
+
+    ``device`` is the PortAudio index chosen by the Bluetooth-aware mic-source
+    policy (SCR-288); when ``None`` this resolves the OS default input, preserving
+    the pre-fix behaviour. Resolving for the *selected* device matters when the
+    default input is a Bluetooth device we are redirecting away from — the rate
+    must track the built-in mic we open, not the AirPods we skip, or the built-in
+    opens at a non-native rate and reintroduces the shared-buffer collapse.
 
     Falls back to ``target_rate`` when the device can't be queried, preserving
     the pre-fix behaviour in that rare case rather than crashing the audio child.
@@ -2970,7 +2977,10 @@ def resolve_capture_rate(target_rate: int = 16000) -> int:
     import sounddevice
 
     try:
-        info = sounddevice.query_devices(kind="input")
+        if device is not None:
+            info = sounddevice.query_devices(device)
+        else:
+            info = sounddevice.query_devices(kind="input")
         native = int(round(float(info["default_samplerate"])))
         return native or target_rate
     except Exception as exc:  # noqa: BLE001 — a query failure must not crash audio.

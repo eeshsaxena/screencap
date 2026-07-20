@@ -31,13 +31,20 @@ import numpy as np
 from screencap.engine.recorder import resample_capture_block, resolve_capture_rate
 
 
-def _fake_sounddevice(*, default_samplerate=None, raise_on_query=False):
-    """A stand-in ``sounddevice`` module so the test needs no real mic/device."""
+def _fake_sounddevice(*, default_samplerate=None, raise_on_query=False, by_index=None):
+    """A stand-in ``sounddevice`` module so the test needs no real mic/device.
+
+    ``by_index`` maps a device index -> its native rate, exercising the
+    device-scoped ``resolve_capture_rate(device=...)`` path; without it, the
+    default-input path (``kind="input"``) returns ``default_samplerate``.
+    """
     mod = types.ModuleType("sounddevice")
 
-    def query_devices(kind=None):
+    def query_devices(device=None, kind=None):
         if raise_on_query:
             raise RuntimeError("no input device")
+        if device is not None and by_index is not None:
+            return {"name": f"Dev{device}", "default_samplerate": by_index[device]}
         return {"name": "Fake Mic", "default_samplerate": default_samplerate}
 
     mod.query_devices = query_devices
@@ -66,6 +73,25 @@ def test_resolve_capture_rate_falls_back_on_query_error():
     fake = _fake_sounddevice(raise_on_query=True)
     with mock.patch.dict(sys.modules, {"sounddevice": fake}):
         assert resolve_capture_rate(16000) == 16000
+
+
+def test_resolve_capture_rate_uses_selected_device():
+    """SCR-288 R8: the rate tracks the *selected* device, not the OS default.
+
+    A muted-start recording later unmuted onto the built-in mic must resolve for
+    that built-in device (48000), not the default input (Bluetooth) sampled at
+    process start.
+    """
+    fake = _fake_sounddevice(default_samplerate=16000.0, by_index={7: 48000.0})
+    with mock.patch.dict(sys.modules, {"sounddevice": fake}):
+        assert resolve_capture_rate(16000, device=7) == 48000
+
+
+def test_resolve_capture_rate_device_query_error_falls_back():
+    """A failed query for a specific device still degrades to target_rate."""
+    fake = _fake_sounddevice(raise_on_query=True)
+    with mock.patch.dict(sys.modules, {"sounddevice": fake}):
+        assert resolve_capture_rate(16000, device=3) == 16000
 
 
 def test_resample_capture_block_downsamples_native_to_16k():
