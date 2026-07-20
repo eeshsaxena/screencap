@@ -28,6 +28,10 @@ enum ShellRoute: Hashable {
     /// (U6/U12); nil for a plain day-card open. `.timeline` has no sidebar row:
     /// it highlights the Days row (see `ShellSidebarModel.highlightedRoute`).
     case timeline(day: Date, seekMs: Int?, highlight: DaySpanHighlight?)
+    /// The dedicated task view: opening a task moment lands HERE, scoped to just
+    /// the task (player + task-only strip), not the whole day. Like `.timeline` it
+    /// has no sidebar row — it highlights the Moments row (see `highlightedRoute`).
+    case taskDetail(TaskRouteKey)
     case privacy
     case appRules
     case intelligence
@@ -37,6 +41,21 @@ enum ShellRoute: Hashable {
 /// A dedicated Hashable value so it can ride `ShellRoute.timeline`'s associated
 /// values (a bare tuple can't — tuples aren't Hashable).
 struct DaySpanHighlight: Hashable {
+    let startMs: Int
+    let endMs: Int
+}
+
+/// The identity a `ShellRoute.taskDetail` carries — enough to render the scoped
+/// task view and to reach the full day. A dedicated Hashable value (like
+/// `DaySpanHighlight`) so it can ride the route's associated value. Never a
+/// recording title on any surface — the recording name is opaque plumbing (R5).
+struct TaskRouteKey: Hashable {
+    let recording: String
+    let recordingId: String?
+    let taskIndex: Int
+    let name: String
+    let category: String?
+    let day: Date
     let startMs: Int
     let endMs: Int
 }
@@ -91,8 +110,13 @@ enum ShellSidebarModel {
     /// (reached from Days cards and citations), so it highlights the Days row
     /// (U4). Every other route highlights its own row.
     static func highlightedRoute(for route: ShellRoute) -> ShellRoute {
-        if case .timeline = route { return .days }
-        return route
+        switch route {
+        case .timeline: return .days
+        // The task view is reached from a Moments row, so it keeps the Moments
+        // row lit — mirroring `.timeline` → Days.
+        case .taskDetail: return .moments
+        default: return route
+        }
     }
 
     /// Whether a nav row should render as active for the current route — pure so

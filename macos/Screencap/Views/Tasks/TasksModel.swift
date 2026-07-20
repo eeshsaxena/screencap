@@ -38,6 +38,20 @@ enum TasksModel {
         /// The landing highlight span for the day page (AE3).
         var highlight: DaySpanHighlight { DaySpanHighlight(startMs: startMs, endMs: endMs) }
 
+        /// The route payload for opening this task's dedicated view (U2/KTD-1).
+        var routeKey: TaskRouteKey {
+            TaskRouteKey(
+                recording: recording,
+                recordingId: recordingId,
+                taskIndex: taskIndex,
+                name: name,
+                category: category,
+                day: day,
+                startMs: startMs,
+                endMs: endMs
+            )
+        }
+
         /// "HH:mm–HH:mm" over the task's local wall-clock window (never a recording
         /// name, R5). A sub-minute span collapses to a single time.
         var timeRangeText: String {

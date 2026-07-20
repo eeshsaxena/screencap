@@ -157,8 +157,12 @@ struct MomentsView: View {
     @EnvironmentObject private var store: StoreController
     @EnvironmentObject private var recorder: RecorderController
     @EnvironmentObject private var intelligence: IntelligenceController
+    /// For each task row's `RecordingSummary` (poster anchors + current dir name).
+    @EnvironmentObject private var index: RecordingsIndex
 
-    /// A row click opens the day page seeked to the row's span with the band
+    /// A task row click opens the dedicated task view scoped to the task (R4).
+    var onOpenTask: (TaskRouteKey) -> Void
+    /// A row's "Open day" opens the day page seeked to the row's span with the band
     /// highlighted (AE3): (day, seekMs, highlight).
     var onOpenTimeline: (Date, Int?, DaySpanHighlight?) -> Void
     /// The honest "set up intelligence" zero state deep-links to the Intelligence
@@ -166,6 +170,10 @@ struct MomentsView: View {
     var onOpenIntelligence: () -> Void
 
     @StateObject private var controller = MomentsController()
+    /// ONE frame index + thumbnail loader shared across every task row's poster
+    /// (not one per row), mirroring the clip thumbnails.
+    @State private var frameIndex = RecordingFrameIndex()
+    @State private var thumbnailLoader = ThumbnailLoader()
     /// The shared task-curation write-through (R12) — the SAME cache + verbs the
     /// day page uses, so a rename here and a rename there can't drift.
     @StateObject private var dayTasks = DayTasks()
@@ -416,13 +424,16 @@ struct MomentsView: View {
                 ForEach(group.rows) { row in
                     MomentRowView(
                         row: row,
+                        openTask: { if case .auto(let task) = row { onOpenTask(task.routeKey) } },
                         openDay: { openDay(row) },
                         play: { if case .clipped(let clip) = row { playClip(clip) } },
                         share: { if case .clipped(let clip) = row { shareClip(clip) } },
                         exportCopy: { if case .clipped(let clip) = row { exportCopy(clip) } },
                         deleteClip: { if case .clipped(let clip) = row { pendingDelete = clip } },
                         rename: { if case .auto(let task) = row { renameTarget = task } },
-                        deleteTask: { if case .auto(let task) = row { deleteTask(task) } }
+                        deleteTask: { if case .auto(let task) = row { deleteTask(task) } },
+                        frameIndex: frameIndex,
+                        thumbnailLoader: thumbnailLoader
                     )
                 }
             }

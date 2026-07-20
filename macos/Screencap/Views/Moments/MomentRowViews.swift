@@ -16,6 +16,9 @@ private let momentRowGutter: CGFloat = 120
 /// from the same `MomentRow`, invoking only the kind-appropriate action closures.
 struct MomentRowView: View {
     let row: MomentsModel.MomentRow
+    /// Open a task moment's dedicated scoped view — player + task-only strip, not
+    /// the whole day (auto rows, R4).
+    var openTask: () -> Void
     /// Jump to the row's source day (both kinds, R4).
     var openDay: () -> Void
     // Clipped-only actions.
@@ -26,11 +29,17 @@ struct MomentRowView: View {
     // App-detected-only actions.
     var rename: () -> Void
     var deleteTask: () -> Void
+    // Shared thumbnail machinery for the auto row's task-span poster (KTD-6).
+    let frameIndex: RecordingFrameIndex
+    let thumbnailLoader: ThumbnailLoader
 
     var body: some View {
         switch row {
         case .auto(let task):
-            AutoRow(task: task, openDay: openDay, rename: rename, delete: deleteTask)
+            AutoRow(
+                task: task, frameIndex: frameIndex, thumbnailLoader: thumbnailLoader,
+                openTask: openTask, openDay: openDay, rename: rename, delete: deleteTask
+            )
         case .clipped(let clip):
             ClippedRow(
                 clip: clip, openDay: openDay, play: play,
@@ -42,60 +51,80 @@ struct MomentRowView: View {
 
 // MARK: - App-detected row
 
-/// An app-detected task span: name + wall-clock range + optional category chip,
-/// opening its day on click (AE3) and curating via the shared write-through (R12).
-/// Reserves the thumbnail gutter (empty) so its text aligns with clipped rows.
+/// An app-detected task span: a task-span thumbnail + name + wall-clock range +
+/// optional category chip. The whole row opens the task's dedicated scoped view
+/// (R4); a separate "Open day →" control opens the day (AE3); curation is via the
+/// shared write-through (R12). The thumbnail fills the shared gutter so its text
+/// aligns with clipped rows.
 private struct AutoRow: View {
     let task: TasksModel.TaskRow
+    let frameIndex: RecordingFrameIndex
+    let thumbnailLoader: ThumbnailLoader
+    var openTask: () -> Void
     var openDay: () -> Void
     var rename: () -> Void
     var delete: () -> Void
 
+    @EnvironmentObject private var index: RecordingsIndex
     @State private var hovering = false
 
+    /// Stable-id-first resolution (survives a post-stop rename) for the poster
+    /// anchors + current dir name.
+    private var summary: RecordingSummary? {
+        index.summary(recordingId: task.recordingId, name: task.recording)
+    }
+
     var body: some View {
-        Button(action: openDay) {
-            HStack(alignment: .top, spacing: 14) {
-                Color.clear.frame(width: momentRowGutter, height: 1)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(task.name)
-                        .font(SCTypography.sans(size: 13.5, weight: .medium))
-                        .foregroundStyle(Color.scInk)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                    HStack(spacing: 8) {
-                        Text(task.timeRangeText)
-                            .font(SCTypography.mono(size: 11))
+        HStack(alignment: .top, spacing: 14) {
+            MomentTaskThumbnail(
+                task: task, summary: summary,
+                frameIndex: frameIndex, thumbnailLoader: thumbnailLoader
+            )
+            .frame(width: momentRowGutter)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(task.name)
+                    .font(SCTypography.sans(size: 13.5, weight: .medium))
+                    .foregroundStyle(Color.scInk)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                HStack(spacing: 8) {
+                    Text(task.timeRangeText)
+                        .font(SCTypography.mono(size: 11))
+                        .foregroundStyle(Color.scInkMuted)
+                    if let category = task.category, !category.isEmpty {
+                        Text(category)
+                            .font(SCTypography.mono(size: 10))
                             .foregroundStyle(Color.scInkMuted)
-                        if let category = task.category, !category.isEmpty {
-                            Text(category)
-                                .font(SCTypography.mono(size: 10))
-                                .foregroundStyle(Color.scInkMuted)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 1)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: SCMetrics.radiusPill)
-                                        .strokeBorder(Color.scBorderWarm, lineWidth: 1)
-                                )
-                        }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 1)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: SCMetrics.radiusPill)
+                                    .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+                            )
                     }
                 }
-                Spacer(minLength: 0)
+            }
+            Spacer(minLength: 0)
+            // "Open day →" as its OWN control (event-consuming) so a click here
+            // opens the day and never also fires the row's open-task.
+            Button(action: openDay) {
                 Text("Open day →")
                     .font(SCTypography.sans(size: 12))
                     .foregroundStyle(Color.scTeal)
                     .opacity(hovering ? 1 : 0.6)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
-            .overlay(
-                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
-                    .strokeBorder(hovering ? Color.scTeal : Color.scBorderWarm, lineWidth: 1)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open the full day for this task")
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .strokeBorder(hovering ? Color.scTeal : Color.scBorderWarm, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: openTask)
         .onHover { hovering = $0 }
         .contextMenu {
             Button("Rename…", action: rename)
@@ -103,7 +132,61 @@ private struct AutoRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(task.name), \(task.timeRangeText)")
-        .accessibilityHint("Opens the day seeked to this task")
+        .accessibilityHint("Opens the task")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { openTask() }
+    }
+}
+
+// MARK: - Task-span thumbnail
+
+/// A task-span thumbnail: a frame from within the task's OWN span (KTD-4), so two
+/// tasks in one recording read distinctly (R2/AE3), falling back to the hatch
+/// placeholder. Mirrors `MomentClipThumbnail`'s shape so auto and clipped rows
+/// align; reuses the shared frame index + loader (not one per row).
+private struct MomentTaskThumbnail: View {
+    let task: TasksModel.TaskRow
+    let summary: RecordingSummary?
+    let frameIndex: RecordingFrameIndex
+    let thumbnailLoader: ThumbnailLoader
+    var aspectRatio: CGFloat = 16.0 / 9.0
+
+    @State private var image: ThumbnailImage?
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity)
+            .aspectRatio(aspectRatio, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: SCMetrics.radiusChip))
+            .overlay(
+                RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
+                    .strokeBorder(Color.scFillSubtle, lineWidth: 1)
+            )
+            .task(id: task.id) { await load() }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let image {
+            Image(decorative: image.cgImage, scale: 1)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+        } else {
+            CardHatchPlaceholder()
+        }
+    }
+
+    private func load() async {
+        let startedAtMs = summary?.startedAt.map { Int($0 * 1000) }
+        let durationMs = summary?.durationSeconds.map { Int($0 * 1000) }
+        image = await frameIndex.taskThumbnail(
+            // The current dir name (survives a post-stop rename), not the snapshot.
+            recording: summary?.name ?? task.recording,
+            taskStartMs: task.startMs,
+            startedAtMs: startedAtMs,
+            durationMs: durationMs,
+            thumbnailLoader: thumbnailLoader
+        )
     }
 }
 
