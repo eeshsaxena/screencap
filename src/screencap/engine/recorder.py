@@ -2949,6 +2949,68 @@ def _make_set_paused_handler(pause_state: "_CapturePauseState", pause_control_q)
     return _handler
 
 
+# --- Mic capture rate + software resampling -------------------------------
+#
+# Opening the shared default input device at a NON-NATIVE rate (the pipeline's
+# 16 kHz target) makes CoreAudio collapse that device's GLOBAL buffer-frame-size
+# to its minimum. That property is shared by every client of the mic, so a
+# meeting app (Zoom/Meet/Teams) capturing the same mic is then driven at a
+# sub-millisecond IOProc cadence and glitches the user's outbound voice —
+# clearing up only once the recording stops. Capturing at the device's NATIVE
+# rate keeps the shared buffer healthy; we resample to the 16 kHz on-disk /
+# transcription target in software instead.
+
+
+def resolve_capture_rate(target_rate: int = 16000) -> int:
+    """Return the default input device's native sample rate.
+
+    Falls back to ``target_rate`` when the device can't be queried, preserving
+    the pre-fix behaviour in that rare case rather than crashing the audio child.
+    """
+    import sounddevice
+
+    try:
+        info = sounddevice.query_devices(kind="input")
+        native = int(round(float(info["default_samplerate"])))
+        return native or target_rate
+    except Exception as exc:  # noqa: BLE001 — a query failure must not crash audio.
+        logger.warning(
+            f"Could not resolve input device rate ({exc}); capturing at {target_rate} Hz"
+        )
+        return target_rate
+
+
+def resample_capture_block(
+    resampler: "av.AudioResampler", frames: "np.ndarray | None", src_rate: int
+) -> "np.ndarray | None":
+    """Feed one native-rate float32 mono block through ``resampler``.
+
+    ``frames`` is ``(N, 1)`` float32 (or ``None`` to flush the resampler's
+    residual tail at end-of-capture). Returns the resampled ``(M, 1)`` float32
+    frames ready for the 16 kHz FLAC writer, or ``None`` when the resampler
+    produced no output for this block (it buffers a little internally).
+
+    One long-lived ``resampler`` is reused for the whole recording so the
+    conversion stays gapless across flush blocks AND chunk boundaries — the same
+    stateful-resampler contract as ``audio_clip._decode_and_resample``.
+    """
+    if frames is None:
+        rframes = resampler.resample(None)  # flush tail
+    else:
+        aframe = av.AudioFrame.from_ndarray(
+            np.ascontiguousarray(frames.reshape(1, -1), dtype=np.float32),
+            format="fltp",
+            layout="mono",
+        )
+        aframe.sample_rate = src_rate
+        aframe.pts = None
+        rframes = resampler.resample(aframe)
+    parts = [rf.to_ndarray() for rf in rframes]
+    if not parts:
+        return None
+    return np.concatenate(parts, axis=1).reshape(-1, 1).astype(np.float32)
+
+
 def record_audio(
     recording: Recording,
     db_path: str,
@@ -3000,6 +3062,18 @@ def record_audio(
     SAMPLERATE = 16000
     CHANNELS = 1
 
+    # Capture at the mic's NATIVE rate and resample to SAMPLERATE in software;
+    # requesting 16 kHz from the shared device collapses its global IO buffer and
+    # glitches any concurrent mic client (see resolve_capture_rate). The on-disk
+    # audio_*.flac stays 16 kHz mono, so nothing downstream changes.
+    CAPTURE_RATE = resolve_capture_rate(SAMPLERATE)
+    _resampler = (
+        av.AudioResampler(format="fltp", layout="mono", rate=SAMPLERATE)
+        if CAPTURE_RATE != SAMPLERATE
+        else None
+    )
+    logger.info(f"Audio capture rate={CAPTURE_RATE} Hz -> on-disk {SAMPLERATE} Hz")
+
     # Locked buffer — audio_callback appends, flush thread drains
     audio_buffer: list[np.ndarray] = []
     buffer_lock = threading.Lock()
@@ -3023,6 +3097,37 @@ def record_audio(
             drained = audio_buffer[:]
             audio_buffer.clear()
         return np.concatenate(drained, axis=0)
+
+    def _drain_for_write() -> np.ndarray | None:
+        """Drain the callback buffer and resample it to SAMPLERATE for the FLAC.
+
+        With native-rate capture (no resampler) this is just the drained block;
+        otherwise it's the resampled 16 kHz frames (possibly ``None`` while the
+        stateful resampler buffers a fraction of a window internally).
+
+        A resample failure must not propagate: this runs on the flush thread, and
+        an escaping exception would drop the ``audio_final`` ack and stall
+        ``chunk_processor._wait_for_audio`` (mirrors the ack-before-close care
+        below). On failure we degrade to writing nothing this cycle.
+        """
+        raw = _drain_buffer()
+        if raw is None or _resampler is None:
+            return raw
+        try:
+            return resample_capture_block(_resampler, raw, CAPTURE_RATE)
+        except Exception as e:  # noqa: BLE001 — a bad block must not crash audio.
+            logger.error(f"Audio resample failed (dropping block): {e}")
+            return None
+
+    def _flush_resampler_tail() -> np.ndarray | None:
+        """Resampled residual tail to write once, at true end-of-capture."""
+        if _resampler is None:
+            return None
+        try:
+            return resample_capture_block(_resampler, None, CAPTURE_RATE)
+        except Exception as e:  # noqa: BLE001 — a bad flush must not crash audio.
+            logger.error(f"Audio resampler tail flush failed: {e}")
+            return None
 
     # Track current chunk index for chunked audio
     _current_chunk_idx = [0]  # mutable container
@@ -3067,13 +3172,23 @@ def record_audio(
         index or open a new file — there is no next chunk.
         """
         # Drain and write any remaining buffered frames for this chunk.
-        frames = _drain_buffer()
+        frames = _drain_for_write()
         if frames is not None:
             _ensure_writer(sf_writer_ref)
             try:
                 sf_writer_ref[0].write(frames)
             except Exception as e:
                 logger.error(f"Audio rotation drain failed: {e}")
+        if is_final:
+            # Flush the resampler's residual tail into THIS (last) chunk before
+            # closing — there is no next chunk to carry it.
+            tail = _flush_resampler_tail()
+            if tail is not None:
+                _ensure_writer(sf_writer_ref)
+                try:
+                    sf_writer_ref[0].write(tail)
+                except Exception as e:
+                    logger.error(f"Audio tail flush failed: {e}")
         if sf_writer_ref[0] is not None:
             sf_writer_ref[0].close()
             sf_writer_ref[0] = None
@@ -3116,7 +3231,7 @@ def record_audio(
             if _finalized[0]:
                 return  # finalized by final_chunk rotation
 
-            frames = _drain_buffer()
+            frames = _drain_for_write()
             if frames is not None:
                 _ensure_writer(sf_writer_ref)
                 try:
@@ -3145,7 +3260,7 @@ def record_audio(
     # mic TCC — it does not defer to .start()).
     def _make_stream():
         return sounddevice.InputStream(
-            callback=audio_callback, samplerate=SAMPLERATE, channels=CHANNELS,
+            callback=audio_callback, samplerate=CAPTURE_RATE, channels=CHANNELS,
         )
 
     controller = audio_mute.AudioStreamController(
@@ -3251,9 +3366,9 @@ def record_audio(
                 break
 
     # Final drain — write any remaining buffered frames (skip if already
-    # finalized by a final_chunk rotation above).
+    # finalized by a final_chunk rotation above, which flushed its own tail).
     if not _finalized[0]:
-        final_frames = _drain_buffer()
+        final_frames = _drain_for_write()
         if final_frames is not None:
             _ensure_writer(sf_writer_ref)
             try:
@@ -3261,6 +3376,14 @@ def record_audio(
                 logger.debug(f"Final flush: {len(final_frames)} audio frames")
             except Exception as e:
                 logger.error(f"Final audio flush failed: {e}")
+        # Flush the resampler's residual tail (no more chunks to carry it).
+        tail = _flush_resampler_tail()
+        if tail is not None:
+            _ensure_writer(sf_writer_ref)
+            try:
+                sf_writer_ref[0].write(tail)
+            except Exception as e:
+                logger.error(f"Audio tail flush failed: {e}")
 
     # Send final audio ack BEFORE closing the FLAC writer. sf_writer.close()
     # can block for seconds on FLAC header finalization or raise on disk
