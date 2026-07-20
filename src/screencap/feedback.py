@@ -98,9 +98,17 @@ def _upload_target_allowed(url: str) -> bool:
         return False
     if parts.hostname in LINEAR_UPLOAD_HOSTS:
         return True
-    return parts.hostname == LINEAR_UPLOAD_GCS_HOST and parts.path.startswith(
-        LINEAR_UPLOAD_GCS_PREFIX
-    )
+    if parts.hostname != LINEAR_UPLOAD_GCS_HOST:
+        return False
+    # Reject dot-segments before the prefix check: requests/urllib3 collapse
+    # "/../" per RFC 3986 BEFORE sending, so a path that passes a raw prefix
+    # check (".../uploads.linear.app/../other-bucket/x") is rewritten to a
+    # DIFFERENT bucket by the time bytes go out. Linear's real signed URLs are
+    # all UUID path segments with no dot-segments, so this only rejects forged
+    # targets.
+    if any(seg in ("..", ".") for seg in parts.path.split("/")):
+        return False
+    return parts.path.startswith(LINEAR_UPLOAD_GCS_PREFIX)
 
 
 def _validate_attachments(attachments: list[dict]) -> list[dict] | dict:

@@ -137,9 +137,12 @@ MAX_BODY_BYTES = 64 * 1024                  # JSON control plane only; no file b
 # U0 finding (SCR-281): Linear's signed upload URL must be USED within 60 s of
 # minting (X-Goog-Expires=60; GCS checks the signature when the PUT request
 # arrives, so an already-started slow stream may finish). A 60-min claim would
-# outlive the upload session by an hour for no benefit; 10 min covers the PUT
-# start window + streaming + submit retries. ``expired`` stays retryable — the
-# client re-prepares.
+# outlive that 60 s upload window by an hour for no benefit; 10 min bounds the
+# HMAC-claim replay window while still covering a client's prepare→submit round
+# trip. It does NOT rescue a slow multi-file upload — the signed URLs, not the
+# claim, are the 60 s constraint (see SCR-285: prepare batch-mints all URLs but
+# the CLI PUTs sequentially). ``expired`` stays retryable — the client
+# re-prepares.
 CLAIM_TTL_SECONDS = 10 * 60
 
 # Per-IP budgets (KTD-6). Best-effort per-instance-lifetime.
@@ -243,11 +246,17 @@ def _upload_target_allowed(url: str) -> bool:
         parts = urlparse(url)
     except ValueError:
         return False
-    return (
-        parts.scheme == "https"
-        and parts.hostname == LINEAR_UPLOAD_GCS_HOST
-        and parts.path.startswith(LINEAR_UPLOAD_GCS_PREFIX)
-    )
+    if not (parts.scheme == "https" and parts.hostname == LINEAR_UPLOAD_GCS_HOST):
+        return False
+    # Reject dot-segments before the prefix check: requests/urllib3 (and other
+    # RFC 3986 clients) collapse "/../" BEFORE sending, so a path that passes a
+    # raw prefix check (".../uploads.linear.app/../other-bucket/x") is rewritten
+    # to a DIFFERENT bucket by the time bytes go out. Linear's real signed URLs
+    # are all UUID path segments with no dot-segments, so this only rejects
+    # forged targets.
+    if any(seg in ("..", ".") for seg in parts.path.split("/")):
+        return False
+    return parts.path.startswith(LINEAR_UPLOAD_GCS_PREFIX)
 
 
 # --------------------------------------------------------------------------

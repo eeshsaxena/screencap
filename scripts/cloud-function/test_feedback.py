@@ -201,10 +201,35 @@ def test_prepare_gcs_pathstyle_upload_url_passes_but_foreign_bucket_fails():
     assert payload["ok"] is True
     assert payload["uploads"][0]["uploadUrl"] == ok_url
 
-    evil_url = "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1"
-    with mock.patch("feedback.requests.post", side_effect=fake_post_for(evil_url)):
-        _, payload = _invoke({"action": "prepare", "attachments": manifest})
+    # Foreign bucket as first path segment, and a dot-segment an RFC-3986
+    # client would collapse to another bucket after a raw prefix check passed.
+    for evil_url in (
+        "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1",
+        "https://storage.googleapis.com/uploads.linear.app/../attacker-bucket/1",
+    ):
+        with mock.patch("feedback.requests.post", side_effect=fake_post_for(evil_url)):
+            _, payload = _invoke({"action": "prepare", "attachments": manifest})
+        assert payload["ok"] is False, evil_url
+
+
+def test_submit_keeps_asseturl_on_the_narrow_host_allowlist():
+    # assetUrl stays uploads.linear.app-only (_host_allowed) even though
+    # uploadUrl now accepts the wider GCS path-style form. A GCS path-style
+    # assetUrl — correctly bucket-pinned, so it would pass the LOOSER
+    # _upload_target_allowed — must still be rejected at submit, guarding
+    # against a future swap of the two guards in _handle_submit.
+    gcs_asset = "https://storage.googleapis.com/uploads.linear.app/ws/att/1"
+    claim = feedback.mint_claim(gcs_asset, exp=9_999_999_999)
+    _, payload = _invoke(
+        {
+            "action": "submit",
+            "type": "bug",
+            "message": "hi",
+            "attachments": [{"assetUrl": gcs_asset, "claim": claim}],
+        }
+    )
     assert payload["ok"] is False
+    assert payload["error_kind"] == "invalid"
 
 
 # --------------------------------------------------------------------------

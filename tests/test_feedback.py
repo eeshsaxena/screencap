@@ -180,14 +180,21 @@ def test_gcs_pathstyle_upload_url_allowed_but_foreign_bucket_rejected(tmp_path):
     assert env["ok"] is True
     put.assert_called_once()
 
-    evil_url = "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1"
-    with mock.patch("screencap.feedback.requests.post", return_value=_Resp(prep_for(evil_url))), \
-        mock.patch("screencap.feedback.requests.put") as put:
-        env = feedback.send_feedback(
-            {"type": "bug", "message": "hi", "attachments": [{"path": str(f1), "content_type": "image/png"}]}
-        )
-    assert env["ok"] is False
-    put.assert_not_called()             # no bytes left the machine
+    # Foreign bucket as the first path segment, and a dot-segment that a
+    # normalizing HTTP client (requests/urllib3 collapse "/../" per RFC 3986)
+    # would rewrite to another bucket after a naive prefix check passed. Both
+    # must send no bytes.
+    for evil_url in (
+        "https://storage.googleapis.com/attacker-bucket/uploads.linear.app/1",
+        "https://storage.googleapis.com/uploads.linear.app/../attacker-bucket/1",
+    ):
+        with mock.patch("screencap.feedback.requests.post", return_value=_Resp(prep_for(evil_url))), \
+            mock.patch("screencap.feedback.requests.put") as put:
+            env = feedback.send_feedback(
+                {"type": "bug", "message": "hi", "attachments": [{"path": str(f1), "content_type": "image/png"}]}
+            )
+        assert env["ok"] is False, evil_url
+        put.assert_not_called()         # no bytes left the machine
 
 
 # --------------------------------------------------------------------------
