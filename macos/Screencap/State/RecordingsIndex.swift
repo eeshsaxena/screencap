@@ -178,3 +178,18 @@ final class RecordingsIndex: ObservableObject {
         lastErrorKind = nil
     }
 }
+
+extension RecordingsIndex {
+    /// Resolve a task's recording by stable `recordingId` first (the identity that
+    /// survives a post-stop directory rename), falling back to the current
+    /// directory `name`. The task view and gallery cards use this so a rename
+    /// between the tasks snapshot and opening the task doesn't orphan the footage.
+    /// The returned summary's `name` is the CURRENT directory name — callers read
+    /// chunks/thumbnails from that, not the (possibly stale) snapshot name.
+    func summary(recordingId: String?, name: String) -> RecordingSummary? {
+        if let recordingId, let match = recordings.first(where: { $0.recordingId == recordingId }) {
+            return match
+        }
+        return recordings.first { $0.name == name }
+    }
+}

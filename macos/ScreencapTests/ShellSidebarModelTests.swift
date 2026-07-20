@@ -96,6 +96,32 @@ final class ShellSidebarModelTests: XCTestCase {
         XCTAssertFalse(ShellSidebarModel.isActive(item(ShellSidebarModel.settingsNav, "account"), route: .privacy))
     }
 
+    // MARK: - Task-view active-row highlighting
+
+    /// The dedicated task view (`.taskDetail`) has no row of its own — it is
+    /// reached from a Moments row, so it keeps the Moments row lit, mirroring
+    /// `.timeline` → Days. Days/Chat don't light up while the task view is open.
+    func testTaskDetailRouteHighlightsMomentsRow() {
+        let route = ShellRoute.taskDetail(sampleTaskKey())
+        XCTAssertEqual(ShellSidebarModel.highlightedRoute(for: route), .moments)
+        XCTAssertTrue(ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, "moments"), route: route))
+        for id in ["days", "chat"] {
+            XCTAssertFalse(
+                ShellSidebarModel.isActive(item(ShellSidebarModel.primaryNav, id), route: route),
+                "\(id) is not active while the task view is open"
+            )
+        }
+    }
+
+    private func sampleTaskKey() -> TaskRouteKey {
+        TaskRouteKey(
+            recording: "rec-a", recordingId: nil, taskIndex: 0,
+            name: "Browsing", category: "other",
+            day: Date(timeIntervalSince1970: 1_752_960_000),
+            startMs: 1_752_970_000_000, endMs: 1_752_971_000_000
+        )
+    }
+
     // MARK: - Footer storage math
 
     func testStorageFooterSumsBytesAndFormatsGB() {

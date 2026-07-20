@@ -277,7 +277,11 @@ struct MainWindow: View {
             // The day page (`.timeline`) and the settings routes never become an
             // origin, so a back-out never lands on a settings pane.
             switch newValue {
-            case .days, .moments, .chat:
+            case .days, .moments, .chat, .taskDetail:
+                // `.taskDetail` is recorded so the day page's Back (opened via the
+                // task view's "Open full day") returns to the task view. The task
+                // view's OWN Back targets `.moments` explicitly (see below), so this
+                // never self-loops.
                 lastNonTimelineRoute = newValue
             default:
                 break
@@ -707,6 +711,7 @@ struct MainWindow: View {
             // opens its day page seeked to the span with the band highlighted (AE3);
             // clipped rows play / export / share / delete in place (R4).
             MomentsView(
+                onOpenTask: { key in route = .taskDetail(key) },
                 onOpenTimeline: { day, seekMs, highlight in
                     route = .timeline(day: day, seekMs: seekMs, highlight: highlight)
                 },
@@ -746,6 +751,23 @@ struct MainWindow: View {
                 onBack: { route = lastNonTimelineRoute }
             )
                 .id(day)
+        case .taskDetail(let key):
+            // Opening a task moment lands on its own scoped view — player +
+            // task-only strip — not the whole day. Back returns to Moments
+            // explicitly; "Open full day" reaches the day page seeked + highlighted
+            // (the prior behavior, kept as the secondary path).
+            TaskDetailView(
+                task: key,
+                onBack: { route = .moments },
+                onOpenFullDay: {
+                    route = .timeline(
+                        day: key.day,
+                        seekMs: key.startMs,
+                        highlight: DaySpanHighlight(startMs: key.startMs, endMs: key.endMs)
+                    )
+                }
+            )
+                .id(key)
         }
     }
 
