@@ -120,12 +120,22 @@ def test_set_audio_default_creates_file(tmp_path):
 _PREFER_BUILTIN_ENV = "SCREENCAP_PREFER_BUILTIN_MIC_OVER_BLUETOOTH"
 
 
-def test_prefer_builtin_mic_default_true():
-    """SCR-288: the Bluetooth mic-redirect defaults on (protect playback)."""
+def test_prefer_builtin_mic_default_true(tmp_path):
+    """SCR-288: the Bluetooth mic-redirect defaults on (protect playback).
+
+    Isolated from the real ``~/.screencap/config.toml`` (nonexistent tmp path +
+    cache reset) so the default is asserted against an empty config, not whatever
+    the developer's machine happens to set.
+    """
+    import screencap.config as cfg
     from screencap.config import get_prefer_builtin_mic_over_bluetooth
 
     env = {k: v for k, v in os.environ.items() if k != _PREFER_BUILTIN_ENV}
-    with mock.patch.dict(os.environ, env, clear=True):
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", tmp_path / "config.toml"),
+        mock.patch.dict(os.environ, env, clear=True),
+    ):
+        cfg._config_cache = None
         assert get_prefer_builtin_mic_over_bluetooth() is True
 
 

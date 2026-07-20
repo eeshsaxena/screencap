@@ -104,6 +104,27 @@ def _fourcc(code: str) -> int:
     return struct.unpack(">I", code.encode("ascii"))[0]
 
 
+def _parse_audio_buffer_list_channels(raw: bytes) -> int:
+    """Sum the channel counts in a CoreAudio ``AudioBufferList`` byte buffer.
+
+    Layout (64-bit): ``UInt32 mNumberBuffers`` (+4 bytes pad to 8-byte align the
+    array), then ``mNumberBuffers`` × ``AudioBuffer`` records of
+    ``{UInt32 mNumberChannels; UInt32 mDataByteSize; void* mData}`` = 16 bytes
+    each. Pure and total-input-independent, so it is unit-testable with fabricated
+    bytes — the one non-hardware part of the ctypes device read.
+    """
+    if len(raw) < 4:
+        return 0
+    nbuf = struct.unpack("I", raw[:4])[0]
+    channels, off = 0, 8
+    for _ in range(nbuf):
+        if off + 4 > len(raw):
+            break
+        channels += struct.unpack("I", raw[off:off + 4])[0]
+        off += 16
+    return channels
+
+
 def classify_input_devices() -> list[InputDevice]:
     """Return input-capable devices with transport + in-use classification.
 
@@ -164,6 +185,23 @@ def _coreaudio_inputs_by_name() -> dict[str, tuple[str, bool]]:
 
     ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
     cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+    # Set explicit arg/return types: without them ctypes marshals pointers and
+    # OSStatus as a plain C int, a documented 64-bit (esp. x86_64) crash hazard —
+    # and a native fault would bypass classify_input_devices' fail-open try/except.
+    _osstatus = ctypes.c_int32
+    ca.AudioObjectGetPropertyDataSize.restype = _osstatus
+    ca.AudioObjectGetPropertyDataSize.argtypes = [
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    ca.AudioObjectGetPropertyData.restype = _osstatus
+    ca.AudioObjectGetPropertyData.argtypes = [
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    cf.CFRelease.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFStringGetCString.restype = ctypes.c_bool
     cf.CFStringGetCString.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
     ]
@@ -225,17 +263,7 @@ def _coreaudio_inputs_by_name() -> dict[str, tuple[str, bool]]:
             dev, ctypes.byref(addr), 0, None, ctypes.byref(szc), buf
         ) != 0:
             return 0
-        raw = bytes(buf)
-        nbuf = struct.unpack("I", raw[:4])[0]
-        # AudioBufferList: UInt32 mNumberBuffers, then AudioBuffer[]
-        # {UInt32 mNumberChannels; UInt32 mDataByteSize; void* mData} (16 bytes each).
-        channels, off = 0, 8
-        for _ in range(nbuf):
-            if off + 4 > len(raw):
-                break
-            channels += struct.unpack("I", raw[off:off + 4])[0]
-            off += 16
-        return channels
+        return _parse_audio_buffer_list_channels(bytes(buf))
 
     # Enumerate all devices.
     size = _read_size(sys_obj, sel_devices)

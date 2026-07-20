@@ -3086,18 +3086,19 @@ def record_audio(
     _capture_rate_ref: list[int | None] = [None]
     _resampler_ref: list = [None]
 
-    def _ensure_capture_rate(device_index: int | None) -> int:
-        """Resolve the capture rate + build the resampler once, for the selected
-        device. Idempotent — later opens keep the first resolved rate (KTD-5)."""
+    def _commit_capture_rate(rate: int) -> None:
+        """Pin the capture rate + build the resampler once, AFTER a stream has
+        actually opened at ``rate`` (KTD-5). Committing only post-open means a
+        *failed* open never pins a rate that a later open of a *different* device
+        would then reuse at a non-native rate (which would reintroduce the shared
+        IO-buffer collapse). Idempotent — later opens keep the first pinned rate."""
         if _capture_rate_ref[0] is None:
-            rate = resolve_capture_rate(SAMPLERATE, device=device_index)
             _capture_rate_ref[0] = rate
             if rate != SAMPLERATE:
                 _resampler_ref[0] = av.AudioResampler(
                     format="fltp", layout="mono", rate=SAMPLERATE
                 )
             logger.info(f"Audio capture rate={rate} Hz -> on-disk {SAMPLERATE} Hz")
-        return _capture_rate_ref[0]
 
     # Locked buffer — audio_callback appends, flush thread drains
     audio_buffer: list[np.ndarray] = []
@@ -3311,15 +3312,21 @@ def record_audio(
         if skip:
             logger.info(f"Audio mic-source: skip mic capture (reason={reason})")
             return None
-        _ensure_capture_rate(device_index)
-        logger.info(
-            f"Audio mic-source: device={device_index} reason={reason} "
-            f"rate={_capture_rate_ref[0]} Hz"
-        )
-        return sounddevice.InputStream(
-            callback=audio_callback, samplerate=_capture_rate_ref[0],
+        # Use the already-pinned rate if a prior open committed one; otherwise
+        # resolve for THIS device. Commit only AFTER the open succeeds (below),
+        # so a failed open never pins a rate a later open would wrongly reuse.
+        rate = _capture_rate_ref[0]
+        if rate is None:
+            rate = resolve_capture_rate(SAMPLERATE, device=device_index)
+        stream = sounddevice.InputStream(
+            callback=audio_callback, samplerate=rate,
             channels=CHANNELS, device=device_index,
+        )  # opens the device — may raise; the refs stay untouched on failure
+        _commit_capture_rate(rate)
+        logger.info(
+            f"Audio mic-source: device={device_index} reason={reason} rate={rate} Hz"
         )
+        return stream
 
     controller = audio_mute.AudioStreamController(
         _make_stream, initially_muted=bool(initially_muted),

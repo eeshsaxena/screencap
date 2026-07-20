@@ -12,6 +12,8 @@ right devices attached and is validated manually; the two CI-testable seams are:
 
 from __future__ import annotations
 
+import struct
+
 from screencap.engine import audio_device as ad
 from screencap.engine.audio_device import (
     ACTION_DEFAULT,
@@ -107,6 +109,38 @@ def test_virtual_device_is_not_a_redirect_target():
     devices = [_dev(2, "bluetooth"), _dev(3, "unknown", name="ZoomAudioDevice")]
     sel = select_mic_source(devices, default_index=2, prefer_builtin=True)
     assert sel == ad.Selection(ACTION_SKIP, None, REASON_FALLBACK_SKIP)
+
+
+# --- _parse_audio_buffer_list_channels: the pure ctypes byte parser ---------
+
+def _audio_buffer(channels):
+    # AudioBuffer: UInt32 mNumberChannels; UInt32 mDataByteSize; void* mData (16B).
+    return struct.pack("I", channels) + b"\x00" * 12
+
+
+def _audio_buffer_list(*channel_counts):
+    # AudioBufferList: UInt32 mNumberBuffers (+4B pad), then AudioBuffer[].
+    head = struct.pack("I", len(channel_counts)) + b"\x00" * 4
+    return head + b"".join(_audio_buffer(c) for c in channel_counts)
+
+
+def test_parse_buffer_list_single_stereo_buffer():
+    assert ad._parse_audio_buffer_list_channels(_audio_buffer_list(2)) == 2
+
+
+def test_parse_buffer_list_sums_multiple_buffers():
+    # A device exposing its input as two mono buffers -> 2 channels total.
+    assert ad._parse_audio_buffer_list_channels(_audio_buffer_list(1, 1)) == 2
+
+
+def test_parse_buffer_list_zero_buffers():
+    assert ad._parse_audio_buffer_list_channels(_audio_buffer_list()) == 0
+
+
+def test_parse_buffer_list_truncated_is_safe():
+    # Claims 5 buffers but carries no buffer data -> 0, no IndexError.
+    assert ad._parse_audio_buffer_list_channels(struct.pack("I", 5)) == 0
+    assert ad._parse_audio_buffer_list_channels(b"") == 0
 
 
 # --- resolve_open_target: selection + concrete-index pinning ----------------
