@@ -13,8 +13,10 @@
 #   - the billing functions get GOOGLE_FUNCTION_SOURCE=billing.py so the buildpack
 #     doesn't default to main.py;
 #   - the signer is deployed dark (STRIPE_PAYWALL_ENFORCE left unset = off);
-#   - it is all-or-nothing: on any deploy failure it halts and reports which
-#     functions already landed, so a partial live/test split is never left silently.
+#   - it is fail-fast: on any deploy failure it halts and reports which functions
+#     already landed (no automatic rollback), and it deploys the entitlement
+#     webhook + reconcile BEFORE the checkout path so a partial failure can never
+#     leave a live charge path without its grantor.
 #
 # Usage:
 #   # Preview the exact gcloud commands (secret *references*, never values):
@@ -62,7 +64,10 @@ STRIPE_PORTAL_RETURN_URL="${STRIPE_PORTAL_RETURN_URL:-https://screencap.sh/accou
 SCREENCAP_BUCKET="${SCREENCAP_BUCKET:-screencap-recordings}"
 
 # Refuse raw secrets in the environment — they must come from Secret Manager.
-for var in STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET; do
+# Covers BOTH the value-form vars and the SECRET_* name vars: the latter are what
+# get interpolated into --set-secrets and echoed by --dry-run, so a raw key
+# mistakenly placed there (instead of a Secret Manager NAME) must also be refused.
+for var in STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET SECRET_STRIPE_SECRET_KEY SECRET_STRIPE_WEBHOOK_SECRET; do
   val="${!var:-}"
   case "$val" in
     sk_* | rk_* | whsec_*)
@@ -128,23 +133,27 @@ billing_common=(
   --set-build-env-vars GOOGLE_FUNCTION_SOURCE=billing.py
 )
 
-# 1. create-checkout-session — Firebase-gated; needs the secret key + prices.
-deploy create-checkout-session "${billing_common[@]}" \
-  --entry-point create_checkout_session \
-  --set-secrets "STRIPE_SECRET_KEY=${SECRET_STRIPE_SECRET_KEY}:latest" \
-  --set-env-vars "SCREENCAP_PROJECT_ID=${PROJECT},${PRICE_ENV},TRIAL_PERIOD_DAYS=${TRIAL_PERIOD_DAYS}"
+# Deploy the entitlement GRANTORS (webhook, reconcile) before the checkout path,
+# so a partial deploy failure can never leave a live charge path (checkout)
+# running without its webhook to grant entitlement.
 
-# 2. stripe-webhook — signature-verified; needs BOTH secrets + the price->tier map.
+# 1. stripe-webhook — signature-verified; needs BOTH secrets + the price->tier map.
 deploy stripe-webhook "${billing_common[@]}" \
   --entry-point stripe_webhook \
   --set-secrets "STRIPE_SECRET_KEY=${SECRET_STRIPE_SECRET_KEY}:latest,STRIPE_WEBHOOK_SECRET=${SECRET_STRIPE_WEBHOOK_SECRET}:latest" \
   --set-env-vars "SCREENCAP_PROJECT_ID=${PROJECT},${PRICE_ENV}"
 
-# 3. reconcile-entitlement — Firebase-gated grant-only self-heal.
+# 2. reconcile-entitlement — Firebase-gated grant-only self-heal.
 deploy reconcile-entitlement "${billing_common[@]}" \
   --entry-point reconcile_entitlement \
   --set-secrets "STRIPE_SECRET_KEY=${SECRET_STRIPE_SECRET_KEY}:latest" \
   --set-env-vars "SCREENCAP_PROJECT_ID=${PROJECT}"
+
+# 3. create-checkout-session — Firebase-gated; needs the secret key + prices.
+deploy create-checkout-session "${billing_common[@]}" \
+  --entry-point create_checkout_session \
+  --set-secrets "STRIPE_SECRET_KEY=${SECRET_STRIPE_SECRET_KEY}:latest" \
+  --set-env-vars "SCREENCAP_PROJECT_ID=${PROJECT},${PRICE_ENV},TRIAL_PERIOD_DAYS=${TRIAL_PERIOD_DAYS}"
 
 # 4. stripe-portal-session — Firebase-gated; needs the price map + portal config.
 deploy stripe-portal-session "${billing_common[@]}" \

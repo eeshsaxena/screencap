@@ -73,7 +73,16 @@ def check_secret_key_is_live(key: str) -> tuple[bool, str]:
 
 
 def check_prices(stripe, price_ids: dict[str, str]) -> tuple[bool, str]:
-    """Every configured price must exist, be active, and be recurring."""
+    """Every configured price must exist and be recurring; the two paid tiers
+    must also be active and distinct.
+
+    The legacy grandfather price (``legacy``) is exempt from the active check:
+    once the $5 tier is retired it is archived (``active=false``) in Stripe, yet
+    billing.py's price->tier map still maps it (R11), so requiring it active
+    would spuriously fail the gate and block the cutover. The two paid tiers
+    must be distinct — billing.py's first-wins ``setdefault`` map would silently
+    drop a tier if ``local`` and ``cloud`` collided (the .env.example invariant).
+    """
     problems: list[str] = []
     for label, pid in price_ids.items():
         if not pid:
@@ -84,13 +93,16 @@ def check_prices(stripe, price_ids: dict[str, str]) -> tuple[bool, str]:
         except Exception as exc:  # missing price / network — a fail, not a crash.
             problems.append(f"{label} ({pid}): retrieve failed: {exc}")
             continue
-        if not price.get("active"):
+        if label != "legacy" and not price.get("active"):
             problems.append(f"{label} ({pid}): not active")
         if price.get("type") != "recurring":
             problems.append(f"{label} ({pid}): not recurring (type={price.get('type')})")
+    local, cloud = price_ids.get("local"), price_ids.get("cloud")
+    if local and cloud and local == cloud:
+        problems.append("local and cloud price ids are identical (must be distinct)")
     if problems:
         return False, "; ".join(problems)
-    return True, f"{len(price_ids)} price(s) active and recurring"
+    return True, f"{len(price_ids)} price(s) valid"
 
 
 def check_webhook_endpoint(stripe, required_events: set[str]) -> tuple[bool, str]:
@@ -112,19 +124,28 @@ def check_webhook_endpoint(stripe, required_events: set[str]) -> tuple[bool, str
 
 
 def check_portal_configuration(stripe, config_id: str) -> tuple[bool, str]:
-    """Live mode requires a saved portal configuration (fail-closed in billing.py)."""
+    """Live mode requires the SPECIFIC saved portal configuration the deployed
+    function will use.
+
+    billing.py's ``create_portal_session`` fails closed in live mode when
+    ``STRIPE_PORTAL_CONFIGURATION_ID`` is unset, and deploy_billing.sh only
+    *warns* on an unset id — so "some configuration exists" is not enough. The
+    gate requires the exact id and verifies it exists and is active, mirroring
+    the runtime requirement, or the deployed portal would fail closed while the
+    gate read green.
+    """
+    if not config_id:
+        return False, (
+            "STRIPE_PORTAL_CONFIGURATION_ID is unset — the live portal fails "
+            "closed without it (billing.py); set the id the deploy will use"
+        )
     try:
-        if config_id:
-            cfg = stripe.billing_portal.Configuration.retrieve(config_id)
-            if not cfg.get("active", True):
-                return False, f"portal configuration {config_id} is not active"
-            return True, f"portal configuration {config_id} present"
-        result = stripe.billing_portal.Configuration.list(limit=1)
-        if result.get("data"):
-            return True, "a portal configuration exists"
-        return False, "no customer-portal configuration exists (live mode requires one)"
+        cfg = stripe.billing_portal.Configuration.retrieve(config_id)
     except Exception as exc:
-        return False, f"portal configuration check failed: {exc}"
+        return False, f"portal configuration {config_id} check failed: {exc}"
+    if not cfg.get("active", False):
+        return False, f"portal configuration {config_id} is not active"
+    return True, f"portal configuration {config_id} present and active"
 
 
 def check_account_ready(stripe) -> tuple[bool, str]:

@@ -32,6 +32,7 @@ def _stripe(*, price_overrides=None, endpoints=None, portal_list=None, account=N
     m.billing_portal.Configuration.list.return_value = {
         "data": portal_list if portal_list is not None else [{"id": "bpc_1"}]
     }
+    m.billing_portal.Configuration.retrieve.return_value = {"id": "bpc_1", "active": True}
     m.Account.retrieve.return_value = account or {
         "charges_enabled": True,
         "statement_descriptor": "SCREENCAP",
@@ -104,6 +105,22 @@ def test_price_retrieve_error_fails_not_crash():
     assert "retrieve failed" in detail
 
 
+def test_legacy_price_archived_is_ok():
+    # A retired legacy price is archived (active=false) in live mode, but the
+    # grandfather map still maps it — the gate must not require it active.
+    stripe = _stripe(price_overrides={"price_leg": {"active": False, "type": "recurring"}})
+    ok, _ = vlr.check_prices(
+        stripe, {"local": "price_l", "cloud": "price_c", "legacy": "price_leg"}
+    )
+    assert ok is True
+
+
+def test_duplicate_local_cloud_price_fails():
+    ok, detail = vlr.check_prices(_stripe(), {"local": "price_x", "cloud": "price_x"})
+    assert ok is False
+    assert "identical" in detail
+
+
 # --- webhook ---------------------------------------------------------------
 
 
@@ -135,15 +152,16 @@ def test_webhook_disabled_endpoint_does_not_count():
 # --- portal ----------------------------------------------------------------
 
 
-def test_portal_configuration_present_passes():
-    ok, _ = vlr.check_portal_configuration(_stripe(), "")
+def test_portal_specific_config_present_and_active_passes():
+    ok, _ = vlr.check_portal_configuration(_stripe(), "bpc_1")
     assert ok is True
 
 
-def test_portal_configuration_absent_fails():
-    ok, detail = vlr.check_portal_configuration(_stripe(portal_list=[]), "")
+def test_portal_unset_config_id_fails():
+    # billing.py fails closed in live without the id, so the gate must require it.
+    ok, detail = vlr.check_portal_configuration(_stripe(), "")
     assert ok is False
-    assert "live mode requires one" in detail
+    assert "unset" in detail
 
 
 def test_portal_specific_config_inactive_fails():
@@ -152,6 +170,14 @@ def test_portal_specific_config_inactive_fails():
     ok, detail = vlr.check_portal_configuration(stripe, "bpc_x")
     assert ok is False
     assert "not active" in detail
+
+
+def test_portal_config_missing_fails_not_crash():
+    stripe = _stripe()
+    stripe.billing_portal.Configuration.retrieve.side_effect = Exception("no such config")
+    ok, detail = vlr.check_portal_configuration(stripe, "bpc_missing")
+    assert ok is False
+    assert "check failed" in detail
 
 
 # --- account ---------------------------------------------------------------
@@ -192,7 +218,7 @@ def test_account_descriptor_via_settings_passes():
 
 def test_run_checks_reports_every_check_name():
     results = vlr.run_checks(
-        _stripe(), price_ids={"local": "price_l", "cloud": "price_c"}, portal_config_id=""
+        _stripe(), price_ids={"local": "price_l", "cloud": "price_c"}, portal_config_id="bpc_1"
     )
     names = {name for name, _ok, _detail in results}
     assert names == {"prices", "webhook", "portal", "account"}
