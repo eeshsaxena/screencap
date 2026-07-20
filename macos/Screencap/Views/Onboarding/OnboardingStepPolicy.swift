@@ -236,9 +236,10 @@ enum OnboardingStepPolicy {
 /// The single source of paid-tier prices (KTD-7). Every priced surface — the
 /// picker cards, the upgrade panel, the trial disclosure — composes its copy
 /// from here, so tuning a price (R10) is a one-line change, never a hunt for
-/// duplicated `$`-literals. Indicative launch numbers (Local Pro ~$8, Cloud
-/// ~$15) are placeholders to finalize before launch; the Stripe price is the
-/// billed truth (these strings are display only).
+/// duplicated `$`-literals. These are the finalized launch prices (Local Pro
+/// $8, Cloud $15); they are display only and MUST match the live Stripe prices,
+/// which are the billed truth. The displayed price is compiled into the app, so
+/// changing it requires a new build.
 ///
 /// TODO(build-verify): once the server can surface the live price (via `whoami`
 /// or a config read, per U11's "source prices from config/whoami"), swap these
@@ -246,9 +247,9 @@ enum OnboardingStepPolicy {
 /// Stripe price without a rebuild. Static constants are the interim single
 /// source until that wiring lands.
 enum PricingCatalog {
-    /// Indicative Local Pro monthly price (R10 placeholder).
+    /// Local Pro monthly launch price (display only; Stripe is the billed truth).
     static let localProMonthly = "$8"
-    /// Indicative Cloud monthly price (R10 placeholder), above Local Pro (R3).
+    /// Cloud monthly launch price, above Local Pro (R3); display only.
     static let cloudMonthly = "$15"
 
     static var localProPriceLine: String { "\(localProMonthly)/month" }
@@ -309,9 +310,10 @@ enum OnboardingCopy {
     ]
 
     static let personalCardTitle = "Personal cloud"
-    static let personalCardMeta = "$5/month"
     /// Paywall-off label (KTD-6): shown when `SCREENCAP_STRIPE_PAYWALL` is off, so
-    /// the storage card makes no pricing claim the app isn't enforcing.
+    /// the storage card makes no pricing claim the app isn't enforcing. (The
+    /// paid-only launch retired the old "$5/month" priced meta — the two-tier
+    /// picker below is the priced surface when the paywall is on.)
     static let personalCardMetaFree = "just you"
     static let personalCardBullets = [
         "Upload the recordings you approve",
@@ -439,7 +441,7 @@ enum OnboardingCopy {
         [
             storageHeadline, storageSub, storageFootnote,
             localCardTitle, localCardMeta,
-            personalCardTitle, personalCardMeta, personalCardMetaFree,
+            personalCardTitle, personalCardMetaFree,
             teamCardTitle, teamCardMeta,
             // Paid-only launch (U11): the two priced cards + trial copy.
             localProCardTitle, localProCardMeta,

@@ -441,13 +441,11 @@ final class OnboardingStepPolicyTests: XCTestCase {
         }
     }
 
-    /// The Personal card shows its price now; the Team card (coming soon) must
-    /// not carry any price until the team tier actually ships (R11).
-    func testPersonalCardPricedButTeamCardIsNot() {
-        XCTAssertTrue(
-            OnboardingCopy.personalCardMeta.contains("$5"),
-            "Personal card should surface its $5/mo price"
-        )
+    /// The Team card (coming soon) must not carry any price until the team tier
+    /// actually ships (R11). (The paid-only launch retired the single-tier
+    /// "$5/month" Personal card meta; the priced surface is now the two-tier
+    /// Local Pro / Cloud picker, asserted in `testTwoTierCardsSourcePriceFromCatalog`.)
+    func testTeamCardCarriesNoPrice() {
         let teamStrings = ([OnboardingCopy.teamCardTitle, OnboardingCopy.teamCardMeta]
             + OnboardingCopy.teamCardBullets).joined(separator: " ").lowercased()
         for forbidden in ["$", "month", "/mo"] {
