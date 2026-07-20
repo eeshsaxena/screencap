@@ -4994,7 +4994,10 @@ def feedback_group() -> None:
 
 
 @feedback_group.command("send")
-def feedback_send() -> None:
+@click.option("--json", "as_json", is_flag=True, default=True,
+              help="Output as JSON (always on; accepted so callers can request "
+                   "JSON explicitly per the app-side convention).")
+def feedback_send(as_json: bool) -> None:
     """Read a feedback payload on stdin and relay it; print a JSON envelope.
 
     Stdin: ``{type, message, email?, versions{app,daemon,macos},
