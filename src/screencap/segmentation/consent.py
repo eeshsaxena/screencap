@@ -55,13 +55,17 @@ class TaskKind(enum.Enum):
 
     ``DAY_SPLIT`` covers both day-splitting and recording labeling (they share
     the on-device-only rule, R7). ``FRAMES`` covers screen frames / images
-    (never-cloud, R9).
+    (never-cloud, R9). ``DIARY_PROSE`` covers the day-diary topic bullets +
+    narrative (U3/U4, KTD-4): it REUSES the ``summary_cloud_consent`` row (R14 —
+    no new consent surface) and degrades to an app-level heuristic rather than
+    ``NONE``, so a diary block always carries at least app-level bullets.
     """
 
     DAY_SPLIT = "day_split"
     SUMMARY = "summary"
     RECALL_ANSWER = "recall_answer"
     FRAMES = "frames"
+    DIARY_PROSE = "diary_prose"
 
 
 class ExecutionTarget(enum.Enum):
@@ -70,7 +74,9 @@ class ExecutionTarget(enum.Enum):
     - ``ON_DEVICE`` — run the on-device model.
     - ``CLOUD`` — run the configured cloud provider (transcript text only).
     - ``HEURISTIC`` — on-device unavailable and cloud is not permitted; fall
-      back to the local idle-gap heuristic (day-split/label only, KTD6).
+      back to a local heuristic: the idle-gap split for day-split/label (KTD6),
+      or app/window-level bullets for diary prose (U3, R6/AE3). The caller owns
+      running the heuristic; the policy only names the target.
     - ``NEVER`` — cloud is a fixed-off rule for this kind (frames/images, R9).
     - ``NONE`` — no execution target is available (e.g. on-device unavailable,
       no consented cloud fallback, and no heuristic applies); the caller leaves
@@ -151,7 +157,13 @@ class ConsentPolicy:
           else :attr:`~ExecutionTarget.HEURISTIC` — cloud is never reachable
           (R7 / KTD6).
 
-        Only ``SUMMARY`` and ``RECALL_ANSWER`` can reach cloud, and only as the
+        ``DIARY_PROSE`` (U3 / KTD-4) prefers on-device, reaches cloud only as the
+        consented fallback gated on the EXISTING ``summary_cloud_consent`` row
+        (R14 — no new toggle), and otherwise degrades to
+        :attr:`~ExecutionTarget.HEURISTIC` (app-level bullets, never ``NONE``).
+
+        ``SUMMARY``, ``RECALL_ANSWER`` and ``DIARY_PROSE`` can reach cloud, and
+        (for the first two) only as the
         consented fallback: on-device is preferred whenever available; cloud is
         used only when on-device is unavailable **AND** the task's consent row
         is on **AND** a cloud provider is configured. Otherwise the task
@@ -169,6 +181,20 @@ class ConsentPolicy:
                 if on_device_available
                 else ExecutionTarget.HEURISTIC
             )
+
+        if task_kind is TaskKind.DIARY_PROSE:
+            # U3 / KTD-4: the day-diary bullets/narrative kind. Prefer on-device;
+            # when unavailable, the consented cloud is the enrichment fallback,
+            # gated on the EXISTING summary consent row (R14 — no new consent
+            # surface). Otherwise degrade to the app/window-level HEURISTIC —
+            # never NONE, so a block always carries at least app-level bullets
+            # (R6/AE3). Cloud is permitted here (unlike DAY_SPLIT); the summary
+            # row is the single gate, so no diary-specific toggle exists.
+            if on_device_available:
+                return ExecutionTarget.ON_DEVICE
+            if self.summary_cloud_consent and self.cloud_provider is not None:
+                return ExecutionTarget.CLOUD
+            return ExecutionTarget.HEURISTIC
 
         # --- Cloud-eligible kinds: prefer on-device, cloud is the fallback --
         if task_kind is TaskKind.SUMMARY:

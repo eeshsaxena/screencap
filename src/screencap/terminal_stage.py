@@ -1410,6 +1410,33 @@ def _build_block_namer(recording_dir: Path):
         return None
 
 
+def _build_bullet_provider(recording_dir: Path):
+    """The on-device seam that generates a block's topic bullets (U3, KTD-4).
+
+    Mirrors :func:`_build_block_namer` but routes through
+    :func:`screencap.segmentation.routing.build_prose_provider` — the DIARY_PROSE
+    on-device-class guard (no REMOTE, no cloud egress via this seam; the consented
+    cloud enrichment reuses the description text already on the evidence). Returns
+    the provider only when it exposes the ``call_block_bullets`` verb (the Apple
+    Foundation Models backend); otherwise ``None``, so the consolidator falls to
+    the honest app-level heuristic (R6/AE3). A ``None`` provider never spawns a
+    helper. Test seam: patched in the wiring/parity tests.
+    """
+    try:
+        from screencap.segmentation.routing import build_prose_provider
+
+        provider = build_prose_provider(recording_dir=recording_dir)
+        if not hasattr(provider, "call_block_bullets"):
+            return None
+        return provider
+    except Exception as exc:  # noqa: BLE001 — must never block segmentation
+        logger.debug(
+            "terminal_stage: block bullet provider unavailable for %s (%s)",
+            recording_dir.name, exc,
+        )
+        return None
+
+
 def _consolidate_into_blocks(
     recording_dir: Path,
     ledger: "PipelineLedger | None",
@@ -1459,6 +1486,7 @@ def _consolidate_into_blocks(
             is_live=is_live,
             recording_name=recording_dir.name,
             namer=_build_block_namer(recording_dir),
+            bullet_provider=_build_bullet_provider(recording_dir),
             stop_event=stop_event,
         )
         return {**tasks, "tasks": blocks}
@@ -1842,7 +1870,7 @@ def _persist_local_tasks(
                 metadata=json.dumps({
                     k: t[k]
                     for k in ("description", "apps_used", "derived_name",
-                              "name_fallback")
+                              "name_fallback", "bullets", "bullets_fallback")
                     if k in t
                 }) or None,
                 source=TASK_SOURCE_AGENT,

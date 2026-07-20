@@ -297,6 +297,34 @@ def test_resolve_summary_unavailable_consented_reaches_cloud():
     assert d.action is DegradeAction.CLOUD
 
 
+@pytest.mark.privacy
+def test_resolve_prose_unavailable_consented_reaches_cloud():
+    """DIARY_PROSE (U3) mirrors SUMMARY: consented + provider + unavailable → cloud
+    (gated on the summary consent row, KTD-4/R14) — NOT day-split's never-cloud."""
+    from screencap.segmentation.degrade import resolve_prose
+
+    policy = ConsentPolicy(cloud_provider="gemini", summary_cloud_consent=True)
+    assert resolve_prose(PROVIDER_UNAVAILABLE, policy).action is DegradeAction.CLOUD
+
+
+@pytest.mark.privacy
+def test_resolve_prose_unavailable_no_consent_falls_to_heuristic_never_none():
+    """No consent (or no provider) → the honest app-level HEURISTIC, never NONE —
+    a diary block always carries at least app-level bullets (R6/AE3)."""
+    from screencap.segmentation.degrade import resolve_prose
+
+    no_consent = ConsentPolicy(cloud_provider="gemini", summary_cloud_consent=False)
+    assert (
+        resolve_prose(PROVIDER_UNAVAILABLE, no_consent).action
+        is DegradeAction.HEURISTIC
+    )
+    no_provider = ConsentPolicy(cloud_provider=None, summary_cloud_consent=True)
+    assert (
+        resolve_prose(PROVIDER_UNAVAILABLE, no_provider).action
+        is DegradeAction.HEURISTIC
+    )
+
+
 # ---------------------------------------------------------------------------
 # Terminal wiring: on-device unavailable → idle-gap heuristic (AE4).
 # ---------------------------------------------------------------------------

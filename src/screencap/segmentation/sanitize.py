@@ -12,6 +12,11 @@ bound field lengths, and cap the task count/shape.
 This is applied *after* ``validate_llm_tasks`` (which already normalizes
 timestamps and rejects overlaps) — it hardens the free-text fields the validator
 passes through, independent of the confidence gate.
+
+:func:`sanitize_bullets` is the same-shaped guard for the day-diary topic bullets
+(U3): every bullet source (cloud description reuse, the on-device per-block call,
+the app-level heuristic) routes its free text through it before the bullets land
+in the block-row ``metadata`` blob and reach the app / MCP agents.
 """
 
 from __future__ import annotations
@@ -26,6 +31,12 @@ _MAX_TASKS = 200
 # after markup stripping, which can shift lengths).
 _MAX_NAME_LEN = 80
 _MAX_DESCRIPTION_LEN = 600
+
+# Diary topic bullets (U3): a small list of short evidence-bound phrases. The
+# count is bounded to keep a hostile/runaway model from flooding the block row,
+# and each bullet is length-capped like a task name after markup stripping.
+_MAX_BULLETS = 4
+_MAX_BULLET_LEN = 160
 
 # Control characters (C0 minus tab/newline, plus DEL and C1) are never legitimate
 # in a task name/description and are prime injection vectors.
@@ -73,3 +84,29 @@ def sanitize_tasks(tasks_dict: dict | None) -> dict | None:
         tasks_dict["tasks"] = capped
 
     return tasks_dict
+
+
+def sanitize_bullets(bullets: object) -> list[str]:
+    """Harden a list of model-generated diary topic bullets before persistence (U3).
+
+    Diary bullets derive from screen/transcript content — attacker-influenceable
+    — and are surfaced through ``/v0/tasks.list`` and the MCP surface to
+    downstream agents and rendered in the app, so a prompt injection could yield
+    a *confident* bullet carrying markup or control sequences aimed at the next
+    consumer. Every bullet source (cloud description reuse, the on-device
+    per-block call, and even the app-level heuristic) routes through here: each
+    bullet is stripped of control characters and ``<...>`` markup and
+    length-bounded (the same :func:`_clean_text` hardening task names get), empty
+    results are dropped, and the list is capped at :data:`_MAX_BULLETS`.
+
+    Non-list input (or ``None``) yields an empty list — the caller stores no
+    ``bullets`` key rather than a malformed one.
+    """
+    if not isinstance(bullets, list):
+        return []
+    out: list[str] = []
+    for bullet in bullets[:_MAX_BULLETS]:
+        cleaned = _clean_text(bullet, _MAX_BULLET_LEN)
+        if cleaned:
+            out.append(cleaned)
+    return out

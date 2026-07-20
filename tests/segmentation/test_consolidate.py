@@ -484,9 +484,14 @@ def test_live_and_finalize_paths_yield_identical_blocks(tmp_path, monkeypatch):
     monkeypatch.setattr(
         routing, "build_day_split_provider", lambda *a, **k: _SameWorkProvider(),
     )
-    # Patch the on-device block namer seam with a scripted fake (Vision-free).
+    # Patch the on-device block namer + bullet seams with scripted fakes
+    # (Vision-free, no helper spawn — keeps the parity test hermetic).
     monkeypatch.setattr(
         ts, "_build_block_namer", lambda rec: _ScriptedNamer(name="Diary schema design"),
+    )
+    monkeypatch.setattr(
+        ts, "_build_bullet_provider",
+        lambda rec: _ScriptedBulletProvider(bullets=["Sketched the schema"]),
     )
 
     live_dir = _build_local_recording(tmp_path, "live-rec")
@@ -509,4 +514,192 @@ def test_live_and_finalize_paths_yield_identical_blocks(tmp_path, monkeypatch):
     # finalize.
     assert live[0].is_open is True
     assert fin[0].is_open is False
+
+    # U3: bullets persist in the block-row metadata blob and project on the wire.
+    import json as _json
+
+    from screencap.pipeline_state import read_task_segments_wire
+
+    assert _json.loads(fin[0].metadata or "{}").get("bullets") == [
+        "Sketched the schema",
+    ]
+    assert read_task_segments_wire(fin_dir)[0]["bullets"] == ["Sketched the schema"]
+
+
+# ---------------------------------------------------------------------------
+# U3: Topic bullets — the DIARY_PROSE kind (R4/R6/AE3, KTD-4/KTD-10).
+# All Vision-free: cloud description reuse, the scripted on-device call seam,
+# and the honest app-level heuristic — the model touch always behind the fake.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedBulletProvider:
+    """A stub bullet provider over the ``call_block_bullets`` verb seam."""
+
+    def __init__(self, *, results=None, bullets=("Did a thing",)):
+        from screencap.segmentation.providers.ondevice import CallResult
+
+        self._results = list(results or [])
+        self._bullets = list(bullets)
+        self.calls: list[dict] = []
+        self._CallResult = CallResult
+
+    def call_block_bullets(self, digest_payload):
+        assert digest_payload.get("stripped") is True, (
+            "bullet payloads must carry the strip attestation"
+        )
+        self.calls.append(digest_payload)
+        if self._results:
+            return self._results.pop(0)
+        return self._CallResult(list(self._bullets), None)
+
+
+def test_ae3_no_model_no_content_yields_app_level_bullets_with_marker():
+    """AE3 (bullets half): no model + no content signal → app-level bullets only,
+    no invented specifics, and an observable degrade marker (R6/KTD-10)."""
+    from screencap.segmentation.consolidate import consolidate
+
+    frags = [
+        _frag(1000.0, 2800.0, "Implement auth module",
+              apps=("com.microsoft.VSCode",)),
+    ]
+    out = consolidate(frags, bullet_provider=None, recording_name="rec")
+
+    assert len(out) == 1
+    # App-level ONLY — names the app, never the work-name specifics.
+    assert out[0]["bullets"] == ["Worked in VSCode"]
+    assert "Implement auth module" not in " ".join(out[0]["bullets"])
+    # The honest degrade is observable.
+    assert out[0]["bullets_fallback"]
+
+
+def test_cloud_description_reuse_yields_evidence_bound_bullets():
+    """The cloud path reuses the ``description`` text the prompt already produced
+    (today discarded on merge) — evidence-bound, no degrade marker."""
+    from screencap.segmentation.consolidate import consolidate
+
+    frag = _frag(1000.0, 2800.0, "Fix login", apps=("com.microsoft.VSCode",))
+    frag["description"] = (
+        "Traced the OAuth redirect bug. Patched the token refresh path. "
+        "Added a regression test."
+    )
+    out = consolidate([frag], bullet_provider=None, recording_name="rec")
+
+    bullets = out[0]["bullets"]
+    assert len(bullets) >= 2
+    assert any("OAuth redirect" in b for b in bullets)
+    assert "bullets_fallback" not in out[0]  # a real content source → no marker
+
+
+def test_injected_markup_and_control_chars_in_evidence_are_sanitized():
+    """P1 security: injected markup / control chars in the evidence digest yield a
+    SANITIZED bullet — nothing unsanitized reaches MCP agents or the app."""
+    from screencap.segmentation.consolidate import consolidate
+
+    frag = _frag(1000.0, 2800.0, "Review notes", apps=("com.apple.Notes",))
+    frag["description"] = (
+        "Read the <script>alert('x')</script> memo.\x07 "
+        "Flagged \x1b[31mfollow-ups."
+    )
+    out = consolidate([frag], bullet_provider=None, recording_name="rec")
+
+    joined = " ".join(out[0]["bullets"])
+    assert "<" not in joined and ">" not in joined  # markup spans stripped
+    assert "\x07" not in joined and "\x1b" not in joined  # control chars stripped
+    assert "script" not in joined.lower()  # the whole <script> span is gone
+
+
+def test_on_device_bullet_call_over_evidence_digest_not_block_name():
+    """On-device: one small call per block over its evidence digest — carrying the
+    fragment evidence, NEVER the downstream block name (KTD-4)."""
+    from screencap.segmentation.consolidate import consolidate
+
+    base = 1000.0
+    frags = [
+        _frag(base + i * 180, base + i * 180 + 150, "Diary schema design",
+              apps=("com.figma.Desktop",))
+        for i in range(3)
+    ]
+    namer = _ScriptedNamer(name="Diary schema design")
+    bp = _ScriptedBulletProvider(
+        bullets=["Sketched the block table", "Chose the thread ids"],
+    )
+    out = consolidate(frags, namer=namer, bullet_provider=bp, recording_name="rec")
+
+    assert len(out) == 1
+    assert out[0]["bullets"] == ["Sketched the block table", "Chose the thread ids"]
+    assert "bullets_fallback" not in out[0]
+    assert len(bp.calls) == 1  # one small call for the block, never whole-day
+    # KTD-4: the digest carries no downstream block-name field, only evidence.
+    digest = bp.calls[0]
+    assert "name" not in digest  # no block name fed to the model
+    assert digest.get("timeline")  # fragment evidence present
+
+
+def test_over_budget_bullet_digest_halves_then_gives_up_with_marker():
+    """Budget: an over-budget digest halves via the existing seam before giving up;
+    the give-up leaves the observable marker + the honest app-level heuristic."""
+    from screencap.segmentation.consolidate import consolidate
+    from screencap.segmentation.providers.ondevice import CallResult
+
+    base = 1000.0
+    frags = [
+        _frag(base + i * 180, base + i * 180 + 150, "Diary schema design",
+              apps=("com.figma.Desktop",))
+        for i in range(5)  # 5-entry halvable digest
+    ]
+    namer = _ScriptedNamer(name="Diary schema design")
+    # Always context-window → forces the halving loop until the seam gives up.
+    bp = _ScriptedBulletProvider(
+        results=[CallResult(None, "context-window") for _ in range(8)],
+    )
+    out = consolidate(frags, namer=namer, bullet_provider=bp, recording_name="rec")
+
+    assert len(out) == 1
+    assert len(bp.calls) >= 2  # halved via the seam before giving up
+    assert out[0]["bullets_fallback"] == "context-window"  # observable give-up
+    assert out[0]["bullets"] == ["Worked in Desktop"]  # honest app-level floor
+
+
+def test_renamed_block_keeps_bullets_regeneratable_and_regenerates():
+    """Protection split (KTD-3): a user-RENAMED agent block protects its name but
+    leaves its agent bullets purge-eligible/regeneratable; a re-carve regenerates
+    them deterministically."""
+    from screencap.pipeline_state import (
+        EDITED_FIELD_NAME,
+        TASK_FIELD_BULLETS,
+        TASK_FIELD_NAME,
+        TaskSegmentRow,
+        task_field_is_protected,
+    )
+    from screencap.segmentation.consolidate import consolidate
+
+    renamed = TaskSegmentRow(
+        task_index=0, start_ts=1000.0, end_ts=2800.0, name="My better name",
+        category="development", source="agent", edited=True,
+        edited_fields=EDITED_FIELD_NAME,
+    )
+    assert task_field_is_protected(renamed, TASK_FIELD_NAME) is True
+    assert task_field_is_protected(renamed, TASK_FIELD_BULLETS) is False
+
+    frag = _frag(1000.0, 2800.0, "Implement auth module",
+                 apps=("com.microsoft.VSCode",))
+    out = consolidate([frag], bullet_provider=None, recording_name="rec")
+    assert out[0]["bullets"] == ["Worked in VSCode"]  # regenerated fresh each pass
+
+
+def test_user_edited_bullets_are_field_protected():
+    """A user who edits the bullets themselves protects the bullets field."""
+    from screencap.pipeline_state import (
+        EDITED_FIELD_BULLETS,
+        TASK_FIELD_BULLETS,
+        TaskSegmentRow,
+        task_field_is_protected,
+    )
+
+    edited = TaskSegmentRow(
+        task_index=0, start_ts=1000.0, end_ts=2800.0, name="Auth work",
+        source="agent", edited=True, edited_fields=EDITED_FIELD_BULLETS,
+    )
+    assert task_field_is_protected(edited, TASK_FIELD_BULLETS) is True
 

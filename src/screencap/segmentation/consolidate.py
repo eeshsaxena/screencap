@@ -82,6 +82,18 @@ _STOPWORDS = frozenset({
 UNNAMED = ""
 NAME_FALLBACK_KEY = "name_fallback"
 
+# Topic bullets (U3, R4/R6): 2–4 short evidence-bound bullets per block. The
+# ``bullets_fallback`` marker is the KTD-10 observable degrade signal for the
+# HONEST app-level heuristic path (model unavailable / no content signal / budget
+# exhausted) — a model-sourced bullet set leaves it unset. Both ride the
+# ``metadata`` blob under U1's field-scoped protection (``EDITED_FIELD_BULLETS``).
+MAX_BULLETS = 4
+BULLETS_KEY = "bullets"
+BULLETS_FALLBACK_KEY = "bullets_fallback"
+
+# Split description prose into sentence-ish bullets on end-of-sentence marks.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
 # Per-block naming provenance markers surfaced on the returned dict's ``source``.
 # Mirror the on-device pipeline's vocabulary so every sink sees ONE set.
 SOURCE_MODEL = "ondevice_model"
@@ -134,6 +146,8 @@ class Block:
     thread_id: str | None = None
     is_open: bool = False
     name_fallback: str | None = None
+    bullets: list[str] = field(default_factory=list)
+    bullets_fallback: str | None = None
 
     @property
     def start_ts(self) -> float:
@@ -477,6 +491,200 @@ def _dominant_category(block: Block) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Topic bullets (U3, R4/R6/AE3 — the DIARY_PROSE kind)
+# ---------------------------------------------------------------------------
+
+
+def bullets_for_blocks(
+    blocks: list[Block], *, bullet_provider=None, stop_event=None, deadline=None,
+) -> None:
+    """Attach 2–4 evidence-bound topic bullets to each block IN PLACE (U3, KTD-4).
+
+    Per block, in priority order (each source SANITIZED before it lands — the
+    single P1 chokepoint, since every source is attacker-influenceable screen /
+    transcript content surfaced over MCP + the app):
+
+    1. **Cloud description reuse** — the ``description`` text the cloud prompt
+       already produced on the block's fragments (today discarded on merge),
+       split into sentence-ish bullets. No new egress; it is already on-box
+       evidence, gated when the segmentation ran.
+    2. **On-device model call** — one small ``call_block_bullets`` over the
+       block's evidence digest via the injected ``bullet_provider`` seam, reusing
+       the naming call's budget-halving (``_halve_payload`` / ``_halt_reason`` /
+       :data:`MAX_DIGEST_HALVINGS`).
+    3. **App/window-level heuristic** — when neither is available (no model / no
+       content signal), bullets naming only the apps used (R6/AE3, never invented
+       specifics), plus an observable ``bullets_fallback`` marker (KTD-10).
+
+    Bullets DERIVE from the evidence digest (fragment descriptions / names /
+    apps), NEVER from the downstream — possibly gate-blanked — block name, so a
+    bullet can never assert content a confidence gate rejected (KTD-4).
+    """
+    from screencap.segmentation.sanitize import sanitize_bullets
+
+    for block in blocks:
+        raw, fallback = _block_bullets(block, bullet_provider, stop_event, deadline)
+        block.bullets = sanitize_bullets(raw)
+        # The marker is recorded whenever the block fell to the honest heuristic,
+        # even if sanitizing left the app-level list empty — the degrade must
+        # stay observable (KTD-10).
+        if fallback is not None:
+            block.bullets_fallback = fallback
+
+
+def _block_bullets(
+    block: Block, bullet_provider, stop_event, deadline,
+) -> tuple[list[str], str | None]:
+    """One block's bullets → ``(raw_bullets, fallback_marker)`` (pre-sanitize).
+
+    ``fallback_marker`` is ``None`` on a model/description source and a reason
+    string on the honest app-level heuristic path.
+    """
+    # 1. Cloud-produced descriptions already in the evidence → reuse.
+    desc_bullets = _bullets_from_descriptions(block)
+    if desc_bullets:
+        return desc_bullets, None
+    # 2. On-device per-block model call over the block's evidence digest.
+    model_bullets, reason = _call_block_bullets(
+        block, bullet_provider, stop_event, deadline,
+    )
+    if model_bullets:
+        return model_bullets, None
+    # 3. Honest heuristic: app/window-level bullets, never invented specifics.
+    return _heuristic_bullets(block), (reason or "no-content")
+
+
+def _bullets_from_descriptions(block: Block) -> list[str]:
+    """Evidence-bound bullets from the fragments' cloud-produced descriptions.
+
+    Reads each fragment's ``description`` (the cloud prompt's 3–5 sentence output
+    carried through on the fragment evidence), splits it into sentence-ish
+    bullets, dedupes case-insensitively preserving order, and caps at
+    :data:`MAX_BULLETS`. Empty when no fragment carries a description (the
+    on-device path, where descriptions are omitted to fit the token window).
+    """
+    bullets: list[str] = []
+    seen: set[str] = set()
+    for frag in block.fragments:
+        desc = frag.metadata.get("description")
+        if not isinstance(desc, str) or not desc.strip():
+            continue
+        for sentence in _SENTENCE_SPLIT_RE.split(desc.strip()):
+            text = sentence.strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            bullets.append(text)
+            if len(bullets) >= MAX_BULLETS:
+                return bullets
+    return bullets
+
+
+def _call_block_bullets(
+    block: Block, bullet_provider, stop_event, deadline,
+) -> tuple[list[str] | None, str | None]:
+    """One block's on-device bullet call(s) → ``(bullets, failure_reason)``.
+
+    Mirrors :func:`_call_block_namer`: a ``context-window`` failure halves the
+    block's bullet digest (bounded by ``MAX_DIGEST_HALVINGS``) before giving up,
+    and every iteration re-checks the halt (stop / budget) first.
+    ``bullet_provider is None`` (no on-device model) → unavailable.
+    """
+    if bullet_provider is None:
+        return None, "no-model"
+
+    from screencap.segmentation.activity_summary import attest_derived_stripped
+    from screencap.segmentation.ondevice_pipeline import (
+        MAX_DIGEST_HALVINGS,
+        _halt_reason,
+        _halve_payload,
+    )
+
+    payload = _bullet_digest(block)
+    halvings_left = MAX_DIGEST_HALVINGS
+    while True:
+        if deadline is not None:
+            halt = _halt_reason(stop_event, deadline)
+            if halt is not None:
+                return None, halt
+        try:
+            res = bullet_provider.call_block_bullets(
+                attest_derived_stripped(payload, stripped=True)
+            )
+        except Exception as exc:  # noqa: BLE001 — a provider error is unavailability
+            log.debug("consolidate: block bullet provider raised (%s)", exc)
+            return None, "bullets-error"
+        if res.ok:
+            bullets = [
+                str(b).strip() for b in (res.value or []) if str(b).strip()
+            ]
+            if not bullets:
+                return None, "invalid-result"
+            return bullets[:MAX_BULLETS], None
+        if res.reason == "context-window" and halvings_left > 0:
+            halved = _halve_payload(payload)
+            if halved is None:
+                return None, res.reason
+            payload = halved
+            halvings_left -= 1
+            continue
+        return None, res.reason
+
+
+def _bullet_digest(block: Block) -> dict:
+    """The small, fixed-size bullet-generation input for a block.
+
+    A per-fragment ``timeline`` of work-name + category + minutes (+ any carried
+    description) plus the apps — evidence only, NEVER the downstream block name
+    (KTD-4) and never anything that scales with the whole day. Uses the
+    ``timeline`` key so the shared ``_halve_payload`` budget seam can trim it.
+    """
+    timeline: list[dict] = []
+    for frag in block.fragments:
+        entry: dict = {
+            "name": frag.name,
+            "category": frag.category or "other",
+            "minutes": round((frag.end_ts - frag.start_ts) / 60.0),
+        }
+        desc = frag.metadata.get("description")
+        if isinstance(desc, str) and desc.strip():
+            entry["description"] = desc.strip()
+        timeline.append(entry)
+    return {
+        "kind": "block-bullets",
+        "timeline": timeline,
+        "apps": list(block.apps),
+    }
+
+
+def _heuristic_bullets(block: Block) -> list[str]:
+    """App/window-level bullets — the honest no-model / no-content floor (R6/AE3).
+
+    Names ONLY the apps the block spanned ("Worked in Xcode") — no invented
+    specifics, no fragment work-names, no block name. Empty when the block
+    carries no app signal (the marker still records the degrade).
+    """
+    labels: list[str] = []
+    for app in block.apps:
+        label = _app_label(app)
+        if label and label not in labels:
+            labels.append(label)
+        if len(labels) >= MAX_BULLETS:
+            break
+    return [f"Worked in {label}" for label in labels]
+
+
+def _app_label(bundle_id: str) -> str:
+    """A human-ish app label from a bundle id — the last dotted segment."""
+    if not bundle_id:
+        return ""
+    return str(bundle_id).rsplit(".", 1)[-1].strip()
+
+
+# ---------------------------------------------------------------------------
 # 4. Thread linking (recording-scoped, day-scoped) — KTD-2 / KTD-5
 # ---------------------------------------------------------------------------
 
@@ -734,6 +942,7 @@ def consolidate(
     is_live: bool = False,
     recording_name: str = "",
     namer=None,
+    bullet_provider=None,
     stop_event=None,
     deadline=None,
 ) -> list[dict]:
@@ -741,17 +950,25 @@ def consolidate(
 
     The single body the live incremental tick and the finalize pass share (R10),
     so blocks cannot drift between them. Pure except for the injected ``namer``
-    seam (the one small per-merged-block naming call). Returns a list of task
-    dicts (``task_index`` 0..N-1, ``source='agent'`` provenance kept per block)
-    carrying ``block_id`` / ``thread_id`` / ``is_open`` and, when naming failed,
-    a ``name_fallback`` marker — the shape the terminal stage persists via the
-    scoped ``replace_task_segments`` + ``tasks.json`` mirror.
+    and ``bullet_provider`` seams (the small per-merged-block naming call and the
+    per-block on-device bullet call). Returns a list of task dicts (``task_index``
+    0..N-1, ``source='agent'`` provenance kept per block) carrying ``block_id`` /
+    ``thread_id`` / ``is_open``, sanitized ``bullets`` (U3), and — when naming or
+    bullet generation degraded — a ``name_fallback`` / ``bullets_fallback`` marker
+    (KTD-10) — the shape the terminal stage persists via the scoped
+    ``replace_task_segments`` + ``tasks.json`` mirror.
     """
     blocks = group_fragments(fine_tasks)
     blocks = clamp_blocks_at_midnight(blocks, tz_offset_s)
     name_blocks(blocks, namer=namer, stop_event=stop_event, deadline=deadline)
     link_threads(blocks, recording_name=recording_name, tz_offset_s=tz_offset_s)
     blocks = trim_blocks_to_protected(blocks, list(protected_spans or []))
+    # Bullets are generated over the FINAL (trimmed) blocks so split/trimmed
+    # pieces each carry their own evidence-bound bullets (U3, KTD-4).
+    bullets_for_blocks(
+        blocks, bullet_provider=bullet_provider,
+        stop_event=stop_event, deadline=deadline,
+    )
     assign_block_ids(blocks, prior_rows)
     mark_trailing_open(blocks, is_live=is_live)
     return [_to_task_dict(b, i) for i, b in enumerate(blocks)]
@@ -786,6 +1003,13 @@ def _to_task_dict(block: Block, index: int) -> dict:
         out["is_open"] = True
     if block.name_fallback is not None:
         out[NAME_FALLBACK_KEY] = block.name_fallback
+    # Topic bullets (U3): ride the ``metadata`` blob (the terminal stage folds
+    # them in), under U1's field-scoped ``EDITED_FIELD_BULLETS`` protection. The
+    # fallback marker records the honest app-level degrade (KTD-10).
+    if block.bullets:
+        out[BULLETS_KEY] = list(block.bullets)
+    if block.bullets_fallback is not None:
+        out[BULLETS_FALLBACK_KEY] = block.bullets_fallback
     return out
 
 
