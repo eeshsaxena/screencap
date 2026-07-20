@@ -816,6 +816,7 @@ def _run_locked(
         # seam and the tasks store is excluded from upload by rule).
         _run_local_segmentation(
             recording_dir, ledger, result, is_live=False, stop_event=stop_event,
+            on_progress=on_progress,
         )
         # U9 (SCR-279): ledger-safe boundary AFTER the naming pass. A quiesce that
         # tripped mid-pass leaves the outcome provisional (``in_progress``) and the
@@ -1013,6 +1014,7 @@ def _run_local_segmentation(
     *,
     is_live: bool = False,
     stop_event: "threading.Event | None" = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> None:
     """Segment a LOCAL recording into named tasks; persist to the local store (U4/U7).
 
@@ -1274,6 +1276,16 @@ def _run_local_segmentation(
     # heuristic one). A PRODUCED record drops the detail inside _record.
     _record(branch, detail=unavailable_reason)
 
+    # Day narrative (U4, R8/R9): compose the recording's written day narrative from
+    # the just-persisted diary BLOCKS (names + bullets + rollups only — never raw
+    # evidence). Gated per-recording by the settled outcome and regenerated ONLY
+    # when the closed block set changed (KTD-6). Strictly fail-open: any error
+    # leaves the narrative as-is and NEVER blocks terminal completion.
+    _run_day_narrative(
+        recording_dir, ledger, is_live=is_live,
+        stop_event=stop_event, on_progress=on_progress,
+    )
+
 
 def _provider_pass_branch(tasks: dict) -> "Branch":
     """Classify a USE_PROVIDER pass from its per-task source mix (SCR-275 U6, KTD-8).
@@ -1497,6 +1509,106 @@ def _consolidate_into_blocks(
             recording_dir.name, exc,
         )
         return _carve_out_protected_spans(ledger, tasks)
+
+
+def _build_narrator(recording_dir: Path):
+    """The on-device seam that writes a recording's day narrative (U4, KTD-4).
+
+    Mirrors :func:`_build_bullet_provider`: routes through
+    :func:`screencap.segmentation.routing.build_prose_provider` — the DIARY_PROSE
+    on-device-class guard (no REMOTE, no cloud egress via this seam) — and returns
+    it ONLY when it exposes the ``call_day_narrative`` verb. No on-device backend
+    exposes that verb today (it would need a Swift helper verb, out of scope for
+    the Python unit), so this returns ``None`` and the narrative falls to the
+    honest evidence-bound heuristic (R9); the seam is wired for the model narrator
+    when it lands. A ``None`` narrator never spawns a helper. Test seam: patched in
+    the wiring/parity tests to inject a scripted narrator.
+    """
+    try:
+        from screencap.segmentation.routing import build_prose_provider
+
+        provider = build_prose_provider(recording_dir=recording_dir)
+        if not hasattr(provider, "call_day_narrative"):
+            return None
+        return provider
+    except Exception as exc:  # noqa: BLE001 — must never block segmentation
+        logger.debug(
+            "terminal_stage: day narrator unavailable for %s (%s)",
+            recording_dir.name, exc.__class__.__name__,
+        )
+        return None
+
+
+def _run_day_narrative(
+    recording_dir: Path,
+    ledger: "PipelineLedger | None",
+    *,
+    is_live: bool,
+    stop_event: "threading.Event | None" = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> None:
+    """Generate + persist the recording's evidence-bound day narrative (U4, R8/R9).
+
+    Runs after the diary blocks are persisted, over the SAME shared body live and
+    at finalize. Gated per-recording by the settled outcome (R9/KTD-10/AE3): a
+    ``mechanical_only`` / ``nothing_to_name`` / ``in_progress`` recording writes NO
+    narrative row, so the day view's "partial narrative" over a MIXED day is the
+    emergent union of only the produced-recording rows. Regenerated ONLY when the
+    CLOSED block-set fingerprint changed since the last generation (KTD-6) — never
+    on an unchanged tick, never merely because the live open block grew. The
+    narrative is composed from the block projection (names + bullets + rollups)
+    ONLY — never raw evidence (R9) — and its free text is sanitized before it is
+    persisted. Strictly fail-open: any error leaves the existing narrative intact
+    and NEVER blocks terminal completion.
+
+    P2 log/heartbeat hygiene: generation emits a PHASE-ONLY ``on_progress``
+    heartbeat (never narrative/bullet free text), and a failure logs the exception
+    CLASS NAME only — no prose free text reaches the daemon log or a progress
+    payload.
+    """
+    if ledger is None:
+        return
+    try:
+        from screencap.segmentation.narrative import (
+            build_narrative,
+            narrative_fingerprint,
+            project_rows,
+        )
+        from screencap.segmentation.outcome import (
+            PRODUCED_TASKS,
+            PRODUCED_TASKS_PARTIAL,
+        )
+
+        outcome = ledger.get_recording_outcome()
+        if outcome not in (PRODUCED_TASKS, PRODUCED_TASKS_PARTIAL):
+            return  # honest gate — a non-produced recording contributes no narrative.
+
+        blocks = project_rows(ledger.read_task_segments())
+        fingerprint = narrative_fingerprint(blocks)
+        if fingerprint is None:
+            return  # no closed named block yet — nothing to narrate (R9).
+
+        existing = ledger.get_day_narrative()
+        if existing is not None and existing.fingerprint == fingerprint:
+            return  # closed block set unchanged since last generation (KTD-6).
+
+        # Generation scales with the day's block count and runs inside the terminal
+        # lock — emit the PHASE-ONLY heartbeat before it (P2), never free text.
+        _notify_progress(on_progress, "narrate")
+        result = build_narrative(
+            blocks,
+            narrator=_build_narrator(recording_dir),
+            stop_event=stop_event,
+        )
+        if not result.text:
+            return  # nothing usable to persist (EMPTY guard / all-blank).
+        ledger.set_day_narrative(result.text, fingerprint, result.reason)
+    except Exception as exc:  # noqa: BLE001 — the narrative must never block terminal
+        # P2: class name only — no prose free text ever reaches the daemon log.
+        logger.debug(
+            "terminal_stage: day narrative failed open for %s (%s)",
+            recording_dir.name, exc.__class__.__name__,
+        )
 
 
 def _segment_local_tasks(

@@ -2359,6 +2359,33 @@ def _run_recording_outcome(recording: str) -> "tuple[str | None, str | None]":
         return None, None
 
 
+def _run_day_narrative_read(
+    recording: str,
+) -> "tuple[str | None, float | None, str | None]":
+    """Read a LOCAL recording's day narrative, off the event loop (U4, R8/R9).
+
+    Returns ``(narrative, generated_at, reason)``. ``(None, None, None)`` for a
+    missing recording dir / ``recording.db`` (legacy / pre-U4), a recording that
+    produced NO narrative (a mechanical-only / nothing-to-name day writes no row —
+    R9), or any read error (a corrupt / concurrently-locked DB). Never raises: a
+    narrative read must not fail the read verb. Local-only read (never leaves the
+    Mac — R14).
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = resolve_recording_dir(recording) / "recording.db"
+    if not db_path.exists():
+        return None, None, None
+    try:
+        row = PipelineLedger(db_path).get_day_narrative()
+    except Exception:  # noqa: BLE001 — a narrative read must never fail the verb
+        return None, None, None
+    if row is None:
+        return None, None, None
+    return row.narrative, row.generated_at, row.reason
+
+
 async def tasks_list(request: Request) -> JSONResponse:
     """``POST /v0/tasks.list`` — a LOCAL recording's named task segments (U10).
 
@@ -2502,6 +2529,81 @@ async def tasks_query(request: Request) -> JSONResponse:
         return _internal_error_response(
             exc,
             schema_version=schema._TASKS_QUERY_API_VERSION,
+            request=request,
+        )
+
+
+async def day_narrative(request: Request) -> JSONResponse:
+    """``POST /v0/day.narrative`` — a LOCAL recording's written day narrative (U4).
+
+    App-only read verb over the U4 per-recording narrative row (R8/R9): the
+    evidence-bound prose the day view opens with, composed on-device from the
+    recording's diary BLOCKS (names + bullets + rollups only — never raw
+    evidence). The narrative lives in the local-only ``recording.db`` (never
+    uploaded — R14), so this only ever exposes local-Mac data to the same-EUID
+    caller. A recording that produced NO narrative (a mechanical-only /
+    nothing-to-name day — R9), a legacy / pre-U4 recording, or a locked/absent
+    vault store returns ``ok:true`` with ``narrative: null`` (never an error), so
+    the day view renders the no-narrative case gracefully. A traversal recording
+    name returns 400 ``invalid_name``; a malformed body returns 400
+    ``invalid_request``.
+
+    KTD-14: a locked/absent/error vault store is a healthy serving state — a null
+    narrative + degraded ``store_state`` on a 200, never a 500. Deliberately NOT
+    mirrored over MCP (the narrative stays app-only in v1), and NOT in
+    ``_ACTIVITY_PATHS`` — a read verb must not reset the idle-shutdown clock. The
+    ``recording`` argument is routed through the canonical name validator
+    (traversal-safe), NOT pydantic type-validation alone (P2 security).
+    """
+    from pydantic import ValidationError
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.DayNarrativeRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._DAY_NARRATIVE_API_VERSION,
+            )
+        # Traversal-safe recording resolution FIRST (P2): a ``../x`` name is a 400
+        # ``invalid_name`` even on a locked store — never a raw filesystem reach.
+        validate_recording_name(parsed.recording)
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            # KTD-14: sealed / absent / error store — null narrative + store_state.
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._DAY_NARRATIVE_API_VERSION,
+                    recording=parsed.recording,
+                    narrative=None,
+                    generated_at=None,
+                    reason=None,
+                    store_state=store_state,
+                )
+            )
+        narrative, generated_at, reason = await asyncio.to_thread(
+            _run_day_narrative_read, parsed.recording,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._DAY_NARRATIVE_API_VERSION,
+                recording=parsed.recording,
+                narrative=narrative,
+                generated_at=generated_at,
+                reason=reason,
+                store_state=store_state,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._DAY_NARRATIVE_API_VERSION,
             request=request,
         )
 
@@ -5069,6 +5171,7 @@ def build_app() -> Starlette:
             Route("/v0/tasks.delete", tasks_delete, methods=["POST"]),
             Route("/v0/tasks.merge", tasks_merge, methods=["POST"]),
             Route("/v0/tasks.split", tasks_split, methods=["POST"]),
+            Route("/v0/day.narrative", day_narrative, methods=["POST"]),
             Route("/v0/ambient.status", ambient_status, methods=["GET"]),
             Route("/v0/ambient.set", ambient_set, methods=["POST"]),
             Route("/v0/chat.answer", chat_answer, methods=["POST"]),

@@ -106,6 +106,7 @@ __all__ = [
     "EvictState",
     "ChunkRow",
     "TaskSegmentRow",
+    "DayNarrativeRow",
     "PipelineLedger",
     "LedgerError",
     "EvictionRefused",
@@ -344,6 +345,26 @@ class TaskSegmentRow:
     edited_fields: int = 0
 
 
+@dataclass(frozen=True)
+class DayNarrativeRow:
+    """An immutable snapshot of the per-recording day-narrative row (U4).
+
+    The written, evidence-bound day narrative the day view composes (R8/R9). One
+    row per recording, stored in the local-only ``recording.db`` (never uploaded —
+    R14). ``narrative`` is the sanitized prose; ``fingerprint`` is the CLOSED
+    block-set staleness key (KTD-6) the pass compares against to skip regenerating
+    an unchanged day; ``reason`` is the observable prose source/fallback marker
+    (``None`` when a model narrated, a fallback marker like ``no-model`` /
+    ``heuristic`` on the honest degrade, so a degrade is never silent — KTD-10);
+    ``generated_at`` is the wall-clock write time.
+    """
+
+    narrative: str
+    fingerprint: str
+    reason: str | None = None
+    generated_at: float | None = None
+
+
 def task_row_is_protected(row: TaskSegmentRow) -> bool:
     """True iff ``row`` is a KEPT (user-curated) task row: user OR user-edited.
 
@@ -518,6 +539,26 @@ CREATE TABLE IF NOT EXISTS scrub_generation (
 )
 """
 
+# U4 day diary (KTD-6/KTD-10). One row per recording holding the written,
+# evidence-bound day narrative the day view composes (R8/R9). ``fingerprint`` is
+# the CLOSED block-set staleness key (excluding the live ``is_open`` trailing
+# block) so the pass regenerates ONLY when the settled block set changed — never
+# on an unchanged 300s tick, and never merely because the open block grew.
+# ``reason`` is the observable prose source/fallback marker (KTD-10): ``NULL``
+# when a model narrated, a marker string on the honest heuristic degrade.
+# Local-only, in ``recording.db`` (never uploaded — R14). The whole table is
+# created atomically with its full shape, so — like ``ondevice_window_names`` and
+# ``scrub_generation`` — it needs no post-creation ALTER-ADD migration helper.
+_DAY_NARRATIVE_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_day_narrative (
+    recording_id INTEGER PRIMARY KEY,
+    narrative TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    reason TEXT,
+    generated_at REAL
+)
+"""
+
 
 def bump_scrub_generation(conn: sqlite3.Connection) -> None:
     """Increment the scrub-generation counter ON ``conn`` (no commit — KTD-10).
@@ -617,6 +658,8 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         # SCR-275 U4: on-device naming cache + scrub-generation counter.
         conn.execute(_ONDEVICE_NAMES_DDL)
         conn.execute(_SCRUB_GENERATION_DDL)
+        # U4 day diary: the per-recording day-narrative table (idempotent create).
+        conn.execute(_DAY_NARRATIVE_DDL)
         conn.commit()
     except sqlite3.OperationalError:
         # Read-only DB (an old recording opened for read) — do not crash; the
@@ -1465,6 +1508,103 @@ class PipelineLedger:
             return None, None
         finally:
             if conn is not None:
+                conn.close()
+
+    # ------------------------------------------------------------------
+    # U4 day diary — per-recording day narrative (evidence-bound, local-only).
+    # ------------------------------------------------------------------
+
+    def set_day_narrative(
+        self, narrative: str, fingerprint: str, reason: str | None = None,
+    ) -> None:
+        """Persist this recording's day narrative row, atomically (U4, KTD-6).
+
+        One row per recording (upsert on the PK). ``narrative`` MUST already be
+        the untrusted-output-sanitized prose (the caller runs it through
+        ``sanitize_answer`` before it lands — the narrative is recording-derived,
+        attacker-influenceable model/heuristic text). ``fingerprint`` is the
+        CLOSED block-set staleness key the next pass compares against to skip an
+        unchanged regeneration (KTD-6). ``reason`` is the observable prose
+        source/fallback marker (KTD-10): ``None`` when a model narrated, a marker
+        string on the honest heuristic degrade. Defensively creates the table so a
+        ``recording.db`` that predates the U4 schema still writes. Local-only — the
+        table lives in ``recording.db`` and is never uploaded (R14).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_DAY_NARRATIVE_DDL)
+                conn.execute(
+                    "INSERT INTO pipeline_day_narrative "
+                    "(recording_id, narrative, fingerprint, reason, generated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(recording_id) DO UPDATE SET "
+                    "narrative=excluded.narrative, fingerprint=excluded.fingerprint, "
+                    "reason=excluded.reason, generated_at=excluded.generated_at",
+                    (self._recording_id, narrative, fingerprint, reason, _now()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_day_narrative(self) -> "DayNarrativeRow | None":
+        """Return this recording's day-narrative row, or ``None`` if unwritten.
+
+        ``None`` for a recording that produced no narrative (a mechanical-only /
+        nothing-to-name day never writes a row — R9), a legacy recording captured
+        before U4 (no row, or the table absent), or any read error. Fail-safe
+        exactly like :meth:`get_recording_outcome`: **any** SQLite error resolves
+        to ``None``, never a raise — the read verb must never fail on a legacy or
+        locked-mid-read DB. Local-only read (never leaves the Mac — R14).
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT narrative, fingerprint, reason, generated_at "
+                "FROM pipeline_day_narrative WHERE recording_id=?",
+                (self._recording_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return DayNarrativeRow(
+                narrative=str(row[0]),
+                fingerprint=str(row[1]),
+                reason=(None if row[2] is None else str(row[2])),
+                generated_at=(None if row[3] is None else float(row[3])),
+            )
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def clear_day_narrative(self) -> None:
+        """Delete this recording's day-narrative row (U5 purge / invalidation hook).
+
+        Idempotent — a no-op when no row exists. The retroactive scrub purge (U5)
+        invalidates a stale narrative through here so the next tick regenerates it
+        (or leaves none if the day degraded). Defensively creates the table so a
+        pre-U4 DB never raises on the DELETE.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_DAY_NARRATIVE_DDL)
+                conn.execute(
+                    "DELETE FROM pipeline_day_narrative WHERE recording_id=?",
+                    (self._recording_id,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
                 conn.close()
 
     # ------------------------------------------------------------------

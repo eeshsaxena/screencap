@@ -96,6 +96,11 @@ _TASKS_UPDATE_API_VERSION = 1
 _TASKS_DELETE_API_VERSION = 1
 _TASKS_MERGE_API_VERSION = 1
 _TASKS_SPLIT_API_VERSION = 1
+# Day diary U4: the app-only ``day.narrative`` read verb — a recording's written,
+# evidence-bound day narrative (never mirrored over MCP in v1). Additive (new
+# verb) — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
+# precedent).
+_DAY_NARRATIVE_API_VERSION = 1
 # Day-first navigation U8: the irreversible, LOCAL-ONLY range-delete job
 # (delete.start with a dry_run preview / delete.status / delete.cancel). Additive
 # (new verbs) — no global API_SCHEMA_VERSION bump (mirrors the backfill / tasks
@@ -214,6 +219,8 @@ _MODEL_NAMES = {
     "TasksMergeResponse",
     "TasksSplitRequest",
     "TasksSplitResponse",
+    "DayNarrativeRequest",
+    "DayNarrativeResponse",
     "ModelDownloadStartRequest",
     "ModelDownloadCancelRequest",
     "ModelDownloadStatusResponse",
@@ -1302,6 +1309,39 @@ def _load_models() -> dict[str, Any]:
         recording: str
         task_indices: list[int]
 
+    class DayNarrativeRequest(_DaemonModel):
+        """U4 ``day.narrative`` input: the recording whose day narrative to read.
+
+        ``recording`` is validated by the canonical name validator in the handler
+        (traversal-safe), not via a ``Literal`` — same posture as ``tasks.list`` /
+        ``frame.nearest`` / ``content.search``.
+        """
+
+        recording: str
+
+    class DayNarrativeResponse(EnvelopeResponse):
+        """A recording's written, evidence-bound day narrative (U4, R8/R9).
+
+        ``recording`` echoes the requested name. ``narrative`` is the sanitized
+        prose, or ``None`` when the recording produced none — a mechanical-only /
+        nothing-to-name day writes no narrative (R9), a legacy / pre-U4 recording
+        has no row, or a locked/absent vault store (``store_state`` != mounted).
+        ``generated_at`` is the wall-clock write time (Unix seconds); ``reason`` is
+        the observable prose source/fallback marker (KTD-10): ``None`` when a model
+        narrated, a marker string on the honest heuristic degrade. The app renders
+        the ``None`` case gracefully (no narrative section) rather than as an error.
+        App-only in v1 — deliberately NOT mirrored over MCP.
+        """
+
+        recording: str
+        narrative: str | None = None
+        generated_at: float | None = None
+        reason: str | None = None
+        # KTD-14: mounted / locked / absent / error — a locked store returns a null
+        # narrative + store_state on a 200, never a 500. Absent on an older daemon →
+        # "mounted".
+        store_state: str = "mounted"
+
     class AmbientStatusResponse(EnvelopeResponse):
         """The app's runtime view of always-on ambient supervision (SCR-214 U12).
 
@@ -1544,6 +1584,8 @@ def _load_models() -> dict[str, Any]:
         "TasksMergeResponse": TasksMergeResponse,
         "TasksSplitRequest": TasksSplitRequest,
         "TasksSplitResponse": TasksSplitResponse,
+        "DayNarrativeRequest": DayNarrativeRequest,
+        "DayNarrativeResponse": DayNarrativeResponse,
         "ModelDownloadStartRequest": ModelDownloadStartRequest,
         "ModelDownloadCancelRequest": ModelDownloadCancelRequest,
         "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
@@ -1600,6 +1642,7 @@ __all__ = [
     "_TASKS_DELETE_API_VERSION",
     "_TASKS_MERGE_API_VERSION",
     "_TASKS_SPLIT_API_VERSION",
+    "_DAY_NARRATIVE_API_VERSION",
     "_DELETE_API_VERSION",
     "_CLIP_API_VERSION",
     "_MODELS_API_VERSION",

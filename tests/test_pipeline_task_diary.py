@@ -493,3 +493,78 @@ def test_pydantic_tasksegment_carries_diary_fields():
     assert d2["thread_id"] is None
     assert d2["is_open"] is False
     assert d2["bullets"] == []
+
+
+# ---------------------------------------------------------------------------
+# Day-narrative table (U4) — DDL + migration + ledger read/write helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_narrative_absent_is_none(tmp_path):
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = _make_recording_db(tmp_path)
+    assert PipelineLedger(db_path).get_day_narrative() is None
+
+
+def test_narrative_set_then_get_roundtrip(tmp_path):
+    from screencap.pipeline_state import PipelineLedger
+
+    ledger = PipelineLedger(_make_recording_db(tmp_path))
+    ledger.set_day_narrative("A written day.", "fp-1", "no-model")
+    row = ledger.get_day_narrative()
+    assert row.narrative == "A written day."
+    assert row.fingerprint == "fp-1"
+    assert row.reason == "no-model"
+    assert row.generated_at is not None
+
+
+def test_narrative_upsert_overwrites(tmp_path):
+    from screencap.pipeline_state import PipelineLedger
+
+    ledger = PipelineLedger(_make_recording_db(tmp_path))
+    ledger.set_day_narrative("first", "fp-1", None)
+    ledger.set_day_narrative("second", "fp-2", "no-model")
+    row = ledger.get_day_narrative()
+    assert (row.narrative, row.fingerprint, row.reason) == ("second", "fp-2", "no-model")
+
+
+def test_narrative_clear_removes_row(tmp_path):
+    from screencap.pipeline_state import PipelineLedger
+
+    ledger = PipelineLedger(_make_recording_db(tmp_path))
+    ledger.set_day_narrative("gone soon", "fp-1", None)
+    ledger.clear_day_narrative()
+    assert ledger.get_day_narrative() is None
+    ledger.clear_day_narrative()  # idempotent — a second clear is a no-op.
+
+
+def test_narrative_get_tolerates_missing_table(tmp_path):
+    """A pre-U4 recording.db without the narrative table → None, never an error."""
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = _make_recording_db(tmp_path, ensure=False)  # table absent
+    assert PipelineLedger(db_path).get_day_narrative() is None
+
+
+def test_narrative_set_migrates_defensively_without_ensure(tmp_path):
+    """set_day_narrative creates the table in-transaction, so a write never crashes
+    on a recording.db that skipped ensure_pipeline_state_schema."""
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = _make_recording_db(tmp_path, ensure=False)  # table absent
+    ledger = PipelineLedger(db_path)
+    ledger.set_day_narrative("written", "fp-1", None)
+    assert ledger.get_day_narrative().narrative == "written"
+
+
+def test_ensure_creates_narrative_table(tmp_path):
+    db_path = _make_recording_db(tmp_path)  # ensure=True
+    conn = sqlite3.connect(str(db_path))
+    tables = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    conn.close()
+    assert "pipeline_day_narrative" in tables
