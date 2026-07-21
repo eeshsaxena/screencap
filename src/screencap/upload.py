@@ -98,6 +98,14 @@ def _get_portal_url() -> str:
     return os.environ.get("SCREENCAP_PORTAL_URL", DEFAULT_PORTAL_URL)
 
 
+DEFAULT_SHARE_BASE_URL = "https://screencap.sh"
+
+
+def _get_share_base_url() -> str:
+    """Website base for share links; the browser viewer lives at ``/share/{token}``."""
+    return os.environ.get("SCREENCAP_SHARE_BASE_URL", DEFAULT_SHARE_BASE_URL)
+
+
 class BillingError(RuntimeError):
     """Billing request failure (checkout or portal) carrying a machine-readable
     ``code``.
