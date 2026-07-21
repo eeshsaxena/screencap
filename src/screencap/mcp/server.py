@@ -79,6 +79,28 @@ class ContentSearchResult(BaseModel):
     store_state: str = _DEFAULT_STORE_STATE
 
 
+class DiaryBlockHit(BaseModel):
+    """A day-diary work-BLOCK match — POINTER ONLY (day-diary U6). A text snippet +
+    the ``(recording, block_id)`` pointer + the block's absolute unix-ms span; never
+    a media path, image bytes, or a full bullet dump beyond the snippet."""
+
+    recording: str
+    block_id: str
+    start_ms: int
+    end_ms: int
+    snippet: str
+    score: float
+
+
+class DiarySearchResult(BaseModel):
+    hits: list[DiaryBlockHit]
+    # ok / no_match / not_indexed / index_degraded / store_unavailable — so the
+    # agent never mistakes an empty/degraded diary index for ground truth.
+    index_state: str
+    # KTD-20: mounted / locked / absent / error — a locked vault is data, not an error.
+    store_state: str = _DEFAULT_STORE_STATE
+
+
 class TranscriptHit(BaseModel):
     recording: str
     chunk_index: int
@@ -451,6 +473,30 @@ async def search_screen_content(
     )
     return ContentSearchResult(
         hits=[ContentHit(**h) for h in env.get("hits", [])],
+        index_state=env.get("index_state", "store_unavailable"),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
+    )
+
+
+async def search_diary(
+    query: str, recording: str | None = None, limit: int | None = None,
+) -> DiarySearchResult:
+    """Search the day diary's named work BLOCKS by name + topic bullets (keyword).
+
+    A diary block is a coherent, named stretch of work carrying short topic
+    bullets; this finds one from a fuzzy topic memory ("kick", "design systems")
+    across months of history. Each hit is POINTER-ONLY: a text ``snippet`` + the
+    block's ``(recording, block_id)`` pointer and its absolute unix-ms span
+    (``start_ms``/``end_ms``) — seek into the block's day via ``browse_day`` /
+    ``query_timeline`` → ``resolve_frame``. Best-effort recall — check
+    ``index_state`` (``not_indexed`` / ``store_unavailable`` mean "no data", not
+    "no match"). The day narrative is never indexed, so it never surfaces here.
+    """
+    env = await (await _client()).diary_search(
+        query, recording=recording, limit=_clamp_or_none(limit),
+    )
+    return DiarySearchResult(
+        hits=[DiaryBlockHit(**h) for h in env.get("hits", [])],
         index_state=env.get("index_state", "store_unavailable"),
         store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
@@ -830,7 +876,7 @@ def build_server() -> FastMCP:
         lifespan=_lifespan,
     )
     for fn in (
-        search_screen_content, search_transcript, query_timeline,
+        search_screen_content, search_diary, search_transcript, query_timeline,
         resolve_frame, read_frame, list_recordings, whoami, chat_answer,
         # U13 (R18): day-first browse tools. NO delete-shaped tool — deletion is
         # human-only, enforced by its absence from this surface.

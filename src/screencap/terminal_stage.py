@@ -1276,6 +1276,15 @@ def _run_local_segmentation(
     # heuristic one). A PRODUCED record drops the detail inside _record.
     _record(branch, detail=unavailable_reason)
 
+    # Diary search index (U6, R5/KTD-8): mirror the just-persisted diary BLOCKS'
+    # name + bullet text into the ``diary_fts`` table inside ``content_index.db``
+    # so a fuzzy topic memory finds the block across months of history (AE2). The
+    # write RE-READS the block rows under ``content_index_write_lock()`` (the P1
+    # purge-race barrier) and is INDEPENDENT of ``content_index_enabled`` (the
+    # diary is default-on — the OCR flag gates only the content pass). The
+    # NARRATIVE is never indexed. Strictly fail-open.
+    _index_diary_blocks(recording_dir)
+
     # Day narrative (U4, R8/R9): compose the recording's written day narrative from
     # the just-persisted diary BLOCKS (names + bullets + rollups only — never raw
     # evidence). Gated per-recording by the settled outcome and regenerated ONLY
@@ -1537,6 +1546,40 @@ def _build_narrator(recording_dir: Path):
             recording_dir.name, exc.__class__.__name__,
         )
         return None
+
+
+def _index_diary_blocks(recording_dir: Path) -> None:
+    """Mirror the just-persisted diary BLOCKS into the search index (U6, R5/KTD-8).
+
+    Writes each block's NAME + topic-bullet text — NEVER the narrative (KTD-8) —
+    into the ``diary_fts`` table inside the global ``content_index.db`` so a fuzzy
+    topic memory ("kick", "design systems") finds the block across months of
+    history (AE2). Delegates to :func:`content_index.write_recording_diary`, which
+    RE-READS the block rows from ``recording.db`` UNDER
+    ``content_index_write_lock()`` — the P1 purge-race barrier — and replaces the
+    recording's diary rows idempotently (a re-consolidation drops vanished /
+    renamed / bullet-lost blocks instead of accumulating them).
+
+    INDEPENDENT of ``content_index_enabled`` (P2 / R5): that flag gates only the
+    OCR ``content_fts`` pass; diary block search is a core, always-on requirement,
+    so this runs after EVERY consolidation regardless of the flag, materialising
+    the hardened store on the first named block.
+
+    Strictly fail-open: a search-index write must NEVER block terminal completion
+    or the recording pipeline. Any error logs a CLASS-NAME-ONLY marker (no block
+    name / bullet free text ever reaches the daemon log) and returns.
+    """
+    try:
+        from screencap.content_index import write_recording_diary
+
+        write_recording_diary(
+            recording_dir.name, recording_dir / "recording.db",
+        )
+    except Exception as exc:  # noqa: BLE001 — the diary index must never block terminal
+        logger.debug(
+            "terminal_stage: diary search index failed open for %s (%s)",
+            recording_dir.name, exc.__class__.__name__,
+        )
 
 
 def _run_day_narrative(

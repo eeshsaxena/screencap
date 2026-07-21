@@ -45,6 +45,9 @@ class _StubClient:
     async def content_search(self, query, *, recording=None, limit=None):
         return await self._reply("content", query, recording, limit)
 
+    async def diary_search(self, query, *, recording=None, limit=None):
+        return await self._reply("diary", query, recording, limit)
+
     async def transcript_search(self, query, *, recording=None, limit=None):
         return await self._reply("transcript", query, recording, limit)
 
@@ -90,6 +93,41 @@ async def test_content_tool_maps_pointer_only_hits(monkeypatch):
     assert result.hits[0].timestamp_ms == 125000
     # Pointer-only: the model has no path/bytes field by construction.
     assert set(server.ContentHit.model_fields) == {"recording", "timestamp_ms", "snippet", "score"}
+
+
+@pytest.mark.asyncio
+async def test_diary_tool_maps_pointer_only_block_hits(monkeypatch):
+    """The read-only diary mirror maps ``(recording, block_id, span, snippet)``
+    pointer hits — no path/bytes/full-bullet field on the model (day-diary U6)."""
+    stub = _StubClient({
+        "diary": {
+            "ok": True,
+            "hits": [{
+                "recording": "2026-06-01_0900",
+                "block_id": "blk-morning",
+                "start_ms": 10_000,
+                "end_ms": 120_000,
+                "snippet": "spinning back kick",
+                "score": -1.4,
+            }],
+            "index_state": "ok",
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.search_diary("spinning")
+
+    assert isinstance(result, server.DiarySearchResult)
+    assert result.index_state == "ok"
+    hit = result.hits[0]
+    assert hit.recording == "2026-06-01_0900" and hit.block_id == "blk-morning"
+    assert hit.start_ms == 10_000 and hit.end_ms == 120_000
+    # Pointer-only by construction: no path / bytes / full-bullet field.
+    assert set(server.DiaryBlockHit.model_fields) == {
+        "recording", "block_id", "start_ms", "end_ms", "snippet", "score",
+    }
+    # The tool forwards to the diary verb (not content).
+    assert stub.calls[0][0] == "diary"
 
 
 @pytest.mark.asyncio
@@ -201,8 +239,9 @@ async def test_resolve_frame_is_registered():
     mcp = server.build_server()
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
-        "search_screen_content", "search_transcript", "query_timeline",
-        "resolve_frame", "read_frame", "list_recordings", "whoami", "chat_answer",
+        "search_screen_content", "search_diary", "search_transcript",
+        "query_timeline", "resolve_frame", "read_frame", "list_recordings",
+        "whoami", "chat_answer",
         # U13 (R18) day-first browse tools — NO delete-shaped tool (human-only).
         "browse_day", "query_tasks", "create_clip",
     }

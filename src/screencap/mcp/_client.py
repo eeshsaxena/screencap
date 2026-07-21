@@ -121,6 +121,16 @@ class AsyncDaemonClient:
             body["limit"] = limit
         return await self._post("/v0/content.search", body)
 
+    async def diary_search(
+        self, query: str, *, recording: str | None = None, limit: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"query": query}
+        if recording is not None:
+            body["recording"] = recording
+        if limit is not None:
+            body["limit"] = limit
+        return await self._post("/v0/diary.search", body)
+
     async def transcript_search(
         self, query: str, *, recording: str | None = None, limit: int | None = None,
     ) -> dict[str, Any]:

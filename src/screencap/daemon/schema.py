@@ -101,6 +101,12 @@ _TASKS_SPLIT_API_VERSION = 1
 # verb) — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
 # precedent).
 _DAY_NARRATIVE_API_VERSION = 1
+# Day diary U6: the ``diary.search`` read verb — ranked day-diary BLOCK snippets
+# (name + topic bullets) + pointers over the ``diary_fts`` table inside the global
+# content index (R5/KTD-8). Mirrors ``content.search``'s recall posture; the
+# NARRATIVE is never indexed. Additive (new verb) — no global API_SCHEMA_VERSION
+# bump (mirrors the content.search / tasks.list additive precedent).
+_DIARY_SEARCH_API_VERSION = 1
 # Day-first navigation U8: the irreversible, LOCAL-ONLY range-delete job
 # (delete.start with a dry_run preview / delete.status / delete.cancel). Additive
 # (new verbs) — no global API_SCHEMA_VERSION bump (mirrors the backfill / tasks
@@ -221,6 +227,9 @@ _MODEL_NAMES = {
     "TasksSplitResponse",
     "DayNarrativeRequest",
     "DayNarrativeResponse",
+    "DiarySearchRequest",
+    "DiaryBlockHit",
+    "DiarySearchResponse",
     "ModelDownloadStartRequest",
     "ModelDownloadCancelRequest",
     "ModelDownloadStatusResponse",
@@ -555,6 +564,47 @@ def _load_models() -> dict[str, Any]:
         # future state decodes tolerantly.
         index_state: str
         # KTD-20: mounted / locked / absent / error — a locked store returns empty
+        # hits + store_state. Absent on an older daemon → "mounted".
+        store_state: str = "mounted"
+
+    class DiarySearchRequest(_DaemonModel):
+        """U6 day-diary BLOCK search input (R5 / KTD-8).
+
+        ``recording`` is an OPTIONAL filter (search across every recording when
+        absent), routed through the canonical name validator in the handler
+        (traversal-safe) before use — same posture as ``content.search``, NOT a
+        ``Literal``.
+        """
+
+        query: str = Field(max_length=_MAX_QUERY_LEN)
+        recording: str | None = None
+        limit: int | None = None
+
+    class DiaryBlockHit(_DaemonModel):
+        """A single day-diary block match — POINTER ONLY (R5 / KTD-8).
+
+        Structurally incapable of carrying a media path, image bytes, or a full
+        bullet dump: a text ``snippet`` + the ``(recording, block_id)`` pointer +
+        the block's absolute unix-ms span (``start_ms``/``end_ms``) + bm25
+        ``score``. The app deep-links by ``block_id`` and locates the block in its
+        day by span; it never receives bullet text beyond the matched ``snippet``.
+        R5 is a property of this shape, enforced at the daemon boundary.
+        """
+
+        recording: str
+        block_id: str
+        start_ms: int
+        end_ms: int
+        snippet: str
+        score: float
+
+    class DiarySearchResponse(EnvelopeResponse):
+        hits: list[DiaryBlockHit]
+        # content_index.IndexState value: ok / no_match / not_indexed /
+        # index_degraded / store_unavailable. Typed as str (not Literal) so a
+        # future state decodes tolerantly.
+        index_state: str
+        # KTD-14: mounted / locked / absent / error — a locked store returns empty
         # hits + store_state. Absent on an older daemon → "mounted".
         store_state: str = "mounted"
 
@@ -1586,6 +1636,9 @@ def _load_models() -> dict[str, Any]:
         "TasksSplitResponse": TasksSplitResponse,
         "DayNarrativeRequest": DayNarrativeRequest,
         "DayNarrativeResponse": DayNarrativeResponse,
+        "DiarySearchRequest": DiarySearchRequest,
+        "DiaryBlockHit": DiaryBlockHit,
+        "DiarySearchResponse": DiarySearchResponse,
         "ModelDownloadStartRequest": ModelDownloadStartRequest,
         "ModelDownloadCancelRequest": ModelDownloadCancelRequest,
         "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
@@ -1643,6 +1696,7 @@ __all__ = [
     "_TASKS_MERGE_API_VERSION",
     "_TASKS_SPLIT_API_VERSION",
     "_DAY_NARRATIVE_API_VERSION",
+    "_DIARY_SEARCH_API_VERSION",
     "_DELETE_API_VERSION",
     "_CLIP_API_VERSION",
     "_MODELS_API_VERSION",

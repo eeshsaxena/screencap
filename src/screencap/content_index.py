@@ -171,6 +171,77 @@ class IndexFrame:
     text: str
 
 
+# --------------------------------------------------------------------------
+# Day-diary block search (SCR day-diary U6 / KTD-8)
+# --------------------------------------------------------------------------
+#
+# A SECOND FTS surface inside the SAME ``content_index.db``: block name + topic
+# bullet text keyed by ``(recording, block_id)`` with the block's ms span, so a
+# fuzzy topic memory ("kick", "design systems") finds a diary BLOCK across months
+# of history in one query (R5). It rides the same machinery as ``content_fts`` —
+# the FTS5 probe + escaped-``LIKE`` fallback, the hardened perms, the
+# ``content_index_write_lock()``, the WAL + ``busy_timeout`` + PASSIVE checkpoint
+# — but is otherwise independent:
+#
+# * **Default-on (P2 / R5).** The diary write is INDEPENDENT of the default-off
+#   ``content_index_enabled`` flag (which gates only the OCR ``content_fts``
+#   pass). Block name/bullet text is always written after consolidation; the DB
+#   file/dir is created with the same hardened perms whether or not OCR indexing
+#   is on.
+# * **Narrative is NEVER indexed** (KTD-8) — only block name + bullet text.
+# * **Purge-race safe (P1).** :func:`write_recording_diary` holds
+#   ``content_index_write_lock()`` and RE-READS the recording's block rows under
+#   that lock immediately before writing — the diary equivalent of the
+#   ``index_core`` unlink-before-write re-``stat`` barrier. A consolidation pass
+#   that read block rows BEFORE a retroactive-disable purge deleted them must not
+#   re-insert the disabled app's text after the purge's diary delete; re-reading
+#   under the lock closes that window. The purge side (U5) deletes diary rows
+#   under the SAME lock via :meth:`ContentIndex.delete_recording_diary_interval`.
+
+
+@dataclass(frozen=True)
+class DiaryEntry:
+    """One diary block's searchable text + locating pointer, to persist.
+
+    ``text`` is the block NAME plus its topic bullets joined (never the narrative
+    — KTD-8). ``start_ms`` / ``end_ms`` are the block's absolute unix-ms span
+    (the recall surface's ms convention, matching ``timestamp_ms``); the interval
+    purge (U5) keys on them.
+    """
+
+    block_id: str
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+@dataclass(frozen=True)
+class DiaryHit:
+    """A single ranked diary match: text snippet + a POINTER, never a path.
+
+    Pointer-only (R5 / KTD-8): ``(recording, block_id)`` plus the block's ms span
+    — the app deep-links by ``block_id`` and locates the block in its day by span,
+    never receiving full bullet text beyond the matched ``snippet``. ``score`` is
+    the bm25 value (most-negative = best) on the FTS5 path, or ``0.0`` on the LIKE
+    fallback where no ranking is available.
+    """
+
+    recording: str
+    block_id: str
+    start_ms: int
+    end_ms: int
+    snippet: str
+    score: float
+
+
+@dataclass(frozen=True)
+class DiarySearchResult:
+    """Result of a diary search: ranked hits + the reason for the outcome."""
+
+    hits: list[DiaryHit] = field(default_factory=list)
+    index_state: IndexState = IndexState.NO_MATCH
+
+
 def default_index_path() -> Path:
     """Return the content-index DB path (does not create the DB file).
 
@@ -503,11 +574,51 @@ class ContentIndex:
                 "CREATE INDEX IF NOT EXISTS idx_content_plain_rec "
                 "ON content_plain(recording, timestamp_ms)"
             )
+        self._create_diary_schema(conn)
         conn.commit()
+
+    def _create_diary_schema(self, conn: sqlite3.Connection) -> None:
+        """Create the day-diary block-search table (U6, KTD-8).
+
+        A SECOND table in the SAME store, mirroring ``content_fts``'s shape: the
+        block ``text`` (name + bullets) indexed, the pointer/filter columns
+        UNINDEXED. Created on EVERY open regardless of ``content_index_enabled``
+        (the diary write is default-on — P2/R5), so the first consolidated block
+        materialises the hardened store whether or not OCR indexing runs.
+        """
+        if self._fts_available:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS diary_fts USING fts5("
+                "  text,"
+                "  recording UNINDEXED,"
+                "  block_id UNINDEXED,"
+                "  start_ms UNINDEXED,"
+                "  end_ms UNINDEXED,"
+                "  tokenize = 'unicode61 remove_diacritics 2'"
+                ")"
+            )
+        else:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS diary_plain ("
+                "  recording TEXT NOT NULL,"
+                "  block_id TEXT NOT NULL,"
+                "  start_ms INTEGER NOT NULL,"
+                "  end_ms INTEGER NOT NULL,"
+                "  text TEXT NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_diary_plain_rec "
+                "ON diary_plain(recording)"
+            )
 
     @property
     def _table(self) -> str:
         return "content_fts" if self._fts_available else "content_plain"
+
+    @property
+    def _diary_table(self) -> str:
+        return "diary_fts" if self._fts_available else "diary_plain"
 
     # -- write -----------------------------------------------------------
 
@@ -605,6 +716,146 @@ class ContentIndex:
         except _OPERATIONAL_ERRORS:
             pass
 
+    # -- diary write (day-diary block search, U6) ------------------------
+
+    def write_diary_blocks(
+        self, recording: str, entries: Iterable[DiaryEntry],
+    ) -> int:
+        """Replace ALL of ``recording``'s diary rows with ``entries`` (idempotent).
+
+        Delete-then-insert PER RECORDING inside one committed transaction, so a
+        re-consolidation pass drops a recording's stale blocks (a block that
+        disappeared, or whose text changed) instead of accumulating them — the
+        diary equivalent of :meth:`write_chunk`'s whole-range replace. A concurrent
+        reader never observes a half-written recording. Entries with empty text
+        (no name and no bullets) are dropped. Returns the number of rows written.
+
+        SECURITY (P1): the CALLER must hold :func:`content_index_write_lock` across
+        the RE-READ of the source block rows and this write — see
+        :func:`write_recording_diary`. This method assumes it, and only performs
+        the delete-then-insert.
+        """
+        if self._conn is None:
+            raise sqlite3.OperationalError("content index not open")
+        rows = [
+            (recording, e.block_id, int(e.start_ms), int(e.end_ms), e.text)
+            for e in entries
+            if e.block_id and e.text and e.text.strip()
+        ]
+        conn = self._conn
+        table = self._diary_table
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            # Whole-recording replace: clear every prior diary row for this
+            # recording so a re-consolidation where a block vanished / was renamed
+            # / lost bullets drops the stale row instead of leaving it queryable.
+            cur.execute(
+                f"DELETE FROM {table} WHERE recording = ?", (recording,)
+            )
+            if rows:
+                cur.executemany(
+                    f"INSERT INTO {table} "
+                    "(recording, block_id, start_ms, end_ms, text) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    rows,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        self._checkpoint()
+        return len(rows)
+
+    # -- diary search (day-diary block search, U6) -----------------------
+
+    def search_diary(
+        self,
+        query: str,
+        *,
+        recording: str | None = None,
+        limit: int = _DEFAULT_LIMIT,
+    ) -> DiarySearchResult:
+        """Return ranked block snippets + POINTERS for ``query``. Never raises.
+
+        Same injection-safe binding as :meth:`search` (phrase-escaped FTS5
+        ``MATCH`` / ``%``-``_`` escaped LIKE), pointer-only hits (recording,
+        block_id, ms span, snippet) — never full bullet text beyond the snippet.
+        """
+        if not self._available or self._conn is None:
+            return DiarySearchResult([], IndexState.STORE_UNAVAILABLE)
+        limit = max(1, min(int(limit), _MAX_LIMIT))
+        query = (query or "").strip()
+        if not query:
+            return DiarySearchResult([], IndexState.NO_MATCH)
+        try:
+            if self._fts_available:
+                hits = self._search_diary_fts(query, recording, limit)
+                degraded = False
+            else:
+                hits = self._search_diary_like(query, recording, limit)
+                degraded = True
+        except _DATABASE_ERRORS as exc:
+            logger.warning("diary search failed: %s", type(exc).__name__)
+            return DiarySearchResult([], IndexState.STORE_UNAVAILABLE)
+
+        if not hits:
+            return DiarySearchResult(
+                [], IndexState.INDEX_DEGRADED if degraded else IndexState.NO_MATCH
+            )
+        return DiarySearchResult(
+            hits, IndexState.INDEX_DEGRADED if degraded else IndexState.OK
+        )
+
+    def _search_diary_fts(
+        self, query: str, recording: str | None, limit: int
+    ) -> list[DiaryHit]:
+        assert self._conn is not None
+        match = _build_fts_match(query)
+        if not match:
+            return []
+        sql = (
+            "SELECT recording, block_id, start_ms, end_ms, "
+            "snippet(diary_fts, 0, '', '', '…', ?) AS snip, "
+            "bm25(diary_fts) AS score "
+            "FROM diary_fts WHERE diary_fts MATCH ?"
+        )
+        params: list[object] = [_SNIPPET_TOKEN_BUDGET, match]
+        if recording is not None:
+            sql += " AND recording = ?"
+            params.append(recording)
+        sql += " ORDER BY score LIMIT ?"
+        params.append(limit)
+        cur = self._conn.execute(sql, params)
+        return [
+            DiaryHit(rec, block_id, int(start_ms), int(end_ms), snip or "", float(score))
+            for rec, block_id, start_ms, end_ms, snip, score in cur.fetchall()
+        ]
+
+    def _search_diary_like(
+        self, query: str, recording: str | None, limit: int
+    ) -> list[DiaryHit]:
+        assert self._conn is not None
+        pattern = f"%{escape_like(query)}%"
+        sql = (
+            "SELECT recording, block_id, start_ms, end_ms, text "
+            "FROM diary_plain WHERE text LIKE ? ESCAPE '\\'"
+        )
+        params: list[object] = [pattern]
+        if recording is not None:
+            sql += " AND recording = ?"
+            params.append(recording)
+        sql += " ORDER BY end_ms DESC LIMIT ?"
+        params.append(limit)
+        cur = self._conn.execute(sql, params)
+        return [
+            DiaryHit(
+                rec, block_id, int(start_ms), int(end_ms),
+                like_snippet(text, query), 0.0,
+            )
+            for rec, block_id, start_ms, end_ms, text in cur.fetchall()
+        ]
+
     # -- search ----------------------------------------------------------
 
     def search(
@@ -700,12 +951,17 @@ class ContentIndex:
         Deletes from BOTH ``content_fts`` and ``content_plain`` when present, so
         a store that was written under one schema and later opened under the
         other (FTS5 availability differs across builds) can never leave the
-        purged recording's sensitive rows behind in the now-inactive table.
+        purged recording's sensitive rows behind in the now-inactive table. Also
+        cascades into the day-diary block rows (U6): deleting a whole recording /
+        day must remove its diary block+bullet text from the global store too
+        (R13) — the diary lives in the SAME sidecar but is never uploaded.
         """
-        return self._delete(
+        deleted = self._delete(
             "DELETE FROM {table} WHERE recording = ?",
             (recording,),
         )
+        deleted += self.delete_recording_diary(recording)
+        return deleted
 
     def delete_recording_interval(
         self, recording: str, start_ms: int, end_ms: int | None
@@ -726,6 +982,43 @@ class ContentIndex:
             "DELETE FROM {table} "
             "WHERE recording = ? AND timestamp_ms >= ? AND timestamp_ms < ?",
             (recording, int(start_ms), int(end_ms)),
+        )
+
+    def delete_recording_diary(self, recording: str) -> int:
+        """Purge every day-diary block row for ``recording`` (U6, R13).
+
+        The whole-recording diary purge — used by the full-recording cascade
+        (:meth:`delete_recording`) and available to the U5 retroactive purge. Runs
+        over BOTH ``diary_fts`` and ``diary_plain`` when present (FTS5 availability
+        differs across builds), so a schema-crossed store never strands rows.
+        """
+        return self._delete_diary(
+            "DELETE FROM {table} WHERE recording = ?",
+            (recording,),
+        )
+
+    def delete_recording_diary_interval(
+        self, recording: str, start_ms: int, end_ms: int | None
+    ) -> int:
+        """Purge ``recording`` diary blocks OVERLAPPING ``[start_ms, end_ms)`` (U5).
+
+        The retroactive-disable purge the U5 cascade calls under
+        ``content_index_write_lock()`` — a block whose ms span intersects a
+        disabled interval is removed so its name/bullet text stops being queryable
+        (AE5). A block overlaps iff ``start_ms < end_ms`` AND ``end_ms > start_ms``
+        (half-open). ``end_ms=None`` is the open-ended trailing interval (the
+        ``scrub_worker`` ``float('inf')`` upper bound). Deletes from BOTH diary
+        tables when present (see :meth:`delete_recording_diary`).
+        """
+        if end_ms is None:
+            return self._delete_diary(
+                "DELETE FROM {table} WHERE recording = ? AND end_ms > ?",
+                (recording, int(start_ms)),
+            )
+        return self._delete_diary(
+            "DELETE FROM {table} "
+            "WHERE recording = ? AND start_ms < ? AND end_ms > ?",
+            (recording, int(end_ms), int(start_ms)),
         )
 
     def max_indexed_timestamp_ms(self, recording: str) -> int | None:
@@ -760,6 +1053,40 @@ class ContentIndex:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def _present_diary_tables(self, conn: sqlite3.Connection) -> list[str]:
+        """Which of the two DIARY tables actually exist in this store (U6)."""
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type IN ('table', 'view') "
+            "AND name IN ('diary_fts', 'diary_plain')"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def _delete_diary(self, sql_template: str, params: Sequence[object]) -> int:
+        """Run ``sql_template`` (a ``{table}`` placeholder) against every present
+        DIARY table in one transaction. Returns total rows deleted.
+
+        ``{table}`` is interpolated only from a fixed allowlist of literal table
+        names discovered via ``sqlite_master`` — never from caller input.
+        """
+        if self._conn is None:
+            raise sqlite3.OperationalError("content index not open")
+        conn = self._conn
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        deleted = 0
+        try:
+            for table in self._present_diary_tables(conn):
+                cur.execute(sql_template.format(table=table), params)
+                if cur.rowcount and cur.rowcount > 0:
+                    deleted += cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        self._checkpoint()
+        return deleted
+
     def _delete(self, sql_template: str, params: Sequence[object]) -> int:
         """Run ``sql_template`` (a ``{table}`` placeholder) against every present
         content table in one transaction. Returns total rows deleted.
@@ -785,6 +1112,119 @@ class ContentIndex:
             raise
         self._checkpoint()
         return deleted
+
+
+# --------------------------------------------------------------------------
+# Day-diary write orchestration (the P1 purge-race barrier lives HERE, U6)
+# --------------------------------------------------------------------------
+
+
+def _diary_text(name: str | None, bullets: object) -> str:
+    """Join a block's NAME + topic bullets into one searchable string (U6, KTD-8).
+
+    The NARRATIVE is never included. Bullets are the U3 ``metadata.bullets`` list;
+    a non-list / missing value contributes nothing. Empty when the block has
+    neither a name nor bullets (the caller drops such blocks from the index).
+    """
+    parts: list[str] = []
+    if isinstance(name, str) and name.strip():
+        parts.append(name.strip())
+    if isinstance(bullets, list):
+        parts.extend(str(b).strip() for b in bullets if str(b).strip())
+    return "  ".join(parts).strip()
+
+
+def _read_diary_source_rows(db_path: Path) -> list:
+    """Read a recording's task-segment (block) rows — the diary index SOURCE.
+
+    Lazily imports the ledger (``content_index`` stays import-light): the re-read
+    of the authoritative block rows is what the P1 barrier keys on, so it must hit
+    the live ``recording.db`` at write time, not a caller-cached snapshot.
+    """
+    from screencap.pipeline_state import PipelineLedger
+
+    return PipelineLedger(Path(db_path)).read_task_segments()
+
+
+def _diary_entries_from_rows(rows: Iterable) -> list[DiaryEntry]:
+    """Project block rows → :class:`DiaryEntry` list (name+bullets, ms span).
+
+    Only rows carrying a ``block_id`` become diary entries (a legacy non-diary
+    row has none and cannot be a block). Bullets are parsed from the row's
+    ``metadata`` JSON via the shared wire projector so the index and the app read
+    the SAME bullets. A block with neither a name nor bullets yields empty text
+    and is dropped by :meth:`ContentIndex.write_diary_blocks`.
+    """
+    from screencap.pipeline_state import _parse_wire_bullets
+
+    entries: list[DiaryEntry] = []
+    for row in rows:
+        block_id = getattr(row, "block_id", None)
+        if not block_id:
+            continue
+        bullets = _parse_wire_bullets(getattr(row, "metadata", None))
+        text = _diary_text(getattr(row, "name", None), bullets)
+        if not text:
+            continue
+        entries.append(
+            DiaryEntry(
+                block_id=str(block_id),
+                start_ms=int(round(float(getattr(row, "start_ts", 0.0)) * 1000)),
+                end_ms=int(round(float(getattr(row, "end_ts", 0.0)) * 1000)),
+                text=text,
+            )
+        )
+    return entries
+
+
+def write_recording_diary(
+    recording: str,
+    db_path: Path | str,
+    *,
+    store_path: Path | str | None = None,
+    rows_reader=None,
+) -> int:
+    """Replace ``recording``'s diary rows from its LIVE block rows (U6, P1-safe).
+
+    The ONE diary write entry point (the terminal-stage consolidation hook calls
+    it live and at finalize). Independent of ``content_index_enabled`` — the diary
+    write is default-on (P2/R5), so this ALWAYS runs after consolidation and
+    materialises the hardened store on the first named block.
+
+    SECURITY (P1 — the purge-race barrier): the whole re-read + write is held
+    under ``content_index_write_lock()``, and the block rows are RE-READ from
+    ``recording.db`` UNDER that lock immediately before the write — the diary
+    equivalent of ``index_core``'s unlink-before-write re-``stat`` barrier. This
+    closes the resurrection window: a consolidation pass that read block rows
+    BEFORE a retroactive-disable purge deleted them must not re-insert the
+    disabled app's text AFTER the purge's diary delete. Under the lock the two
+    orderings converge to "purged": either this write lands first and the purge
+    (U5, same lock) then deletes it, or the purge runs first (deleting the block
+    rows from ``recording.db`` and the diary rows) and this re-read then sees the
+    purged rows and writes clean text.
+
+    Empty-store guard: when there is nothing to write AND the store file does not
+    exist yet, no (empty) store is created — mirrors the content pass. When the
+    store already exists the delete-then-insert still runs so a re-consolidation
+    that dropped every block clears the stale rows.
+
+    ``rows_reader`` is an injectable seam (defaults to :func:`_read_diary_source_rows`)
+    for the contention tests. Returns the number of rows written.
+    """
+    if store_path is None:
+        store_path = default_index_path()
+    store_path = Path(store_path)
+    reader = rows_reader or _read_diary_source_rows
+    with content_index_write_lock():
+        # RE-READ the authoritative block rows UNDER the lock (the barrier).
+        rows = reader(db_path)
+        entries = _diary_entries_from_rows(rows)
+        if not entries and not store_path.exists():
+            return 0  # nothing to index and no store to clear — don't create one.
+        with ContentIndex(store_path) as store:
+            if not store.available:
+                return 0
+            return store.write_diary_blocks(recording, entries)
 
 
 def like_snippet(
