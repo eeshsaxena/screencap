@@ -199,9 +199,21 @@ class TestRecordAudioIntegration:
         keeps the mock's frames flowing 1:1, exactly as before the resampler
         existed. (The native-rate + resample path is covered by
         ``tests/test_audio_capture_rate.py``.)
+
+        ``classify_input_devices`` is also stubbed to ``[]`` so the SCR-288
+        mic-source policy resolves deterministically to the OS default
+        (``device=None``) on any machine — otherwise these tests would enumerate
+        the host's real devices and behave differently with AirPods connected.
         """
-        with patch(
-            "screencap.engine.recorder.resolve_capture_rate", return_value=SAMPLERATE
+        with (
+            patch(
+                "screencap.engine.recorder.resolve_capture_rate",
+                return_value=SAMPLERATE,
+            ),
+            patch(
+                "screencap.engine.audio_device.classify_input_devices",
+                return_value=[],
+            ),
         ):
             yield
 
@@ -261,7 +273,7 @@ class TestRecordAudioIntegration:
 
         captured_callback = {}
 
-        def mock_input_stream(callback, samplerate, channels):
+        def mock_input_stream(callback, samplerate, channels, device=None):
             captured_callback["fn"] = callback
             return self._make_mock_stream(callback, duration_secs=1.0)
 
@@ -315,7 +327,7 @@ class TestRecordAudioIntegration:
         terminate = multiprocessing.Event()
         started = multiprocessing.Event()
 
-        def mock_input_stream(callback, samplerate, channels):
+        def mock_input_stream(callback, samplerate, channels, device=None):
             return self._make_mock_stream(callback, duration_secs=0.5)
 
         with patch("sounddevice.InputStream", side_effect=mock_input_stream):
@@ -357,7 +369,7 @@ class TestRecordAudioIntegration:
         terminate = multiprocessing.Event()
         started = multiprocessing.Event()
 
-        def mock_input_stream(callback, samplerate, channels):
+        def mock_input_stream(callback, samplerate, channels, device=None):
             # No chunks fed — immediate stop
             mock = MagicMock()
             mock.samplerate = SAMPLERATE
@@ -409,7 +421,7 @@ class TestRecordAudioIntegration:
         # A mute the engine-main handler forwarded during teardown.
         mute_q.put({"muted": True, "ts": 1000.5})
 
-        def mock_input_stream(callback, samplerate, channels):
+        def mock_input_stream(callback, samplerate, channels, device=None):
             m = MagicMock()
             m.samplerate = SAMPLERATE
             m.start = MagicMock()
@@ -456,7 +468,7 @@ class TestRecordAudioIntegration:
 
         target_duration = 2.0
 
-        def mock_input_stream(callback, samplerate, channels):
+        def mock_input_stream(callback, samplerate, channels, device=None):
             return self._make_mock_stream(callback, duration_secs=target_duration)
 
         with patch("sounddevice.InputStream", side_effect=mock_input_stream):

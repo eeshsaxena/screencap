@@ -263,6 +263,35 @@ def set_audio_default(value: bool) -> None:
     invalidate_config_cache()
 
 
+def get_prefer_builtin_mic_over_bluetooth() -> bool:
+    """Return whether mic capture redirects to the built-in mic on Bluetooth (SCR-288).
+
+    Default True: when a Bluetooth device (AirPods) would be the input, capture
+    from the built-in mic instead so the user's playback stays high-quality A2DP
+    rather than dropping to HFP/SCO "phone call" quality. Set to False to capture
+    directly from the Bluetooth mic (accepting the playback degradation).
+    """
+    return _parse_bool_env(
+        "SCREENCAP_PREFER_BUILTIN_MIC_OVER_BLUETOOTH",
+        "prefer_builtin_mic_over_bluetooth",
+        True,
+    )
+
+
+def set_prefer_builtin_mic_over_bluetooth(value: bool) -> None:
+    """Persist the Bluetooth mic-redirect setting to ``config.toml``.
+
+    Mirrors :func:`set_audio_default` — tomlkit via the setup-wizard loader/saver
+    pair, then cache invalidation.
+    """
+    from screencap.setup_wizard import _load_config_toml, _save_config_atomic
+
+    doc = _load_config_toml(_CONFIG_PATH)
+    doc["prefer_builtin_mic_over_bluetooth"] = value
+    _save_config_atomic(_CONFIG_PATH, doc)
+    invalidate_config_cache()
+
+
 def _parse_ambient_bool(env_name: str, cfg_key: str, default: bool) -> bool:
     """Env var (truthy → bool) > ``[ambient].<cfg_key>`` > default.
 
