@@ -350,7 +350,10 @@ enum TasksModel {
     ) -> String? {
         guard let index = sittingIndex, let count = sittingCount, let minutes = totalMinutes,
               count >= 2 else { return nil }
-        return "\(index) of \(count) · \(threadDurationText(minutes: minutes)) today"
+        // No " today" suffix: this chip renders on the cross-day Tasks list, so a
+        // Friday thread viewed Monday would read "... today" incorrectly. The
+        // day heading already carries the date; the rollup is that day's total.
+        return "\(index) of \(count) · \(threadDurationText(minutes: minutes))"
     }
 
     /// Compact duration text for a thread rollup: "2h43" (hours + zero-padded

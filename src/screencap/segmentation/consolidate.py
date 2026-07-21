@@ -520,9 +520,20 @@ def bullets_for_blocks(
     apps), NEVER from the downstream — possibly gate-blanked — block name, so a
     bullet can never assert content a confidence gate rejected (KTD-4).
     """
-    from screencap.segmentation.sanitize import sanitize_bullets
+    from screencap.segmentation.sanitize import (
+        _MAX_NAME_LEN,
+        _clean_text,
+        sanitize_bullets,
+    )
 
     for block in blocks:
+        # Sanitize the block NAME at the same per-block chokepoint as bullets: the
+        # merged model name (str(raw_name).strip()[:80]) is otherwise unsanitized
+        # and reaches diary_fts / diary.search snippets / the MCP task mirrors and
+        # the narrative digest verbatim — a prompt-injection sink sanitize.py
+        # exists to close. Legitimate names pass through unchanged; only control
+        # chars / <...> markup are stripped.
+        block.name = _clean_text(block.name, _MAX_NAME_LEN)
         raw, fallback = _block_bullets(block, bullet_provider, stop_event, deadline)
         block.bullets = sanitize_bullets(raw)
         # The marker is recorded whenever the block fell to the honest heuristic,

@@ -997,9 +997,14 @@ class ScrubWorker:
         (``PipelineLedger.clear_day_narrative`` -- built as the U5 invalidation hook)
         so the next consolidation tick recomposes it from the surviving blocks.
         Post-commit with its OWN connection (the scrub transaction has already
-        committed), so it can't be part of the row-delete atom; any error is
-        swallowed per the worker's fail-open discipline (the block-set fingerprint
-        would still force a regenerate on the next tick).
+        committed), so it can't be part of the row-delete atom. This clear IS the
+        privacy guarantee: after it, the stored narrative is gone (NULL) until a
+        later tick recomposes it from the surviving blocks. Any error is swallowed
+        per the worker's fail-open discipline; note the swallow is a genuine (if
+        narrow) defence-in-depth edge — a purge does NOT change the consolidation
+        fingerprint that gates whether the next tick runs, so a failed clear is
+        not guaranteed to be re-driven until the block set changes for another
+        reason (tracked as a follow-up). The common path (clear -> NULL) is safe.
         """
         try:
             from screencap.pipeline_state import PipelineLedger

@@ -160,6 +160,7 @@ from screencap.segmentation.providers.chained import UnavailableProvider  # noqa
 from screencap.segmentation.routing import build_prose_provider  # noqa: E402
 
 
+@pytest.mark.privacy
 def test_prose_on_device_exposes_bullet_verb(cfg):
     cfg("on-device")
     prov = build_prose_provider()
@@ -168,6 +169,7 @@ def test_prose_on_device_exposes_bullet_verb(cfg):
     assert hasattr(prov, "call_block_bullets")
 
 
+@pytest.mark.privacy
 def test_prose_local_server_local_endpoint_participates(cfg):
     cfg("local-server", endpoint="http://127.0.0.1:1234")
     assert isinstance(build_prose_provider(), LocalServerProvider)

@@ -1192,16 +1192,26 @@ def write_recording_diary(
     materialises the hardened store on the first named block.
 
     SECURITY (P1 — the purge-race barrier): the whole re-read + write is held
-    under ``content_index_write_lock()``, and the block rows are RE-READ from
-    ``recording.db`` UNDER that lock immediately before the write — the diary
-    equivalent of ``index_core``'s unlink-before-write re-``stat`` barrier. This
-    closes the resurrection window: a consolidation pass that read block rows
-    BEFORE a retroactive-disable purge deleted them must not re-insert the
-    disabled app's text AFTER the purge's diary delete. Under the lock the two
+    under ``content_index_write_lock(require_cross_process=True)``, and the block
+    rows are RE-READ from ``recording.db`` UNDER that lock immediately before the
+    write — the diary equivalent of ``index_core``'s unlink-before-write re-``stat``
+    barrier. This closes the resurrection window: a consolidation pass that read
+    block rows BEFORE a retroactive-disable purge deleted them must not re-insert
+    the disabled app's text AFTER the purge's diary delete. Under the lock the two
     orderings converge to "purged": either this write lands first and the purge
     (U5, same lock) then deletes it, or the purge runs first (deleting the block
     rows from ``recording.db`` and the diary rows) and this re-read then sees the
     purged rows and writes clean text.
+
+    ``require_cross_process=True`` is load-bearing: the diary write runs in the
+    DAEMON process (terminal-stage segmentation), a DIFFERENT process from the
+    recorder subprocess that runs the retroactive-disable purge, so the in-process
+    ``threading.Lock`` does NOT serialize the two — only the flock does (same
+    posture as ``index_core`` / ``corpus_migrate``, both cross-process daemon
+    writers). On a filesystem without flock support we DECLINE the write (return
+    ``-1``) rather than write unserialized, which could resurrect just-purged
+    text; the purge still deletes, so its result stands. On the default local
+    APFS store flock works and the write proceeds normally.
 
     Empty-store guard: when there is nothing to write AND the store file does not
     exist yet, no (empty) store is created — mirrors the content pass. When the
@@ -1209,22 +1219,28 @@ def write_recording_diary(
     that dropped every block clears the stale rows.
 
     ``rows_reader`` is an injectable seam (defaults to :func:`_read_diary_source_rows`)
-    for the contention tests. Returns the number of rows written.
+    for the contention tests. Returns the number of rows written, or ``-1`` when
+    the cross-process lock was unavailable and the write was declined.
     """
     if store_path is None:
         store_path = default_index_path()
     store_path = Path(store_path)
     reader = rows_reader or _read_diary_source_rows
-    with content_index_write_lock():
-        # RE-READ the authoritative block rows UNDER the lock (the barrier).
-        rows = reader(db_path)
-        entries = _diary_entries_from_rows(rows)
-        if not entries and not store_path.exists():
-            return 0  # nothing to index and no store to clear — don't create one.
-        with ContentIndex(store_path) as store:
-            if not store.available:
-                return 0
-            return store.write_diary_blocks(recording, entries)
+    try:
+        with content_index_write_lock(require_cross_process=True):
+            # RE-READ the authoritative block rows UNDER the lock (the barrier).
+            rows = reader(db_path)
+            entries = _diary_entries_from_rows(rows)
+            if not entries and not store_path.exists():
+                return 0  # nothing to index and no store to clear — don't create one.
+            with ContentIndex(store_path) as store:
+                if not store.available:
+                    return 0
+                return store.write_diary_blocks(recording, entries)
+    except CrossProcessLockUnavailable:
+        # No cross-process flock on this filesystem: decline rather than write a
+        # diary row the recorder-subprocess purge cannot serialize against.
+        return -1
 
 
 def like_snippet(

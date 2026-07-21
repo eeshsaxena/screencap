@@ -1499,6 +1499,19 @@ def _consolidate_into_blocks(
         tz_offset = _local_tz_offset_s(
             float(min(t.get("start_ts", 0.0) for t in task_list if isinstance(t, dict)))
         )
+        # Wall-clock budget mirroring the per-window naming pass, so the
+        # per-block namer/bullet model calls honour both the budget AND the
+        # cooperative stop_event (the halt check is gated behind a non-None
+        # deadline — without one, neither fires; see consolidate._halt loops).
+        from screencap.segmentation.ondevice_pipeline import (
+            FINALIZE_PASS_BUDGET_S,
+            LIVE_PASS_BUDGET_S,
+            _monotonic,
+        )
+
+        deadline = _monotonic() + (
+            LIVE_PASS_BUDGET_S if is_live else FINALIZE_PASS_BUDGET_S
+        )
         blocks = consolidate(
             task_list,
             prior_rows=prior_rows,
@@ -1509,6 +1522,7 @@ def _consolidate_into_blocks(
             namer=_build_block_namer(recording_dir),
             bullet_provider=_build_bullet_provider(recording_dir),
             stop_event=stop_event,
+            deadline=deadline,
         )
         return {**tasks, "tasks": blocks}
     except Exception as exc:  # noqa: BLE001 — consolidation must never block terminal
@@ -1638,10 +1652,22 @@ def _run_day_narrative(
         # Generation scales with the day's block count and runs inside the terminal
         # lock — emit the PHASE-ONLY heartbeat before it (P2), never free text.
         _notify_progress(on_progress, "narrate")
+        # Wall-clock budget so the narrator model call honours the budget AND the
+        # cooperative stop_event (halt is gated behind a non-None deadline).
+        from screencap.segmentation.ondevice_pipeline import (
+            FINALIZE_PASS_BUDGET_S,
+            LIVE_PASS_BUDGET_S,
+            _monotonic,
+        )
+
+        narrative_deadline = _monotonic() + (
+            LIVE_PASS_BUDGET_S if is_live else FINALIZE_PASS_BUDGET_S
+        )
         result = build_narrative(
             blocks,
             narrator=_build_narrator(recording_dir),
             stop_event=stop_event,
+            deadline=narrative_deadline,
         )
         if not result.text:
             return  # nothing usable to persist (EMPTY guard / all-blank).
