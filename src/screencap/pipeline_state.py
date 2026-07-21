@@ -88,6 +88,7 @@ import logging
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -696,6 +697,18 @@ def _now() -> float:
     return time.time()
 
 
+def _mint_block_id() -> str:
+    """Mint a fresh opaque block-identity token (KTD-2).
+
+    Mirrors the consolidator's ``blk_<uuid4hex>`` shape (see
+    ``segmentation/consolidate.py``) so a curation-minted block id (a merge
+    survivor / a split half) is indistinguishable from a consolidator-minted one
+    to every downstream reader — the wire projection, the diary FTS, and the app's
+    deep-link-by-``block_id`` path.
+    """
+    return f"blk_{uuid.uuid4().hex}"
+
+
 def _insert_user_task_row(
     conn: sqlite3.Connection,
     recording_id: int,
@@ -709,6 +722,8 @@ def _insert_user_task_row(
     metadata: str | None,
     edited: int,
     now: float,
+    block_id: str | None = None,
+    thread_id: str | None = None,
 ) -> None:
     """Insert ONE ``source='user'`` task-segment row on ``conn`` (no commit).
 
@@ -717,16 +732,25 @@ def _insert_user_task_row(
     so the column list and value order can't drift. ``source`` is always
     ``TASK_SOURCE_USER`` on these paths. The caller owns the surrounding
     ``BEGIN IMMEDIATE`` transaction and commit.
+
+    ``block_id`` / ``thread_id`` (U7/KTD-2): a curation act keeps diary identity
+    coherent — a merge survivor mints a fresh ``block_id`` and preserves a
+    unanimous ``thread_id``; each split half mints its own fresh ``block_id`` and
+    inherits the original's ``thread_id``. ``None`` (the ``tasks.create`` default)
+    leaves both columns NULL — a brand-new user block joins no thread. ``is_open``
+    / ``edited_fields`` keep their column defaults (a user row is never the live
+    trailing block; field-scoped protection is set on edit, not on insert).
     """
     conn.execute(
         "INSERT INTO pipeline_task_segments "
         "(recording_id, task_index, start_ts, end_ts, name, "
-        " category, confidence, metadata, source, edited, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " category, confidence, metadata, source, edited, block_id, thread_id, "
+        " updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             recording_id, task_index, start_ts, end_ts, name,
             category, confidence, metadata,
-            TASK_SOURCE_USER, edited, now,
+            TASK_SOURCE_USER, edited, block_id, thread_id, now,
         ),
     )
 
@@ -1976,6 +2000,14 @@ class PipelineLedger:
         exist — nothing to merge. Any failure between the delete and the insert
         rolls the WHOLE transaction back, so a partial failure never leaves a
         half-merge (the originals are deleted only if the survivor commits).
+
+        Diary coherence (U7/KTD-2): the survivor mints a FRESH ``block_id`` (a
+        merged block is a new identity) and PRESERVES the ``thread_id`` only when
+        every merged row already shares one non-null thread — merging two sittings
+        of the same thread keeps that thread; a mixed merge (any row outside the
+        thread) drops to no thread rather than inventing one. Thread rollups are
+        computed at read time keyed on ``(recording, thread_id)``, so preserving
+        the token is all the survivor needs to stay in its thread.
         """
         # De-dup while preserving order; a merge needs >=2 DISTINCT targets.
         wanted = list(dict.fromkeys(int(i) for i in task_indices))
@@ -1988,7 +2020,8 @@ class PipelineLedger:
                     return None
                 placeholders = ",".join("?" for _ in wanted)
                 rows = conn.execute(
-                    "SELECT task_index, start_ts, end_ts FROM pipeline_task_segments "
+                    "SELECT task_index, start_ts, end_ts, thread_id "
+                    "FROM pipeline_task_segments "
                     f"WHERE recording_id=? AND task_index IN ({placeholders})",
                     (self._recording_id, *wanted),
                 ).fetchall()
@@ -1998,6 +2031,15 @@ class PipelineLedger:
                     return None
                 union_start = min(float(r["start_ts"]) for r in rows)
                 union_end = max(float(r["end_ts"]) for r in rows)
+                # Preserve the thread only when it is UNANIMOUS across the merged
+                # rows (one distinct non-null token, present on every row); any
+                # gap → no thread, never a fabricated one.
+                thread_ids = {r["thread_id"] for r in rows}
+                survivor_thread = (
+                    next(iter(thread_ids))
+                    if len(thread_ids) == 1 and None not in thread_ids
+                    else None
+                )
                 conn.execute(
                     "DELETE FROM pipeline_task_segments "
                     f"WHERE recording_id=? AND task_index IN ({placeholders})",
@@ -2009,6 +2051,7 @@ class PipelineLedger:
                     start_ts=union_start, end_ts=union_end, name=name,
                     category=category, confidence=confidence, metadata=metadata,
                     edited=0, now=_now(),
+                    block_id=_mint_block_id(), thread_id=survivor_thread,
                 )
                 conn.commit()
                 return new_index
@@ -2039,13 +2082,20 @@ class PipelineLedger:
         ``(left_index, right_index)``; returns ``None`` (rolling back) when the
         row is absent OR ``split_ts`` is not strictly inside the span. Any failure
         rolls the whole transaction back — never a half-split.
+
+        Diary coherence (U7/KTD-2): each half mints its OWN fresh ``block_id`` (a
+        split produces two new identities) and INHERITS the original's
+        ``thread_id`` — splitting a sitting keeps both halves in the sitting's
+        thread. Only this row is rewritten, so neighboring blocks' ``block_id`` /
+        thread membership are untouched.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT start_ts, end_ts, name, category, confidence, metadata "
+                    "SELECT start_ts, end_ts, name, category, confidence, "
+                    "metadata, thread_id "
                     "FROM pipeline_task_segments WHERE recording_id=? AND task_index=?",
                     (self._recording_id, task_index),
                 ).fetchone()
@@ -2061,6 +2111,7 @@ class PipelineLedger:
                 category = row["category"]
                 confidence = row["confidence"]
                 metadata = row["metadata"]
+                thread_id = row["thread_id"]
                 conn.execute(
                     "DELETE FROM pipeline_task_segments "
                     "WHERE recording_id=? AND task_index=?",
@@ -2074,6 +2125,7 @@ class PipelineLedger:
                     name=name_left if name_left is not None else base_name,
                     category=category, confidence=confidence, metadata=metadata,
                     edited=0, now=now,
+                    block_id=_mint_block_id(), thread_id=thread_id,
                 )
                 # The just-inserted left row is visible on this connection, so the
                 # second allocation returns left_index+1 — the two halves never
@@ -2085,6 +2137,7 @@ class PipelineLedger:
                     name=name_right if name_right is not None else base_name,
                     category=category, confidence=confidence, metadata=metadata,
                     edited=0, now=now,
+                    block_id=_mint_block_id(), thread_id=thread_id,
                 )
                 conn.commit()
                 return (left_index, right_index)

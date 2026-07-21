@@ -266,7 +266,16 @@ class DayPurge(BaseModel):
 
 
 class DayTask(BaseModel):
-    """One named task on the day (``start_ts`` / ``end_ts`` are unix SECONDS)."""
+    """One named diary block on the day (``start_ts`` / ``end_ts`` are unix SECONDS).
+
+    Day-diary fields (U7, read-only mirror): ``bullets`` are the block's short topic
+    summaries; ``block_id`` is the opaque stable identity (deep-link key);
+    ``thread_id`` links same-work blocks within the recording+day; ``is_open`` marks
+    the live trailing block. The thread rollup (``thread_total_minutes`` /
+    ``thread_sitting_count`` / ``thread_sitting_index``) is present when the daemon
+    computed it — ``timeline.day`` leaves it null (use ``query_tasks`` for rollups).
+    Mirrored read-only: there is NO thread/block mutation tool (curation is
+    human-only, R18)."""
 
     task_index: int
     start_ts: float
@@ -274,6 +283,13 @@ class DayTask(BaseModel):
     name: str
     category: str | None = None
     confidence: str | None = None
+    bullets: list[str] = []
+    block_id: str | None = None
+    thread_id: str | None = None
+    is_open: bool = False
+    thread_total_minutes: float | None = None
+    thread_sitting_count: int | None = None
+    thread_sitting_index: int | None = None
 
 
 class DayRecording(BaseModel):
@@ -317,11 +333,18 @@ class DayResult(BaseModel):
 
 
 class TaskHit(BaseModel):
-    """One named task in the cross-day list, carrying its recording pointer.
+    """One named diary block in the cross-day list, carrying its recording pointer.
 
     ``recording`` is opaque plumbing (KTD-1) retained so the agent can seek into
     the task's day page (``browse_day`` / ``query_timeline`` → ``resolve_frame``);
     ``start_ts`` / ``end_ts`` are unix seconds.
+
+    Day-diary fields (U7, read-only mirror): ``bullets`` / ``block_id`` /
+    ``thread_id`` / ``is_open`` mirror the app's block shape. The thread rollup
+    (``thread_total_minutes`` / ``thread_sitting_count`` / ``thread_sitting_index``)
+    is computed by ``tasks.query`` keyed on ``(recording, thread_id)``: a thread of
+    >=2 sittings reports all three, a lone block reports null. Read-only — there is
+    NO thread/block mutation tool (curation is human-only, R18).
     """
 
     recording: str
@@ -332,6 +355,13 @@ class TaskHit(BaseModel):
     name: str
     category: str | None = None
     confidence: str | None = None
+    bullets: list[str] = []
+    block_id: str | None = None
+    thread_id: str | None = None
+    is_open: bool = False
+    thread_total_minutes: float | None = None
+    thread_sitting_count: int | None = None
+    thread_sitting_index: int | None = None
 
 
 class TaskDay(BaseModel):

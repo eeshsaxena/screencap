@@ -739,8 +739,17 @@ def _load_models() -> dict[str, Any]:
         threads survive ``task_index`` renumbering; ``thread_id`` links same-work
         blocks within a day; ``is_open`` marks the live trailing block. All default
         to empty/None so an older daemon that never emits them still validates and
-        the Swift side decodes with ``decodeIfPresent``. Thread rollups (total
-        minutes, sitting count) are NOT here — ``tasks_query`` computes those (U7).
+        the Swift side decodes with ``decodeIfPresent``.
+
+        Thread rollup fields (U7/R7, additive): ``thread_total_minutes`` /
+        ``thread_sitting_count`` / ``thread_sitting_index`` are the read-time thread
+        rollup (total minutes across the thread's sittings, sitting count, and this
+        block's 1-based place in the thread). They are computed only where the read
+        verb has the day's cross-recording context — ``tasks.query`` and
+        ``tasks.list`` populate them; ``timeline.day`` leaves them null (its
+        per-recording day band does not compute the rollup). A lone block reports
+        all three as null. Keyed strictly on ``(recording, thread_id)`` upstream, so
+        a token minted in one recording never merges with the same token in another.
         """
 
         task_index: int
@@ -753,6 +762,9 @@ def _load_models() -> dict[str, Any]:
         block_id: str | None = None
         thread_id: str | None = None
         is_open: bool = False
+        thread_total_minutes: float | None = None
+        thread_sitting_count: int | None = None
+        thread_sitting_index: int | None = None
 
     class DaySegmentRecording(_DaemonModel):
         """One recording's day-clamped span + honest blocked-interval split (U3).
@@ -1192,12 +1204,23 @@ def _load_models() -> dict[str, Any]:
     class TasksQueryTask(_DaemonModel):
         """One named task in the cross-day list, carrying its recording pointer.
 
-        The shared 6-field ``TaskSegment`` shape (``task_index`` / ``start_ts`` /
+        The shared ``TaskSegment`` shape (``task_index`` / ``start_ts`` /
         ``end_ts`` / ``name`` / ``category`` / ``confidence``) plus the
         ``recording`` (+ ``recording_id``) it came from — the Tasks surface needs
         the recording key to seek into its day page and to curate the task
         (rename/split/merge/delete route through the per-recording CRUD verbs).
         ``start_ts`` / ``end_ts`` are Unix seconds (the ledger's native units).
+
+        Day-diary fields (U1/KTD-9, additive): ``bullets`` / ``block_id`` /
+        ``thread_id`` / ``is_open`` mirror :class:`TaskSegment` so the cross-day
+        surface sees exactly what the per-recording ``tasks.list`` sees.
+
+        Thread rollup fields (U7/R7): ``thread_total_minutes`` /
+        ``thread_sitting_count`` / ``thread_sitting_index`` are computed at read
+        time by ``tasks_query``, keyed strictly on ``(recording, thread_id)`` — a
+        thread of >=2 blocks reports all three; a lone block reports null. All new
+        fields default to empty/None so an older daemon still validates and the
+        Swift side decodes with ``decodeIfPresent``.
         """
 
         recording: str
@@ -1208,6 +1231,13 @@ def _load_models() -> dict[str, Any]:
         name: str
         category: str | None = None
         confidence: str | None = None
+        bullets: list[str] = []
+        block_id: str | None = None
+        thread_id: str | None = None
+        is_open: bool = False
+        thread_total_minutes: float | None = None
+        thread_sitting_count: int | None = None
+        thread_sitting_index: int | None = None
 
     class TasksQueryDay(_DaemonModel):
         """All tasks that map to one local calendar day (KTD-11), start-ordered."""

@@ -1687,11 +1687,13 @@ async def test_tasks_list_returns_persisted_segments(
     assert len(payload["tasks"]) == 2
     first = payload["tasks"][0]
     # The typed ``TaskSegment`` model carries the original six fields PLUS the
-    # day-diary fields (U1/KTD-9), which ``model_dump`` always emits with
-    # empty/None defaults; older clients simply ignore the extras.
+    # day-diary fields (U1/KTD-9) and the U7 thread-rollup fields, which
+    # ``model_dump`` always emits with empty/None defaults; older clients simply
+    # ignore the extras.
     assert set(first) == {
         "task_index", "start_ts", "end_ts", "name", "category", "confidence",
         "bullets", "block_id", "thread_id", "is_open",
+        "thread_total_minutes", "thread_sitting_count", "thread_sitting_index",
     }
     assert first["task_index"] == 0
     assert first["name"] == "Payroll run in Gusto"

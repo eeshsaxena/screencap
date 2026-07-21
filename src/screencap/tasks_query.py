@@ -49,6 +49,52 @@ def _local_day(ts: float, tz_offset_seconds: int) -> str:
     )
 
 
+# Diary fields (U1/KTD-9) carried through the day surface ADDITIVELY, exactly as
+# ``read_task_segments_wire`` emits them: present on a task dict only when the row
+# actually holds that data, so a plain non-diary task keeps the original
+# eight-key shape and an older consumer sees no new keys.
+_WIRE_DIARY_KEYS = ("block_id", "thread_id", "bullets")
+
+
+def annotate_thread_rollups(tasks: list[dict[str, Any]]) -> None:
+    """Attach each task's thread rollup (R7, U7) to its dict IN PLACE.
+
+    The single shared read-time rollup computation behind BOTH ``tasks.query`` (a
+    day spanning many recordings) and ``tasks.list`` (one recording) — one home so
+    the two surfaces can't drift.
+
+    Threads are grouped strictly on the COMPOSITE key ``(recording, thread_id)``: a
+    ``thread_id`` token minted in recording A must NEVER merge with the same token
+    string minted in recording B (same-day cross-recording linking is DEFERRED —
+    this composite key is exactly what prevents a false merge). ``tasks.list`` rows
+    carry no ``recording`` key, but every row there is the SAME recording, so the
+    ``None`` recording part groups them correctly.
+
+    A thread is >=2 blocks sharing that key; each member gains
+    ``thread_total_minutes`` (summed span across the thread's sittings),
+    ``thread_sitting_count``, and a 1-based ``thread_sitting_index`` (chronological
+    by ``start_ts``, ``task_index`` tiebreak). A lone block — no ``thread_id``, or
+    the only member of its key — gains NOTHING (the read verb serializes its rollup
+    fields as null), so "sitting 1 of 1" never appears.
+    """
+    groups: dict[tuple[Any, str], list[dict[str, Any]]] = {}
+    for task in tasks:
+        thread_id = task.get("thread_id")
+        if not thread_id:
+            continue
+        groups.setdefault((task.get("recording"), thread_id), []).append(task)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        ordered = sorted(members, key=lambda t: (t["start_ts"], t["task_index"]))
+        total_minutes = sum(t["end_ts"] - t["start_ts"] for t in ordered) / 60.0
+        count = len(ordered)
+        for sitting_index, task in enumerate(ordered, start=1):
+            task["thread_total_minutes"] = total_minutes
+            task["thread_sitting_count"] = count
+            task["thread_sitting_index"] = sitting_index
+
+
 def _read_outcome(rec_dir: Path) -> tuple[str | None, str | None]:
     """This recording's segmentation OUTCOME ``(reason, detail)`` — the honest
     status the rollup exposes, read fail-open.
@@ -163,18 +209,24 @@ def query_tasks(
             if not (range_start <= seg["start_ts"] < range_end):
                 continue
             day = _local_day(seg["start_ts"], tz_offset_seconds)
-            days.setdefault(day, []).append(
-                {
-                    "recording": meta.name,
-                    "recording_id": meta.recording_id,
-                    "task_index": seg["task_index"],
-                    "start_ts": seg["start_ts"],
-                    "end_ts": seg["end_ts"],
-                    "name": seg["name"],
-                    "category": seg["category"],
-                    "confidence": seg["confidence"],
-                }
-            )
+            task = {
+                "recording": meta.name,
+                "recording_id": meta.recording_id,
+                "task_index": seg["task_index"],
+                "start_ts": seg["start_ts"],
+                "end_ts": seg["end_ts"],
+                "name": seg["name"],
+                "category": seg["category"],
+                "confidence": seg["confidence"],
+            }
+            # Carry the diary fields additively (U1/KTD-9): only present when the
+            # wire row held them, so a non-diary task keeps the eight-key shape.
+            for key in _WIRE_DIARY_KEYS:
+                if key in seg:
+                    task[key] = seg[key]
+            if seg.get("is_open"):
+                task["is_open"] = True
+            days.setdefault(day, []).append(task)
 
     # Tasks within a day: chronological by start (then task_index / recording for
     # a stable order across recordings). Days: reverse-chronological (newest
@@ -184,6 +236,10 @@ def query_tasks(
         tasks = sorted(
             days[date], key=lambda t: (t["start_ts"], t["task_index"], t["recording"])
         )
+        # Thread rollups (R7) computed at READ time, keyed on the composite
+        # (recording, thread_id) so a token minted in one recording never merges
+        # with the same token in another (cross-recording safety).
+        annotate_thread_rollups(tasks)
         day_list.append({"date": date, "tasks": tasks})
 
     # Rollup: newest recording first (stable name tiebreak) — same reverse-

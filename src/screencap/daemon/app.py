@@ -2448,11 +2448,22 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     so the verb answers an empty list rather than a 500. The ``PrivacyMode`` and
     upload rules are unchanged: this only reads rows the local pipeline already
     persisted; nothing leaves the Mac.
+
+    Thread rollups (U7/R7) are annotated here via the SAME
+    ``tasks_query.annotate_thread_rollups`` helper ``tasks.query`` uses, so the
+    per-recording surface reports the same ``thread_total_minutes`` /
+    ``thread_sitting_count`` / ``thread_sitting_index`` a threaded block shows in
+    the cross-day list — one shared rollup computation, no drift. All rows here
+    are one recording, so the composite ``(recording, thread_id)`` grouping is
+    exact.
     """
     from screencap.config import resolve_recording_dir
     from screencap.pipeline_state import read_task_segments_wire
+    from screencap.tasks_query import annotate_thread_rollups
 
-    return read_task_segments_wire(resolve_recording_dir(recording))
+    rows = read_task_segments_wire(resolve_recording_dir(recording))
+    annotate_thread_rollups(rows)
+    return rows
 
 
 def _run_recording_outcome(recording: str) -> "tuple[str | None, str | None]":
