@@ -19,6 +19,21 @@ import Foundation
 /// One named task segment for a recording. `startTs` / `endTs` are Unix seconds
 /// (the ledger's native units). `category` / `confidence` are optional provider
 /// metadata; the idle-gap heuristic fallback emits neither.
+///
+/// Day-diary fields (U1/KTD-9, additive): `bullets` are the block's short topic
+/// summaries; `blockId` is the opaque stable identity a consolidation pass assigns
+/// so deep links / threads survive `task_index` renumbering; `threadId` links
+/// same-work blocks within a day; `isOpen` marks the live trailing block.
+///
+/// Thread rollup fields (U7/R7, additive): `threadTotalMinutes` /
+/// `threadSittingCount` / `threadSittingIndex` are the read-time thread rollup
+/// (total minutes across the thread's sittings, sitting count, and this block's
+/// 1-based place in the thread), computed only where the read verb has the day's
+/// cross-recording context; a lone block reports all three as `nil`.
+///
+/// Every new field is decoded with `decodeIfPresent` (defaulting to empty/`nil`/
+/// `false`) so an older daemon that never emits them still decodes — the same
+/// forward-compat contract as `TasksQueryTask` (CrossDayTasks.swift).
 struct RecordingTask: Decodable, Sendable, Hashable, Identifiable {
     let taskIndex: Int
     let startTs: Double
@@ -26,6 +41,13 @@ struct RecordingTask: Decodable, Sendable, Hashable, Identifiable {
     let name: String
     let category: String?
     let confidence: String?
+    let bullets: [String]
+    let blockId: String?
+    let threadId: String?
+    let isOpen: Bool
+    let threadTotalMinutes: Double?
+    let threadSittingCount: Int?
+    let threadSittingIndex: Int?
 
     /// Stable within one recording — `task_index` is unique per recording by the
     /// ledger's `UNIQUE (recording_id, task_index)` constraint.
@@ -37,7 +59,14 @@ struct RecordingTask: Decodable, Sendable, Hashable, Identifiable {
         endTs: Double,
         name: String,
         category: String? = nil,
-        confidence: String? = nil
+        confidence: String? = nil,
+        bullets: [String] = [],
+        blockId: String? = nil,
+        threadId: String? = nil,
+        isOpen: Bool = false,
+        threadTotalMinutes: Double? = nil,
+        threadSittingCount: Int? = nil,
+        threadSittingIndex: Int? = nil
     ) {
         self.taskIndex = taskIndex
         self.startTs = startTs
@@ -45,6 +74,32 @@ struct RecordingTask: Decodable, Sendable, Hashable, Identifiable {
         self.name = name
         self.category = category
         self.confidence = confidence
+        self.bullets = bullets
+        self.blockId = blockId
+        self.threadId = threadId
+        self.isOpen = isOpen
+        self.threadTotalMinutes = threadTotalMinutes
+        self.threadSittingCount = threadSittingCount
+        self.threadSittingIndex = threadSittingIndex
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        taskIndex = try c.decode(Int.self, forKey: .taskIndex)
+        startTs = try c.decode(Double.self, forKey: .startTs)
+        endTs = try c.decode(Double.self, forKey: .endTs)
+        name = try c.decode(String.self, forKey: .name)
+        category = try c.decodeIfPresent(String.self, forKey: .category)
+        confidence = try c.decodeIfPresent(String.self, forKey: .confidence)
+        // Day-diary fields — additive, decoded tolerantly so an older daemon that
+        // omits them still validates (forward compat, KTD-9).
+        bullets = try c.decodeIfPresent([String].self, forKey: .bullets) ?? []
+        blockId = try c.decodeIfPresent(String.self, forKey: .blockId)
+        threadId = try c.decodeIfPresent(String.self, forKey: .threadId)
+        isOpen = try c.decodeIfPresent(Bool.self, forKey: .isOpen) ?? false
+        threadTotalMinutes = try c.decodeIfPresent(Double.self, forKey: .threadTotalMinutes)
+        threadSittingCount = try c.decodeIfPresent(Int.self, forKey: .threadSittingCount)
+        threadSittingIndex = try c.decodeIfPresent(Int.self, forKey: .threadSittingIndex)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -54,6 +109,13 @@ struct RecordingTask: Decodable, Sendable, Hashable, Identifiable {
         case name
         case category
         case confidence
+        case bullets
+        case blockId = "block_id"
+        case threadId = "thread_id"
+        case isOpen = "is_open"
+        case threadTotalMinutes = "thread_total_minutes"
+        case threadSittingCount = "thread_sitting_count"
+        case threadSittingIndex = "thread_sitting_index"
     }
 }
 

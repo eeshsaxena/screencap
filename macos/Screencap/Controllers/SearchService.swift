@@ -27,6 +27,14 @@ protocol SearchService: Sendable {
     func tasksDelete(_ req: TasksDeleteRequest) async throws -> TasksDeleteResponse
     func tasksMerge(_ req: TasksMergeRequest) async throws -> TasksMergeResponse
     func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse
+
+    // U8 (day diary) — the two read-only diary verbs, on the same seam so the day
+    // view + Tasks surface inject a single fake in tests. Both are read verbs: a
+    // throw (incl. an older daemon's 404) degrades gracefully at the call site —
+    // the narrative section is omitted, and diary search falls back to the local
+    // substring filter — never surfaced as an error.
+    func dayNarrative(_ req: DayNarrativeRequest) async throws -> DayNarrativeResponse
+    func diarySearch(_ req: DiarySearchRequest) async throws -> DiarySearchResponse
 }
 
 /// Live implementation: forwards to the daemon over the UNIX socket.
@@ -69,5 +77,13 @@ struct LiveSearchService: SearchService {
 
     func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse {
         try await DaemonClient.tasksSplit(req)
+    }
+
+    func dayNarrative(_ req: DayNarrativeRequest) async throws -> DayNarrativeResponse {
+        try await DaemonClient.dayNarrative(req)
+    }
+
+    func diarySearch(_ req: DiarySearchRequest) async throws -> DiarySearchResponse {
+        try await DaemonClient.diarySearch(req)
     }
 }

@@ -293,4 +293,10 @@ private final class FakeDaysSearchService: SearchService, @unchecked Sendable {
     func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse {
         TasksSplitResponse(recording: req.recording, taskIndices: [0, 1])
     }
+    func dayNarrative(_ req: DayNarrativeRequest) async throws -> DayNarrativeResponse {
+        DayNarrativeResponse(recording: req.recording, narrative: nil)
+    }
+    func diarySearch(_ req: DiarySearchRequest) async throws -> DiarySearchResponse {
+        DiarySearchResponse(hits: [], indexState: .ok)
+    }
 }

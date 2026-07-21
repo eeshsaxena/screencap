@@ -27,6 +27,21 @@ struct TasksQueryTask: Decodable, Sendable, Hashable, Identifiable {
     let name: String
     let category: String?
     let confidence: String?
+    /// Day-diary fields (U1/KTD-9, additive) — mirror `RecordingTask` so the
+    /// cross-day surface sees exactly what per-recording `tasks.list` sees.
+    /// `bullets` are the block's short topic summaries; `blockId` is the stable
+    /// opaque identity (deep-links resolve by it, NOT `task_index`); `threadId`
+    /// links same-work blocks within a day; `isOpen` marks the live trailing block.
+    let bullets: [String]
+    let blockId: String?
+    let threadId: String?
+    let isOpen: Bool
+    /// Thread rollup (U7/R7, additive): total minutes across the thread's
+    /// sittings, the sitting count, and this block's 1-based place. `tasks.query`
+    /// populates them for a thread of >=2; a lone block reports all three `nil`.
+    let threadTotalMinutes: Double?
+    let threadSittingCount: Int?
+    let threadSittingIndex: Int?
 
     /// Stable across the loaded window — `(recording, task_index)` is unique by the
     /// ledger's `UNIQUE (recording_id, task_index)` constraint.
@@ -40,7 +55,14 @@ struct TasksQueryTask: Decodable, Sendable, Hashable, Identifiable {
         endTs: Double,
         name: String,
         category: String? = nil,
-        confidence: String? = nil
+        confidence: String? = nil,
+        bullets: [String] = [],
+        blockId: String? = nil,
+        threadId: String? = nil,
+        isOpen: Bool = false,
+        threadTotalMinutes: Double? = nil,
+        threadSittingCount: Int? = nil,
+        threadSittingIndex: Int? = nil
     ) {
         self.recording = recording
         self.recordingId = recordingId
@@ -50,6 +72,13 @@ struct TasksQueryTask: Decodable, Sendable, Hashable, Identifiable {
         self.name = name
         self.category = category
         self.confidence = confidence
+        self.bullets = bullets
+        self.blockId = blockId
+        self.threadId = threadId
+        self.isOpen = isOpen
+        self.threadTotalMinutes = threadTotalMinutes
+        self.threadSittingCount = threadSittingCount
+        self.threadSittingIndex = threadSittingIndex
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +91,14 @@ struct TasksQueryTask: Decodable, Sendable, Hashable, Identifiable {
         name = try c.decode(String.self, forKey: .name)
         category = try c.decodeIfPresent(String.self, forKey: .category)
         confidence = try c.decodeIfPresent(String.self, forKey: .confidence)
+        // Day-diary fields — additive, decoded tolerantly for forward compat.
+        bullets = try c.decodeIfPresent([String].self, forKey: .bullets) ?? []
+        blockId = try c.decodeIfPresent(String.self, forKey: .blockId)
+        threadId = try c.decodeIfPresent(String.self, forKey: .threadId)
+        isOpen = try c.decodeIfPresent(Bool.self, forKey: .isOpen) ?? false
+        threadTotalMinutes = try c.decodeIfPresent(Double.self, forKey: .threadTotalMinutes)
+        threadSittingCount = try c.decodeIfPresent(Int.self, forKey: .threadSittingCount)
+        threadSittingIndex = try c.decodeIfPresent(Int.self, forKey: .threadSittingIndex)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -73,6 +110,13 @@ struct TasksQueryTask: Decodable, Sendable, Hashable, Identifiable {
         case name
         case category
         case confidence
+        case bullets
+        case blockId = "block_id"
+        case threadId = "thread_id"
+        case isOpen = "is_open"
+        case threadTotalMinutes = "thread_total_minutes"
+        case threadSittingCount = "thread_sitting_count"
+        case threadSittingIndex = "thread_sitting_index"
     }
 }
 

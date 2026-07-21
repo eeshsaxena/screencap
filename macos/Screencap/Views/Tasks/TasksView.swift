@@ -27,6 +27,11 @@ struct TasksView: View {
     /// write surfaces `writeError` (retryable) and reverts optimistic state.
     @StateObject private var dayTasks = DayTasks()
 
+    /// U8 (R5/KTD-8) — the FREE-tier history diary search behind the same field.
+    /// The local `filter` covers loaded rows; this reaches the WHOLE history via
+    /// `diary.search` so a weeks-old block is findable without paging.
+    @StateObject private var diary = DiarySearchModel()
+
     @State private var phase: LoadPhase = .loading
     @State private var response: TasksQueryResponse?
     @State private var storeState: StoreState = .mounted
@@ -36,6 +41,11 @@ struct TasksView: View {
     @State private var loadingOlder = false
     /// The task awaiting a rename (drives the rename sheet).
     @State private var renameTarget: TasksModel.TaskRow?
+    /// U8 — block rows whose topic bullets are expanded (keyed by `TaskRow.id`).
+    /// Collapsed by default (mirrors ChatView's `sourcesExpanded` disclosure).
+    @State private var expandedBullets: Set<String> = []
+    /// U8 — debounces the history diary search behind the search field.
+    @State private var diaryTask: Task<Void, Never>?
 
     private enum LoadPhase: Equatable {
         case loading
@@ -56,6 +66,10 @@ struct TasksView: View {
             .onChange(of: recorder.state) { _ in
                 Task { await load(showLoading: false) }
             }
+            // U8 — drive the FREE-tier history diary search off the same field,
+            // debounced so each keystroke doesn't fire a verb call.
+            .onChange(of: query) { _ in scheduleDiarySearch() }
+            .onDisappear { diaryTask?.cancel() }
             // R12 — the shared write-through's failure surfaces here with the same
             // retryable alert the day page uses, never a silent no-op.
             .alert(
@@ -130,26 +144,61 @@ struct TasksView: View {
                 .padding(.bottom, 18)
             filterField
                 .padding(.bottom, 18)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    switch listState {
-                    case .populated(let groups):
-                        ForEach(groups) { group in
-                            dayGroupView(group)
+            // A ScrollViewReader so a thread chip tap can scroll to a sibling
+            // sitting on the SAME day page (R7 — same-day scope, no cross-day jump).
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        switch listState {
+                        case .populated(let groups):
+                            ForEach(groups) { group in
+                                dayGroupView(group, proxy: proxy)
+                            }
+                            loadOlderButton
+                        case .filterZero(let q):
+                            filterZeroState(q)
+                        case .systemZero(let zero):
+                            systemZeroState(zero)
                         }
-                        loadOlderButton
-                    case .filterZero(let q):
-                        filterZeroState(q)
-                    case .systemZero(let zero):
-                        systemZeroState(zero)
+                        // U8 — the FREE-tier history diary results (R5/KTD-8):
+                        // matches beyond the loaded window. Shown whenever a query
+                        // is active and history returned hits — vital in the
+                        // filter-zero case (nothing loaded matched, but a weeks-old
+                        // block did).
+                        diaryHistorySection
                     }
+                    .padding(.bottom, 8)
                 }
-                .padding(.bottom, 8)
+                .scrollContentBackground(.hidden)
             }
-            .scrollContentBackground(.hidden)
         }
         .padding(.horizontal, 36)
         .padding(.vertical, 28)
+    }
+
+    /// U8 — the "found across your history" section: cross-day diary-search hits
+    /// (block snippet, day label, matched time) that jump to the day + block on
+    /// select (deep-linked by span, KTD-2). Rendered only when a query is active
+    /// and `diary.search` returned hits; a blank query or no hits hides it.
+    @ViewBuilder
+    private var diaryHistorySection: some View {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !needle.isEmpty, !diary.results.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Found across your history")
+                    .font(SCTypography.serifDayHeading)
+                    .foregroundStyle(Color.scInk)
+                    .accessibilityAddTraits(.isHeader)
+                VStack(spacing: 8) {
+                    ForEach(diary.results) { result in
+                        DiaryResultRowView(result: result) {
+                            onOpenTimeline(result.day, result.startMs, result.highlight)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+        }
     }
 
     private var header: some View {
@@ -190,7 +239,7 @@ struct TasksView: View {
     }
 
     @ViewBuilder
-    private func dayGroupView(_ group: TasksModel.DayGroup) -> some View {
+    private func dayGroupView(_ group: TasksModel.DayGroup, proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(group.label)
                 .font(SCTypography.serifDayHeading)
@@ -200,7 +249,15 @@ struct TasksView: View {
                 ForEach(group.rows) { row in
                     TaskRowView(
                         row: row,
+                        bulletsExpanded: bulletsExpandedBinding(row),
                         onOpen: { onOpenTimeline(row.day, row.startMs, row.highlight) },
+                        onTapThread: {
+                            // R7 — same-day scope: scroll to the next sitting of
+                            // this thread within the loaded day group.
+                            if let sibling = TasksModel.threadSiblingId(in: group.rows, from: row) {
+                                withAnimation { proxy.scrollTo(sibling, anchor: .center) }
+                            }
+                        },
                         onRename: { renameTarget = row },
                         onDelete: {
                             Task {
@@ -211,8 +268,37 @@ struct TasksView: View {
                             }
                         }
                     )
+                    // The scroll target id for a thread chip tap (row-stable).
+                    .id(row.id)
                 }
             }
+        }
+    }
+
+    /// A per-row binding into the expanded-bullets set (collapsed by default).
+    private func bulletsExpandedBinding(_ row: TasksModel.TaskRow) -> Binding<Bool> {
+        Binding(
+            get: { expandedBullets.contains(row.id) },
+            set: { expanded in
+                if expanded { expandedBullets.insert(row.id) }
+                else { expandedBullets.remove(row.id) }
+            }
+        )
+    }
+
+    /// U8 — debounce the history diary search a short beat behind typing so each
+    /// keystroke doesn't fire a verb call; a cleared field clears results at once.
+    private func scheduleDiarySearch() {
+        diaryTask?.cancel()
+        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            diary.clear()
+            return
+        }
+        diaryTask = Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
+            await diary.search(text)
         }
     }
 
@@ -357,18 +443,56 @@ struct TasksView: View {
 
 // MARK: - Task row
 
-/// One task row: the task NAME, its wall-clock range, and an optional category
-/// chip — never a recording name (R5). A click opens the day page (AE3); the
-/// context menu curates via the shared write-through (R12).
+/// One diary BLOCK row: the block NAME, its wall-clock range, an optional category
+/// chip, a thread chip (rollup, tappable → sibling sitting), and its topic bullets
+/// (expandable) — never a recording name (R5). A click on the header opens the day
+/// page (AE3); the context menu curates via the shared write-through (R12). The
+/// live trailing block (`isOpen`) renders provisional (mirrors `LiveTaskDraft`).
+///
+/// The header is a `Button(onOpen)`; the thread chip and bullets disclosure are
+/// SIBLING controls (not nested Buttons) so each tap resolves unambiguously.
 private struct TaskRowView: View {
     let row: TasksModel.TaskRow
+    /// Collapsed-by-default bullets disclosure (mirrors ChatView's
+    /// `sourcesExpanded`), owned by the parent so state survives row re-diffing.
+    @Binding var bulletsExpanded: Bool
     var onOpen: () -> Void
+    var onTapThread: () -> Void
     var onRename: () -> Void
     var onDelete: () -> Void
 
     @State private var hovering = false
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            headerButton
+            if row.threadChipText != nil || !row.bullets.isEmpty {
+                HStack(spacing: 8) {
+                    if let chip = row.threadChipText { threadChip(chip) }
+                    if !row.bullets.isEmpty { bulletsDisclosure }
+                    Spacer(minLength: 0)
+                }
+            }
+            if bulletsExpanded, !row.bullets.isEmpty { bulletsList }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .strokeBorder(rowBorderColor, lineWidth: 1)
+        )
+        .onHover { hovering = $0 }
+        .contextMenu {
+            Button("Rename…", action: onRename)
+            Button("Delete", role: .destructive, action: onDelete)
+        }
+    }
+
+    /// The primary tap target: name + time + category + open indicator. A live
+    /// (`isOpen`) block shows a provisional "live" marker instead of the
+    /// open-day affordance (it is still being written).
+    private var headerButton: some View {
         Button(action: onOpen) {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -395,6 +519,130 @@ private struct TaskRowView: View {
                     }
                 }
                 Spacer(minLength: 0)
+                if row.isOpen {
+                    livePill
+                } else {
+                    Text("Open day →")
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scTeal)
+                        .opacity(hovering ? 1 : 0.6)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(row.name), \(row.timeRangeText)")
+        .accessibilityHint("Opens the day seeked to this task")
+    }
+
+    /// The provisional "live" marker for the open trailing block (mirrors the
+    /// `LiveTaskDraft` provisional presentation): a small pulsing-tone dot + label.
+    private var livePill: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(Color.scTeal)
+                .frame(width: 6, height: 6)
+            Text("live")
+                .font(SCTypography.mono(size: 10))
+                .foregroundStyle(Color.scTeal)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
+        .background(Color.scTealSoft.opacity(0.4), in: Capsule())
+        .accessibilityLabel("Live — still recording")
+    }
+
+    /// The thread chip ("2 of 2 · 2h43 today", R7) — tappable to scroll to a
+    /// sibling sitting on the same day. Rendered only for threads of >=2 sittings.
+    private func threadChip(_ text: String) -> some View {
+        Button(action: onTapThread) {
+            HStack(spacing: 4) {
+                Image(systemName: "link")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(text)
+                    .font(SCTypography.mono(size: 10))
+            }
+            .foregroundStyle(Color.scTeal)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background(Color.scTealSoft.opacity(0.4), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Thread, \(text). Tap to go to the linked sitting.")
+    }
+
+    /// The bullets disclosure toggle — chevron + count, mirroring ChatView's
+    /// `sourcesStrip` disclosure. Collapsed by default (R4 — bullets confirm the
+    /// block without crowding the scan).
+    private var bulletsDisclosure: some View {
+        Button {
+            bulletsExpanded.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: bulletsExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(row.bullets.count == 1 ? "1 note" : "\(row.bullets.count) notes")
+                    .font(SCTypography.mono(size: 10))
+            }
+            .foregroundStyle(Color.scInkMuted)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(bulletsExpanded ? "Hide topic notes" : "Show \(row.bullets.count) topic notes")
+    }
+
+    /// The expanded topic bullets (R4) — one line per bullet, evidence-bound prose.
+    private var bulletsList: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(row.bullets.enumerated()), id: \.offset) { _, bullet in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("•")
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkMuted)
+                    Text(bullet)
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.leading, 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// A live block gets the teal accent border; hover keeps the teal affordance;
+    /// otherwise the warm resting border.
+    private var rowBorderColor: Color {
+        if row.isOpen { return Color.scTeal }
+        return hovering ? Color.scTeal : Color.scBorderWarm
+    }
+}
+
+/// One FREE-tier history diary-search result (U8, R5/KTD-8): the matched block
+/// snippet, its day label + time, and a jump into the day + block on select
+/// (deep-linked by span). POINTER ONLY — never a recording name (R5).
+private struct DiaryResultRowView: View {
+    let result: TasksModel.DiaryResultRow
+    var onOpen: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(result.snippet)
+                        .font(SCTypography.sans(size: 13, weight: .medium))
+                        .foregroundStyle(Color.scInk)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    Text("\(result.dayLabel) · \(result.timeText)")
+                        .font(SCTypography.mono(size: 11))
+                        .foregroundStyle(Color.scInkMuted)
+                }
+                Spacer(minLength: 0)
                 Text("Open day →")
                     .font(SCTypography.sans(size: 12))
                     .foregroundStyle(Color.scTeal)
@@ -411,13 +659,9 @@ private struct TaskRowView: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .contextMenu {
-            Button("Rename…", action: onRename)
-            Button("Delete", role: .destructive, action: onDelete)
-        }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(row.name), \(row.timeRangeText)")
-        .accessibilityHint("Opens the day seeked to this task")
+        .accessibilityLabel("\(result.snippet), \(result.dayLabel)")
+        .accessibilityHint("Opens the day seeked to this block")
     }
 }
 

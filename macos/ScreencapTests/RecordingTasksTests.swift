@@ -457,4 +457,10 @@ private final class FakeTasksService: SearchService, @unchecked Sendable {
     func appsList() async throws -> AppsListResponse {
         AppsListResponse(appNames: [], hostnames: [])
     }
+    func dayNarrative(_ req: DayNarrativeRequest) async throws -> DayNarrativeResponse {
+        DayNarrativeResponse(recording: req.recording, narrative: nil)
+    }
+    func diarySearch(_ req: DiarySearchRequest) async throws -> DiarySearchResponse {
+        DiarySearchResponse(hits: [], indexState: .ok)
+    }
 }

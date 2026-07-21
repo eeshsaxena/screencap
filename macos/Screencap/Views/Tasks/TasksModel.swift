@@ -27,6 +27,20 @@ enum TasksModel {
         let startTs: Double
         let endTs: Double
         let day: Date
+        /// Day-diary block fields (U8). `bullets` are the block's short topic
+        /// summaries (expandable in the row); `blockId` is the stable opaque
+        /// identity a deep-link resolves by (NOT `task_index`, which re-carves
+        /// renumber); `threadId` links same-work blocks within the day; `isOpen`
+        /// marks the live trailing block (rendered provisional).
+        let bullets: [String]
+        let blockId: String?
+        let threadId: String?
+        let isOpen: Bool
+        /// Thread rollup (U7/R7): total minutes across the thread's sittings, the
+        /// sitting count, and this block's 1-based place. `nil` for a lone block.
+        let threadTotalMinutes: Double?
+        let threadSittingCount: Int?
+        let threadSittingIndex: Int?
 
         var id: String { "\(recording)#\(taskIndex)" }
 
@@ -44,6 +58,51 @@ enum TasksModel {
             let start = TasksModel.clock(startTs)
             let end = TasksModel.clock(endTs)
             return start == end ? start : "\(start)–\(end)"
+        }
+
+        /// The thread chip label ("2 of 2 · 2h43 today"), or `nil` when this block
+        /// is not part of a thread of >=2 sittings (R7 — a lone block shows no
+        /// chip). Rendered only when non-nil.
+        var threadChipText: String? {
+            TasksModel.threadChipText(
+                sittingIndex: threadSittingIndex,
+                sittingCount: threadSittingCount,
+                totalMinutes: threadTotalMinutes
+            )
+        }
+
+        init(
+            recording: String,
+            recordingId: String?,
+            taskIndex: Int,
+            name: String,
+            category: String?,
+            startTs: Double,
+            endTs: Double,
+            day: Date,
+            bullets: [String] = [],
+            blockId: String? = nil,
+            threadId: String? = nil,
+            isOpen: Bool = false,
+            threadTotalMinutes: Double? = nil,
+            threadSittingCount: Int? = nil,
+            threadSittingIndex: Int? = nil
+        ) {
+            self.recording = recording
+            self.recordingId = recordingId
+            self.taskIndex = taskIndex
+            self.name = name
+            self.category = category
+            self.startTs = startTs
+            self.endTs = endTs
+            self.day = day
+            self.bullets = bullets
+            self.blockId = blockId
+            self.threadId = threadId
+            self.isOpen = isOpen
+            self.threadTotalMinutes = threadTotalMinutes
+            self.threadSittingCount = threadSittingCount
+            self.threadSittingIndex = threadSittingIndex
         }
     }
 
@@ -80,7 +139,14 @@ enum TasksModel {
                     category: task.category,
                     startTs: task.startTs,
                     endTs: task.endTs,
-                    day: dayDate
+                    day: dayDate,
+                    bullets: task.bullets,
+                    blockId: task.blockId,
+                    threadId: task.threadId,
+                    isOpen: task.isOpen,
+                    threadTotalMinutes: task.threadTotalMinutes,
+                    threadSittingCount: task.threadSittingCount,
+                    threadSittingIndex: task.threadSittingIndex
                 )
             }
             return DayGroup(
@@ -107,11 +173,13 @@ enum TasksModel {
         }
     }
 
-    /// Substring match over the row's task name and category.
+    /// Substring match over the row's task name, category, and topic bullets (R5 —
+    /// a fuzzy topic memory finds the block by its bullets, not just its name).
     private static func matches(_ row: TaskRow, needle: String) -> Bool {
         let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
         if row.name.range(of: needle, options: options) != nil { return true }
         if let category = row.category, category.range(of: needle, options: options) != nil { return true }
+        if row.bullets.contains(where: { $0.range(of: needle, options: options) != nil }) { return true }
         return false
     }
 
@@ -266,6 +334,113 @@ enum TasksModel {
         case .inProgress: return 3
         case .nothingToName: return 2
         case .producedTasks, .producedTasksPartial, .mechanicalOnly, .unknown: return 1
+        }
+    }
+
+    // MARK: - Thread rollup (R7)
+
+    /// The thread chip label ("2 of 2 · 2h43 today") from the wire rollup, or
+    /// `nil` when the block is not part of a thread of >=2 sittings (R7 — a lone
+    /// block, or an older daemon that omits the rollup, shows no chip). All three
+    /// rollup fields must be present and the sitting count must be >=2.
+    static func threadChipText(
+        sittingIndex: Int?,
+        sittingCount: Int?,
+        totalMinutes: Double?
+    ) -> String? {
+        guard let index = sittingIndex, let count = sittingCount, let minutes = totalMinutes,
+              count >= 2 else { return nil }
+        return "\(index) of \(count) · \(threadDurationText(minutes: minutes)) today"
+    }
+
+    /// Compact duration text for a thread rollup: "2h43" (hours + zero-padded
+    /// minutes), "2h" (whole hours), or "43m" (under an hour). Rounds to the
+    /// nearest minute; a negative input clamps to "0m".
+    static func threadDurationText(minutes: Double) -> String {
+        let total = max(0, Int(minutes.rounded()))
+        let h = total / 60
+        let m = total % 60
+        if h > 0 {
+            return m > 0 ? "\(h)h\(String(format: "%02d", m))" : "\(h)h"
+        }
+        return "\(m)m"
+    }
+
+    /// The row id of a thread sibling to scroll to when the thread chip is tapped
+    /// (R7 — same-day scope: siblings are the other sittings of the same thread
+    /// within `rows`). Prefers the NEXT sitting after `current` (wrapping to the
+    /// first when `current` is the last), so repeated taps cycle the thread's
+    /// sittings on the same day page. `nil` when the row has no thread or no
+    /// sibling exists in the loaded day.
+    static func threadSiblingId(in rows: [TaskRow], from current: TaskRow) -> String? {
+        guard let threadId = current.threadId else { return nil }
+        let siblings = rows.filter { $0.threadId == threadId }
+        guard siblings.count >= 2 else { return nil }
+        guard let pos = siblings.firstIndex(where: { $0.id == current.id }) else {
+            return siblings.first(where: { $0.id != current.id })?.id
+        }
+        let next = siblings[(pos + 1) % siblings.count]
+        return next.id == current.id ? nil : next.id
+    }
+
+    // MARK: - Deep-link by block_id (KTD-2)
+
+    /// Resolve a day's rows to the span of the block with `blockId` — the deep-link
+    /// seam that survives a re-carve (KTD-2). Deep links key on the STABLE
+    /// `block_id`, never `task_index` (which `replace_task_segments` renumbers every
+    /// pass), so a search hit still lands on the right block after the day is
+    /// re-consolidated. `nil` when no loaded row carries that block id.
+    static func blockSpan(in rows: [TaskRow], blockId: String) -> (startMs: Int, endMs: Int)? {
+        guard let row = rows.first(where: { $0.blockId == blockId }) else { return nil }
+        return (row.startMs, row.endMs)
+    }
+
+    // MARK: - Diary search results (R5/KTD-8, FREE-tier history reach)
+
+    /// One `diary.search` hit as a presentation row: the matched snippet, the day
+    /// it belongs to (derived from the block's start), and the pointer needed to
+    /// deep-link into the day by `block_id` (KTD-2 — not `task_index`). POINTER
+    /// ONLY: it never carries bullet text beyond the matched `snippet` (R5).
+    struct DiaryResultRow: Identifiable, Equatable {
+        let blockId: String
+        let recording: String
+        let snippet: String
+        let day: Date
+        let dayLabel: String
+        let startMs: Int
+        let endMs: Int
+
+        /// Stable per hit — `(recording, block_id)` is the block's pointer.
+        var id: String { "\(recording)#\(blockId)" }
+
+        /// The landing highlight span for the day page (AE3) — the block's extent.
+        var highlight: DaySpanHighlight { DaySpanHighlight(startMs: startMs, endMs: endMs) }
+
+        /// "HH:mm" at the block's start, in local time.
+        var timeText: String { TasksModel.clock(Double(startMs) / 1000) }
+    }
+
+    /// Map ranked `diary.search` hits (daemon order preserved) into presentation
+    /// rows — deriving each hit's local day + label from its start span. A hit
+    /// whose span is nonsensical still maps (the day is derived from `startMs`);
+    /// nothing is fabricated or dropped.
+    static func diaryResultRows(
+        from hits: [DiaryBlockHit],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [DiaryResultRow] {
+        hits.map { hit in
+            let start = Date(timeIntervalSince1970: Double(hit.startMs) / 1000)
+            let day = calendar.startOfDay(for: start)
+            return DiaryResultRow(
+                blockId: hit.blockId,
+                recording: hit.recording,
+                snippet: hit.snippet,
+                day: day,
+                dayLabel: DaysModel.label(for: day, now: now, calendar: calendar),
+                startMs: hit.startMs,
+                endMs: hit.endMs
+            )
         }
     }
 

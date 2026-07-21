@@ -1863,6 +1863,33 @@ enum DaemonClient {
         return try await request(method: "POST", path: "/v0/tasks.split", body: body)
     }
 
+    // MARK: - Day diary read verbs (U8)
+
+    /// A recording's written, evidence-bound day narrative (U4/R8). Read-only,
+    /// LOCAL-only, app-only (deliberately NOT mirrored over MCP in v1 — R14). A
+    /// mechanical-only / nothing-to-name day, a legacy recording, or a
+    /// locked/absent vault all return a `nil` narrative on a 200 (never a 500),
+    /// carrying a degraded `store_state` when the vault is sealed. On
+    /// `socketUnavailable`/`connectionFailed` the caller degrades silently — the
+    /// narrative section is simply omitted (nullable end to end). No CLI fallback.
+    static func dayNarrative(_ req: DayNarrativeRequest) async throws -> DayNarrativeResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/day.narrative", body: body)
+    }
+
+    /// FREE-tier day-diary BLOCK search (U6, R5/KTD-8). Read-only, pointer-only
+    /// over the LOCAL `diary_fts` table inside the content index — the "find a
+    /// weeks-old moment" reach beyond the loaded Tasks window, NOT the paid Recall
+    /// palette. Returns ranked `(recording, block_id)` pointers + spans + matched
+    /// snippets; the app deep-links by `block_id`. A locked / absent / error vault
+    /// returns empty hits + a degraded `store_state`. On
+    /// `socketUnavailable`/`connectionFailed` the caller degrades gracefully (the
+    /// local substring filter still covers loaded rows). No CLI fallback.
+    static func diarySearch(_ req: DiarySearchRequest) async throws -> DiarySearchResponse {
+        let body = try JSONEncoder().encode(req)
+        return try await request(method: "POST", path: "/v0/diary.search", body: body)
+    }
+
     /// Conversational-recall answer (conversational-recall U5). Daemon-only,
     /// local, POINTER-ONLY response (R2/R8 — sources carry `(recording,
     /// timestamp_ms, stream)`, never image bytes). Prior-turn context is carried
