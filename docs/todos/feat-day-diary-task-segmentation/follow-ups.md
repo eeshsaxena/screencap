@@ -49,13 +49,28 @@ flags to check: the provisional `is_open` styling vs. the intended
 day-groups; a couple of minor Swift literal-inference spots noted in the U8/U9
 reports.
 
-## Moments merge interplay (cross-plan)
+## Moments merge interplay (cross-plan) — PARTIALLY DONE in the merge
 
-`docs/plans/2026-07-20-002-feat-moments-merge-tasks-clips-plan.md` will replace
-the Tasks/Days surface U8 targeted. Per KTD-12 the diary schema/wire landed
-first; when Moments ships, re-base its row model on blocks (block_id/thread_id/
-bullets/rollups) and re-target U8's day-view/search entry onto the Moments
-surface.
+The Moments merge (#429) + dedicated task view (#430) landed on `main` and
+DELETED `Views/Tasks/TasksView.swift` (the surface U8 targeted). Resolving the
+merge did the KTD-12 re-base:
+
+- **Done:** the diary row rendering (expandable topic bullets, the thread rollup
+  chip, the live `is_open` pill) was ported onto the Moments `AutoRow`
+  (`Views/Moments/MomentRowViews.swift`). The narrative section (`DayTimelineView`)
+  and the morning resume card (`DaysView`) survived the merge unchanged. Diary
+  data flows through the shared `TasksModel.TaskRow` the Moments list consumes.
+- **Deferred:** (1) the cross-history **diary search UI entry** — `DiarySearchModel`
+  + `DaemonClient.diarySearch` + the `/v0/diary.search` verb + FTS index all exist
+  and are tested (`DayDiaryTests`), but the model is not yet wired into a live
+  surface; `MomentsView` has only its own loaded-rows substring filter, so
+  cross-history fuzzy recall (R5) needs a UI entry there. (2) The thread chip is
+  informational on the Moments row; the same-day **scroll-to-sibling** tap
+  (present in the old `TaskRowView`) was not re-plumbed. (3) `DiarySearchModel`
+  currently has no non-test consumer — either wire it into Moments or fold it in
+  when the search UI lands.
+- All of the above is **compile-unverified Swift** (the port + the survivors) —
+  verify in the macOS build.
 
 ## Deferred by the plan (not this PR)
 

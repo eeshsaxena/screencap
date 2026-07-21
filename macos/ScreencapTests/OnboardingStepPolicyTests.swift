@@ -335,6 +335,15 @@ final class OnboardingStepPolicyTests: XCTestCase {
         XCTAssertTrue(OnboardingCopy.cloudCardMeta.lowercased().contains("trial"))
     }
 
+    /// The finalized launch prices are pinned to their exact values ($8 Local
+    /// Pro, $15 Cloud). They ship compiled into the DMG and must match the live
+    /// Stripe prices, so an accidental edit that would display a wrong price
+    /// fails the build rather than reaching a customer (R4/R10).
+    func testFinalizedLaunchPricesArePinned() {
+        XCTAssertEqual(PricingCatalog.localProMonthly, "$8")
+        XCTAssertEqual(PricingCatalog.cloudMonthly, "$15")
+    }
+
     /// R12: the trial disclosure states auto-conversion AND cancellation before
     /// any charge, and no paid card claims end-to-end encryption / "we can't
     /// watch" (the Cloud path is server-readable). AE5.
@@ -441,13 +450,11 @@ final class OnboardingStepPolicyTests: XCTestCase {
         }
     }
 
-    /// The Personal card shows its price now; the Team card (coming soon) must
-    /// not carry any price until the team tier actually ships (R11).
-    func testPersonalCardPricedButTeamCardIsNot() {
-        XCTAssertTrue(
-            OnboardingCopy.personalCardMeta.contains("$5"),
-            "Personal card should surface its $5/mo price"
-        )
+    /// The Team card (coming soon) must not carry any price until the team tier
+    /// actually ships (R11). (The paid-only launch retired the single-tier
+    /// "$5/month" Personal card meta; the priced surface is now the two-tier
+    /// Local Pro / Cloud picker, asserted in `testTwoTierCardsSourcePriceFromCatalog`.)
+    func testTeamCardCarriesNoPrice() {
         let teamStrings = ([OnboardingCopy.teamCardTitle, OnboardingCopy.teamCardMeta]
             + OnboardingCopy.teamCardBullets).joined(separator: " ").lowercased()
         for forbidden in ["$", "month", "/mo"] {

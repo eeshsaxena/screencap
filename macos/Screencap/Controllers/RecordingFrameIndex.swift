@@ -61,6 +61,10 @@ actor RecordingFrameIndex {
     /// per visible card at once — the same thrash the JPEG loader's `DecodeGate`
     /// guards against, but heavier. A small permit count keeps it capped.
     private let posterGate = DecodeGate(permits: 3)
+    /// Per-`(recording, taskStartMs)` extracted task-span poster, cached as its
+    /// in-flight `Task` (same discipline as `posterCache`). Keyed by the task
+    /// instant so two tasks in one recording keep distinct card frames (KTD-4).
+    private var taskPosterCache: [String: Task<ThumbnailImage?, Never>] = [:]
 
     /// `stalenessCapMs` (~30s default): content hits map essentially exactly,
     /// while timeline / transcript anchors snap to a captured moment that can
@@ -142,6 +146,87 @@ actor RecordingFrameIndex {
         let image = await task.value
         if image == nil, posterCache[recording] == task { posterCache[recording] = nil }
         return image
+    }
+
+    /// The gallery card's task thumbnail (KTD-4) — a frame from within the task's
+    /// OWN span, so two tasks in one recording read distinctly (R2/AE3). Walks the
+    /// honest fallback chain: (1) nearest flat screenshot within the staleness cap,
+    /// (2) a poster from the covering video chunk (anchor-correct offset — the
+    /// common case for finished video recordings), else `nil` → the hatched
+    /// placeholder. Deliberately does NOT fall back to a recording-wide poster:
+    /// that same first-chunk frame would appear on every task in the recording and
+    /// misrepresent this task's moment, so a task-span miss reads as an honest
+    /// placeholder instead (R2/AE3). Privacy is the existing local convention —
+    /// masked frames are shown; a decrypt failure or an absent/blocked interval
+    /// yields `nil` (never leaks, never crashes).
+    func taskThumbnail(
+        recording: String,
+        taskStartMs: Int,
+        startedAtMs: Int?,
+        durationMs: Int?,
+        thumbnailLoader: ThumbnailLoader,
+        maxPixelSize: Int = 320
+    ) async -> ThumbnailImage? {
+        if let url = await resolve(recording: recording, anchorMs: taskStartMs),
+           let image = await thumbnailLoader.thumbnail(for: url) {
+            return image
+        }
+        if let image = await taskPoster(
+            recording: recording, taskStartMs: taskStartMs,
+            startedAtMs: startedAtMs, durationMs: durationMs, maxPixelSize: maxPixelSize
+        ) {
+            return image
+        }
+        return nil
+    }
+
+    /// A poster extracted from the video chunk that covers `taskStartMs`, at the
+    /// anchor-correct in-chunk offset (KTD-4 step 2). `nil` when the task instant
+    /// has no covering local chunk → the caller's next fallback. Cached per
+    /// `(recording, taskStartMs)`; the miss is not retained so a still-processing
+    /// recording isn't stuck on the placeholder. Same trust boundary as
+    /// `posterFrame` (LOCAL, unmasked video the app already plays; masking is
+    /// upload-scoped, see SECURITY.md).
+    func taskPoster(
+        recording: String,
+        taskStartMs: Int,
+        startedAtMs: Int?,
+        durationMs: Int?,
+        maxPixelSize: Int = 320
+    ) async -> ThumbnailImage? {
+        let key = "\(recording)#\(taskStartMs)"
+        if let existing = taskPosterCache[key] { return await existing.value }
+        let root = recordingsRoot
+        let gate = posterGate
+        let task = Task<ThumbnailImage?, Never>.detached(priority: .userInitiated) {
+            let chunks = DayMediaLoader.loadChunks(
+                root: root, recording: recording,
+                startedAtMs: startedAtMs, durationMs: durationMs
+            )
+            guard let resolved = Self.posterTarget(taskStartMs: taskStartMs, in: chunks) else { return nil }
+            await gate.wait()
+            let image = await Self.extractFrame(
+                url: resolved.url, atSeconds: resolved.offsetSeconds, maxPixelSize: maxPixelSize
+            )
+            await gate.signal()
+            return image
+        }
+        taskPosterCache[key] = task
+        let image = await task.value
+        if image == nil, taskPosterCache[key] == task { taskPosterCache[key] = nil }
+        return image
+    }
+
+    /// Resolve a task instant to its poster extraction inputs — the covering
+    /// chunk's mp4 URL and the anchor-correct in-chunk offset (seconds), reusing
+    /// `DayMediaMap.target` so the offset is measured from the chunk's first written
+    /// frame, not the manifest `chunk_start` (KTD-4/KTD-12). `nil` when no covering
+    /// local chunk exists. Pure over a prebuilt chunk list so the anchor math is
+    /// unit-tested without disk or AVFoundation.
+    static func posterTarget(taskStartMs t: Int, in chunks: [DayPlayableChunk]) -> (url: URL, offsetSeconds: Double)? {
+        guard case let .media(chunk, offsetSeconds) = DayMediaMap.target(atMs: t, in: chunks),
+              let url = chunk.fileURL else { return nil }
+        return (url, offsetSeconds)
     }
 
     /// The cached (or freshly started) enumeration task for a recording. The disk
@@ -239,17 +324,25 @@ actor RecordingFrameIndex {
     }
 
     /// Extract a downsampled `CGImage` roughly one second into the video — past a
-    /// possible black lead-in — with generous seek tolerance (the card wants a
-    /// recognizable poster, not an exact frame). Falls back to the first frame for
-    /// a sub-second chunk, and returns `nil` on any AVFoundation failure (an
-    /// unreadable or still-being-written chunk) → the placeholder.
+    /// possible black lead-in — the recording-level card poster (first chunk).
     static func extractPoster(url: URL, maxPixelSize: Int) async -> ThumbnailImage? {
+        await extractFrame(url: url, atSeconds: 1, maxPixelSize: maxPixelSize)
+    }
+
+    /// Extract a downsampled `CGImage` at `seconds` into the video, with generous
+    /// seek tolerance (the card wants a recognizable poster, not an exact frame).
+    /// Falls back to the first frame, and returns `nil` on any AVFoundation failure
+    /// (an unreadable or still-being-written chunk) → the placeholder. Shared by the
+    /// recording poster (`extractPoster`, at 1s) and the task-span poster
+    /// (`taskPoster`, at the anchor-correct offset).
+    static func extractFrame(url: URL, atSeconds seconds: Double, maxPixelSize: Int) async -> ThumbnailImage? {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maxPixelSize, height: maxPixelSize)
         generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
-        if let image = try? await generator.image(at: CMTime(seconds: 1, preferredTimescale: 600)).image {
+        let requested = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
+        if let image = try? await generator.image(at: requested).image {
             return ThumbnailImage(cgImage: image)
         }
         if let image = try? await generator.image(at: .zero).image {

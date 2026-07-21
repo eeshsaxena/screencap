@@ -2949,6 +2949,78 @@ def _make_set_paused_handler(pause_state: "_CapturePauseState", pause_control_q)
     return _handler
 
 
+# --- Mic capture rate + software resampling -------------------------------
+#
+# Opening the shared default input device at a NON-NATIVE rate (the pipeline's
+# 16 kHz target) makes CoreAudio collapse that device's GLOBAL buffer-frame-size
+# to its minimum. That property is shared by every client of the mic, so a
+# meeting app (Zoom/Meet/Teams) capturing the same mic is then driven at a
+# sub-millisecond IOProc cadence and glitches the user's outbound voice —
+# clearing up only once the recording stops. Capturing at the device's NATIVE
+# rate keeps the shared buffer healthy; we resample to the 16 kHz on-disk /
+# transcription target in software instead.
+
+
+def resolve_capture_rate(target_rate: int = 16000, device: int | None = None) -> int:
+    """Return the native sample rate of the input device we will actually open.
+
+    ``device`` is the PortAudio index chosen by the Bluetooth-aware mic-source
+    policy (SCR-288); when ``None`` this resolves the OS default input, preserving
+    the pre-fix behaviour. Resolving for the *selected* device matters when the
+    default input is a Bluetooth device we are redirecting away from — the rate
+    must track the built-in mic we open, not the AirPods we skip, or the built-in
+    opens at a non-native rate and reintroduces the shared-buffer collapse.
+
+    Falls back to ``target_rate`` when the device can't be queried, preserving
+    the pre-fix behaviour in that rare case rather than crashing the audio child.
+    """
+    import sounddevice
+
+    try:
+        if device is not None:
+            info = sounddevice.query_devices(device)
+        else:
+            info = sounddevice.query_devices(kind="input")
+        native = int(round(float(info["default_samplerate"])))
+        return native or target_rate
+    except Exception as exc:  # noqa: BLE001 — a query failure must not crash audio.
+        logger.warning(
+            f"Could not resolve input device rate ({exc}); capturing at {target_rate} Hz"
+        )
+        return target_rate
+
+
+def resample_capture_block(
+    resampler: "av.AudioResampler", frames: "np.ndarray | None", src_rate: int
+) -> "np.ndarray | None":
+    """Feed one native-rate float32 mono block through ``resampler``.
+
+    ``frames`` is ``(N, 1)`` float32 (or ``None`` to flush the resampler's
+    residual tail at end-of-capture). Returns the resampled ``(M, 1)`` float32
+    frames ready for the 16 kHz FLAC writer, or ``None`` when the resampler
+    produced no output for this block (it buffers a little internally).
+
+    One long-lived ``resampler`` is reused for the whole recording so the
+    conversion stays gapless across flush blocks AND chunk boundaries — the same
+    stateful-resampler contract as ``audio_clip._decode_and_resample``.
+    """
+    if frames is None:
+        rframes = resampler.resample(None)  # flush tail
+    else:
+        aframe = av.AudioFrame.from_ndarray(
+            np.ascontiguousarray(frames.reshape(1, -1), dtype=np.float32),
+            format="fltp",
+            layout="mono",
+        )
+        aframe.sample_rate = src_rate
+        aframe.pts = None
+        rframes = resampler.resample(aframe)
+    parts = [rf.to_ndarray() for rf in rframes]
+    if not parts:
+        return None
+    return np.concatenate(parts, axis=1).reshape(-1, 1).astype(np.float32)
+
+
 def record_audio(
     recording: Recording,
     db_path: str,
@@ -2959,6 +3031,7 @@ def record_audio(
     mute_control_q=None,
     pause_control_q=None,
     initially_muted: bool = False,
+    prefer_builtin_mic_over_bluetooth: bool = True,
 ) -> None:
     """Record audio narration during the recording and store data in database.
 
@@ -2996,9 +3069,36 @@ def record_audio(
 
     import sounddevice
 
+    from screencap.engine import audio_device
+
     FLUSH_INTERVAL_SECS = 30
     SAMPLERATE = 16000
     CHANNELS = 1
+
+    # Capture at the SELECTED mic's NATIVE rate and resample to SAMPLERATE in
+    # software; requesting 16 kHz from the shared device collapses its global IO
+    # buffer and glitches any concurrent mic client (see resolve_capture_rate).
+    # Rate + resampler are resolved lazily at the first real stream open, for the
+    # device the Bluetooth-aware policy actually selects (SCR-288 KTD-5) — not the
+    # OS default sampled now, which for a muted-start recording may be the AirPods
+    # we are about to redirect away from. The on-disk audio_*.flac stays 16 kHz
+    # mono, so nothing downstream changes.
+    _capture_rate_ref: list[int | None] = [None]
+    _resampler_ref: list = [None]
+
+    def _commit_capture_rate(rate: int) -> None:
+        """Pin the capture rate + build the resampler once, AFTER a stream has
+        actually opened at ``rate`` (KTD-5). Committing only post-open means a
+        *failed* open never pins a rate that a later open of a *different* device
+        would then reuse at a non-native rate (which would reintroduce the shared
+        IO-buffer collapse). Idempotent — later opens keep the first pinned rate."""
+        if _capture_rate_ref[0] is None:
+            _capture_rate_ref[0] = rate
+            if rate != SAMPLERATE:
+                _resampler_ref[0] = av.AudioResampler(
+                    format="fltp", layout="mono", rate=SAMPLERATE
+                )
+            logger.info(f"Audio capture rate={rate} Hz -> on-disk {SAMPLERATE} Hz")
 
     # Locked buffer — audio_callback appends, flush thread drains
     audio_buffer: list[np.ndarray] = []
@@ -3023,6 +3123,37 @@ def record_audio(
             drained = audio_buffer[:]
             audio_buffer.clear()
         return np.concatenate(drained, axis=0)
+
+    def _drain_for_write() -> np.ndarray | None:
+        """Drain the callback buffer and resample it to SAMPLERATE for the FLAC.
+
+        With native-rate capture (no resampler) this is just the drained block;
+        otherwise it's the resampled 16 kHz frames (possibly ``None`` while the
+        stateful resampler buffers a fraction of a window internally).
+
+        A resample failure must not propagate: this runs on the flush thread, and
+        an escaping exception would drop the ``audio_final`` ack and stall
+        ``chunk_processor._wait_for_audio`` (mirrors the ack-before-close care
+        below). On failure we degrade to writing nothing this cycle.
+        """
+        raw = _drain_buffer()
+        if raw is None or _resampler_ref[0] is None:
+            return raw
+        try:
+            return resample_capture_block(_resampler_ref[0], raw, _capture_rate_ref[0])
+        except Exception as e:  # noqa: BLE001 — a bad block must not crash audio.
+            logger.error(f"Audio resample failed (dropping block): {e}")
+            return None
+
+    def _flush_resampler_tail() -> np.ndarray | None:
+        """Resampled residual tail to write once, at true end-of-capture."""
+        if _resampler_ref[0] is None:
+            return None
+        try:
+            return resample_capture_block(_resampler_ref[0], None, _capture_rate_ref[0])
+        except Exception as e:  # noqa: BLE001 — a bad flush must not crash audio.
+            logger.error(f"Audio resampler tail flush failed: {e}")
+            return None
 
     # Track current chunk index for chunked audio
     _current_chunk_idx = [0]  # mutable container
@@ -3067,13 +3198,23 @@ def record_audio(
         index or open a new file — there is no next chunk.
         """
         # Drain and write any remaining buffered frames for this chunk.
-        frames = _drain_buffer()
+        frames = _drain_for_write()
         if frames is not None:
             _ensure_writer(sf_writer_ref)
             try:
                 sf_writer_ref[0].write(frames)
             except Exception as e:
                 logger.error(f"Audio rotation drain failed: {e}")
+        if is_final:
+            # Flush the resampler's residual tail into THIS (last) chunk before
+            # closing — there is no next chunk to carry it.
+            tail = _flush_resampler_tail()
+            if tail is not None:
+                _ensure_writer(sf_writer_ref)
+                try:
+                    sf_writer_ref[0].write(tail)
+                except Exception as e:
+                    logger.error(f"Audio tail flush failed: {e}")
         if sf_writer_ref[0] is not None:
             sf_writer_ref[0].close()
             sf_writer_ref[0] = None
@@ -3116,7 +3257,7 @@ def record_audio(
             if _finalized[0]:
                 return  # finalized by final_chunk rotation
 
-            frames = _drain_buffer()
+            frames = _drain_for_write()
             if frames is not None:
                 _ensure_writer(sf_writer_ref)
                 try:
@@ -3143,10 +3284,49 @@ def record_audio(
     # acquisition means an audio-off recording constructs NOTHING until the first
     # unmute (constructing an InputStream opens the CoreAudio device + evaluates
     # mic TCC — it does not defer to .start()).
+    def _select_input_device(prefer_builtin: bool):
+        """Return ``(device_index_or_None, skip, reason)`` for the next open.
+
+        Fail-open to the OS default on any error so the SCR-288 redirect never
+        breaks or worsens capture (KTD-2); the pure decision + concrete-index
+        pinning live in ``audio_device.resolve_open_target``.
+        """
+        try:
+            default_dev = sounddevice.default.device[0]
+            default_index = (
+                default_dev if isinstance(default_dev, int) and default_dev >= 0 else None
+            )
+            devices = audio_device.classify_input_devices()
+        except Exception as e:  # noqa: BLE001 — selection must never crash capture.
+            logger.warning(f"Mic-source selection failed (fail-open to default): {e}")
+            return (None, False, audio_device.REASON_DEFAULT)
+        return audio_device.resolve_open_target(devices, default_index, prefer_builtin)
+
     def _make_stream():
-        return sounddevice.InputStream(
-            callback=audio_callback, samplerate=SAMPLERATE, channels=CHANNELS,
+        """Select the input device (SCR-288) and construct the stream, or return
+        ``None`` to signal skip (protect Bluetooth playback). Re-evaluated at
+        every real open — start and each unmute/resume (R7)."""
+        device_index, skip, reason = _select_input_device(
+            prefer_builtin_mic_over_bluetooth
         )
+        if skip:
+            logger.info(f"Audio mic-source: skip mic capture (reason={reason})")
+            return None
+        # Use the already-pinned rate if a prior open committed one; otherwise
+        # resolve for THIS device. Commit only AFTER the open succeeds (below),
+        # so a failed open never pins a rate a later open would wrongly reuse.
+        rate = _capture_rate_ref[0]
+        if rate is None:
+            rate = resolve_capture_rate(SAMPLERATE, device=device_index)
+        stream = sounddevice.InputStream(
+            callback=audio_callback, samplerate=rate,
+            channels=CHANNELS, device=device_index,
+        )  # opens the device — may raise; the refs stay untouched on failure
+        _commit_capture_rate(rate)
+        logger.info(
+            f"Audio mic-source: device={device_index} reason={reason} rate={rate} Hz"
+        )
+        return stream
 
     controller = audio_mute.AudioStreamController(
         _make_stream, initially_muted=bool(initially_muted),
@@ -3251,9 +3431,9 @@ def record_audio(
                 break
 
     # Final drain — write any remaining buffered frames (skip if already
-    # finalized by a final_chunk rotation above).
+    # finalized by a final_chunk rotation above, which flushed its own tail).
     if not _finalized[0]:
-        final_frames = _drain_buffer()
+        final_frames = _drain_for_write()
         if final_frames is not None:
             _ensure_writer(sf_writer_ref)
             try:
@@ -3261,6 +3441,14 @@ def record_audio(
                 logger.debug(f"Final flush: {len(final_frames)} audio frames")
             except Exception as e:
                 logger.error(f"Final audio flush failed: {e}")
+        # Flush the resampler's residual tail (no more chunks to carry it).
+        tail = _flush_resampler_tail()
+        if tail is not None:
+            _ensure_writer(sf_writer_ref)
+            try:
+                sf_writer_ref[0].write(tail)
+            except Exception as e:
+                logger.error(f"Audio tail flush failed: {e}")
 
     # Send final audio ack BEFORE closing the FLAC writer. sf_writer.close()
     # can block for seconds on FLAC header finalization or raise on disk
@@ -4292,6 +4480,13 @@ def record(
     # lazily (``initially_muted=True`` opens nothing until first unmute), and
     # always-spawning also removes today's 60 s-per-chunk ``_wait_for_audio``
     # stall that occurs with chunking on + audio off.
+    #
+    # prefer_builtin_mic_over_bluetooth (SCR-288) is a GLOBAL setting, not a
+    # per-recording override like RECORD_AUDIO, so resolve it straight from the
+    # outer config getter here and pass it to the child rather than threading it
+    # through the RecordingConfig/Settings chain.
+    from screencap.config import get_prefer_builtin_mic_over_bluetooth
+
     audio_recorder = multiprocessing.Process(
         target=utils.WrapStdout(record_audio),
         args=(
@@ -4308,6 +4503,7 @@ def record(
             "mute_control_q": mute_control_q,
             "pause_control_q": pause_control_q,
             "initially_muted": not config.RECORD_AUDIO,
+            "prefer_builtin_mic_over_bluetooth": get_prefer_builtin_mic_over_bluetooth(),
         },
     )
     audio_recorder.start()

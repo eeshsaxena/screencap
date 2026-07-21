@@ -6,13 +6,14 @@ import SwiftUI
 /// `timeline` has no sidebar row — it is reached from Days cards and citations,
 /// optionally carrying a wall-clock seek anchor.
 ///
-/// Day-first restructure (R1): the four primary destinations are Days · Tasks ·
-/// Clips · Chat. `tasks` and `clips` render honest placeholders until their
-/// surfaces land (U6/U11); `days` is the default landing surface (R2).
+/// Day-first restructure (R1): the three primary destinations are Days ·
+/// Moments · Chat. `moments` merges the former Tasks and Clips surfaces into one
+/// cross-day list; `days` is the default landing surface (R2).
 enum ShellRoute: Hashable {
     case days
-    case tasks
-    case clips
+    /// The merged Moments surface (Tasks + Clips): one cross-day list of
+    /// app-detected spans and the ranges the user clipped (R1).
+    case moments
     /// The Account & Plan pane (account-sheet U5, KTD-4): the Settings entry
     /// renders the shared `AccountSheetView` as an embedded pane — sheet
     /// presentation is reserved for the gate and upload entries.
@@ -27,6 +28,10 @@ enum ShellRoute: Hashable {
     /// (U6/U12); nil for a plain day-card open. `.timeline` has no sidebar row:
     /// it highlights the Days row (see `ShellSidebarModel.highlightedRoute`).
     case timeline(day: Date, seekMs: Int?, highlight: DaySpanHighlight?)
+    /// The dedicated task view: opening a task moment lands HERE, scoped to just
+    /// the task (player + task-only strip), not the whole day. Like `.timeline` it
+    /// has no sidebar row — it highlights the Moments row (see `highlightedRoute`).
+    case taskDetail(TaskRouteKey)
     case privacy
     case appRules
     case intelligence
@@ -36,6 +41,21 @@ enum ShellRoute: Hashable {
 /// A dedicated Hashable value so it can ride `ShellRoute.timeline`'s associated
 /// values (a bare tuple can't — tuples aren't Hashable).
 struct DaySpanHighlight: Hashable {
+    let startMs: Int
+    let endMs: Int
+}
+
+/// The identity a `ShellRoute.taskDetail` carries — enough to render the scoped
+/// task view and to reach the full day. A dedicated Hashable value (like
+/// `DaySpanHighlight`) so it can ride the route's associated value. Never a
+/// recording title on any surface — the recording name is opaque plumbing (R5).
+struct TaskRouteKey: Hashable {
+    let recording: String
+    let recordingId: String?
+    let taskIndex: Int
+    let name: String
+    let category: String?
+    let day: Date
     let startMs: Int
     let endMs: Int
 }
@@ -72,13 +92,14 @@ struct ShellNavItem: Identifiable, Hashable {
 /// out of the view so U4's routing / stub / footer rules are directly assertable.
 enum ShellSidebarModel {
 
-    /// The four primary destinations (R1): Days · Tasks · Clips · Chat. Days is
-    /// the default landing surface (R2); Tasks and Clips render honest "coming in
-    /// this update" placeholders until U6/U11 land.
+    /// The three primary destinations (R1): Days · Moments · Chat. Days is the
+    /// default landing surface (R2); Moments merges the former Tasks and Clips
+    /// surfaces into one cross-day list.
     static let primaryNav: [ShellNavItem] = [
         ShellNavItem(id: "days", label: "Days", route: .days, availability: .enabled),
-        ShellNavItem(id: "tasks", label: "Tasks", route: .tasks, availability: .enabled),
-        ShellNavItem(id: "clips", label: "Clips", route: .clips, availability: .enabled),
+        // Moments — app-detected task spans and the ranges you clipped, in one
+        // cross-day list interleaved by footage time (R1–R7).
+        ShellNavItem(id: "moments", label: "Moments", route: .moments, availability: .enabled),
         // Chat — ask about your recorded history and get a grounded answer with
         // the real moments as sources.
         ShellNavItem(id: "chat", label: "Chat", route: .chat, availability: .enabled),
@@ -89,8 +110,13 @@ enum ShellSidebarModel {
     /// (reached from Days cards and citations), so it highlights the Days row
     /// (U4). Every other route highlights its own row.
     static func highlightedRoute(for route: ShellRoute) -> ShellRoute {
-        if case .timeline = route { return .days }
-        return route
+        switch route {
+        case .timeline: return .days
+        // The task view is reached from a Moments row, so it keeps the Moments
+        // row lit — mirroring `.timeline` → Days.
+        case .taskDetail: return .moments
+        default: return route
+        }
     }
 
     /// Whether a nav row should render as active for the current route — pure so

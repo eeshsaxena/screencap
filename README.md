@@ -183,6 +183,7 @@ Config lives at `~/.screencap/config.toml`; environment variables take precedenc
 ```toml
 recordings_dir = "/custom/path"        # default ~/.screencap/recordings
 audio_default = true
+prefer_builtin_mic_over_bluetooth = true  # on AirPods, record from the built-in mic instead
 disk_warn_mb = 2000                    # refuse to start / warn below this free space
 disk_stop_mb = 500                     # auto-stop recording below this (0 disables)
 
@@ -197,11 +198,14 @@ allow_apps = ["com.example.safe"]
 | `SCREENCAP_RECORDINGS_DIR` | `~/.screencap/recordings` | Where recordings live |
 | `SCREENCAP_DOWNLOADS_DIR` | `~/.screencap/downloads` | Where downloads land |
 | `SCREENCAP_AUDIO_DEFAULT` | `true` | Audio capture default |
+| `SCREENCAP_PREFER_BUILTIN_MIC_OVER_BLUETOOTH` | `true` | On Bluetooth input (AirPods), record from the built-in mic so playback stays high-quality; `false` records from the Bluetooth mic (degrades playback) |
 | `SCREENCAP_DISK_WARN_MB` / `SCREENCAP_DISK_STOP_MB` | `2000` / `500` | Disk-space guardrails |
 | `SCREENCAP_PRIVACY_MODE` | — | Tighten (never loosen) the privacy mode |
 | `SCREENCAP_UPLOAD_DEFAULT` | `ask` | `local` / `cloud` / `both` / `ask` |
 | `SCREENCAP_CHUNK_DURATION` | `900` | Chunk length in seconds (`0` disables) |
 | `SCREENCAP_RETENTION_POLICY` | `keep_forever` | Or `delete_after_upload`, `delete_after_days`, `size_cap` |
+
+**Bluetooth audio (AirPods).** Opening a Bluetooth headset's microphone forces macOS to drop it from high-quality stereo (A2DP) to telephone-quality "call" mode (HFP/SCO), degrading the audio you *hear* — not just the mic. So when your input device is a Bluetooth one, Screencap records from the built-in mic instead: your music/call playback stays untouched and you don't have to do anything. If there's no built-in mic to fall back to (e.g. a desktop Mac) and you aren't already on a call, mic capture is skipped for that stretch to protect playback. Already in a call on AirPods? Nothing changes — the mic is already in call mode, so Screencap captures normally. Set `prefer_builtin_mic_over_bluetooth = false` to always record from the Bluetooth mic anyway.
 
 A recording directory (`~/.screencap/recordings/rec-YYYYMMDDTHHMMSS/`) contains chunked video (`chunk_0000.mp4` + manifest), audio (`audio_0000.flac`), interaction events (`events_0000.jsonl`), `screenshots/`, the local-only `recording.db`, and system metrics — with transcripts and exports added as they're produced.
 

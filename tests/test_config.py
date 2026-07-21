@@ -117,6 +117,64 @@ def test_set_audio_default_creates_file(tmp_path):
         assert get_audio_default() is False
 
 
+_PREFER_BUILTIN_ENV = "SCREENCAP_PREFER_BUILTIN_MIC_OVER_BLUETOOTH"
+
+
+def test_prefer_builtin_mic_default_true(tmp_path):
+    """SCR-288: the Bluetooth mic-redirect defaults on (protect playback).
+
+    Isolated from the real ``~/.screencap/config.toml`` (nonexistent tmp path +
+    cache reset) so the default is asserted against an empty config, not whatever
+    the developer's machine happens to set.
+    """
+    import screencap.config as cfg
+    from screencap.config import get_prefer_builtin_mic_over_bluetooth
+
+    env = {k: v for k, v in os.environ.items() if k != _PREFER_BUILTIN_ENV}
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", tmp_path / "config.toml"),
+        mock.patch.dict(os.environ, env, clear=True),
+    ):
+        cfg._config_cache = None
+        assert get_prefer_builtin_mic_over_bluetooth() is True
+
+
+def test_prefer_builtin_mic_env_override():
+    from screencap.config import get_prefer_builtin_mic_over_bluetooth
+
+    with mock.patch.dict(os.environ, {_PREFER_BUILTIN_ENV: "false"}):
+        assert get_prefer_builtin_mic_over_bluetooth() is False
+    with mock.patch.dict(os.environ, {_PREFER_BUILTIN_ENV: "1"}):
+        assert get_prefer_builtin_mic_over_bluetooth() is True
+
+
+def test_prefer_builtin_mic_toml_round_trip(tmp_path):
+    """R11: a False persisted to config.toml disables the redirect (escape hatch)."""
+    import screencap.config as cfg
+    from screencap.config import (
+        get_prefer_builtin_mic_over_bluetooth,
+        set_prefer_builtin_mic_over_bluetooth,
+    )
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("# header comment\n")
+
+    env = {k: v for k, v in os.environ.items() if k != _PREFER_BUILTIN_ENV}
+    with (
+        mock.patch.object(cfg, "_CONFIG_PATH", cfg_path),
+        mock.patch.dict(os.environ, env, clear=True),
+    ):
+        cfg._config_cache = None
+        assert get_prefer_builtin_mic_over_bluetooth() is True  # default
+
+        set_prefer_builtin_mic_over_bluetooth(False)
+        # Cache invalidated → the fresh read observes the write.
+        assert get_prefer_builtin_mic_over_bluetooth() is False
+        text = cfg_path.read_text()
+        assert "# header comment" in text
+        assert "prefer_builtin_mic_over_bluetooth = false" in text
+
+
 # --- recordings_dir setter tests (SCR-228 / U1) ---
 
 
