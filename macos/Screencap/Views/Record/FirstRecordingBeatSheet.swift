@@ -72,8 +72,10 @@ struct FirstRecordingBeatSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                // No custom accessibilityLabel: VoiceOver reads the button's own
+                // audited `beatUpgradeLineCopy` text, so R7's honesty ratchet covers
+                // the screen-reader string too.
                 .buttonStyle(.plain)
-                .accessibilityLabel("Get Screencap's own on-device model for more reliable results")
             }
             HStack {
                 Spacer()

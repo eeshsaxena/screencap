@@ -480,9 +480,12 @@ final class IntelligenceSettingsTests: XCTestCase {
         XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.consentTrustFooter(framesOn: true)))
         XCTAssertTrue(corpus.contains(ConnectProviderModel.flowPickCaption))
         XCTAssertTrue(corpus.contains(BYOVendor.gemini.cliLimitsCopy))
-        // SCR-274 — the new upgrade-copy statics must be enrolled so R7 reaches them.
+        // SCR-274 — the new upgrade-copy statics must be enrolled so R7 reaches them,
+        // and both carry the sanctioned experiential phrasing ("more reliable").
         XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.onDeviceUpgradeReasonCopy))
         XCTAssertTrue(corpus.contains(IntelligenceSelectionModel.beatUpgradeLineCopy))
+        XCTAssertTrue(IntelligenceSelectionModel.onDeviceUpgradeReasonCopy.lowercased().contains("more reliable"))
+        XCTAssertTrue(IntelligenceSelectionModel.beatUpgradeLineCopy.lowercased().contains("more reliable"))
 
         let haystack = corpus.joined(separator: " ").lowercased()
         let forbidden = [
