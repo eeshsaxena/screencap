@@ -63,3 +63,39 @@ Cross-day threads; Recall/Chat grounding on diary blocks (a 4th evidence stream
 — must land in both `generation_finish.py` and `IntelligenceHelper/main.swift`);
 bulk backfill of historical recordings (must follow the recording-name-free
 opaque-ordinal progress contract); exposing the narrative over MCP.
+
+## Code-review follow-ups (deferred; the applied fixes shipped in fix(review))
+
+Findings the multi-agent review surfaced that were NOT applied this PR (the
+applied set — cross-process diary lock, name sanitizer, halt budget/stop_event,
+CI test markers, narrative comment, thread-chip copy — is in the `fix(review)`
+commit):
+
+- **Narrative regeneration after a failed invalidation (P2 defence-in-depth).**
+  `scrub_worker._invalidate_day_narrative` clears the narrative fail-open; if the
+  clear fails, a bullets-only purge on a protected row does not change the
+  consolidation fingerprint, so the next tick may skip regeneration. The primary
+  clear->NULL path is privacy-safe. Fix: fold a purge/disable signal into the
+  consolidation fingerprint (or reset `_last_consolidation_key`) so a purge forces
+  the next tick to re-consolidate. Cross-process (scrub is recorder-subprocess,
+  the fingerprint is daemon-side), so it wants its own change + test.
+- **block_id reuse on shared-app alone (P3).** `consolidate.py` reuses a prior
+  `block_id` when blocks share an app even without name-token overlap; on
+  browser-heavy days a stable id can re-point a deep link / morning-card jump onto
+  different work. Require positive name-token overlap before reuse.
+- **`update_task_segment` sets `EDITED_FIELD_BULLETS` on ANY metadata write.**
+  Benign today (`tasks.update` never passes metadata), but a future full-metadata
+  edit path would over-protect agent bullets and defeat the AE5 purge. Set the
+  bullets bit only when bullets actually changed.
+- **`narrative._thread_rollups` groups by `thread_id` alone**, not the composite
+  `(recording, thread_id)` used in `tasks_query`. Safe today (per-recording), a
+  latent false-merge if ever fed multi-recording blocks — harden to the composite.
+- **`supervisor._segmentation_fingerprint` catch** `(OSError, ValueError,
+  IndexError)` does not cover `sqlite3.OperationalError` from the widened
+  `read_task_segments` SELECT on a legacy pre-U1 `recording.db`; narrow (the active
+  ambient DB carries the current schema) but `_consolidation_fingerprint` has the
+  broad backstop and this one doesn't.
+- **Test hygiene:** the renamed-block bullet-regeneration test never passes the
+  renamed row as `prior_rows` (name overpromises); add a model-provider injection
+  test for a merged NAME (only bullets are covered today); add a `diary.search`
+  FTS-query-injection test and real-daemon round-trip tests for the new MCP tools.
