@@ -59,4 +59,29 @@ final class IntelligenceSurfacePolicyTests: XCTestCase {
         XCTAssertFalse(IntelligenceSurfacePolicy.shouldShowDeadStateBanner(
             verdict: nil, suppressedThisRecording: false))
     }
+
+    // MARK: - on-device upgrade offer (SCR-274)
+
+    /// Covers AE4 — Apple Intelligence ready, dedicated model not downloaded.
+    func testUpgradeOfferedWhenReadyAppleAndNotDownloaded() {
+        XCTAssertTrue(IntelligenceSurfacePolicy.shouldOfferOnDeviceUpgrade(
+            probe: .available, downloadedModelInstalled: false))
+    }
+
+    /// Covers AE5 — an already-downloaded user already has the better model.
+    func testUpgradeNotOfferedWhenModelDownloaded() {
+        XCTAssertFalse(IntelligenceSurfacePolicy.shouldOfferOnDeviceUpgrade(
+            probe: .available, downloadedModelInstalled: true))
+    }
+
+    /// Cloud-only-usable / AI-off / ineligible users reach `.lightConfirm` but have
+    /// no on-device path to upgrade — no line.
+    func testUpgradeNotOfferedWhenAppleIntelligenceNotAvailable() {
+        for probe: OnDeviceModelStatus in [.appleIntelligenceOff, .notEligible, .osUnsupported, .unknown, .modelDownloading] {
+            XCTAssertFalse(
+                IntelligenceSurfacePolicy.shouldOfferOnDeviceUpgrade(
+                    probe: probe, downloadedModelInstalled: false),
+                "probe \(probe)")
+        }
+    }
 }

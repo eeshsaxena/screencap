@@ -19,6 +19,15 @@ struct FirstRecordingBeatSheet: View {
     private var mode: IntelligenceSurfacePolicy.BeatMode {
         IntelligenceSurfacePolicy.beatMode(verdict: verdict)
     }
+    /// SCR-274 — whether the light-confirm should carry the more-reliable upgrade line.
+    private var offerOnDeviceUpgrade: Bool {
+        let installed = (intelligence.settings?.downloadedModelInstalled ?? false)
+            || download.isDefaultModelInstalled
+        return IntelligenceSurfacePolicy.shouldOfferOnDeviceUpgrade(
+            probe: OnDeviceModelStatus.probe(),
+            downloadedModelInstalled: installed
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -51,6 +60,21 @@ struct FirstRecordingBeatSheet: View {
                 .font(SCTypography.sans(size: 12.5))
                 .foregroundStyle(Color.scInkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if offerOnDeviceUpgrade {
+                // SCR-274: one secondary, dismissible upgrade nudge below the
+                // reassurance (which keeps reading priority, R6). Deep-links to the
+                // reframed Settings card; never blocks the light confirm.
+                Button(action: { onOpenIntelligence(); dismiss() }) {
+                    Text(IntelligenceSelectionModel.beatUpgradeLineCopy)
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scTeal)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Get Screencap's own on-device model for more reliable results")
+            }
             HStack {
                 Spacer()
                 Button("Got it") { dismiss() }
