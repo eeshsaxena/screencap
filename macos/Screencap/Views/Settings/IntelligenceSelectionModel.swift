@@ -119,6 +119,11 @@ struct OnDeviceRowRender: Equatable {
     let status: Status
     let affordance: DownloadAffordance
     let affordanceDemoted: Bool
+    /// SCR-274 (R1/R2): Apple Intelligence is the ready engine but the more-reliable
+    /// dedicated model isn't downloaded yet, so the row presents the download as a
+    /// stated upgrade (reason line) rather than an unexplained second affordance.
+    /// True iff `status == .readyApple && affordance == .download`.
+    let upgradeOffer: Bool
 }
 
 // MARK: - Just-added highlight (R8)
@@ -205,6 +210,16 @@ enum IntelligenceSelectionModel {
     static let onDeviceAppleModelDownloadingCopy = "Model downloading…"
     static let onDeviceCheckingCopy = "Checking availability…"
     static let onDeviceUnavailableCopy = "On-device model isn't available on this Mac."
+    /// SCR-274 — the card's upgrade reason line, shown when Apple Intelligence is
+    /// ready but the more-reliable dedicated model isn't downloaded. Experiential
+    /// ("more reliable"), never a benchmarked/quality-superlative claim (R7).
+    static let onDeviceUpgradeReasonCopy =
+        "More reliable task names & summaries — Screencap's own model, still on this Mac."
+    /// SCR-274 — the first-recording beat's one-line upgrade nudge (deep-links to
+    /// Settings → Intelligence). Carries the on-device reassurance so it isn't
+    /// ambiguous before the user reaches the reframed card.
+    static let beatUpgradeLineCopy =
+        "For more reliable results, get Screencap's own on-device model in Settings → Intelligence."
 
     // MARK: Consent section copy (U5 — R10 plain per-row language)
 
@@ -304,6 +319,7 @@ enum IntelligenceSelectionModel {
         onDeviceReadyAppleCopy, onDeviceReadyDownloadedCopy,
         onDeviceAppleModelDownloadingCopy, onDeviceCheckingCopy,
         onDeviceUnavailableCopy,
+        onDeviceUpgradeReasonCopy, beatUpgradeLineCopy,
         cloudTasksSectionTitle,
         summaryConsentRowTitle,
         summaryConsentRowCaption(framesOn: false), summaryConsentRowCaption(framesOn: true),
@@ -570,8 +586,15 @@ enum IntelligenceSelectionModel {
             demoted = false
         }
 
+        // SCR-274: the download reads as a more-reliable upgrade exactly when Apple
+        // Intelligence is the ready engine and the dedicated model isn't installed
+        // (idle download, daemon reachable → affordance `.download`). Every other
+        // cell — installed, downloading, failed, disabled, needs-attention — is false.
+        let upgradeOffer = status == .readyApple && affordance == .download
+
         return OnDeviceRowRender(
-            status: status, affordance: affordance, affordanceDemoted: demoted
+            status: status, affordance: affordance, affordanceDemoted: demoted,
+            upgradeOffer: upgradeOffer
         )
     }
 

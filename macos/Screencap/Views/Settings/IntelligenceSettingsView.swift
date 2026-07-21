@@ -508,14 +508,43 @@ struct IntelligenceSettingsView: View {
         )
         VStack(alignment: .leading, spacing: 8) {
             if reconcile {
+                // The reconcile prompt replaces the status line; an upgrade offer only
+                // makes sense atop a genuine "Ready (Apple Intelligence)" status (SCR-274).
                 statusLine(text: IntelligenceSelectionModel.reconcileNeededCopy, tone: .warn)
+                downloadAffordance(render.affordance, demoted: render.affordanceDemoted)
+            } else if render.upgradeOffer {
+                onDeviceStatusLine(render.status)
+                // SCR-274: the download reads as a stated upgrade. Group the reason
+                // line with the Download action so VoiceOver announces them together
+                // (R2's "informed choice" holds for screen-reader users).
+                VStack(alignment: .leading, spacing: 6) {
+                    upgradeReasonLine
+                    downloadAffordance(render.affordance, demoted: render.affordanceDemoted)
+                }
+                .accessibilityElement(children: .combine)
             } else {
                 onDeviceStatusLine(render.status)
+                downloadAffordance(render.affordance, demoted: render.affordanceDemoted)
             }
-            downloadAffordance(render.affordance, demoted: render.affordanceDemoted)
         }
         .padding(.horizontal, 44)
         .padding(.bottom, 12)
+    }
+
+    /// SCR-274 — the more-reliable upgrade callout under the on-device row. Rendered
+    /// distinct from the status-row dot+text chrome (a teal up-arrow + secondary text)
+    /// so it reads as an offer, not a third status indicator (R1).
+    private var upgradeReasonLine: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "arrow.up.circle")
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scTeal)
+            Text(IntelligenceSelectionModel.onDeviceUpgradeReasonCopy)
+                .font(SCTypography.sans(size: 12))
+                .foregroundStyle(Color.scInkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
     }
 
     /// The status line for the merged row's render case. The needs-attention

@@ -393,6 +393,34 @@ final class IntelligenceSelectionModelTests: XCTestCase {
         XCTAssertEqual(installed.affordance, .hidden)
     }
 
+    /// SCR-274 — `upgradeOffer` is true in exactly one cell: Apple Intelligence
+    /// ready, dedicated model not installed, download idle, daemon reachable (the
+    /// row shows the download as a stated more-reliable upgrade). False everywhere
+    /// else — installed, downloading, failed, daemon-unreachable, not-ready probes.
+    func testUpgradeOfferOnlyWhenReadyAppleAndDownloadable() {
+        // The one true cell (Covers AE1).
+        XCTAssertTrue(render(.available).upgradeOffer)
+
+        // Installed → no offer (Covers AE2).
+        XCTAssertFalse(render(.available, installed: true).upgradeOffer)
+
+        // Download in flight / failed / daemon-unreachable → the download UI or a
+        // disabled state is primary; no upgrade callout.
+        XCTAssertFalse(render(.available, download: .downloading(bytesDone: 1, bytesTotal: 4)).upgradeOffer)
+        XCTAssertFalse(render(.available, download: .failed(reason: "network error")).upgradeOffer)
+        XCTAssertFalse(render(.available, daemonUnreachable: true).upgradeOffer)
+
+        // Checking (unknown probe) and Apple's own model downloading → no offer.
+        XCTAssertFalse(render(.unknown).upgradeOffer)
+        XCTAssertFalse(render(.modelDownloading).upgradeOffer)
+
+        // Not-ready probes (Covers AE3) → existing set-up path, no upgrade framing.
+        for probe in notReadyProbes {
+            XCTAssertFalse(render(probe).upgradeOffer, "probe \(probe)")
+            XCTAssertFalse(render(probe, installed: true).upgradeOffer, "probe \(probe) installed")
+        }
+    }
+
     /// ready × not installed × downloading — Ready stays the badge; the
     /// progress + Cancel accessory rides demoted.
     func testMatrixReadyDownloadingIsDemotedProgress() {
