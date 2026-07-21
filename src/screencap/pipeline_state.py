@@ -2120,6 +2120,38 @@ def _parse_wire_bullets(metadata: str | None) -> list | None:
     return None
 
 
+def _strip_metadata_bullets(metadata: str | None) -> str | None:
+    """Return ``metadata`` with the agent topic-bullet payload removed (U5/KTD-3).
+
+    The retroactive purge's field-scoped bullet clear
+    (``scrub_worker._clear_protected_agent_bullets``) calls this to drop the
+    ``bullets`` list — and its paired ``bullets_fallback`` honest-degrade marker —
+    from a block's ``metadata`` JSON blob IN PLACE, so a user-renamed block loses
+    the disabled app's bullets while EVERY other field is preserved (the name lives
+    in its own column; ``description`` / ``apps_used`` / ``block_id`` / ``thread_id``
+    ride the blob and stay). Returns the re-serialized blob, or ``None`` when the
+    strip empties it.
+
+    Idempotent + non-fabricating, mirroring :func:`_parse_wire_bullets`'s
+    fail-open read discipline: a ``None`` / empty / unparseable / non-dict blob, or
+    a blob carrying NEITHER bullet key, is returned UNCHANGED (same object) so the
+    caller can detect "nothing to clear" by equality and skip the write.
+    """
+    if not metadata:
+        return metadata
+    try:
+        blob = json.loads(metadata)
+    except (ValueError, TypeError):
+        return metadata
+    if not isinstance(blob, dict):
+        return metadata
+    if "bullets" not in blob and "bullets_fallback" not in blob:
+        return metadata
+    blob.pop("bullets", None)
+    blob.pop("bullets_fallback", None)
+    return json.dumps(blob) if blob else None
+
+
 def read_task_segments_wire(rec_dir: Path) -> list[dict]:
     """Read a recording's named task segments as the ``TaskSegment`` wire shape.
 
