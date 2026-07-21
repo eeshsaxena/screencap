@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.30.0] - 2026-07-21
+
+### Added
+
+- **segmentation:** Day-diary pipeline — diary block schema with field-scoped protection, fragment consolidation into named threaded blocks, evidence-bound topic bullets and day narrative + read verb, retroactive purge extended to bullets/narrative/diary FTS, diary search index over blocks + bullets, thread rollups with MCP read-only parity
+- **daemon:** `/v0/tasks.query` cross-day task verb; irreversible range-delete job; in-vault clips store with `clip.create`/`clip.list`/`clip.delete`; `/v0/timeline.day` now carries `end_status`, purge provenance, and `store_mounted`
+- **mcp:** Day-first agent tools with deletion parity; `search_diary` pinned in the exact tool allowlist
+- **feedback:** In-app feedback relay — Cloud Function relay, CLI `feedback send` command, source-marker tagging for relayed issues (SCR-281)
+- **audio:** Bluetooth-aware mic-source selection — input device classification, native capture-rate resolution, `prefer_builtin_mic_over_bluetooth` config toggle (default on), and capture-time redirect away from Bluetooth (SCR-288)
+- **billing:** Stripe live-charging cutover support — live-mode readiness gate, Secret-Manager deploy wrapper for billing/signer functions, dry-run count preview + full pagination for the grandfather backfill
+
+### Changed
+
+- **brand:** Renamed ScreenCap → Screencap across Python, docs, build scripts, PyInstaller spec, and the Homebrew formula
+- **onboarding:** Finalized $8/$15 launch pricing, retired dead $5/month copy
+
+### Fixed
+
+- **privacy:** Purge persisted task names on retroactive scrub (SCR-280); persist retroactive-purge intervals so purged app spans can't reach the LLM (SCR-277)
+- **segmentation:** Carry the committed name across a halt so the live trailing task never flaps to `task_N` (SCR-278); sanitize block names, cross-process diary lock, halt budget
+- **pipeline:** Resume quiesce-stopped local finalizes stuck at `in_progress` (SCR-279)
+- **recall:** Honest day-recap figures — coverage clamp, encrypted stills, focus time; let day-recap chat answers through the grounding guardrail
+- **engine:** Capture mic at native rate to stop glitching a concurrent app's audio
+- **feedback:** Close an email markdown-injection hole, handle expired-retryable state, fix key eviction; apply U0 spike findings from real-workspace Linear API verification
+- **review:** Harden the GCS upload-target allowlist against dot-segment traversal; harden purge-identity reads and cover `disk_full` stops; degrade empty-stretch claims when day coverage is incomplete; fix deletion honesty and a fail-closed clip guard; ignore a stale substring query under the Clipped filter; add a backward-compat guard for an unset source-marker label
+
 ## [0.28.0] - 2026-07-17
 
 ### Added
