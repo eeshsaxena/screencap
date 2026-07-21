@@ -698,7 +698,12 @@ struct MainWindow: View {
                 onNewRecording: presentNewRecording,
                 onUpgradePrompt: { presentedAccountContext = .gate },
                 onOpenSearch: { showingPalette = true },
-                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs, highlight: nil) }
+                onOpenTimeline: { date, seekMs in route = .timeline(day: date, seekMs: seekMs, highlight: nil) },
+                // U9 — the resume card lands on the day at the thread's last block,
+                // with the block band highlighted (AE3), keyed by block_id span.
+                onResumeThread: { day, seekMs, highlight in
+                    route = .timeline(day: day, seekMs: seekMs, highlight: highlight)
+                }
             )
         case .tasks:
             // U6: the cross-day Tasks surface — reverse-chronological named task

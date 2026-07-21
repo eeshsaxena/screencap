@@ -21,6 +21,15 @@ struct HUDHintStore {
     /// choice and a skip). Its absence is what makes the beat "catch-up": a user
     /// who never reached that step (existing users) has it unset and is eligible.
     static let intelligenceChoiceSeenKey = "com.screencap.macos.intelligenceChoiceSeen"
+    /// Day-diary U9 — the morning resume card's dismissals, KEYED by "day|thread"
+    /// (unlike the single-boolean local-model hint): dismissing one day's thread
+    /// must not suppress a later day's card (a new day re-arms — R11/KTD-11).
+    /// Persisted as an ordered `[String]` (most-recent last) so growth is bounded
+    /// by `resumeCardDismissalCap`; exposed as a `Set` for membership checks.
+    static let resumeCardDismissedKeysKey = "com.screencap.macos.resumeCardDismissedKeys"
+    /// Cap on retained resume dismissals — the set is tiny (one per resumed day)
+    /// but the key space is unbounded over time, so keep only the most recent N.
+    static let resumeCardDismissalCap = 60
 
     private let defaults: UserDefaults
 
@@ -60,5 +69,25 @@ struct HUDHintStore {
 
     func markIntelligenceChoiceSeen() {
         defaults.set(true, forKey: Self.intelligenceChoiceSeenKey)
+    }
+
+    /// The set of dismissed morning-resume-card keys ("day|thread" — U9/KTD-11).
+    /// Read as a Set so the gating predicate can do O(1) membership checks; the
+    /// underlying storage is an ordered array for bounded pruning.
+    var dismissedResumeKeys: Set<String> {
+        Set(defaults.stringArray(forKey: Self.resumeCardDismissedKeysKey) ?? [])
+    }
+
+    /// Persist a dismissed resume-card key. Re-appends (most-recent last), dedupes,
+    /// and prunes to the most recent `resumeCardDismissalCap` keys so the store
+    /// never grows without bound as the user resumes across many days.
+    func markResumeCardDismissed(_ key: String) {
+        var keys = defaults.stringArray(forKey: Self.resumeCardDismissedKeysKey) ?? []
+        keys.removeAll { $0 == key }
+        keys.append(key)
+        if keys.count > Self.resumeCardDismissalCap {
+            keys = Array(keys.suffix(Self.resumeCardDismissalCap))
+        }
+        defaults.set(keys, forKey: Self.resumeCardDismissedKeysKey)
     }
 }

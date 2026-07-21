@@ -29,6 +29,11 @@ struct DaysView: View {
     var onOpenSearch: () -> Void
     /// A card click opens the day page (day, optional wall-clock seek anchor).
     var onOpenTimeline: (Date, Int?) -> Void
+    /// U9 — the morning resume card's jump: open the day at the thread's last block
+    /// (day, seek anchor, block-span highlight). Distinct from `onOpenTimeline` so
+    /// the returning user lands with the block band emphasized (AE3), keyed by
+    /// `block_id` span (KTD-2).
+    var onResumeThread: (Date, Int?, DaySpanHighlight?) -> Void
 
     // One frame resolver + thumbnail cache shared across every card.
     @State private var frameIndex = RecordingFrameIndex()
@@ -40,6 +45,13 @@ struct DaysView: View {
     // Owns its own AmbientController (mirroring AmbientRecordingSection) to drive
     // the Today card's live capture status — additive, no app-root plumbing.
     @StateObject private var ambient = AmbientController()
+
+    // U9 — the morning resume card. `resumeDays` is fetched FRESH from tasks.query
+    // on each Days appearance (never cached, KTD-11); nil = not yet loaded (no card
+    // flashes before evidence). Dismissals are the persisted (day, thread) keys,
+    // loaded once and mutated in place on dismiss (the `ShellSidebar` hint idiom).
+    @State private var resumeDays: [TasksQueryDay]?
+    @State private var resumeDismissals: Set<String> = HUDHintStore().dismissedResumeKeys
 
     var body: some View {
         content
@@ -62,6 +74,9 @@ struct DaysView: View {
             .task {
                 if index.usingCLIFallback { await index.refresh() }
             }
+            // U9 — recompute the resume card FRESH on each Days appearance (KTD-11:
+            // never cached, so a since-deleted day can never be named). Fail-open.
+            .task { await loadResume() }
             // Live-refresh the Today card on recording lifecycle edges (KTD-12):
             // a recording start/stop (ambient attach included) flips recorder.state.
             .onChange(of: recorder.state) { _ in
@@ -130,6 +145,7 @@ struct DaysView: View {
             if showsMigrationBanner { migrationBanner }
             header
                 .padding(.bottom, 22)
+            resumeCard
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     TodayCardView(
@@ -173,6 +189,53 @@ struct DaysView: View {
         }
         .padding(.horizontal, 36)
         .padding(.vertical, 28)
+    }
+
+    // MARK: - Morning resume card (U9)
+
+    /// The morning resume card, gated by the pure `ResumeCardModel` predicate over
+    /// the fresh `tasks.query` days + the live recording flag + persisted
+    /// dismissals. Renders nothing until loaded, and nothing when no real thread is
+    /// resumable (R12) — never a fabricated resume.
+    @ViewBuilder
+    private var resumeCard: some View {
+        if let days = resumeDays,
+           let content = ResumeCardModel.shouldShowResumeCard(
+               days: days,
+               now: Date(),
+               dismissals: resumeDismissals,
+               isRecording: recorder.state.isRecording
+           ) {
+            ResumeCardView(
+                content: content,
+                onResume: { onResumeThread(content.day, content.startMs, content.highlight) },
+                onDismiss: {
+                    resumeDismissals.insert(content.dismissalKey)
+                    HUDHintStore().markResumeCardDismissed(content.dismissalKey)
+                }
+            )
+            .padding(.bottom, 18)
+        }
+    }
+
+    /// Fetch the recent-window `tasks.query` for the resume card. A short window is
+    /// enough — the card only ever names the MOST RECENT recorded day (KTD-11); 7
+    /// days back spans a weekend plus a couple of quiet days. Fail-open: a daemon
+    /// hiccup or sealed vault leaves no card rather than a fabricated one.
+    private func loadResume() async {
+        let now = Date()
+        let calendar = Calendar.current
+        let start = calendar.date(byAdding: .day, value: -7, to: calendar.startOfDay(for: now)) ?? now
+        do {
+            let resp = try await DaemonClient.tasksQuery(
+                startDate: TasksModel.dateKey(start, calendar: calendar),
+                endDate: TasksModel.dateKey(now, calendar: calendar),
+                tzOffsetSeconds: TimeZone.current.secondsFromGMT(for: now)
+            )
+            resumeDays = resp.days
+        } catch {
+            resumeDays = []
+        }
     }
 
     /// Resolve tasks + app chips (at most once each) for a day's recordings so the
