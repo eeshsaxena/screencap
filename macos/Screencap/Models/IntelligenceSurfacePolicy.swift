@@ -39,4 +39,14 @@ enum IntelligenceSurfacePolicy {
         guard let v = verdict else { return false }
         return !v.usable && !suppressedThisRecording
     }
+
+    /// SCR-274 — whether the first-recording beat's light-confirm surfaces the "more
+    /// reliable" on-device upgrade line: Apple Intelligence is the ready engine
+    /// (`probe == .available`) and the dedicated model isn't downloaded yet. Never
+    /// shown to an already-downloaded user (R6/AE5), nor to a cloud-only-usable user
+    /// (who reaches `.lightConfirm` via cloud consent but has no on-device path to
+    /// upgrade). Pure, so the gate stays unit-testable like its siblings above.
+    static func shouldOfferOnDeviceUpgrade(probe: OnDeviceModelStatus, downloadedModelInstalled: Bool) -> Bool {
+        probe == .available && !downloadedModelInstalled
+    }
 }
