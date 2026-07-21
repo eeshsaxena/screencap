@@ -150,3 +150,45 @@ def test_local_server_remote_endpoint_excluded(cfg):
 def test_cloud_active_provider_has_no_on_device_backend(cfg):
     cfg("gemini")
     assert isinstance(build_answer_provider(), UnavailableGenerationProvider)
+
+
+# ---------------------------------------------------------------------------
+# U3 — build_prose_provider (DIARY_PROSE on-device-class routing, KTD-4)
+# ---------------------------------------------------------------------------
+
+from screencap.segmentation.providers.chained import UnavailableProvider  # noqa: E402
+from screencap.segmentation.routing import build_prose_provider  # noqa: E402
+
+
+@pytest.mark.privacy
+def test_prose_on_device_exposes_bullet_verb(cfg):
+    cfg("on-device")
+    prov = build_prose_provider()
+    # The on-device backend exposes the block-bullet verb the consolidator calls.
+    assert isinstance(prov, OnDeviceProvider)
+    assert hasattr(prov, "call_block_bullets")
+
+
+@pytest.mark.privacy
+def test_prose_local_server_local_endpoint_participates(cfg):
+    cfg("local-server", endpoint="http://127.0.0.1:1234")
+    assert isinstance(build_prose_provider(), LocalServerProvider)
+
+
+@pytest.mark.privacy
+def test_prose_local_server_remote_endpoint_excluded(cfg):
+    # KTD-4/KTD-5: a REMOTE BYO endpoint must NOT be a prose backend (no egress).
+    cfg("local-server", endpoint="http://evil.example.com:1234")
+    prov = build_prose_provider()
+    assert isinstance(prov, UnavailableProvider)
+    assert not hasattr(prov, "call_block_bullets")
+
+
+@pytest.mark.privacy
+def test_prose_cloud_active_provider_has_no_on_device_bullet_backend(cfg):
+    # A cloud active provider yields no on-device-class bullet backend → the
+    # consolidator falls to the app-level heuristic (cloud never egresses here).
+    cfg("gemini")
+    prov = build_prose_provider()
+    assert isinstance(prov, UnavailableProvider)
+    assert not hasattr(prov, "call_block_bullets")

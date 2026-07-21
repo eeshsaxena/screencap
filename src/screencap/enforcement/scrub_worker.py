@@ -218,6 +218,13 @@ def _purge_task_segments(
     it stays queryable via ``tasks.query``/``browse_day`` over a span the strip
     reports as "removed by you".
 
+    U5 (KTD-3, AE5) -- on the POLICY path this ALSO strips agent-written topic
+    bullets in place from the user-protected rows the whole-row DELETE kept, via
+    :func:`_clear_protected_agent_bullets` (a user-renamed block keeps its name but
+    loses the disabled app's bullets). The returned count covers both the deletes
+    and those in-place bullet-clears, so the scrub can tell whether any block row
+    changed (and the day narrative therefore went stale).
+
     Runs on the scrub's OWN connection/cursor inside its existing
     ``BEGIN IMMEDIATE`` transaction (same ``recording.db``), so the source-row
     deletes and this purge commit as one atom. Bounds are second-widened (floor
@@ -246,12 +253,92 @@ def _purge_task_segments(
                     f"WHERE {owned}end_ts > ? AND start_ts < ?",
                     (lo, math.ceil(end)),
                 )
+        # U5 (KTD-3, AE5): on the POLICY path, also strip AGENT-written bullets
+        # from user-protected rows the whole-row DELETE kept (e.g. a user-renamed
+        # block), so the disabled app's bullet text can't live on under a kept
+        # name. The range-delete path (all_sources) already dropped every
+        # overlapping row, so there is nothing left to bullet-clear.
+        if not all_sources:
+            _clear_protected_agent_bullets(cur, conn, intervals)
         return conn.total_changes - before
     except Exception:
         logger.warning(
             "task-segment purge failed (non-fatal)", exc_info=True
         )
         return 0
+
+
+def _clear_protected_agent_bullets(
+    cur: sqlite3.Cursor,
+    conn: sqlite3.Connection,
+    intervals: list[tuple[float, float]],
+) -> None:
+    """Strip AGENT-written bullets from user-protected rows the whole-row DELETE
+    kept (U5, KTD-3, AE5) -- INSIDE the caller's transaction.
+
+    ``_purge_task_segments`` whole-row-deletes only UNEDITED agent rows, so every
+    protected row (a ``source='user'`` block or a user-curated agent block) survives
+    with its ``metadata`` bullets intact. For a user-RENAMED block that means the
+    disabled app's topic bullets live on under the user's kept name -- defeating AE5.
+
+    For each surviving row overlapping ``intervals`` whose ``bullets`` FIELD is not
+    user-protected (``task_field_is_protected(row, TASK_FIELD_BULLETS)`` is False -- a
+    rename-only edit leaves the agent-written bullets purge-eligible), strip the
+    bullets from its ``metadata`` in place, leaving the name / ``edited`` /
+    ``edited_fields`` untouched. A user-EDITED bullet set (``EDITED_FIELD_BULLETS``)
+    and a ``source='user'`` row are protected on the ``bullets`` axis, so they are
+    never touched. Idempotent: a row with no bullets left is not rewritten.
+
+    Same second-widened overlap bounds as the DELETE; runs on the scrub's own cursor
+    in the same ``BEGIN IMMEDIATE`` transaction, so the clears commit atomically with
+    the row deletes.
+    """
+    from screencap.pipeline_state import (
+        TASK_FIELD_BULLETS,
+        TASK_SOURCE_AGENT,
+        TaskSegmentRow,
+        _strip_metadata_bullets,
+        task_field_is_protected,
+    )
+
+    seen: set[int] = set()
+    for start, end in intervals:
+        lo = math.floor(start)
+        if end == float("inf"):
+            rows = cur.execute(
+                "SELECT task_index, metadata, source, edited, edited_fields "
+                "FROM pipeline_task_segments WHERE end_ts > ?",
+                (lo,),
+            ).fetchall()
+        else:
+            rows = cur.execute(
+                "SELECT task_index, metadata, source, edited, edited_fields "
+                "FROM pipeline_task_segments "
+                "WHERE end_ts > ? AND start_ts < ?",
+                (lo, math.ceil(end)),
+            ).fetchall()
+        for task_index, metadata, source, edited, edited_fields in rows:
+            idx = int(task_index)
+            if idx in seen:
+                continue
+            probe = TaskSegmentRow(
+                task_index=idx, start_ts=0.0, end_ts=0.0, name="",
+                metadata=metadata,
+                source=source if source is not None else TASK_SOURCE_AGENT,
+                edited=bool(edited),
+                edited_fields=int(edited_fields or 0),
+            )
+            if task_field_is_protected(probe, TASK_FIELD_BULLETS):
+                continue  # user owns the bullets -> never touched
+            new_metadata = _strip_metadata_bullets(metadata)
+            if new_metadata == metadata:
+                continue  # no agent bullets to clear -> idempotent no-op
+            cur.execute(
+                "UPDATE pipeline_task_segments SET metadata=?, updated_at=? "
+                "WHERE task_index=?",
+                (new_metadata, time.time(), idx),
+            )
+            seen.add(idx)
 
 
 def _chunks(seq: list[Any], size: int) -> list[list[Any]]:
@@ -854,8 +941,19 @@ class ScrubWorker:
 
             # SCR-118: purge the same intervals from the content index so
             # retroactively-disabled on-screen text can no longer be found via
-            # search (the R7 lifecycle hole reached through the async path).
+            # search (the R7 lifecycle hole reached through the async path). U5
+            # (KTD-8) extends this shared helper to also drop the diary block/bullet
+            # search rows for the interval.
             self._purge_content_index_intervals(intervals)
+
+            # U5 (R13, AE5): if the purge changed any block row (a whole-row delete
+            # OR an in-place bullet clear), invalidate the day narrative — it is
+            # composed from block names + bullets, so the stored prose may still
+            # describe the disabled app. Cleared here so the next consolidation tick
+            # recomposes it from the SURVIVING blocks (or leaves none on a degraded
+            # day). Post-commit + fail-open via the U4 seam (its own connection).
+            if counts["task_segments"] > 0:
+                self._invalidate_day_narrative()
 
             # SCR-280: mirror the ledger task-segment purge in the human-readable
             # tasks.json file (post-commit, fail-open — it is a file, not part of
@@ -888,6 +986,34 @@ class ScrubWorker:
         the U8 range-delete path can't drift on the R7 lifecycle rule.
         """
         purge_content_index_intervals(self._capture_dir, intervals)
+
+    def _invalidate_day_narrative(self) -> None:
+        """Clear this recording's day-narrative row after the purge touched its
+        blocks (U5, R13) -- strictly fail-open.
+
+        The day narrative (U4) is derived prose composed from block names + bullets,
+        so once a block is deleted or its bullets are cleared the stored narrative
+        may still describe the disabled app. This clears it through the U4 seam
+        (``PipelineLedger.clear_day_narrative`` -- built as the U5 invalidation hook)
+        so the next consolidation tick recomposes it from the surviving blocks.
+        Post-commit with its OWN connection (the scrub transaction has already
+        committed), so it can't be part of the row-delete atom. This clear IS the
+        privacy guarantee: after it, the stored narrative is gone (NULL) until a
+        later tick recomposes it from the surviving blocks. Any error is swallowed
+        per the worker's fail-open discipline; note the swallow is a genuine (if
+        narrow) defence-in-depth edge — a purge does NOT change the consolidation
+        fingerprint that gates whether the next tick runs, so a failed clear is
+        not guaranteed to be re-driven until the block set changes for another
+        reason (tracked as a follow-up). The common path (clear -> NULL) is safe.
+        """
+        try:
+            from screencap.pipeline_state import PipelineLedger
+
+            PipelineLedger(self._db_path).clear_day_narrative()
+        except Exception:
+            logger.warning(
+                "day-narrative invalidation failed (non-fatal)", exc_info=True
+            )
 
     def _purge_tasks_json_intervals(
         self, intervals: list[tuple[float, float]],
@@ -936,6 +1062,13 @@ def purge_content_index_intervals(
     never used, and never raises into the caller (the disable job OR the U8
     range-delete job). The SHARED body behind both purge paths so the R7
     lifecycle rule can't drift between them.
+
+    U5 (KTD-8, AE5): the ``diary_fts`` day-diary block search rows live in the
+    SAME ``content_index.db``, so this purges them for the same interval, under the
+    same ``content_index_write_lock()`` and with the same ms-widened bounds, right
+    beside the frame-level content purge — a disabled app's block name / bullet
+    text stops being searchable too. Both purge paths (disable + range-delete) route
+    through here, so the diary sink is covered by whichever fired.
     """
     if not intervals:
         return
@@ -970,6 +1103,11 @@ def purge_content_index_intervals(
                 start_ms = math.floor(start * 1000)
                 end_ms = None if end == float("inf") else math.ceil(end * 1000)
                 store.delete_recording_interval(recording, start_ms, end_ms)
+                # U5 (KTD-8): drop the diary block/bullet search rows overlapping
+                # the same interval (name + bullets keyed by block span), so the
+                # disabled app's diary text also stops being searchable (AE5). A
+                # store with no diary tables yet is a safe no-op.
+                store.delete_recording_diary_interval(recording, start_ms, end_ms)
     except Exception:
         logger.warning(
             "content-index interval purge failed (non-fatal)", exc_info=True

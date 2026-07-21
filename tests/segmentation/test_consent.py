@@ -229,6 +229,123 @@ class TestRecallAnswer:
 
 
 # ---------------------------------------------------------------------------
+# Diary prose (U3, KTD-4) — its own matrix row that REUSES the summary consent
+# toggle (R14 — no new consent surface). Prefers on-device; consented cloud is
+# the enrichment fallback; otherwise the honest app/window-level heuristic —
+# never NONE, so a block always carries at least app-level bullets (R6/AE3).
+# ---------------------------------------------------------------------------
+
+class TestDiaryProse:
+    def test_on_device_when_available_regardless_of_consent(self):
+        """On-device is always preferred; the consent row never forces cloud."""
+        for consent in (True, False):
+            policy = ConsentPolicy(
+                cloud_provider="gemini", summary_cloud_consent=consent,
+            )
+            assert (
+                policy.resolve(TaskKind.DIARY_PROSE, on_device_available=True)
+                is ExecutionTarget.ON_DEVICE
+            )
+
+    def test_cloud_when_unavailable_and_summary_consent_and_provider(self):
+        policy = ConsentPolicy(cloud_provider="gemini", summary_cloud_consent=True)
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=False)
+            is ExecutionTarget.CLOUD
+        )
+
+    def test_heuristic_when_unavailable_and_no_consent(self):
+        """No consent → the honest app-level heuristic, NOT cloud and NOT NONE."""
+        policy = ConsentPolicy(cloud_provider="gemini", summary_cloud_consent=False)
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=False)
+            is ExecutionTarget.HEURISTIC
+        )
+
+    def test_heuristic_when_unavailable_and_no_provider(self):
+        """Consent on but no cloud backend → still the app-level heuristic floor."""
+        policy = ConsentPolicy(cloud_provider=None, summary_cloud_consent=True)
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=False)
+            is ExecutionTarget.HEURISTIC
+        )
+
+    def test_reuses_summary_row_not_recall(self):
+        """Prose rides the SUMMARY consent row (KTD-4); the recall row can't gate it."""
+        policy = ConsentPolicy(
+            cloud_provider="gemini",
+            summary_cloud_consent=False,
+            recall_cloud_consent=True,
+        )
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=False)
+            is ExecutionTarget.HEURISTIC
+        )
+
+
+class TestDiaryProseNoNewConsentSurface:
+    """R14 (U3 owns this): DIARY_PROSE resolves through the EXISTING consent
+    ladder and introduces NO new consent surface — no new ``ConsentPolicy``
+    field, no new config getter, no toggle. The cloud gate is the existing
+    ``summary_cloud_consent`` row."""
+
+    def test_no_new_consent_policy_field(self):
+        assert not hasattr(ConsentPolicy(), "diary_prose_cloud_consent")
+
+    def test_no_new_config_getter(self):
+        import screencap.config as config
+
+        assert not hasattr(config, "get_diary_prose_cloud_consent")
+
+    def test_from_config_summary_consent_off_prose_never_cloud(self):
+        import screencap.config as cfg
+
+        env = {
+            k: v for k, v in os.environ.items() if not k.startswith("SCREENCAP_")
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg._config_cache = {
+                "intelligence": {
+                    "cloud_provider": "gemini",
+                    "summary_cloud_consent": False,
+                }
+            }
+            policy = ConsentPolicy.from_config()
+        # Off → on-device when available; heuristic when not — never cloud.
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=True)
+            is ExecutionTarget.ON_DEVICE
+        )
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=False)
+            is ExecutionTarget.HEURISTIC
+        )
+
+    def test_from_config_summary_consent_on_prose_cloud_eligible(self):
+        import screencap.config as cfg
+
+        env = {
+            k: v for k, v in os.environ.items() if not k.startswith("SCREENCAP_")
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            # Default summary consent is ON (KTD1); only a provider is configured.
+            cfg._config_cache = {"intelligence": {"cloud_provider": "gemini"}}
+            policy = ConsentPolicy.from_config()
+        assert (
+            policy.resolve(TaskKind.DIARY_PROSE, on_device_available=False)
+            is ExecutionTarget.CLOUD
+        )
+
+    def test_day_split_still_never_cloud_with_prose_added(self):
+        """Adding the prose row must not weaken the day-split never-cloud guard."""
+        policy = ConsentPolicy(cloud_provider="gemini", summary_cloud_consent=True)
+        assert (
+            policy.resolve(TaskKind.DAY_SPLIT, on_device_available=False)
+            is ExecutionTarget.HEURISTIC
+        )
+
+
+# ---------------------------------------------------------------------------
 # ConsentPolicy.from_config — wiring to the config getters
 # ---------------------------------------------------------------------------
 

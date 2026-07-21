@@ -654,6 +654,57 @@ class OnDeviceProvider:
         self.last_unavailable_reason = None
         return CallResult({"overview": overview.strip(), "tags": list(tags)}, None)
 
+    def call_block_bullets(
+        self, digest_payload: dict,
+    ) -> CallResult[list[str]]:
+        """One diary-bullet call for a merged block's evidence digest → ``[str, …]``.
+
+        The prose-kind (U3, KTD-4) analogue of :meth:`call_name_window`: it takes
+        the block's small evidence digest (fragment work-names / categories /
+        minutes / apps — derived from already-stripped per-window evidence, never
+        raw screen content) as wrapped by the consolidator with a
+        ``"stripped": True`` attestation, asserted HERE fail-closed (anything but
+        exactly ``True`` is refused without spawning, mirroring
+        :meth:`call_name_window`) and then dropped from the
+        ``{"task":"block-bullets","digest":{…}}`` request so it never rides into
+        the prompt. The digest carries NO downstream block name, so a bullet can
+        never assert content a confidence gate blanked (KTD-4).
+
+        A ``context-window`` failure is surfaced, NOT handled: digest halving is
+        caller-driven (the consolidator halves and calls again, then falls to the
+        app-level heuristic). Success value is the raw ``list[str]`` of bullets —
+        untrusted model output; the caller runs it through
+        :func:`~screencap.segmentation.sanitize.sanitize_bullets` before it is
+        persisted.
+        """
+        if not isinstance(digest_payload, dict) or digest_payload.get(
+            "stripped"
+        ) is not True:
+            log.warning(
+                "call_block_bullets refused a digest not marked stripped=True "
+                "(fail-closed); not spawning the helper."
+            )
+            self.last_unavailable_reason = REASON_NOT_STRIPPED
+            return CallResult(None, REASON_NOT_STRIPPED)
+
+        digest = {k: v for k, v in digest_payload.items() if k != "stripped"}
+        result, reason = self._call_verb(
+            {"task": "block-bullets", "digest": digest}
+        )
+        if result is None:
+            self.last_unavailable_reason = reason
+            return CallResult(None, reason)
+
+        bullets = result.get("bullets")
+        if not isinstance(bullets, list) or not all(
+            isinstance(b, str) for b in bullets
+        ):
+            log.warning("On-device block-bullets result had no usable bullet list")
+            self.last_unavailable_reason = REASON_BAD_RESULT
+            return CallResult(None, REASON_BAD_RESULT)
+        self.last_unavailable_reason = None
+        return CallResult([b.strip() for b in bullets if b.strip()], None)
+
     def _call_verb(
         self, request: dict, *, deadline: "float | None" = None,
     ) -> tuple[dict | None, str | None]:

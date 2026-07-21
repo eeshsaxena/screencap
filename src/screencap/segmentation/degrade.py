@@ -48,14 +48,16 @@ class DegradeAction(enum.Enum):
 
     - ``USE_PROVIDER`` — the provider returned real tasks; persist them
       unchanged. ``tasks`` on the :class:`Degradation` carries the dict.
-    - ``HEURISTIC`` — the provider could not run; fall back to the local
-      idle-gap heuristic (day-split/label only, KTD6). The caller builds the
-      task boundaries and persists them.
+    - ``HEURISTIC`` — the provider could not run; fall back to a local
+      heuristic: the idle-gap split for day-split/label (KTD6), or app/window-
+      level bullets for diary prose (U3, R6/AE3). The caller builds and persists
+      the result.
     - ``CLOUD`` — the provider could not run and this (consented) task may use
-      the configured cloud provider. Reachable only for SUMMARY/RECALL_ANSWER,
-      **never** for DAY_SPLIT (R7 over R5). Not exercised by terminal_stage's
-      day-split path today; it is the resolver's capability for the future
-      on-demand summary/title flow.
+      the configured cloud provider. Reachable for SUMMARY/RECALL_ANSWER and
+      DIARY_PROSE (the last gated on the summary consent row, KTD-4), **never**
+      for DAY_SPLIT (R7 over R5). Not exercised by terminal_stage's day-split
+      path today; it is the resolver's capability for the summary/title and
+      diary-prose flows.
     - ``NONE`` — nothing to run: the provider ran and produced nothing
       (fail-open no-tasks), or no execution target is available. The caller
       leaves the recording unnamed; it NEVER hard-fails and NEVER uploads.
@@ -114,6 +116,25 @@ def resolve(
     # ON_DEVICE is unreachable here (on_device_available=False); NEVER/NONE and
     # any unexpected target all mean "leave it unrun".
     return Degradation(DegradeAction.NONE)
+
+
+def resolve_prose(
+    provider_result: SegmentResult,
+    policy: ConsentPolicy,
+) -> Degradation:
+    """Diary-prose (bullets/narrative) resolve — cloud-eligible, never NONE (U3).
+
+    The mirror of :func:`resolve_day_split` for the ``DIARY_PROSE`` kind (KTD-4),
+    with the OPPOSITE guarantee: cloud IS a permitted fallback here (gated on the
+    existing summary consent row, R14), and — because a diary block always
+    carries at least app-level bullets — the provider-unavailable branch never
+    resolves to :attr:`DegradeAction.NONE`. It routes to
+    :attr:`~DegradeAction.CLOUD` (consented) or :attr:`~DegradeAction.HEURISTIC`
+    (the honest app/window-level bullets, R6/AE3). Delegates to :func:`resolve`
+    for :attr:`TaskKind.DIARY_PROSE`; the never-cloud assertion is day-split's
+    alone and is left untouched.
+    """
+    return resolve(TaskKind.DIARY_PROSE, provider_result, policy)
 
 
 def resolve_day_split(

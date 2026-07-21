@@ -268,11 +268,14 @@ def test_second_pass_refreshes_agent_rows_without_duplicating(tmp_path, monkeypa
 
 
 def test_user_span_survives_and_no_agent_span_overlaps_it(tmp_path, monkeypatch):
+    """U2 KTD-7 TRIM: a user span in the MIDDLE of an agent block trims that block
+    to abut the curated span cleanly (splitting it into two abutting pieces),
+    instead of DROPPING the whole block. The no-overlap invariant still holds."""
     from screencap.pipeline_state import TaskSegmentRow
 
     rec_dir = _make_local_recording(tmp_path)
     ledger = _ledger(rec_dir)
-    # A user task overlapping the FIRST canned agent task [1000, 2800).
+    # A user task in the MIDDLE of the FIRST canned agent block [1000, 2800).
     ledger.insert_task_segment(TaskSegmentRow(
         task_index=0, start_ts=1500.0, end_ts=2000.0, name="My standup meeting",
     ))
@@ -288,8 +291,14 @@ def test_user_span_survives_and_no_agent_span_overlaps_it(tmp_path, monkeypatch)
     assert [s.name for s in user_rows] == ["My standup meeting"]
     assert user_rows[0].start_ts == 1500.0 and user_rows[0].end_ts == 2000.0
 
-    # The carve-out dropped the overlapping first agent task; the second is kept.
-    assert [s.name for s in agent_rows] == ["Coordinate PR review"]
+    # KTD-7: the overlapped block was TRIMMED to abut the user span (two pieces),
+    # not dropped; the second (non-overlapping) block is untouched.
+    assert sorted((s.start_ts, s.end_ts) for s in agent_rows) == [
+        (1000.0, 1500.0), (2000.0, 2800.0), (2800.0, 4600.0),
+    ]
+    assert [
+        s.name for s in agent_rows if s.start_ts < 2800.0
+    ] == ["Implement auth module", "Implement auth module"]
 
     # INVARIANT: no agent span overlaps the protected user span.
     for a in agent_rows:
@@ -301,7 +310,8 @@ def test_user_span_survives_and_no_agent_span_overlaps_it(tmp_path, monkeypatch)
     _run_incremental(rec_dir)
     segs2 = ledger.read_task_segments()
     assert [s.name for s in segs2 if s.source == "user"] == ["My standup meeting"]
-    assert [s.name for s in segs2 if s.source == "agent"] == ["Coordinate PR review"]
+    agent2 = sorted((s.start_ts, s.end_ts) for s in segs2 if s.source == "agent")
+    assert agent2 == [(1000.0, 1500.0), (2000.0, 2800.0), (2800.0, 4600.0)]
 
 
 def test_edited_agent_span_is_protected_from_overlap(tmp_path, monkeypatch):
@@ -438,7 +448,13 @@ def test_partial_db_fail_closed_yields_no_task_over_masked_interval(
 
 def test_provider_unavailable_falls_back_to_idle_gap_heuristic(tmp_path, monkeypatch):
     """Covers AE5 / AE2: a CLI-only / pre-macOS-26 install (no on-device model)
-    still fills today's Journal mid-recording via the idle-gap heuristic."""
+    still fills today's Journal mid-recording via the idle-gap heuristic.
+
+    U2 day-diary: the idle-gap heuristic's mechanical ``task_N`` names never
+    surface as diary block names (R2 / KTD-10). Consolidation folds the two
+    mechanical clusters into two honest UNNAMED blocks (empty name + a
+    ``name_fallback`` marker); the mechanical signal is carried by the recording
+    outcome, not by a mechanical name on the block."""
     rec_dir = _make_local_recording(tmp_path)
     _install_provider(monkeypatch, _FakeProvider(PROVIDER_UNAVAILABLE))
     _install_consent(monkeypatch, ConsentPolicy())  # no cloud configured.
@@ -447,7 +463,11 @@ def test_provider_unavailable_falls_back_to_idle_gap_heuristic(tmp_path, monkeyp
 
     assert result.tasks_persisted == 2
     segs = _ledger(rec_dir).read_task_segments()
-    assert [s.name for s in segs] == ["task_1", "task_2"]
+    # Honest UNNAMED blocks — NOT the mechanical ``task_1`` / ``task_2`` names.
+    assert [s.name for s in segs] == ["", ""]
+    assert all(
+        json.loads(s.metadata).get("name_fallback") == "mechanical" for s in segs
+    )
     assert all(s.source == "agent" for s in segs)
     persisted = json.loads((rec_dir / "tasks.json").read_text())
     assert persisted["summary"]["source"] == "idle_gap_heuristic"

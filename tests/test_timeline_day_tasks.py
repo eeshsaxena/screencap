@@ -114,6 +114,15 @@ def _find(result: dict, name: str) -> dict | None:
 
 
 _TASK_FIELDS = {"task_index", "start_ts", "end_ts", "name", "category", "confidence"}
+# The typed ``TaskSegment`` model additionally carries the day-diary fields (U1)
+# and the U7 thread-rollup fields, which ``model_dump`` always emits with
+# empty/None defaults even when the raw wire dict omitted them (a non-diary row,
+# and — for rollups — the day band which does not compute them). Old clients
+# ignore the extras.
+_TASK_MODEL_FIELDS = _TASK_FIELDS | {
+    "bullets", "block_id", "thread_id", "is_open",
+    "thread_total_minutes", "thread_sitting_count", "thread_sitting_index",
+}
 
 
 # --- tasks populated + ordered ---------------------------------------------
@@ -166,7 +175,7 @@ def test_tasks_flow_through_the_typed_response_model(tmp_path):
     entry = _find(day_segments.day_segments(_DAY, 0, recordings_dir=tmp_path), "ambient-20260703")
     dumped = schema.DaySegmentRecording(**entry).model_dump()
     assert dumped["tasks"][0]["name"] == "Design review"
-    assert set(dumped["tasks"][0]) == _TASK_FIELDS
+    assert set(dumped["tasks"][0]) == _TASK_MODEL_FIELDS
 
 
 # --- empty / legacy cases (fail-open) --------------------------------------

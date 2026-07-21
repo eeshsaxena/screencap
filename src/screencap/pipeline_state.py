@@ -83,10 +83,12 @@ coexistence story) for the same reason ``scrub_worker`` does.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -105,6 +107,7 @@ __all__ = [
     "EvictState",
     "ChunkRow",
     "TaskSegmentRow",
+    "DayNarrativeRow",
     "PipelineLedger",
     "LedgerError",
     "EvictionRefused",
@@ -116,9 +119,18 @@ __all__ = [
     "read_task_segments_wire",
     "spans_overlap",
     "task_row_is_protected",
+    "task_field_is_protected",
     "USER_TASK_INDEX_BASE",
     "TASK_SOURCE_AGENT",
     "TASK_SOURCE_USER",
+    "TASK_FIELD_NAME",
+    "TASK_FIELD_CATEGORY",
+    "TASK_FIELD_TIME",
+    "TASK_FIELD_BULLETS",
+    "EDITED_FIELD_NAME",
+    "EDITED_FIELD_CATEGORY",
+    "EDITED_FIELD_TIME",
+    "EDITED_FIELD_BULLETS",
 ]
 
 # Match the engine writer's busy_timeout (privacy/scrub_worker.py:471) so a
@@ -145,6 +157,36 @@ _BUSY_TIMEOUT_MS = 10000
 TASK_SOURCE_AGENT = "agent"
 TASK_SOURCE_USER = "user"
 USER_TASK_INDEX_BASE = 1_000_000
+
+# Field-scoped edit protection (U1/KTD-3). The single ``edited`` boolean froze
+# the WHOLE row against both re-segmentation and the retroactive purge. The day
+# diary splits that: ``edited_fields`` is a BITMASK recording WHICH fields a user
+# curated, so a user-RENAMED block keeps its name protected while its
+# agent-written bullets stay purge-eligible and regeneratable (AE5). ``edited``
+# still exists and still carries the row-level meaning ``task_row_is_protected``
+# uses for the agent re-carve (a user-touched row is never bulk-deleted); the
+# bitmask is the NEW axis the purge (U5) and bullet-regeneration (U3) paths
+# consult via :func:`task_field_is_protected`.
+#
+# The field NAMES are the vocabulary those callers pass; the bit VALUES are the
+# stored ``edited_fields`` column. ``time`` covers a span edit (start_ts/end_ts);
+# ``bullets`` covers the topic bullets carried inside ``metadata``.
+TASK_FIELD_NAME = "name"
+TASK_FIELD_CATEGORY = "category"
+TASK_FIELD_TIME = "time"
+TASK_FIELD_BULLETS = "bullets"
+
+EDITED_FIELD_NAME = 1 << 0
+EDITED_FIELD_CATEGORY = 1 << 1
+EDITED_FIELD_TIME = 1 << 2
+EDITED_FIELD_BULLETS = 1 << 3
+
+_EDITED_FIELD_BITS: dict[str, int] = {
+    TASK_FIELD_NAME: EDITED_FIELD_NAME,
+    TASK_FIELD_CATEGORY: EDITED_FIELD_CATEGORY,
+    TASK_FIELD_TIME: EDITED_FIELD_TIME,
+    TASK_FIELD_BULLETS: EDITED_FIELD_BULLETS,
+}
 
 
 def spans_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
@@ -277,6 +319,16 @@ class TaskSegmentRow:
     ``'agent'`` or ``'user'``; ``edited`` marks a user-curated agent row. Both
     default to the agent-unedited state so a row constructed the old way (or read
     back from a pre-U5 DB migrated in place) reads as an agent row.
+
+    Day-diary columns (U1, KTD-2/KTD-3): ``block_id`` is the opaque stable
+    identity a consolidation pass (U2) assigns to a user-facing work block so deep
+    links / threads survive ``task_index`` renumbering; ``thread_id`` links
+    same-work blocks within a day; ``is_open`` marks the live trailing block during
+    a live pass (STORED, cleared at finalize — never derived at read time);
+    ``edited_fields`` is the field-scoped protection bitmask (see
+    :func:`task_field_is_protected`). All default to the neutral empty state so a
+    row constructed the old way, or read back from a pre-U1 DB migrated in place,
+    reads as a plain non-diary agent row.
     """
 
     task_index: int
@@ -288,6 +340,30 @@ class TaskSegmentRow:
     metadata: str | None = None
     source: str = TASK_SOURCE_AGENT
     edited: bool = False
+    block_id: str | None = None
+    thread_id: str | None = None
+    is_open: bool = False
+    edited_fields: int = 0
+
+
+@dataclass(frozen=True)
+class DayNarrativeRow:
+    """An immutable snapshot of the per-recording day-narrative row (U4).
+
+    The written, evidence-bound day narrative the day view composes (R8/R9). One
+    row per recording, stored in the local-only ``recording.db`` (never uploaded —
+    R14). ``narrative`` is the sanitized prose; ``fingerprint`` is the CLOSED
+    block-set staleness key (KTD-6) the pass compares against to skip regenerating
+    an unchanged day; ``reason`` is the observable prose source/fallback marker
+    (``None`` when a model narrated, a fallback marker like ``no-model`` /
+    ``heuristic`` on the honest degrade, so a degrade is never silent — KTD-10);
+    ``generated_at`` is the wall-clock write time.
+    """
+
+    narrative: str
+    fingerprint: str
+    reason: str | None = None
+    generated_at: float | None = None
 
 
 def task_row_is_protected(row: TaskSegmentRow) -> bool:
@@ -299,8 +375,43 @@ def task_row_is_protected(row: TaskSegmentRow) -> bool:
     terminal-stage carve-out so the two can never disagree on what counts as
     protected. Only the predicate is shared — each caller keeps its own span
     assembly.
+
+    ROW-LEVEL by design (KTD-3): it stays the re-carve gate — a user-touched row is
+    never bulk-deleted. The FIELD-level purge/regeneration question ("is *this*
+    field protected?") is :func:`task_field_is_protected`, a distinct axis.
     """
     return row.source == TASK_SOURCE_USER or bool(row.edited)
+
+
+def task_field_is_protected(row: TaskSegmentRow, field: str) -> bool:
+    """True iff the user curated ``field`` on ``row`` (field-scoped, U1/KTD-3).
+
+    The load-bearing privacy predicate the retroactive purge (U5) and bullet
+    regeneration (U3) consult so protection is per FIELD, not per row (AE5): a
+    user-RENAMED agent block protects its ``name`` while its agent-written
+    ``bullets`` stay purge-eligible and regeneratable. ``field`` is one of
+    :data:`TASK_FIELD_NAME` / ``…_CATEGORY`` / ``…_TIME`` / ``…_BULLETS``; an
+    unknown field is a programming error (``KeyError``), never a silent ``False``
+    that would leak protection.
+
+    Rules:
+
+    * ``source='user'`` — the whole row is user-authored content, so EVERY field
+      is protected (a user-created block is untouched by the purge).
+    * agent row with a non-zero ``edited_fields`` bitmask — only the flagged bits
+      are protected (the field-scoped split).
+    * agent row with ``edited=1`` but ``edited_fields=0`` — a LEGACY row curated
+      before the split existed. We can't tell which field was edited, so we
+      conservatively protect EVERY field: the pre-split whole-row protection the
+      user already saw. New writes always set the precise bit, so this fallback
+      only ever covers migrated pre-U1 rows.
+    """
+    bit = _EDITED_FIELD_BITS[field]  # KeyError on an unknown field — never silent
+    if row.source == TASK_SOURCE_USER:
+        return True
+    if row.edited_fields:
+        return bool(row.edited_fields & bit)
+    return bool(row.edited)
 
 
 def from_chunk_status(status: "ChunkStatus") -> UploadState:
@@ -340,21 +451,35 @@ CREATE TABLE IF NOT EXISTS pipeline_task_segments (
     metadata TEXT,
     source TEXT NOT NULL DEFAULT 'agent',
     edited INTEGER NOT NULL DEFAULT 0,
+    block_id TEXT,
+    thread_id TEXT,
+    is_open INTEGER NOT NULL DEFAULT 0,
+    edited_fields INTEGER NOT NULL DEFAULT 0,
     updated_at REAL,
     UNIQUE (recording_id, task_index)
 )
 """
 
-# Guarded ALTER-ADD migration for the U5 source/edited columns. ``CREATE TABLE
-# IF NOT EXISTS`` above does NOT add columns to an already-existing raw-DDL
-# table, so an EXISTING recording.db captured before U5 keeps the old shape
-# unless we ALTER it here. Each entry is ``(column_name, column_ddl)``; existing
-# rows take the ``DEFAULT`` (agent/unedited), so a migrated DB reads back exactly
-# like a fresh one. Mirrors ``engine.db._migrate_schema``'s PRAGMA-check +
+# Guarded ALTER-ADD migration for the columns added after the initial raw DDL.
+# ``CREATE TABLE IF NOT EXISTS`` above does NOT add columns to an already-existing
+# raw-DDL table, so an EXISTING recording.db captured before a given column keeps
+# the old shape unless we ALTER it here. Each entry is ``(column_name,
+# column_ddl)``; existing rows take the ``DEFAULT``, so a migrated DB reads back
+# exactly like a fresh one. Mirrors ``engine.db._migrate_schema``'s PRAGMA-check +
 # duplicate-column tolerance.
+#
+#   * U5: ``source`` / ``edited`` (task ownership).
+#   * U1 day diary (KTD-2/KTD-3): ``block_id`` / ``thread_id`` (stable identity +
+#     thread membership, both nullable), ``is_open`` (STORED live-trailing flag),
+#     ``edited_fields`` (field-scoped protection bitmask). Existing rows default
+#     to the neutral empty state — a plain non-diary agent row.
 _TASK_SEGMENTS_ADDED_COLUMNS = (
     ("source", "source TEXT NOT NULL DEFAULT 'agent'"),
     ("edited", "edited INTEGER NOT NULL DEFAULT 0"),
+    ("block_id", "block_id TEXT"),
+    ("thread_id", "thread_id TEXT"),
+    ("is_open", "is_open INTEGER NOT NULL DEFAULT 0"),
+    ("edited_fields", "edited_fields INTEGER NOT NULL DEFAULT 0"),
 )
 
 # U2 (honest status). One row per recording holding the segmentation OUTCOME
@@ -412,6 +537,26 @@ _SCRUB_GENERATION_DDL = """
 CREATE TABLE IF NOT EXISTS scrub_generation (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     generation INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+# U4 day diary (KTD-6/KTD-10). One row per recording holding the written,
+# evidence-bound day narrative the day view composes (R8/R9). ``fingerprint`` is
+# the CLOSED block-set staleness key (excluding the live ``is_open`` trailing
+# block) so the pass regenerates ONLY when the settled block set changed — never
+# on an unchanged 300s tick, and never merely because the open block grew.
+# ``reason`` is the observable prose source/fallback marker (KTD-10): ``NULL``
+# when a model narrated, a marker string on the honest heuristic degrade.
+# Local-only, in ``recording.db`` (never uploaded — R14). The whole table is
+# created atomically with its full shape, so — like ``ondevice_window_names`` and
+# ``scrub_generation`` — it needs no post-creation ALTER-ADD migration helper.
+_DAY_NARRATIVE_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_day_narrative (
+    recording_id INTEGER PRIMARY KEY,
+    narrative TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    reason TEXT,
+    generated_at REAL
 )
 """
 
@@ -514,6 +659,8 @@ def ensure_pipeline_state_schema(db_path: Path | str) -> None:
         # SCR-275 U4: on-device naming cache + scrub-generation counter.
         conn.execute(_ONDEVICE_NAMES_DDL)
         conn.execute(_SCRUB_GENERATION_DDL)
+        # U4 day diary: the per-recording day-narrative table (idempotent create).
+        conn.execute(_DAY_NARRATIVE_DDL)
         conn.commit()
     except sqlite3.OperationalError:
         # Read-only DB (an old recording opened for read) — do not crash; the
@@ -550,6 +697,18 @@ def _now() -> float:
     return time.time()
 
 
+def _mint_block_id() -> str:
+    """Mint a fresh opaque block-identity token (KTD-2).
+
+    Mirrors the consolidator's ``blk_<uuid4hex>`` shape (see
+    ``segmentation/consolidate.py``) so a curation-minted block id (a merge
+    survivor / a split half) is indistinguishable from a consolidator-minted one
+    to every downstream reader — the wire projection, the diary FTS, and the app's
+    deep-link-by-``block_id`` path.
+    """
+    return f"blk_{uuid.uuid4().hex}"
+
+
 def _insert_user_task_row(
     conn: sqlite3.Connection,
     recording_id: int,
@@ -563,6 +722,8 @@ def _insert_user_task_row(
     metadata: str | None,
     edited: int,
     now: float,
+    block_id: str | None = None,
+    thread_id: str | None = None,
 ) -> None:
     """Insert ONE ``source='user'`` task-segment row on ``conn`` (no commit).
 
@@ -571,16 +732,25 @@ def _insert_user_task_row(
     so the column list and value order can't drift. ``source`` is always
     ``TASK_SOURCE_USER`` on these paths. The caller owns the surrounding
     ``BEGIN IMMEDIATE`` transaction and commit.
+
+    ``block_id`` / ``thread_id`` (U7/KTD-2): a curation act keeps diary identity
+    coherent — a merge survivor mints a fresh ``block_id`` and preserves a
+    unanimous ``thread_id``; each split half mints its own fresh ``block_id`` and
+    inherits the original's ``thread_id``. ``None`` (the ``tasks.create`` default)
+    leaves both columns NULL — a brand-new user block joins no thread. ``is_open``
+    / ``edited_fields`` keep their column defaults (a user row is never the live
+    trailing block; field-scoped protection is set on edit, not on insert).
     """
     conn.execute(
         "INSERT INTO pipeline_task_segments "
         "(recording_id, task_index, start_ts, end_ts, name, "
-        " category, confidence, metadata, source, edited, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " category, confidence, metadata, source, edited, block_id, thread_id, "
+        " updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             recording_id, task_index, start_ts, end_ts, name,
             category, confidence, metadata,
-            TASK_SOURCE_USER, edited, now,
+            TASK_SOURCE_USER, edited, block_id, thread_id, now,
         ),
     )
 
@@ -1220,13 +1390,16 @@ class PipelineLedger:
                         "INSERT INTO pipeline_task_segments "
                         "(recording_id, task_index, start_ts, end_ts, name, "
                         " category, confidence, metadata, source, edited, "
+                        " block_id, thread_id, is_open, edited_fields, "
                         " updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             self._recording_id, seg.task_index,
                             seg.start_ts, seg.end_ts, seg.name,
                             seg.category, seg.confidence, seg.metadata,
-                            seg.source, int(seg.edited), now,
+                            seg.source, int(seg.edited),
+                            seg.block_id, seg.thread_id, int(seg.is_open),
+                            int(seg.edited_fields), now,
                         ),
                     )
                 conn.commit()
@@ -1359,6 +1532,103 @@ class PipelineLedger:
             return None, None
         finally:
             if conn is not None:
+                conn.close()
+
+    # ------------------------------------------------------------------
+    # U4 day diary — per-recording day narrative (evidence-bound, local-only).
+    # ------------------------------------------------------------------
+
+    def set_day_narrative(
+        self, narrative: str, fingerprint: str, reason: str | None = None,
+    ) -> None:
+        """Persist this recording's day narrative row, atomically (U4, KTD-6).
+
+        One row per recording (upsert on the PK). ``narrative`` MUST already be
+        the untrusted-output-sanitized prose (the caller runs it through
+        ``sanitize_answer`` before it lands — the narrative is recording-derived,
+        attacker-influenceable model/heuristic text). ``fingerprint`` is the
+        CLOSED block-set staleness key the next pass compares against to skip an
+        unchanged regeneration (KTD-6). ``reason`` is the observable prose
+        source/fallback marker (KTD-10): ``None`` when a model narrated, a marker
+        string on the honest heuristic degrade. Defensively creates the table so a
+        ``recording.db`` that predates the U4 schema still writes. Local-only — the
+        table lives in ``recording.db`` and is never uploaded (R14).
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_DAY_NARRATIVE_DDL)
+                conn.execute(
+                    "INSERT INTO pipeline_day_narrative "
+                    "(recording_id, narrative, fingerprint, reason, generated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(recording_id) DO UPDATE SET "
+                    "narrative=excluded.narrative, fingerprint=excluded.fingerprint, "
+                    "reason=excluded.reason, generated_at=excluded.generated_at",
+                    (self._recording_id, narrative, fingerprint, reason, _now()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def get_day_narrative(self) -> "DayNarrativeRow | None":
+        """Return this recording's day-narrative row, or ``None`` if unwritten.
+
+        ``None`` for a recording that produced no narrative (a mechanical-only /
+        nothing-to-name day never writes a row — R9), a legacy recording captured
+        before U4 (no row, or the table absent), or any read error. Fail-safe
+        exactly like :meth:`get_recording_outcome`: **any** SQLite error resolves
+        to ``None``, never a raise — the read verb must never fail on a legacy or
+        locked-mid-read DB. Local-only read (never leaves the Mac — R14).
+        """
+        conn = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT narrative, fingerprint, reason, generated_at "
+                "FROM pipeline_day_narrative WHERE recording_id=?",
+                (self._recording_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return DayNarrativeRow(
+                narrative=str(row[0]),
+                fingerprint=str(row[1]),
+                reason=(None if row[2] is None else str(row[2])),
+                generated_at=(None if row[3] is None else float(row[3])),
+            )
+        except sqlite3.Error:
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def clear_day_narrative(self) -> None:
+        """Delete this recording's day-narrative row (U5 purge / invalidation hook).
+
+        Idempotent — a no-op when no row exists. The retroactive scrub purge (U5)
+        invalidates a stale narrative through here so the next tick regenerates it
+        (or leaves none if the day degraded). Defensively creates the table so a
+        pre-U4 DB never raises on the DELETE.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_DAY_NARRATIVE_DDL)
+                conn.execute(
+                    "DELETE FROM pipeline_day_narrative WHERE recording_id=?",
+                    (self._recording_id,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
                 conn.close()
 
     # ------------------------------------------------------------------
@@ -1606,6 +1876,24 @@ class PipelineLedger:
                 if mark_edited:
                     sets.append("edited=?")
                     params.append(1)
+                    # Field-scoped protection (U1/KTD-3): OR in the bit for each
+                    # field this edit actually changed, so a rename-only edit
+                    # protects ``name`` while leaving agent-written ``bullets``
+                    # purge-eligible (AE5). Accumulates with prior edits (RHS reads
+                    # the existing column), never clobbers them. ``bullets`` live in
+                    # the ``metadata`` blob, so a metadata write records the
+                    # bullets bit.
+                    new_bits = 0
+                    if name is not None:
+                        new_bits |= EDITED_FIELD_NAME
+                    if category is not None:
+                        new_bits |= EDITED_FIELD_CATEGORY
+                    if start_ts is not None or end_ts is not None:
+                        new_bits |= EDITED_FIELD_TIME
+                    if metadata is not None:
+                        new_bits |= EDITED_FIELD_BULLETS
+                    sets.append("edited_fields = edited_fields | ?")
+                    params.append(new_bits)
                     # Re-home an unedited agent row out of the agent's LOW range
                     # so a later scoped replace can't collide with it.
                     already_edited = int(row["edited"]) == 1
@@ -1664,7 +1952,8 @@ class PipelineLedger:
         try:
             rows = conn.execute(
                 "SELECT task_index, start_ts, end_ts, name, category, "
-                "confidence, metadata, source, edited FROM pipeline_task_segments "
+                "confidence, metadata, source, edited, block_id, thread_id, "
+                "is_open, edited_fields FROM pipeline_task_segments "
                 "WHERE recording_id=? ORDER BY task_index",
                 (self._recording_id,),
             ).fetchall()
@@ -1679,6 +1968,10 @@ class PipelineLedger:
                     metadata=r["metadata"],
                     source=r["source"] if r["source"] is not None else TASK_SOURCE_AGENT,
                     edited=bool(r["edited"]),
+                    block_id=r["block_id"],
+                    thread_id=r["thread_id"],
+                    is_open=bool(r["is_open"]),
+                    edited_fields=int(r["edited_fields"] or 0),
                 )
                 for r in rows
             ]
@@ -1707,6 +2000,14 @@ class PipelineLedger:
         exist — nothing to merge. Any failure between the delete and the insert
         rolls the WHOLE transaction back, so a partial failure never leaves a
         half-merge (the originals are deleted only if the survivor commits).
+
+        Diary coherence (U7/KTD-2): the survivor mints a FRESH ``block_id`` (a
+        merged block is a new identity) and PRESERVES the ``thread_id`` only when
+        every merged row already shares one non-null thread — merging two sittings
+        of the same thread keeps that thread; a mixed merge (any row outside the
+        thread) drops to no thread rather than inventing one. Thread rollups are
+        computed at read time keyed on ``(recording, thread_id)``, so preserving
+        the token is all the survivor needs to stay in its thread.
         """
         # De-dup while preserving order; a merge needs >=2 DISTINCT targets.
         wanted = list(dict.fromkeys(int(i) for i in task_indices))
@@ -1719,7 +2020,8 @@ class PipelineLedger:
                     return None
                 placeholders = ",".join("?" for _ in wanted)
                 rows = conn.execute(
-                    "SELECT task_index, start_ts, end_ts FROM pipeline_task_segments "
+                    "SELECT task_index, start_ts, end_ts, thread_id "
+                    "FROM pipeline_task_segments "
                     f"WHERE recording_id=? AND task_index IN ({placeholders})",
                     (self._recording_id, *wanted),
                 ).fetchall()
@@ -1729,6 +2031,15 @@ class PipelineLedger:
                     return None
                 union_start = min(float(r["start_ts"]) for r in rows)
                 union_end = max(float(r["end_ts"]) for r in rows)
+                # Preserve the thread only when it is UNANIMOUS across the merged
+                # rows (one distinct non-null token, present on every row); any
+                # gap → no thread, never a fabricated one.
+                thread_ids = {r["thread_id"] for r in rows}
+                survivor_thread = (
+                    next(iter(thread_ids))
+                    if len(thread_ids) == 1 and None not in thread_ids
+                    else None
+                )
                 conn.execute(
                     "DELETE FROM pipeline_task_segments "
                     f"WHERE recording_id=? AND task_index IN ({placeholders})",
@@ -1740,6 +2051,7 @@ class PipelineLedger:
                     start_ts=union_start, end_ts=union_end, name=name,
                     category=category, confidence=confidence, metadata=metadata,
                     edited=0, now=_now(),
+                    block_id=_mint_block_id(), thread_id=survivor_thread,
                 )
                 conn.commit()
                 return new_index
@@ -1770,13 +2082,20 @@ class PipelineLedger:
         ``(left_index, right_index)``; returns ``None`` (rolling back) when the
         row is absent OR ``split_ts`` is not strictly inside the span. Any failure
         rolls the whole transaction back — never a half-split.
+
+        Diary coherence (U7/KTD-2): each half mints its OWN fresh ``block_id`` (a
+        split produces two new identities) and INHERITS the original's
+        ``thread_id`` — splitting a sitting keeps both halves in the sitting's
+        thread. Only this row is rewritten, so neighboring blocks' ``block_id`` /
+        thread membership are untouched.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT start_ts, end_ts, name, category, confidence, metadata "
+                    "SELECT start_ts, end_ts, name, category, confidence, "
+                    "metadata, thread_id "
                     "FROM pipeline_task_segments WHERE recording_id=? AND task_index=?",
                     (self._recording_id, task_index),
                 ).fetchone()
@@ -1792,6 +2111,7 @@ class PipelineLedger:
                 category = row["category"]
                 confidence = row["confidence"]
                 metadata = row["metadata"]
+                thread_id = row["thread_id"]
                 conn.execute(
                     "DELETE FROM pipeline_task_segments "
                     "WHERE recording_id=? AND task_index=?",
@@ -1805,6 +2125,7 @@ class PipelineLedger:
                     name=name_left if name_left is not None else base_name,
                     category=category, confidence=confidence, metadata=metadata,
                     edited=0, now=now,
+                    block_id=_mint_block_id(), thread_id=thread_id,
                 )
                 # The just-inserted left row is visible on this connection, so the
                 # second allocation returns left_index+1 — the two halves never
@@ -1816,6 +2137,7 @@ class PipelineLedger:
                     name=name_right if name_right is not None else base_name,
                     category=category, confidence=confidence, metadata=metadata,
                     edited=0, now=now,
+                    block_id=_mint_block_id(), thread_id=thread_id,
                 )
                 conn.commit()
                 return (left_index, right_index)
@@ -1826,14 +2148,78 @@ class PipelineLedger:
                 conn.close()
 
 
+def _parse_wire_bullets(metadata: str | None) -> list | None:
+    """Extract the topic ``bullets`` list from a task row's ``metadata`` JSON blob.
+
+    Bullets (U1/U3) ride the free-text ``metadata`` blob (alongside
+    description/apps_used/derived_name) rather than a dedicated column. Returns
+    the list when the blob parses and carries a non-empty list-typed ``bullets``
+    key; ``None`` otherwise — a missing/``None``/unparseable blob, a blob without
+    a ``bullets`` key, or a non-list / empty value. Strictly non-fabricating: a
+    row with no real bullets never grows an empty list, and a malformed blob never
+    raises (fail-open read surface).
+    """
+    if not metadata:
+        return None
+    try:
+        blob = json.loads(metadata)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(blob, dict):
+        return None
+    bullets = blob.get("bullets")
+    if isinstance(bullets, list) and bullets:
+        return bullets
+    return None
+
+
+def _strip_metadata_bullets(metadata: str | None) -> str | None:
+    """Return ``metadata`` with the agent topic-bullet payload removed (U5/KTD-3).
+
+    The retroactive purge's field-scoped bullet clear
+    (``scrub_worker._clear_protected_agent_bullets``) calls this to drop the
+    ``bullets`` list — and its paired ``bullets_fallback`` honest-degrade marker —
+    from a block's ``metadata`` JSON blob IN PLACE, so a user-renamed block loses
+    the disabled app's bullets while EVERY other field is preserved (the name lives
+    in its own column; ``description`` / ``apps_used`` / ``block_id`` / ``thread_id``
+    ride the blob and stay). Returns the re-serialized blob, or ``None`` when the
+    strip empties it.
+
+    Idempotent + non-fabricating, mirroring :func:`_parse_wire_bullets`'s
+    fail-open read discipline: a ``None`` / empty / unparseable / non-dict blob, or
+    a blob carrying NEITHER bullet key, is returned UNCHANGED (same object) so the
+    caller can detect "nothing to clear" by equality and skip the write.
+    """
+    if not metadata:
+        return metadata
+    try:
+        blob = json.loads(metadata)
+    except (ValueError, TypeError):
+        return metadata
+    if not isinstance(blob, dict):
+        return metadata
+    if "bullets" not in blob and "bullets_fallback" not in blob:
+        return metadata
+    blob.pop("bullets", None)
+    blob.pop("bullets_fallback", None)
+    return json.dumps(blob) if blob else None
+
+
 def read_task_segments_wire(rec_dir: Path) -> list[dict]:
-    """Read a recording's named task segments as the 6-field ``TaskSegment`` wire shape.
+    """Read a recording's named task segments as the ``TaskSegment`` wire shape.
 
     The single shared read path behind ``tasks.list`` (daemon) and the day-level
     ``tasks`` band (``day_segments``): reads ``read_task_segments`` off the
     recording's local-only ``recording.db`` (never uploaded — R4/R8) and projects
-    each row to ``{task_index, start_ts, end_ts, name, category, confidence}`` — the
-    store's ``source`` / ``edited`` ownership columns stay internal.
+    each row to ``{task_index, start_ts, end_ts, name, category, confidence}`` plus
+    the day-diary fields (U1/KTD-9) — ``bullets`` (parsed from the ``metadata``
+    blob), ``thread_id``, ``block_id``, ``is_open`` — carried ADDITIVELY: each
+    diary key is present only when the row actually holds that data, so a plain
+    non-diary row projects the original six-field shape unchanged and an
+    older-daemon consumer sees no new keys (forward compat; the Swift side decodes
+    with ``decodeIfPresent``). Thread rollups (total minutes, sitting count) are
+    NOT computed here — that is ``tasks_query``'s job (U7). The store's ``source`` /
+    ``edited`` / ``edited_fields`` ownership columns stay internal.
 
     READ-FIRST: reads directly and only migrates
     (``ensure_pipeline_state_schema``) on a missing-table / missing-column
@@ -1850,8 +2236,9 @@ def read_task_segments_wire(rec_dir: Path) -> list[dict]:
     try:
         segments = PipelineLedger(db_path).read_task_segments()
     except sqlite3.OperationalError:
-        # Legacy DB missing the task table / pre-U5 source/edited columns → migrate
-        # once (idempotent, creates the table on an old DB), then retry the read.
+        # Legacy DB missing the task table / pre-diary columns → migrate once
+        # (idempotent, creates the table / ALTER-adds the columns on an old DB),
+        # then retry the read.
         try:
             ensure_pipeline_state_schema(db_path)
             segments = PipelineLedger(db_path).read_task_segments()
@@ -1860,8 +2247,9 @@ def read_task_segments_wire(rec_dir: Path) -> list[dict]:
     except (LedgerError, sqlite3.Error):
         # No recording row / unreadable DB → treat as "no tasks" rather than raise.
         return []
-    return [
-        {
+    out: list[dict] = []
+    for seg in segments:
+        row: dict = {
             "task_index": seg.task_index,
             "start_ts": seg.start_ts,
             "end_ts": seg.end_ts,
@@ -1869,8 +2257,19 @@ def read_task_segments_wire(rec_dir: Path) -> list[dict]:
             "category": seg.category,
             "confidence": seg.confidence,
         }
-        for seg in segments
-    ]
+        # Diary fields are additive: only present when the row carries them, so a
+        # non-diary row (and an older consumer) sees exactly the six-field shape.
+        if seg.block_id is not None:
+            row["block_id"] = seg.block_id
+        if seg.thread_id is not None:
+            row["thread_id"] = seg.thread_id
+        if seg.is_open:
+            row["is_open"] = True
+        bullets = _parse_wire_bullets(seg.metadata)
+        if bullets is not None:
+            row["bullets"] = bullets
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------

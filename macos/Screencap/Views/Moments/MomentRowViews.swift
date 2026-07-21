@@ -67,6 +67,9 @@ private struct AutoRow: View {
 
     @EnvironmentObject private var index: RecordingsIndex
     @State private var hovering = false
+    // Collapsed-by-default bullets disclosure (U8 diary rendering, re-based onto
+    // the Moments AutoRow per KTD-12) — local to the row.
+    @State private var bulletsExpanded = false
 
     /// Stable-id-first resolution (survives a post-stop rename) for the poster
     /// anchors + current dir name.
@@ -103,6 +106,19 @@ private struct AutoRow: View {
                             )
                     }
                 }
+                // U8 diary substance on the moment row (KTD-12 re-base): the live
+                // marker, the thread rollup chip (R7), and the expandable topic
+                // bullets (R4). The chip is informational here (the row tap opens
+                // the task); same-day scroll-to-sibling is deferred (follow-ups).
+                if task.isOpen || task.threadChipText != nil || !task.bullets.isEmpty {
+                    HStack(spacing: 8) {
+                        if task.isOpen { livePill }
+                        if let chip = task.threadChipText { threadChipBadge(chip) }
+                        if !task.bullets.isEmpty { bulletsDisclosure }
+                        Spacer(minLength: 0)
+                    }
+                }
+                if bulletsExpanded, !task.bullets.isEmpty { bulletsList }
             }
             Spacer(minLength: 0)
             // "Open day →" as its OWN control (event-consuming) so a click here
@@ -135,6 +151,72 @@ private struct AutoRow: View {
         .accessibilityHint("Opens the task")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { openTask() }
+    }
+
+    /// The provisional "live" marker for the open trailing block (U8) — mirrors
+    /// the LiveTaskDraft provisional presentation: a small teal dot + label.
+    private var livePill: some View {
+        HStack(spacing: 5) {
+            Circle().fill(Color.scTeal).frame(width: 6, height: 6)
+            Text("live")
+                .font(SCTypography.mono(size: 10))
+                .foregroundStyle(Color.scTeal)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
+        .background(Color.scTealSoft.opacity(0.4), in: Capsule())
+        .accessibilityLabel("Live — still recording")
+    }
+
+    /// The thread rollup chip ("2 of 2 · 2h43", R7) — informational on the moment
+    /// row (the row tap opens the task). Rendered only for threads of >=2 sittings.
+    private func threadChipBadge(_ text: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "link").font(.system(size: 9, weight: .semibold))
+            Text(text).font(SCTypography.mono(size: 10))
+        }
+        .foregroundStyle(Color.scTeal)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
+        .background(Color.scTealSoft.opacity(0.4), in: Capsule())
+        .accessibilityLabel("Thread, \(text)")
+    }
+
+    /// The collapsed/expanded topic-bullets toggle (R4) — a chevron disclosure.
+    private var bulletsDisclosure: some View {
+        Button {
+            bulletsExpanded.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: bulletsExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(task.bullets.count == 1 ? "1 note" : "\(task.bullets.count) notes")
+                    .font(SCTypography.mono(size: 10))
+            }
+            .foregroundStyle(Color.scInkMuted)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(bulletsExpanded ? "Hide topic notes" : "Show \(task.bullets.count) topic notes")
+    }
+
+    /// The expanded topic bullets (R4) — one line per bullet, evidence-bound prose.
+    private var bulletsList: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(task.bullets.enumerated()), id: \.offset) { _, bullet in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("•")
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkMuted)
+                    Text(bullet)
+                        .font(SCTypography.sans(size: 12))
+                        .foregroundStyle(Color.scInkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.leading, 2)
+        .accessibilityElement(children: .combine)
     }
 }
 

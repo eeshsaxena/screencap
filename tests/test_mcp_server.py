@@ -45,6 +45,9 @@ class _StubClient:
     async def content_search(self, query, *, recording=None, limit=None):
         return await self._reply("content", query, recording, limit)
 
+    async def diary_search(self, query, *, recording=None, limit=None):
+        return await self._reply("diary", query, recording, limit)
+
     async def transcript_search(self, query, *, recording=None, limit=None):
         return await self._reply("transcript", query, recording, limit)
 
@@ -62,6 +65,12 @@ class _StubClient:
 
     async def whoami(self):
         return await self._reply("whoami")
+
+    async def timeline_day(self, *, date=None, tz_offset_seconds=None):
+        return await self._reply("timeline_day", date, tz_offset_seconds)
+
+    async def tasks_query(self, *, start_date=None, end_date=None, tz_offset_seconds=None):
+        return await self._reply("tasks_query", start_date, end_date, tz_offset_seconds)
 
 
 def _use_client(monkeypatch, client) -> None:
@@ -90,6 +99,41 @@ async def test_content_tool_maps_pointer_only_hits(monkeypatch):
     assert result.hits[0].timestamp_ms == 125000
     # Pointer-only: the model has no path/bytes field by construction.
     assert set(server.ContentHit.model_fields) == {"recording", "timestamp_ms", "snippet", "score"}
+
+
+@pytest.mark.asyncio
+async def test_diary_tool_maps_pointer_only_block_hits(monkeypatch):
+    """The read-only diary mirror maps ``(recording, block_id, span, snippet)``
+    pointer hits — no path/bytes/full-bullet field on the model (day-diary U6)."""
+    stub = _StubClient({
+        "diary": {
+            "ok": True,
+            "hits": [{
+                "recording": "2026-06-01_0900",
+                "block_id": "blk-morning",
+                "start_ms": 10_000,
+                "end_ms": 120_000,
+                "snippet": "spinning back kick",
+                "score": -1.4,
+            }],
+            "index_state": "ok",
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.search_diary("spinning")
+
+    assert isinstance(result, server.DiarySearchResult)
+    assert result.index_state == "ok"
+    hit = result.hits[0]
+    assert hit.recording == "2026-06-01_0900" and hit.block_id == "blk-morning"
+    assert hit.start_ms == 10_000 and hit.end_ms == 120_000
+    # Pointer-only by construction: no path / bytes / full-bullet field.
+    assert set(server.DiaryBlockHit.model_fields) == {
+        "recording", "block_id", "start_ms", "end_ms", "snippet", "score",
+    }
+    # The tool forwards to the diary verb (not content).
+    assert stub.calls[0][0] == "diary"
 
 
 @pytest.mark.asyncio
@@ -201,11 +245,90 @@ async def test_resolve_frame_is_registered():
     mcp = server.build_server()
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
-        "search_screen_content", "search_transcript", "query_timeline",
-        "resolve_frame", "read_frame", "list_recordings", "whoami", "chat_answer",
+        "search_screen_content", "search_diary", "search_transcript",
+        "query_timeline", "resolve_frame", "read_frame", "list_recordings",
+        "whoami", "chat_answer",
         # U13 (R18) day-first browse tools — NO delete-shaped tool (human-only).
         "browse_day", "query_tasks", "create_clip",
     }
+
+
+@pytest.mark.asyncio
+async def test_no_thread_or_block_mutation_tool_registered():
+    """U7 Scope Boundary / SECURITY.md R18: thread & block curation is human-only —
+    NO create/rename/merge/split/delete-shaped thread/block tool is ever forwarded
+    over MCP. The read/browse surface is the whole tool set (pinned above)."""
+    mcp = server.build_server()
+    names = {t.name for t in await mcp.list_tools()}
+    forbidden = {
+        "merge_tasks", "split_task", "rename_task", "update_task", "delete_task",
+        "create_task", "curate_task", "edit_task",
+        "merge_thread", "split_thread", "link_thread", "curate_thread",
+        "merge_block", "split_block", "rename_block", "edit_block", "delete_block",
+    }
+    assert names.isdisjoint(forbidden), names
+    # The only mutating tool is clip creation (R18-attributed, no delete counterpart).
+    assert {n for n in names if "clip" in n} == {"create_clip"}
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_mirrors_diary_and_rollup_fields(monkeypatch):
+    """The cross-day ``query_tasks`` tool mirrors the day-diary fields + thread
+    rollup READ-ONLY so an agent sees exactly what the app sees (U7/KTD-9)."""
+    stub = _StubClient({
+        "tasks_query": {
+            "ok": True, "start_date": "2026-06-01", "end_date": "2026-06-01",
+            "days": [{"date": "2026-06-01", "tasks": [{
+                "recording": "2026-06-01_0900", "recording_id": "id0", "task_index": 0,
+                "start_ts": 1.0, "end_ts": 61.0, "name": "Kata drills",
+                "bullets": ["spinning back kick"], "block_id": "blk-morning",
+                "thread_id": "thr-kata", "is_open": False,
+                "thread_total_minutes": 60.0, "thread_sitting_count": 2,
+                "thread_sitting_index": 1,
+            }]}],
+            "recordings": [], "store_state": "mounted",
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.query_tasks("2026-06-01", "2026-06-01")
+
+    hit = result.days[0].tasks[0]
+    assert hit.block_id == "blk-morning" and hit.thread_id == "thr-kata"
+    assert hit.bullets == ["spinning back kick"] and hit.is_open is False
+    assert hit.thread_total_minutes == 60.0 and hit.thread_sitting_count == 2
+    assert hit.thread_sitting_index == 1
+    # It forwarded to the tasks.query verb (not a mutation).
+    assert stub.calls[0][0] == "tasks_query"
+
+
+@pytest.mark.asyncio
+async def test_browse_day_mirrors_diary_block_fields(monkeypatch):
+    """The ``browse_day`` tool mirrors a block's diary fields READ-ONLY. Rollups are
+    null here (the day band does not compute them — use query_tasks)."""
+    stub = _StubClient({
+        "timeline_day": {
+            "ok": True, "date": "2026-06-01",
+            "recordings": [{
+                "name": "2026-06-01_0900", "recording_id": "id0", "state": "done",
+                "start_ms": 0, "end_ms": 1000,
+                "tasks": [{
+                    "task_index": 0, "start_ts": 1.0, "end_ts": 61.0, "name": "Kata",
+                    "bullets": ["kick"], "block_id": "blk-a", "thread_id": "thr-k",
+                    "is_open": True,
+                }],
+            }],
+        }
+    })
+    _use_client(monkeypatch, stub)
+
+    result = await server.browse_day("2026-06-01")
+
+    task = result.recordings[0].tasks[0]
+    assert task.block_id == "blk-a" and task.thread_id == "thr-k"
+    assert task.bullets == ["kick"] and task.is_open is True
+    # Rollup fields present on the model but null (not computed by the day band).
+    assert task.thread_total_minutes is None and task.thread_sitting_count is None
 
 
 @pytest.mark.asyncio

@@ -147,7 +147,8 @@ def test_built_server_exposes_no_store_mutation_tool():
     # The exact expected tool set (pins additions too). The U13 day-first browse
     # tools (browse_day / query_tasks / create_clip, R18) are additive; create_clip
     # writes a durable CLIP artifact but is NOT a vault-store mutation (no
-    # lock/unlock/migrate), so KTD-16 still holds.
+    # lock/unlock/migrate), so KTD-16 still holds. search_diary (day-diary U6) is a
+    # read-only pointer-only search over blocks/bullets — no mutation.
     assert names == {
         "search_screen_content",
         "search_transcript",
@@ -160,6 +161,7 @@ def test_built_server_exposes_no_store_mutation_tool():
         "browse_day",
         "query_tasks",
         "create_clip",
+        "search_diary",
     }
 
     # No store-mutation tool by any plausible name — a headless agent must never be

@@ -711,3 +711,157 @@ async def test_update_name_only_is_unaffected_by_orphan_guard(
     assert row.name == "Renamed"
     # Span untouched — the guard did not run, and did not alter the bounds.
     assert (row.start_ts, row.end_ts) == (_C1[0] + 100, _C1[0] + 300)
+
+
+# ---------------------------------------------------------------------------
+# U7 diary coherence: merge/split keep block_id + thread membership coherent.
+# Privacy-marked (the composite-thread invariant is a diary-privacy-adjacent
+# contract) + Vision-free — CI runs only ``pytest -m privacy``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_merge_same_thread_preserves_thread_and_mints_fresh_block(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Merging two blocks of the SAME (recording, thread) preserves the thread;
+    the merged survivor gets a coherent freshly-minted ``block_id``."""
+    from screencap.pipeline_state import TaskSegmentRow
+
+    _patch_peer(monkeypatch)
+    rec = _make_recording(recordings_dir, "demo")
+    _ledger(rec).replace_task_segments([
+        TaskSegmentRow(task_index=0, start_ts=10.0, end_ts=20.0, name="A",
+                       block_id="blk-a", thread_id="thr-1"),
+        TaskSegmentRow(task_index=1, start_ts=20.0, end_ts=30.0, name="B",
+                       block_id="blk-b", thread_id="thr-1"),
+    ])
+
+    resp = await _post(
+        "tasks.merge",
+        {"recording": "demo", "task_indices": [0, 1], "name": "Combined"},
+    )
+    assert resp.status_code == 200, resp.text
+    survivor = _rows_by_index(rec)[resp.json()["task_index"]]
+
+    # Thread preserved; block_id freshly minted (the consolidator's blk_ shape),
+    # not reused from either original.
+    assert survivor.thread_id == "thr-1"
+    assert survivor.block_id and survivor.block_id.startswith("blk_")
+    assert survivor.block_id not in {"blk-a", "blk-b"}
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_merge_mixed_thread_membership_drops_to_no_thread(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A merge spanning a threaded block and an un-threaded one does NOT invent a
+    thread — the survivor drops to no thread (unanimity rule)."""
+    from screencap.pipeline_state import TaskSegmentRow
+
+    _patch_peer(monkeypatch)
+    rec = _make_recording(recordings_dir, "demo")
+    _ledger(rec).replace_task_segments([
+        TaskSegmentRow(task_index=0, start_ts=10.0, end_ts=20.0, name="A",
+                       block_id="blk-a", thread_id="thr-1"),
+        TaskSegmentRow(task_index=1, start_ts=20.0, end_ts=30.0, name="B",
+                       block_id="blk-b"),  # no thread
+    ])
+
+    resp = await _post(
+        "tasks.merge",
+        {"recording": "demo", "task_indices": [0, 1], "name": "Combined"},
+    )
+    assert resp.status_code == 200, resp.text
+    survivor = _rows_by_index(rec)[resp.json()["task_index"]]
+    assert survivor.thread_id is None  # no fabricated thread
+    assert survivor.block_id and survivor.block_id.startswith("blk_")
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_split_mints_fresh_blocks_inherits_thread_leaves_neighbor(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Split assigns a FRESH ``block_id`` to each half and both inherit the
+    original's thread; the neighboring block's id + thread membership are
+    untouched."""
+    from screencap.pipeline_state import TaskSegmentRow
+
+    _patch_peer(monkeypatch)
+    rec = _make_recording(recordings_dir, "demo")
+    _ledger(rec).replace_task_segments([
+        TaskSegmentRow(task_index=0, start_ts=0.0, end_ts=10.0, name="X",
+                       block_id="blk-x", thread_id="thr-1"),
+        TaskSegmentRow(task_index=1, start_ts=10.0, end_ts=20.0, name="neighbor",
+                       block_id="blk-n", thread_id="thr-1"),
+    ])
+
+    resp = await _post(
+        "tasks.split", {"recording": "demo", "task_index": 0, "split_ts": 4.0}
+    )
+    assert resp.status_code == 200, resp.text
+    left_idx, right_idx = resp.json()["task_indices"]
+    rows = _rows_by_index(rec)
+    left, right = rows[left_idx], rows[right_idx]
+
+    # Each half: its OWN fresh block_id (neither the original's nor the other's),
+    # both inheriting the split block's thread.
+    assert left.block_id.startswith("blk_") and right.block_id.startswith("blk_")
+    assert left.block_id != right.block_id
+    assert {left.block_id, right.block_id}.isdisjoint({"blk-x", "blk-n"})
+    assert left.thread_id == "thr-1" and right.thread_id == "thr-1"
+
+    # The neighbor at index 1 was NOT rewritten — same block_id + thread.
+    neighbor = rows[1]
+    assert neighbor.block_id == "blk-n" and neighbor.thread_id == "thr-1"
+
+
+@pytest.mark.privacy
+@pytest.mark.asyncio
+async def test_audit_never_records_block_name_or_bullets(
+    recordings_dir: Path, audit_log_at: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create / rename / merge / split leaves NO block name (free-text label) or
+    bullet text anywhere in the audit log — only verb + outcome + peer."""
+    from screencap.pipeline_state import TaskSegmentRow
+
+    _patch_peer(monkeypatch)
+    rec = _make_recording(recordings_dir, "demo")
+    _ledger(rec).replace_task_segments([
+        TaskSegmentRow(task_index=0, start_ts=0.0, end_ts=10.0, name="agent 0"),
+        TaskSegmentRow(task_index=1, start_ts=10.0, end_ts=20.0, name="agent 1"),
+        TaskSegmentRow(task_index=2, start_ts=20.0, end_ts=30.0, name="agent 2"),
+        TaskSegmentRow(task_index=3, start_ts=30.0, end_ts=40.0, name="agent 3"),
+    ])
+
+    secret = "SECRET-PROJECT-ORION"
+    # Each verb carries the sensitive label in a distinct field; disjoint indices
+    # so no verb re-homes a row another verb then targets.
+    assert (await _post("tasks.create", {
+        "recording": "demo", "name": f"{secret}-create",
+        "start_ts": 100.0, "end_ts": 110.0,
+    })).status_code == 200
+    assert (await _post("tasks.update", {
+        "recording": "demo", "task_index": 3, "name": f"{secret}-rename",
+    })).status_code == 200
+    assert (await _post("tasks.merge", {
+        "recording": "demo", "task_indices": [0, 1], "name": f"{secret}-merge",
+    })).status_code == 200
+    assert (await _post("tasks.split", {
+        "recording": "demo", "task_index": 2, "split_ts": 25.0,
+        "name_left": f"{secret}-left", "name_right": f"{secret}-right",
+    })).status_code == 200
+
+    log_text = audit_log_at.read_text(encoding="utf-8")
+    assert secret not in log_text  # no free-text label ever accrues in the log
+
+    records = [json.loads(line) for line in log_text.splitlines() if line.strip()]
+    verbs = {r["verb"] for r in records}
+    assert {"tasks.create", "tasks.update", "tasks.merge", "tasks.split"} <= verbs
+    # Every one of these audited exits was a success recording peer + outcome only.
+    curation = [r for r in records if r["verb"].startswith("tasks.")]
+    assert curation and all(r["outcome"] == "ok" for r in curation)
+    assert all(r["peer_pid"] == 4321 for r in curation)

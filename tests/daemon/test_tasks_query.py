@@ -111,6 +111,8 @@ def _seed_task_segments(rec_dir: Path, rows: list[dict]) -> None:
                 name=r["name"],
                 category=r.get("category"),
                 confidence=r.get("confidence"),
+                block_id=r.get("block_id"),
+                thread_id=r.get("thread_id"),
             )
             for r in rows
         ]
@@ -188,6 +190,123 @@ def test_range_spanning_days_returns_day_grouped_tasks(tmp_path):
     rollup = _rollup(result)
     assert rollup["rec-a"]["reason"] == "produced_tasks"
     assert rollup["rec-b"]["reason"] == "mechanical_only"
+
+
+# --- thread rollups (R7, U7): computed at read time, composite-keyed ---------
+
+
+def test_thread_rollup_reported_on_members_and_absent_on_lone_block(tmp_path):
+    """A thread of two blocks (same recording, same ``thread_id``) reports the
+    rollup (total minutes, sitting 1-of-2 / 2-of-2) on BOTH rows; a lone block in
+    the same day reports none (no rollup keys → serialized null downstream)."""
+    rec = tmp_path / "rec-thread"
+    _make_recording_db(rec, started=_DAY0_START + 3600, end=_DAY0_START + 9000)
+    _seed_task_segments(
+        rec,
+        [
+            {"task_index": 0, "start_ts": _DAY0_START + 3600, "end_ts": _DAY0_START + 5400,
+             "name": "Kata drills", "block_id": "blk-a", "thread_id": "thr-kata"},
+            {"task_index": 1, "start_ts": _DAY0_START + 7200, "end_ts": _DAY0_START + 9000,
+             "name": "Kata drills", "block_id": "blk-b", "thread_id": "thr-kata"},
+            # A lone, unrelated block on the same day — no thread.
+            {"task_index": 2, "start_ts": _DAY0_START + 5400, "end_ts": _DAY0_START + 6000,
+             "name": "Email", "block_id": "blk-c"},
+        ],
+    )
+
+    result = tasks_query.query_tasks(_DAY0, _DAY0, 0, recordings_dir=tmp_path)
+    by_block = {t["block_id"]: t for t in _day(result, _DAY0)["tasks"]}
+    a, b, c = by_block["blk-a"], by_block["blk-b"], by_block["blk-c"]
+
+    # Each thread member: total 60 min (30 + 30), count 2, chronological index.
+    assert a["thread_total_minutes"] == 60.0 and a["thread_sitting_count"] == 2
+    assert a["thread_sitting_index"] == 1
+    assert b["thread_total_minutes"] == 60.0 and b["thread_sitting_count"] == 2
+    assert b["thread_sitting_index"] == 2
+    assert a["thread_id"] == b["thread_id"] == "thr-kata"
+
+    # The lone block carries NO rollup (and no thread_id) — never "sitting 1 of 1".
+    assert "thread_total_minutes" not in c
+    assert "thread_sitting_count" not in c and "thread_sitting_index" not in c
+    assert "thread_id" not in c
+
+
+def test_same_thread_id_across_recordings_never_merges(tmp_path):
+    """Cross-recording safety: the SAME ``thread_id`` string minted in two
+    different recordings on the same day stays TWO threads — the rollup is keyed on
+    the composite ``(recording, thread_id)``, so the tokens can never falsely
+    merge (same-day cross-recording linking is deferred)."""
+    shared = "thr-collision"  # the identical token string in both recordings
+    rec_a = tmp_path / "rec-a"
+    _make_recording_db(rec_a, started=_DAY0_START + 3600, end=_DAY0_START + 9000)
+    _seed_task_segments(
+        rec_a,
+        [
+            {"task_index": 0, "start_ts": _DAY0_START + 3600, "end_ts": _DAY0_START + 5400,
+             "name": "A one", "block_id": "a1", "thread_id": shared},
+            {"task_index": 1, "start_ts": _DAY0_START + 7200, "end_ts": _DAY0_START + 9000,
+             "name": "A two", "block_id": "a2", "thread_id": shared},
+        ],
+    )
+    rec_b = tmp_path / "rec-b"
+    _make_recording_db(rec_b, started=_DAY0_START + 10000, end=_DAY0_START + 20000)
+    _seed_task_segments(
+        rec_b,
+        [
+            {"task_index": 0, "start_ts": _DAY0_START + 10000, "end_ts": _DAY0_START + 13600,
+             "name": "B one", "block_id": "b1", "thread_id": shared},
+            {"task_index": 1, "start_ts": _DAY0_START + 14000, "end_ts": _DAY0_START + 17600,
+             "name": "B two", "block_id": "b2", "thread_id": shared},
+        ],
+    )
+
+    result = tasks_query.query_tasks(_DAY0, _DAY0, 0, recordings_dir=tmp_path)
+    by_block = {t["block_id"]: t for t in _day(result, _DAY0)["tasks"]}
+
+    # rec-a's thread: count 2 (NOT 4 — the rec-b blocks did not join), total 60 min.
+    assert by_block["a1"]["thread_sitting_count"] == 2
+    assert by_block["a1"]["thread_total_minutes"] == 60.0
+    # rec-b's thread: its OWN count 2, total 120 min (2 x 60).
+    assert by_block["b1"]["thread_sitting_count"] == 2
+    assert by_block["b1"]["thread_total_minutes"] == 120.0
+    # Sitting index restarts per (recording, thread) — both threads own a "1 of 2".
+    assert by_block["a1"]["thread_sitting_index"] == 1
+    assert by_block["b1"]["thread_sitting_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_verb_carries_thread_rollup_through_typed_model(tmp_path, monkeypatch):
+    """The rollup survives the typed ``TasksQueryResponse`` parity check — i.e. the
+    fields are a real part of the wire model, not a stray dict key dropped by
+    ``extra='ignore'``."""
+    rec = tmp_path / "rec-a"
+    _make_recording_db(rec, started=_DAY0_START + 3600, end=_DAY0_START + 9000)
+    _seed_task_segments(
+        rec,
+        [
+            {"task_index": 0, "start_ts": _DAY0_START + 3600, "end_ts": _DAY0_START + 5400,
+             "name": "Kata", "block_id": "blk-a", "thread_id": "thr-k"},
+            {"task_index": 1, "start_ts": _DAY0_START + 7200, "end_ts": _DAY0_START + 9000,
+             "name": "Kata", "block_id": "blk-b", "thread_id": "thr-k"},
+        ],
+    )
+    _set_outcome(rec, "produced_tasks")
+    monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(tmp_path))
+
+    app = build_app()
+    resp = await _asgi_post(
+        app, "/v0/tasks.query", {"start_date": _DAY0, "end_date": _DAY0}
+    )
+    assert resp.status_code == 200, resp.text
+    parsed = schema.TasksQueryResponse(**resp.json()).model_dump()
+    by_block = {t["block_id"]: t for t in parsed["days"][0]["tasks"]}
+    assert by_block["blk-a"]["thread_total_minutes"] == 60.0
+    assert by_block["blk-a"]["thread_sitting_count"] == 2
+    assert by_block["blk-a"]["thread_sitting_index"] == 1
+    assert by_block["blk-a"]["thread_id"] == "thr-k"
+    assert by_block["blk-b"]["thread_sitting_index"] == 2
+    # Bullets/block_id/is_open mirror TaskSegment too (additive parity, U7).
+    assert by_block["blk-a"]["is_open"] is False
 
 
 # --- empty range + honest statuses ------------------------------------------

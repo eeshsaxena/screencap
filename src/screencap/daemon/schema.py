@@ -96,6 +96,17 @@ _TASKS_UPDATE_API_VERSION = 1
 _TASKS_DELETE_API_VERSION = 1
 _TASKS_MERGE_API_VERSION = 1
 _TASKS_SPLIT_API_VERSION = 1
+# Day diary U4: the app-only ``day.narrative`` read verb — a recording's written,
+# evidence-bound day narrative (never mirrored over MCP in v1). Additive (new
+# verb) — no global API_SCHEMA_VERSION bump (mirrors the tasks.list additive
+# precedent).
+_DAY_NARRATIVE_API_VERSION = 1
+# Day diary U6: the ``diary.search`` read verb — ranked day-diary BLOCK snippets
+# (name + topic bullets) + pointers over the ``diary_fts`` table inside the global
+# content index (R5/KTD-8). Mirrors ``content.search``'s recall posture; the
+# NARRATIVE is never indexed. Additive (new verb) — no global API_SCHEMA_VERSION
+# bump (mirrors the content.search / tasks.list additive precedent).
+_DIARY_SEARCH_API_VERSION = 1
 # Day-first navigation U8: the irreversible, LOCAL-ONLY range-delete job
 # (delete.start with a dry_run preview / delete.status / delete.cancel). Additive
 # (new verbs) — no global API_SCHEMA_VERSION bump (mirrors the backfill / tasks
@@ -214,6 +225,11 @@ _MODEL_NAMES = {
     "TasksMergeResponse",
     "TasksSplitRequest",
     "TasksSplitResponse",
+    "DayNarrativeRequest",
+    "DayNarrativeResponse",
+    "DiarySearchRequest",
+    "DiaryBlockHit",
+    "DiarySearchResponse",
     "ModelDownloadStartRequest",
     "ModelDownloadCancelRequest",
     "ModelDownloadStatusResponse",
@@ -551,6 +567,47 @@ def _load_models() -> dict[str, Any]:
         # hits + store_state. Absent on an older daemon → "mounted".
         store_state: str = "mounted"
 
+    class DiarySearchRequest(_DaemonModel):
+        """U6 day-diary BLOCK search input (R5 / KTD-8).
+
+        ``recording`` is an OPTIONAL filter (search across every recording when
+        absent), routed through the canonical name validator in the handler
+        (traversal-safe) before use — same posture as ``content.search``, NOT a
+        ``Literal``.
+        """
+
+        query: str = Field(max_length=_MAX_QUERY_LEN)
+        recording: str | None = None
+        limit: int | None = None
+
+    class DiaryBlockHit(_DaemonModel):
+        """A single day-diary block match — POINTER ONLY (R5 / KTD-8).
+
+        Structurally incapable of carrying a media path, image bytes, or a full
+        bullet dump: a text ``snippet`` + the ``(recording, block_id)`` pointer +
+        the block's absolute unix-ms span (``start_ms``/``end_ms``) + bm25
+        ``score``. The app deep-links by ``block_id`` and locates the block in its
+        day by span; it never receives bullet text beyond the matched ``snippet``.
+        R5 is a property of this shape, enforced at the daemon boundary.
+        """
+
+        recording: str
+        block_id: str
+        start_ms: int
+        end_ms: int
+        snippet: str
+        score: float
+
+    class DiarySearchResponse(EnvelopeResponse):
+        hits: list[DiaryBlockHit]
+        # content_index.IndexState value: ok / no_match / not_indexed /
+        # index_degraded / store_unavailable. Typed as str (not Literal) so a
+        # future state decodes tolerantly.
+        index_state: str
+        # KTD-14: mounted / locked / absent / error — a locked store returns empty
+        # hits + store_state. Absent on an older daemon → "mounted".
+        store_state: str = "mounted"
+
     class TranscriptSearchRequest(_DaemonModel):
         """SCR-118 transcript keyword-search input."""
 
@@ -672,9 +729,27 @@ def _load_models() -> dict[str, Any]:
 
         Shared between ``tasks.list`` (per-recording) and the day-level ``tasks``
         band nested on :class:`DaySegmentRecording` (U9) — one wire shape, so the
-        strip and the per-recording view can't drift. ``source`` / ``edited``
-        (KTD3) are deliberately NOT exposed: task ownership is an internal store
-        concern, not part of the read wire shape.
+        strip and the per-recording view can't drift. ``source`` / ``edited`` /
+        ``edited_fields`` (KTD3) are deliberately NOT exposed: task ownership is an
+        internal store concern, not part of the read wire shape.
+
+        Day-diary fields (U1/KTD-9, additive): ``bullets`` are the block's short
+        topic summaries (parsed from the store's ``metadata`` blob); ``block_id`` is
+        the opaque stable identity a consolidation pass assigns so deep links /
+        threads survive ``task_index`` renumbering; ``thread_id`` links same-work
+        blocks within a day; ``is_open`` marks the live trailing block. All default
+        to empty/None so an older daemon that never emits them still validates and
+        the Swift side decodes with ``decodeIfPresent``.
+
+        Thread rollup fields (U7/R7, additive): ``thread_total_minutes`` /
+        ``thread_sitting_count`` / ``thread_sitting_index`` are the read-time thread
+        rollup (total minutes across the thread's sittings, sitting count, and this
+        block's 1-based place in the thread). They are computed only where the read
+        verb has the day's cross-recording context — ``tasks.query`` and
+        ``tasks.list`` populate them; ``timeline.day`` leaves them null (its
+        per-recording day band does not compute the rollup). A lone block reports
+        all three as null. Keyed strictly on ``(recording, thread_id)`` upstream, so
+        a token minted in one recording never merges with the same token in another.
         """
 
         task_index: int
@@ -683,6 +758,13 @@ def _load_models() -> dict[str, Any]:
         name: str
         category: str | None = None
         confidence: str | None = None
+        bullets: list[str] = []
+        block_id: str | None = None
+        thread_id: str | None = None
+        is_open: bool = False
+        thread_total_minutes: float | None = None
+        thread_sitting_count: int | None = None
+        thread_sitting_index: int | None = None
 
     class DaySegmentRecording(_DaemonModel):
         """One recording's day-clamped span + honest blocked-interval split (U3).
@@ -1122,12 +1204,23 @@ def _load_models() -> dict[str, Any]:
     class TasksQueryTask(_DaemonModel):
         """One named task in the cross-day list, carrying its recording pointer.
 
-        The shared 6-field ``TaskSegment`` shape (``task_index`` / ``start_ts`` /
+        The shared ``TaskSegment`` shape (``task_index`` / ``start_ts`` /
         ``end_ts`` / ``name`` / ``category`` / ``confidence``) plus the
         ``recording`` (+ ``recording_id``) it came from — the Tasks surface needs
         the recording key to seek into its day page and to curate the task
         (rename/split/merge/delete route through the per-recording CRUD verbs).
         ``start_ts`` / ``end_ts`` are Unix seconds (the ledger's native units).
+
+        Day-diary fields (U1/KTD-9, additive): ``bullets`` / ``block_id`` /
+        ``thread_id`` / ``is_open`` mirror :class:`TaskSegment` so the cross-day
+        surface sees exactly what the per-recording ``tasks.list`` sees.
+
+        Thread rollup fields (U7/R7): ``thread_total_minutes`` /
+        ``thread_sitting_count`` / ``thread_sitting_index`` are computed at read
+        time by ``tasks_query``, keyed strictly on ``(recording, thread_id)`` — a
+        thread of >=2 blocks reports all three; a lone block reports null. All new
+        fields default to empty/None so an older daemon still validates and the
+        Swift side decodes with ``decodeIfPresent``.
         """
 
         recording: str
@@ -1138,6 +1231,13 @@ def _load_models() -> dict[str, Any]:
         name: str
         category: str | None = None
         confidence: str | None = None
+        bullets: list[str] = []
+        block_id: str | None = None
+        thread_id: str | None = None
+        is_open: bool = False
+        thread_total_minutes: float | None = None
+        thread_sitting_count: int | None = None
+        thread_sitting_index: int | None = None
 
     class TasksQueryDay(_DaemonModel):
         """All tasks that map to one local calendar day (KTD-11), start-ordered."""
@@ -1288,6 +1388,39 @@ def _load_models() -> dict[str, Any]:
 
         recording: str
         task_indices: list[int]
+
+    class DayNarrativeRequest(_DaemonModel):
+        """U4 ``day.narrative`` input: the recording whose day narrative to read.
+
+        ``recording`` is validated by the canonical name validator in the handler
+        (traversal-safe), not via a ``Literal`` — same posture as ``tasks.list`` /
+        ``frame.nearest`` / ``content.search``.
+        """
+
+        recording: str
+
+    class DayNarrativeResponse(EnvelopeResponse):
+        """A recording's written, evidence-bound day narrative (U4, R8/R9).
+
+        ``recording`` echoes the requested name. ``narrative`` is the sanitized
+        prose, or ``None`` when the recording produced none — a mechanical-only /
+        nothing-to-name day writes no narrative (R9), a legacy / pre-U4 recording
+        has no row, or a locked/absent vault store (``store_state`` != mounted).
+        ``generated_at`` is the wall-clock write time (Unix seconds); ``reason`` is
+        the observable prose source/fallback marker (KTD-10): ``None`` when a model
+        narrated, a marker string on the honest heuristic degrade. The app renders
+        the ``None`` case gracefully (no narrative section) rather than as an error.
+        App-only in v1 — deliberately NOT mirrored over MCP.
+        """
+
+        recording: str
+        narrative: str | None = None
+        generated_at: float | None = None
+        reason: str | None = None
+        # KTD-14: mounted / locked / absent / error — a locked store returns a null
+        # narrative + store_state on a 200, never a 500. Absent on an older daemon →
+        # "mounted".
+        store_state: str = "mounted"
 
     class AmbientStatusResponse(EnvelopeResponse):
         """The app's runtime view of always-on ambient supervision (SCR-214 U12).
@@ -1531,6 +1664,11 @@ def _load_models() -> dict[str, Any]:
         "TasksMergeResponse": TasksMergeResponse,
         "TasksSplitRequest": TasksSplitRequest,
         "TasksSplitResponse": TasksSplitResponse,
+        "DayNarrativeRequest": DayNarrativeRequest,
+        "DayNarrativeResponse": DayNarrativeResponse,
+        "DiarySearchRequest": DiarySearchRequest,
+        "DiaryBlockHit": DiaryBlockHit,
+        "DiarySearchResponse": DiarySearchResponse,
         "ModelDownloadStartRequest": ModelDownloadStartRequest,
         "ModelDownloadCancelRequest": ModelDownloadCancelRequest,
         "ModelDownloadStatusResponse": ModelDownloadStatusResponse,
@@ -1587,6 +1725,8 @@ __all__ = [
     "_TASKS_DELETE_API_VERSION",
     "_TASKS_MERGE_API_VERSION",
     "_TASKS_SPLIT_API_VERSION",
+    "_DAY_NARRATIVE_API_VERSION",
+    "_DIARY_SEARCH_API_VERSION",
     "_DELETE_API_VERSION",
     "_CLIP_API_VERSION",
     "_MODELS_API_VERSION",

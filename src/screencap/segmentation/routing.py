@@ -132,6 +132,51 @@ def build_answer_provider() -> GenerationProvider:
     return UnavailableGenerationProvider()
 
 
+def build_prose_provider(
+    recording_dir: "Path | str | None" = None,
+) -> LLMProvider:
+    """Return the on-device-class provider for the day-diary prose kind (U3, KTD-4).
+
+    Mirrors :func:`build_answer_provider`'s shape: it returns **on-device-class
+    only** — the block-bullet / narrative model calls run on-device, and the
+    consented-cloud enrichment fallback (reusing the description text the cloud
+    prompt already produces) is owned by the caller/dispatcher, not here. REMOTE
+    BYO endpoints are excluded (a REMOTE endpoint resolves to
+    :class:`UnavailableProvider`) so diary evidence never egresses off-box via
+    this seam, and a cloud active provider yields :class:`UnavailableProvider`
+    too (the on-device-class step has no cloud backend).
+
+    Only the Apple Foundation Models backend exposes the ``call_block_bullets``
+    verb the consolidator uses, so the on-device case returns a recording-bound
+    :class:`OnDeviceProvider` directly (the ``recording_dir`` context the verb's
+    budget/stop plumbing rides). Any other backend lacks the verb, so the
+    consolidator's per-block bullet call falls through to the honest app-level
+    heuristic (R6/AE3).
+    """
+    from screencap import config
+    from screencap.segmentation.endpoint import LOCAL, classify_endpoint
+    from screencap.segmentation.providers.chained import UnavailableProvider
+
+    name = config.get_llm_provider()
+
+    if name == "on-device":
+        from screencap.segmentation.providers.ondevice import OnDeviceProvider
+
+        return OnDeviceProvider(recording_dir=recording_dir)
+
+    if name == "local-server":
+        endpoint = config.get_local_server_endpoint()
+        if endpoint and classify_endpoint(endpoint) == LOCAL:
+            from screencap.segmentation.providers.local_server import LocalServerProvider
+
+            return LocalServerProvider()
+        return UnavailableProvider()
+
+    # Downloaded / cloud / anything else has no on-device-class bullet backend;
+    # the caller falls through to the app-level heuristic (never off-box here).
+    return UnavailableProvider()
+
+
 def _downloaded_model_installed() -> bool:
     try:
         from screencap.models import is_model_installed

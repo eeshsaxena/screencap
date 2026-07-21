@@ -124,6 +124,12 @@ final class SearchViewModelBackfillTests: XCTestCase {
         func tasksSplit(_ req: TasksSplitRequest) async throws -> TasksSplitResponse {
             TasksSplitResponse(recording: req.recording, taskIndices: [0, 1])
         }
+        func dayNarrative(_ req: DayNarrativeRequest) async throws -> DayNarrativeResponse {
+            DayNarrativeResponse(recording: req.recording, narrative: nil)
+        }
+        func diarySearch(_ req: DiarySearchRequest) async throws -> DiarySearchResponse {
+            DiarySearchResponse(hits: [], indexState: .noMatch)
+        }
     }
 
     /// Poll until `predicate` holds (or time out) — the run task and stream

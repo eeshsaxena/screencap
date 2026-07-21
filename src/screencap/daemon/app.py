@@ -1562,6 +1562,126 @@ async def content_search(request: Request) -> JSONResponse:
         )
 
 
+def _run_diary_search(
+    query: str, recording: str | None, limit: int | None,
+) -> dict[str, Any]:
+    """Blocking day-diary BLOCK search, run off the event loop via to_thread (U6).
+
+    Reads the ``diary_fts`` table inside the global content index (block name +
+    topic bullets keyed by ``(recording, block_id)`` with the block's ms span).
+    Never opens/creates the store when it does not exist yet (a read must not spawn
+    an empty store) — surfaces ``not_indexed`` instead. The store's own
+    ``search_diary`` is fail-soft (corrupt → ``store_unavailable``), so this never
+    raises for an unreadable store. Pointer-only hits: ``(recording, block_id,
+    start_ms/end_ms span, snippet)`` — never full bullet text beyond the snippet;
+    the NARRATIVE is never indexed so it can never appear here (KTD-8).
+    """
+    from screencap.content_index import (
+        ContentIndex,
+        IndexState,
+        default_index_path,
+    )
+
+    path = default_index_path()
+    if not path.exists():
+        # No diary index yet (no recording has consolidated a named block) —
+        # honestly report the absent store rather than spawning an empty one.
+        return {"hits": [], "index_state": IndexState.NOT_INDEXED.value}
+
+    kwargs: dict[str, Any] = {}
+    if limit is not None:
+        kwargs["limit"] = limit
+    with ContentIndex(path) as store:
+        result = store.search_diary(query, recording=recording, **kwargs)
+    hits = [
+        {
+            "recording": h.recording,
+            "block_id": h.block_id,
+            "start_ms": h.start_ms,
+            "end_ms": h.end_ms,
+            "snippet": h.snippet,
+            "score": h.score,
+        }
+        for h in result.hits
+    ]
+    return {"hits": hits, "index_state": result.index_state.value}
+
+
+async def diary_search(request: Request) -> JSONResponse:
+    """``POST /v0/diary.search`` — ranked day-diary BLOCK snippets + pointers (U6).
+
+    Read-only over the ``diary_fts`` table inside the global content index
+    (R5/KTD-8): a fuzzy topic memory ("kick", "design systems") finds a diary
+    BLOCK by its name + topic bullets across months of history, landing on the
+    block's ``(recording, block_id)`` pointer + ms span (AE2). Pointer-only
+    response (the model is structurally incapable of carrying a media path, image
+    bytes, or a full bullet dump beyond the matched snippet — R5). The NARRATIVE is
+    NEVER indexed, so it can never surface here (KTD-8).
+
+    The caller-supplied ``recording`` filter is routed through the canonical name
+    validator (traversal-safe) before use; the FTS ``MATCH`` is bound +
+    phrase-escaped inside ``content_index``. A missing/corrupt store fails soft via
+    ``index_state`` rather than 500-ing. Mirrors ``content.search``'s recall
+    posture: subscription-gated when the local paywall is enforced, and
+    deliberately NOT in ``_ACTIVITY_PATHS`` — idle-shutdown is kept alive by the
+    MCP-held subscription (preserving the cron-polling protection).
+    """
+    from pydantic import ValidationError
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        _check_subscription_for_recall(
+            schema_version=schema._DIARY_SEARCH_API_VERSION
+        )
+        # KTD-14: a locked / absent / error store returns empty hits +
+        # ``store_state`` (never a 500). The diary index lives inside the store, so
+        # ``index_state=store_unavailable`` is the honest read-outcome there.
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._DIARY_SEARCH_API_VERSION,
+                    hits=[],
+                    index_state="store_unavailable",
+                    store_state=store_state,
+                )
+            )
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.DiarySearchRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._DIARY_SEARCH_API_VERSION,
+            )
+        recording = parsed.recording
+        if recording is not None:
+            validate_recording_name(recording)
+
+        limit = _clamp_limit(parsed.limit)
+        result = await asyncio.to_thread(
+            _run_diary_search, parsed.query, recording, limit,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._DIARY_SEARCH_API_VERSION,
+                hits=result["hits"],
+                index_state=result["index_state"],
+                store_state=store_state,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._DIARY_SEARCH_API_VERSION,
+            request=request,
+        )
+
+
 # SCR-118 query bounds (DoS guards enforced at the daemon, not only in the MCP
 # tool layer, so a direct UDS caller cannot drive an unbounded scan).
 _QUERY_MAX_RECORDINGS = 200
@@ -2328,11 +2448,22 @@ def _run_tasks_list(recording: str) -> list[dict[str, Any]]:
     so the verb answers an empty list rather than a 500. The ``PrivacyMode`` and
     upload rules are unchanged: this only reads rows the local pipeline already
     persisted; nothing leaves the Mac.
+
+    Thread rollups (U7/R7) are annotated here via the SAME
+    ``tasks_query.annotate_thread_rollups`` helper ``tasks.query`` uses, so the
+    per-recording surface reports the same ``thread_total_minutes`` /
+    ``thread_sitting_count`` / ``thread_sitting_index`` a threaded block shows in
+    the cross-day list — one shared rollup computation, no drift. All rows here
+    are one recording, so the composite ``(recording, thread_id)`` grouping is
+    exact.
     """
     from screencap.config import resolve_recording_dir
     from screencap.pipeline_state import read_task_segments_wire
+    from screencap.tasks_query import annotate_thread_rollups
 
-    return read_task_segments_wire(resolve_recording_dir(recording))
+    rows = read_task_segments_wire(resolve_recording_dir(recording))
+    annotate_thread_rollups(rows)
+    return rows
 
 
 def _run_recording_outcome(recording: str) -> "tuple[str | None, str | None]":
@@ -2357,6 +2488,33 @@ def _run_recording_outcome(recording: str) -> "tuple[str | None, str | None]":
         return PipelineLedger(db_path).get_recording_outcome_with_detail()
     except Exception:  # noqa: BLE001 — an outcome read must never fail tasks.list
         return None, None
+
+
+def _run_day_narrative_read(
+    recording: str,
+) -> "tuple[str | None, float | None, str | None]":
+    """Read a LOCAL recording's day narrative, off the event loop (U4, R8/R9).
+
+    Returns ``(narrative, generated_at, reason)``. ``(None, None, None)`` for a
+    missing recording dir / ``recording.db`` (legacy / pre-U4), a recording that
+    produced NO narrative (a mechanical-only / nothing-to-name day writes no row —
+    R9), or any read error (a corrupt / concurrently-locked DB). Never raises: a
+    narrative read must not fail the read verb. Local-only read (never leaves the
+    Mac — R14).
+    """
+    from screencap.config import resolve_recording_dir
+    from screencap.pipeline_state import PipelineLedger
+
+    db_path = resolve_recording_dir(recording) / "recording.db"
+    if not db_path.exists():
+        return None, None, None
+    try:
+        row = PipelineLedger(db_path).get_day_narrative()
+    except Exception:  # noqa: BLE001 — a narrative read must never fail the verb
+        return None, None, None
+    if row is None:
+        return None, None, None
+    return row.narrative, row.generated_at, row.reason
 
 
 async def tasks_list(request: Request) -> JSONResponse:
@@ -2502,6 +2660,81 @@ async def tasks_query(request: Request) -> JSONResponse:
         return _internal_error_response(
             exc,
             schema_version=schema._TASKS_QUERY_API_VERSION,
+            request=request,
+        )
+
+
+async def day_narrative(request: Request) -> JSONResponse:
+    """``POST /v0/day.narrative`` — a LOCAL recording's written day narrative (U4).
+
+    App-only read verb over the U4 per-recording narrative row (R8/R9): the
+    evidence-bound prose the day view opens with, composed on-device from the
+    recording's diary BLOCKS (names + bullets + rollups only — never raw
+    evidence). The narrative lives in the local-only ``recording.db`` (never
+    uploaded — R14), so this only ever exposes local-Mac data to the same-EUID
+    caller. A recording that produced NO narrative (a mechanical-only /
+    nothing-to-name day — R9), a legacy / pre-U4 recording, or a locked/absent
+    vault store returns ``ok:true`` with ``narrative: null`` (never an error), so
+    the day view renders the no-narrative case gracefully. A traversal recording
+    name returns 400 ``invalid_name``; a malformed body returns 400
+    ``invalid_request``.
+
+    KTD-14: a locked/absent/error vault store is a healthy serving state — a null
+    narrative + degraded ``store_state`` on a 200, never a 500. Deliberately NOT
+    mirrored over MCP (the narrative stays app-only in v1), and NOT in
+    ``_ACTIVITY_PATHS`` — a read verb must not reset the idle-shutdown clock. The
+    ``recording`` argument is routed through the canonical name validator
+    (traversal-safe), NOT pydantic type-validation alone (P2 security).
+    """
+    from pydantic import ValidationError
+
+    from screencap.daemon._name_validation import validate_recording_name
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+        try:
+            parsed = schema.DayNarrativeRequest.model_validate(body)
+        except ValidationError:
+            return _validation_error_response(
+                schema_version=schema._DAY_NARRATIVE_API_VERSION,
+            )
+        # Traversal-safe recording resolution FIRST (P2): a ``../x`` name is a 400
+        # ``invalid_name`` even on a locked store — never a raw filesystem reach.
+        validate_recording_name(parsed.recording)
+        store_state = _store_state_value(request)
+        if store_state != StoreState.MOUNTED.value:
+            # KTD-14: sealed / absent / error store — null narrative + store_state.
+            return JSONResponse(
+                schema.envelope(
+                    schema_version=schema._DAY_NARRATIVE_API_VERSION,
+                    recording=parsed.recording,
+                    narrative=None,
+                    generated_at=None,
+                    reason=None,
+                    store_state=store_state,
+                )
+            )
+        narrative, generated_at, reason = await asyncio.to_thread(
+            _run_day_narrative_read, parsed.recording,
+        )
+        return JSONResponse(
+            schema.envelope(
+                schema_version=schema._DAY_NARRATIVE_API_VERSION,
+                recording=parsed.recording,
+                narrative=narrative,
+                generated_at=generated_at,
+                reason=reason,
+                store_state=store_state,
+            )
+        )
+    except errors.DaemonAPIError as exc:
+        return _api_error_response(exc)
+    except Exception as exc:
+        return _internal_error_response(
+            exc,
+            schema_version=schema._DAY_NARRATIVE_API_VERSION,
             request=request,
         )
 
@@ -5057,6 +5290,7 @@ def build_app() -> Starlette:
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
             Route("/v0/content.search", content_search, methods=["POST"]),
+            Route("/v0/diary.search", diary_search, methods=["POST"]),
             Route("/v0/transcript.search", transcript_search, methods=["POST"]),
             Route("/v0/timeline.query", timeline_query, methods=["POST"]),
             Route("/v0/timeline.day", timeline_day, methods=["POST"]),
@@ -5069,6 +5303,7 @@ def build_app() -> Starlette:
             Route("/v0/tasks.delete", tasks_delete, methods=["POST"]),
             Route("/v0/tasks.merge", tasks_merge, methods=["POST"]),
             Route("/v0/tasks.split", tasks_split, methods=["POST"]),
+            Route("/v0/day.narrative", day_narrative, methods=["POST"]),
             Route("/v0/ambient.status", ambient_status, methods=["GET"]),
             Route("/v0/ambient.set", ambient_set, methods=["POST"]),
             Route("/v0/chat.answer", chat_answer, methods=["POST"]),

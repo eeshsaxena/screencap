@@ -53,6 +53,11 @@ struct DayTimelineView: View {
     @State private var query = ""
     @State private var contentIndexEnabled = false
     @State private var searchTask: Task<Void, Never>?
+    /// U8 (R8/R9) — the composed day-narrative section state. `.hidden` on a
+    /// mechanical/thin/absent day (no section), `.stillComposing` while a live day
+    /// is being written, `.narrative` when prose exists. Composed from the
+    /// per-recording `day.narrative` responses.
+    @State private var narrativeState: DayNarrativeState = .hidden
 
     // SCR-219 (U5) — clip-bounds mode. `clipMode` swaps the playback pane's
     // action buttons for the `ClipBoundsView` overlay; the rest are the working
@@ -113,6 +118,10 @@ struct DayTimelineView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            // U8 (F1/R8/R9) — the day opens with its written narrative, BELOW the
+            // header chrome. Evidence-bound: absent on a mechanical/thin day, a
+            // distinct "still composing" note while the live day is being written.
+            narrativeSection
             playbackPane
             strip
         }
@@ -321,6 +330,68 @@ struct DayTimelineView: View {
         .padding(.vertical, 16)
         .background(Color.scCanvas)
         .overlay(alignment: .bottom) { Divider().overlay(Color.scBorderWarm) }
+    }
+
+    // MARK: - Narrative (U8, F1/R8/R9)
+
+    /// The written day narrative, or its honest states. Rendered only on the
+    /// opened day while the store is mounted; a locked/absent store defers to the
+    /// strip's own "can't verify" honesty, never a stale narrative.
+    @ViewBuilder
+    private var narrativeSection: some View {
+        if storeMounted {
+            switch narrativeState {
+            case .narrative(let text):
+                narrativeCard(text)
+            case .stillComposing:
+                stillComposingNote
+            case .hidden:
+                EmptyView()
+            }
+        }
+    }
+
+    /// The narrative prose card (R8) — the day's written summary, composed from
+    /// block evidence (partial on a mixed day, KTD-10).
+    private func narrativeCard(_ text: String) -> some View {
+        Text(text)
+            .font(SCTypography.sans(size: 13.5))
+            .foregroundStyle(Color.scInk)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+            .overlay(
+                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                    .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+            )
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+            .accessibilityLabel("Day summary. \(text)")
+    }
+
+    /// The DISTINCT "still composing" state (R10): real blocks exist but the
+    /// narrative isn't written yet (a live day in progress). Never a blank slot
+    /// that reads as "nothing to say".
+    private var stillComposingNote: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Still writing today's summary…")
+                .font(SCTypography.sans(size: 12.5))
+                .foregroundStyle(Color.scInkSecondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+        )
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+        .accessibilityLabel("Still writing today's summary")
     }
 
     /// U9 (req 5, R9) — the day-page overflow menu hosting "Delete this day…".
@@ -1267,6 +1338,7 @@ struct DayTimelineView: View {
             if showLoading {
                 spans = []
                 loadPhase = .daemonUnavailable
+                narrativeState = .hidden
             }
             return
         }
@@ -1293,6 +1365,33 @@ struct DayTimelineView: View {
             }
         }.value
         engine.load(chunks: chunks, seekToMs: seekToMs)
+        // U8 (F1/R8/R9) — compose the day narrative from each recording's
+        // per-recording narrative. Runs after the strip is ready so prose never
+        // gates the timeline; refreshed on every load (incl. quiet live reloads)
+        // so a live day's narrative fills in as it is written (R10).
+        await loadNarrative(for: spans)
+    }
+
+    /// Compose the day's narrative section state (U8). Queries `day.narrative` for
+    /// each recording on the day and composes their prose into ONE section
+    /// (partial on a mixed day, KTD-10). `hasBlocks` — whether any recording
+    /// carries a real consolidated block (a task row with a `block_id`, or the
+    /// live open block) — distinguishes the "still composing" state (blocks but no
+    /// narrative yet) from "nothing to say" (no blocks). Fail-open: a per-recording
+    /// miss is skipped, and a total miss with no blocks simply hides the section.
+    private func loadNarrative(for spans: [DaySegmentRecording]) async {
+        var responses: [DayNarrativeResponse] = []
+        for span in spans {
+            if let response = try? await DaemonClient.dayNarrative(
+                DayNarrativeRequest(recording: span.name)
+            ) {
+                responses.append(response)
+            }
+        }
+        let hasBlocks = spans.contains { span in
+            span.tasks.contains { $0.blockId != nil || $0.isOpen }
+        }
+        narrativeState = DayNarrativeComposition.compose(responses: responses, hasBlocks: hasBlocks)
     }
 
     /// R15/KTD-12 — the live-refresh subscription. Rides the EXISTING daemon

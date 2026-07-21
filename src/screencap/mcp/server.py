@@ -79,6 +79,28 @@ class ContentSearchResult(BaseModel):
     store_state: str = _DEFAULT_STORE_STATE
 
 
+class DiaryBlockHit(BaseModel):
+    """A day-diary work-BLOCK match — POINTER ONLY (day-diary U6). A text snippet +
+    the ``(recording, block_id)`` pointer + the block's absolute unix-ms span; never
+    a media path, image bytes, or a full bullet dump beyond the snippet."""
+
+    recording: str
+    block_id: str
+    start_ms: int
+    end_ms: int
+    snippet: str
+    score: float
+
+
+class DiarySearchResult(BaseModel):
+    hits: list[DiaryBlockHit]
+    # ok / no_match / not_indexed / index_degraded / store_unavailable — so the
+    # agent never mistakes an empty/degraded diary index for ground truth.
+    index_state: str
+    # KTD-20: mounted / locked / absent / error — a locked vault is data, not an error.
+    store_state: str = _DEFAULT_STORE_STATE
+
+
 class TranscriptHit(BaseModel):
     recording: str
     chunk_index: int
@@ -244,7 +266,16 @@ class DayPurge(BaseModel):
 
 
 class DayTask(BaseModel):
-    """One named task on the day (``start_ts`` / ``end_ts`` are unix SECONDS)."""
+    """One named diary block on the day (``start_ts`` / ``end_ts`` are unix SECONDS).
+
+    Day-diary fields (U7, read-only mirror): ``bullets`` are the block's short topic
+    summaries; ``block_id`` is the opaque stable identity (deep-link key);
+    ``thread_id`` links same-work blocks within the recording+day; ``is_open`` marks
+    the live trailing block. The thread rollup (``thread_total_minutes`` /
+    ``thread_sitting_count`` / ``thread_sitting_index``) is present when the daemon
+    computed it — ``timeline.day`` leaves it null (use ``query_tasks`` for rollups).
+    Mirrored read-only: there is NO thread/block mutation tool (curation is
+    human-only, R18)."""
 
     task_index: int
     start_ts: float
@@ -252,6 +283,13 @@ class DayTask(BaseModel):
     name: str
     category: str | None = None
     confidence: str | None = None
+    bullets: list[str] = []
+    block_id: str | None = None
+    thread_id: str | None = None
+    is_open: bool = False
+    thread_total_minutes: float | None = None
+    thread_sitting_count: int | None = None
+    thread_sitting_index: int | None = None
 
 
 class DayRecording(BaseModel):
@@ -295,11 +333,18 @@ class DayResult(BaseModel):
 
 
 class TaskHit(BaseModel):
-    """One named task in the cross-day list, carrying its recording pointer.
+    """One named diary block in the cross-day list, carrying its recording pointer.
 
     ``recording`` is opaque plumbing (KTD-1) retained so the agent can seek into
     the task's day page (``browse_day`` / ``query_timeline`` → ``resolve_frame``);
     ``start_ts`` / ``end_ts`` are unix seconds.
+
+    Day-diary fields (U7, read-only mirror): ``bullets`` / ``block_id`` /
+    ``thread_id`` / ``is_open`` mirror the app's block shape. The thread rollup
+    (``thread_total_minutes`` / ``thread_sitting_count`` / ``thread_sitting_index``)
+    is computed by ``tasks.query`` keyed on ``(recording, thread_id)``: a thread of
+    >=2 sittings reports all three, a lone block reports null. Read-only — there is
+    NO thread/block mutation tool (curation is human-only, R18).
     """
 
     recording: str
@@ -310,6 +355,13 @@ class TaskHit(BaseModel):
     name: str
     category: str | None = None
     confidence: str | None = None
+    bullets: list[str] = []
+    block_id: str | None = None
+    thread_id: str | None = None
+    is_open: bool = False
+    thread_total_minutes: float | None = None
+    thread_sitting_count: int | None = None
+    thread_sitting_index: int | None = None
 
 
 class TaskDay(BaseModel):
@@ -451,6 +503,30 @@ async def search_screen_content(
     )
     return ContentSearchResult(
         hits=[ContentHit(**h) for h in env.get("hits", [])],
+        index_state=env.get("index_state", "store_unavailable"),
+        store_state=env.get("store_state", _DEFAULT_STORE_STATE),
+    )
+
+
+async def search_diary(
+    query: str, recording: str | None = None, limit: int | None = None,
+) -> DiarySearchResult:
+    """Search the day diary's named work BLOCKS by name + topic bullets (keyword).
+
+    A diary block is a coherent, named stretch of work carrying short topic
+    bullets; this finds one from a fuzzy topic memory ("kick", "design systems")
+    across months of history. Each hit is POINTER-ONLY: a text ``snippet`` + the
+    block's ``(recording, block_id)`` pointer and its absolute unix-ms span
+    (``start_ms``/``end_ms``) — seek into the block's day via ``browse_day`` /
+    ``query_timeline`` → ``resolve_frame``. Best-effort recall — check
+    ``index_state`` (``not_indexed`` / ``store_unavailable`` mean "no data", not
+    "no match"). The day narrative is never indexed, so it never surfaces here.
+    """
+    env = await (await _client()).diary_search(
+        query, recording=recording, limit=_clamp_or_none(limit),
+    )
+    return DiarySearchResult(
+        hits=[DiaryBlockHit(**h) for h in env.get("hits", [])],
         index_state=env.get("index_state", "store_unavailable"),
         store_state=env.get("store_state", _DEFAULT_STORE_STATE),
     )
@@ -830,7 +906,7 @@ def build_server() -> FastMCP:
         lifespan=_lifespan,
     )
     for fn in (
-        search_screen_content, search_transcript, query_timeline,
+        search_screen_content, search_diary, search_transcript, query_timeline,
         resolve_frame, read_frame, list_recordings, whoami, chat_answer,
         # U13 (R18): day-first browse tools. NO delete-shaped tool — deletion is
         # human-only, enforced by its absence from this surface.
