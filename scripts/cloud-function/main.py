@@ -64,13 +64,14 @@ import logging
 import os
 import re
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import firebase_admin
 import functions_framework
 import google.auth
 import google.auth.exceptions
 import google.auth.transport.requests
+import shares
 from auth import AuthInvalid, AuthUnavailable, verify_bearer, verify_bearer_full
 from flask import jsonify
 from google.cloud import storage
@@ -86,6 +87,10 @@ UPLOAD_EXPIRY_MINUTES = 15
 # is acceptable there (used by the demo handlers in U3).
 USER_DOWNLOAD_EXPIRY_MINUTES = 30
 DEMO_DOWNLOAD_EXPIRY_HOURS = 4
+# Share GET URLs are kept short: revoke/expiry stop FUTURE signing, but an
+# already-issued signed URL stays valid for its own TTL (share plan R4/A2), so a
+# short window bounds how long a just-revoked link keeps working.
+SHARE_DOWNLOAD_EXPIRY_HOURS = 1
 MAX_FILES = 500
 
 def _resolve_project_id() -> str:
@@ -177,14 +182,24 @@ def get_upload_urls(request):
         return _handle_demo_list(data)
     if action == "demo-sign-download":
         return _handle_demo_sign_download(data)
+    # Anonymous share resolution — dispatched BEFORE the token gate, like the
+    # demo actions. It reads shares/ only (disjoint from users/ and demo/), never
+    # touches verify_bearer-gated code, and signs only the artifacts named in the
+    # stored record (never a path built from the raw token).
+    if action == "resolve-share":
+        return _handle_resolve_share(data)
 
-    # Token-gated, users/{uid}/-scoped actions.
+    # Token-gated actions.
     if action in (None, "upload"):
         return _handle_upload(request, data)
     if action == "list":
         return _handle_list(request, data)
     if action == "sign-download":
         return _handle_sign_download(request, data)
+    if action == "create-share":
+        return _handle_create_share(request, data)
+    if action == "revoke-share":
+        return _handle_revoke_share(request, data)
 
     # Strict allow-list: unknown / removed actions are rejected, never silently
     # handled. ``get-index`` is gone — it read sessions/_index.json, a path the
@@ -488,3 +503,153 @@ def _handle_upload(request, data):
             return _cors((jsonify({"error": "Signing temporarily unavailable"}), 503))
 
     return _cors(jsonify({"urls": urls, "gcs_prefix": f"gs://{BUCKET}/{prefix}"}))
+
+
+# ---------------------------------------------------------------------------
+# Share-by-link (SCR-229) — a per-recording, token-addressable share namespace
+# disjoint from users/ and demo/. Only the artifacts named in the stored record
+# are ever signed, and the anonymous resolver reads shares/ only.
+# ---------------------------------------------------------------------------
+
+
+def _handle_create_share(request, data):
+    """Mint a share: write the record + return signed PUT URLs (Bearer required).
+
+    The token is server-generated (unguessable) and bound to the caller's uid in
+    the record so ``revoke-share`` can enforce owner-only revocation. The
+    per-share decryption key never reaches here — it stays in the URL fragment,
+    minted client-side.
+    """
+    uid, err = _authenticate(request)
+    if err:
+        return err
+
+    files = data.get("files")
+    if not files or not isinstance(files, list):
+        return _cors((jsonify({"error": "'files' field required"}), 400))
+    if len(files) > MAX_FILES:
+        return _cors((jsonify({"error": f"Too many files (max {MAX_FILES})"}), 400))
+    for name in files:
+        if not shares.is_valid_artifact(name):
+            return _cors((jsonify({"error": f"Invalid artifact name: {name!r}"}), 400))
+
+    days = data.get("expires_days")
+    try:
+        days = int(days) if days is not None else shares.DEFAULT_EXPIRY_DAYS
+    except (TypeError, ValueError):
+        return _cors((jsonify({"error": "Invalid expires_days"}), 400))
+    if not 1 <= days <= 365:
+        return _cors((jsonify({"error": "expires_days out of range (1-365)"}), 400))
+
+    expires_at = shares.expires_at_iso(datetime.now(timezone.utc), days)
+    token = shares.new_token()
+    record = shares.build_record(uid, list(files), expires_at, view_only=True)
+
+    try:
+        _bucket.blob(shares.record_key(token)).upload_from_string(
+            shares.dumps(record), content_type="application/json"
+        )
+        _credentials.refresh(_auth_request)
+        urls = {}
+        for name in files:
+            blob = _bucket.blob(shares.artifact_key(token, name))
+            urls[name] = blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(minutes=UPLOAD_EXPIRY_MINUTES),
+                method="PUT",
+                content_type="application/octet-stream",
+                service_account_email=_credentials.service_account_email,
+                access_token=_credentials.token,
+            )
+    except google.auth.exceptions.GoogleAuthError as exc:
+        logger.warning("share create signing failed: %s", exc)
+        return _cors((jsonify({"error": "Signing temporarily unavailable"}), 503))
+
+    return _cors(
+        jsonify(
+            {"token": token, "urls": urls, "expires_at": expires_at, "view_only": True}
+        )
+    )
+
+
+def _handle_resolve_share(data):
+    """Resolve a share token to signed GET URLs — UNAUTHENTICATED, shares/ only.
+
+    The token is an opaque lookup key; this signs only the artifacts named in the
+    stored record, never a path built from the raw token. A revoked or expired
+    share returns 410 so the viewer can show the denied state; an unknown token
+    is 404.
+    """
+    token = data.get("token")
+    if not shares.is_valid_token(token):
+        return _cors((jsonify({"error": "Invalid share token"}), 400))
+
+    record_blob = _bucket.blob(shares.record_key(token))
+    if not record_blob.exists():
+        return _cors((jsonify({"error": "Share not found"}), 404))
+    try:
+        record = shares.loads(record_blob.download_as_text())
+    except shares.ShareError:
+        return _cors((jsonify({"error": "Share not found"}), 404))
+
+    if shares.is_revoked(record) or shares.is_expired(record, datetime.now(timezone.utc)):
+        return _cors(
+            (jsonify({"error": "Share no longer available", "code": "share_gone"}), 410)
+        )
+
+    try:
+        _credentials.refresh(_auth_request)
+        urls = {}
+        for name in record.get("artifacts", []):
+            if not shares.is_valid_artifact(name):
+                continue
+            blob = _bucket.blob(shares.artifact_key(token, name))
+            urls[name] = blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(hours=SHARE_DOWNLOAD_EXPIRY_HOURS),
+                method="GET",
+                service_account_email=_credentials.service_account_email,
+                access_token=_credentials.token,
+            )
+    except google.auth.exceptions.GoogleAuthError as exc:
+        logger.warning("share resolve signing failed: %s", exc)
+        return _cors((jsonify({"error": "Signing temporarily unavailable"}), 503))
+
+    return _cors(
+        jsonify(
+            {
+                "urls": urls,
+                "view_only": bool(record.get("view_only", True)),
+                "expires_at": record.get("expires_at"),
+            }
+        )
+    )
+
+
+def _handle_revoke_share(request, data):
+    """Revoke a share (Bearer required, owner-only)."""
+    uid, err = _authenticate(request)
+    if err:
+        return err
+
+    token = data.get("token")
+    if not shares.is_valid_token(token):
+        return _cors((jsonify({"error": "Invalid share token"}), 400))
+
+    record_blob = _bucket.blob(shares.record_key(token))
+    if not record_blob.exists():
+        return _cors((jsonify({"error": "Share not found"}), 404))
+    try:
+        record = shares.loads(record_blob.download_as_text())
+    except shares.ShareError:
+        return _cors((jsonify({"error": "Share not found"}), 404))
+
+    if not shares.is_owner(record, uid):
+        # A non-owner cannot tell "not yours" from "does not exist".
+        return _cors((jsonify({"error": "Share not found"}), 404))
+
+    record["revoked"] = True
+    _bucket.blob(shares.record_key(token)).upload_from_string(
+        shares.dumps(record), content_type="application/json"
+    )
+    return _cors(jsonify({"revoked": True, "token": token}))

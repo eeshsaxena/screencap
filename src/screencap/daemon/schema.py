@@ -23,6 +23,7 @@ _RECORDING_PAUSE_API_VERSION = 1
 # no global API_SCHEMA_VERSION bump (mirrors the recording.mute / permission.request
 # precedent).
 _RECORDING_RENAME_API_VERSION = 1
+_RECORDING_SHARE_API_VERSION = 1
 _PERMISSION_REQUEST_API_VERSION = 1
 # SCR-200 identity-scoped decoy/orphan TCC cleanup verb. Additive (new verb) — no
 # global API_SCHEMA_VERSION bump (mirrors the permission.request precedent).
@@ -168,6 +169,8 @@ _MODEL_NAMES = {
     "RecordingPauseResponse",
     "RecordingRenameRequest",
     "RecordingRenameResponse",
+    "RecordingShareRequest",
+    "RecordingShareResponse",
     "RecordingStopResponse",
     "PermissionRequestRequest",
     "PermissionRequestResponse",
@@ -513,6 +516,31 @@ def _load_models() -> dict[str, Any]:
         title: str
         title_is_user_set: bool
         cursor: int
+
+    class RecordingShareRequest(_DaemonModel):
+        """Share-by-link (SCR-229): op-discriminated create / revoke / list.
+
+        ``op="create"`` shares ``recording_id`` (stable id or directory name) with
+        optional ``expires_days``; ``op="revoke"`` targets ``token``; ``op="list"``
+        needs neither. The daemon mints the per-recording share key locally and
+        never returns or logs it — only the assembled link carries it in the URL
+        fragment.
+        """
+
+        op: str
+        recording_id: str | None = None
+        token: str | None = None
+        expires_days: int | None = None
+
+    class RecordingShareResponse(EnvelopeResponse):
+        """One response model backing all ops: create -> {url, token, expires_at},
+        revoke -> {revoked, token}, list -> {shares}. Unused fields stay null."""
+
+        url: str | None = None
+        token: str | None = None
+        expires_at: str | None = None
+        revoked: bool | None = None
+        shares: list[dict[str, Any]] | None = None
 
     class PermissionRequestRequest(_DaemonModel):
         """On-demand daemon-driven registration request (U8).
@@ -1608,6 +1636,8 @@ def _load_models() -> dict[str, Any]:
         "RecordingPauseResponse": RecordingPauseResponse,
         "RecordingRenameRequest": RecordingRenameRequest,
         "RecordingRenameResponse": RecordingRenameResponse,
+        "RecordingShareRequest": RecordingShareRequest,
+        "RecordingShareResponse": RecordingShareResponse,
         "PermissionRequestRequest": PermissionRequestRequest,
         "PermissionRequestResponse": PermissionRequestResponse,
         "ContentSearchRequest": ContentSearchRequest,

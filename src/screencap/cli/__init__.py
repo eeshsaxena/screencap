@@ -2083,6 +2083,68 @@ def whoami_cmd(as_json, force_refresh):
         console.print("Not signed in. Run [bold]screencap login[/bold] to upload to the cloud.")
 
 
+@cli.group("share")
+def share() -> None:
+    """Share a cloud recording by link (SCR-229)."""
+
+
+def _share_client_call(**kwargs):
+    """Call the daemon share verb, printing a clean error + exiting on failure."""
+    from screencap.cli._daemon_client import (
+        DaemonAPIError,
+        DaemonHTTPClient,
+        DaemonUnreachableError,
+        SchemaMismatchError,
+    )
+
+    try:
+        with DaemonHTTPClient() as client:
+            return client.share(**kwargs)
+    except (DaemonUnreachableError, DaemonAPIError, SchemaMismatchError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+
+@share.command("create")
+@click.argument("recording")
+@click.option(
+    "--expires-days", type=int, default=None, help="Days until the link expires (default 30)."
+)
+def share_create(recording: str, expires_days: int | None) -> None:
+    """Create a view-only share link for a cloud RECORDING."""
+    result = _share_client_call(op="create", recording_id=recording, expires_days=expires_days)
+    click.echo(result["url"])
+    click.echo(
+        "Anyone with this link can view the recording (view-only). The link "
+        "carries the decryption key — treat it as a secret. "
+        f"Expires {result.get('expires_at', 'in 30 days')}.",
+        err=True,
+    )
+
+
+@share.command("revoke")
+@click.argument("token")
+def share_revoke(token: str) -> None:
+    """Revoke a share link by TOKEN (stops future access)."""
+    _share_client_call(op="revoke", token=token)
+    click.echo("Revoked. Already-downloaded copies can't be retracted.", err=True)
+
+
+@share.command("list")
+def share_list() -> None:
+    """List share links created on this Mac."""
+    result = _share_client_call(op="list")
+    shares = result.get("shares", [])
+    if not shares:
+        click.echo("No shares created on this Mac.")
+        return
+    for s in shares:
+        status = " (revoked)" if s.get("revoked") else ""
+        click.echo(
+            f"{s.get('token')}  {s.get('recording')}  expires {s.get('expires_at')}{status}"
+        )
+
+
 @cli.command("checkout-url")
 @click.option("--tier", type=click.Choice(["local", "cloud"]), required=True,
               help="Which paid tier to check out: local (unlimited local) or cloud.")

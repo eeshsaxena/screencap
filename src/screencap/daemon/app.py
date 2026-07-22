@@ -1167,6 +1167,83 @@ async def recording_rename(request: Request) -> JSONResponse:
         )
 
 
+def _run_share_op(parsed) -> dict:
+    """Blocking share op (create / revoke / list), run off the event loop.
+
+    Uses the live :class:`~screencap.share_backend.DaemonShareBackend`. The
+    per-recording share key is minted inside ``create_share_flow`` and returned
+    ONLY inside the assembled URL fragment — never persisted or logged here.
+    """
+    from screencap import config, share_backend, share_service, upload
+
+    backend = share_backend.DaemonShareBackend(
+        config.get_recordings_dir(), config.get_base_dir()
+    )
+    try:
+        if parsed.op == "create":
+            if not parsed.recording_id:
+                raise ValueError("share create requires recording_id")
+            result = share_service.create_share_flow(
+                backend,
+                parsed.recording_id,
+                site_base_url=upload._get_share_base_url(),
+                expires_days=parsed.expires_days,
+            )
+            return {"url": result.url, "token": result.token, "expires_at": result.expires_at}
+        if parsed.op == "revoke":
+            if not parsed.token:
+                raise ValueError("share revoke requires token")
+            share_service.revoke_share_flow(backend, parsed.token)
+            backend.mark_local_revoked(parsed.token)
+            return {"revoked": True, "token": parsed.token}
+        if parsed.op == "list":
+            return {"shares": backend.list_local_shares()}
+        raise ValueError(f"unknown share op: {parsed.op!r}")
+    finally:
+        backend.close()
+
+
+async def recording_share(request: Request) -> JSONResponse:
+    """Share a cloud recording by link (SCR-229, U4).
+
+    An additive mutating verb on the same trust boundary as ``recording.rename``:
+    the peer descriptor is derived and every exit path is audited with peer +
+    outcome ONLY — never the token or the (never-server-visible) share key. The
+    blocking op (fetch masked copy, re-encrypt, create-share, upload) runs off the
+    event loop.
+    """
+    from screencap.daemon import audit_log, provenance
+
+    peer = provenance.derive_peer_descriptor_from_asgi_scope(request.scope)
+
+    def _audit(outcome: str) -> None:
+        audit_log.record_verb(
+            "recording.share",
+            peer_pid=peer.pid,
+            peer_path=peer.path,
+            classification=peer.classification,
+            outcome=outcome,
+        )
+
+    try:
+        parsed = schema.RecordingShareRequest.model_validate(await request.json())
+        result = await asyncio.to_thread(_run_share_op, parsed)
+        _audit("ok")
+        return JSONResponse(
+            schema.envelope(schema_version=schema._RECORDING_SHARE_API_VERSION, **result)
+        )
+    except errors.DaemonAPIError as exc:
+        _audit(exc.error_code)
+        return _api_error_response(exc)
+    except Exception as exc:
+        _audit(errors.ERROR_CODE_INTERNAL)
+        return _internal_error_response(
+            exc,
+            schema_version=schema._RECORDING_SHARE_API_VERSION,
+            request=request,
+        )
+
+
 async def permission_request(request: Request) -> JSONResponse:
     """On-demand daemon-driven TCC registration (U8).
 
@@ -5287,6 +5364,7 @@ def build_app() -> Starlette:
             Route("/v0/recording.pause", recording_pause, methods=["POST"]),
             Route("/v0/recording.resume", recording_resume, methods=["POST"]),
             Route("/v0/recording.rename", recording_rename, methods=["POST"]),
+            Route("/v0/recording.share", recording_share, methods=["POST"]),
             Route("/v0/permission.request", permission_request, methods=["POST"]),
             Route("/v0/permission.cleanup_decoys", permission_cleanup_decoys, methods=["POST"]),
             Route("/v0/content.search", content_search, methods=["POST"]),

@@ -284,6 +284,30 @@ class DaemonHTTPClient:
             )
         )
 
+    def share(
+        self,
+        *,
+        op: str,
+        recording_id: str | None = None,
+        token: str | None = None,
+        expires_days: int | None = None,
+    ) -> dict[str, Any]:
+        """``POST /v0/recording.share`` — create / revoke / list a share link (SCR-229).
+
+        The daemon mints the per-recording share key locally; ``create`` returns
+        ``{url, token, expires_at}`` with the key only inside the URL fragment.
+        """
+        body: dict[str, Any] = {"op": op}
+        if recording_id is not None:
+            body["recording_id"] = recording_id
+        if token is not None:
+            body["token"] = token
+        if expires_days is not None:
+            body["expires_days"] = expires_days
+        return self._parse_ok_envelope(
+            self._request("POST", "/v0/recording.share", json_body=body)
+        )
+
     def content_search(
         self,
         query: str,
