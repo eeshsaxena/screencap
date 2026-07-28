@@ -290,14 +290,12 @@ enum OnboardingCopy {
         + "automatically — the video just cuts around them."
     static let appRulesFooter = "Fine-tune per app anytime in Settings → App rules."
 
-    // Step 3 — storage (design 196–236). The local card's design copy ships as
-    // written except the "Share by exporting encrypted files" bullet (SCR-220)
-    // and its old "free · forever · no account" meta: the paid-only launch
-    // removed the free tier, so a free-forever promise is no longer true in any
-    // build and the meta now states only the unpriced fact that holds while the
-    // paywall is off. The cloud cards drop pricing (KTD-9) and carry only what
-    // is true today: per-recording upload approved in the Review window and
-    // single-recording web sharing; future capability is future-tense.
+    // Step 3 — storage (design 196–236). The local card ships the design copy
+    // except the "Share by exporting encrypted files" bullet (SCR-220) and the
+    // meta (see `localCardMeta`). The cloud cards drop pricing (KTD-9) and
+    // carry only what is true today: per-recording upload approved in the
+    // Review window and single-recording web sharing; future capability is
+    // future-tense.
     static let storageHeadline = "Where should your recordings live?"
     static let storageSub =
         "Either way, recording happens on this Mac. This only decides what happens after."

@@ -309,27 +309,32 @@ final class OnboardingStepPolicyTests: XCTestCase {
     /// still are (R2), and the Team card stays price-free while coming-soon
     /// (checked below).
     ///
-    /// `forever` is banned because the paid-only launch removed the free tier:
-    /// the local card's old "free · forever · no account" meta promised a
-    /// free-forever plan that no longer exists. `forever` is the precise guard
-    /// word — banning `free` outright would collide with the paid cards'
-    /// legitimate "free trial" copy, which this test also asserts survives.
+    /// The free-tier phrases are banned because the paid-only launch removed the
+    /// free tier: the local card's old "free · forever · no account" meta
+    /// promised a free-forever plan that no longer exists. The ban lists the
+    /// equivalent phrasings, not just the retired string — a guard that only
+    /// caught "forever" would pass on "always free" or "free tier" and let the
+    /// same false promise back in. `free` alone is deliberately NOT banned: it
+    /// would collide with the paid cards' legitimate "free trial" copy, which
+    /// this test asserts survives.
     func testStorageAndAccountCopyCarriesNoForbiddenClaims() {
         let all = OnboardingCopy.storageAndAccountStrings.joined(separator: " ").lowercased()
-        for forbidden in ["encrypt", "e2e", "keys stay", "we can't watch", "forever"] {
-            XCTAssertFalse(all.contains(forbidden), "storage/account copy contains \"\(forbidden)\"")
+        let forbidden = [
+            "encrypt", "e2e", "keys stay", "we can't watch",
+            // Free-tier promises — there is no free tier to promise.
+            "forever", "always free", "free tier", "free plan", "free forever", "$0",
+        ]
+        for phrase in forbidden {
+            XCTAssertFalse(all.contains(phrase), "storage/account copy contains \"\(phrase)\"")
         }
         XCTAssertFalse(all.contains("shared team library"))
-        // The ban targets the free-tier promise, not the real trial: the paid
-        // cards' "free trial" copy must still be present (guards against a
-        // future over-broad `free` ban).
         XCTAssertTrue(all.contains("free trial"), "the paid cards' real free-trial copy must survive")
     }
 
-    /// Paywall OFF renders no price anywhere on the storage step (KTD-6): the
-    /// app must not advertise a price it isn't enforcing. This is the mirror of
-    /// the priced-card assertions — the two pre-billing metas are the only
-    /// strings the storage cards can show while the paywall is off.
+    /// Paywall OFF renders no price on either storage card that swaps copy with
+    /// the flag (KTD-6): the app must not advertise a price it isn't enforcing.
+    /// The Team card never carries a price in either state and is pinned
+    /// separately by `testTeamCardCarriesNoPrice`.
     func testPaywallOffCardMetasMakeNoPriceClaim() {
         for meta in [OnboardingCopy.localCardMeta, OnboardingCopy.personalCardMetaFree] {
             XCTAssertFalse(meta.contains("$"), "paywall-off meta must carry no price: \(meta)")
