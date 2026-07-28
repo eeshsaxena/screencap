@@ -273,11 +273,29 @@ final class DayPlaybackEngine: ObservableObject {
     /// periodic time observer while media plays.
     @Published private(set) var currentDayMs: Int?
 
+    /// SCR-297 — the aspect ratio of the footage under the playhead, or nil
+    /// when it is not (yet) known. `DayTimelineView.playbackPane` gives itself
+    /// this shape so the video stops pillarboxing inside an ill-fitting pane
+    /// and the pane's overlay chrome lands on the video rather than on black.
+    ///
+    /// nil is a first-class, safe state, not an error: it is what the item
+    /// reports before `.readyToPlay`, and it renders exactly as the pane did
+    /// before this existed. See `PlaybackAspect.resolve`.
+    @Published private(set) var sourceAspect: CGFloat?
+
     let player = AVPlayer()
     private(set) var chunks: [DayPlayableChunk] = []
     private var currentChunk: DayPlayableChunk?
     private var timeObserverToken: Any?
     private var endObserver: NSObjectProtocol?
+    private var presentationSizeObservation: NSKeyValueObservation?
+
+    /// Resolved aspect per recording. Chunks of one recording captured the same
+    /// display, so caching here turns the brief unresolved window into a
+    /// once-per-recording event instead of once-per-chunk — without it the pane
+    /// visibly pops to full width at every chunk boundary crossing. Mirrors
+    /// `tasksCache` below.
+    private var aspectCache: [String: CGFloat] = [:]
 
     /// The recording under the playhead (for "Share from here").
     var currentRecording: String? { currentChunk?.recording }
@@ -343,9 +361,17 @@ final class DayPlaybackEngine: ObservableObject {
         switch resolved {
         case .media(let chunk, let offsetSeconds):
             if chunk != currentChunk {
+                let crossedRecording = chunk.recording != currentChunk?.recording
                 currentChunk = chunk
                 // fileURL is non-nil by DayMediaMap.target's contract for .media.
                 player.replaceCurrentItem(with: chunk.fileURL.map(AVPlayerItem.init(url:)))
+                // SCR-297: a new item reports its own presentation size, so the
+                // observation has to follow the item. Seed from the cache first
+                // so re-entering a known recording never flashes full-width.
+                if crossedRecording {
+                    sourceAspect = aspectCache[chunk.recording]
+                }
+                observePresentationSize(of: player.currentItem, for: chunk.recording)
             }
             let time = CMTime(seconds: offsetSeconds, preferredTimescale: 600)
             let tolerance = CMTime(seconds: 0.1, preferredTimescale: 600)
@@ -354,7 +380,48 @@ final class DayPlaybackEngine: ObservableObject {
             currentChunk = nil
             player.pause()
             player.replaceCurrentItem(with: nil)
+            // A placeholder is a page state, not footage: it carries no aspect
+            // and fills the pane, so any previously resolved shape must go.
+            presentationSizeObservation = nil
+            sourceAspect = nil
         }
+    }
+
+    /// Track the item's display size and publish it as `sourceAspect`.
+    ///
+    /// `presentationSize` (rather than the asset's `naturalSize`) because it
+    /// already has the preferred transform and pixel aspect ratio applied, so
+    /// rotated and non-square-pixel captures need no arithmetic here. It is
+    /// `.zero` until the item is ready, which `PlaybackAspect.resolve` maps to
+    /// "unresolved" — the pane keeps filling its box until real numbers arrive.
+    private func observePresentationSize(of item: AVPlayerItem?, for recording: String) {
+        presentationSizeObservation = nil
+        guard let item else { return }
+        presentationSizeObservation = item.observe(
+            \.presentationSize, options: [.initial, .new]
+        ) { [weak self] item, _ in
+            // KVO gives no queue guarantee, so hop rather than assume main.
+            // Only the CGSize crosses the boundary.
+            let size = item.presentationSize
+            Task { @MainActor [weak self] in
+                self?.applyReportedSize(size, forRecording: recording)
+            }
+        }
+    }
+
+    /// Fold a reported display size into `sourceAspect` and the cache.
+    ///
+    /// Internal rather than private so the tests can drive the state machine
+    /// directly: the `presentationSize` path needs a real, ready `AVPlayerItem`
+    /// and cannot be exercised hermetically, and `@testable` reaches internal
+    /// but not private. The KVO wiring itself is proven at runtime.
+    func applyReportedSize(_ size: CGSize, forRecording recording: String) {
+        // The playhead can move to another recording while an observation is
+        // in flight; a late size must not repaint the current one.
+        guard recording == currentRecording else { return }
+        guard let aspect = PlaybackAspect.resolve(reportedSize: size) else { return }
+        aspectCache[recording] = aspect
+        sourceAspect = aspect
     }
 
     /// Called from the view's `.onDisappear` — releases the time observer so
@@ -368,6 +435,11 @@ final class DayPlaybackEngine: ObservableObject {
             NotificationCenter.default.removeObserver(endObserver)
             self.endObserver = nil
         }
+        // SCR-297: the KVO observation retains its target item; releasing it
+        // here keeps this in lockstep with the other observers rather than
+        // leaving a live reference behind after teardown (cf. SCR-93).
+        presentationSizeObservation = nil
+        sourceAspect = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         currentChunk = nil

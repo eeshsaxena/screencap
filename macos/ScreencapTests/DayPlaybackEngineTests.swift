@@ -151,6 +151,164 @@ final class DayPlaybackEngineTests: XCTestCase {
         engine.tearDown()
     }
 
+    // MARK: - Source aspect (SCR-297)
+
+    // The `presentationSize` KVO path needs a real, ready AVPlayerItem and
+    // cannot run hermetically, so these drive `applyReportedSize` directly and
+    // cover the state machine around it: the cache that prevents the pane
+    // popping at every chunk boundary, the clears that keep a placeholder
+    // aspect-free, and the guard against a late resolution repainting a
+    // recording the playhead already left. The KVO wiring itself is proven at
+    // runtime (SCR-297 verification pass), not here.
+
+    private let laptopSize = CGSize(width: 1920, height: 1200)   // 1.6
+    private let ultrawideSize = CGSize(width: 3440, height: 1440) // ~2.389
+
+    @MainActor
+    func testSourceAspectStartsUnresolved() {
+        let engine = DayPlaybackEngine()
+        XCTAssertNil(engine.sourceAspect)
+        engine.tearDown()
+    }
+
+    /// R5/KTD2 — entering an unseen recording must publish nil rather than a
+    /// guess, then adopt the real shape once the item reports it.
+    @MainActor
+    func testUncachedRecordingIsUnresolvedUntilASizeArrives() {
+        let engine = DayPlaybackEngine()
+        let chunks = [chunk("rec-a", start: 0, end: 100_000, anchor: 0)]
+        engine.load(chunks: chunks, seekToMs: 0)
+
+        XCTAssertNil(engine.sourceAspect, "no size reported yet — must not guess")
+
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+        XCTAssertEqual(engine.sourceAspect, 1.6)
+        engine.tearDown()
+    }
+
+    /// KTD5 — the no-pop guarantee. Crossing a chunk boundary inside one
+    /// recording swaps the AVPlayerItem; without the cache the pane would drop
+    /// to full width and snap back on every crossing.
+    @MainActor
+    func testCrossingChunksWithinARecordingKeepsTheResolvedAspect() {
+        let engine = DayPlaybackEngine()
+        let chunks = [
+            chunk("rec-a", start: 0, end: 100_000, anchor: 0),
+            chunk("rec-a", start: 100_000, end: 200_000, anchor: 100_000),
+        ]
+        engine.load(chunks: chunks, seekToMs: 0)
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+
+        engine.seek(toDayMs: 150_000)
+
+        XCTAssertEqual(engine.target, .media(chunk: chunks[1], offsetSeconds: 50))
+        XCTAssertEqual(engine.sourceAspect, 1.6, "the pane must not pop at a chunk boundary")
+        engine.tearDown()
+    }
+
+    /// Re-entering a recording whose shape is already known publishes it
+    /// immediately, with no intervening nil.
+    @MainActor
+    func testReturningToACachedRecordingResolvesImmediately() {
+        let engine = DayPlaybackEngine()
+        let chunks = [
+            chunk("rec-a", start: 0, end: 100_000, anchor: 0),
+            chunk("rec-b", start: 100_000, end: 200_000, anchor: 100_000),
+        ]
+        engine.load(chunks: chunks, seekToMs: 0)
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+
+        engine.seek(toDayMs: 150_000)
+        engine.applyReportedSize(ultrawideSize, forRecording: "rec-b")
+        XCTAssertEqual(engine.sourceAspect ?? 0, 2.3889, accuracy: 0.001)
+
+        engine.seek(toDayMs: 50_000)
+        XCTAssertEqual(engine.sourceAspect, 1.6, "rec-a's shape was cached — no second unresolved window")
+        engine.tearDown()
+    }
+
+    /// A day spanning two displays re-shapes at the boundary. Correct
+    /// behaviour, and the reason the cache is keyed per recording rather than
+    /// held as one day-wide value.
+    @MainActor
+    func testCrossingIntoAnUncachedRecordingClearsTheAspect() {
+        let engine = DayPlaybackEngine()
+        let chunks = [
+            chunk("rec-a", start: 0, end: 100_000, anchor: 0),
+            chunk("rec-b", start: 100_000, end: 200_000, anchor: 100_000),
+        ]
+        engine.load(chunks: chunks, seekToMs: 0)
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+
+        engine.seek(toDayMs: 150_000)
+        XCTAssertNil(engine.sourceAspect, "rec-b's shape is unknown — fill the box, don't reuse rec-a's")
+        engine.tearDown()
+    }
+
+    /// R6 — a gap in the day is a page state, not footage.
+    @MainActor
+    func testPlaceholderClearsTheAspect() {
+        let engine = DayPlaybackEngine()
+        let chunks = [chunk("rec-a", start: 0, end: 100_000, anchor: 0)]
+        engine.load(chunks: chunks, seekToMs: 0)
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+        XCTAssertEqual(engine.sourceAspect, 1.6)
+
+        engine.seek(toDayMs: 500_000)
+        XCTAssertEqual(engine.target, .placeholder(.nothingCaptured))
+        XCTAssertNil(engine.sourceAspect)
+        engine.tearDown()
+    }
+
+    /// The playhead can move while an observation is in flight. A size arriving
+    /// for the recording it left must not repaint the current one.
+    @MainActor
+    func testLateResolutionForAnotherRecordingIsIgnored() {
+        let engine = DayPlaybackEngine()
+        let chunks = [
+            chunk("rec-a", start: 0, end: 100_000, anchor: 0),
+            chunk("rec-b", start: 100_000, end: 200_000, anchor: 100_000),
+        ]
+        engine.load(chunks: chunks, seekToMs: 0)
+        engine.seek(toDayMs: 150_000)
+
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+
+        XCTAssertNil(engine.sourceAspect, "a stale resolution must not shape the current recording")
+        engine.tearDown()
+    }
+
+    /// R8/KTD6 — an unusable size leaves the pane filling its box, and is not
+    /// cached, so a later well-formed report can still resolve it.
+    @MainActor
+    func testUnresolvableSizeIsNeitherPublishedNorCached() {
+        let engine = DayPlaybackEngine()
+        let chunks = [chunk("rec-a", start: 0, end: 100_000, anchor: 0)]
+        engine.load(chunks: chunks, seekToMs: 0)
+
+        engine.applyReportedSize(.zero, forRecording: "rec-a")
+        XCTAssertNil(engine.sourceAspect)
+
+        engine.applyReportedSize(CGSize(width: 8000, height: 100), forRecording: "rec-a")
+        XCTAssertNil(engine.sourceAspect)
+
+        // Not cached: the real size still lands when it arrives.
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+        XCTAssertEqual(engine.sourceAspect, 1.6)
+        engine.tearDown()
+    }
+
+    @MainActor
+    func testTearDownClearsTheAspect() {
+        let engine = DayPlaybackEngine()
+        let chunks = [chunk("rec-a", start: 0, end: 100_000, anchor: 0)]
+        engine.load(chunks: chunks, seekToMs: 0)
+        engine.applyReportedSize(laptopSize, forRecording: "rec-a")
+
+        engine.tearDown()
+        XCTAssertNil(engine.sourceAspect)
+    }
+
     // MARK: - Disk loader (fixture dirs)
 
     private func makeRecordingDir(_ root: URL, name: String) throws -> URL {
