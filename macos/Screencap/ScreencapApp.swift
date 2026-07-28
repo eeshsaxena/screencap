@@ -64,7 +64,10 @@ struct ScreencapApp: App {
                 .environmentObject(auth)
                 .environmentObject(uploads)
                 .environmentObject(store)
-                .frame(minWidth: 880, minHeight: 560)
+                .frame(
+                    minWidth: ShellWindowLayout.windowMinWidth,
+                    minHeight: ShellWindowLayout.windowMinHeight
+                )
                 .background(OpenWindowBridge())
                 .onAppear {
                     appDelegate.bind(recorder: recorder)
@@ -109,6 +112,17 @@ struct ScreencapApp: App {
         // guards (AppDelegate, MenuBarMenu) are unaffected.
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
+        // Without this the scene has no stated ideal size, so a first launch
+        // opens the window at the `minWidth`/`minHeight` floor above. That is
+        // what users actually shipped with — nobody resizes a window that looks
+        // deliberate — and it put the Day page permanently at its tightest
+        // layout, which is where the shell overflowed and where the playback
+        // pane collapsed into a ~3:1 letterbox strip. The floor is a floor, not
+        // a default.
+        .defaultSize(
+            width: ShellWindowLayout.windowDefaultWidth,
+            height: ShellWindowLayout.windowDefaultHeight
+        )
         .commands {
             CommandGroup(replacing: .newItem) {}
         }

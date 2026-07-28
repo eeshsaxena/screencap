@@ -673,7 +673,9 @@ struct MainWindow: View {
         // no NavigationSplitView, so no native window toolbar or sidebar-collapse
         // control to hide — which is what previously occluded the traffic lights.
         // Two frames: `width:` and `maxHeight:` are distinct SwiftUI overloads.
-        .frame(width: 248)
+        // The width is a HARD minimum the window must be able to honour — see
+        // ShellWindowLayout, which pins it against the declared window minimum.
+        .frame(width: ShellWindowLayout.sidebarWidth)
         .frame(maxHeight: .infinity)
     }
 
