@@ -444,6 +444,27 @@ class Supervisor:
         self._recovering = False
         self._finalized_seen = False
         self._stopping = False
+        # SCR-276: the third engine state SCR-273 created but never named —
+        # SIGTERMed, past ``stop_timeout``, still draining finalize work in the
+        # background under the ``stop_kill_grace`` backstop. Without it every
+        # consumer of ``_proc.is_alive()`` inherits the pre-SCR-273 binary
+        # reading ("alive == recording"), which is what makes the drain window
+        # invisible: ``spawn`` refuses as "already recording",
+        # ``current_session`` reports an unmarked live session, and the
+        # ``_stopping`` crash-telemetry gate stays closed for the whole drain.
+        # Set ONLY by the no-kill stop path; cleared by ``shutdown`` (which
+        # reverts to the bounded kill-at-``stop_timeout`` contract) and by
+        # ``_reset_state``.
+        self._draining = False
+        # SCR-276: set at EVERY site where the daemon itself SIGKILLs the engine
+        # (the stop backstop, and stop()'s bounded kill arms). Distinguishes "the
+        # engine exited non-zero because we killed it" from "it crashed on its
+        # own" — which ``_stopping`` alone can no longer tell apart once a stop
+        # can leave the engine draining for minutes (see
+        # ``_exit_is_operator_terminated``). Recording the kill at the kill site
+        # keeps the predicate correct without depending on ``_draining``
+        # bookkeeping being exactly right on every path.
+        self._killed_by_daemon = False
         self._exit_handled = False
         self._operation_lock = asyncio.Lock()
         self._exit_lock = asyncio.Lock()
@@ -549,6 +570,13 @@ class Supervisor:
             snapshot["engine_pid"] = self._proc.pid
         elif self._engine_pid is not None:
             snapshot["engine_pid"] = self._engine_pid
+        # SCR-276: mark the post-stop drain so a status probe (or an app relaunch)
+        # mid-drain can tell "recording" from "this recording is stopping" and
+        # not re-attach to it. Additive by omission — absent means not draining,
+        # mirroring the `muted` / `paused` overlay convention — so a client that
+        # does not know the field behaves exactly as before.
+        if self._draining:
+            snapshot["finalizing"] = True
         return snapshot
 
     async def send_command(self, command: dict[str, Any]) -> bool:
@@ -813,6 +841,19 @@ class Supervisor:
                     schema_version=schema._RECORDING_START_API_VERSION
                 )
             if self._proc is not None and self._proc.is_alive():
+                if self._draining:
+                    # SCR-276: the engine is alive but STOPPED — draining its
+                    # post-stop finalize work (SCR-273). Nothing is recording, so
+                    # refuse with the typed retryable code rather than
+                    # `lock_contended`, whose CLI/app copy claims a recording is
+                    # already active. The drain is bounded by `stop_kill_grace`,
+                    # so retrying always eventually succeeds.
+                    raise errors.FinalizeInProgressError(
+                        schema_version=schema._RECORDING_START_API_VERSION,
+                        recording_name=(self._session_state or {}).get(
+                            "recording_name"
+                        ),
+                    )
                 owner = self._owner_payload()
                 raise errors.LockContendedError(
                     owner,
@@ -898,6 +939,8 @@ class Supervisor:
                 self._engine_pid = proc.pid
                 self._finalized_seen = False
                 self._stopping = False
+                self._draining = False
+                self._killed_by_daemon = False
                 self._exit_handled = False
                 self._session_state = {
                     "session_id": name,
@@ -1054,6 +1097,12 @@ class Supervisor:
                         # ambient re-arm), and arm a hard backstop kill so a
                         # truly hung engine still cannot outlive the daemon's
                         # supervision.
+                        # SCR-276: name the drain, BEFORE arming the tasks that
+                        # observe it, so no exit funnel can ever run against a
+                        # drain that is not yet marked as one.  This is the only
+                        # place `_draining` is set, so the flag can never apply
+                        # to an engine that is genuinely still recording.
+                        self._draining = True
                         self._poll_task = asyncio.create_task(
                             self._exit_poll(proc)
                         )
@@ -1063,13 +1112,17 @@ class Supervisor:
                         # kill_on_timeout caller (storage.lock): bounded-time
                         # contract wins — the store is about to be sealed out
                         # from under the engine, so it must not outlive this
-                        # return.
+                        # return. SCR-276: this can land while a PRIOR stop left
+                        # the engine draining, so record the kill — otherwise the
+                        # exit funnel reports our own SIGKILL as a mid-drain crash.
+                        self._killed_by_daemon = True
                         proc.kill()
                     final_state = "force_stopped"
                 try:
                     rc = await proc.wait(timeout=1.0)
                 except asyncio.TimeoutError:
                     if proc.is_alive():
+                        self._killed_by_daemon = True
                         proc.kill()
                     rc = await proc.wait(timeout=2.0)
                     final_state = "force_stopped"
@@ -1383,6 +1436,13 @@ class Supervisor:
         if self._proc is not None and self._proc.is_alive():
             proc = self._proc
             self._stopping = True
+            # SCR-276: shutdown reverts to the BOUNDED contract — it kills at
+            # `stop_timeout` below rather than letting the drain run to
+            # `stop_kill_grace`. So a shutdown that lands mid-drain is no longer
+            # a drain, and leaving `_draining` set would make the resulting
+            # SIGKILL (rc != 0) look like a mid-drain crash to the telemetry gate
+            # in `_handle_engine_exit`. Clearing it here keeps that gate honest.
+            self._draining = False
             # Same TOCTOU defense as Supervisor.stop(): capture the cursor
             # before `terminate()` so the late subscription replays any
             # `recording_finalized` the engine's SIGTERM handler publishes
@@ -1408,10 +1468,15 @@ class Supervisor:
                     )
                 except asyncio.TimeoutError:
                     if proc.is_alive():
+                        # SCR-276: record every daemon-initiated kill at the kill
+                        # site (see `_exit_is_operator_terminated`), so the crash
+                        # gate never depends on flag bookkeeping elsewhere.
+                        self._killed_by_daemon = True
                         proc.kill()
                 try:
                     rc = await proc.wait(timeout=2.0)
                 except asyncio.TimeoutError:
+                    self._killed_by_daemon = True
                     proc.kill()
                     try:
                         rc = await proc.wait(timeout=2.0)
@@ -1589,6 +1654,32 @@ class Supervisor:
             self._observe_event(event)
             await self._bus.publish(event)
 
+    def _exit_is_operator_terminated(self) -> bool:
+        """Whether a non-zero engine exit is attributable to the daemon (SCR-276).
+
+        The crash-telemetry gate. A non-zero rc that WE caused (our SIGKILL) is
+        not a crash and must not raise ``engine_crashed`` or mark the catalog
+        terminated-unexpectedly; a non-zero rc the engine reached on its own is.
+
+        Pre-SCR-273 ``self._stopping`` was a sound proxy, because the stop path
+        was bounded: it SIGKILLed at ``stop_timeout`` and returned, so every
+        non-zero exit under ``_stopping`` was our kill. SCR-273's no-kill drain
+        broke that — ``_stopping`` now stays True for the whole (up to
+        ``stop_kill_grace``) background drain, silently swallowing a genuine
+        mid-drain crash. Splitting the drain out restores the original meaning:
+
+        * ``_stopping and not _draining`` — inside the bounded stop / shutdown
+          path, where a non-zero rc is our own SIGKILL. Suppress.
+        * ``_killed_by_daemon`` — WE SIGKILLed it (the stop backstop after
+          ``stop_kill_grace``, or a bounded ``kill_on_timeout`` stop that landed
+          mid-drain). Also our kill. Suppress.
+        * otherwise (including a live drain we did NOT kill) — the engine died
+          on its own. Report it.
+        """
+        if self._killed_by_daemon:
+            return True
+        return self._stopping and not self._draining
+
     async def _exit_poll(self, proc: _PopenEngineProcess) -> None:
         while proc.is_alive():
             await asyncio.sleep(self._poll_interval)
@@ -1623,7 +1714,7 @@ class Supervisor:
                 self._ambient_active = False
 
             if not self._finalized_seen:
-                if rc != 0 and not self._stopping:
+                if rc != 0 and not self._exit_is_operator_terminated():
                     self._mark_catalog_terminated_unexpectedly(
                         (self._session_state or {}).get("capture_dir")
                     )
@@ -2031,8 +2122,18 @@ class Supervisor:
         request = self._build_ambient_request()
         try:
             await self.spawn(request)
-        except errors.LockContendedError:
-            logger.info("ambient auto-start deferred: recording lock already held")
+        except (errors.LockContendedError, errors.FinalizeInProgressError):
+            # SCR-276: BOTH refusals mean "the lock is busy right now", not
+            # "ambient is broken" — a later exit re-arm or the next boot retries.
+            # `FinalizeInProgressError` is a SIBLING of `LockContendedError`, not
+            # a subclass, so it must be named explicitly: without it a drain falls
+            # into the generic arm below and burns the crash-backoff budget toward
+            # the degraded ceiling. `_roll_ambient_day` stops then immediately
+            # respawns, so every day-roll whose drain outlives `stop_timeout`
+            # would hit that path.
+            logger.info(
+                "ambient auto-start deferred: recording lock held or finalizing"
+            )
             return
         except errors.ReconcilingError:
             logger.info("ambient auto-start deferred: still reconciling")
@@ -2653,6 +2754,11 @@ class Supervisor:
                     "engine still alive %.0fs after stop; force-killing",
                     self._stop_kill_grace,
                 )
+                # SCR-276: record the kill BEFORE it lands, so the exit funnel
+                # can never observe the resulting non-zero rc without also
+                # seeing that we caused it, and report a hung engine we killed
+                # as a spontaneous mid-drain crash.
+                self._killed_by_daemon = True
                 proc.kill()
 
     async def _cancel_exit_poll(self) -> None:
@@ -3015,6 +3121,8 @@ class Supervisor:
         self._engine_token_uid = None
         self._finalized_seen = False
         self._stopping = False
+        self._draining = False
+        self._killed_by_daemon = False
         self._exit_handled = False
 
 

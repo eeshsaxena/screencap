@@ -7,6 +7,10 @@ private let daemonSessionLogger = Logger(subsystem: "com.screencap.macos", categ
 /// Mirrors `src/screencap/daemon/errors.py`'s string constants.
 enum DaemonErrorCode {
     static let lockContended = "lock_contended"
+    // SCR-276: recording.start refused because the PREVIOUS recording is still
+    // draining its post-stop finalize work. Deliberately NOT folded into
+    // `lockContended` — nothing is recording, so that case's copy is wrong.
+    static let finalizeInProgress = "finalize_in_progress"
     static let notOwnedByDaemon = "not_owned_by_daemon"
     static let permissionRequired = "permission_required"
     // SCR-228: recording.start refused because a storage migration holds the daemon.
@@ -16,6 +20,17 @@ enum DaemonErrorCode {
 /// Decodes the `missing` list off a `permission_required` error envelope (U6).
 private struct PermissionRequiredPayload: Decodable {
     let missing: [String]
+}
+
+/// Decodes the draining recording's name off a `finalize_in_progress` envelope
+/// (SCR-276). The field is omitted when the daemon does not know the name, so
+/// it is optional and the copy degrades to an unnamed subject.
+private struct FinalizeInProgressPayload: Decodable {
+    let recordingName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case recordingName = "recording_name"
+    }
 }
 
 /// Typed outcomes returned by the daemon session service. Hoisted out of the
@@ -39,6 +54,14 @@ enum DaemonSession {
         /// missing field to `false` (unmuted) here so the controller hydrates a
         /// concrete value on attach / reconnect.
         case daemonOwnedSession(startedAt: Date, muted: Bool)
+        /// SCR-276: a daemon-owned session the snapshot still reports as
+        /// recording, but which has been STOPPED and is draining its finalize
+        /// work. The pidfile lock is only released when the engine exits, so
+        /// `is_recording` stays true for the whole drain — without this case an
+        /// app relaunch mid-drain re-attaches to a recording that is stopping
+        /// and shows a live HUD for it. Carries `recordingName` so a
+        /// user-facing "still finishing" surface can name it (SCR-296).
+        case finalizingSession(recordingName: String?)
         case foreignClaimant
         case unreachable
     }
@@ -47,6 +70,11 @@ enum DaemonSession {
         case schemaMismatch
         case socketUnavailable
         case lockContended
+        /// SCR-276: the start was refused because the previous recording is
+        /// still finalizing. Retryable — the drain is bounded by the daemon's
+        /// stop backstop — so the surface says "try again in a moment" rather
+        /// than `lockContended`'s "already recording".
+        case finalizeInProgress(recordingName: String?)
         /// A daemon-backed start was rejected before spawn because a required
         /// TCC grant is missing (U6). Carries the canonical permission strings
         /// the app maps to panes. Routed into the grant flow, never the CLI
@@ -166,6 +194,12 @@ final class LiveDaemonSessionService: DaemonSessionService {
             let snap = try await DaemonClient.sessionSnapshot()
             guard snap.isRecording == true else { return .noActiveSession }
             if snap.daemonOwned {
+                // SCR-276: check the finalizing overlay BEFORE promoting to a
+                // live session. `is_recording` alone cannot distinguish the two
+                // — the lock outlives the stop for the whole drain.
+                if snap.finalizing == true {
+                    return .finalizingSession(recordingName: snap.recordingName)
+                }
                 let started = snap.startedAt.map(Date.init(timeIntervalSince1970:)) ?? Date()
                 // Additive `muted` overlay (U7): absent → unmuted (back-compat
                 // with a stale daemon that omits it), mirroring the audio-echo rule.
@@ -210,6 +244,15 @@ final class LiveDaemonSessionService: DaemonSessionService {
             // the diagnostic detail (regressed log-content from pre-refactor).
             daemonSessionLogger.info("Daemon transport failed; falling back to CLI. Error: \(String(describing: error), privacy: .public)")
             return .socketUnavailable
+        case DaemonClientError.envelopeError(let code, let rawBody)
+            where code == DaemonErrorCode.finalizeInProgress:
+            // SCR-276: routed BEFORE `lockContended` and never merged into it —
+            // the whole point is that "already recording" is the wrong story
+            // here. The name is a best-effort decode; the copy reads fine
+            // without it.
+            let name = (try? JSONDecoder().decode(FinalizeInProgressPayload.self, from: rawBody))?
+                .recordingName
+            return .finalizeInProgress(recordingName: name)
         case DaemonClientError.envelopeError(let code, _)
             where code == DaemonErrorCode.lockContended || code == DaemonErrorCode.notOwnedByDaemon:
             return .lockContended

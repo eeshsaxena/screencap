@@ -711,8 +711,15 @@ async def session_snapshot(request: Request) -> JSONResponse:
             # SCR-214 U4: ``paused`` rides the same additive overlay as ``muted``
             # — absent until the first confirmed pause event, so a never-paused
             # recording omits it and the app defaults to not-paused.
+            # SCR-276: ``finalizing`` rides it too. The pidfile lock is only
+            # released when the engine actually EXITS, so the SCR-273 post-stop
+            # drain keeps this snapshot reporting ``is_recording: true`` for up
+            # to ``stop_kill_grace``. The flag is what lets a status probe (or an
+            # app relaunch) tell a live recording from one that is stopping,
+            # rather than re-attaching to it. Absent → not draining, so a client
+            # that does not know the field behaves exactly as before.
             for key in ("engine_pid", "frames_written", "started_by", "muted",
-                        "paused"):
+                        "paused", "finalizing"):
                 if current.get(key) is not None:
                     payload[key] = current[key]
     elif not daemon_owned:

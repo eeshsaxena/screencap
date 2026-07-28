@@ -299,3 +299,42 @@ def test_daemon_api_error_surfaces_and_reports_not_recording(monkeypatch):
     # Daemon was reachable for the HTTP call but returned an error;
     # status falls back to "not recording" without raising.
     assert payload["is_recording"] is False
+
+
+def test_status_during_drain_reports_finishing_not_recording(monkeypatch):
+    """SCR-276: during the post-stop finalize drain the pidfile lock is still
+    held, so the snapshot keeps reporting ``is_recording: true``. Without the
+    ``finalizing`` overlay ``status`` renders a live recording with a climbing
+    elapsed counter while ``start`` in the same shell refuses with "still
+    finishing processing" — two CLI surfaces contradicting each other."""
+    import screencap.cli as cli_mod
+
+    snapshot = _recording_snapshot(name="demo", started_at=time.time() - 5.0)
+    snapshot["finalizing"] = True
+
+    _patch_client(monkeypatch, lambda request: httpx.Response(200, json=snapshot))
+
+    payload = json.loads(_run_status_json().output)
+    # `is_recording` stays true — the lock genuinely IS held — so the JSON
+    # contract is unchanged and `finalizing` is the only discriminator.
+    assert payload["is_recording"] is True
+    assert payload["finalizing"] is True
+
+    monkeypatch.setattr(cli_mod, "_should_default_to_json", lambda: False)
+    human = CliRunner().invoke(cli, ["status"], catch_exceptions=False)
+    assert human.exit_code == 0
+    assert "Finishing" in human.output
+    assert "elapsed" not in human.output
+
+
+def test_status_without_finalizing_field_is_unchanged(monkeypatch):
+    """Additive by omission: an older daemon omits ``finalizing`` entirely, and
+    a live recording must still render exactly as before."""
+    snapshot = _recording_snapshot(name="demo", started_at=time.time() - 5.0)
+    assert "finalizing" not in snapshot
+
+    _patch_client(monkeypatch, lambda request: httpx.Response(200, json=snapshot))
+
+    payload = json.loads(_run_status_json().output)
+    assert payload["is_recording"] is True
+    assert payload["finalizing"] is False

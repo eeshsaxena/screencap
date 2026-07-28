@@ -421,6 +421,7 @@ def _permission_probe_cmd() -> None:
 # spawn workers and the recording hot loop can import it without dragging
 # Click + rich Console into the child process.
 from screencap._stderr_events import (  # noqa: E402
+    EVENT_FINALIZE_IN_PROGRESS,
     EVENT_PERMISSION_REQUIRED,
     EVENT_STOPPED,
     PERMISSION_DISPLAY,
@@ -714,6 +715,12 @@ def _run_start_via_daemon(
     Returns the exit code per Phase 1's taxonomy:
       0=clean, 1=generic failure, 2=lock-held, 3=permission_lost,
       4=disk_full, 5=user-initiated force-quit (2-tap Ctrl+C).
+
+    SCR-276: the ``finalize_in_progress`` refusal also returns 2 — the recording
+    lock genuinely IS held during the post-stop drain (it is released only when
+    the engine exits), so 2 stays accurate and the documented cross-language
+    exit-code contract is unchanged. Only the *message* differs between the two
+    causes, and only stderr carries that distinction.
     """
     import json as _json
     import signal as _signal
@@ -814,6 +821,38 @@ def _run_start_via_daemon(
                 start_result = client.start(**{k: v for k, v in payload.items() if v is not None})
             except DaemonAPIError as exc:
                 code = exc.envelope.get("error", "unknown")
+                if code == "finalize_in_progress":
+                    # SCR-276: the previous recording is still draining its
+                    # post-stop finalize work (SCR-273). Nothing is recording, so
+                    # do NOT reuse the `lock_contended` copy below — it would
+                    # claim a recording is active and send the user hunting for
+                    # one to stop. Retryable by definition (the drain is bounded
+                    # by the daemon's stop backstop), so name the retry.
+                    # Rendered via a stderr ``Console`` (the project convention),
+                    # NOT ``click.echo`` — the adjacent ``lock_contended`` branch
+                    # passes rich markup to ``click.echo``, which emits the
+                    # ``[red]`` tags literally.
+                    finalizing_name = exc.envelope.get("recording_name")
+                    subject = (
+                        f"'{escape(str(finalizing_name))}'"
+                        if finalizing_name
+                        else "The previous recording"
+                    )
+                    Console(stderr=True).print(
+                        f"[yellow]{subject} is still finishing processing. "
+                        f"Try again in a moment.[/yellow]"
+                    )
+                    # Also emit the structured event, mirroring the
+                    # `permission_required` branch below: the CLI-fallback
+                    # SwiftUI shell parses this stderr channel as NDJSON and
+                    # discards prose, and it shares exit code 2 with
+                    # `lock_contended`, so without this it renders "Screencap is
+                    # already recording." — the exact wrong story this refusal
+                    # exists to remove.
+                    _emit_event(
+                        EVENT_FINALIZE_IN_PROGRESS, name=finalizing_name
+                    )
+                    return 2
                 if code == "lock_contended":
                     owner = exc.envelope.get("owner", {})
                     click.echo(
@@ -2591,6 +2630,12 @@ def status(as_json, no_nlp_check):
         ok: bool
         schema_version: int
         is_recording: bool
+        # SCR-276: the recording has been STOPPED and is draining its finalize
+        # work. `is_recording` stays True (the lock is genuinely held until the
+        # engine exits), so this is the only field that separates "recording"
+        # from "finishing" — without it `status` contradicts `start`, which
+        # refuses with `finalize_in_progress` in the same window.
+        finalizing: bool
         started_at: float | None
         elapsed: float | None
         recording_name: str | None
@@ -2606,6 +2651,7 @@ def status(as_json, no_nlp_check):
         "ok": True,
         "schema_version": _STATUS_SCHEMA_VERSION,
         "is_recording": False,
+        "finalizing": False,
         "started_at": None,
         "elapsed": None,
         "recording_name": None,
@@ -2688,6 +2734,10 @@ def status(as_json, no_nlp_check):
         snapshot = None
 
     if snapshot and snapshot.get("is_recording"):
+        # SCR-276: additive overlay — absent (older daemon, or not draining)
+        # reads as False, so the JSON shape and every existing consumer are
+        # unchanged.
+        payload["finalizing"] = bool(snapshot.get("finalizing"))
         started_at = snapshot.get("started_at")
         if isinstance(started_at, (int, float)):
             payload["is_recording"] = True
@@ -2731,7 +2781,16 @@ def status(as_json, no_nlp_check):
     # Pretty output for human callers.
     if payload["is_recording"]:
         elapsed = payload.get("elapsed")
-        if elapsed is not None:
+        if payload["finalizing"]:
+            # SCR-276: the recording is STOPPED and draining. Rendering the live
+            # "Recording — Ns elapsed" line here (with a counter that keeps
+            # climbing) contradicts `screencap start`, which refuses in this same
+            # window with "still finishing processing".
+            console.print(
+                "[yellow]Finishing[/yellow] — recording stopped, still "
+                "processing"
+            )
+        elif elapsed is not None:
             console.print(f"[#22d3ee]Recording[/#22d3ee] — {int(elapsed)}s elapsed")
         else:
             console.print("[#22d3ee]Recording[/#22d3ee] — (start time unknown)")
