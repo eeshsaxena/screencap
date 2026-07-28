@@ -42,7 +42,12 @@ final class DayPlaybackPaneLayoutTests: XCTestCase {
             .modifier(SourceAspectFit(aspect: aspect))
             .background(
                 GeometryReader { geometry in
-                    Color.clear.onAppear { probe.size = geometry.size }
+                    // onAppear catches the first settled layout; onChange
+                    // catches any later re-proposal, so the probe reports the
+                    // final size rather than whichever pass fired first.
+                    Color.clear
+                        .onAppear { probe.size = geometry.size }
+                        .onChange(of: geometry.size) { probe.size = $0 }
                 }
             )
             .frame(
@@ -53,10 +58,10 @@ final class DayPlaybackPaneLayoutTests: XCTestCase {
             .padding(.horizontal, ShellWindowLayout.playbackPaneHorizontalInset)
 
         // Retain the handle across the measurement — releasing the window can
-        // tear the hosted tree down mid-read.
+        // tear the hosted tree down mid-read, so the read has to happen inside
+        // the extended lifetime rather than after it.
         let hosted = ViewHost.host(pane, size: slot)
-        withExtendedLifetime(hosted) {}
-        return probe.size
+        return withExtendedLifetime(hosted) { probe.size }
     }
 
     /// The reported case. At the shipped default the detail column is

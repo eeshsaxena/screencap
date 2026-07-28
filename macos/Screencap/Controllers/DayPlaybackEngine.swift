@@ -400,10 +400,13 @@ final class DayPlaybackEngine: ObservableObject {
         presentationSizeObservation = item.observe(
             \.presentationSize, options: [.initial, .new]
         ) { [weak self] item, _ in
-            // KVO gives no queue guarantee, so hop rather than assume main.
-            // Only the CGSize crosses the boundary.
+            // KVO gives no queue guarantee, so hop rather than assume main
+            // (unlike the periodic time observer above, which is handed an
+            // explicit .main queue and can use MainActor.assumeIsolated).
+            // Only the CGSize crosses the boundary; `self` stays weak through
+            // the nested capture.
             let size = item.presentationSize
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 self?.applyReportedSize(size, forRecording: recording)
             }
         }
