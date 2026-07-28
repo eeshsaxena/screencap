@@ -326,7 +326,9 @@ struct DayTimelineView: View {
             searchField
             dayActionsMenu
         }
-        .padding(.horizontal, 24)
+        // The day page's content gutter. The playback pane insets by the same
+        // value so the player's edges align with this row (ShellWindowLayout).
+        .padding(.horizontal, ShellWindowLayout.dayHeaderHorizontalPadding)
         .padding(.vertical, 16)
         .background(Color.scCanvas)
         .overlay(alignment: .bottom) { Divider().overlay(Color.scBorderWarm) }
@@ -448,7 +450,7 @@ struct DayTimelineView: View {
             Text(Self.headerDateFormatter.string(from: currentDate))
                 .font(SCTypography.grotesk(size: 15, weight: .semibold))
                 .foregroundStyle(Color.scInk)
-                .frame(minWidth: 150, alignment: .leading)
+                .frame(minWidth: ShellWindowLayout.dayDateLabelMinWidth, alignment: .leading)
 
             Button { stepDay(1) } label: {
                 Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold))
@@ -483,7 +485,14 @@ struct DayTimelineView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-        .frame(width: 300)
+        // Was a fixed 300pt, which made the field the largest single hard
+        // minimum in the header and left it nothing to give back when the
+        // window got tight. A range keeps the preferred width while letting the
+        // header compress instead of overflowing (see ShellWindowLayout).
+        .frame(
+            minWidth: ShellWindowLayout.daySearchFieldMinWidth,
+            maxWidth: ShellWindowLayout.daySearchFieldMaxWidth
+        )
         .background(Color.scSurface, in: Capsule())
         .overlay(Capsule().strokeBorder(Color.scTeal.opacity(0.4), lineWidth: 1))
     }
@@ -516,10 +525,25 @@ struct DayTimelineView: View {
                 .padding(.horizontal, 24)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The pane carries no aspect-ratio constraint — it takes whatever space
+        // the header, narrative and strip leave — so it misbehaved at BOTH ends
+        // of the window's size range. Narrow: the vertical leftover collapsed to
+        // a short, very wide box (~3:1 against 16:10 footage), so the video drew
+        // at about half the pane's width and the rest read as dead black space.
+        // Maximized: the video ran flush into the sidebar divider and the window
+        // edge, reading as a slab wedged into the chrome. The floor fixes the
+        // first, the inset the second.
+        .frame(
+            maxWidth: .infinity,
+            minHeight: ShellWindowLayout.playbackPaneMinHeight,
+            maxHeight: .infinity
+        )
         .overlay(alignment: .bottomLeading) { timestampChip }
         .overlay(alignment: .bottomTrailing) { if !clipMode { actionButtons } }
         .overlay(alignment: .bottom) { clipBoundsOverlay }
+        // AFTER the overlays deliberately: the timestamp chip and action bar must
+        // stay anchored to the video's own edges, not float out over the margin.
+        .padding(.horizontal, ShellWindowLayout.playbackPaneHorizontalInset)
         // KTD-10: the Inspect window survives only as a day-page footage DEBUG
         // entry (it also hosts Undated recordings) — never a browsing or citation
         // path. Chat / search citations route here to the day page instead (U12).
