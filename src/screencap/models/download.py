@@ -22,10 +22,12 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from screencap.models import registry
 from screencap.models.registry import DEFAULT_MODEL_ID
@@ -42,6 +44,11 @@ _HF_ENDPOINT = "https://huggingface.co"
 _DISK_HEADROOM = 2.2
 
 _INSTALLED_MARKER = ".installed"
+
+#: How often the staging dir is measured while the snapshot fetch blocks. Fast
+#: enough to keep a progress bar visibly moving, cheap enough that walking a
+#: handful of files costs nothing next to a multi-GB transfer.
+_PROGRESS_SAMPLE_INTERVAL_S = 0.25
 
 ProgressCb = Callable[[int, int], None]  # (bytes_done, bytes_total)
 
@@ -78,6 +85,85 @@ def _rmtree_safe(path: Path) -> None:
         path.unlink(missing_ok=True)
         return
     shutil.rmtree(path, ignore_errors=True)
+
+
+def _staged_bytes(staging: Path) -> int:
+    """Bytes materialized under ``staging`` so far.
+
+    Counts regular files only, via ``lstat`` so a symlink is never followed out of
+    the staging dir (the verify pass refuses symlinks outright; this must not
+    inflate the count with a link target's size in the meantime). Hugging Face
+    stages each file as a ``.incomplete`` temp under ``.cache/huggingface`` and
+    then *renames* it into place, so a file's bytes are counted once either way.
+    """
+    total = 0
+    for p in staging.rglob("*"):
+        try:
+            st = p.lstat()
+        except OSError:
+            continue  # vanished mid-walk (a rename into place) — next sample gets it
+        if stat.S_ISREG(st.st_mode):
+            total += st.st_size
+    return total
+
+
+@contextmanager
+def _progress_sampler(
+    staging: Path,
+    total: int,
+    progress_cb: ProgressCb | None,
+    interval: float = _PROGRESS_SAMPLE_INTERVAL_S,
+) -> Iterator[None]:
+    """Report bytes-on-disk while the blocking snapshot fetch runs.
+
+    ``snapshot_download`` is one blocking call with no byte-level callback, so
+    without this the engine reports ``(0, total)`` for the entire multi-GB
+    transfer and every consumer — the onboarding step, the Intelligence pane, the
+    ``model status`` CLI — renders a bar frozen at 0% that a user cannot tell
+    apart from a hang. Sampling the staging dir keeps the reading independent of
+    ``huggingface_hub`` internals (its ``tqdm_class`` seam only counts *files*,
+    useless when one weight file is ~99% of the bytes).
+
+    The callback fires on this sampler thread, between the caller's own bracketing
+    0% / 100% readings. Ordering is held by three things together, since the join
+    below is bounded and cannot carry the guarantee alone: the sampler re-checks
+    the stop flag after measuring and before reporting, the thread is joined on
+    exit, and the caller's 100% reading only follows the (slow) hash verification.
+    A stale sample therefore does not land after the terminal one and drag the
+    reported byte count backwards.
+    """
+    if progress_cb is None:
+        yield
+        return
+
+    done = threading.Event()
+
+    def _sample() -> None:
+        while not done.wait(interval):
+            try:
+                staged = min(_staged_bytes(staging), total)
+                # Re-check after the walk: `done` may have been set while we were
+                # measuring, and the join below is bounded. Without this the stale
+                # reading could land after the caller's terminal 100% one and drag
+                # the reported byte count backwards.
+                if done.is_set():
+                    return
+                progress_cb(staged, total)
+            except Exception:  # a broken consumer must never fail the download
+                log.debug("model download progress sample failed", exc_info=True)
+
+    thread = threading.Thread(target=_sample, name="model-download-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join(timeout=2.0)
+        if thread.is_alive():
+            # Orphaned: it will keep sampling a staging dir that is about to be
+            # renamed away. Harmless (the loop swallows its own errors) but never
+            # silent — an invisible leaked thread is how a slow consumer hides.
+            log.warning("model download progress sampler did not stop within 2s")
 
 
 def get_disclosed_size(model_id: str | None = None, runtime: str | None = None) -> int | None:
@@ -211,7 +297,8 @@ def download_model(
 
     try:
         filenames = [f.name for f in variant.files]
-        snapshot(variant.repo, variant.revision, staging, filenames)
+        with _progress_sampler(staging, total, progress_cb):
+            snapshot(variant.repo, variant.revision, staging, filenames)
 
         if stop_event is not None and stop_event.is_set():
             _rmtree_safe(staging)

@@ -88,6 +88,40 @@ class TestHappyPath:
         assert mode == 0o600
         assert stat.S_IMODE(result.path.stat().st_mode) == 0o700
 
+    def test_reports_progress_during_the_fetch(self, tmp_path, test_model):
+        """Progress must advance WHILE the snapshot runs, not only 0% → 100%.
+
+        ``snapshot_download`` blocks for the whole multi-GB transfer and offers no
+        byte-level callback, so without the staging sampler the engine reports
+        ``(0, total)`` for minutes on end and every UI renders a frozen bar that
+        is indistinguishable from a hang (the QA "stuck at 0%" report).
+        """
+        seen: list[tuple[int, int]] = []
+        sampled = threading.Event()
+
+        def chunked_snapshot(repo, revision, local_dir, filenames):
+            half = len(_WEIGHTS) // 2
+            (local_dir / "model.gguf").write_bytes(_WEIGHTS[:half])
+            # Hold the partial file on disk until the sampler sees it (bounded, so
+            # a non-sampling engine fails the assertion below rather than hanging).
+            sampled.wait(5)
+            (local_dir / "model.gguf").write_bytes(_WEIGHTS)
+
+        def progress_cb(done, total):
+            seen.append((done, total))
+            if 0 < done < total:
+                sampled.set()
+
+        result = _dl(tmp_path, snapshot_fn=chunked_snapshot, progress_cb=progress_cb)
+
+        assert result.state == "installed"
+        assert any(0 < done < total for done, total in seen), (
+            f"no intermediate progress reading; the bar would sit at 0%: {seen}"
+        )
+        # Never over-report: a reading above the disclosed total would drive a
+        # >100% bar.
+        assert all(done <= total for done, total in seen)
+
 
 @pytest.mark.privacy
 class TestFailClosed:

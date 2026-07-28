@@ -164,6 +164,19 @@ class TestThrottle:
         assert job._should_emit(1, 10_000) is False  # +0.01% within 0.5s → skip
         assert job._should_emit(200, 10_000) is True  # +2% → emit
 
+    def test_should_emit_suppresses_a_stalled_repeat(self):
+        """A stall re-reports the same byte count — elapsed time alone must not emit.
+
+        The engine samples bytes-on-disk on a fixed cadence, so a stalled transfer
+        calls back forever with an unchanged count; without the equality guard the
+        interval branch would republish an identical payload twice a second.
+        """
+        job = ModelDownloadJob(FakeBus())
+        assert job._should_emit(5_000, 10_000) is True
+        job._last_emit_t = 0.0  # force the elapsed-time branch wide open
+        assert job._should_emit(5_000, 10_000) is False  # same bytes → still silent
+        assert job._should_emit(5_001, 10_000) is True  # real movement → heartbeat
+
     def test_status_default_is_idle(self):
         assert ModelDownloadJob(FakeBus()).status().state == "idle"
 

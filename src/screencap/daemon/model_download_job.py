@@ -11,10 +11,11 @@ Lifecycle
 - :meth:`start` is **idempotent**: a second start while a download is in flight
   returns the in-flight snapshot rather than spawning a second task.
 - The engine runs blocking work via ``asyncio.to_thread``; its ``progress_cb``
-  fires on that worker thread, so it bridges thread→loop with
-  ``run_coroutine_threadsafe`` (like the backfill job). Progress is **throttled**
-  (≥1% delta or ≥0.5 s apart) so a ~2 GB byte-level callback can't flood
-  ``/v0/events``.
+  fires off-loop — on that worker thread for the bracketing 0% / 100% readings,
+  and on the engine's staging-dir sampler thread throughout the fetch — so it
+  bridges thread→loop with ``run_coroutine_threadsafe`` (like the backfill job).
+  Progress is **throttled** (≥1% delta or ≥0.5 s apart) so the sampled readings
+  of a ~2 GB transfer can't flood ``/v0/events``.
 - :meth:`cancel` sets the ``threading.Event`` the engine polls between steps.
 - :meth:`is_running` feeds the idle-shutdown busy predicate so the daemon never
   idle-exits mid-download.
@@ -96,9 +97,13 @@ class ModelDownloadJob:
         self._bytes_total = 0
         self._terminal_state: str | None = None
         self._terminal_reason: str | None = None
-        # Throttle bookkeeping (worker-thread local; GIL-guarded).
+        # Throttle bookkeeping. Written off-loop, but the engine serializes its
+        # callers (its sampler stops reporting once its stop flag is set, and is
+        # joined before the terminal reading), so only one thread is ever in
+        # `_should_emit` at a time; GIL-guarded.
         self._last_emit_pct = -1.0
         self._last_emit_t = 0.0
+        self._last_emit_bytes = -1
 
     # -- Public API (driven by the daemon verbs) --------------------------
 
@@ -118,6 +123,7 @@ class ModelDownloadJob:
         self._terminal_reason = None
         self._last_emit_pct = -1.0
         self._last_emit_t = 0.0
+        self._last_emit_bytes = -1
         self._running = True
         self._task = asyncio.create_task(self._run(model_id, engine_kwargs))
         return self.status()
@@ -183,7 +189,7 @@ class ModelDownloadJob:
             self._running = False
 
     def _on_progress(self, bytes_done: int, bytes_total: int) -> None:
-        """Engine ``progress_cb`` — runs on the ``to_thread`` worker thread."""
+        """Engine ``progress_cb`` — runs off-loop (see the module docstring)."""
         self._bytes_done = bytes_done
         self._bytes_total = bytes_total
         if not self._should_emit(bytes_done, bytes_total):
@@ -198,6 +204,13 @@ class ModelDownloadJob:
         )
 
     def _should_emit(self, bytes_done: int, bytes_total: int) -> bool:
+        # Unchanged byte count → never emit. The engine samples bytes-on-disk on a
+        # fixed cadence, so a stalled transfer keeps reporting the same number; the
+        # elapsed-time branch below would otherwise re-publish an identical payload
+        # to every /v0/events subscriber twice a second for as long as the stall
+        # lasts. Time is a heartbeat for *slow* progress, not for no progress.
+        if bytes_done == self._last_emit_bytes:
+            return False
         now = time.monotonic()
         pct = (100.0 * bytes_done / bytes_total) if bytes_total else 0.0
         if (
@@ -206,6 +219,7 @@ class ModelDownloadJob:
         ):
             self._last_emit_pct = pct
             self._last_emit_t = now
+            self._last_emit_bytes = bytes_done
             return True
         return False
 
