@@ -78,6 +78,60 @@ enum ModelDownloadState: Equatable {
     }
 }
 
+/// SCR-293 — what a download-*offer* surface should render: the onboarding step
+/// and the first-recording beat, both of which present the download on its own
+/// rather than as one row in a model picker. Pure over the controller's
+/// published state so the two surfaces can't drift and the matrix is testable
+/// without a UI test. The Settings pane keeps its own richer matrix
+/// (`IntelligenceSelectionModel.onDeviceRowRender`), which folds in the
+/// Apple-Intelligence probe these surfaces don't consult.
+enum ModelDownloadOffer: Equatable {
+    case installed
+    case downloading(fractionComplete: Double?)
+    /// A download was in flight as of the last good read, but status reads have
+    /// stopped landing — the progress bar is stale. Offer recovery instead of a
+    /// frozen bar that still reads as advancing.
+    ///
+    /// Scoped to *unreadable status*, *not* a hung transfer: a download that is
+    /// genuinely stuck while `model status` keeps answering renders as a healthy
+    /// `.downloading` bar here. Detecting that is SCR-292, daemon-side.
+    case stalled
+    /// The CLI can't be reached at all, so there is no download to offer — an
+    /// enabled button that silently does nothing is the same swallowed error.
+    case unavailable
+    case failed(reason: String)
+    case offer
+
+    /// The user-facing reason for `.stalled`. "Background helper" is the app's
+    /// established word for the daemon (`DaysView`); "may have stopped" is the
+    /// honest claim — the download's real state is exactly what we can't read.
+    static let stalledReason =
+        "Lost contact with the background helper — this download may have stopped."
+
+    /// The user-facing reason for `.unavailable`. Mirrors what the Settings
+    /// pane says through `IntelligenceSelectionModel.startDaemonDownloadReason`,
+    /// in these surfaces' own vocabulary (they never say "daemon").
+    static let unavailableReason =
+        "Can't reach the background helper — the download can't start right now."
+
+    static func render(
+        state: ModelDownloadState, progressStale: Bool, daemonUnreachable: Bool
+    ) -> ModelDownloadOffer {
+        switch state {
+        case .installed:
+            return .installed
+        case .downloading:
+            // Stale outranks the bar: a frozen ProgressView is the lie, since
+            // it's indistinguishable from a slow but healthy download.
+            return progressStale ? .stalled : .downloading(fractionComplete: state.fractionComplete)
+        case let .failed(reason):
+            return .failed(reason: reason)
+        case .idle, .cancelled:
+            return daemonUnreachable ? .unavailable : .offer
+        }
+    }
+}
+
 /// Drives the opt-in model download from the Intelligence pane (U10). Mirrors
 /// `IntelligenceController`'s pluggable CLI-invoker seam so the state machine is
 /// unit-testable without a running daemon. Actions issue the `model` CLI verbs;
@@ -96,6 +150,35 @@ final class ModelDownloadController: ObservableObject {
     /// the whole-pane error state a failed `IntelligenceController.refresh()`
     /// produces.
     @Published private(set) var daemonUnreachable: Bool = false
+
+    /// SCR-293 — consecutive failed CLI round-trips since the last good one,
+    /// across every verb. Published because the stale-progress signal derived
+    /// from it changes while `state` deliberately does not: without this, a
+    /// download whose status reads have dried up emits no change at all and the
+    /// surfaces keep rendering a frozen bar. Deliberately separate from
+    /// `daemonUnreachable`, which keeps its first-failure semantics for the
+    /// Settings pane's KTD3 matrix.
+    @Published private(set) var consecutiveCLIFailures: Int = 0
+
+    /// Consecutive failures before a rendered download counts as stale. The
+    /// poll cadence is ~1s, so a single miss is ordinary jitter; requiring two
+    /// keeps one blip from flashing an error over a healthy download.
+    static let staleProgressFailureThreshold = 2
+
+    /// SCR-293 — the rendered download progress can no longer be trusted: a
+    /// download was in flight as of the last good read, but the CLI has stopped
+    /// answering since. Surfaces that render `.downloading` must show recovery
+    /// instead of a bar frozen at its last reading.
+    var isDownloadProgressStale: Bool {
+        guard state.isDownloading else { return false }
+        // The debounce buys its second opinion from the poll loop's next tick.
+        // With no loop left — an explicit Cancel stops it and KTD8 forbids
+        // resurrecting it — there is no next tick, so one failed read is already
+        // terminal and waiting for a second would just restore the frozen bar
+        // this whole signal exists to remove.
+        let threshold = isPolling ? Self.staleProgressFailureThreshold : 1
+        return consecutiveCLIFailures >= threshold
+    }
 
     typealias JSONInvoker = @Sendable ([String]) async throws -> Data
     private let invoke: JSONInvoker
@@ -150,6 +233,7 @@ final class ModelDownloadController: ObservableObject {
             }
             lastError = nil
             daemonUnreachable = false
+            consecutiveCLIFailures = 0
             // KTD8 — a download started elsewhere (onboarding) must animate
             // here too: observing `.downloading` starts the poll loop, not just
             // `startDownload`. No-op when already polling or not downloading.
@@ -157,6 +241,7 @@ final class ModelDownloadController: ObservableObject {
         } catch {
             lastError = error.localizedDescription
             daemonUnreachable = true
+            consecutiveCLIFailures += 1
         }
     }
 
@@ -168,8 +253,10 @@ final class ModelDownloadController: ObservableObject {
             if let modelID { args.append(modelID) }
             _ = try await invoke(args)
             lastError = nil
+            consecutiveCLIFailures = 0
         } catch {
             lastError = error.localizedDescription
+            consecutiveCLIFailures += 1
         }
         await refreshStatus()
         startPollingIfNeeded()
@@ -181,8 +268,15 @@ final class ModelDownloadController: ObservableObject {
         do {
             _ = try await invoke(["model", "cancel"])
             lastError = nil
+            consecutiveCLIFailures = 0
         } catch {
+            // SCR-293 — a failed cancel counts toward staleness precisely
+            // because this path also `stopPolling()`s: with the CLI down, the
+            // state stays `.downloading` and the loop that would have healed it
+            // is gone, so the surfaces must reach `.stalled` (and its Retry)
+            // from here rather than sitting on a frozen bar forever.
             lastError = error.localizedDescription
+            consecutiveCLIFailures += 1
         }
         await refreshStatus()
         // The daemon-side cancel converges lazily (the underlying snapshot
@@ -199,15 +293,42 @@ final class ModelDownloadController: ObservableObject {
     /// leaves the loop running) without reaching into the private task.
     var isPolling: Bool { pollTask != nil }
 
-    /// Poll `model status` on a ~1s cadence while a download is in flight so the
-    /// pane's ProgressView advances. The `model download` verb returns immediately
-    /// (the daemon job runs in the background), so without this the bar would
-    /// freeze at its first reading. Self-cancels once state leaves `.downloading`.
+    /// Healthy poll cadence — fast enough that the ProgressView reads as smooth.
+    private static let pollIntervalNanos: UInt64 = 1_000_000_000
+    /// Ceiling for the backed-off cadence during a sustained outage.
+    private static let maxPollIntervalNanos: UInt64 = 30_000_000_000
+
+    /// SCR-293 — the delay before the next status read. Test seam: internal so
+    /// `@testable` tests can pin the curve without running a real timer.
+    ///
+    /// A healthy download keeps the ~1s cadence, and so does the debounce window
+    /// (the second opinion `isDownloadProgressStale` waits for must arrive
+    /// promptly, or the frozen bar just lasts longer). Past the threshold there
+    /// is no longer anything to animate and every attempt spawns a CLI
+    /// subprocess that can burn its full 10s timeout, so back off exponentially
+    /// to a 30s ceiling. Any successful read zeroes the counter and restores 1s.
+    var nextPollDelayNanos: UInt64 {
+        let overage = consecutiveCLIFailures - Self.staleProgressFailureThreshold
+        guard overage >= 0 else { return Self.pollIntervalNanos }
+        // Clamp the shift before it can overflow on a long outage.
+        let shift = UInt64(min(overage + 1, 5))
+        return min(Self.pollIntervalNanos << shift, Self.maxPollIntervalNanos)
+    }
+
+    /// Poll `model status` while a download is in flight so the pane's
+    /// ProgressView advances. The `model download` verb returns immediately (the
+    /// daemon job runs in the background), so without this the bar would freeze
+    /// at its first reading. Cadence comes from ``nextPollDelayNanos``.
+    /// Self-cancels once state leaves `.downloading`.
     private func startPollingIfNeeded() {
         guard state.isDownloading, pollTask == nil else { return }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                // Read the cadence weakly so the loop never holds `self` across
+                // the sleep — `self` owns this task, and a strong capture would
+                // keep both alive past `deinit`.
+                guard let delay = self?.nextPollDelayNanos else { return }
+                try? await Task.sleep(nanoseconds: delay)
                 guard let self, !Task.isCancelled else { return }
                 await self.refreshStatus()
                 if !self.state.isDownloading {

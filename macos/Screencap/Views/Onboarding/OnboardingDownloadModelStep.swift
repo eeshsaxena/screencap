@@ -42,7 +42,15 @@ struct OnboardingDownloadModelStep: View {
 
     @ViewBuilder
     private var downloadControl: some View {
-        switch download.state {
+        // SCR-293 — switching on `state` alone rendered a frozen progress bar
+        // forever once status reads started failing (the controller leaves
+        // `state` intact by design). The shared matrix folds in the staleness
+        // signal so this step can't silently swallow it again.
+        switch ModelDownloadOffer.render(
+            state: download.state,
+            progressStale: download.isDownloadProgressStale,
+            daemonUnreachable: download.daemonUnreachable
+        ) {
         case .installed:
             VStack(spacing: 14) {
                 Text("Model installed — your day's tasks will be named on this Mac.")
@@ -50,14 +58,40 @@ struct OnboardingDownloadModelStep: View {
                     .foregroundStyle(Color.scTeal)
                 OnboardingPrimaryButton(title: "Continue", enabled: true, action: onContinue)
             }
-        case let .downloading(done, total):
+        case let .downloading(fraction):
             VStack(spacing: 10) {
-                ProgressView(value: total > 0 ? Double(done) / Double(total) : nil)
+                ProgressView(value: fraction)
                     .frame(width: 280)
                 Text("Downloading…").font(SCTypography.sans(size: 12))
                     .foregroundStyle(Color.scInkMuted)
                 OnboardingLinkButton(title: "Cancel", action: { Task { await download.cancel() } })
             }
+        case .stalled:
+            VStack(spacing: 10) {
+                Text(ModelDownloadOffer.stalledReason)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scRust)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Retry re-reads status rather than restarting the download: the
+                // transfer may well still be running daemon-side, and a success
+                // re-arms the poll loop (KTD8) that a failed Cancel had stopped.
+                OnboardingPrimaryButton(title: "Retry", enabled: true,
+                                        action: { Task { await download.refreshStatus() } })
+            }
+            .frame(maxWidth: 380)
+        case .unavailable:
+            VStack(spacing: 10) {
+                OnboardingPrimaryButton(title: downloadTitle, enabled: false, action: {})
+                Text(ModelDownloadOffer.unavailableReason)
+                    .font(SCTypography.sans(size: 12))
+                    .foregroundStyle(Color.scInkMuted)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                OnboardingLinkButton(title: "Retry",
+                                     action: { Task { await download.refreshStatus() } })
+            }
+            .frame(maxWidth: 380)
         case let .failed(reason):
             VStack(spacing: 10) {
                 Text("Download failed: \(reason)")
@@ -65,7 +99,7 @@ struct OnboardingDownloadModelStep: View {
                 OnboardingPrimaryButton(title: "Retry", enabled: true,
                                         action: { Task { await download.startDownload() } })
             }
-        case .idle, .cancelled:
+        case .offer:
             OnboardingPrimaryButton(title: downloadTitle, enabled: true,
                                     action: { Task { await download.startDownload() } })
         }
