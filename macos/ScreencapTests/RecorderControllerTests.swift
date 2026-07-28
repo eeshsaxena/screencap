@@ -1150,6 +1150,28 @@ final class RecorderControllerTests: XCTestCase {
         await recorder._testCancelDaemonTask()
     }
 
+    /// SCR-276: a snapshot marked `finalizing` must NOT be attached to. The
+    /// pidfile lock is released only when the engine exits, so `is_recording`
+    /// stays true for the whole post-stop drain — attaching there showed a live
+    /// recording HUD for a recording that was actually stopping.
+    func testFinalizingSnapshotDoesNotAttachAsALiveRecording() async {
+        let daemon = CapturingDaemonSessionService(
+            startResult: .init(cursor: 0, sessionID: "x", audioEcho: true)
+        )
+        daemon.snapshotResult = .finalizingSession(recordingName: "yesterday")
+        let recorder = RecorderController(daemonService: daemon)
+
+        await recorder.probeDaemon()
+
+        XCTAssertFalse(recorder.state.isRecording, "a finalizing session is not a live recording")
+        // This path is PASSIVE (probeDaemon on launch) and the drain always ends
+        // on its own, so it must surface nothing: `lastError` is the red
+        // terminal-failure channel and is cleared only by `enterStarting()`, so
+        // a notice written here would outlive the drain it describes.
+        XCTAssertNil(recorder.lastError, "a passive finalizing probe must not paint an error banner")
+        await recorder._testCancelDaemonTask()
+    }
+
     // MARK: - Unmute permission UX (SCR-254 U9)
 
     /// A muted recording + a live mic-mute state; used to drive the unmute branch.

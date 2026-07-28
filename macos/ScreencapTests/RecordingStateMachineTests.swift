@@ -535,6 +535,38 @@ final class RecordingStateMachineTests: XCTestCase {
         XCTAssertTrue(effects.contains(.surfaceError("Screencap is already recording.")))
     }
 
+    /// SCR-276: exit 2 carries BOTH "another recording is active" and "the
+    /// previous recording is still finalizing" — the recording lock is genuinely
+    /// held in both cases. On the CLI-fallback transport only the structured
+    /// `finalize_in_progress` event separates them, so without it the drain
+    /// window renders the exact wrong copy the ticket exists to remove.
+    func testFinalizeInProgressEventRewritesExitCode2Copy() {
+        var machine = RecordingStateMachine()
+
+        XCTAssertEqual(machine.handle(event: event(
+            type: "finalize_in_progress", name: "yesterday"
+        )), [], "the event itself is silent; the exit path owns the message")
+
+        let effects = machine.processTerminated(exitCode: 2)
+
+        XCTAssertTrue(effects.contains(.surfaceError(
+            RecorderController.finalizeInProgressErrorMessage(recordingName: "yesterday")
+        )))
+        XCTAssertFalse(effects.contains(.surfaceError("Screencap is already recording.")))
+
+        // The flag must not leak into a later attempt's genuine contention.
+        let next = machine.processTerminated(exitCode: 2)
+        XCTAssertTrue(next.contains(.surfaceError("Screencap is already recording.")))
+    }
+
+    func testFinalizeInProgressLineDecodesName() throws {
+        let json = #"{"type":"finalize_in_progress","name":"yesterday","schema_version":1}"#
+        let line = try JSONDecoder().decode(RecorderEventLine.self, from: Data(json.utf8))
+
+        XCTAssertEqual(line.type, "finalize_in_progress")
+        XCTAssertEqual(line.name, "yesterday")
+    }
+
     func testProcessTerminatedExitCode3SurfacesPermissionRevoked() {
         var machine = RecordingStateMachine()
 
@@ -661,6 +693,7 @@ final class RecordingStateMachineTests: XCTestCase {
         reason: String? = nil,
         reader: String? = nil,
         destination: String? = nil,
+        name: String? = nil,
         ts: Double? = nil
     ) -> RecorderEventLine {
         RecorderEventLine(
@@ -675,6 +708,7 @@ final class RecordingStateMachineTests: XCTestCase {
             reason: reason,
             reader: reader,
             destination: destination,
+            name: name,
             ts: ts
         )
     }

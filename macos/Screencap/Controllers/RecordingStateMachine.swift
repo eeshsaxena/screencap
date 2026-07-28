@@ -103,6 +103,15 @@ struct RecordingStateMachine {
     /// message that would clobber the precise grant-flow alert. Reset at the
     /// start of each attempt (`enterStarting`) and consumed in `processTerminated`.
     private(set) var permissionRequiredRouted = false
+    /// SCR-276: set when a `finalize_in_progress` start-refusal arrived on the
+    /// CLI-fallback event channel. That refusal shares exit code 2 with
+    /// `lock_contended`, so without this flag `processTerminated` renders
+    /// "Screencap is already recording." — wrong, because nothing is recording;
+    /// the previous recording is draining its finalize work. Carries the
+    /// draining recording's name when the daemon knew it. Reset at the start of
+    /// each attempt (`enterStarting`) and consumed in `processTerminated`.
+    private(set) var finalizeInProgressRouted = false
+    private(set) var finalizingRecordingName: String?
 
     /// Set the start-response cursor from the orchestrator after a successful
     /// `/v0/recording.start`. Kept as a named mutating method so the field
@@ -129,6 +138,8 @@ struct RecordingStateMachine {
         guard !state.isRecording else { return [] }
         state = .starting
         permissionRequiredRouted = false
+        finalizeInProgressRouted = false
+        finalizingRecordingName = nil
         return [.clearError]
     }
 
@@ -326,6 +337,18 @@ struct RecordingStateMachine {
             permissionRequiredRouted = true
             return [.handlePermissionRequired(missing: event.missing ?? [])]
 
+        case "finalize_in_progress":
+            // SCR-276: the daemon refused the start because the PREVIOUS
+            // recording is still draining its finalize work. Record it (with the
+            // name when the daemon knew it) so the imminent exit-2 termination
+            // renders the accurate "still finishing" copy instead of
+            // `lock_contended`'s "Screencap is already recording." Emitting no
+            // effect here keeps the single terminal message on the exit path,
+            // matching how exit 2 already behaves.
+            finalizeInProgressRouted = true
+            finalizingRecordingName = event.name
+            return []
+
         case "capture_unhealthy":
             // Advisory, NON-terminal (SCR-76). The controller surfaces a
             // distinct, non-blocking hint and does NOT stop the recording —
@@ -465,7 +488,20 @@ struct RecordingStateMachine {
                     ))
                 }
             case 2:
-                effects.append(.surfaceError("Screencap is already recording."))
+                // SCR-276: exit 2 covers BOTH "another recording is active" and
+                // "the previous recording is still finalizing" — the recording
+                // lock is genuinely held in both cases. Only the structured
+                // event distinguishes them, so branch on it rather than
+                // asserting the more common story.
+                if finalizeInProgressRouted {
+                    effects.append(.surfaceError(
+                        RecorderController.finalizeInProgressErrorMessage(
+                            recordingName: finalizingRecordingName
+                        )
+                    ))
+                } else {
+                    effects.append(.surfaceError("Screencap is already recording."))
+                }
             case 3:
                 effects.append(.surfaceError("Recording stopped because a required permission was revoked."))
             case 4:
@@ -478,6 +514,10 @@ struct RecordingStateMachine {
         // Consume the SCR-142 routed flag so it cannot leak into a later
         // termination; the next attempt re-arms it via `enterStarting`.
         permissionRequiredRouted = false
+        // Same for the SCR-276 finalize flag — a stale True would mislabel a
+        // genuine "already recording" exit 2 on a later attempt.
+        finalizeInProgressRouted = false
+        finalizingRecordingName = nil
 
         if state.isRecording {
             state = .idle

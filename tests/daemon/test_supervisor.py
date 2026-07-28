@@ -92,7 +92,11 @@ def fake_engine_script(tmp_path: Path) -> Path:
                         force_stopped=False,
                         disk_full=False,
                     )
-                raise SystemExit(0)
+                # SCR-276: a non-zero exit code AFTER the drain delay models an
+                # engine that CRASHED mid-finalize (paired with
+                # FAKE_FINALIZE_ON_TERM=0, so no finalized event lands). Default
+                # 0 keeps every existing caller's clean-drain behavior.
+                raise SystemExit(int(os.environ.get("FAKE_TERM_EXIT_CODE", "0")))
 
 
             signal.signal(signal.SIGTERM, handle_term)
@@ -317,6 +321,218 @@ async def test_stop_lets_slow_finalize_drain_instead_of_killing(
         assert finalized["force_stopped"] is False
         await _wait_until(lambda: not isolated_lock.lock_is_active())
         assert supervisor.current_session() is None
+    finally:
+        await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_drain_window_is_reported_as_finalizing_not_as_recording(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
+) -> None:
+    """SCR-276: during SCR-273's post-stop drain the engine is alive but STOPPED.
+
+    Both surfaces that read ``_proc.is_alive()`` must say so rather than
+    inheriting the pre-SCR-273 "alive == recording" reading: ``spawn`` refuses
+    with the typed retryable ``finalize_in_progress`` (NOT ``lock_contended``,
+    whose CLI/app copy claims a recording is active), and ``current_session``
+    carries the ``finalizing`` marker so a status probe can tell a live
+    recording from one that is stopping.
+    """
+    from screencap.daemon import errors
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("FAKE_TERM_DELAY", "3.0")
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=0.05,
+        startup_timeout=2.0,
+        stop_timeout=0.3,
+        stop_kill_grace=10.0,
+    )
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="slow", output_dir=str(tmp_path / "slow"))
+    )
+    try:
+        # Before the stop the engine really IS recording: contention must still
+        # read as `lock_contended`, or this change would mislabel a live
+        # recording as finalizing.
+        with pytest.raises(errors.LockContendedError):
+            await supervisor.spawn(
+                schema.RecordingStartRequest(
+                    name="other", output_dir=str(tmp_path / "other")
+                )
+            )
+        assert "finalizing" not in (supervisor.current_session() or {})
+
+        assert await supervisor.stop(force=False) == {
+            "stopped": True,
+            "final_state": "finalizing",
+        }
+
+        with pytest.raises(errors.FinalizeInProgressError) as exc_info:
+            await supervisor.spawn(
+                schema.RecordingStartRequest(
+                    name="next", output_dir=str(tmp_path / "next")
+                )
+            )
+        payload = exc_info.value.envelope()
+        assert payload["error"] == "finalize_in_progress"
+        assert payload["retryable"] is True
+        assert payload["recording_name"] == "slow"
+        # The refusal must not claim a recording is active.
+        assert "owner" not in payload
+
+        assert supervisor.current_session()["finalizing"] is True
+
+        # The drain ends on its own, and the next start then succeeds — the
+        # refusal really was transient, as `retryable` promises.
+        await _wait_until(lambda: not isolated_lock.lock_is_active(), timeout=10.0)
+        assert supervisor.current_session() is None
+        await supervisor.spawn(
+            schema.RecordingStartRequest(
+                name="next", output_dir=str(tmp_path / "next")
+            )
+        )
+    finally:
+        await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_crash_during_drain_is_reported_but_backstop_kill_is_not(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
+) -> None:
+    """SCR-276: ``_stopping`` alone can no longer gate crash telemetry.
+
+    It stays True for the whole drain, so it swallowed every mid-drain crash.
+    An engine that dies non-zero mid-drain without finalizing must raise
+    ``engine_crashed``; the backstop's OWN SIGKILL of a hung engine must not.
+    """
+    from screencap.daemon.supervisor import Supervisor
+
+    async def _run(env: dict[str, str], *, kill_grace: float) -> list[dict]:
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        bus = EventBus()
+        supervisor = Supervisor(
+            bus,
+            engine_command_factory=_factory(fake_engine_script),
+            reconcile_on_init=False,
+            poll_interval=0.05,
+            startup_timeout=2.0,
+            stop_timeout=0.3,
+            stop_kill_grace=kill_grace,
+        )
+        await supervisor.spawn(
+            schema.RecordingStartRequest(name="c", output_dir=str(tmp_path / "c"))
+        )
+        try:
+            sub = await bus.subscribe()
+            assert await supervisor.stop(force=False) == {
+                "stopped": True,
+                "final_state": "finalizing",
+            }
+            seen: list[dict] = []
+            while True:
+                event = await asyncio.wait_for(sub.queue.get(), timeout=10.0)
+                seen.append(event)
+                if event["type"] == _stderr_events.EVENT_RECORDING_FINALIZED:
+                    return seen
+        finally:
+            await supervisor.shutdown()
+
+    # A genuine mid-drain crash: slow post-SIGTERM work, no finalized event,
+    # non-zero exit. Nothing killed it, so it must be reported.
+    crashed = await _run(
+        {
+            "FAKE_TERM_DELAY": "0.5",
+            "FAKE_FINALIZE_ON_TERM": "0",
+            "FAKE_TERM_EXIT_CODE": "7",
+        },
+        kill_grace=10.0,
+    )
+    assert any(e["type"] == _stderr_events.EVENT_ENGINE_CRASHED for e in crashed)
+
+    # A hung engine the backstop SIGKILLs: also a non-zero exit with no
+    # finalized event, but WE caused it — so it is a force-stop, not a crash.
+    monkeypatch.delenv("FAKE_TERM_DELAY", raising=False)
+    monkeypatch.delenv("FAKE_FINALIZE_ON_TERM", raising=False)
+    monkeypatch.delenv("FAKE_TERM_EXIT_CODE", raising=False)
+    killed = await _run({"FAKE_IGNORE_TERM": "1"}, kill_grace=0.6)
+    assert not any(e["type"] == _stderr_events.EVENT_ENGINE_CRASHED for e in killed)
+    finalized = [
+        e for e in killed if e["type"] == _stderr_events.EVENT_RECORDING_FINALIZED
+    ]
+    assert finalized[-1]["force_stopped"] is True
+
+
+@pytest.mark.asyncio
+async def test_kill_on_timeout_stop_during_drain_is_not_reported_as_a_crash(
+    tmp_path: Path,
+    fake_engine_script: Path,
+    isolated_lock,
+    monkeypatch: pytest.MonkeyPatch,
+    allow_tmp_output_dir,
+) -> None:
+    """SCR-276: a bounded ``kill_on_timeout`` stop can land DURING a drain.
+
+    ``storage.lock`` stops with ``kill_on_timeout=True`` because it is about to
+    seal the volume out from under the engine. If a prior ordinary stop already
+    left the engine draining, that SIGKILL produces a non-zero exit inside the
+    drain — which must still read as our own force-stop, not as a mid-drain
+    engine crash.
+    """
+    from screencap.daemon.supervisor import Supervisor
+
+    monkeypatch.setenv("FAKE_IGNORE_TERM", "1")
+    bus = EventBus()
+    supervisor = Supervisor(
+        bus,
+        engine_command_factory=_factory(fake_engine_script),
+        reconcile_on_init=False,
+        poll_interval=0.05,
+        startup_timeout=2.0,
+        stop_timeout=0.3,
+        # Long enough that the backstop never fires — the kill below is the
+        # ONLY thing that ends this engine.
+        stop_kill_grace=30.0,
+    )
+    await supervisor.spawn(
+        schema.RecordingStartRequest(name="lock", output_dir=str(tmp_path / "lock"))
+    )
+    try:
+        sub = await bus.subscribe()
+        assert await supervisor.stop(force=False) == {
+            "stopped": True,
+            "final_state": "finalizing",
+        }
+        assert supervisor.current_session()["finalizing"] is True
+
+        assert await supervisor.stop(force=False, kill_on_timeout=True) == {
+            "stopped": True,
+            "final_state": "force_stopped",
+        }
+
+        seen: list[dict] = []
+        while True:
+            event = await asyncio.wait_for(sub.queue.get(), timeout=5.0)
+            seen.append(event)
+            if event["type"] == _stderr_events.EVENT_RECORDING_FINALIZED:
+                break
+        assert not any(
+            e["type"] == _stderr_events.EVENT_ENGINE_CRASHED for e in seen
+        )
+        assert seen[-1]["force_stopped"] is True
     finally:
         await supervisor.shutdown()
 

@@ -16,6 +16,12 @@ NOT_RECORDING = "not_recording"
 RECORDING_NOT_FOUND = "recording_not_found"
 RECORDING_ACTIVE = "recording_active"
 SCHEMA_MISMATCH = "schema_mismatch"
+# SCR-276: recording.start refused because the PREVIOUS recording is still
+# draining its post-stop finalize work (SCR-273's no-kill stop path). Distinct
+# from LOCK_CONTENDED — nothing is recording, so "another recording is already
+# active" is the wrong story. Retryable by definition: the drain always ends
+# (the engine finishes, or the stop backstop kills it at ``stop_kill_grace``).
+FINALIZE_IN_PROGRESS = "finalize_in_progress"
 SLOW_CONSUMER = "slow_consumer"
 CURSOR_UNKNOWN = "cursor_unknown"
 CATALOG_UNREADABLE = "catalog_unreadable"
@@ -272,6 +278,54 @@ class LockContendedError(DaemonAPIError):
 
     def envelope(self) -> dict[str, Any]:
         return lock_contended_envelope(self.owner, schema_version=self.schema_version)
+
+
+class FinalizeInProgressError(DaemonAPIError):
+    """recording.start refused during the post-stop finalize drain (SCR-276).
+
+    SCR-273 stopped killing an engine that outlives ``stop_timeout``, so a
+    stopped recording legitimately keeps draining (transcribe / scrub OCR) for
+    1–5 minutes on stills-enabled stops. During that window nothing is
+    recording, so raising :class:`LockContendedError` — whose surfaces render
+    "another recording is already active" — tells the wrong story.
+
+    Carries the draining recording's ``recording_name`` (when known) plus a
+    human ``message``, and is always ``retryable``: the drain is bounded by
+    ``stop_kill_grace``, so trying again shortly always eventually succeeds.
+    Mirrors :class:`StoreLockError`'s reason/message/retryable shape. HTTP 409
+    (conflict with current state), matching :class:`LockContendedError` so a
+    client that only branches on status behaves unchanged.
+    """
+
+    error_code = FINALIZE_IN_PROGRESS
+    http_status = 409
+
+    def __init__(
+        self,
+        *,
+        schema_version: int,
+        recording_name: str | None = None,
+        message: str = (
+            "The previous recording is still finishing processing. "
+            "Try again in a moment."
+        ),
+        http_status: int | None = None,
+    ) -> None:
+        self.recording_name = recording_name
+        self.message = message
+        super().__init__(schema_version=schema_version, http_status=http_status)
+
+    def envelope(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"message": self.message, "retryable": True}
+        # Omitted rather than null when unknown, mirroring the additive-overlay
+        # convention used by the snapshot's `muted` / `paused` fields.
+        if self.recording_name is not None:
+            payload["recording_name"] = self.recording_name
+        return error_envelope(
+            schema_version=self.schema_version,
+            error=self.error_code,
+            **payload,
+        )
 
 
 class NotOwnedByDaemonError(DaemonAPIError):
@@ -781,6 +835,7 @@ __all__ = [
     "RECORDING_NOT_FOUND",
     "RECORDING_ACTIVE",
     "SCHEMA_MISMATCH",
+    "FINALIZE_IN_PROGRESS",
     "SLOW_CONSUMER",
     "CURSOR_UNKNOWN",
     "CATALOG_UNREADABLE",
@@ -815,6 +870,7 @@ __all__ = [
     "invalid_permission_envelope",
     "DaemonAPIError",
     "LockContendedError",
+    "FinalizeInProgressError",
     "NotOwnedByDaemonError",
     "NotRecordingError",
     "RecordingNotFoundError",

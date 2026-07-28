@@ -130,6 +130,16 @@ EVENT_PERMISSION_LOST = "permission_lost"
 # into the same precise grant flow the daemon transport already uses. Pairs
 # with process exit code 3.
 EVENT_PERMISSION_REQUIRED = "permission_required"
+# SCR-276: the daemon refused the start because the PREVIOUS recording is still
+# draining its post-stop finalize work. Emitted by the CLI daemon client on a
+# ``finalize_in_progress`` envelope, for the same reason ``permission_required``
+# above is: the CLI-fallback SwiftUI shell reads this NDJSON stderr channel and
+# only sees exit codes otherwise. This refusal shares exit code 2 with
+# ``lock_contended`` (the recording lock genuinely IS held during the drain), so
+# without this event the shell cannot tell the two apart and renders
+# ``lock_contended``'s "Screencap is already recording." — the exact wrong story
+# SCR-276 exists to remove. Carries the draining recording's ``name`` when known.
+EVENT_FINALIZE_IN_PROGRESS = "finalize_in_progress"
 # Advisory mid-recording capture-health signal (SCR-76). Emitted by the
 # engine's supervisor loop when a reader is demonstrably attempting but
 # producing no useful output AND the cause is NOT a screen_recording denial
@@ -269,6 +279,7 @@ __all__ = [
     "EVENT_RECORDING_RESUMED",
     "EVENT_PERMISSION_LOST",
     "EVENT_PERMISSION_REQUIRED",
+    "EVENT_FINALIZE_IN_PROGRESS",
     "EVENT_CAPTURE_UNHEALTHY",
     "EVENT_CAPTURE_RECOVERED",
     "CAPTURE_UNHEALTHY_REASON_READER_STALLED",

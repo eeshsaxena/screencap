@@ -540,3 +540,35 @@ def test_internal_ambient_request_is_local_only(
     assert request.cloud_intent is False
     assert request.force_mode is None
     assert request.keep_local is True
+
+
+@pytest.mark.asyncio
+async def test_ambient_spawn_during_drain_defers_without_burning_retry_budget(
+    fake_engine_script: Path, isolated_lock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SCR-276: a post-stop finalize drain must DEFER ambient, not fail it.
+
+    ``FinalizeInProgressError`` is a SIBLING of ``LockContendedError``, not a
+    subclass, so the benign-deferral arm has to name it explicitly. Without that
+    it falls into the generic ``except Exception`` handler and burns the
+    crash-backoff budget toward the degraded ceiling — and ``_roll_ambient_day``
+    stops then immediately respawns, so every day-roll whose drain outlives
+    ``stop_timeout`` would hit it.
+    """
+    sup = _make_supervisor(fake_engine_script)
+
+    async def refuse_finalizing(_request):
+        raise errors.FinalizeInProgressError(
+            schema_version=schema._RECORDING_START_API_VERSION,
+            recording_name="draining",
+        )
+
+    monkeypatch.setattr(sup, "spawn", refuse_finalizing)
+
+    await sup._spawn_ambient()
+
+    assert sup._ambient_retry_count == 0, (
+        "a finalize drain is a transient busy state, not an ambient spawn failure"
+    )
+    assert sup._ambient_degraded is None
+    assert sup._ambient_active is False

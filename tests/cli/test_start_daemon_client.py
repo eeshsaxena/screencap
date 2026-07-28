@@ -157,6 +157,34 @@ def test_start_lock_contended_returns_exit_2(stub_daemon):
     assert result.exit_code == 2, result.output
 
 
+def test_start_finalize_in_progress_says_finishing_not_already_recording(stub_daemon):
+    """SCR-276: the post-stop drain refusal must not claim a recording is active.
+
+    Nothing is recording during SCR-273's finalize drain, so reusing the
+    ``lock_contended`` copy sent the user hunting for a recording to stop. Exit
+    2 is retained deliberately — the recording lock genuinely IS still held —
+    so only the message distinguishes the two causes.
+    """
+    stub_daemon.start_status = 409
+    stub_daemon.start_response = {
+        "ok": False,
+        "error": "finalize_in_progress",
+        "schema_version": 1,
+        "api_schema_version": 1,
+        "daemon_version": "test",
+        "recording_name": "yesterday",
+        "message": "The previous recording is still finishing processing.",
+        "retryable": True,
+    }
+    result = stub_daemon.invoke(["start", "--name", "demo", "--local"])
+    assert result.exit_code == 2, result.output
+    assert "already active" not in result.output
+    assert "still finishing processing" in result.output
+    assert "yesterday" in result.output
+    # Rendered through rich, not click.echo — no literal markup tags leak.
+    assert "[yellow]" not in result.output
+
+
 def test_start_permission_lost_exits_three(stub_daemon):
     stub_daemon.events = [
         {

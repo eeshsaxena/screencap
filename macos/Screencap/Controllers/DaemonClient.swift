@@ -316,6 +316,13 @@ struct SessionSnapshotResponse: Decodable {
     /// controller maps a missing value to `false` (unmuted), mirroring the
     /// additive `audio`-echo back-compat rule on `RecordingStartResponse`.
     let muted: Bool?
+    /// SCR-276: whether this session has been STOPPED and is draining its
+    /// post-stop finalize work. Additive — absent means not draining (and a
+    /// stale daemon always omits it), so `is_recording: true` with no
+    /// `finalizing` reads exactly as it did before. Needed because the pidfile
+    /// lock, and therefore `is_recording`, outlives the stop for the whole
+    /// drain (up to `stop_kill_grace`).
+    let finalizing: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ok
@@ -334,6 +341,7 @@ struct SessionSnapshotResponse: Decodable {
         case framesWritten = "frames_written"
         case cursor
         case muted
+        case finalizing
     }
 }
 

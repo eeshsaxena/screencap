@@ -63,6 +63,43 @@ final class DaemonSessionServiceTests: XCTestCase {
         XCTAssertFalse(description.contains("_"))  // human copy, not a raw code
     }
 
+    // SCR-276: the post-stop finalize drain must NOT collapse into
+    // `.lockContended` — nothing is recording, so that case's "Screencap is
+    // already recording." copy is wrong. It routes to its own case, carries the
+    // draining recording's name, and degrades cleanly when the name is absent.
+    func testTranslateFinalizeInProgressIsDistinctFromLockContended() {
+        let service = LiveDaemonSessionService()
+        let body = #"{"ok":false,"error":"finalize_in_progress","recording_name":"yesterday","retryable":true}"#
+        let error = DaemonClientError.envelopeError(
+            code: DaemonErrorCode.finalizeInProgress,
+            rawBody: Data(body.utf8)
+        )
+
+        XCTAssertEqual(service.translateFailure(error), .finalizeInProgress(recordingName: "yesterday"))
+        XCTAssertNotEqual(service.translateFailure(error), .lockContended)
+
+        // Name omitted (daemon did not know it) still resolves, not throws.
+        let unnamed = DaemonClientError.envelopeError(
+            code: DaemonErrorCode.finalizeInProgress,
+            rawBody: Data(#"{"ok":false,"error":"finalize_in_progress"}"#.utf8)
+        )
+        XCTAssertEqual(service.translateFailure(unnamed), .finalizeInProgress(recordingName: nil))
+    }
+
+    // SCR-276: the copy is the whole point of the ticket — assert it says what
+    // is happening and names the retry, and never claims a recording is active.
+    func testFinalizeInProgressCopyDoesNotClaimARecordingIsActive() {
+        let named = RecorderController.finalizeInProgressErrorMessage(recordingName: "yesterday")
+        XCTAssertTrue(named.contains("yesterday"))
+        XCTAssertTrue(named.contains("still finishing processing"))
+        XCTAssertTrue(named.contains("Try again in a moment"))
+        XCTAssertFalse(named.contains("already recording"))
+
+        let unnamed = RecorderController.finalizeInProgressErrorMessage(recordingName: nil)
+        XCTAssertTrue(unnamed.hasPrefix("The previous recording"))
+        XCTAssertFalse(unnamed.contains("already recording"))
+    }
+
     func testTranslatePermissionRequiredDecodesMissingList() {
         let service = LiveDaemonSessionService()
         let body = #"{"ok":false,"error":"permission_required","missing":["screen_recording","accessibility"]}"#

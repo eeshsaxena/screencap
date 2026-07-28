@@ -73,6 +73,11 @@ struct RecorderEventLine: Decodable {
     /// events and on the daemon's crash-synthesized finalize, where the banner
     /// falls back to the upload-oriented copy (the conservative default).
     let destination: String?
+    /// The draining recording's name on a `finalize_in_progress` (SCR-276)
+    /// start-refusal, so the CLI-fallback shell can name it in the same copy the
+    /// daemon transport uses. Optional — the daemon omits it when unknown.
+    /// Absent on every other event type.
+    let name: String?
     let ts: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -81,6 +86,7 @@ struct RecorderEventLine: Decodable {
         case forceStopped = "force_stopped"
         case permission
         case missing
+        case name
         case changes
         case optOutCommandExamples = "opt_out_command_examples"
         case cursor
@@ -890,6 +896,25 @@ final class RecorderController: ObservableObject {
             if transport == .cliFallback {
                 startPermissionWatchdog()
             }
+        case .finalizingSession(let recordingName):
+            // SCR-276: the snapshot still reports `is_recording` (the pidfile
+            // lock outlives the stop for the whole drain), but this session has
+            // been stopped. Do NOT attach — promoting to `.recording` here is
+            // what made a mid-drain relaunch show a live HUD for a recording
+            // that is finishing.
+            //
+            // Deliberately surfaces NOTHING to the user. This path is PASSIVE
+            // (`probeDaemon()` on launch / on the daemon-installed
+            // notification), so the user did not ask for anything and has no
+            // action to take — the drain always ends on its own. `lastError` is
+            // the terminal-failure channel: it renders red and is only ever
+            // cleared by `enterStarting()`, so a notice written here would
+            // outlive the drain it describes. A user-visible "still finishing"
+            // surface needs its own auto-clearing channel (SCR-296).
+            recorderLogger.info(
+                "Daemon session is finalizing; not attaching. name=\(recordingName ?? "unknown", privacy: .public)"
+            )
+            transitionToIdle()
         case .foreignClaimant:
             lastError = "Another process is recording."
             transitionToIdle()
@@ -1565,6 +1590,15 @@ final class RecorderController: ObservableObject {
         case .lockContended:
             lastError = "Screencap is already recording."
             if state.isRecording { transitionToIdle() }
+        case .finalizeInProgress(let recordingName):
+            // SCR-276: nothing is recording — the previous recording is draining
+            // its finalize work (SCR-273). Say that, and name the retry: the
+            // drain is bounded by the daemon's stop backstop, so a retry always
+            // eventually succeeds.
+            lastError = RecorderController.finalizeInProgressErrorMessage(
+                recordingName: recordingName
+            )
+            if state.isRecording { transitionToIdle() }
         case .permissionRequired(let missing):
             // The daemon rejected the start before spawn (U6). Do NOT fall back
             // to the CLI path — route into the grant flow instead, mirroring the
@@ -1584,6 +1618,16 @@ final class RecorderController: ObservableObject {
         daemonEventTask?.cancel()
         daemonEventTask = nil
         apply(machine.processTerminated(exitCode: exitCode))
+    }
+
+    /// Build the "previous recording is still finalizing" message (SCR-276).
+    /// Static + non-private so the copy is assertable without driving a daemon.
+    /// `nonisolated` because the nonisolated `RecordingStateMachine` renders the
+    /// same copy on the CLI-fallback transport — one source of truth, so the two
+    /// transports can never drift.
+    nonisolated static func finalizeInProgressErrorMessage(recordingName: String?) -> String {
+        let subject = recordingName.map { "“\($0)”" } ?? "The previous recording"
+        return "\(subject) is still finishing processing. Try again in a moment."
     }
 
     /// Build the actionable "permission required before recording" message.

@@ -26,6 +26,20 @@ from screencap.daemon.supervisor import Supervisor
 
 from .conftest import short_socket_path, wait_for_socket
 
+
+@pytest.fixture
+def isolated_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from screencap import pidfile
+
+    lock_dir = tmp_path / "run"
+    monkeypatch.setattr(pidfile, "LOCK_DIR", lock_dir)
+    monkeypatch.setattr(pidfile, "LOCK_FILE", lock_dir / "recording.lock")
+    monkeypatch.setattr(pidfile, "PID_FILE", tmp_path / "recording.pid")
+    pidfile._reset_for_tests()
+    yield pidfile
+    pidfile._reset_for_tests()
+
+
 # --- unit: the pump is the sole writer of confirmed mute state ---------------
 
 
@@ -45,6 +59,53 @@ def test_observe_event_mute_is_noop_without_session() -> None:
     # No active session -> no crash, nothing to write.
     sup._observe_event({"type": _stderr_events.EVENT_AUDIO_MUTED})
     assert sup.current_session() is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_finalizing_overlay_during_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_lock
+) -> None:
+    """SCR-276: the ``finalizing`` marker reaches the session.snapshot WIRE.
+
+    The pidfile lock is released only when the engine EXITS, so throughout
+    SCR-273's post-stop drain the snapshot keeps reporting ``is_recording:
+    true``. Without the overlay an app relaunch mid-drain re-attaches to a
+    recording that is stopping. Additive by omission: a non-draining session
+    must still omit the key entirely.
+    """
+    import httpx
+
+    from screencap.daemon.app import build_app
+
+    isolated_lock.claim_lock(None, claimant="daemon")
+    isolated_lock.update_lock_metadata(
+        tmp_path / "demo",
+        recording_started_at=time.time(),
+        recording_name="demo",
+        started_by="test",
+    )
+    sup = Supervisor(EventBus(), reconcile_on_init=False)
+    sup._session_state = {  # type: ignore[assignment]
+        "session_id": "demo",
+        "recording_name": "demo",
+        "capture_dir": str(tmp_path / "demo"),
+        "started_at": time.time(),
+    }
+
+    app = build_app()
+    app.state.supervisor = sup
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        live = (await client.get("/v0/session.snapshot")).json()
+        assert live["is_recording"] is True
+        assert "finalizing" not in live
+
+        sup._draining = True
+        draining = (await client.get("/v0/session.snapshot")).json()
+        # Still `is_recording` (the lock is genuinely held) — the marker is the
+        # only thing that distinguishes the two.
+        assert draining["is_recording"] is True
+        assert draining["finalizing"] is True
 
 
 # --- integration: full confirmed-state loop ---------------------------------
