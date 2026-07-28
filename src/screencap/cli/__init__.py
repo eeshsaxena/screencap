@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 # Line-buffered stderr is part of the SwiftUI cross-language event contract
 # (todo 012). PyInstaller-frozen binaries don't always honour
@@ -5198,6 +5198,40 @@ def backfill_cancel_cmd() -> None:
     console.print(f"  {_backfill_snapshot_line(snapshot)}")
 
 
+# Structured `screencap search enable` failure event, on the same stderr channel as
+# the `clip` verb's `_CLIP_EVENT_*` (see `_fail` there). The literals are the
+# cross-language contract the macOS disclosure sheet decodes to choose actionable copy
+# — a Keychain refusal is deterministic, so "please try again" is wrong advice for it,
+# while an incomplete migration genuinely does resume on retry. Mirrored by
+# `SearchEnableFailure` in macos/Screencap/Controllers/SearchDisclosureController.swift.
+_SEARCH_ENABLE_EVENT_FAILED = "search_enable_failed"
+SEARCH_ENABLE_REASON_KEY_UNAVAILABLE = "corpus_key_unavailable"
+SEARCH_ENABLE_REASON_INCOMPLETE = "migration_incomplete"
+SEARCH_ENABLE_REASON_UNKNOWN = "unknown"
+
+
+def _fail_search_enable(reason: str, detail: str) -> NoReturn:
+    """Report a failed ``search enable`` on STDERR and exit non-zero.
+
+    STDERR specifically: the macOS app surfaces `CLIError.nonZeroExit(code:stderr:)`,
+    which carries stderr alone — a reason printed to stdout is dropped on the floor and
+    the user is left with a bare "Couldn't turn on search."
+
+    Two channels, mirroring the ``clip`` verb: the structured event the app decodes,
+    plus a human-readable line for someone running this in a terminal.
+    """
+    from screencap._stderr_events import emit_event
+
+    emit_event(_SEARCH_ENABLE_EVENT_FAILED, reason=reason, detail=detail)
+    # Named `err_console`, not an inline `Console(stderr=True).print(...)`: the SCR-168
+    # AST guard (tests/test_cli_rich_markup_escape.py) only recognizes sinks on a
+    # `console`/`err_console` receiver, so the inline shape would silently sit outside
+    # the escaping invariant it enforces.
+    err_console = Console(stderr=True)
+    err_console.print(f"[red]Could not enable search ({escape(reason)}):[/red] {escape(detail)}")
+    raise SystemExit(1)
+
+
 @cli.group("search")
 def search_group() -> None:
     """On-device recording search (search-by-default guardrails).
@@ -5215,16 +5249,31 @@ def search_enable_cmd() -> None:
     """Acknowledge the disclosure and enable encrypted on-device search."""
     from rich.console import Console
 
-    from screencap import config, corpus_migrate
+    from screencap import config, corpus_crypto, corpus_migrate
 
     console = Console()
     console.print("Enabling on-device search — encrypting your existing recordings...")
     config.set_search_disclosure_acknowledged(True)
     try:
         report = corpus_migrate.flip_corpus_to_encrypted()
+    except corpus_crypto.CorpusKeyUnavailable as exc:
+        _fail_search_enable(SEARCH_ENABLE_REASON_KEY_UNAVAILABLE, str(exc))
     except Exception as exc:  # noqa: BLE001 — surface the failure with a clean exit
-        console.print(f"[red]Could not enable search: {escape(str(exc))}[/red]")
-        raise SystemExit(1)
+        _fail_search_enable(SEARCH_ENABLE_REASON_UNKNOWN, f"{type(exc).__name__}: {exc}")
+    # `flip_corpus_to_encrypted` sets the done marker LAST and only on a clean,
+    # plaintext-free pass — it *returns* an incomplete report rather than raising. So
+    # an unset marker is the exact signal that the flip did not converge, and
+    # reporting success here would leave the app believing search is on while the gate
+    # stays off (and the disclosure re-appears on the next launch).
+    if not config.get_corpus_encrypted():
+        detail = (
+            f"could not encrypt {', '.join(report.errors)}"
+            if report.errors
+            else "some plaintext stills or a plaintext index survived the pass"
+        )
+        _fail_search_enable(
+            SEARCH_ENABLE_REASON_INCOMPLETE, f"{detail} — search stays off; retrying resumes it"
+        )
     console.print(
         f"[green]Search enabled.[/green] Encrypted {report.stills_encrypted} still(s) "
         f"across {report.recordings_scanned} recording(s); index rekeyed: "
