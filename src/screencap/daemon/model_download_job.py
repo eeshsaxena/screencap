@@ -11,11 +11,14 @@ Lifecycle
 - :meth:`start` is **idempotent**: a second start while a download is in flight
   returns the in-flight snapshot rather than spawning a second task.
 - The engine runs blocking work via ``asyncio.to_thread``; its ``progress_cb``
-  fires off-loop — on that worker thread for the bracketing 0% / 100% readings,
-  and on the engine's staging-dir sampler thread throughout the fetch — so it
-  bridges thread→loop with ``run_coroutine_threadsafe`` (like the backfill job).
+  fires off-loop on that one worker thread (the engine watches its staging dir
+  from there while the fetch runs on a thread of its own), so it bridges
+  thread→loop with ``run_coroutine_threadsafe`` (like the backfill job).
   Progress is **throttled** (≥1% delta or ≥0.5 s apart) so the sampled readings
   of a ~2 GB transfer can't flood ``/v0/events``.
+- A fetch that stops producing bytes is failed by the engine's stall guard, so
+  a wedged transfer reaches a terminal ``failed`` + ``stalled:…`` reason instead
+  of leaving this job ``running`` — and the daemon alive — forever.
 - :meth:`cancel` sets the ``threading.Event`` the engine polls between steps.
 - :meth:`is_running` feeds the idle-shutdown busy predicate so the daemon never
   idle-exits mid-download.
@@ -97,10 +100,10 @@ class ModelDownloadJob:
         self._bytes_total = 0
         self._terminal_state: str | None = None
         self._terminal_reason: str | None = None
-        # Throttle bookkeeping. Written off-loop, but the engine serializes its
-        # callers (its sampler stops reporting once its stop flag is set, and is
-        # joined before the terminal reading), so only one thread is ever in
-        # `_should_emit` at a time; GIL-guarded.
+        # Throttle bookkeeping. Written off-loop, but the engine reports every
+        # reading — sampled and terminal alike — from the single `asyncio.to_thread`
+        # worker, so only one thread is ever in `_should_emit` at a time;
+        # GIL-guarded.
         self._last_emit_pct = -1.0
         self._last_emit_t = 0.0
         self._last_emit_bytes = -1
