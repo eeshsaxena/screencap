@@ -145,6 +145,50 @@ class TestHappyPath:
         finally:
             hf_constants.HF_HUB_DISABLE_XET = original
 
+    # Marked so it runs in CI's `-m privacy` lane: it pins the fetch host, and an
+    # unmarked guard for a CI-dark function would itself never run in CI.
+    @pytest.mark.privacy
+    def test_default_snapshot_pins_xet_off_and_the_host_for_the_fetch(self, tmp_path, monkeypatch):
+        """The live fetch must apply both pins *at call time* (SCR-294).
+
+        ``_default_snapshot`` is the one function no other test reaches — every
+        other test injects ``snapshot_fn`` — so its two safety pins are otherwise
+        CI-dark, and dropping either leaves the whole suite green:
+
+        - **Xet off.** Both shipped variants are Xet-backed, and Xet assembles
+          into ``local_dir`` only at the very end. Every bytes-on-disk reading
+          (the progress bar *and* the stall clock) dies without this pin: the bar
+          sits at 0% for the entire multi-GB fetch, and the stall guard starves
+          and fails a healthy download.
+        - **Host pinned.** ``HF_ENDPOINT`` is read once at import, so the host
+          can only be pinned per call; the repo+commit+sha256 pin is incomplete
+          without it.
+
+        Asserting *inside* the stubbed call is the point — checking after it
+        returns would pass even if the pin were applied around the wrong scope.
+        """
+        import huggingface_hub
+        from huggingface_hub import constants as hf_constants
+
+        seen: dict[str, object] = {}
+
+        def fake_snapshot(**kwargs):
+            seen["disable_xet"] = hf_constants.HF_HUB_DISABLE_XET
+            seen["endpoint"] = kwargs.get("endpoint")
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
+        monkeypatch.setattr(hf_constants, "HF_HUB_DISABLE_XET", False)
+
+        dl._default_snapshot("acme/test", "deadbeef" * 5, tmp_path, ["model.gguf"])
+
+        assert seen["disable_xet"] is True, (
+            "Xet was live during the fetch; the staging dir stays flat and the "
+            "progress bar sits at 0% for the whole download (SCR-294)"
+        )
+        assert seen["endpoint"] == dl._HF_ENDPOINT
+        # The pin is scoped to the fetch, not leaked to the daemon's other consumers.
+        assert hf_constants.HF_HUB_DISABLE_XET is False
+
 
 @pytest.mark.privacy
 class TestFailClosed:

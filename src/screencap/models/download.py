@@ -69,7 +69,7 @@ _PROGRESS_SAMPLE_INTERVAL_S = 0.25
 #: takes 17 hours, so nothing usable is being given up.
 #:
 #: Both floors assume the transfer actually streams into the staging dir, which
-#: is why :func:`_pinned_hub_settings` disables Xet. See its docstring.
+#: is why :func:`_xet_disabled` forces the plain-HTTP path. See its docstring.
 _STALL_TIMEOUT_S = 300.0
 
 #: Fetch attempts before a stall is surfaced — i.e. one retry. A stall is usually
