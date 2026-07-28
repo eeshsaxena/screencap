@@ -107,18 +107,45 @@ struct FirstRecordingBeatSheet: View {
 
     @ViewBuilder
     private var downloadControl: some View {
-        switch download.state {
+        // SCR-293 — shares the onboarding step's matrix so a download whose
+        // status reads have dried up shows recovery here too, instead of a
+        // progress bar frozen at its last reading.
+        switch ModelDownloadOffer.render(
+            state: download.state,
+            progressStale: download.isDownloadProgressStale,
+            daemonUnreachable: download.daemonUnreachable
+        ) {
         case .installed:
             Label("On-device model installed", systemImage: "checkmark.circle")
                 .font(SCTypography.sans(size: 12.5))
                 .foregroundStyle(Color.scTeal)
-        case let .downloading(done, total):
+        case let .downloading(fraction):
             VStack(alignment: .leading, spacing: 6) {
-                ProgressView(value: total > 0 ? Double(done) / Double(total) : nil)
+                ProgressView(value: fraction)
                 Button("Cancel") { Task { await download.cancel() } }
                     .buttonStyle(.plain)
                     .font(SCTypography.sans(size: 11))
                     .foregroundStyle(Color.scInkMuted)
+            }
+        case .stalled:
+            VStack(alignment: .leading, spacing: 6) {
+                Text(ModelDownloadOffer.stalledReason)
+                    .font(SCTypography.sans(size: 11.5))
+                    .foregroundStyle(Color.scRust)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Re-read status rather than restart: the transfer may still be
+                // running daemon-side, and a success re-arms the poll loop.
+                Button("Retry") { Task { await download.refreshStatus() } }
+            }
+        case .unavailable:
+            VStack(alignment: .leading, spacing: 6) {
+                Button(downloadTitle) {}
+                    .disabled(true)
+                Text(ModelDownloadOffer.unavailableReason)
+                    .font(SCTypography.sans(size: 11.5))
+                    .foregroundStyle(Color.scInkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Retry") { Task { await download.refreshStatus() } }
             }
         case let .failed(reason):
             VStack(alignment: .leading, spacing: 6) {
@@ -127,7 +154,7 @@ struct FirstRecordingBeatSheet: View {
                     .foregroundStyle(Color.scRust)
                 Button("Retry") { Task { await download.startDownload() } }
             }
-        case .idle, .cancelled:
+        case .offer:
             Button(downloadTitle) { Task { await download.startDownload() } }
                 .keyboardShortcut(.defaultAction)
         }
