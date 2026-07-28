@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 // U7 — the floating recording HUD (design 29–41): a bottom-center dark pill with
-// a pulsing amber elapsed clock, the provisional recording title, a Draw stub, a
-// functional Mute control (SCR-254), Hide, and a teal "Stop & save", plus the
+// a pulsing amber elapsed clock, the provisional recording title, a functional
+// Mute control (SCR-254), Hide, and a teal "Stop & save", plus the
 // "recording to this Mac" sub-caption. It lives
 // in a separate non-activating floating `NSPanel` (KTD-4) so it survives the
 // main-window hide and floats over full-screen apps on every Space, and is marked
@@ -105,7 +105,6 @@ struct RecordingHUDView: View {
             elapsedGroup
             titleChip
             divider
-            stub("Draw", ticket: "SCR-217")
             muteButton
             hideButton
             divider
@@ -158,18 +157,6 @@ struct RecordingHUDView: View {
             .accessibilityHidden(true)
     }
 
-    /// A disabled HUD control stub (Draw SCR-217), rendered per the design but
-    /// non-functional (KTD-8).
-    private func stub(_ label: String, ticket: String) -> some View {
-        Text(label)
-            .font(SCTypography.sans(size: 13))
-            .foregroundStyle(Color.scHUDMuted)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .help("Coming soon — \(ticket)")
-            .accessibilityLabel("\(label), coming soon")
-    }
-
     /// The functional Mute control (SCR-254 U8). The muted state gets a DISTINCT
     /// visual — a filled rust pill + `mic.slash.fill` — so the mic being off reads
     /// at a glance, not by label alone. While a toggle is in flight it shows a
@@ -214,8 +201,8 @@ struct RecordingHUDView: View {
     }
 
     /// Dismisses the pill for the rest of the recording (design 8a). A plain
-    /// "Hide" label beside Draw and Mute; restored via ⌘⇧H, the bottom-edge peek,
-    /// or the menu-bar "Show recording controls" item.
+    /// "Hide" label beside the Mute control; restored via ⌘⇧H, the bottom-edge
+    /// peek, or the menu-bar "Show recording controls" item.
     private var hideButton: some View {
         Button {
             recorder.hideRecordingHUD()

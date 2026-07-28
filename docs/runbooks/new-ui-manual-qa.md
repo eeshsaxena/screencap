@@ -105,10 +105,9 @@ the previous release first; completion marker absent.
 - [ ] HUD follows across Spaces and over a full-screen app.
 - [ ] The HUD does **not** appear in its own recording (capture-excluded),
       and the footer reads "recording to this Mac" with no encryption claim.
-- [ ] HUD Draw renders disabled with the SCR-217 tooltip; the **Mute** control is
-      functional (SCR-254, see the Mute section below); Stop ends the recording;
-      the main window restores on Library with the fresh card in `processing` →
-      `ready` state.
+- [ ] The **Mute** control is functional (SCR-254, see the Mute section below);
+      Stop ends the recording; the main window restores on Library with the fresh
+      card in `processing` → `ready` state.
 - [ ] Menu bar during recording: icon swaps, Stop Recording (⌘⇧S) works;
       menu-bar Start (⌘⇧R, idle) starts with the sheet's defaults (flip
       `audio_default` off via
@@ -124,7 +123,7 @@ the previous release first; completion marker absent.
 Run these with a *second app focused* (e.g. a browser) so the global paths are
 genuinely exercised — a window-scoped shortcut would pass this only by accident.
 
-- [ ] Pill shows a plain **"Hide"** button beside Draw and the Mute control (not a
+- [ ] Pill shows a plain **"Hide"** button beside the Mute control (not a
       chevron icon); clicking it dismisses the pill and the recording continues.
 - [ ] With focus in the recorded app, **⌘⇧H** hides the pill; **⌘⇧H** again
       restores it bottom-center. The elapsed timer keeps advancing throughout.
