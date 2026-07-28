@@ -86,6 +86,22 @@ enum ShellWindowLayout {
     /// navigator above it instead of introducing a third alignment.
     static let playbackPaneHorizontalInset: CGFloat = 24
 
+    /// Bounds on a *believable* captured-display aspect ratio (SCR-297).
+    ///
+    /// The pane takes its shape from whatever `AVPlayerItem` reports, and a
+    /// corrupt or surprising `presentationSize` must not be able to produce a
+    /// degenerate player — a 40:1 sliver or a zero-width box. Anything outside
+    /// this range is treated as *unresolved* rather than clamped to the edge:
+    /// falling back to filling the pane is a known-good rendering, whereas a
+    /// clamped-to-4:1 player would be confidently the wrong shape.
+    ///
+    /// The range is deliberately generous rather than tuned — 0.5 covers a
+    /// portrait-rotated display, 4.0 covers super-ultrawide and dual-display
+    /// side-by-side captures, and everything real sits well inside. It exists
+    /// to reject nonsense, not to police unusual hardware.
+    static let playbackAspectMin: CGFloat = 0.5
+    static let playbackAspectMax: CGFloat = 4.0
+
     // MARK: - Window
 
     /// The window's declared minimum content width. Derived from
@@ -128,5 +144,81 @@ enum ShellWindowLayout {
     /// The narrowest content width the shell lays out without overflowing.
     static var minContentWidth: CGFloat {
         sidebarWidth + dayHeaderMinWidth
+    }
+}
+
+/// The Day page player's shape contract (SCR-297).
+///
+/// Before this, `playbackPane` filled whatever box the page left it and let
+/// `AVPlayerView` pillarbox the footage inside — so the pane's edges were the
+/// *video's* edges only by coincidence. They usually weren't: at the shipped
+/// 1180x780 default a 16:10 capture drew ~710pt inside a ~932pt pane, leaving
+/// ~100pt of black either side, and the pane's overlay chrome (timestamp chip,
+/// action bar, clip bounds) floated out over that black rather than sitting on
+/// the video it annotates.
+///
+/// Giving the pane the footage's real aspect ratio fixes both at once. The
+/// arithmetic lives here rather than inside the view body for the same reason
+/// the width contract above does: it is the kind of layout reasoning that is
+/// invisible when wrong, so it is pinned by tests instead of eyeballed.
+///
+/// Deliberately pure and free of AVFoundation. The engine converts a reported
+/// `presentationSize` into a ratio via `resolve(reportedSize:)`; everything
+/// downstream is arithmetic over `CGSize`.
+enum PlaybackAspect {
+
+    /// Turn a size reported by the player into a usable aspect ratio.
+    ///
+    /// Returns `nil` — meaning *unresolved*, render as before — for every input
+    /// that cannot produce a trustworthy shape:
+    ///
+    /// - `.zero`, which is what `AVPlayerItem.presentationSize` reports until
+    ///   the item reaches `.readyToPlay`. This is the normal pre-playback
+    ///   state, not an error.
+    /// - Non-positive or non-finite dimensions, which would divide badly.
+    /// - A ratio outside `playbackAspectMin ... playbackAspectMax`.
+    ///
+    /// Never guesses. A wrong ratio is worse than no ratio: it mis-shapes the
+    /// player *and* mis-anchors the chrome, where `nil` just reproduces the
+    /// shipped behaviour.
+    static func resolve(reportedSize size: CGSize) -> CGFloat? {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0
+        else { return nil }
+
+        let ratio = size.width / size.height
+        guard ratio >= ShellWindowLayout.playbackAspectMin,
+              ratio <= ShellWindowLayout.playbackAspectMax
+        else { return nil }
+
+        return ratio
+    }
+
+    /// The player's rendered size inside a pane slot of `slot`.
+    ///
+    /// `slot` is the whole box the day page hands the pane, gutter included;
+    /// the horizontal inset is subtracted here so callers pass the raw slot and
+    /// there is exactly one place the gutter is applied.
+    ///
+    /// A `nil` aspect returns the full inset-adjusted slot — byte-for-byte the
+    /// pre-SCR-297 layout, which is what makes falling back to unresolved safe.
+    /// A non-`nil` aspect returns the largest box of that ratio that fits, so
+    /// the result never exceeds the slot in either dimension and the remainder
+    /// becomes page background rather than letterbox black.
+    static func fittedSize(inSlot slot: CGSize, aspect: CGFloat?) -> CGSize {
+        let availableWidth = max(0, slot.width - ShellWindowLayout.playbackPaneHorizontalInset * 2)
+        let availableHeight = max(0, slot.height)
+        let available = CGSize(width: availableWidth, height: availableHeight)
+
+        guard let aspect, aspect > 0, availableWidth > 0, availableHeight > 0 else {
+            return available
+        }
+
+        // Compare the slot's own ratio against the footage's to find the
+        // binding dimension: a slot proportionally wider than the footage runs
+        // out of height first, and vice versa.
+        return availableWidth / availableHeight > aspect
+            ? CGSize(width: availableHeight * aspect, height: availableHeight)
+            : CGSize(width: availableWidth, height: availableWidth / aspect)
     }
 }

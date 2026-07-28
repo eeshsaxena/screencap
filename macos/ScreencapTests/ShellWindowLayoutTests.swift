@@ -77,6 +77,152 @@ final class ShellWindowLayoutTests: XCTestCase {
         )
     }
 
+    // MARK: - Source-aspect resolution (SCR-297)
+
+    /// The clamp exists to reject nonsense, not to police unusual hardware. If
+    /// it ever tightened past a real display shape the pane would silently fall
+    /// back to filling the box for that user and the pillarboxing would return
+    /// for them alone — a per-hardware bug nothing else would catch.
+    func testAspectClampAdmitsEveryRealisticDisplayShape() {
+        XCTAssertLessThan(ShellWindowLayout.playbackAspectMin, ShellWindowLayout.playbackAspectMax)
+
+        for (label, ratio) in [
+            ("4:3", 4.0 / 3.0),
+            ("16:10", 16.0 / 10.0),
+            ("16:9", 16.0 / 9.0),
+            ("21:9 ultrawide", 3440.0 / 1440.0),
+            ("portrait-rotated", 1080.0 / 1920.0),
+        ] as [(String, CGFloat)] {
+            XCTAssertNotNil(
+                PlaybackAspect.resolve(reportedSize: CGSize(width: ratio, height: 1)),
+                "\(label) (\(ratio)) must resolve — it is a real display shape"
+            )
+        }
+    }
+
+    func testAspectResolvesRealCaptureSizes() {
+        XCTAssertEqual(PlaybackAspect.resolve(reportedSize: CGSize(width: 1920, height: 1200)), 1.6)
+        XCTAssertEqual(
+            PlaybackAspect.resolve(reportedSize: CGSize(width: 3440, height: 1440)) ?? 0,
+            2.3889, accuracy: 0.001
+        )
+        XCTAssertEqual(
+            PlaybackAspect.resolve(reportedSize: CGSize(width: 1080, height: 1920)) ?? 0,
+            0.5625, accuracy: 0.0001
+        )
+    }
+
+    /// `.zero` is the ordinary pre-`readyToPlay` state, not corruption — it has
+    /// to resolve to nil so the pane renders as it does today rather than
+    /// collapsing.
+    func testAspectIsUnresolvedForDegenerateSizes() {
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: .zero))
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: 1920, height: 0)))
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: 0, height: 1080)))
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: -1920, height: 1080)))
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: CGFloat.infinity, height: 1080)))
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: 1920, height: CGFloat.nan)))
+    }
+
+    func testAspectIsUnresolvedOutsideTheClamp() {
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: 8000, height: 100)))
+        XCTAssertNil(PlaybackAspect.resolve(reportedSize: CGSize(width: 100, height: 8000)))
+    }
+
+    // MARK: - Fitted player size (SCR-297)
+
+    /// The default window: the slot is proportionally wider than 16:10 footage,
+    /// so height binds and the leftover width becomes page background. This is
+    /// the case the ticket was filed about.
+    func testFittedSizeIsHeightBoundInASlotWiderThanTheFootage() {
+        let slot = CGSize(width: 932, height: 420)
+        let fitted = PlaybackAspect.fittedSize(inSlot: slot, aspect: 1.6)
+
+        XCTAssertEqual(fitted.height, slot.height)
+        XCTAssertLessThan(fitted.width, slot.width - ShellWindowLayout.playbackPaneHorizontalInset * 2)
+        XCTAssertEqual(fitted.width / fitted.height, 1.6, accuracy: 0.0001)
+    }
+
+    /// The opposite bind: the player takes the full gutter-adjusted width and
+    /// gives height back.
+    func testFittedSizeIsWidthBoundInASlotNarrowerThanTheFootage() {
+        let slot = CGSize(width: 700, height: 600)
+        let fitted = PlaybackAspect.fittedSize(inSlot: slot, aspect: 1.6)
+
+        XCTAssertEqual(
+            fitted.width,
+            slot.width - ShellWindowLayout.playbackPaneHorizontalInset * 2
+        )
+        XCTAssertLessThan(fitted.height, slot.height)
+        XCTAssertEqual(fitted.width / fitted.height, 1.6, accuracy: 0.0001)
+    }
+
+    /// The fallback that makes "never guess a ratio" safe: unresolved must
+    /// reproduce the pre-SCR-297 layout exactly, not approximately.
+    func testUnresolvedAspectReturnsTheFullInsetAdjustedSlot() {
+        let slot = CGSize(width: 932, height: 420)
+        let fitted = PlaybackAspect.fittedSize(inSlot: slot, aspect: nil)
+
+        XCTAssertEqual(
+            fitted,
+            CGSize(
+                width: slot.width - ShellWindowLayout.playbackPaneHorizontalInset * 2,
+                height: slot.height
+            )
+        )
+    }
+
+    /// An ultrawide capture is the shape most likely to degenerate, since it
+    /// binds on width and gives back the most height.
+    func testUltrawideFootageKeepsAWatchableHeightAtTheDefaultWindow() {
+        let slot = CGSize(width: 932, height: 420)
+        let fitted = PlaybackAspect.fittedSize(inSlot: slot, aspect: 3440.0 / 1440.0)
+
+        XCTAssertEqual(
+            fitted.width,
+            slot.width - ShellWindowLayout.playbackPaneHorizontalInset * 2
+        )
+        XCTAssertGreaterThan(fitted.height, 200, "an ultrawide day should not render as a sliver")
+    }
+
+    /// The invariant that matters most: whatever the footage, the player fits.
+    /// A result exceeding the slot would push the strip off-screen and re-open
+    /// the overflow class of bug PR #442 closed.
+    func testFittedSizeNeverExceedsTheSlotForAnyAdmittedRatio() {
+        let slots = [
+            CGSize(width: 752, height: 320),   // minimum window
+            CGSize(width: 932, height: 420),   // default window
+            CGSize(width: 2312, height: 1000), // maximized on a large display
+        ]
+        let ratios = stride(
+            from: ShellWindowLayout.playbackAspectMin,
+            through: ShellWindowLayout.playbackAspectMax,
+            by: 0.1
+        )
+
+        for slot in slots {
+            let available = slot.width - ShellWindowLayout.playbackPaneHorizontalInset * 2
+            for ratio in ratios {
+                let fitted = PlaybackAspect.fittedSize(inSlot: slot, aspect: ratio)
+                XCTAssertLessThanOrEqual(fitted.width, available, "ratio \(ratio) in slot \(slot)")
+                XCTAssertLessThanOrEqual(fitted.height, slot.height, "ratio \(ratio) in slot \(slot)")
+                XCTAssertGreaterThan(fitted.width, 0, "ratio \(ratio) in slot \(slot)")
+                XCTAssertGreaterThan(fitted.height, 0, "ratio \(ratio) in slot \(slot)")
+            }
+        }
+    }
+
+    /// A slot too narrow to hold its own gutter must clamp to zero width rather
+    /// than going negative — a negative frame is a SwiftUI runtime complaint,
+    /// and the arithmetic should not be able to produce one at any window size.
+    func testFittedSizeDegradesSafelyWhenTheSlotCannotHoldTheGutter() {
+        let fitted = PlaybackAspect.fittedSize(
+            inSlot: CGSize(width: 10, height: 100), aspect: 1.6
+        )
+        XCTAssertEqual(fitted.width, 0)
+        XCTAssertGreaterThanOrEqual(fitted.height, 0)
+    }
+
     // MARK: - Measured control widths
 
     /// Everything in `minContentWidth` is a value we declare — except two, which
