@@ -96,7 +96,11 @@ local-model = [
     # WEIGHTS (~2 GB) are the opt-in download, not these libs. Kept OUT of
     # `dev`/CI on purpose: the runtime tests stub the backends + `importorskip`,
     # so CI needs no native ML build. `mlx-lm` is Apple-Silicon-only.
-    "huggingface_hub>=0.20.0",
+    # >=0.23: the model download engine needs `snapshot_download` to stream into
+    # `local_dir` (0.20-0.22 filled the global cache and copied at the end, which
+    # leaves the staging dir flat and starves the stall detector) and to accept
+    # `endpoint=` for the per-call host pin. Both landed in 0.23.0.
+    "huggingface_hub>=0.23.0",
     "llama-cpp-python>=0.3.0",
     "mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]

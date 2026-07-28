@@ -2,8 +2,8 @@
 
 The real Hugging Face fetch cannot run in CI; these inject a fake ``snapshot_fn``
 that materializes fixture files, and exercise the fail-closed verify path:
-sha256 mismatch, disallowed format, missing file, symlink, interruption, and
-insufficient disk all leave the model NOT installed.
+sha256 mismatch, disallowed format, missing file, symlink, interruption, stall,
+cancellation, and insufficient disk all leave the model NOT installed.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import hashlib
 import os
 import stat
 import threading
+import time
 import types
 
 import pytest
@@ -122,6 +123,28 @@ class TestHappyPath:
         # >100% bar.
         assert all(done <= total for done, total in seen)
 
+    def test_xet_pin_restores_only_when_the_last_fetch_exits(self):
+        """The Xet switch is process-global, so its restore must be depth-counted.
+
+        An abandoned (stalled) fetch thread can still be inside the pin when a
+        retry enters it. A naive save/restore would let whichever exits first
+        write the *pinned* value back as the original, leaving the daemon's other
+        Hugging Face consumers permanently flipped.
+        """
+        from huggingface_hub import constants as hf_constants
+
+        original = hf_constants.HF_HUB_DISABLE_XET
+        try:
+            hf_constants.HF_HUB_DISABLE_XET = False
+            with dl._xet_disabled():
+                with dl._xet_disabled():
+                    assert hf_constants.HF_HUB_DISABLE_XET is True
+                # Inner exit must NOT restore — a fetch is still in flight.
+                assert hf_constants.HF_HUB_DISABLE_XET is True
+            assert hf_constants.HF_HUB_DISABLE_XET is False
+        finally:
+            hf_constants.HF_HUB_DISABLE_XET = original
+
 
 @pytest.mark.privacy
 class TestFailClosed:
@@ -168,8 +191,116 @@ class TestFailClosed:
         result = _dl(tmp_path, snapshot_fn=interrupt, stop_event=stop)
         assert result.state == "cancelled"
         assert get_installed_model_path(_TEST_ID, _RUNTIME, tmp_path) is None
-        # No half-populated dir left behind.
-        assert not (tmp_path / _TEST_ID / (_RUNTIME + ".partial")).exists()
+        # No half-populated dir left behind. Globbed, not an exact path: staging is
+        # uniquely named per attempt, so an exact-path check would pass vacuously.
+        assert not list((tmp_path / _TEST_ID).glob(_RUNTIME + ".partial*"))
+
+    def test_stalled_fetch_fails_instead_of_hanging(self, tmp_path, test_model, monkeypatch):
+        """A fetch that stops producing bytes must fail, not block forever.
+
+        ``snapshot_download`` has no overall deadline, and its internal retry
+        budget resets on every chunk that arrives, so a wedged transfer blocks the
+        engine indefinitely: the daemon job stays ``running``, the status verb
+        keeps saying ``downloading``, and the idle-shutdown busy predicate pins the
+        process. The bar simply stops moving — no error, no Retry, and (because the
+        stop flag is only read after the fetch returns) no working Cancel either.
+        """
+        monkeypatch.setattr(dl, "_STALL_TIMEOUT_S", 0.4)
+        release = threading.Event()
+        attempts: list = []
+
+        # No progress_cb is passed: the stall guard must not depend on one.
+        def wedged(repo, rev, local_dir, files):
+            attempts.append(local_dir)
+            (local_dir / "model.gguf").write_bytes(_WEIGHTS[:16])  # some bytes land...
+            # ...then nothing, ever. Bounded so a guard-less engine fails the
+            # assertions below instead of hanging the suite.
+            release.wait(20)
+
+        try:
+            result = _dl(tmp_path, snapshot_fn=wedged)
+        finally:
+            release.set()
+
+        assert result.state == "failed"
+        assert result.reason.startswith("stalled:no-bytes-in-"), result.reason
+        assert len(attempts) == 2, "one retry, then surface"
+        # Each attempt stages somewhere unique, so an abandoned fetch thread — which
+        # cannot be stopped — can never write into a live attempt's tree.
+        assert len(set(attempts)) == len(attempts)
+        assert get_installed_model_path(_TEST_ID, _RUNTIME, tmp_path) is None
+
+    def test_progressing_fetch_is_not_declared_stalled(self, tmp_path, test_model, monkeypatch):
+        """A transfer still producing bytes must never be failed as stalled.
+
+        The guard's real risk is the false positive, and it is silent: a clock that
+        never re-arms, or one reading the ``total``-clamped count instead of the raw
+        one, fails every healthy download identically. The live Hugging Face fetch
+        cannot run in CI, so nothing else would catch it. Growth here deliberately
+        runs PAST the manifest total, which is what pins the raw-vs-clamped half.
+        """
+        monkeypatch.setattr(dl, "_STALL_TIMEOUT_S", 0.4)
+        finished = []
+
+        def growing(repo, rev, local_dir, files):
+            for i in range(6):  # ~0.9s of real progress, exceeding the manifest total
+                (local_dir / f"part{i}.gguf").write_bytes(_WEIGHTS)
+                time.sleep(0.15)
+            (local_dir / "model.gguf").write_bytes(_WEIGHTS)
+            finished.append(local_dir)
+
+        result = _dl(tmp_path, snapshot_fn=growing)
+
+        assert finished, "a fetch that was still producing bytes got abandoned"
+        assert result.state == "installed", result.reason
+
+    def test_cancel_lands_during_the_fetch(self, tmp_path, test_model):
+        """Cancel must abandon an in-flight fetch, not wait it out.
+
+        The stop flag used to be read only once the fetch returned, so Cancel could
+        not land during the one step that takes minutes. The watch loop is the only
+        place it can — and a cancelled download must not open a retry transfer.
+        """
+        stop = threading.Event()
+        release = threading.Event()
+        attempts: list = []
+
+        def wedged(repo, rev, local_dir, files):
+            attempts.append(local_dir)
+            stop.set()  # the user hits Cancel as soon as the fetch starts
+            release.wait(20)
+
+        started = time.monotonic()
+        try:
+            result = _dl(tmp_path, snapshot_fn=wedged, stop_event=stop)
+        finally:
+            release.set()
+        elapsed = time.monotonic() - started
+
+        assert result.state == "cancelled"
+        # Without the poll this still converges once `wedged` returns, so the timing
+        # is what actually pins "lands DURING the fetch".
+        assert elapsed < 5, f"cancel waited out the fetch instead of landing ({elapsed:.1f}s)"
+        assert len(attempts) == 1, "a cancelled download must not start a retry"
+        assert get_installed_model_path(_TEST_ID, _RUNTIME, tmp_path) is None
+
+    def test_fetch_error_is_reported_not_swallowed(self, tmp_path, test_model):
+        """An exception from the fetch must survive the worker-thread hand-back.
+
+        The fetch runs on its own thread now, so its exception is captured there and
+        re-raised on the caller's. Lose that hand-back and a network failure returns
+        an empty staging dir instead — surfacing as ``missing-file``, which reads as
+        a corrupt manifest and sends the user down the wrong path entirely.
+        """
+
+        def boom(repo, rev, local_dir, files):
+            raise ConnectionError("no route to host")
+
+        result = _dl(tmp_path, snapshot_fn=boom)
+
+        assert result.state == "failed"
+        assert result.reason == "download-error:ConnectionError"
+        assert not list((tmp_path / _TEST_ID).glob(_RUNTIME + ".partial*"))
 
     def test_insufficient_disk_fails_before_fetch(self, tmp_path, test_model, monkeypatch):
         touched = {"snapshot": False}
