@@ -61,6 +61,24 @@ def _py(home: Path, code: str, key_file: Path | None = None):
     return subprocess.run([sys.executable, "-c", code], env=env, cwd=str(_REPO), capture_output=True, text=True)
 
 
+def _failure_event(stream: str) -> dict | None:
+    """The `search_enable_failed` structured event in a captured stream, if present.
+
+    Mirrors the Swift `SearchEnableEventLine.failure(inStderr:)` scan, so both sides of
+    the contract are pinned by a test that reads the stream the same way."""
+    for line in stream.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "search_enable_failed":
+            return event
+    return None
+
+
 def _status(home: Path, key_file: Path | None = None) -> dict:
     r = _cli(home, "search", "status", "--json", key_file=key_file)
     assert r.returncode == 0, r.stderr
@@ -161,6 +179,98 @@ def test_new_install_disclosure_then_search_on_and_gate_healthy(tmp_path):
     )
     assert healthy.returncode == 0, healthy.stderr
     assert healthy.stdout.strip() == "True"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits these cases rely on")
+def test_search_enable_key_failure_reports_the_reason_on_stderr(tmp_path):
+    """A failed ``search enable`` puts its reason on STDERR, not stdout.
+
+    The macOS disclosure sheet only ever sees ``CLIError.nonZeroExit(code:stderr:)``,
+    which carries stderr — a reason printed to stdout is dropped and the user gets a
+    bare "Couldn't turn on search. Please try again." Pins the reason code too, since
+    the app maps it to actionable copy (a Keychain refusal is not retryable)."""
+    home = tmp_path / "home"
+    (home / ".screencap").mkdir(parents=True)
+    # A directory that exists but refuses new files: `_write_key_file` mkdirs the
+    # parent (fine) then O_CREATs the key (EACCES) → CorpusKeyUnavailable.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        r = _cli(home, "search", "enable", key_file=locked / "corpus.key")
+    finally:
+        locked.chmod(0o700)
+
+    assert r.returncode != 0, f"expected a non-zero exit, got 0\nstdout={r.stdout}"
+    event = _failure_event(r.stderr)
+    assert event["reason"] == "corpus_key_unavailable", event
+    assert "corpus key" in event["detail"]  # the human-readable cause rides along
+    assert _failure_event(r.stdout) is None  # not stdout-only (the original bug)
+
+    # Pin the emitted SHAPE, not just the values: the Swift decoder
+    # (`SearchEnableEventLine`) keys on exactly these names, and its fixture is a
+    # captured paste that cannot notice a producer-side rename on its own.
+    assert set(event) == {"type", "ts", "schema_version", "reason", "detail"}, event
+    assert event["schema_version"] == 1, event
+
+    assert _status(home)["corpus_encrypted"] is False  # gate stayed off
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits these cases rely on")
+def test_search_enable_uncategorized_failure_still_reports_a_reason(tmp_path):
+    """An unexpected exception reports ``unknown`` rather than escaping as a traceback.
+
+    This is the catch-all arm — by definition the one that fires for failures nobody
+    anticipated — so it is exactly where a silent regression would hurt most."""
+    home = tmp_path / "home"
+    recordings = home / ".screencap" / "recordings"
+    recordings.mkdir(parents=True)
+    key_file = tmp_path / "corpus.key"
+    # Unreadable recordings dir: `migrate_corpus` calls `recordings_dir.iterdir()`
+    # OUTSIDE its per-recording try/except, so the PermissionError propagates out of
+    # `flip_corpus_to_encrypted` uncategorized.
+    recordings.chmod(0o000)
+    try:
+        r = _cli(home, "search", "enable", key_file=key_file)
+    finally:
+        recordings.chmod(0o700)
+
+    assert r.returncode != 0, f"expected a non-zero exit, got 0\nstdout={r.stdout}"
+    event = _failure_event(r.stderr)
+    assert event["reason"] == "unknown", event
+    assert "PermissionError" in event["detail"], event  # detail names the exception type
+    assert "Traceback" not in r.stderr  # handled, not an escaped crash
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits these cases rely on")
+def test_search_enable_incomplete_migration_fails_instead_of_reporting_success(tmp_path):
+    """An incomplete flip exits non-zero — it must never print "Search enabled."
+
+    ``flip_corpus_to_encrypted`` *returns* (not raises) when stills survive as
+    plaintext, leaving ``corpus_encrypted`` unset. Reporting success there tells the
+    app search is on while the gate is off, and the disclosure re-appears next launch."""
+    home = tmp_path / "home"
+    ss = home / ".screencap" / "recordings" / "rec-1" / "screenshots"
+    ss.mkdir(parents=True)
+    key_file = tmp_path / "corpus.key"
+
+    jpeg = io.BytesIO()
+    Image.new("RGB", (64, 32), "white").save(jpeg, format="JPEG")
+    still = ss / "100.000000.jpg"
+    still.write_bytes(jpeg.getvalue())
+    old = time.time() - 10  # past the active-writer grace, so it is not merely deferred
+    os.utime(still, (old, old))
+    still.chmod(0o000)  # unreadable → the encrypt step fails and the plaintext survives
+    try:
+        r = _cli(home, "search", "enable", key_file=key_file)
+    finally:
+        still.chmod(0o600)
+
+    assert r.returncode != 0, f"expected a non-zero exit, got 0\nstdout={r.stdout}"
+    assert _failure_event(r.stderr)["reason"] == "migration_incomplete", r.stderr
+    assert "Search enabled" not in r.stdout, r.stdout
+
+    assert _status(home, key_file)["corpus_encrypted"] is False
 
 
 def test_decline_durably_holds_gate_off(tmp_path):
