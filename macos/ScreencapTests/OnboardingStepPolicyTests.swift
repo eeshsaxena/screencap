@@ -303,17 +303,40 @@ final class OnboardingStepPolicyTests: XCTestCase {
     // MARK: - Honesty gate (KTD-9 / R7)
 
     /// The storage and account steps carry no end-to-end-encryption or
-    /// present-tense team-sharing claims. The Personal card now DOES carry its
-    /// real price ($5/mo, billing U7 / R2) — honest and billable on a
-    /// server-readable tier — so pricing is no longer forbidden here; the E2EE
-    /// "we can't watch" claims still are (R2), and the Team card stays
-    /// price-free while coming-soon (checked below).
+    /// present-tense team-sharing claims. The paid cards DO carry their real
+    /// prices (KTD-7) — honest and billable on a server-readable tier — so
+    /// pricing is no longer forbidden here; the E2EE "we can't watch" claims
+    /// still are (R2), and the Team card stays price-free while coming-soon
+    /// (checked below).
+    ///
+    /// `forever` is banned because the paid-only launch removed the free tier:
+    /// the local card's old "free · forever · no account" meta promised a
+    /// free-forever plan that no longer exists. `forever` is the precise guard
+    /// word — banning `free` outright would collide with the paid cards'
+    /// legitimate "free trial" copy, which this test also asserts survives.
     func testStorageAndAccountCopyCarriesNoForbiddenClaims() {
         let all = OnboardingCopy.storageAndAccountStrings.joined(separator: " ").lowercased()
-        for forbidden in ["encrypt", "e2e", "keys stay", "we can't watch"] {
+        for forbidden in ["encrypt", "e2e", "keys stay", "we can't watch", "forever"] {
             XCTAssertFalse(all.contains(forbidden), "storage/account copy contains \"\(forbidden)\"")
         }
         XCTAssertFalse(all.contains("shared team library"))
+        // The ban targets the free-tier promise, not the real trial: the paid
+        // cards' "free trial" copy must still be present (guards against a
+        // future over-broad `free` ban).
+        XCTAssertTrue(all.contains("free trial"), "the paid cards' real free-trial copy must survive")
+    }
+
+    /// Paywall OFF renders no price anywhere on the storage step (KTD-6): the
+    /// app must not advertise a price it isn't enforcing. This is the mirror of
+    /// the priced-card assertions — the two pre-billing metas are the only
+    /// strings the storage cards can show while the paywall is off.
+    func testPaywallOffCardMetasMakeNoPriceClaim() {
+        for meta in [OnboardingCopy.localCardMeta, OnboardingCopy.personalCardMetaFree] {
+            XCTAssertFalse(meta.contains("$"), "paywall-off meta must carry no price: \(meta)")
+            XCTAssertFalse(meta.lowercased().contains("forever"), "paywall-off meta must not promise forever: \(meta)")
+            // Guards against silently deleting the meta and leaving a bare card.
+            XCTAssertFalse(meta.isEmpty, "paywall-off meta must still describe the tier")
+        }
     }
 
     // MARK: - Paid-only launch: two-tier cards + prices (U11 / KTD-7)
@@ -335,13 +358,32 @@ final class OnboardingStepPolicyTests: XCTestCase {
         XCTAssertTrue(OnboardingCopy.cloudCardMeta.lowercased().contains("trial"))
     }
 
-    /// The finalized launch prices are pinned to their exact values ($8 Local
-    /// Pro, $15 Cloud). They ship compiled into the DMG and must match the live
+    /// The finalized launch prices are pinned to their exact values ($9 Local
+    /// Pro, $20 Cloud). They ship compiled into the DMG and must match the live
     /// Stripe prices, so an accidental edit that would display a wrong price
     /// fails the build rather than reaching a customer (R4/R10).
     func testFinalizedLaunchPricesArePinned() {
-        XCTAssertEqual(PricingCatalog.localProMonthly, "$8")
-        XCTAssertEqual(PricingCatalog.cloudMonthly, "$15")
+        XCTAssertEqual(PricingCatalog.localProMonthly, "$9")
+        XCTAssertEqual(PricingCatalog.cloudMonthly, "$20")
+    }
+
+    /// Cloud stays priced strictly above Local Pro (R3/R2). Compared
+    /// NUMERICALLY, never as strings: at the launch prices `"$20" < "$9"`
+    /// lexicographically, so a string comparison would fail on correct data and
+    /// pass on an inverted pair. Parsing also pins the `$<whole dollars>` shape
+    /// the price lines interpolate.
+    func testCloudIsPricedAboveLocalPro() throws {
+        XCTAssertEqual(PricingCatalog.localProMonthly.first, "$")
+        XCTAssertEqual(PricingCatalog.cloudMonthly.first, "$")
+        let localPro = try XCTUnwrap(
+            Int(PricingCatalog.localProMonthly.dropFirst()),
+            "Local Pro price must parse as a whole-dollar amount"
+        )
+        let cloud = try XCTUnwrap(
+            Int(PricingCatalog.cloudMonthly.dropFirst()),
+            "Cloud price must parse as a whole-dollar amount"
+        )
+        XCTAssertGreaterThan(cloud, localPro, "Cloud must be priced above Local Pro")
     }
 
     /// R12: the trial disclosure states auto-conversion AND cancellation before
