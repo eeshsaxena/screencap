@@ -237,7 +237,7 @@ enum OnboardingStepPolicy {
 /// picker cards, the upgrade panel, the trial disclosure — composes its copy
 /// from here, so tuning a price (R10) is a one-line change, never a hunt for
 /// duplicated `$`-literals. These are the finalized launch prices (Local Pro
-/// $8, Cloud $15); they are display only and MUST match the live Stripe prices,
+/// $9, Cloud $20); they are display only and MUST match the live Stripe prices,
 /// which are the billed truth. The displayed price is compiled into the app, so
 /// changing it requires a new build.
 ///
@@ -248,9 +248,9 @@ enum OnboardingStepPolicy {
 /// source until that wiring lands.
 enum PricingCatalog {
     /// Local Pro monthly launch price (display only; Stripe is the billed truth).
-    static let localProMonthly = "$8"
+    static let localProMonthly = "$9"
     /// Cloud monthly launch price, above Local Pro (R3); display only.
-    static let cloudMonthly = "$15"
+    static let cloudMonthly = "$20"
 
     static var localProPriceLine: String { "\(localProMonthly)/month" }
     static var cloudPriceLine: String { "\(cloudMonthly)/month" }
@@ -290,11 +290,12 @@ enum OnboardingCopy {
         + "automatically — the video just cuts around them."
     static let appRulesFooter = "Fine-tune per app anytime in Settings → App rules."
 
-    // Step 3 — storage (design 196–236). The local card's design copy is true
-    // and ships as-is except the "Share by exporting encrypted files" bullet
-    // (SCR-220). The cloud cards drop pricing (KTD-9) and carry only what is
-    // true today: per-recording upload approved in the Review window and
-    // single-recording web sharing; future capability is future-tense.
+    // Step 3 — storage (design 196–236). The local card ships the design copy
+    // except the "Share by exporting encrypted files" bullet (SCR-220) and the
+    // meta (see `localCardMeta`). The cloud cards drop pricing (KTD-9) and
+    // carry only what is true today: per-recording upload approved in the
+    // Review window and single-recording web sharing; future capability is
+    // future-tense.
     static let storageHeadline = "Where should your recordings live?"
     static let storageSub =
         "Either way, recording happens on this Mac. This only decides what happens after."
@@ -302,7 +303,11 @@ enum OnboardingCopy {
         "You can switch anytime in Settings → Privacy. Local files stay local when you upgrade."
 
     static let localCardTitle = "This Mac only"
-    static let localCardMeta = "free · forever · no account"
+    /// Paywall-off label, mirroring `personalCardMetaFree` (KTD-6): states a
+    /// true, unpriced fact about the pre-billing build. It deliberately makes
+    /// NO price claim — the paywall is off, so the app isn't enforcing one —
+    /// and no free-tier claim either, since there is no free tier to promise.
+    static let localCardMeta = "no account needed"
     static let localCardBullets = [
         "Everything stays on your disk",
         "Upload only what you approve in Review",

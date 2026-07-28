@@ -527,4 +527,33 @@ final class AccountSheetPolicyTests: XCTestCase {
         // Vacuity guard: the audit list actually covers the catalog.
         XCTAssertGreaterThan(AccountSheetCopy.renderedStrings.count, 20)
     }
+
+    // MARK: - Prices are inherited from PricingCatalog, never re-literalled (KTD-7)
+
+    /// The account sheet's priced strings compose from `PricingCatalog` rather
+    /// than carrying their own `$`-literals, so a price change is a one-line
+    /// edit in the catalog. This is the cross-surface half of the
+    /// single-source-of-price contract that `OnboardingStepPolicyTests` pins on
+    /// the onboarding side — it fails if anyone hardcodes a price here.
+    func testPricedStringsComposeFromCatalog() throws {
+        for (tier, price) in [
+            (EntitlementTier.localPro, PricingCatalog.localProMonthly),
+            (EntitlementTier.cloud, PricingCatalog.cloudMonthly),
+        ] {
+            let button = try XCTUnwrap(AccountSheetCopy.tierButtonTitle(tier))
+            XCTAssertTrue(
+                button.contains(price),
+                "tierButtonTitle(\(tier)) must surface the catalog price \(price), got: \(button)"
+            )
+            let priceLine = try XCTUnwrap(AccountSheetCopy.planPriceLine(tier))
+            XCTAssertTrue(
+                priceLine.contains(price),
+                "planPriceLine(\(tier)) must surface the catalog price \(price), got: \(priceLine)"
+            )
+        }
+
+        // The unpriced tier stays unpriced — no price leaks onto "no plan".
+        XCTAssertNil(AccountSheetCopy.tierButtonTitle(EntitlementTier.none))
+        XCTAssertNil(AccountSheetCopy.planPriceLine(EntitlementTier.none))
+    }
 }
