@@ -75,6 +75,12 @@ export class NotSignedInError extends Error {
   }
 }
 
+export const SIGNED_OUT: WhoAmI = { signedIn: false, uid: null, email: null };
+
+export function toWhoAmI(state: AuthState): WhoAmI {
+  return { signedIn: true, uid: state.uid, email: state.email };
+}
+
 export function chromeAuthDeps(): AuthDeps {
   return {
     fetch: globalThis.fetch.bind(globalThis),
@@ -126,12 +132,21 @@ export class AuthSession {
   /** Collapses concurrent refreshes so a popup and the service worker waking
    * at the same moment don't each burn a refresh round trip. */
   private inFlight: Promise<AuthState> | null = null;
+  /**
+   * Bumped by every deliberate session change. A network round trip captures
+   * it before starting and {@link adopt} refuses to write a result issued
+   * against a superseded session — otherwise a refresh already awaiting the
+   * network when the user signs out would resolve afterwards and quietly
+   * restore the session it was told to end.
+   */
+  private generation = 0;
 
   constructor(private readonly deps: AuthDeps) {}
 
   /** Runs the interactive Google flow and exchanges the result for a Firebase
    * session. Replaces any existing session. */
   async signIn(): Promise<AuthState> {
+    const generation = ++this.generation;
     const { firebaseApiKey, oauthClientId } = this.deps.credentials();
     const redirectUri = this.deps.redirectUri();
     const nonce = toHex(this.deps.randomBytes(16));
@@ -173,11 +188,12 @@ export class AuthSession {
       refreshToken: string;
       expiresIn: string;
     };
-    return this.adopt(body.idToken, body.refreshToken, body.expiresIn);
+    return this.adopt(generation, body.idToken, body.refreshToken, body.expiresIn);
   }
 
   /** Forgets the session on this device. The account itself is untouched. */
   async signOut(): Promise<void> {
+    this.generation += 1;
     this.cached = null;
     this.inFlight = null;
     await this.deps.storage.remove(REFRESH_TOKEN_STORAGE_KEY);
@@ -190,29 +206,23 @@ export class AuthSession {
    * Throws {@link NotSignedInError} when there is no usable credential — the
    * caller's cue to show signed-out, not to retry.
    */
-  async getIdToken(options: { forceRefresh?: boolean } = {}): Promise<string> {
+  async getIdToken(): Promise<string> {
     const cached = this.cached;
-    if (
-      !options.forceRefresh &&
-      cached &&
-      cached.expiresAt - this.deps.now() > REFRESH_BUFFER_SECONDS
-    ) {
+    if (cached && cached.expiresAt - this.deps.now() > REFRESH_BUFFER_SECONDS) {
       return cached.idToken;
     }
     return (await this.refresh()).idToken;
   }
 
-  /** Who is signed in, or `{ signedIn: false }`. Never throws: a rejected or
+  /** Who is signed in, or {@link SIGNED_OUT}. Never throws: a rejected or
    * absent credential is a signed-out state, not an error to surface. */
   async whoami(): Promise<WhoAmI> {
     try {
       await this.getIdToken();
     } catch {
-      return { signedIn: false, uid: null, email: null };
+      return SIGNED_OUT;
     }
-    const state = this.cached;
-    if (!state) return { signedIn: false, uid: null, email: null };
-    return { signedIn: true, uid: state.uid, email: state.email };
+    return this.cached ? toWhoAmI(this.cached) : SIGNED_OUT;
   }
 
   private async refresh(): Promise<AuthState> {
@@ -223,6 +233,7 @@ export class AuthSession {
   }
 
   private async doRefresh(): Promise<AuthState> {
+    const generation = this.generation;
     const refreshToken =
       this.cached?.refreshToken ??
       (await this.deps.storage.get(REFRESH_TOKEN_STORAGE_KEY));
@@ -258,15 +269,25 @@ export class AuthSession {
       refresh_token: string;
       expires_in: string;
     };
-    return this.adopt(body.id_token, body.refresh_token, body.expires_in);
+    return this.adopt(generation, body.id_token, body.refresh_token, body.expires_in);
   }
 
-  /** Cache a fresh token pair in memory and persist only the refresh token. */
+  /**
+   * Cache a fresh token pair in memory and persist only the refresh token.
+   *
+   * Refuses to write when `generation` no longer matches: the session was
+   * deliberately changed while this token was in flight, so adopting it would
+   * resurrect a session the user already ended.
+   */
   private async adopt(
+    generation: number,
     idToken: string,
     refreshToken: string,
     expiresIn: string,
   ): Promise<AuthState> {
+    if (generation !== this.generation) {
+      throw new NotSignedInError("Session changed while signing in");
+    }
     const { uid, email } = readIdentityClaims(idToken);
     const state: AuthState = {
       idToken,

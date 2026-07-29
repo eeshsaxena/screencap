@@ -25,7 +25,9 @@ interface Harness {
 }
 
 function harness(
-  responses: Partial<Record<"idp" | "refresh", () => Response>> = {},
+  responses: Partial<
+    Record<"idp" | "refresh", () => Response | Promise<Response>>
+  > = {},
 ): Harness {
   const store = new Map<string, string>();
   const calls: string[] = [];
@@ -70,8 +72,7 @@ function harness(
       }
       if (url.startsWith(SECURE_TOKEN_URL)) {
         calls.push("refresh");
-        return (
-          responses.refresh?.() ??
+        return await (responses.refresh?.() ??
           ok({
             // `refreshed` only distinguishes this token from the sign-in one so
             // tests can tell them apart; Firebase's real tokens differ by iat.
@@ -82,8 +83,7 @@ function harness(
             }),
             refresh_token: "refresh-2",
             expires_in: "3600",
-          })
-        );
+          }));
       }
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch,
@@ -196,6 +196,35 @@ describe("AuthSession", () => {
 
     await session.signOut();
 
+    expect(h.store.has(REFRESH_TOKEN_STORAGE_KEY)).toBe(false);
+    expect(await session.whoami()).toMatchObject({ signedIn: false });
+  });
+
+  it("keeps the user signed out when a refresh lands after sign-out", async () => {
+    let releaseRefresh!: (r: Response) => void;
+    const held = new Promise<Response>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const h = harness({ refresh: () => held });
+    h.store.set(REFRESH_TOKEN_STORAGE_KEY, "refresh-from-disk");
+    const session = new AuthSession(h.deps);
+
+    // A refresh is awaiting the network when the user signs out.
+    const pending = session.getIdToken();
+    await session.signOut();
+    releaseRefresh(
+      new Response(
+        JSON.stringify({
+          id_token: fakeIdToken({ user_id: "uid-1", email: "a@example.com" }),
+          refresh_token: "rotated-refresh",
+          expires_in: "3600",
+        }),
+        { status: 200 },
+      ),
+    );
+    await expect(pending).rejects.toThrow();
+
+    // The late refresh must not resurrect the session it was told to end.
     expect(h.store.has(REFRESH_TOKEN_STORAGE_KEY)).toBe(false);
     expect(await session.whoami()).toMatchObject({ signedIn: false });
   });

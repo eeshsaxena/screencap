@@ -8,7 +8,13 @@
  * expected to be lost, not preserved.
  */
 
-import { AuthSession, chromeAuthDeps, type WhoAmI } from "../auth/firebase.js";
+import {
+  AuthSession,
+  chromeAuthDeps,
+  SIGNED_OUT,
+  toWhoAmI,
+  type WhoAmI,
+} from "../auth/firebase.js";
 
 const session = new AuthSession(chromeAuthDeps());
 
@@ -26,11 +32,10 @@ async function handle(request: AuthRequest): Promise<AuthResponse> {
     case "auth.whoami":
       return { ok: true, who: await session.whoami() };
     case "auth.signIn":
-      await session.signIn();
-      return { ok: true, who: await session.whoami() };
+      return { ok: true, who: toWhoAmI(await session.signIn()) };
     case "auth.signOut":
       await session.signOut();
-      return { ok: true, who: await session.whoami() };
+      return { ok: true, who: SIGNED_OUT };
   }
 }
 

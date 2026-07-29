@@ -31,12 +31,24 @@ function render(response: AuthResponse): void {
   error.hidden = view.error === null;
 }
 
-/** Disables the button for the duration so a double-click cannot start two
- * interactive sign-in flows. */
+function asError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Disables the button for the duration so a double-click cannot start two
+ * interactive sign-in flows.
+ *
+ * Catches transport failures too — if the service worker is gone the
+ * `sendMessage` promise rejects rather than returning `{ ok: false }`, and an
+ * uncaught rejection would leave the popup showing no error at all.
+ */
 async function run(button: HTMLButtonElement, request: AuthRequest): Promise<void> {
   button.disabled = true;
   try {
     render(await send(request));
+  } catch (error) {
+    render({ ok: false, error: asError(error) });
   } finally {
     button.disabled = false;
   }
@@ -48,4 +60,6 @@ const signOut = el<HTMLButtonElement>("sign-out");
 signIn.addEventListener("click", () => void run(signIn, { type: "auth.signIn" }));
 signOut.addEventListener("click", () => void run(signOut, { type: "auth.signOut" }));
 
-void send({ type: "auth.whoami" }).then(render);
+void send({ type: "auth.whoami" })
+  .then(render)
+  .catch((error: unknown) => render({ ok: false, error: asError(error) }));
