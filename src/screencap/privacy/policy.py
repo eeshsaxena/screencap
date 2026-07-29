@@ -203,6 +203,19 @@ BROWSER_BUNDLE_IDS_LOWER: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
+# The actions settable as `privacy.default_action` (SCR-225), in the order the
+# App-rules banner shows them. Deliberately narrower than PrivacyAction: the
+# banner exposes exactly three segments, MASK_REGION is unimplemented, and
+# TEXT_REDACT / OCR_FALLBACK are matrix-internal treatments with no segment to
+# express or clear them. The CLI's scalar validation shares this set so the
+# write seam and the parser cannot drift.
+SETTABLE_DEFAULT_ACTIONS: tuple[PrivacyAction, ...] = (
+    PrivacyAction.ALLOW,
+    PrivacyAction.MASK_WINDOW,
+    PrivacyAction.EXCLUDE,
+)
+
+
 @dataclass(frozen=True)
 class PrivacyConfig:
     """Parsed [privacy] section from config.toml."""
@@ -211,12 +224,22 @@ class PrivacyConfig:
     exclude_apps: frozenset[str] = field(default_factory=frozenset)
     allow_apps: frozenset[str] = field(default_factory=frozenset)
     confirmed_allow_apps: frozenset[str] = field(default_factory=frozenset)
+    # Per-app Mask rules (SCR-225). Strictly tightening: an entry raises the
+    # app to MASK_WINDOW but never weakens a stricter matrix action, so
+    # masking a password manager still evaluates EXCLUDE.
+    mask_apps: frozenset[str] = field(default_factory=frozenset)
     mask_domains: frozenset[str] = field(default_factory=frozenset)
     mask_title_patterns: tuple[re.Pattern[str], ...] = ()
     app_classes: dict[str, ContextClass] = field(default_factory=dict)
+    # Blanket floor for apps the user wrote no rule for (SCR-225). ALLOW is
+    # the identity floor — the default, and byte-for-byte today's behavior.
+    default_action: PrivacyAction = PrivacyAction.ALLOW
 
     def is_excluded_app(self, bundle_id: str) -> bool:
         return bundle_id.lower() in self.exclude_apps
+
+    def is_masked_app(self, bundle_id: str) -> bool:
+        return bundle_id.lower() in self.mask_apps
 
     def is_allowed_app(self, bundle_id: str) -> bool:
         return bundle_id.lower() in self.allow_apps
@@ -238,7 +261,8 @@ class PrivacyConfig:
         and the background-window masking evaluator) use this one helper so
         they agree: confirmed entries survive into cloud posture, legacy
         (unconfirmed) entries do not. Tightening knobs (exclude_apps,
-        mask_domains, mask_title_patterns) are untouched."""
+        mask_apps, mask_domains, mask_title_patterns, default_action) are
+        untouched — they can only strengthen cloud posture, never weaken it."""
         return replace(self, allow_apps=self.allow_apps & self.confirmed_allow_apps)
 
     def is_masked_domain(self, domain: str) -> bool:
@@ -258,7 +282,12 @@ class PrivacyConfig:
         # authority rests on two-list membership that must not silently
         # break on a casing mismatch. Idempotent — safe to re-run on
         # unpickle and dataclasses.replace().
-        for name in ("exclude_apps", "allow_apps", "confirmed_allow_apps"):
+        for name in (
+            "exclude_apps",
+            "allow_apps",
+            "confirmed_allow_apps",
+            "mask_apps",
+        ):
             object.__setattr__(
                 self, name, frozenset(b.lower() for b in getattr(self, name))
             )
@@ -377,6 +406,19 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
             )
     confirmed_allow_apps = frozenset(raw_confirmed)
 
+    # mask_apps — per-app Mask rules (SCR-225)
+    raw_mask_apps = section.get("mask_apps", [])
+    if not isinstance(raw_mask_apps, list):
+        raise InvalidPrivacyConfigError(
+            f"privacy.mask_apps must be a list, got {type(raw_mask_apps).__name__}"
+        )
+    for i, app in enumerate(raw_mask_apps):
+        if not isinstance(app, str):
+            raise InvalidPrivacyConfigError(
+                f"privacy.mask_apps[{i}] must be a string, got {type(app).__name__}"
+            )
+    mask_apps = frozenset(raw_mask_apps)
+
     # mask_domains
     raw_domains = section.get("mask_domains", [])
     if not isinstance(raw_domains, list):
@@ -430,14 +472,41 @@ def parse_privacy_config(toml_dict: dict) -> PrivacyConfig:
                 f"Must be one of: {valid}"
             )
 
+    # default_action — the blanket floor for apps with no explicit rule
+    # (SCR-225). Only the three UI-reachable actions are settable: MASK_REGION
+    # is unimplemented, and TEXT_REDACT / OCR_FALLBACK are matrix-internal
+    # treatments with no segment to express them, so accepting them would
+    # write a value no surface can show or unset.
+    raw_default_action = section.get("default_action", PrivacyAction.ALLOW.value)
+    if not isinstance(raw_default_action, str):
+        raise InvalidPrivacyConfigError(
+            f"privacy.default_action must be a string, got "
+            f"{type(raw_default_action).__name__}"
+        )
+    try:
+        default_action = PrivacyAction(raw_default_action.lower())
+    except ValueError:
+        raise InvalidPrivacyConfigError(
+            f"Invalid privacy.default_action={raw_default_action!r}. Must be one "
+            f"of: {', '.join(a.value for a in SETTABLE_DEFAULT_ACTIONS)}"
+        )
+    if default_action not in SETTABLE_DEFAULT_ACTIONS:
+        raise InvalidPrivacyConfigError(
+            f"privacy.default_action={raw_default_action!r} is not settable as a "
+            f"blanket default. Must be one of: "
+            f"{', '.join(a.value for a in SETTABLE_DEFAULT_ACTIONS)}"
+        )
+
     return PrivacyConfig(
         mode=mode,
         exclude_apps=exclude_apps,
         allow_apps=allow_apps,
         confirmed_allow_apps=confirmed_allow_apps,
+        mask_apps=mask_apps,
         mask_domains=mask_domains,
         mask_title_patterns=tuple(compiled),
         app_classes=app_classes,
+        default_action=default_action,
     )
 
 
@@ -551,7 +620,21 @@ class DefaultPolicyEvaluator:
                 evidence=metadata.bundle_id,
             )
 
-        # 2. User mask rules — finer-grained user-authored rules outrank
+        # 2. Per-app Mask rule (SCR-225) — the user's own app-level Mask,
+        # resolved before the finer-grained per-frame rules and before any
+        # allow. Strictly tightening via `stricter`: masking a password
+        # manager still EXCLUDEs. Sitting above the allow steps also makes a
+        # hand-edited config that lists one bundle in both mask_apps and
+        # allow_apps fail closed to the mask.
+        if metadata.bundle_id and self._config.is_masked_app(metadata.bundle_id):
+            matrix_action = get_matrix_action(context.context_class, mode)
+            return ActionDecision(
+                action=stricter(PrivacyAction.MASK_WINDOW, matrix_action),
+                reason=ReasonCode.POLICY_MASKED_APP,
+                evidence=metadata.bundle_id,
+            )
+
+        # 3. User mask rules — finer-grained user-authored rules outrank
         # app-level allows (SCR-235 R4): a domain/title rule the user wrote
         # holds inside apps they allowed. For legacy allows in non-blocking
         # contexts this is a deliberate, strictly-tightening change from the
@@ -575,7 +658,7 @@ class DefaultPolicyEvaluator:
                     evidence=f"pattern={title_match}",
                 )
 
-        # 3. Confirmed allow — the user's explicit, confirmed choice beats
+        # 4. Confirmed allow — the user's explicit, confirmed choice beats
         # the matrix in every mode (SCR-235 R1). One carve-out (R12): a
         # browser window the classifier refined to a confirmation-required
         # context (banking/auth/payment page) keeps the matrix action —
@@ -595,9 +678,9 @@ class DefaultPolicyEvaluator:
                     reason=ReasonCode.POLICY_ALLOWED_APP,
                     evidence=metadata.bundle_id,
                 )
-            # fall through to step 5 (matrix decides for the refined context)
+            # fall through to step 6 (matrix decides for the refined context)
 
-        # 4. Legacy (unconfirmed) allow — the pre-SCR-235 matrix-strictness
+        # 5. Legacy (unconfirmed) allow — the pre-SCR-235 matrix-strictness
         # floor, preserved verbatim: entries from before Unit 7a (or written
         # outside the confirmation flow) must not silently re-enable raw
         # capture. Confirming via the UI/CLI is the upgrade path.
@@ -611,7 +694,7 @@ class DefaultPolicyEvaluator:
                 )
             if matrix_action in (PrivacyAction.MASK_WINDOW, PrivacyAction.TEXT_REDACT):
                 # The floor: allow_apps doesn't override these — fall through
-                # to step 5 so the user gets the matrix's action.
+                # to step 6 so the user gets the matrix's action.
                 pass
             else:
                 # Browser with refined context → let the matrix decide
@@ -621,7 +704,7 @@ class DefaultPolicyEvaluator:
                     == ContextClass.BROWSER_UNVERIFIED
                 )
                 if is_browser and context.context_class != ContextClass.BROWSER_UNVERIFIED:
-                    pass  # fall through to matrix (step 5)
+                    pass  # fall through to matrix (step 6)
                 else:
                     return ActionDecision(
                         action=PrivacyAction.ALLOW,
@@ -629,8 +712,21 @@ class DefaultPolicyEvaluator:
                         evidence=metadata.bundle_id,
                     )
 
-        # 5. Matrix default
-        action = get_matrix_action(context.context_class, mode)
+        # 6. Matrix default, floored by the user's blanket default (SCR-225).
+        # Reached only when no explicit rule decided, so `default_action` is
+        # exactly "what happens to apps I haven't ruled on". ALLOW is the
+        # identity floor, which keeps this branch byte-for-byte pre-SCR-225 for
+        # every config that never sets it.
+        matrix_action = get_matrix_action(context.context_class, mode)
+        action = stricter(self._config.default_action, matrix_action)
+        if action is not matrix_action:
+            # The floor bit — name it, so the audit record attributes the
+            # decision to the user's default rather than to the matrix.
+            return ActionDecision(
+                action=action,
+                reason=ReasonCode.POLICY_DEFAULT_FLOOR,
+                evidence=self._config.default_action.value,
+            )
         reason = _CONTEXT_REASON.get(
             context.context_class, ReasonCode.POLICY_MODE_DEFAULT
         )
