@@ -330,6 +330,11 @@ final class RecorderController: ObservableObject {
                 // starts unmuted and no stale in-flight flag survives.
                 muted = false
                 muteInFlight = false
+                // SCR-296: `finalizing` is deliberately NOT cleared here. An
+                // in-app Stop lands on `.idle` the moment its 60s wait gives up,
+                // which is the middle of a 1-5 minute drain — clearing it here
+                // would weld the surface back to the timeout (KTD1). Only
+                // `recording_finalized` or the U2 backstop closes it.
             }
             // SCR-264: re-run the post-update stale-daemon swap on the
             // recording→idle edge. A launch that landed while a daemon-owned
@@ -399,6 +404,20 @@ final class RecorderController: ObservableObject {
     /// affordance so the control never optimistically shows the target state.
     /// Cleared by the confirming event, by a verb failure, or on `.idle`.
     @Published private(set) var muteInFlight: Bool = false
+    /// SCR-296: true while a stopped recording is still draining its finalize
+    /// work (transcribe → scrub → index → export) under SCR-273's no-kill stop.
+    /// The single authority the menu-bar icon, the Days Today-card dot, and the
+    /// row indicator all read.
+    ///
+    /// ORTHOGONAL to the recording lifecycle, exactly like `muted` — and
+    /// deliberately NOT cleared by the `state.didSet` idle chokepoint. The
+    /// in-app Stop reaches `.idle` when its 60s wait gives up, which is the
+    /// middle of a 1-5 minute drain, so clearing it there would tie visibility
+    /// back to the timeout this exists to escape (KTD1).
+    ///
+    /// Opened by the stop response reporting a drain and closed by
+    /// `recording_finalized` — never by an elapsed budget (KTD2, R7, R8).
+    @Published private(set) var finalizing: Bool = false
     /// U7: the provisional recording name shown on the HUD title (the daemon
     /// session id / CLI name — the directory slug until post-stop auto-naming
     /// renames it; user rename is SCR-223). `nil` → the HUD shows "Recording".
@@ -1100,10 +1119,19 @@ final class RecorderController: ObservableObject {
         let outcome = await stopPolicy.runStop(
             quitting: quitting,
             timeout: nil,
-            sendStopSignal: { [daemonService, isDaemon] in
+            sendStopSignal: { [weak self, daemonService, isDaemon] in
                 if isDaemon {
-                    try await daemonService.stopRecording(force: false)
+                    // SCR-296: open the drain here, INSIDE the closure, before
+                    // the wait begins. `recording_finalized` can land while
+                    // `runStop` is still awaiting, so opening it after the call
+                    // returns would re-open a drain the event had just closed.
+                    if try await daemonService.stopRecording(force: false) {
+                        self?.beginFinalizing()
+                    }
                 } else {
+                    // CLI fallback dispatches detached and returns no final
+                    // state, so there is no drain edge to read here; the next
+                    // daemon probe picks it up instead (U2).
                     _ = try CLIClient.runDetached(["stop"])
                 }
             },
@@ -1181,6 +1209,23 @@ final class RecorderController: ObservableObject {
         }
     }
 
+    // MARK: - Finalize drain (SCR-296)
+
+    /// Open the post-stop finalize drain. Idempotent: a re-probe that observes
+    /// the same drain again must not re-arm anything (U2 hangs its backstop off
+    /// this seam), so a second open while one is running is a no-op.
+    private func beginFinalizing() {
+        guard !finalizing else { return }
+        finalizing = true
+    }
+
+    /// Close the drain. Idempotent for the mirror reason — the finalize event
+    /// and the U2 backstop race by design, and whichever lands second is inert.
+    private func endFinalizing() {
+        guard finalizing else { return }
+        finalizing = false
+    }
+
     // MARK: - Event / process callbacks
 
     private func handleRecorderEvent(_ event: RecorderEventLine) {
@@ -1247,6 +1292,10 @@ final class RecorderController: ObservableObject {
             case .stopPermissionWatchdog:
                 stopPermissionWatchdog()
             case .resolveAwaiting(.finalized, let success):
+                // SCR-296: the drain's closing edge (R8). The engine has exited
+                // — cleanly or force-killed, both of which publish this event —
+                // so the surface comes down on real completion, not a clock.
+                endFinalizing()
                 stopPolicy.resolveFinalized(success)
             case .resolveAwaiting(.stopped, let success):
                 stopPolicy.resolveStopped(success)
