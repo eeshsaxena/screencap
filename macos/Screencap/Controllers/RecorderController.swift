@@ -418,6 +418,21 @@ final class RecorderController: ObservableObject {
     /// Opened by the stop response reporting a drain and closed by
     /// `recording_finalized` — never by an elapsed budget (KTD2, R7, R8).
     @Published private(set) var finalizing: Bool = false
+    /// The daemon's own drain bound (`SCREENCAP_DAEMON_STOP_KILL_GRACE`,
+    /// `src/screencap/daemon/supervisor.py`). Mirrored here only so the
+    /// ordering below is test-pinnable; the daemon remains its owner.
+    static let daemonStopKillGrace: TimeInterval = 630
+    /// SCR-296 (KTD4): failure-only bound on the drain surface, for the case
+    /// where the closing event never arrives at all.
+    ///
+    /// MUST exceed `daemonStopKillGrace`. The daemon already hard-bounds the
+    /// drain by force-killing a hung engine, and that kill still publishes
+    /// `recording_finalized` — so the real closing edge always arrives by the
+    /// grace plus kill/exit/publish latency. A backstop at or under the grace
+    /// would fire FIRST and clear the surface while work was still running,
+    /// which is the layered-timeout failure recorded in
+    /// `docs/solutions/integration-issues/inner-timeout-unreachable-behind-outer-watchdog-2026-06-24.md`.
+    static let defaultFinalizingBackstop: TimeInterval = 690
     /// U7: the provisional recording name shown on the HUD title (the daemon
     /// session id / CLI name — the directory slug until post-stop auto-naming
     /// renames it; user rename is SCR-223). `nil` → the HUD shows "Recording".
@@ -493,6 +508,11 @@ final class RecorderController: ObservableObject {
 
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
+    /// SCR-296: how long the drain surface may stay up without a closing event.
+    /// Injectable so tests can exercise the backstop without a 690s wait.
+    private let finalizingBackstop: TimeInterval
+    /// The armed backstop, nil whenever no drain is open.
+    private var finalizingBackstopTask: Task<Void, Never>?
     private var daemonInstalledObserver: NSObjectProtocol?
 
     func bindIndex(_ index: RecordingsIndex) {
@@ -512,8 +532,10 @@ final class RecorderController: ObservableObject {
         windowLifecycle: WindowLifecycle = WindowLifecycleFactory.makeDefault(),
         inputMonitor: HUDInputMonitor = HUDInputMonitorFactory.makeDefault(),
         hintStore: HUDHintStore = HUDHintStore(),
-        micAuthorizer: MicAuthorizing = LiveMicAuthorizer()
+        micAuthorizer: MicAuthorizing = LiveMicAuthorizer(),
+        finalizingBackstop: TimeInterval = RecorderController.defaultFinalizingBackstop
     ) {
+        self.finalizingBackstop = finalizingBackstop
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
         self.cliService = cliService
@@ -928,8 +950,14 @@ final class RecorderController: ObservableObject {
             // action to take — the drain always ends on its own. `lastError` is
             // the terminal-failure channel: it renders red and is only ever
             // cleared by `enterStarting()`, so a notice written here would
-            // outlive the drain it describes. A user-visible "still finishing"
-            // surface needs its own auto-clearing channel (SCR-296).
+            // outlive the drain it describes.
+            //
+            // SCR-296: `finalizing` is that auto-clearing channel, and this is
+            // how a drain the app did not start reaches it (R3) — a CLI or
+            // ambient stop, or a relaunch into a drain already running (R12).
+            // `beginFinalizing()` is idempotent, so the repeated probes that
+            // reach this branch during one drain open it exactly once.
+            beginFinalizing()
             recorderLogger.info(
                 "Daemon session is finalizing; not attaching. name=\(recordingName ?? "unknown", privacy: .public)"
             )
@@ -1211,17 +1239,26 @@ final class RecorderController: ObservableObject {
 
     // MARK: - Finalize drain (SCR-296)
 
-    /// Open the post-stop finalize drain. Idempotent: a re-probe that observes
-    /// the same drain again must not re-arm anything (U2 hangs its backstop off
-    /// this seam), so a second open while one is running is a no-op.
+    /// Open the post-stop finalize drain and arm its failure backstop.
+    /// Idempotent: a re-probe that observes the same drain again must not re-arm
+    /// the backstop, so a second open while one is running is a no-op. A drain
+    /// that opens after a previous one closed does get a fresh backstop.
     private func beginFinalizing() {
         guard !finalizing else { return }
         finalizing = true
+        finalizingBackstopTask = Task { [weak self, backstop = finalizingBackstop] in
+            try? await Task.sleep(nanoseconds: UInt64(backstop * 1_000_000_000))
+            if Task.isCancelled { return }
+            self?.endFinalizing()
+        }
     }
 
-    /// Close the drain. Idempotent for the mirror reason — the finalize event
-    /// and the U2 backstop race by design, and whichever lands second is inert.
+    /// Close the drain and disarm the backstop. Idempotent for the mirror
+    /// reason — the finalize event and the backstop race by design, and
+    /// whichever lands second must be inert.
     private func endFinalizing() {
+        finalizingBackstopTask?.cancel()
+        finalizingBackstopTask = nil
         guard finalizing else { return }
         finalizing = false
     }
