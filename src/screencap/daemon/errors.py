@@ -68,6 +68,24 @@ STORE_ABSENT = "store_absent"
 # from "the store is stuck mounted, nothing was sealed" (detach failed).
 STORE_LOCK_FAILED = "store_lock_failed"
 
+# SCR-299 U1 (KTD2): typed failure vocabulary for ``recording.share``. The
+# surfaces render recovery copy keyed on these codes and NEVER on message text,
+# so each one has to name a different user action: sign in, upload first, or try
+# again. Before these existed every share failure collapsed into
+# ERROR_CODE_INTERNAL and a signed-out user got no actionable next step.
+#
+# NOT_SIGNED_IN is deliberately un-prefixed: it is a property of the caller's
+# credential, not of sharing, and any later verb needing the same refusal should
+# reuse it rather than mint a parallel code.
+NOT_SIGNED_IN = "not_signed_in"
+# There is nothing to share — the recording has no masked copy, locally or in
+# the cloud. Terminal, not retryable: the fix is to upload, not to wait.
+SHARE_UNAVAILABLE = "share_unavailable"
+# The share backend could not be reached or refused the call (cloud-function
+# failure, transport error). Retryable, and distinct from SHARE_UNAVAILABLE so
+# the surface never tells a user with nothing uploaded to "try again".
+SHARE_BACKEND_UNAVAILABLE = "share_backend_unavailable"
+
 # Codes returned by the daemon outside the typed-exception paths (route
 # handler `except Exception`, query-string parse failures). Keeping them
 # as named constants prevents drift between handlers and tests.
@@ -385,6 +403,45 @@ class RecordingActiveError(DaemonAPIError):
 
     error_code = RECORDING_ACTIVE
     http_status = 409
+
+
+class NotSignedInError(DaemonAPIError):
+    """The caller holds no usable cloud credential (SCR-299 U1).
+
+    Raised by ``recording.share`` when the auth layer reports no stored
+    credential. Maps to HTTP 403 so a client can distinguish "you are not
+    signed in" from a conflict or a backend outage — the app turns this into a
+    Sign-in action rather than a retry.
+    """
+
+    error_code = NOT_SIGNED_IN
+    http_status = 403
+
+
+class ShareUnavailableError(DaemonAPIError):
+    """The recording has no masked copy to share (SCR-299 U1).
+
+    Raised when share source resolution finds nothing locally and nothing in the
+    cloud. Maps to HTTP 409 (conflict with current state) rather than 404: the
+    recording exists, it just has no shareable copy yet. Terminal — the app
+    keeps the affordance unavailable so this is defense in depth.
+    """
+
+    error_code = SHARE_UNAVAILABLE
+    http_status = 409
+
+
+class ShareBackendUnavailableError(DaemonAPIError):
+    """The share backend failed or could not be reached (SCR-299 U1).
+
+    Covers a non-200 from the share cloud functions and transport failures
+    (connection reset, DNS, timeout). Maps to HTTP 503 so the retryable nature
+    is legible from the status alone, keeping it distinct from
+    :class:`ShareUnavailableError`, where retrying is useless.
+    """
+
+    error_code = SHARE_BACKEND_UNAVAILABLE
+    http_status = 503
 
 
 class StorageMigrationError(DaemonAPIError):
@@ -851,6 +908,9 @@ __all__ = [
     "STORE_LOCKED",
     "STORE_ABSENT",
     "STORE_LOCK_FAILED",
+    "NOT_SIGNED_IN",
+    "SHARE_UNAVAILABLE",
+    "SHARE_BACKEND_UNAVAILABLE",
     "ERROR_CODE_INTERNAL",
     "ERROR_CODE_INVALID_CURSOR",
     "EXCEPTION_TO_ERROR_CODE",
@@ -875,6 +935,9 @@ __all__ = [
     "NotRecordingError",
     "RecordingNotFoundError",
     "RecordingActiveError",
+    "NotSignedInError",
+    "ShareUnavailableError",
+    "ShareBackendUnavailableError",
     "SchemaMismatchError",
     "InvalidRequestError",
     "SlowConsumerError",

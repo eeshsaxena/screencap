@@ -34,6 +34,21 @@ class ShareError(RuntimeError):
     """A share could not be produced (no masked source, backend failure)."""
 
 
+class ShareSourceMissing(ShareError):
+    """There is nothing to share: the recording has no masked copy, locally or
+    in the cloud.
+
+    A distinct TYPE rather than a ShareError message variant so the daemon can
+    map it to its own error code structurally (SCR-299 KTD2). The surfaces key
+    their recovery copy on that code, and "you have nothing uploaded" is a
+    different instruction from "the backend is down, try again" — matching on
+    message text would let a reworded backend string silently swap the two.
+
+    Subclasses :class:`ShareError`, so existing callers that catch the base
+    class are unaffected; mappers must test this class FIRST.
+    """
+
+
 @dataclass(frozen=True)
 class SourceArtifact:
     """One masked artifact to include in a share.
@@ -88,11 +103,11 @@ def create_share_flow(
     """Produce a share link for ``recording_name``.
 
     Raises:
-        ShareError: the recording has no masked artifacts to share.
+        ShareSourceMissing: the recording has no masked artifacts to share.
     """
     artifacts = backend.masked_artifacts(recording_name)
     if not artifacts:
-        raise ShareError(f"no shareable (masked) artifacts for {recording_name!r}")
+        raise ShareSourceMissing(f"no shareable (masked) artifacts for {recording_name!r}")
 
     names = [a.name for a in artifacts]
     by_name = {a.name: a for a in artifacts}
