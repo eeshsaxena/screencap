@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import XCTest
 @testable import Screencap
@@ -44,15 +45,42 @@ final class ShellWindowLayoutTests: XCTestCase {
         XCTAssertGreaterThan(ShellWindowLayout.windowDefaultHeight, ShellWindowLayout.windowMinHeight)
     }
 
-    /// The playback pane's floor has to actually fit inside the window's floor,
-    /// otherwise the guard above is satisfied while the pane still forces
-    /// vertical overflow. Header + narrative + strip are budgeted generously.
-    func testPlaybackPaneFloorFitsTheMinimumWindowHeight() {
-        let dayChromeHeight: CGFloat = 320
+    /// The height twin of the invariant above (SCR-301).
+    ///
+    /// This replaced a flat 320pt "day chrome" budget, which passed while saying
+    /// nothing useful: 320pt covers the header and strip almost exactly, so the
+    /// assertion held no matter how tall the narrative grew — and a long
+    /// narrative is what pushed the header off the top of the page.
+    func testWindowMinimumHeightCoversTheDayPagesHardMinimum() {
         XCTAssertLessThanOrEqual(
-            ShellWindowLayout.playbackPaneMinHeight + dayChromeHeight,
+            ShellWindowLayout.minContentHeight,
             ShellWindowLayout.windowMinHeight,
-            "the playback pane's floor plus the day page chrome must fit at the minimum window height"
+            """
+            The day page needs \(ShellWindowLayout.minContentHeight)pt \
+            (\(ShellWindowLayout.dayHeaderMinHeight)pt header + \
+            \(ShellWindowLayout.playbackPaneMinHeight)pt pane floor + \
+            \(ShellWindowLayout.dayStripMinHeight)pt strip + \
+            \(ShellWindowLayout.dayNarrativeMinHeight)pt narrative) but the \
+            window's declared minimum is \(ShellWindowLayout.windowMinHeight)pt. \
+            At the floor the page's VStack overflows and the header — the only \
+            in-page way off the day — is drawn outside the window.
+            """
+        )
+    }
+
+    /// A page too short to hold the chrome must drop the narrative rather than
+    /// hand back a negative frame — SwiftUI complains at runtime about those,
+    /// and a negative cap would make the stack overflow again by exactly the
+    /// amount it went below zero.
+    func testNarrativeCapNeverGoesNegative() {
+        XCTAssertEqual(ShellWindowLayout.dayNarrativeMaxHeight(inPageHeight: 0), 0)
+        XCTAssertEqual(ShellWindowLayout.dayNarrativeMaxHeight(inPageHeight: 200), 0)
+        XCTAssertGreaterThanOrEqual(
+            ShellWindowLayout.dayNarrativeMaxHeight(
+                inPageHeight: ShellWindowLayout.windowMinHeight
+            ),
+            ShellWindowLayout.dayNarrativeMinHeight,
+            "a narrative should still be readable at the minimum window height"
         )
     }
 
@@ -272,5 +300,301 @@ final class ShellWindowLayoutTests: XCTestCase {
             as the date picker above.
             """
         )
+    }
+
+    // MARK: - Measured day-page section heights (SCR-301)
+
+    /// The detail column at the window's minimum width — the narrowest the day
+    /// page ever lays out in, so the tallest its sections ever wrap to.
+    private static let detailWidth: CGFloat =
+        ShellWindowLayout.windowMinWidth - ShellWindowLayout.sidebarWidth
+
+    /// The day whose header is tallest. The header's date label renders
+    /// "EEEE, d MMMM" in a fixed en_US locale, and at the minimum detail width a
+    /// long one wraps to a second line — 70pt against 63pt for a short date. A
+    /// fixture built from `Date()` would therefore measure a different header
+    /// depending on the day the suite runs, and pass on a short date while the
+    /// budget was short for most of the year. 30 September 2026 is a Wednesday:
+    /// the longest weekday with the longest month name.
+    private static let tallestHeaderDate: Date = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US")
+        return calendar.date(from: DateComponents(year: 2026, month: 9, day: 30))!
+    }()
+
+    private static func dayPage() -> DayTimelineView {
+        DayTimelineView(date: tallestHeaderDate, onBack: {})
+    }
+
+    /// The height budgets are estimates of what AppKit draws, exactly like the
+    /// two control widths above, and they carry the same consequence: budget the
+    /// header or strip short and the narrative's cap hands out height the page
+    /// does not have, the stack overflows, and the header goes off the top with
+    /// no test failing.
+    ///
+    /// Measured at the **minimum** detail width, which is where these sections
+    /// are tallest — the strip's legend wraps to a second row below roughly
+    /// 1100pt and gains 13pt. And measured from the frame SwiftUI resolves, not
+    /// from `NSView.fittingSize`: fitting size reports the wrapped-away 151pt
+    /// even at a width where the page really lays the strip out at 164pt, which
+    /// is precisely the 13pt of overflow this guard exists to catch.
+    @MainActor
+    func testMeasuredDayPageSectionHeightsAreWithinBudget() {
+        let view = Self.dayPage()
+
+        let headerHeight = Self.laidOutHeight(of: view.header, named: "header")
+        XCTAssertLessThanOrEqual(
+            headerHeight,
+            ShellWindowLayout.dayHeaderMinHeight,
+            """
+            The day header lays out at \(headerHeight)pt against a budgeted \
+            \(ShellWindowLayout.dayHeaderMinHeight)pt. Raise \
+            dayHeaderMinHeight to the measured value and re-check \
+            windowMinHeight.
+            """
+        )
+
+        let stripHeight = Self.laidOutHeight(of: view.strip, named: "strip")
+        XCTAssertLessThanOrEqual(
+            stripHeight,
+            ShellWindowLayout.dayStripMinHeight,
+            """
+            The day strip lays out at \(stripHeight)pt against a budgeted \
+            \(ShellWindowLayout.dayStripMinHeight)pt — same consequence as the \
+            header above.
+            """
+        )
+    }
+
+    /// The height a section resolves to at the narrowest detail column.
+    @MainActor
+    private static func laidOutHeight(of section: some View, named name: String) -> CGFloat {
+        let sink = SectionFrames()
+        let hosted = ViewHost.host(
+            section
+                .reportingFrame(as: name, to: sink)
+                .coordinateSpace(name: SectionFrames.pageSpace)
+                .frame(width: detailWidth),
+            size: CGSize(width: detailWidth, height: 600)
+        )
+        return withExtendedLifetime(hosted) { sink.frames[name]?.height ?? .infinity }
+    }
+
+    /// A day with no narrative must not pay for one — no blank band on every
+    /// mechanical day.
+    ///
+    /// Measured inside `DayPageLayout`, like every other height assertion below,
+    /// because the cap only behaves as designed in a real stack. Hosted on its
+    /// own, a `.frame(maxHeight:)` fills whatever its parent proposes and
+    /// reports the full cap even for an empty section; inside the page the
+    /// VStack sizes it against its siblings and it takes only what it needs.
+    /// Measuring the section alone answers a question the layout never asks.
+    @MainActor
+    func testAbsentNarrativeTakesNoHeightInThePage() {
+        let view = Self.dayPage()
+        let frames = Self.hostDayPage(
+            view,
+            narrative: view.narrativeSection,
+            pageHeight: ShellWindowLayout.windowDefaultHeight
+        )
+
+        XCTAssertNil(
+            frames["narrative"],
+            "a day with no narrative should show no narrative slot"
+        )
+    }
+
+    /// The other half of the cap: a short narrative keeps its natural height
+    /// rather than stretching to fill the space the page could spare. This is
+    /// what `ViewThatFits` buys — a bare `ScrollView` would take the whole cap
+    /// and render a one-line summary as a card ten lines tall.
+    @MainActor
+    func testShortNarrativeKeepsItsNaturalHeightInThePage() {
+        let view = Self.dayPage()
+        let pageHeight: CGFloat = 900
+        let cap = ShellWindowLayout.dayNarrativeMaxHeight(inPageHeight: pageHeight)
+        let frames = Self.hostDayPage(
+            view,
+            narrative: view.narrativeCard("A quiet morning of reading."),
+            pageHeight: pageHeight
+        )
+
+        guard let narrative = frames["narrative"] else {
+            return XCTFail("the short narrative was not drawn at all")
+        }
+        XCTAssertLessThan(
+            narrative.height, cap,
+            """
+            A one-line narrative laid out at \(narrative.height)pt against a \
+            \(cap)pt cap — it is stretching to fill the slot instead of taking \
+            its natural height.
+            """
+        )
+    }
+
+    /// The reported failure, end to end (SCR-301).
+    ///
+    /// The day page at the minimum window height with a narrative far longer
+    /// than the page can hold. Before the cap, the VStack overflowed
+    /// symmetrically and the header's date picker was drawn 60pt **above** the
+    /// top of the page — the whole header row gone, and with it every way to
+    /// leave the day.
+    ///
+    /// Both page edges are checked, because the cap can fail at either one. The
+    /// original layout pushed the header off the top (caught by the first
+    /// assertion); drop the cap while keeping the top anchor and the overflow
+    /// simply moves to the bottom and takes the strip with it instead — visible
+    /// only to the second. The top anchor itself has no failing case here by
+    /// design: while the cap holds there is nothing to overflow, so it is
+    /// insurance against a term exceeding its budget at runtime, not a term in
+    /// the arithmetic.
+    ///
+    /// The third page height is not a window size — it is the window floor minus
+    /// the ~147pt first-run privacy banner, which `MainWindow.shellContent`
+    /// stacks above the two-column row. That page is shorter than the day
+    /// chrome, so the cap goes to zero and the narrative has to be dropped
+    /// outright: a `.frame(maxHeight: 0)` would still draw the card's 44pt of
+    /// chrome centred on the empty slot, straight over the header.
+    @MainActor
+    func testTheWholeDayPageStaysOnThePageWhenTheNarrativeIsLong() {
+        let view = Self.dayPage()
+        let narrative = String(
+            repeating: "Worked through the migration backlog and reviewed the pipeline changes. ",
+            count: 40
+        )
+
+        for pageHeight in [
+            ShellWindowLayout.windowMinHeight,
+            ShellWindowLayout.windowDefaultHeight,
+            ShellWindowLayout.windowMinHeight - Self.firstRunBannerHeight,
+        ] {
+            let frames = Self.hostDayPage(
+                view,
+                narrative: view.narrativeCard(narrative),
+                pageHeight: pageHeight
+            )
+
+            guard let header = frames["header"], let strip = frames["strip"] else {
+                return XCTFail("the page reported no section frames at \(pageHeight)pt")
+            }
+
+            XCTAssertGreaterThanOrEqual(
+                header.minY, 0,
+                """
+                At a \(pageHeight)pt page the header is drawn at y=\
+                \(header.minY) — above the top of the page, so the Back button \
+                and date navigator are not on screen at all. The day page's \
+                vertical terms no longer fit; check the narrative cap and the \
+                measured section heights.
+                """
+            )
+            // On a page that cannot seat a readable narrative the section is
+            // dropped, so there is no strip position to assert — only that the
+            // header survived, which the assertion above already covers.
+            let cap = ShellWindowLayout.dayNarrativeMaxHeight(inPageHeight: pageHeight)
+            guard cap >= ShellWindowLayout.dayNarrativeMinHeight else {
+                XCTAssertNil(
+                    frames["narrative"],
+                    """
+                    At a \(pageHeight)pt page there is only \(cap)pt for the \
+                    narrative, but it was still drawn at \
+                    \(String(describing: frames["narrative"])). A capped card \
+                    does not shrink past its own chrome — it renders over the \
+                    header. Drop the section instead.
+                    """
+                )
+                continue
+            }
+
+            XCTAssertLessThanOrEqual(
+                strip.maxY, pageHeight,
+                """
+                At a \(pageHeight)pt page the strip ends at y=\(strip.maxY) — \
+                below the page. The stack is overflowing; the narrative cap is \
+                the term that keeps it inside.
+                """
+            )
+        }
+    }
+
+    /// `FirstRunPrivacyBanner`'s height including the gutter `MainWindow` gives
+    /// it — the amount the day page loses while the banner is up.
+    @MainActor
+    private static var firstRunBannerHeight: CGFloat {
+        laidOutHeight(
+            of: FirstRunPrivacyBanner(onReview: {}, onDismiss: {})
+                .padding(.horizontal, 16)
+                .padding(.top, 12),
+            named: "banner"
+        )
+    }
+
+    /// Lay the day page out at `pageHeight` and return where its sections landed.
+    ///
+    /// The playback pane is stood in for rather than built: its whole
+    /// contribution to the page's height is its floor plus its willingness to
+    /// grow, and an `AVPlayer` in a unit test is neither needed nor welcome.
+    /// Header, narrative and strip are the real views.
+    @MainActor
+    private static func hostDayPage(
+        _ view: DayTimelineView,
+        narrative: some View,
+        pageHeight: CGFloat
+    ) -> [String: CGRect] {
+        let sections = SectionFrames()
+        let page = DayPageLayout {
+            view.header.reportingFrame(as: "header", to: sections)
+        } narrative: {
+            narrative.reportingFrame(as: "narrative", to: sections)
+        } pane: {
+            Color.clear.frame(
+                maxWidth: .infinity,
+                minHeight: ShellWindowLayout.playbackPaneMinHeight,
+                maxHeight: .infinity
+            )
+        } strip: {
+            view.strip.reportingFrame(as: "strip", to: sections)
+        }
+        .coordinateSpace(name: SectionFrames.pageSpace)
+        .frame(width: detailWidth, height: pageHeight)
+
+        let hosted = ViewHost.host(
+            page, size: CGSize(width: detailWidth, height: pageHeight)
+        )
+        return withExtendedLifetime(hosted) { sections.frames }
+    }
+}
+
+// MARK: - Section geometry
+
+/// Collects sections' frames in the day page's own coordinate space.
+///
+/// The page is almost entirely SwiftUI, which draws no discrete `NSView`s to
+/// measure, so the geometry is read where SwiftUI resolves it rather than
+/// inferred from whatever AppKit controls happen to be in the tree — those
+/// report their own intrinsic size, not the slot they were given.
+private final class SectionFrames {
+    static let pageSpace = "day-page"
+    var frames: [String: CGRect] = [:]
+}
+
+private struct SectionFrameKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { _, latest in latest }
+    }
+}
+
+private extension View {
+    func reportingFrame(as name: String, to sink: SectionFrames) -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: SectionFrameKey.self,
+                    value: [name: geo.frame(in: .named(SectionFrames.pageSpace))]
+                )
+            }
+        )
+        .onPreferenceChange(SectionFrameKey.self) { sink.frames.merge($0) { _, latest in latest } }
     }
 }

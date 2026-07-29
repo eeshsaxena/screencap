@@ -116,13 +116,20 @@ struct DayTimelineView: View {
     private var currentDate: Date { displayedDate ?? date }
 
     var body: some View {
-        VStack(spacing: 0) {
+        // SCR-301 — the four sections go through `DayPageLayout`, which caps the
+        // narrative at the height the other three leave and pins the stack to the
+        // top. As a plain VStack this overflowed at small window heights and took
+        // the whole header off the top of the page with it.
+        DayPageLayout {
             header
+        } narrative: {
             // U8 (F1/R8/R9) — the day opens with its written narrative, BELOW the
             // header chrome. Evidence-bound: absent on a mechanical/thin day, a
             // distinct "still composing" note while the live day is being written.
             narrativeSection
+        } pane: {
             playbackPane
+        } strip: {
             strip
         }
         .background(Color.scPaper)
@@ -312,7 +319,11 @@ struct DayTimelineView: View {
 
     // MARK: - Header
 
-    private var header: some View {
+    /// Not private: `ShellWindowLayoutTests` hosts this row and measures it
+    /// against `ShellWindowLayout.dayHeaderMinHeight`. The page's height
+    /// arithmetic is only true while the budget matches what AppKit actually
+    /// draws, so it is measured rather than assumed (SCR-301).
+    var header: some View {
         HStack(spacing: 16) {
             Button(action: onBack) {
                 Text("← Back")
@@ -339,8 +350,12 @@ struct DayTimelineView: View {
     /// The written day narrative, or its honest states. Rendered only on the
     /// opened day while the store is mounted; a locked/absent store defers to the
     /// strip's own "can't verify" honesty, never a stale narrative.
+    ///
+    /// Not private, for the same reason as `header` — `ShellWindowLayoutTests`
+    /// hosts it to prove that a day with no narrative takes no height under
+    /// `DayPageLayout`'s cap.
     @ViewBuilder
-    private var narrativeSection: some View {
+    var narrativeSection: some View {
         if storeMounted {
             switch narrativeState {
             case .narrative(let text):
@@ -355,22 +370,46 @@ struct DayTimelineView: View {
 
     /// The narrative prose card (R8) — the day's written summary, composed from
     /// block evidence (partial on a mixed day, KTD-10).
-    private func narrativeCard(_ text: String) -> some View {
+    ///
+    /// SCR-301: the prose scrolls once it outgrows the height `DayPageLayout`
+    /// allows it, so a long day cannot push the header off the page. It is
+    /// `ViewThatFits` rather than a bare `ScrollView` because a `ScrollView`
+    /// greedily fills whatever it is offered — a one-line narrative would then
+    /// render as a card the full height of the cap. This keeps a short narrative
+    /// at its natural height and only reaches for the scrolling copy when the
+    /// text genuinely does not fit. Nothing is ever truncated either way.
+    ///
+    /// Not private, for the same reason as `header` — `ShellWindowLayoutTests`
+    /// hosts it to prove a short narrative keeps its natural height under the
+    /// cap rather than ballooning to fill it.
+    func narrativeCard(_ text: String) -> some View {
+        ViewThatFits(in: .vertical) {
+            narrativeProse(text)
+            ScrollView(.vertical) { narrativeProse(text) }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
+        .overlay(
+            RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
+                .strokeBorder(Color.scBorderWarm, lineWidth: 1)
+        )
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+        // Combine before labelling: the label used to sit on a `Text` leaf, but
+        // `ViewThatFits` hands the long-narrative days a `ScrollView`, and a
+        // label on a container with children of its own is not reliably read.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Day summary. \(text)")
+    }
+
+    /// The prose itself, shared by the card's fitted and scrolling forms.
+    private func narrativeProse(_ text: String) -> some View {
         Text(text)
             .font(SCTypography.sans(size: 13.5))
             .foregroundStyle(Color.scInk)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .background(Color.scSurface, in: RoundedRectangle(cornerRadius: SCMetrics.radiusMd))
-            .overlay(
-                RoundedRectangle(cornerRadius: SCMetrics.radiusMd)
-                    .strokeBorder(Color.scBorderWarm, lineWidth: 1)
-            )
-            .padding(.horizontal, 24)
-            .padding(.top, 16)
-            .accessibilityLabel("Day summary. \(text)")
     }
 
     /// The DISTINCT "still composing" state (R10): real blocks exist but the
@@ -1155,7 +1194,9 @@ struct DayTimelineView: View {
 
     // MARK: - Strip
 
-    private var strip: some View {
+    /// Not private, for the same reason as `header` — measured against
+    /// `ShellWindowLayout.dayStripMinHeight`.
+    var strip: some View {
         VStack(alignment: .leading, spacing: 0) {
             DayStripView(
                 bounds: axisBounds,
