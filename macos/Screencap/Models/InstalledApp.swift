@@ -24,6 +24,11 @@ struct InstalledApp: Decodable, Identifiable, Hashable {
     let resolvedAction: String
     let inExcludeApps: Bool
     let inAllowApps: Bool
+    let inMaskApps: Bool
+    /// Which layer decided `resolvedAction`: `user_rule`, `default_floor`, or
+    /// `matrix` (schema v4). Drives the row note so "masked by you" reads
+    /// differently from the matrix's own mask.
+    let actionSource: String
     let allowConfirmed: Bool
     let confirmationRequired: Bool
     let isMatrixExclude: Bool
@@ -41,6 +46,8 @@ struct InstalledApp: Decodable, Identifiable, Hashable {
         case resolvedAction = "resolved_action"
         case inExcludeApps = "in_exclude_apps"
         case inAllowApps = "in_allow_apps"
+        case inMaskApps = "in_mask_apps"
+        case actionSource = "action_source"
         case allowConfirmed = "allow_confirmed"
         case confirmationRequired = "confirmation_required"
         case isMatrixExclude = "is_matrix_exclude"
@@ -68,6 +75,13 @@ extension InstalledApp {
         allowConfirmed = try c.decodeIfPresent(Bool.self, forKey: .allowConfirmed) ?? false
         confirmationRequired = try c.decodeIfPresent(Bool.self, forKey: .confirmationRequired)
             ?? isMatrixExclude
+        // Schema v4 fields (SCR-225) — same lenient contract: a stale daemon
+        // serving v3 degrades to today's rendering (no user mask rules, every
+        // decision attributed to the matrix) instead of failing the whole
+        // `apps` array decode.
+        inMaskApps = try c.decodeIfPresent(Bool.self, forKey: .inMaskApps) ?? false
+        actionSource = try c.decodeIfPresent(String.self, forKey: .actionSource)
+            ?? "matrix"
     }
 }
 
@@ -77,11 +91,17 @@ struct AppsEnvelope: Decodable {
     let schemaVersion: Int
     let apps: [InstalledApp]
     let error: String?
+    /// The configured blanket default for apps with no explicit rule (schema
+    /// v4, SCR-225). Optional so a stale daemon serving v3 still decodes; the
+    /// banner falls back to `allow`, which is the identity floor and therefore
+    /// an honest reading of a daemon that has no such setting.
+    let defaultAction: String?
 
     enum CodingKeys: String, CodingKey {
         case ok
         case schemaVersion = "schema_version"
         case apps
         case error
+        case defaultAction = "default_action"
     }
 }

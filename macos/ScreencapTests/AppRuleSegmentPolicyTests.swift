@@ -15,7 +15,9 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         inAllowApps: Bool = false,
         isMatrixExclude: Bool = false,
         allowConfirmed: Bool? = nil,
-        confirmationRequired: Bool? = nil
+        confirmationRequired: Bool? = nil,
+        inMaskApps: Bool? = nil,
+        actionSource: String? = nil
     ) -> InstalledApp {
         var json: [String: Any] = [
             "bundle_id": bundleId,
@@ -32,6 +34,8 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         ]
         if let allowConfirmed { json["allow_confirmed"] = allowConfirmed }
         if let confirmationRequired { json["confirmation_required"] = confirmationRequired }
+        if let inMaskApps { json["in_mask_apps"] = inMaskApps }
+        if let actionSource { json["action_source"] = actionSource }
         let data = try! JSONSerialization.data(withJSONObject: json)
         return try! JSONDecoder().decode(InstalledApp.self, from: data)
     }
@@ -113,9 +117,10 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         XCTAssertNil(AppRuleSegmentPolicy.transition(for: excluded, tapping: .block), "already blocked")
     }
 
-    /// Matrix-masked (chat under internal): Mask selected-but-locked (the
-    /// per-app Mask override is SCR-225 — the segment itself never accepts
-    /// interaction), Record overrides via allow_apps, Block via exclude_apps.
+    /// Matrix-masked (chat under internal): Mask selected. Tapping Mask is a
+    /// no-op because it is already the selection — pinning an implicit mask
+    /// would change nothing. Record overrides via allow_apps, Block via
+    /// exclude_apps.
     func testMatrixMaskedRow() {
         let masked = app(contextClass: "chat", resolvedAction: "mask_window")
         let policy = AppRuleSegmentPolicy.derive(for: masked)
@@ -147,7 +152,10 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
         XCTAssertEqual(policy.selection, .record)
         XCTAssertEqual(policy.note, "recorded", "unknown class must not render '· unknown'")
         XCTAssertEqual(AppRuleSegmentPolicy.transition(for: unknown, tapping: .block), .excludeAdd)
-        XCTAssertNil(AppRuleSegmentPolicy.transition(for: unknown, tapping: .mask))
+        // Since SCR-225 Mask writes the per-app rule here rather than being a
+        // dead segment — an allow-resolved row is exactly where masking has an
+        // effect to add.
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: unknown, tapping: .mask), .maskAdd)
     }
 
     /// An unknown future `resolved_action` renders as recorded rather than
@@ -233,5 +241,128 @@ final class AppRuleSegmentPolicyTests: XCTestCase {
             )).note,
             "text redacted while recording · video calls"
         )
+    }
+
+    // MARK: - SCR-225: per-app Mask rule and the default floor
+
+    /// A user-set Mask rule selects Mask with its own note, distinct from the
+    /// matrix's mask so the row says who decided.
+    func testUserMaskRuleRow() {
+        let masked = app(
+            contextClass: "code_editor_terminal", resolvedAction: "mask_window",
+            inMaskApps: true, actionSource: "user_rule"
+        )
+        let policy = AppRuleSegmentPolicy.derive(for: masked)
+        XCTAssertEqual(policy.selection, .mask)
+        XCTAssertTrue(policy.isUserRule)
+        XCTAssertTrue(policy.recordEnabled)
+        XCTAssertTrue(policy.blockEnabled)
+        XCTAssertFalse(policy.maskEnabled, "already masked")
+        XCTAssertEqual(policy.note, "window masked · masked by you")
+        XCTAssertNil(
+            AppRuleSegmentPolicy.transition(for: masked, tapping: .mask),
+            "already masked"
+        )
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: masked, tapping: .record), .allowAdd)
+        XCTAssertEqual(AppRuleSegmentPolicy.transition(for: masked, tapping: .block), .excludeAdd)
+    }
+
+    /// A Mask rule cannot loosen an EXCLUDE-class app, so the row must keep
+    /// reading Block. Rendering Mask here would claim a weaker protection than
+    /// the recorder applies, and the segment stays disabled because tapping it
+    /// could not change the outcome.
+    func testMaskRuleOnAnExcludedClassStillReadsBlocked() {
+        let pm = app(
+            contextClass: "password_manager", resolvedAction: "exclude",
+            isMatrixExclude: true,
+            allowConfirmed: false, confirmationRequired: true,
+            inMaskApps: true
+        )
+        let policy = AppRuleSegmentPolicy.derive(for: pm)
+        XCTAssertEqual(policy.selection, .block)
+        XCTAssertFalse(policy.maskEnabled)
+        XCTAssertNil(AppRuleSegmentPolicy.transition(for: pm, tapping: .mask))
+    }
+
+    /// Tapping Mask on an allow-resolved row writes the per-app rule. This is
+    /// the capability the segment gained; it needs no confirmation because a
+    /// Mask rule is tightening-only.
+    func testTappingMaskOnARecordedRowWritesTheRule() {
+        let recorded = app(resolvedAction: "allow")
+        XCTAssertEqual(
+            AppRuleSegmentPolicy.transition(for: recorded, tapping: .mask), .maskAdd
+        )
+    }
+
+    /// An explicit deny outranks a Mask rule, so the row still reads as blocked
+    /// and attributes the block to the user.
+    func testDenyOutranksAMaskRule() {
+        let both = app(
+            resolvedAction: "exclude", inExcludeApps: true, inMaskApps: true
+        )
+        let policy = AppRuleSegmentPolicy.derive(for: both)
+        XCTAssertEqual(policy.selection, .block)
+        XCTAssertEqual(policy.note, "blocked by you")
+        XCTAssertFalse(policy.maskEnabled)
+    }
+
+    /// Mask is offered on an ordinary recorded row — the capability the segment
+    /// gained. Paired with the disabled cases above, this pins both directions.
+    func testMaskIsOfferedOnARecordedRow() {
+        let recorded = app(resolvedAction: "allow")
+        XCTAssertTrue(AppRuleSegmentPolicy.derive(for: recorded).maskEnabled)
+    }
+
+    /// A confirmed allow outranks a Mask rule — it is the one rule the user
+    /// confirmed individually.
+    func testConfirmedAllowOutranksAMaskRule() {
+        let both = app(
+            resolvedAction: "allow", inAllowApps: true,
+            allowConfirmed: true, confirmationRequired: false,
+            inMaskApps: true
+        )
+        XCTAssertEqual(AppRuleSegmentPolicy.derive(for: both).selection, .record)
+    }
+
+    /// A row the blanket default tightened names the default, not the class —
+    /// otherwise "blocked by default · unknown" reads as an app property.
+    func testDefaultFloorRowNamesTheDefault() {
+        let blocked = app(resolvedAction: "exclude", actionSource: "default_floor")
+        let policy = AppRuleSegmentPolicy.derive(for: blocked)
+        XCTAssertEqual(policy.selection, .block)
+        XCTAssertFalse(policy.isUserRule)
+        XCTAssertEqual(policy.note, "blocked by your default for new apps")
+
+        let maskedByDefault = app(
+            resolvedAction: "mask_window", actionSource: "default_floor"
+        )
+        XCTAssertEqual(
+            AppRuleSegmentPolicy.derive(for: maskedByDefault).note,
+            "window masked by your default for new apps"
+        )
+    }
+
+    /// Stale-daemon skew: a schema-v3 payload has neither new key. It must
+    /// decode and render exactly as it does today rather than failing the whole
+    /// apps array.
+    func testSchemaV3PayloadStillDecodesAndRenders() {
+        let legacy = app(contextClass: "chat", resolvedAction: "mask_window")
+        XCTAssertFalse(legacy.inMaskApps)
+        XCTAssertEqual(legacy.actionSource, "matrix")
+        let policy = AppRuleSegmentPolicy.derive(for: legacy)
+        XCTAssertEqual(policy.selection, .mask)
+        XCTAssertEqual(policy.note, "window masked while recording · chat")
+        XCTAssertFalse(policy.isUserRule)
+    }
+
+    /// The envelope's default_action is optional for the same skew reason, and
+    /// absence reads as the identity floor.
+    func testEnvelopeWithoutDefaultActionDecodes() throws {
+        let json: [String: Any] = [
+            "ok": true, "schema_version": 3, "apps": [], "error": NSNull(),
+        ]
+        let data = try JSONSerialization.data(withJSONObject: json)
+        let envelope = try JSONDecoder().decode(AppsEnvelope.self, from: data)
+        XCTAssertNil(envelope.defaultAction)
     }
 }
