@@ -316,3 +316,99 @@ class TestSpotlightFlag:
         ) as m:
             runner.invoke(cli, ["apps", "--json", "--include-spotlight"], catch_exceptions=False)
             m.assert_called_once_with(use_spotlight=True)
+
+
+class TestMaskAndDefaultActionFields:
+    """SCR-225 schema v4: in_mask_apps, action_source, envelope default_action."""
+
+    def _write_privacy(self, body: str) -> None:
+        import screencap.config
+        from screencap.config import _CONFIG_PATH
+        _CONFIG_PATH.write_text(body)
+        screencap.config._config_cache = None
+
+    def test_schema_v4_fields_present(self):
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        assert payload["schema_version"] >= 4
+        assert payload["default_action"] == "allow"
+        for app in payload["apps"]:
+            assert "in_mask_apps" in app
+            assert "action_source" in app
+
+    def test_mask_rule_row_reports_user_rule(self):
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\nmask_apps = ["com.microsoft.VSCode"]\n'
+        )
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.microsoft.VSCode")
+        assert row["in_mask_apps"] is True
+        assert row["resolved_action"] == "mask_window"
+        assert row["action_source"] == "user_rule"
+
+    def test_mask_apps_membership_is_case_insensitive(self):
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\nmask_apps = ["COM.MICROSOFT.VSCODE"]\n'
+        )
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.microsoft.VSCode")
+        assert row["in_mask_apps"] is True
+
+    def test_exclude_rule_row_reports_user_rule(self):
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\nexclude_apps = ["com.microsoft.VSCode"]\n'
+        )
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.microsoft.VSCode")
+        assert row["action_source"] == "user_rule"
+
+    def test_matrix_driven_exclude_is_not_reported_as_a_user_rule(self):
+        """The load-bearing disambiguation: a legacy allow whose matrix action
+        is EXCLUDE returns the same reason code as a real exclude_apps entry.
+        Attributing it to the user would render "blocked by you" on a row the
+        matrix protected, misattributing the protection."""
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\n'
+            'allow_apps = ["com.1password.1password"]\n'
+        )
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.1password.1password")
+        assert row["resolved_action"] == "exclude"
+        assert row["in_exclude_apps"] is False
+        assert row["action_source"] == "matrix"
+
+    def test_unruled_row_reports_matrix(self):
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.tinyspeck.slackmacgap")
+        assert row["action_source"] == "matrix"
+
+    def test_tightened_default_reports_default_floor(self):
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\ndefault_action = "exclude"\n'
+        )
+        payload = json.loads(_invoke_apps_json().stdout.strip())
+        assert payload["default_action"] == "exclude"
+        row = _by_bundle(payload, "com.microsoft.VSCode")
+        assert row["resolved_action"] == "exclude"
+        assert row["action_source"] == "default_floor"
+
+    def test_confirmed_allow_escapes_the_floor_and_reports_user_rule(self):
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\ndefault_action = "exclude"\n'
+            'allow_apps = ["com.microsoft.VSCode"]\n'
+            'confirmed_allow_apps = ["com.microsoft.VSCode"]\n'
+        )
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.microsoft.VSCode")
+        assert row["resolved_action"] == "allow"
+        assert row["action_source"] == "user_rule"
+
+    def test_allow_default_leaves_every_row_unchanged(self):
+        """The identity-floor regression gate at the payload layer."""
+        baseline = json.loads(_invoke_apps_json().stdout.strip())
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\ndefault_action = "allow"\n'
+        )
+        after = json.loads(_invoke_apps_json().stdout.strip())
+        for before_row, after_row in zip(baseline["apps"], after["apps"]):
+            assert before_row["resolved_action"] == after_row["resolved_action"]
+            assert before_row["action_source"] == after_row["action_source"]
