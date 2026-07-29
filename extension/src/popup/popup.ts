@@ -5,7 +5,7 @@
  */
 
 import type { AuthRequest, AuthResponse } from "../background/service-worker.js";
-import { popupView } from "./view.js";
+import { popupView, unreachableView, type PopupView } from "./view.js";
 
 function el<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -17,38 +17,46 @@ async function send(request: AuthRequest): Promise<AuthResponse> {
   return chrome.runtime.sendMessage<AuthRequest, AuthResponse>(request);
 }
 
-function render(response: AuthResponse): void {
-  const view = response.ok
+function asError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function fromResponse(response: AuthResponse): PopupView {
+  return response.ok
     ? popupView(response.who)
     : popupView({ signedIn: false }, response.error);
+}
 
-  el("signed-in").hidden = !view.showSignedIn;
-  el("signed-out").hidden = view.showSignedIn;
+function render(view: PopupView): void {
+  const signedIn = view.status === "signed-in" || view.status === "stale";
+
+  el("signed-in").hidden = !signedIn;
+  el("signed-out").hidden = view.status !== "signed-out";
+  el("unknown").hidden = view.status !== "unknown";
   el("account").textContent = view.accountLabel ?? "";
+
+  const staleNote = el("stale-note");
+  staleNote.hidden = view.status !== "stale";
 
   const error = el("error");
   error.textContent = view.error ?? "";
   error.hidden = view.error === null;
 }
 
-function asError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /**
  * Disables the button for the duration so a double-click cannot start two
  * interactive sign-in flows.
  *
- * Catches transport failures too — if the service worker is gone the
- * `sendMessage` promise rejects rather than returning `{ ok: false }`, and an
- * uncaught rejection would leave the popup showing no error at all.
+ * A transport failure renders as `unknown`, not signed-out — if the service
+ * worker is unreachable the popup does not know the auth state, and showing a
+ * sign-in call to action would be a guess.
  */
 async function run(button: HTMLButtonElement, request: AuthRequest): Promise<void> {
   button.disabled = true;
   try {
-    render(await send(request));
+    render(fromResponse(await send(request)));
   } catch (error) {
-    render({ ok: false, error: asError(error) });
+    render(unreachableView(asError(error)));
   } finally {
     button.disabled = false;
   }
@@ -56,10 +64,12 @@ async function run(button: HTMLButtonElement, request: AuthRequest): Promise<voi
 
 const signIn = el<HTMLButtonElement>("sign-in");
 const signOut = el<HTMLButtonElement>("sign-out");
+const retry = el<HTMLButtonElement>("retry");
 
 signIn.addEventListener("click", () => void run(signIn, { type: "auth.signIn" }));
 signOut.addEventListener("click", () => void run(signOut, { type: "auth.signOut" }));
+retry.addEventListener("click", () => void run(retry, { type: "auth.whoami" }));
 
 void send({ type: "auth.whoami" })
-  .then(render)
-  .catch((error: unknown) => render({ ok: false, error: asError(error) }));
+  .then((response) => render(fromResponse(response)))
+  .catch((error: unknown) => render(unreachableView(asError(error))));

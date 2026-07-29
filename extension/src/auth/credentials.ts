@@ -1,13 +1,21 @@
 /**
- * Provisioned credentials, mirroring the `_provisioned` pattern in
- * `src/screencap/auth.py`: values are injected at build time, never hardcoded
- * per developer, and an un-provisioned build resolves to a placeholder that
- * `isPlaceholderCredential` recognizes so a release guard can reject it.
+ * Provisioned credentials, following the `_provisioned` pattern in
+ * `src/screencap/auth.py`: values are meant to be injected at build time rather
+ * than hardcoded per developer, and an un-provisioned build resolves to a
+ * placeholder that `isPlaceholderCredential` recognizes.
  *
- * Unlike the CLI's Google **Desktop** OAuth client, the extension uses a
- * **Web** client through `chrome.identity.launchWebAuthFlow` requesting an
- * OIDC `id_token` directly. That flow has no token-endpoint call, so no client
- * secret is bundled — one less provisioned secret than the CLI carries.
+ * **Not yet wired.** No build step rewrites {@link PROVISIONED} today, and no
+ * release guard calls {@link isPlaceholderCredential} — the checked-in values
+ * are placeholders and `bundledCredentials` throws on them, so an
+ * un-provisioned build fails loudly at first sign-in rather than shipping a
+ * broken one silently. Wiring the injection and the release check is
+ * outstanding work, tracked with the rest of the browser tier.
+ *
+ * Neither value is secret: a Firebase web API key and an OAuth client id are
+ * public identifiers. Unlike the CLI's Google **Desktop** OAuth client, the
+ * extension uses a **Web** client through `chrome.identity.launchWebAuthFlow`
+ * requesting an OIDC `id_token` directly, so there is no token-endpoint call
+ * and no client secret to bundle at all.
  */
 
 export const DEFAULT_FIREBASE_API_KEY = "UNPROVISIONED_FIREBASE_API_KEY";

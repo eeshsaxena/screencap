@@ -43,6 +43,11 @@
         margin: 12px 0 0;
         color: #b3261e;
       }
+      .note {
+        font-size: 12px;
+        margin: 0 0 12px;
+        opacity: 0.75;
+      }
       [hidden] {
         display: none;
       }
@@ -58,7 +63,15 @@
 
     <section id="signed-in" hidden>
       <p class="account">Signed in as <strong id="account"></strong></p>
+      <p id="stale-note" class="note" hidden>
+        Can't reach Screencap right now — you're still signed in.
+      </p>
       <button id="sign-out">Sign out</button>
+    </section>
+
+    <section id="unknown" hidden>
+      <p class="account">Couldn't reach the extension's background service.</p>
+      <button id="retry">Try again</button>
     </section>
 
     <p id="error" class="error" hidden></p>
