@@ -152,6 +152,19 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     ]);
   });
 
+  it("collapses a duplicated entry into one row", async () => {
+    // Two popups reconciling at once, or an add that raced another context's
+    // write, can store the same pattern twice. Two Remove buttons for one grant
+    // is a confusing way to present that.
+    seedStored("https://example.com/*", "https://example.com/*");
+    fake.granted = ["https://example.com/*"];
+
+    expect(await new Allowlist(deps()).list()).toEqual([
+      { pattern: "https://example.com/*", label: "https://example.com" },
+    ]);
+    expect(storedPatterns()).toEqual(["https://example.com/*"]);
+  });
+
   it("survives a corrupt stored value instead of throwing", async () => {
     fake.storageArea.set(ALLOWLIST_STORAGE_KEY, "{not json");
     fake.granted = ["https://example.com/*"];
