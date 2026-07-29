@@ -159,22 +159,15 @@ export class Allowlist {
     const adoptable = granted.filter(isAdoptablePattern);
     const live = new Set(adoptable);
 
-    // Deduplicated as it goes. Two popup windows reconciling at once, or an
-    // `add` that raced another context's write, can leave the same pattern
-    // stored twice; showing it twice would offer two Remove buttons for one
+    // Stored entries that still hold a grant keep their original order, then
+    // grants nothing is tracking yet are appended. `Set` keeps first-occurrence
+    // order, which also collapses a pattern stored twice — two popups
+    // reconciling at once, or an `add` racing another context's write, can
+    // leave a duplicate that would otherwise render two Remove buttons for one
     // grant.
-    const seen = new Set<string>();
-    const reconciled: string[] = [];
-    const take = (pattern: string): void => {
-      if (seen.has(pattern)) return;
-      seen.add(pattern);
-      reconciled.push(pattern);
-    };
-
-    // Stored entries that still hold a grant keep their original order...
-    for (const pattern of stored) if (live.has(pattern)) take(pattern);
-    // ...then grants nothing is tracking yet are appended.
-    for (const pattern of adoptable) take(pattern);
+    const reconciled = [
+      ...new Set([...stored.filter((pattern) => live.has(pattern)), ...adoptable]),
+    ];
 
     if (!sameOrder(reconciled, stored)) {
       await this.persist(reconciled);

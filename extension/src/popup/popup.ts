@@ -11,7 +11,11 @@
  */
 
 import type { AuthRequest, AuthResponse } from "../background/service-worker.js";
-import { Allowlist, chromeAllowlistDeps } from "../permissions/allowlist.js";
+import {
+  Allowlist,
+  chromeAllowlistDeps,
+  type AllowlistEntry,
+} from "../permissions/allowlist.js";
 import { addOutcome, allowlistView, type AllowlistView } from "./allowlist-view.js";
 import { popupView, unreachableView, type PopupView } from "./view.js";
 
@@ -90,7 +94,7 @@ function renderAllowlist(view: AllowlistView): void {
   el<HTMLUListElement>("allowlist-entries").replaceChildren(...view.entries.map(rowFor));
 }
 
-function rowFor(entry: { pattern: string; label: string }): HTMLLIElement {
+function rowFor(entry: AllowlistEntry): HTMLLIElement {
   const row = document.createElement("li");
 
   const origin = document.createElement("span");
@@ -152,6 +156,13 @@ async function run(button: HTMLButtonElement, request: AuthRequest): Promise<voi
  * does not follow the service-worker delegation the auth buttons above use.
  */
 function addOrigin(): void {
+  // The Enter handler calls this directly, so it does not go through the
+  // button and the browser's own disabled-button suppression never applies.
+  // Without this check, click-then-Enter (or held-Enter auto-repeat) starts a
+  // second permissions.request() for the same origin while the first prompt is
+  // still open.
+  if (addButton.disabled) return;
+
   const raw = addInput.value;
   if (raw.trim() === "") return;
 
