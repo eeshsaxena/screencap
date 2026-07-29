@@ -43,6 +43,19 @@ struct MenuBarMenu: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        // SCR-296: the finalize drain outlives `.stopping` — the state machine
+        // reaches `.idle` the moment the 60s stop wait gives up, while finalize
+        // work runs for minutes more, and the menu used to go quiet for all of
+        // it. A leading status line rather than a branch in the chain below, so
+        // Start Recording stays visible: the daemon refuses a start during the
+        // drain with a typed, retryable message (SCR-276), which is a better
+        // answer than an affordance that silently vanishes. Suppressed during a
+        // Cmd+Q shutdown, whose countdown line already says this.
+        if recorder.finalizing, recorder.quitProgressSecondsRemaining == nil {
+            Text(MenuBarIconPresentation.finalizingStatusLine)
+            Divider()
+        }
+
         if let remaining = recorder.quitProgressSecondsRemaining {
             Text("Finalizing recording — \(remaining)s remaining")
             Divider()

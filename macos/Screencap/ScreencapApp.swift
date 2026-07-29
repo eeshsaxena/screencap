@@ -177,7 +177,12 @@ struct ScreencapApp: App {
                 .environmentObject(store)
                 .environmentObject(privacy)
         } label: {
-            MenuBarLabel(isRecording: recorder.state.isRecording)
+            MenuBarLabel(
+                state: MenuBarIconPresentation.state(
+                    isRecording: recorder.state.isRecording,
+                    finalizing: recorder.finalizing
+                )
+            )
         }
         .menuBarExtraStyle(.menu)
     }
@@ -190,13 +195,24 @@ struct ScreencapApp: App {
 /// holds the "calm instrument" discipline — advisories de-color, color is reserved
 /// for the recording state and the brand accent (R7).
 private struct MenuBarLabel: View {
-    let isRecording: Bool
+    let state: MenuBarIconPresentation.State
 
     var body: some View {
-        Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
+        Image(systemName: MenuBarIconPresentation.iconName(state))
             .symbolRenderingMode(.palette)
-            .foregroundStyle(isRecording ? Color.scRecording : Color.scAccent)
-            .accessibilityLabel(isRecording ? "Screencap, recording" : "Screencap")
+            .foregroundStyle(tint)
+            .accessibilityLabel(MenuBarIconPresentation.accessibilityLabel(state))
+    }
+
+    /// Colour stays scarce (R7): the recording role and the brand accent only.
+    /// SCR-296's finalizing state de-colours to the muted ink role rather than
+    /// claiming a third hue — its glyph is what sets it apart.
+    private var tint: Color {
+        switch state {
+        case .recording: return .scRecording
+        case .idle: return .scAccent
+        case .finalizing: return .scInkMuted
+        }
     }
 }
 
