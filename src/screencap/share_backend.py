@@ -20,6 +20,7 @@ from pathlib import Path
 from screencap.share_service import (
     CreateShareResponse,
     ShareError,
+    ShareSourceMissing,
     SourceArtifact,
 )
 
@@ -68,7 +69,9 @@ class DaemonShareBackend:
 
         urls, _prefix = download.request_signed_urls(recording_name)
         if not urls:
-            raise ShareError(
+            # Nothing to share rather than a backend fault: the surfaces render
+            # a different instruction for each, so this stays the typed variant.
+            raise ShareSourceMissing(
                 f"recording {recording_name!r} has no local scrubbed copy and is not in the cloud"
             )
         self._tempdir = tempfile.TemporaryDirectory(prefix="screencap-share-")

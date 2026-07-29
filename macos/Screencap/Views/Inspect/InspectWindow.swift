@@ -18,6 +18,22 @@ enum InspectShareAffordance {
         if case .ready = state { return true }
         return false
     }
+
+    /// Whether the share-LINK actions (copy / revoke) belong in the menu at all
+    /// (SCR-299 R11, AE3).
+    ///
+    /// A share is built from the recording's cloud copy, so a local-only
+    /// recording has nothing to link to. The actions are omitted rather than
+    /// shown-and-failing — and this is deliberately narrower than
+    /// `isEnabled` above, which still gates the untouched upload hand-off: a
+    /// local-only recording must keep its route to the consent window even
+    /// though it can't be shared by link.
+    ///
+    /// `summary` is nil when the recordings index hasn't resolved this
+    /// recording yet; treat that as not-yet-shareable rather than guessing.
+    static func showsLinkActions(for summary: RecordingSummary?) -> Bool {
+        summary?.isShareable == true
+    }
 }
 
 /// Per-recording read-only inspect window — the "just looking" surface. A
@@ -33,11 +49,28 @@ enum InspectShareAffordance {
 struct InspectWindow: View {
     let recordingName: String
     @StateObject private var model: InspectWindowViewModel
+    /// Share-by-link state for this recording (SCR-299). Owned per window, like
+    /// the playback model — two inspect windows share nothing.
+    @StateObject private var shareLink: ShareLinkController
 
     // Observed so a freshly-set `pendingSeekMs[recordingName]` (a second anchored
     // search result for an already-open, already-ready window) re-renders the body
     // and fires the reuse `.onChange` below (Finding #2).
     @ObservedObject private var opener = InspectWindowOpener.shared
+
+    /// The recordings list the app already keeps, injected by the scene. Read
+    /// only for this recording's cloud-copy state — inspect still performs no
+    /// upload itself.
+    @EnvironmentObject private var recordingsIndex: RecordingsIndex
+
+    /// Non-nil while the OS share sheet is presenting the link.
+    @State private var sharingURL: URL?
+    /// Drives the post-copy confirmation carrying the honesty copy.
+    @State private var justCopied = false
+    /// Gates the irreversible revoke behind an explicit confirmation.
+    @State private var confirmingRevoke = false
+
+    @Environment(\.openWindow) private var openWindow
 
     @State private var videoModel: VideoPlayerPaneModel?
     @State private var timelineEvents: [TimelineEvent] = []
@@ -53,6 +86,7 @@ struct InspectWindow: View {
     init(recordingName: String) {
         self.recordingName = recordingName
         _model = StateObject(wrappedValue: InspectWindowViewModel(recordingName: recordingName))
+        _shareLink = StateObject(wrappedValue: ShareLinkController(recordingName: recordingName))
     }
 
     var body: some View {
@@ -62,7 +96,58 @@ struct InspectWindow: View {
             // distinguishable in the title bar, Dock, and Cmd-` cycling (R7).
             .navigationTitle(recordingName)
             .toolbar { shareToolbarItem }
+            // Anchor for the OS share sheet; zero-size until `sharingURL` is set.
+            .background(ShareServicePresenter(item: $sharingURL))
+            .alert("Share link copied", isPresented: $justCopied) {
+                copiedConfirmationButtons
+            } message: {
+                Text(
+                    """
+                    Anyone with this link can view the recording — it carries \
+                    the decryption key, so treat the link itself as a secret.
+
+                    Revoking stops future views, but can't retract a copy \
+                    someone has already downloaded.
+                    """
+                )
+            }
+            .confirmationDialog(
+                "Revoke this share link?",
+                isPresented: $confirmingRevoke,
+                titleVisibility: .visible
+            ) {
+                Button("Revoke Link", role: .destructive) {
+                    Task { await shareLink.revoke() }
+                }
+                Button("Keep Link", role: .cancel) {}
+            } message: {
+                Text(
+                    """
+                    Anyone using this link will lose access, and it can't be \
+                    undone — sharing again means creating a new link.
+
+                    This still can't retract a copy someone has already \
+                    downloaded.
+                    """
+                )
+            }
+            .alert(
+                failureTitle,
+                isPresented: Binding(
+                    get: { failureCopy != nil },
+                    set: { if !$0 { Task { await shareLink.dismissFailure() } } }
+                )
+            ) {
+                if let failureCopy { failureButtons(for: failureCopy) }
+            } message: {
+                // Static copy keyed on the daemon's error code — never the
+                // backend's own text (R13).
+                Text(failureCopy?.message ?? "")
+            }
             .task { await model.loadInspectData() }
+            // Independent of inspect-data: resolves whether this Mac already
+            // holds a live link, so Revoke is offered without a reopen (R14).
+            .task { await shareLink.refresh() }
             .onChange(of: model.state) { newState in
                 buildVideoIfReady(newState)
             }
@@ -80,21 +165,110 @@ struct InspectWindow: View {
             }
     }
 
-    /// Low-emphasis hand-off to the consent window (R9/R10). A secondary toolbar
-    /// item — never a prominent/primary button — enabled only once the recording
-    /// has loaded. Reuses the existing `ReviewWindowOpener`, exactly as the
-    /// Recordings-list Upload button reaches the consent window; inspect performs
-    /// no upload itself.
+    /// This recording's row in the list the app already keeps. Nil until the
+    /// index resolves it; the link actions treat that as not-yet-shareable.
+    private var recordingSummary: RecordingSummary? {
+        recordingsIndex.recordings.first { $0.name == recordingName }
+    }
+
+    private var failureCopy: ShareLinkErrorCopy? {
+        if case .failed(let copy, _) = shareLink.phase { return copy }
+        return nil
+    }
+
+    /// Titled by what actually failed — a failed revoke must not claim the app
+    /// couldn't create a link.
+    private var failureTitle: String {
+        if case .failed(_, let operation) = shareLink.phase, operation == .revoke {
+            return "Couldn't revoke the share link"
+        }
+        return "Couldn't create the share link"
+    }
+
+    /// Low-emphasis hand-off to the consent window (R9/R10), now also the home
+    /// of the share-link actions (SCR-299). A secondary toolbar item — never a
+    /// prominent/primary button — enabled only once the recording has loaded.
+    ///
+    /// The upload hand-off is unchanged and stays FIRST: it reaches the
+    /// untouched review/consent window exactly as before, and remains available
+    /// for a local-only recording that has no link to copy. Inspect still
+    /// performs no upload itself and carries no consent machinery — signing in
+    /// routes out to the main window rather than presenting an account sheet
+    /// here.
     private var shareToolbarItem: some ToolbarContent {
         ToolbarItem(placement: .automatic) {
-            Button {
-                ReviewWindowOpener.shared.open(recordingName: recordingName)
+            Menu {
+                Button("Upload…") {
+                    ReviewWindowOpener.shared.open(recordingName: recordingName)
+                }
+
+                if InspectShareAffordance.showsLinkActions(for: recordingSummary) {
+                    Divider()
+                    // Read before acting: the one-line truth about what the
+                    // link is. The full statement — including that revoking
+                    // can't retract an already-downloaded copy — follows on
+                    // the confirmation (R7).
+                    Text("Link is view-only and carries its own key")
+                    // Keyed on whether the link is still in memory, NOT on
+                    // whether a share exists. The key is never persisted (it
+                    // only ever lives in the fragment), so after a relaunch the
+                    // old link is unrecoverable and copying genuinely mints a
+                    // new one — the label must not call that "again".
+                    if shareLink.lastCreatedURL != nil {
+                        Button("Copy Link Again") {
+                            shareLink.copyExistingLink()
+                            justCopied = true
+                        }
+                    } else {
+                        Button("Copy Share Link") {
+                            Task {
+                                await shareLink.copyLink()
+                                if case .hasLink = shareLink.phase { justCopied = true }
+                            }
+                        }
+                    }
+                    if shareLink.activeToken != nil {
+                        // Confirmed rather than immediate: revoking cannot be
+                        // undone, and it cuts off everyone already holding the
+                        // link with no warning to them.
+                        Button("Revoke Share Link…") { confirmingRevoke = true }
+                    }
+                }
             } label: {
                 Label("Share / Upload…", systemImage: "square.and.arrow.up")
             }
-            .help("Open the upload review window for this recording")
-            .disabled(!InspectShareAffordance.isEnabled(for: model.state))
+            .help("Upload this recording, or copy a view-only share link")
+            .disabled(!InspectShareAffordance.isEnabled(for: model.state) || shareLink.isBusy)
         }
+    }
+
+    /// Post-copy confirmation. This is where the honest description of the
+    /// security model lands in full (R7, and origin assumptions A2/A5): the
+    /// link carries the key, anyone holding it can view, and revoking cannot
+    /// retract a copy already fetched.
+    @ViewBuilder
+    private var copiedConfirmationButtons: some View {
+        if shareLink.lastCreatedURL != nil {
+            Button("Share…") { sharingURL = shareLink.lastCreatedURL }
+        }
+        Button("Done", role: .cancel) {}
+    }
+
+    @ViewBuilder
+    private func failureButtons(for copy: ShareLinkErrorCopy) -> some View {
+        switch copy.action {
+        case .retry:
+            // Routed by the recorded operation, so retrying a failed revoke
+            // retries the revoke rather than minting a fresh link.
+            Button("Try Again") { Task { await shareLink.retryFailedOperation() } }
+        case .signIn:
+            // Inspect deliberately holds no account sheet, so sign-in routes to
+            // the main window, where the account surface lives.
+            Button("Open Screencap") { openWindow(id: MainWindowID) }
+        case .noRecovery:
+            EmptyView()
+        }
+        Button("OK", role: .cancel) { Task { await shareLink.dismissFailure() } }
     }
 
     @ViewBuilder

@@ -176,4 +176,23 @@ struct RecordingSummary: Decodable, Identifiable, Hashable {
     var isClippable: Bool {
         !isStub && (durationSeconds ?? 0) > 0
     }
+
+    /// SCR-299 R11 / KTD3 eligibility predicate for the Inspect share-link
+    /// actions: a recording can be shared by link once it has a **cloud copy**.
+    ///
+    /// A share is built from that cloud copy — the daemon fetches the masked
+    /// `<name>-scrubbed` artifacts from storage when no local scrubbed sibling
+    /// survives — so being uploaded is the whole requirement.
+    ///
+    /// Deliberately distinct from both neighbours above. It is the **inverse**
+    /// of `isUploadEligible`'s `!uploaded` clause: you can only share what is
+    /// already in the cloud. And unlike `isClippable` it must **not** exclude a
+    /// stub — a stub is the uploaded-then-locally-deleted state, and its cloud
+    /// copy is exactly what a share reads, so excluding it would disable
+    /// sharing on the recordings the backend most clearly supports. (In
+    /// practice a stub rarely reaches the Inspect menu, because inspect-data
+    /// needs local video to load; that gate is the view's, not this predicate's.)
+    var isShareable: Bool {
+        uploaded
+    }
 }

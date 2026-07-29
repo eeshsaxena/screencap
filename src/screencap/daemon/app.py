@@ -1174,12 +1174,51 @@ async def recording_rename(request: Request) -> JSONResponse:
         )
 
 
+def _share_api_error(exc: Exception):
+    """Map a share failure to its typed daemon error, or None if unrecognized.
+
+    Classification is STRUCTURAL — by exception type, never by message text
+    (SCR-299 KTD2). The surfaces render recovery copy keyed on the resulting
+    code, so a reworded backend string must not be able to turn "sign in" into
+    "try again".
+
+    Returning None is meaningful: it keeps an unexpected exception on the
+    generic internal-error path instead of mislabeling it as a known failure.
+    """
+    from screencap import auth, share_service
+
+    version = schema._RECORDING_SHARE_API_VERSION
+
+    if isinstance(exc, auth.NotSignedIn):
+        return errors.NotSignedInError(schema_version=version)
+    # ShareSourceMissing subclasses ShareError — test it FIRST, or a user with
+    # nothing uploaded gets told to retry something that can never succeed.
+    if isinstance(exc, share_service.ShareSourceMissing):
+        return errors.ShareUnavailableError(schema_version=version)
+    if isinstance(exc, share_service.ShareError):
+        return errors.ShareBackendUnavailableError(schema_version=version)
+
+    # requests is a cloud-path dependency, imported lazily so this mapper stays
+    # usable (and `screencap --help` stays fast) when it is absent.
+    try:
+        import requests
+    except ImportError:
+        return None
+    if isinstance(exc, requests.exceptions.RequestException):
+        return errors.ShareBackendUnavailableError(schema_version=version)
+    return None
+
+
 def _run_share_op(parsed) -> dict:
     """Blocking share op (create / revoke / list), run off the event loop.
 
     Uses the live :class:`~screencap.share_backend.DaemonShareBackend`. The
     per-recording share key is minted inside ``create_share_flow`` and returned
     ONLY inside the assembled URL fragment — never persisted or logged here.
+
+    Known failures are re-raised as typed :class:`~screencap.daemon.errors.
+    DaemonAPIError`s so the handler's envelope carries a code the app can act
+    on; anything unrecognized propagates untouched to the generic path.
     """
     from screencap import config, share_backend, share_service, upload
 
@@ -1206,6 +1245,19 @@ def _run_share_op(parsed) -> dict:
         if parsed.op == "list":
             return {"shares": backend.list_local_shares()}
         raise ValueError(f"unknown share op: {parsed.op!r}")
+    except errors.DaemonAPIError:
+        raise
+    except Exception as exc:
+        typed = _share_api_error(exc)
+        if typed is None:
+            # Unrecognized: stays on the generic internal-error path rather than
+            # being dressed up as a known failure the app would act on.
+            raise
+        # `from None` drops the cause deliberately. A typed error skips the
+        # handler's traceback logging today, and severing the chain keeps that
+        # true even if logging is added later — the backend message can carry
+        # recording names and share text that must not accrue in a log.
+        raise typed from None
     finally:
         backend.close()
 

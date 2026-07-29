@@ -1,16 +1,23 @@
 import AppKit
 import SwiftUI
 
-/// Presents the system share sheet (`NSSharingServicePicker`) for a file URL over
-/// a SwiftUI surface (U11 range Share + Clips share, F2). A zero-size anchor
-/// NSView the picker attaches to; setting `item` non-nil shows the picker relative
-/// to it, and `item` is cleared once the picker is dismissed (service chosen or
-/// cancelled) so the same file can be re-shared later.
+/// Presents the system share sheet (`NSSharingServicePicker`) for a URL over a
+/// SwiftUI surface (U11 range Share + Clips share, F2; SCR-299 share links). A
+/// zero-size anchor NSView the picker attaches to; setting `item` non-nil shows
+/// the picker relative to it, and `item` is cleared once the picker is dismissed
+/// (service chosen or cancelled) so the same item can be re-shared later.
 ///
-/// Upload-share is deliberately NOT one of the offered services here — that
-/// consent boundary stays routed through the Review window (KTD-4). This surfaces
-/// only the OS-provided recipients (Messages, Mail, AirDrop, …) for the already-cut
-/// local clip file.
+/// Handles two kinds of URL, and the distinction matters:
+///
+/// * A **local file URL** — an already-cut clip (U11/F2).
+/// * A **share link** — the `https` URL minted by SCR-299. Its fragment carries
+///   the recording's decryption key, so whoever receives it can view the
+///   recording. The window states that before the link is ever copied (R7).
+///
+/// **Uploading** is still deliberately NOT one of the offered services: that
+/// consent boundary stays routed through the Review window (KTD-4). Handing an
+/// already-minted link to Messages or Mail is not an upload — the upload already
+/// happened, and the user chose to share it — so it does not cross that boundary.
 struct ShareServicePresenter: NSViewRepresentable {
     @Binding var item: URL?
 
