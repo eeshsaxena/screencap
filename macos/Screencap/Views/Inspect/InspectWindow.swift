@@ -67,6 +67,8 @@ struct InspectWindow: View {
     @State private var sharingURL: URL?
     /// Drives the post-copy confirmation carrying the honesty copy.
     @State private var justCopied = false
+    /// Gates the irreversible revoke behind an explicit confirmation.
+    @State private var confirmingRevoke = false
 
     @Environment(\.openWindow) private var openWindow
 
@@ -106,6 +108,26 @@ struct InspectWindow: View {
 
                     Revoking stops future views, but can't retract a copy \
                     someone has already downloaded.
+                    """
+                )
+            }
+            .confirmationDialog(
+                "Revoke this share link?",
+                isPresented: $confirmingRevoke,
+                titleVisibility: .visible
+            ) {
+                Button("Revoke Link", role: .destructive) {
+                    Task { await shareLink.revoke() }
+                }
+                Button("Keep Link", role: .cancel) {}
+            } message: {
+                Text(
+                    """
+                    Anyone using this link will lose access, and it can't be \
+                    undone — sharing again means creating a new link.
+
+                    This still can't retract a copy someone has already \
+                    downloaded.
                     """
                 )
             }
@@ -206,9 +228,10 @@ struct InspectWindow: View {
                         }
                     }
                     if shareLink.activeToken != nil {
-                        Button("Revoke Share Link") {
-                            Task { await shareLink.revoke() }
-                        }
+                        // Confirmed rather than immediate: revoking cannot be
+                        // undone, and it cuts off everyone already holding the
+                        // link with no warning to them.
+                        Button("Revoke Share Link…") { confirmingRevoke = true }
                     }
                 }
             } label: {
