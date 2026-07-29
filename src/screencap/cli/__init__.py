@@ -3880,14 +3880,17 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
     \b
     Valid FIELD names (todo 022):
       list fields (add/remove): exclude_apps, allow_apps, confirmed_allow_apps,
-                                mask_domains, mask_title_patterns
-      scalar fields (set):      mode (public|internal), setup_skipped (bool)
+                                mask_apps, mask_domains, mask_title_patterns
+      scalar fields (set):      mode (public|internal), setup_skipped (bool),
+                                default_action (allow|mask_window|exclude)
       map fields (BUNDLE=CLASS): app_classes
 
     \b
     Examples:
       screencap settings privacy exclude_apps add com.example.foo
       screencap settings privacy allow_apps remove com.example.bar
+      screencap settings privacy mask_apps add com.apple.Terminal
+      screencap settings privacy default_action set exclude
       screencap settings privacy mode set internal
       screencap settings privacy app_classes set com.example.foo=chat
 
@@ -3897,10 +3900,16 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
 
     ``allow_apps add`` writes a *confirmed* allow (SCR-235): the entry is
     authoritative over the privacy matrix in every mode. Sensitive classes
-    (excluded by the matrix in any mode) require ``--confirm-sensitive``;
-    unclassified bundles are refused until classified via ``app_classes``.
+    (excluded by the matrix in any mode) require ``--confirm-sensitive``.
     ``confirmed_allow_apps add`` is gated identically. ``allow_apps remove``
     also drops the confirmation, so re-allowing a sensitive app re-prompts.
+
+    ``mask_apps`` and ``default_action`` are the SCR-225 tightening rules and
+    can only strengthen the matrix, never weaken it: a Mask rule needs no
+    confirmation because it cannot loosen anything, and ``default_action`` is
+    the floor for apps with no explicit rule (``allow`` is the identity floor
+    and the default). The three per-app rules are mutually exclusive — adding
+    one clears the bundle from the others in the same write.
     """
     import json as _json
 
@@ -3912,6 +3921,7 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
         _PRIVACY_MODE_VALUES,
         _PRIVACY_SCALAR_FIELDS,
         _privacy_config_writer,
+        _privacy_default_action_values,
         _privacy_list_field_value,
         _settings_privacy_apply,
     )
@@ -3993,6 +4003,22 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
                     f"{_PRIVACY_MODE_VALUES}, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"invalid_mode:{value}")
+            parsed_value = value.lower()
+        elif field == "default_action":
+            # The blanket floor for apps with no explicit rule (SCR-225).
+            # Validate here, at the write seam, against the same set
+            # parse_privacy_config accepts — an unvalidated write would
+            # persist a value that raises InvalidPrivacyConfigError on the
+            # next start, which is the failure `mode`'s value list prevents.
+            valid_actions = _privacy_default_action_values()
+            if value.lower() not in valid_actions:
+                err_console.print(
+                    f"[red]Error:[/red] default_action must be one of "
+                    f"{valid_actions}, got: {escape(str(value))}"
+                )
+                _result(
+                    False, exit_code=1, error=f"invalid_default_action:{value}"
+                )
             parsed_value = value.lower()
         elif field == "setup_skipped":
             if value.lower() in ("true", "1", "yes"):

@@ -132,6 +132,85 @@ class TestScalarFields:
 # ---------------------------------------------------------------------------
 
 
+class TestMaskAppsAndDefaultAction:
+    """SCR-225: the per-app Mask list field and the default-action scalar."""
+
+    def test_mask_apps_add_then_remove(self):
+        add = _invoke("mask_apps", "add", "com.apple.Terminal")
+        assert add.exit_code == 0
+        assert _read_cfg()["privacy"]["mask_apps"] == ["com.apple.Terminal"]
+
+        remove = _invoke("mask_apps", "remove", "com.apple.Terminal")
+        assert remove.exit_code == 0
+        assert _read_cfg()["privacy"]["mask_apps"] == []
+
+    def test_mask_apps_add_is_idempotent(self):
+        _invoke("mask_apps", "add", "com.apple.Terminal")
+        again = _invoke("mask_apps", "add", "com.apple.Terminal")
+        assert again.exit_code == 0
+        assert _read_cfg()["privacy"]["mask_apps"] == ["com.apple.Terminal"]
+
+    def test_mask_apps_remove_of_absent_bundle_is_a_no_op(self):
+        result = _invoke("mask_apps", "remove", "com.example.never-added")
+        assert result.exit_code == 0
+
+    def test_mask_apps_remove_matches_a_case_variant_entry(self):
+        """Runtime membership is case-normalized, so a hand-edited case variant
+        must still be removable through the CLI."""
+        from screencap.config import _CONFIG_PATH
+
+        _write_config(
+            _CONFIG_PATH,
+            '[privacy]\nmode = "internal"\nmask_apps = ["COM.APPLE.TERMINAL"]\n',
+        )
+        result = _invoke("mask_apps", "remove", "com.apple.Terminal")
+        assert result.exit_code == 0
+        assert _read_cfg()["privacy"].get("mask_apps", []) == []
+
+    def test_mask_apps_rejects_the_set_op(self):
+        result = _invoke("mask_apps", "set", "com.apple.Terminal")
+        assert result.exit_code != 0
+
+    def test_default_action_accepts_each_settable_value(self):
+        for value in ("allow", "mask_window", "exclude"):
+            result = _invoke("default_action", "set", value)
+            assert result.exit_code == 0, value
+            assert _read_cfg()["privacy"]["default_action"] == value
+
+    def test_default_action_rejects_an_unknown_value(self):
+        result = _invoke("default_action", "set", "banana")
+        assert result.exit_code != 0
+        assert "default_action" not in _read_cfg().get("privacy", {})
+
+    def test_default_action_rejects_an_unenforceable_action(self):
+        """MASK_REGION is unimplemented and the text/OCR actions have no
+        segment to express them — writing one would crash the next start."""
+        for value in ("mask_region", "text_redact", "ocr_fallback"):
+            result = _invoke("default_action", "set", value)
+            assert result.exit_code != 0, value
+            assert "default_action" not in _read_cfg().get("privacy", {})
+
+    def test_default_action_rejects_add_op(self):
+        result = _invoke("default_action", "add", "exclude")
+        assert result.exit_code != 0
+
+    def test_default_action_survives_in_the_json_envelope(self):
+        result = _invoke("default_action", "set", "exclude", as_json=True)
+        payload = _last_json_line(result.output)
+        assert payload["ok"] is True
+        assert payload["changed"] is True
+        assert payload["field"] == "default_action"
+
+    def test_mask_apps_add_clears_an_existing_exclude_entry(self):
+        """End-to-end mutual exclusion through the Click command."""
+        _invoke("exclude_apps", "add", "com.apple.Terminal")
+        result = _invoke("mask_apps", "add", "com.apple.Terminal")
+        assert result.exit_code == 0
+        privacy = _read_cfg()["privacy"]
+        assert privacy["mask_apps"] == ["com.apple.Terminal"]
+        assert privacy.get("exclude_apps", []) == []
+
+
 class TestConfirmationGate:
     """SCR-235: allow_apps adds write confirmed entries; confirmation-required
     classes (matrix EXCLUDE in any mode) need --confirm-sensitive."""
@@ -298,20 +377,28 @@ class TestConfirmationGate:
 
 
 class TestMatrixFloorUnknownBundles:
-    """Finding 001 — fail-closed for bundles not in BUNDLE_ID_MAP and not
-    classified via app_classes. The runtime evaluator's strictness floor
-    mostly mitigates the harm, but the CLI add-time path stays explicit:
-    refuse to allow-list an unclassified bundle, and prevent the two-step
-    bypass (set X=password_manager → remove X → allow_apps add X).
+    """Finding 001 — the app_classes guards that block loosening a bundle's
+    class, and the two-step bypass (set X=password_manager → remove X →
+    allow_apps add X), which is still rejected at the remove step.
+
+    SCR-225 (KTD9) retired the sibling refusal that blocked allow-listing an
+    *unclassified* bundle outright: it made a tightened `default_action`
+    unusable, because the escape hatch failed on exactly the apps the floor
+    caught. Classification-derived gating is unchanged.
     """
 
-    def test_allow_apps_add_rejects_unknown_bundle(self):
-        """Variant A: bundle absent from BUNDLE_ID_MAP and not overridden via
-        app_classes — refuse the add. Caller must classify first."""
+    def test_allow_apps_add_permits_unknown_bundle(self):
+        """SCR-225 KTD9: an unclassified bundle allow-lists as a plain entry.
+        A bundle that resolves to a sensitive class is still gated — see
+        test_allow_apps_blocked_via_app_classes_override below."""
         result = _invoke("allow_apps", "add", "com.example.fictional-unknown")
-        assert result.exit_code != 0
-        out = result.output.lower()
-        assert "unknown_bundle_id" in out or "unclassified" in out
+        assert result.exit_code == 0
+        cfg = _read_cfg()
+        assert "com.example.fictional-unknown" in cfg["privacy"]["allow_apps"]
+        assert (
+            "com.example.fictional-unknown"
+            in cfg["privacy"]["confirmed_allow_apps"]
+        )
 
     def test_allow_apps_add_succeeds_for_known_browser(self):
         """Counter-test: a real BUNDLE_ID_MAP browser entry still works
