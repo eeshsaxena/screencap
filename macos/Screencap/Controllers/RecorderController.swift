@@ -1201,8 +1201,12 @@ final class RecorderController: ObservableObject {
             // self-resolves. Writing it to `lastError` (the terminal-failure
             // channel, never auto-cleared — see the `state.didSet` idle
             // chokepoint) left a stale red banner over the Library long after the
-            // recording finished uploading. The per-recording Library status
-            // chips already carry the finalization signal.
+            // recording finished uploading. SCR-296 carries the signal instead,
+            // on `finalizing` — an orthogonal flag this transition deliberately
+            // does not clear, read by the menu-bar icon and the Today card.
+            // (Before SCR-296 this comment claimed Library status chips already
+            // covered it; they did not — the lifecycle was decoded and rendered
+            // nowhere, so the window was genuinely silent.)
             if quitting {
                 if isDaemon {
                     lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."

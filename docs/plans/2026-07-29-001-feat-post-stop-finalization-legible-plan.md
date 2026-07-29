@@ -72,9 +72,9 @@ flowchart TB
 
 **Per-recording state**
 
-- R4. Library and Days rows show a per-recording unfinished indicator for a recording that has stopped but not completed.
-- R5. The row indicator covers the recording's full path to completion, which on cloud and both destinations includes upload.
-- R6. The row indicator appears during the finalize drain, not only after the engine exits.
+- R4. The Days browsing surface shows that a recording has stopped but not completed.
+- R5. That indicator covers the recording's full path to completion, which on cloud and both destinations includes upload.
+- R6. The indicator appears during the finalize drain, not only after the engine exits.
 - R13. The Days Today-card status indicator distinguishes finalizing from recording, paused, starting, and off.
 
 **Lifecycle and clearing**
@@ -200,11 +200,13 @@ The work is entirely app-side. One orthogonal published property on the recorder
 
 Restructured, no scope change. R4 and R6 were restated as intent — R4 dropped the `derived state is processing` mechanism and R6 dropped the "the Library repaints" mechanism — because research found that mechanism cannot satisfy them (KTD3). R10 likewise dropped its `at the daemon's existing stop kill grace` clause, which KTD4 now owns and sets *above* that bound. R13 was added for the Days Today-card status dot, a surface the brainstorm did not name. All other requirements, both governing Key Decisions, and every `Governs`/`Covers` link are unchanged.
 
+R4 and R6 were restated a second time during implementation, from "Library and Days rows" to the Days browsing surface. The app has no per-recording row: `DaysView` aggregates recordings into day cards, the sidebar reads the list only for a storage footer, and the only per-recording views are moment rows. The brainstorm and the first plan draft both assumed a row surface that does not exist. The Today card carries the same intent on the surface that does, which also merges the row unit into the status-dot unit. (session-settled: user-directed — chosen over building a new per-recording list view: that is new UI wanting its own design pass, well outside this plan.)
+
 ### Key Technical Decisions
 
 - KTD1. **Model the finalizing state as an orthogonal published property, not a state-machine state.** It mirrors how mute and pause are handled — orthogonal to the idle/starting/recording/stopping lifecycle. It must survive `enterIdleStayingBackgrounded()` and must not be cleared at the `state.didSet` idle chokepoint that clears `captureAdvisory`, since that chokepoint fires exactly when an in-app Stop concludes. Governs R7.
 - KTD2. **Open on the user-action edge, close on the completion edge.** The state opens from the stop response's finalizing outcome and closes on the finalize event. Gating visibility on a transition that only fires after a long background await is the documented failure in the HUD-freeze learning; this inverts it. Governs R7, R8.
-- KTD3. **The row's drain-window label reads the finalizing signal; the list response's lifecycle state carries the post-exit window.** The engine holds the pidfile flock until it exits, so a draining recording is still reported as `recording` — not `processing` — for the entire drain. Branching at display time is what the CLI's status output already does for this window, and it leaves the shared backend contract untouched. (session-settled: user-approved — chosen over changing the backend state derivation: that would alter a contract the CLI shares.) Governs R4, R6.
+- KTD3. **The drain window reads the finalizing signal; the list response's lifecycle state carries the post-exit window.** The engine holds the pidfile flock until it exits, so a draining recording is still reported as `recording` — not `processing` — for the entire drain. Branching at display time is what the CLI's status output already does for this window, and it leaves the shared backend contract untouched. (session-settled: user-approved — chosen over changing the backend state derivation: that would alter a contract the CLI shares.) Governs R4, R6.
 - KTD4. **The app-side backstop sits above the daemon's 630s kill grace, not at it.** The daemon already hard-bounds the drain; an app bound set equal or lower fires before the real completion signal can arrive and clears the surface falsely — the layered-timeout failure documented in `docs/solutions/integration-issues/inner-timeout-unreachable-behind-outer-watchdog-2026-06-24.md`. (session-settled: user-approved — chosen over binding at the kill grace.) Governs R10.
 - KTD5. **The third menu-bar icon state is a symbol variant, not a new color.** The label's existing discipline reserves color for the recording state and the brand accent and de-colors advisories, so a new hue would break a stated rule for a non-alarming condition. Governs R1.
 - KTD6. **The Days Today-card status indicator gains a finalizing case, drawn as an unfilled ring in the existing muted role.** Shape carries the distinction, not colour: `starting` already occupies the muted colour, so a colour-only treatment could not satisfy R13, and a new hue would break the same scarcity rule KTD5 honours. Shape also keeps the indicator from being colour-only for accessibility. (session-settled: user-directed — chosen over a distinct muted colour and over a pulse: colour is already spoken for and motion needs a reduced-motion fallback on a passive surface.) Governs R13.
@@ -235,7 +237,7 @@ flowchart TB
 
 ### Sequencing
 
-U1 establishes the authority and must land first. U2 completes its coverage and hardening. U3, U4, and U5 are the readers and are independent of each other; each depends only on U1. U4 and U5 both touch `macos/Screencap/Views/Days/DaysView.swift`, so landing them in either order requires a rebase but no coordination.
+U1 establishes the authority and must land first. U2 completes its coverage and hardening. U3 and U4 are the readers, independent of each other and depending only on U1.
 
 ---
 
@@ -312,48 +314,31 @@ U1 establishes the authority and must land first. U2 completes its coverage and 
   - The finalizing case does not resolve to the recording color role.
 - **Verification:** the icon shows a distinct non-recording busy state for the drain's duration and returns to idle when it ends.
 
-### U4. Library and Days row unfinished indicator
+### U4. Today-card finalizing state
 
-- **Goal:** A recording that has stopped but not completed shows an unfinished indicator on its row, during the drain and through upload.
-- **Requirements:** R4, R5, R6, R9. Implements KTD3, KTD7.
+Absorbs the unit that was U5. The two were separate on the assumption that a per-recording row surface existed alongside the Today card; it does not, so both land on the same status. U5's number is retired rather than reused.
+
+- **Goal:** The Days surface shows that a recording has stopped but is not done, across both the drain and the upload that can follow it, and its status dot tells that apart from every state it already shows.
+- **Requirements:** R4, R5, R6, R9, R13. Implements KTD3, KTD6, KTD7.
 - **Dependencies:** U1.
 - **Files:**
-  - `macos/Screencap/Views/Shared/RecordingRowStatus.swift` (new)
-  - `macos/Screencap/Views/Days/DaysView.swift`
-  - `macos/Screencap/Views/MainWindow.swift`
-  - `macos/ScreencapTests/RecordingRowStatusPolicyTests.swift` (new)
-- **Approach:**
-  1. Add a pure policy resolving a row's display status from the recording's lifecycle state plus whether that named recording is the one currently draining — the two-source rule KTD3 owns.
-  2. Render the indicator on the row surfaces that consume the recordings list, starting from `DaysView` and the consumer reached via `MainWindow`.
-  3. Trigger a list refresh when the finalizing state changes, extending the existing reactive re-resolve rather than adding a timer (KTD7).
-  4. Correct the stale claim about existing status chips in the timed-out branch of `runStop` in `macos/Screencap/Controllers/RecorderController.swift`, which asserts the Library already carries this signal.
-- **Patterns to follow:** the existing `.onChange(of:)` re-resolve in `DaysView`; the already-decoded lifecycle state on the recording summary model.
-- **Test scenarios:**
-  - Covers AE1. A local recording resolves to unfinished while draining and to finished once complete.
-  - Covers AE2. A cloud recording still reports its backend lifecycle as incomplete after the drain ends, and the row stays unfinished through upload.
-  - A recording that is draining resolves to unfinished even though its backend lifecycle still reads as recording — the KTD3 case the derived state alone cannot cover.
-  - A different recording than the one draining is unaffected by the finalizing state.
-  - A recording whose ledger reports a failed chunk resolves to finished rather than sitting unfinished forever.
-  - The indicator carries no elapsed time, countdown, or percentage.
-- **Verification:** the row shows unfinished from the moment Stop is pressed until the recording completes, with no polling introduced.
-
-### U5. Days Today-card status dot finalizing case
-
-- **Goal:** The Today card's status dot distinguishes finalizing from the states it already shows.
-- **Requirements:** R13, R9. Implements KTD6.
-- **Dependencies:** U1.
-- **Files:**
+  - `macos/Screencap/Views/Days/DaysModel.swift`
   - `macos/Screencap/Views/Days/DaysView.swift`
   - `macos/ScreencapTests/DaysModelTests.swift`
 - **Approach:**
-  1. Add a finalizing case to the status enum backing the dot and map it to a de-colored role, consistent with KTD5's treatment of the same condition in the menu bar.
-  2. Resolve the case from the same finalizing authority U1 established, so the dot and the icon cannot disagree.
-- **Patterns to follow:** the existing status-dot colour mapping, where starting already uses a muted non-alarming role.
+  1. Add a finalizing case to the Today-card status enum.
+  2. Resolve it from two sources per KTD3 — the drain flag for the drain window, and the lifecycle already on each summary for the upload window. Order it behind recording and ahead of starting.
+  3. Draw the dot as an unfilled ring in the existing muted role (KTD6), since `starting` already owns that colour.
+  4. Correct the stale claim about existing status chips in the timed-out branch of `runStop` in `macos/Screencap/Controllers/RecorderController.swift`, which asserts the Library already carries this signal.
+- **Patterns to follow:** the existing pure `todayCaptureStatus` resolver and its status-line vocabulary; the existing status-dot colour mapping, where `starting` already uses a muted non-alarming role.
 - **Test scenarios:**
-  - Finalizing resolves to its own case, distinct from recording, paused, starting, and off.
-  - The finalizing case does not resolve to the recording colour role.
-  - Recording takes precedence over finalizing if both were ever set, so a fresh recording is never shown as finishing.
-- **Verification:** the Today card and the menu-bar icon show the same condition for the same window.
+  - Covers AE1. A drain with no residual processing resolves to finalizing and clears when both sources go quiet.
+  - Covers AE2. A recording still reporting an incomplete lifecycle keeps the card finalizing after the drain flag has cleared.
+  - The drain source alone resolves to finalizing — the KTD3 case the backend lifecycle cannot cover, since it holds a draining recording in `recording`.
+  - Recording takes precedence over finalizing, so a fresh capture is never shown as finishing.
+  - Finalizing takes precedence over starting.
+  - The status line carries no elapsed time, countdown, or percentage.
+- **Verification:** the card reports unfinished from Stop until the recording completes, the dot is distinguishable from `starting` without colour, and no polling is introduced.
 
 ---
 
@@ -389,5 +374,4 @@ Per unit:
 - U1 — the state exists, opens on the stop edge, closes on the finalize edge, and no idle transition clears it.
 - U2 — daemon-reported drains open the state, the backstop sits above the kill grace, and the force-stop message still fires on an abnormal exit.
 - U3 — the icon renders three distinct states with distinct accessibility labels, and the Cmd+Q countdown keeps precedence.
-- U4 — the row shows unfinished across both the drain and upload windows, and the stale status-chip claim in `runStop`'s timed-out branch is corrected.
-- U5 — the Today-card dot has a finalizing case that cannot disagree with the menu-bar icon.
+- U4 — the Today card reports unfinished across both the drain and upload windows, its dot is distinguishable from `starting` without colour, and the stale status-chip claim in `runStop`'s timed-out branch is corrected.
