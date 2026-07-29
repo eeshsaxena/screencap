@@ -101,6 +101,25 @@ def _reset_config_cache():
     screencap.config._config_cache = None
 
 
+@pytest.fixture(autouse=True)
+def _default_paywall_off(monkeypatch):
+    """Default both client paywall flags OFF for the whole suite.
+
+    Paid-only launch flipped ``get_stripe_paywall_enabled`` and
+    ``get_local_paywall_enforced`` to default ON in config.py. The test suite is
+    not a billing bed: any test that spins up a daemon and calls a gated verb
+    (recall/search, recording.start, the MCP content.search / frame.nearest
+    round-trips) would otherwise 402 ``subscription_required``. Setting the env
+    vars here short-circuits the config read for every test (the in-process
+    daemons read the same ``os.environ``). Tests that exercise the paywall opt
+    in explicitly — the subscription-gate tests monkeypatch the config fn (which
+    wins over env), and the config tests clear/del the env to exercise the real
+    default + file-read path.
+    """
+    monkeypatch.setenv("SCREENCAP_STRIPE_PAYWALL", "0")
+    monkeypatch.setenv("SCREENCAP_LOCAL_PAYWALL_ENFORCE", "0")
+
+
 # ---------------------------------------------------------------------------
 # Real engine DB fixture
 # ---------------------------------------------------------------------------

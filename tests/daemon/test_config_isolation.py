@@ -36,11 +36,13 @@ def test_config_reads_resolve_the_isolated_path(
     # The env var short-circuits the config read; clear it so we exercise the file.
     monkeypatch.delenv("SCREENCAP_LOCAL_PAYWALL_ENFORCE", raising=False)
 
-    # No isolated config file → the flag falls through to its default (off).
-    cfg.invalidate_config_cache()
-    assert cfg.get_local_paywall_enforced() is False
-
-    # A value in the isolated config is honored → reads hit the isolated path.
-    cfg._CONFIG_PATH.write_text("local_paywall_enforce = true\n")
+    # No isolated config file → the flag falls through to its default (ON, since
+    # the paid-only launch; SCR). Prove the isolated PATH is what's read by then
+    # writing the NON-default value: a False result can only come from the
+    # isolated file being honored, not the default.
     cfg.invalidate_config_cache()
     assert cfg.get_local_paywall_enforced() is True
+
+    cfg._CONFIG_PATH.write_text("local_paywall_enforce = false\n")
+    cfg.invalidate_config_cache()
+    assert cfg.get_local_paywall_enforced() is False
