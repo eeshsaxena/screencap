@@ -37,19 +37,6 @@ final class ShareLinkControllerTests: XCTestCase {
         XCTAssertEqual(controller.activeToken, "t")
     }
 
-    func testCopyingAgainReusesTheLinkWithoutAnotherCreate() async {
-        let service = FakeShareLinkService()
-        service.createResult = .success(makeResponse(url: "https://s.sh/share/t#k", token: "t"))
-        let pasteboard = PasteboardSpy()
-        let controller = makeController(service: service, pasteboard: pasteboard)
-
-        await controller.copyLink()
-        controller.copyExistingLink()
-
-        XCTAssertEqual(service.createCallCount, 1)
-        XCTAssertEqual(pasteboard.written.count, 2)
-    }
-
     // MARK: - Revoke (R4, AE6)
 
     func testRevokeReturnsToNoLinkAndStopsOfferingRevoke() async {
@@ -116,10 +103,51 @@ final class ShareLinkControllerTests: XCTestCase {
 
         await controller.copyLink()
 
-        XCTAssertEqual(controller.phase, .failed(.notSignedIn))
+        XCTAssertEqual(controller.phase, .failed(.notSignedIn, during: .create))
         XCTAssertEqual(ShareLinkErrorCopy.notSignedIn.action, .signIn)
         XCTAssertTrue(pasteboard.written.isEmpty)
         XCTAssertNil(controller.lastCreatedURL)
+    }
+
+    /// A failed revoke must report itself as a REVOKE failure. Without the
+    /// recorded operation the window titled it "couldn't create the share
+    /// link" and its retry minted a fresh link instead of retrying the revoke.
+    func testFailedRevokeIsAttributedToRevokeAndRetriesTheRevoke() async {
+        let service = FakeShareLinkService()
+        service.createResult = .success(makeResponse(url: "https://s.sh/share/t#k", token: "t"))
+        service.revokeResult = .failure(
+            DaemonClientError.envelopeError(code: "share_backend_unavailable", rawBody: Data())
+        )
+        let controller = makeController(service: service)
+
+        await controller.copyLink()
+        await controller.revoke()
+        XCTAssertEqual(controller.phase, .failed(.backendUnavailable, during: .revoke))
+
+        // Retry must re-drive the revoke — not create a second live link.
+        service.revokeResult = .success(makeResponse())
+        await controller.retryFailedOperation()
+
+        XCTAssertEqual(service.createCallCount, 1)
+        XCTAssertEqual(service.revokedTokens, ["t", "t"])
+        XCTAssertEqual(controller.phase, .noLink)
+    }
+
+    /// Dismissing a failed revoke returns to the truth: the link is still live.
+    func testDismissingAFailedRevokeRestoresTheLiveLink() async {
+        let service = FakeShareLinkService()
+        service.createResult = .success(makeResponse(url: "https://s.sh/share/t#k", token: "t"))
+        service.revokeResult = .failure(
+            DaemonClientError.envelopeError(code: "share_backend_unavailable", rawBody: Data())
+        )
+        service.listResult = .success([record(token: "t", recording: "rec-1")])
+        let controller = makeController(service: service)
+
+        await controller.copyLink()
+        await controller.revoke()
+        await controller.dismissFailure()
+
+        XCTAssertEqual(controller.phase, .hasLink(token: "t"))
     }
 
     func testTransientFailureOffersRetryAndASubsequentRetrySucceeds() async {
@@ -130,7 +158,7 @@ final class ShareLinkControllerTests: XCTestCase {
         let controller = makeController(service: service)
 
         await controller.copyLink()
-        XCTAssertEqual(controller.phase, .failed(.backendUnavailable))
+        XCTAssertEqual(controller.phase, .failed(.backendUnavailable, during: .create))
         XCTAssertEqual(ShareLinkErrorCopy.backendUnavailable.action, .retry)
 
         service.createResult = .success(makeResponse(url: "https://s.sh/share/t#k", token: "t"))
@@ -149,7 +177,36 @@ final class ShareLinkControllerTests: XCTestCase {
 
         await controller.copyLink()
 
-        XCTAssertEqual(controller.phase, .failed(.unknown))
+        XCTAssertEqual(controller.phase, .failed(.unknown, during: .create))
+        XCTAssertTrue(pasteboard.written.isEmpty)
+    }
+
+    /// Re-copying an in-memory link must not pay for a whole new share: a
+    /// create fetches, re-encrypts, and uploads the recording, and it would
+    /// also leave a second live link behind.
+    func testCopyingAgainDoesNotMintASecondShare() async {
+        let service = FakeShareLinkService()
+        service.createResult = .success(makeResponse(url: "https://s.sh/share/t#k", token: "t"))
+        let pasteboard = PasteboardSpy()
+        let controller = makeController(service: service, pasteboard: pasteboard)
+
+        await controller.copyLink()
+        controller.copyExistingLink()
+        controller.copyExistingLink()
+
+        XCTAssertEqual(service.createCallCount, 1)
+        XCTAssertEqual(pasteboard.written, Array(repeating: "https://s.sh/share/t#k", count: 3))
+    }
+
+    /// The key lives only in the fragment and is never persisted, so with no
+    /// link in memory there is nothing to re-copy — this must be a no-op rather
+    /// than putting a stale or empty value on the pasteboard.
+    func testCopyingAgainWithNothingInMemoryIsANoOp() {
+        let pasteboard = PasteboardSpy()
+        let controller = makeController(service: FakeShareLinkService(), pasteboard: pasteboard)
+
+        controller.copyExistingLink()
+
         XCTAssertTrue(pasteboard.written.isEmpty)
     }
 

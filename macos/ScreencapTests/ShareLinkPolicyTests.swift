@@ -109,7 +109,7 @@ final class ShareLinkPolicyTests: XCTestCase {
         XCTAssertEqual(ShareLinkErrorCopy.notSignedIn.action, .signIn)
         XCTAssertEqual(ShareLinkErrorCopy.backendUnavailable.action, .retry)
         // Retrying cannot make an un-uploaded recording shareable.
-        XCTAssertEqual(ShareLinkErrorCopy.nothingToShare.action, .none)
+        XCTAssertEqual(ShareLinkErrorCopy.nothingToShare.action, .noRecovery)
     }
 
     func testUnknownAndFutureCodesFallBackWithoutSurfacingText() {

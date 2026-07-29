@@ -110,7 +110,7 @@ struct InspectWindow: View {
                 )
             }
             .alert(
-                "Couldn't create the share link",
+                failureTitle,
                 isPresented: Binding(
                     get: { failureCopy != nil },
                     set: { if !$0 { Task { await shareLink.dismissFailure() } } }
@@ -150,8 +150,17 @@ struct InspectWindow: View {
     }
 
     private var failureCopy: ShareLinkErrorCopy? {
-        if case .failed(let copy) = shareLink.phase { return copy }
+        if case .failed(let copy, _) = shareLink.phase { return copy }
         return nil
+    }
+
+    /// Titled by what actually failed — a failed revoke must not claim the app
+    /// couldn't create a link.
+    private var failureTitle: String {
+        if case .failed(_, let operation) = shareLink.phase, operation == .revoke {
+            return "Couldn't revoke the share link"
+        }
+        return "Couldn't create the share link"
     }
 
     /// Low-emphasis hand-off to the consent window (R9/R10), now also the home
@@ -178,10 +187,22 @@ struct InspectWindow: View {
                     // can't retract an already-downloaded copy — follows on
                     // the confirmation (R7).
                     Text("Link is view-only and carries its own key")
-                    Button(shareLink.activeToken == nil ? "Copy Share Link" : "Copy Link Again") {
-                        Task {
-                            await shareLink.copyLink()
-                            if case .hasLink = shareLink.phase { justCopied = true }
+                    // Keyed on whether the link is still in memory, NOT on
+                    // whether a share exists. The key is never persisted (it
+                    // only ever lives in the fragment), so after a relaunch the
+                    // old link is unrecoverable and copying genuinely mints a
+                    // new one — the label must not call that "again".
+                    if shareLink.lastCreatedURL != nil {
+                        Button("Copy Link Again") {
+                            shareLink.copyExistingLink()
+                            justCopied = true
+                        }
+                    } else {
+                        Button("Copy Share Link") {
+                            Task {
+                                await shareLink.copyLink()
+                                if case .hasLink = shareLink.phase { justCopied = true }
+                            }
                         }
                     }
                     if shareLink.activeToken != nil {
@@ -214,12 +235,14 @@ struct InspectWindow: View {
     private func failureButtons(for copy: ShareLinkErrorCopy) -> some View {
         switch copy.action {
         case .retry:
-            Button("Try Again") { Task { await shareLink.copyLink() } }
+            // Routed by the recorded operation, so retrying a failed revoke
+            // retries the revoke rather than minting a fresh link.
+            Button("Try Again") { Task { await shareLink.retryFailedOperation() } }
         case .signIn:
             // Inspect deliberately holds no account sheet, so sign-in routes to
             // the main window, where the account surface lives.
             Button("Open Screencap") { openWindow(id: MainWindowID) }
-        case .none:
+        case .noRecovery:
             EmptyView()
         }
         Button("OK", role: .cancel) { Task { await shareLink.dismissFailure() } }

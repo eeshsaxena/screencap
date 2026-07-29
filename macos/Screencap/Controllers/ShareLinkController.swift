@@ -94,11 +94,14 @@ enum ShareLinkErrorCopy: Equatable, CaseIterable {
     case unknown
 
     /// The recovery affordance rendered next to the message.
+    ///
+    /// The no-recovery case is spelled `noRecovery` rather than `none` so it
+    /// can never be misread as `Optional.none` at a call site.
     enum Action: Equatable {
         case retry
         case signIn
         /// No useful recovery — the message alone is the whole answer.
-        case none
+        case noRecovery
     }
 
     var message: String {
@@ -119,7 +122,8 @@ enum ShareLinkErrorCopy: Equatable, CaseIterable {
     var action: Action {
         switch self {
         case .notSignedIn: return .signIn
-        case .nothingToShare: return .none
+        // Retrying cannot make an un-uploaded recording shareable.
+        case .nothingToShare: return .noRecovery
         case .backendUnavailable, .helperUnavailable, .unknown: return .retry
         }
     }
@@ -188,6 +192,15 @@ struct LiveShareLinkService: ShareLinkService {
 /// encryption model. That is why this controller has no `Logger` at all.
 @MainActor
 final class ShareLinkController: ObservableObject {
+    /// Which action failed. Carried on `.failed` so the window can title the
+    /// alert and route its retry correctly — without it, a failed revoke
+    /// reported itself as a failed create and "Try Again" minted a new link
+    /// instead of retrying the revoke.
+    enum Operation: Equatable {
+        case create
+        case revoke
+    }
+
     enum Phase: Equatable {
         /// No link this Mac knows about.
         case noLink
@@ -195,7 +208,7 @@ final class ShareLinkController: ObservableObject {
         case hasLink(token: String)
         case creating
         case revoking
-        case failed(ShareLinkErrorCopy)
+        case failed(ShareLinkErrorCopy, during: Operation)
     }
 
     @Published private(set) var phase: Phase = .noLink
@@ -208,6 +221,10 @@ final class ShareLinkController: ObservableObject {
     /// clobbering the developer's real clipboard mid-suite. Main-actor isolated
     /// like its only caller, so it stays legal under strict concurrency.
     private let writeToPasteboard: @MainActor (String) -> Void
+    /// The token a revoke is acting on, held separately from `phase` so it
+    /// survives a failed revoke — `activeToken` reads nil once the phase is
+    /// `.failed`, which would otherwise make the retry a silent no-op.
+    private var revokeTargetToken: String?
 
     init(
         recordingName: String,
@@ -263,7 +280,7 @@ final class ShareLinkController: ObservableObject {
         do {
             let response = try await service.create(recording: recordingName)
             guard let urlString = response.url, let url = URL(string: urlString) else {
-                phase = .failed(.unknown)
+                phase = .failed(.unknown, during: .create)
                 return
             }
             writeToPasteboard(urlString)
@@ -282,7 +299,7 @@ final class ShareLinkController: ObservableObject {
             // Nothing reaches the pasteboard on failure, and no stale link is
             // left behind for the share sheet to hand out.
             lastCreatedURL = nil
-            phase = .failed(ShareLinkErrorCopy.resolve(error))
+            phase = .failed(ShareLinkErrorCopy.resolve(error), during: .create)
         }
     }
 
@@ -295,21 +312,36 @@ final class ShareLinkController: ObservableObject {
     /// Revoke the active link (R4, AE6). Refreshes afterwards so the menu stops
     /// offering revoke.
     func revoke() async {
-        guard !isBusy, let token = activeToken else { return }
+        guard !isBusy, let token = activeToken ?? revokeTargetToken else { return }
+        revokeTargetToken = token
         phase = .revoking
         do {
             _ = try await service.revoke(token: token)
+            revokeTargetToken = nil
             lastCreatedURL = nil
             phase = .noLink
             await refresh()
         } catch {
-            phase = .failed(ShareLinkErrorCopy.resolve(error))
+            phase = .failed(ShareLinkErrorCopy.resolve(error), during: .revoke)
         }
     }
 
-    /// Clear a failure so the menu returns to its normal actions.
+    /// Retry whichever action failed. Routing on the recorded operation is what
+    /// stops a failed revoke's "Try Again" from minting a fresh link.
+    func retryFailedOperation() async {
+        guard case .failed(_, let operation) = phase else { return }
+        switch operation {
+        case .create: await copyLink()
+        case .revoke: await revoke()
+        }
+    }
+
+    /// Clear a failure so the menu returns to its normal actions. The refresh
+    /// re-derives the real state, so a dismissed revoke failure correctly goes
+    /// back to showing the link as still live.
     func dismissFailure() async {
         guard case .failed = phase else { return }
+        revokeTargetToken = nil
         phase = .noLink
         await refresh()
     }
