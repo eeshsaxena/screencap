@@ -153,7 +153,12 @@ protocol DaemonSessionService {
     func probe() async -> DaemonSession.ProbeOutcome
     func snapshot() async -> DaemonSession.SnapshotOutcome
     func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording
-    func stopRecording(force: Bool) async throws
+    /// Stop the running recording. Returns `true` when the daemon handed the
+    /// engine off to the SCR-273 background drain rather than seeing it exit
+    /// within the stop timeout — i.e. finalize work is still running. This is
+    /// the drain's opening edge; its closing edge is the `recording_finalized`
+    /// event (SCR-296 KTD2).
+    func stopRecording(force: Bool) async throws -> Bool
     /// Forward a mute/unmute request for the running recording (SCR-254 U7).
     /// Returns the daemon's echo of the REQUESTED state — a transport ack, NOT
     /// confirmation (the confirming event flips the controller's `muted`, KTD4).
@@ -166,7 +171,8 @@ protocol DaemonSessionService {
 extension DaemonSessionService {
     /// Convenience overload mirroring the pre-protocol `stopRecording(force:)`
     /// default — production callers do not pass `force`.
-    func stopRecording() async throws {
+    @discardableResult
+    func stopRecording() async throws -> Bool {
         try await stopRecording(force: false)
     }
 }
@@ -224,8 +230,11 @@ final class LiveDaemonSessionService: DaemonSessionService {
         )
     }
 
-    func stopRecording(force: Bool) async throws {
-        _ = try await DaemonClient.recordingStop(RecordingStopRequest(force: force))
+    func stopRecording(force: Bool) async throws -> Bool {
+        let response = try await DaemonClient.recordingStop(RecordingStopRequest(force: force))
+        // SCR-273 returns this instead of killing an engine that outlived the
+        // stop timeout; anything else means the engine was already gone.
+        return response.finalState == "finalizing"
     }
 
     func setMuted(_ muted: Bool) async throws -> Bool {

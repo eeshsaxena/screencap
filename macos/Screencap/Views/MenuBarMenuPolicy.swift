@@ -79,6 +79,58 @@ enum MenuBarMenuPolicy {
     }
 }
 
+/// Shared menu-bar icon presentation (SCR-296) — ONE resolution of the three
+/// states the icon can show, so its glyph, colour role, VoiceOver label, and the
+/// dropdown's status line cannot drift apart. Pure, so the tri-state is
+/// unit-testable without standing up a menu-bar view.
+enum MenuBarIconPresentation {
+    /// The three states the icon distinguishes (R1).
+    enum State: Equatable {
+        case idle
+        case recording
+        /// A stopped recording still draining its finalize work. Ends when the
+        /// engine exits, NOT when upload finishes (R2) — the row indicator is
+        /// what covers the longer window.
+        case finalizing
+    }
+
+    /// Recording wins over finalizing. The two barely overlap in practice, but a
+    /// recording started while a previous drain is still running must read as
+    /// recording — never as finishing.
+    static func state(isRecording: Bool, finalizing: Bool) -> State {
+        if isRecording { return .recording }
+        return finalizing ? .finalizing : .idle
+    }
+
+    /// SF Symbol per state. The finalizing case is a distinct GLYPH rather than
+    /// a recolouring: this menu bar reserves colour for the recording state and
+    /// the brand accent and de-colours advisories, so shape carries the
+    /// distinction (KTD5).
+    static func iconName(_ state: State) -> String {
+        switch state {
+        case .idle: return "record.circle"
+        case .recording: return "record.circle.fill"
+        case .finalizing: return "ellipsis.circle"
+        }
+    }
+
+    /// VoiceOver label. The three states must be tellable apart without seeing
+    /// the glyph, which is the whole reason the distinction is not colour.
+    static func accessibilityLabel(_ state: State) -> String {
+        switch state {
+        case .idle: return "Screencap"
+        case .recording: return "Screencap, recording"
+        case .finalizing: return "Screencap, finishing up"
+        }
+    }
+
+    /// The dropdown's status line during a drain. Carries no countdown, elapsed
+    /// time, or percentage (R9): the app cannot honestly predict when finalize
+    /// work ends, and the Cmd+Q line it sits beside already demonstrates the
+    /// failure mode — that one counts down a timeout budget, not real progress.
+    static let finalizingStatusLine = "Finishing up…"
+}
+
 /// Shared mute-control presentation (SCR-254 U8) — ONE grammar for the HUD pill
 /// and the menu-bar item so "Muted" never reads ambiguously as "tap to mute". The
 /// control shows the CURRENT mic status ("Mic on" / "Muted"), a transitional

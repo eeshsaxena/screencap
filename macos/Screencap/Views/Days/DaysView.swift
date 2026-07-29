@@ -123,7 +123,9 @@ struct DaysView: View {
             startedAt: activeStartedAt,
             ambientEnabled: ambient.enabled,
             ambientActive: ambient.active,
-            ambientPaused: ambient.paused
+            ambientPaused: ambient.paused,
+            drainRunning: recorder.finalizing,
+            hasUnfinishedRecording: DaysModel.hasUnfinishedRecording(todayCard?.recordings ?? [])
         )
     }
 
@@ -576,19 +578,32 @@ private struct TodayCardView: View {
 
     /// A live pulse dot for the recording state; distinct colors keep paused and
     /// off visually separate (AE6).
+    ///
+    /// SCR-296's `finalizing` is drawn as an unfilled RING rather than a fifth
+    /// colour: `starting` already owns the muted role, and a colour-only
+    /// treatment could not tell the two apart. Shape also keeps the state
+    /// legible without relying on colour at all.
     private var statusDot: some View {
         Circle()
-            .fill(statusColor)
+            .fill(isFinalizing ? Color.clear : statusColor)
             .frame(width: 8, height: 8)
             .overlay(
-                Circle().stroke(statusColor.opacity(0.35), lineWidth: 3)
+                Circle().stroke(
+                    isFinalizing ? statusColor : statusColor.opacity(0.35),
+                    lineWidth: isFinalizing ? 1.5 : 3
+                )
             )
     }
+
+    private var isFinalizing: Bool { status == .finalizing }
 
     private var statusColor: Color {
         switch status {
         case .recording: return .scTeal
         case .paused: return .scAmberText
+        // Shares the muted role with `starting` on purpose — `statusDot` draws
+        // this one hollow, so the shape is what separates them.
+        case .finalizing: return .scInkMuted
         case .starting: return .scInkMuted
         case .off: return .scInkFaint
         }

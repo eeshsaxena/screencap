@@ -132,6 +132,92 @@ final class DaysModelTests: XCTestCase {
         XCTAssertNotEqual(DaysModel.todayStatusLine(.paused), DaysModel.todayStatusLine(.off))
     }
 
+    // MARK: - Post-stop finalize drain (SCR-296)
+
+    private func summary(state: String) throws -> RecordingSummary {
+        try JSONDecoder().decode(RecordingSummary.self, from: Data("""
+        {
+          "name": "r-\(state)", "date": "2026-07-29", "duration": "0:10",
+          "size_mb": "1.0 MB", "has_audio": false, "transcribed": false,
+          "uploaded": false, "is_stub": false, "state": "\(state)"
+        }
+        """.utf8))
+    }
+
+    /// The drain half of the two-source rule. The backend cannot supply this —
+    /// it holds a draining recording in `recording` until the engine exits — so
+    /// without the app's own flag the card would show nothing for the whole
+    /// window this ticket exists to make visible.
+    func testDrainRunningShowsFinalizing() {
+        XCTAssertEqual(
+            DaysModel.todayCaptureStatus(
+                isRecording: false, startedAt: nil, ambientEnabled: false,
+                ambientActive: false, ambientPaused: false, drainRunning: true
+            ),
+            .finalizing
+        )
+    }
+
+    /// The other half: on a cloud recording the drain ends but the lifecycle
+    /// stays incomplete through upload, and the card must keep saying so.
+    func testUnfinishedRecordingShowsFinalizingAfterTheDrainEnds() {
+        XCTAssertEqual(
+            DaysModel.todayCaptureStatus(
+                isRecording: false, startedAt: nil, ambientEnabled: false,
+                ambientActive: false, ambientPaused: false,
+                drainRunning: false, hasUnfinishedRecording: true
+            ),
+            .finalizing
+        )
+    }
+
+    /// A live capture is the more urgent fact; a recording started while an old
+    /// drain is still settling must never read as finishing.
+    func testRecordingWinsOverAFinalizingDrain() {
+        let since = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertEqual(
+            DaysModel.todayCaptureStatus(
+                isRecording: true, startedAt: since, ambientEnabled: true,
+                ambientActive: true, ambientPaused: false, drainRunning: true
+            ),
+            .recording(since: since)
+        )
+    }
+
+    /// `starting` means ambient is enabled but idle. A drain is something
+    /// concrete happening right now, so it takes the card.
+    func testFinalizingWinsOverStarting() {
+        XCTAssertEqual(
+            DaysModel.todayCaptureStatus(
+                isRecording: false, startedAt: nil, ambientEnabled: true,
+                ambientActive: false, ambientPaused: false, drainRunning: true
+            ),
+            .finalizing
+        )
+    }
+
+    /// R9: no countdown, no percentage, no figure of any kind — the app cannot
+    /// honestly predict when finalize work ends.
+    func testFinalizingLineIsDistinctAndClaimsNoProgress() {
+        let line = DaysModel.todayStatusLine(.finalizing)
+        XCTAssertNotEqual(line, DaysModel.todayStatusLine(.starting))
+        XCTAssertNotEqual(line, DaysModel.todayStatusLine(.off))
+        XCTAssertFalse(line.contains("%"))
+        XCTAssertNil(
+            line.rangeOfCharacter(from: CharacterSet.decimalDigits),
+            "no elapsed or remaining figure"
+        )
+    }
+
+    func testHasUnfinishedRecordingReadsTheLifecycle() throws {
+        let processing = try summary(state: "processing")
+        let ready = try summary(state: "ready")
+
+        XCTAssertTrue(DaysModel.hasUnfinishedRecording([ready, processing]))
+        XCTAssertFalse(DaysModel.hasUnfinishedRecording([ready]))
+        XCTAssertFalse(DaysModel.hasUnfinishedRecording([]))
+    }
+
     // MARK: - Upload / review badge (R14)
 
     /// The upload arm counts ONLY cloud-destined, upload-eligible recordings — a

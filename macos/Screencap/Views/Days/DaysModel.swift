@@ -117,6 +117,10 @@ enum DaysModel {
         case recording(since: Date?)
         /// Ambient capture is live but paused — nothing is being captured.
         case paused
+        /// SCR-296: capture has stopped, but the recording is not done — the
+        /// finalize drain, or (on cloud) the upload that follows it. Distinct
+        /// from `starting` and `off`, both of which mean nothing is happening.
+        case finalizing
         /// Ambient is enabled but no live recording exists yet (spawning).
         case starting
         /// Ambient recording is off and nothing is recording.
@@ -127,17 +131,38 @@ enum DaysModel {
     /// the AE6 states are assertable without a live daemon. Paused takes
     /// precedence — `AmbientStatus.paused` is only ever true while an ambient
     /// recording is live, so it always means "paused", not "off".
+    /// SCR-296 adds `finalizing`, resolved from TWO sources because no single
+    /// one spans the whole post-stop window (KTD3):
+    ///
+    /// - `drainRunning` covers the finalize drain. The backend cannot report it:
+    ///   it keys `recording` off the pidfile flock, which the engine holds until
+    ///   it exits, so a draining recording still reads as `recording` there.
+    /// - `hasUnfinishedRecording` covers what follows on a cloud recording,
+    ///   where the lifecycle stays incomplete through upload.
     static func todayCaptureStatus(
         isRecording: Bool,
         startedAt: Date?,
         ambientEnabled: Bool,
         ambientActive: Bool,
-        ambientPaused: Bool
+        ambientPaused: Bool,
+        drainRunning: Bool = false,
+        hasUnfinishedRecording: Bool = false
     ) -> TodayCaptureStatus {
         if ambientPaused { return .paused }
         if isRecording || ambientActive { return .recording(since: startedAt) }
+        // Ahead of `starting`: a drain is a concrete thing happening now, while
+        // `starting` is the ambient-enabled idle state. Behind `recording` so a
+        // fresh capture is never shown as finishing.
+        if drainRunning || hasUnfinishedRecording { return .finalizing }
         if ambientEnabled { return .starting }
         return .off
+    }
+
+    /// Whether any of a day's recordings has stopped but not reached a terminal
+    /// state — the upload-window half of the `finalizing` status above. Reads
+    /// the lifecycle the list response already carries.
+    static func hasUnfinishedRecording(_ recordings: [RecordingSummary]) -> Bool {
+        recordings.contains { $0.isProcessing }
     }
 
     /// The Today-card status line copy for each state (R15 vocabulary).
@@ -151,6 +176,11 @@ enum DaysModel {
             return "Recording since \(f.string(from: since))"
         case .paused:
             return "Paused — nothing is being captured until you resume"
+        case .finalizing:
+            // Deliberately matches the menu bar's line: one condition, one
+            // phrase, wherever the user happens to look. No countdown or
+            // percentage — the app cannot honestly predict when this ends (R9).
+            return "Finishing up…"
         case .starting:
             return "Ambient recording is starting…"
         case .off:

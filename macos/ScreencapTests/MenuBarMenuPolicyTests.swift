@@ -4,6 +4,65 @@ import XCTest
 /// Hide control — the menu-bar "Show recording controls" visibility gate.
 final class MenuBarMenuPolicyTests: XCTestCase {
 
+    // MARK: - Menu-bar icon tri-state (SCR-296)
+
+    func testIconStateResolvesTheThreeCases() {
+        XCTAssertEqual(
+            MenuBarIconPresentation.state(isRecording: true, finalizing: false), .recording
+        )
+        XCTAssertEqual(
+            MenuBarIconPresentation.state(isRecording: false, finalizing: true), .finalizing
+        )
+        XCTAssertEqual(
+            MenuBarIconPresentation.state(isRecording: false, finalizing: false), .idle
+        )
+    }
+
+    /// A recording started while a previous drain is still running must read as
+    /// recording — the live capture is the more urgent fact.
+    func testRecordingWinsOverAStillRunningDrain() {
+        XCTAssertEqual(
+            MenuBarIconPresentation.state(isRecording: true, finalizing: true), .recording
+        )
+    }
+
+    /// KTD5: the finalizing state is distinguished by GLYPH, because this menu
+    /// bar reserves colour for the recording state and the brand accent. If the
+    /// three states ever share a symbol, the distinction has silently moved to
+    /// colour and the scarcity rule is broken.
+    func testEachIconStateHasItsOwnGlyph() {
+        let names = [
+            MenuBarIconPresentation.iconName(.idle),
+            MenuBarIconPresentation.iconName(.recording),
+            MenuBarIconPresentation.iconName(.finalizing),
+        ]
+        XCTAssertEqual(Set(names).count, 3, "the three states must not share a glyph")
+    }
+
+    /// The distinction must survive without sight of the glyph.
+    func testEachIconStateHasItsOwnAccessibilityLabel() {
+        let labels = [
+            MenuBarIconPresentation.accessibilityLabel(.idle),
+            MenuBarIconPresentation.accessibilityLabel(.recording),
+            MenuBarIconPresentation.accessibilityLabel(.finalizing),
+        ]
+        XCTAssertEqual(Set(labels).count, 3, "VoiceOver must tell the three states apart")
+    }
+
+    /// R9: the drain has no honest ETA, so the line must not imply one. The
+    /// Cmd+Q countdown beside it is the cautionary example — it counts down a
+    /// timeout budget, so a recording that finishes in 40s still shows minutes
+    /// "remaining".
+    func testFinalizingStatusLineCarriesNoProgressClaim() {
+        let line = MenuBarIconPresentation.finalizingStatusLine
+        XCTAssertFalse(line.contains("%"), "no percentage")
+        XCTAssertFalse(line.contains("remaining"), "no countdown")
+        XCTAssertNil(
+            line.rangeOfCharacter(from: CharacterSet.decimalDigits),
+            "no elapsed or remaining figure"
+        )
+    }
+
     func testVisibleOnlyWhileRecordingAndHidden() {
         XCTAssertTrue(MenuBarMenuPolicy.showRecordingControlsVisible(
             state: .recording(elapsed: 12), hudHidden: true

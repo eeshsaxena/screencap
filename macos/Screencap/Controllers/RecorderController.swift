@@ -330,6 +330,11 @@ final class RecorderController: ObservableObject {
                 // starts unmuted and no stale in-flight flag survives.
                 muted = false
                 muteInFlight = false
+                // SCR-296: `finalizing` is deliberately NOT cleared here. An
+                // in-app Stop lands on `.idle` the moment its 60s wait gives up,
+                // which is the middle of a 1-5 minute drain — clearing it here
+                // would weld the surface back to the timeout (KTD1). Only
+                // `recording_finalized` or the U2 backstop closes it.
             }
             // SCR-264: re-run the post-update stale-daemon swap on the
             // recording→idle edge. A launch that landed while a daemon-owned
@@ -399,6 +404,35 @@ final class RecorderController: ObservableObject {
     /// affordance so the control never optimistically shows the target state.
     /// Cleared by the confirming event, by a verb failure, or on `.idle`.
     @Published private(set) var muteInFlight: Bool = false
+    /// SCR-296: true while a stopped recording is still draining its finalize
+    /// work (transcribe → scrub → index → export) under SCR-273's no-kill stop.
+    /// The single authority the menu-bar icon, the Days Today-card dot, and the
+    /// row indicator all read.
+    ///
+    /// ORTHOGONAL to the recording lifecycle, exactly like `muted` — and
+    /// deliberately NOT cleared by the `state.didSet` idle chokepoint. The
+    /// in-app Stop reaches `.idle` when its 60s wait gives up, which is the
+    /// middle of a 1-5 minute drain, so clearing it there would tie visibility
+    /// back to the timeout this exists to escape (KTD1).
+    ///
+    /// Opened by the stop response reporting a drain and closed by
+    /// `recording_finalized` — never by an elapsed budget (KTD2, R7, R8).
+    @Published private(set) var finalizing: Bool = false
+    /// The daemon's own drain bound (`SCREENCAP_DAEMON_STOP_KILL_GRACE`,
+    /// `src/screencap/daemon/supervisor.py`). Mirrored here only so the
+    /// ordering below is test-pinnable; the daemon remains its owner.
+    static let daemonStopKillGrace: TimeInterval = 630
+    /// SCR-296 (KTD4): failure-only bound on the drain surface, for the case
+    /// where the closing event never arrives at all.
+    ///
+    /// MUST exceed `daemonStopKillGrace`. The daemon already hard-bounds the
+    /// drain by force-killing a hung engine, and that kill still publishes
+    /// `recording_finalized` — so the real closing edge always arrives by the
+    /// grace plus kill/exit/publish latency. A backstop at or under the grace
+    /// would fire FIRST and clear the surface while work was still running,
+    /// which is the layered-timeout failure recorded in
+    /// `docs/solutions/integration-issues/inner-timeout-unreachable-behind-outer-watchdog-2026-06-24.md`.
+    static let defaultFinalizingBackstop: TimeInterval = 690
     /// U7: the provisional recording name shown on the HUD title (the daemon
     /// session id / CLI name — the directory slug until post-stop auto-naming
     /// renames it; user rename is SCR-223). `nil` → the HUD shows "Recording".
@@ -474,6 +508,11 @@ final class RecorderController: ObservableObject {
 
     private var daemonEventTask: Task<Void, Never>?
     private var elapsedTimer: Timer?
+    /// SCR-296: how long the drain surface may stay up without a closing event.
+    /// Injectable so tests can exercise the backstop without a 690s wait.
+    private let finalizingBackstop: TimeInterval
+    /// The armed backstop, nil whenever no drain is open.
+    private var finalizingBackstopTask: Task<Void, Never>?
     private var daemonInstalledObserver: NSObjectProtocol?
 
     func bindIndex(_ index: RecordingsIndex) {
@@ -493,8 +532,10 @@ final class RecorderController: ObservableObject {
         windowLifecycle: WindowLifecycle = WindowLifecycleFactory.makeDefault(),
         inputMonitor: HUDInputMonitor = HUDInputMonitorFactory.makeDefault(),
         hintStore: HUDHintStore = HUDHintStore(),
-        micAuthorizer: MicAuthorizing = LiveMicAuthorizer()
+        micAuthorizer: MicAuthorizing = LiveMicAuthorizer(),
+        finalizingBackstop: TimeInterval = RecorderController.defaultFinalizingBackstop
     ) {
+        self.finalizingBackstop = finalizingBackstop
         self.watchdog = watchdog
         self.alertPresenter = alertPresenter
         self.cliService = cliService
@@ -909,8 +950,14 @@ final class RecorderController: ObservableObject {
             // action to take — the drain always ends on its own. `lastError` is
             // the terminal-failure channel: it renders red and is only ever
             // cleared by `enterStarting()`, so a notice written here would
-            // outlive the drain it describes. A user-visible "still finishing"
-            // surface needs its own auto-clearing channel (SCR-296).
+            // outlive the drain it describes.
+            //
+            // SCR-296: `finalizing` is that auto-clearing channel, and this is
+            // how a drain the app did not start reaches it (R3) — a CLI or
+            // ambient stop, or a relaunch into a drain already running (R12).
+            // `beginFinalizing()` is idempotent, so the repeated probes that
+            // reach this branch during one drain open it exactly once.
+            beginFinalizing()
             recorderLogger.info(
                 "Daemon session is finalizing; not attaching. name=\(recordingName ?? "unknown", privacy: .public)"
             )
@@ -1100,10 +1147,19 @@ final class RecorderController: ObservableObject {
         let outcome = await stopPolicy.runStop(
             quitting: quitting,
             timeout: nil,
-            sendStopSignal: { [daemonService, isDaemon] in
+            sendStopSignal: { [weak self, daemonService, isDaemon] in
                 if isDaemon {
-                    try await daemonService.stopRecording(force: false)
+                    // SCR-296: open the drain here, INSIDE the closure, before
+                    // the wait begins. `recording_finalized` can land while
+                    // `runStop` is still awaiting, so opening it after the call
+                    // returns would re-open a drain the event had just closed.
+                    if try await daemonService.stopRecording(force: false) {
+                        self?.beginFinalizing()
+                    }
                 } else {
+                    // CLI fallback dispatches detached and returns no final
+                    // state, so there is no drain edge to read here; the next
+                    // daemon probe picks it up instead (U2).
                     _ = try CLIClient.runDetached(["stop"])
                 }
             },
@@ -1145,8 +1201,12 @@ final class RecorderController: ObservableObject {
             // self-resolves. Writing it to `lastError` (the terminal-failure
             // channel, never auto-cleared — see the `state.didSet` idle
             // chokepoint) left a stale red banner over the Library long after the
-            // recording finished uploading. The per-recording Library status
-            // chips already carry the finalization signal.
+            // recording finished uploading. SCR-296 carries the signal instead,
+            // on `finalizing` — an orthogonal flag this transition deliberately
+            // does not clear, read by the menu-bar icon and the Today card.
+            // (Before SCR-296 this comment claimed Library status chips already
+            // covered it; they did not — the lifecycle was decoded and rendered
+            // nowhere, so the window was genuinely silent.)
             if quitting {
                 if isDaemon {
                     lastError = "Stop timed out after 5 minutes; recorder finalization may still be running."
@@ -1179,6 +1239,32 @@ final class RecorderController: ObservableObject {
         } else {
             apply(machine.enterIdleStayingBackgrounded())
         }
+    }
+
+    // MARK: - Finalize drain (SCR-296)
+
+    /// Open the post-stop finalize drain and arm its failure backstop.
+    /// Idempotent: a re-probe that observes the same drain again must not re-arm
+    /// the backstop, so a second open while one is running is a no-op. A drain
+    /// that opens after a previous one closed does get a fresh backstop.
+    private func beginFinalizing() {
+        guard !finalizing else { return }
+        finalizing = true
+        finalizingBackstopTask = Task { [weak self, backstop = finalizingBackstop] in
+            try? await Task.sleep(nanoseconds: UInt64(backstop * 1_000_000_000))
+            if Task.isCancelled { return }
+            self?.endFinalizing()
+        }
+    }
+
+    /// Close the drain and disarm the backstop. Idempotent for the mirror
+    /// reason — the finalize event and the backstop race by design, and
+    /// whichever lands second must be inert.
+    private func endFinalizing() {
+        finalizingBackstopTask?.cancel()
+        finalizingBackstopTask = nil
+        guard finalizing else { return }
+        finalizing = false
     }
 
     // MARK: - Event / process callbacks
@@ -1247,6 +1333,10 @@ final class RecorderController: ObservableObject {
             case .stopPermissionWatchdog:
                 stopPermissionWatchdog()
             case .resolveAwaiting(.finalized, let success):
+                // SCR-296: the drain's closing edge (R8). The engine has exited
+                // — cleanly or force-killed, both of which publish this event —
+                // so the surface comes down on real completion, not a clock.
+                endFinalizing()
                 stopPolicy.resolveFinalized(success)
             case .resolveAwaiting(.stopped, let success):
                 stopPolicy.resolveStopped(success)

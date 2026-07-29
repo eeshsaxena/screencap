@@ -625,6 +625,184 @@ final class RecorderControllerTests: XCTestCase {
         XCTAssertFalse(recorder.state.isStopping)
     }
 
+    // MARK: - Post-stop finalize drain (SCR-296)
+
+    /// Build a controller on the daemon transport whose stop reports (or does
+    /// not report) the SCR-273 background drain.
+    private func drainController(
+        entersDrain: Bool,
+        outcome: StopPolicyOutcome,
+        stopError: Error? = nil,
+        backstop: TimeInterval = RecorderController.defaultFinalizingBackstop
+    ) -> RecorderController {
+        let daemon = CapturingDaemonSessionService(
+            startResult: DaemonSession.StartedRecording(cursor: 0, sessionID: "drain", audioEcho: nil)
+        )
+        daemon.stopEntersDrain = entersDrain
+        daemon.stopRecordingError = stopError
+        let recorder = RecorderController(
+            daemonService: daemon,
+            stopPolicy: StubbedStopPolicyCoordinator(outcome: outcome),
+            finalizingBackstop: backstop
+        )
+        recorder._testSetTransport(.daemon)
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        return recorder
+    }
+
+    /// KTD4, pinned as an ordering rather than a magic number. The daemon
+    /// force-kills a hung engine at its kill grace and that kill still publishes
+    /// `recording_finalized`, so the real closing edge always arrives by then.
+    /// A backstop at or under the grace would fire first and clear the surface
+    /// while work was still running — the layered-timeout failure this ordering
+    /// exists to prevent.
+    func testBackstopSitsAboveTheDaemonKillGrace() {
+        XCTAssertGreaterThan(
+            RecorderController.defaultFinalizingBackstop,
+            RecorderController.daemonStopKillGrace,
+            "a backstop at or below the daemon's own bound pre-empts the real closing signal"
+        )
+    }
+
+    /// The failure case the backstop exists for: the closing event never
+    /// arrives, so the surface must not stay up forever.
+    func testBackstopClosesADrainWhoseEventNeverArrives() async {
+        let recorder = drainController(entersDrain: true, outcome: .timedOut, backstop: 0.05)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+        XCTAssertTrue(recorder.finalizing)
+
+        await waitUntil { !recorder.finalizing }
+    }
+
+    /// The backstop and the finalize event race by design. When the backstop
+    /// wins, a late event must be inert rather than re-opening the surface.
+    func testFinalizeEventArrivingAfterTheBackstopIsInert() async {
+        let recorder = drainController(entersDrain: true, outcome: .timedOut, backstop: 0.05)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+        await waitUntil { !recorder.finalizing }
+
+        recorder._testHandleStderrLine(
+            #"{"type":"recording_finalized","schema_version":1,"ts":2.0,"force_stopped":false,"destination":"local"}"#
+        )
+
+        XCTAssertFalse(recorder.finalizing, "a late event must not re-open a closed drain")
+    }
+
+    /// R11 / AE4. A backstop-killed engine exits non-zero and the daemon reports
+    /// `force_stopped`. The drain surface comes down AND the pre-existing
+    /// incomplete-recording banner still fires — the new surface neither
+    /// suppresses nor contradicts it.
+    func testForceStoppedFinalizeClosesDrainAndStillSurfacesTheBanner() async {
+        let recorder = drainController(entersDrain: true, outcome: .timedOut)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+        XCTAssertTrue(recorder.finalizing)
+
+        recorder._testHandleStderrLine(
+            #"{"type":"recording_finalized","schema_version":1,"ts":2.0,"force_stopped":true,"destination":"local"}"#
+        )
+
+        XCTAssertFalse(recorder.finalizing, "a force-killed drain still ends")
+        XCTAssertEqual(
+            recorder.lastError,
+            "Recording stopped before it finished processing. Open the recording to finish it.",
+            "the existing force-stop banner must survive the new surface"
+        )
+    }
+
+    /// A drain that opens after a previous one closed gets its own backstop —
+    /// the first drain's spent timer must not leave the second unguarded.
+    func testASecondDrainArmsItsOwnBackstop() async {
+        let recorder = drainController(entersDrain: true, outcome: .timedOut, backstop: 0.05)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+        recorder._testHandleStderrLine(
+            #"{"type":"recording_finalized","schema_version":1,"ts":2.0,"force_stopped":false,"destination":"local"}"#
+        )
+        XCTAssertFalse(recorder.finalizing)
+
+        recorder._testSetPresentation(state: .recording(elapsed: 5))
+        recorder.stop()
+        await waitUntil { recorder.finalizing }
+        await waitUntil { !recorder.finalizing }
+    }
+
+    /// The point of the flag: an in-app Stop whose finalize work outlasts the
+    /// 60s wait still lands on `.idle`, and the surface must survive that. The
+    /// `state.didSet` chokepoint clears `muted` on the same transition, so
+    /// asserting both together proves the chokepoint ran and `finalizing` was
+    /// exempted — rather than the test passing because didSet never fired.
+    func testDrainSurvivesTheIdleTransitionThatClearsPerRecordingState() async {
+        let recorder = drainController(entersDrain: true, outcome: .timedOut)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+
+        XCTAssertTrue(
+            recorder.finalizing,
+            "the drain outlives the stop wait, so reaching .idle must not end the surface"
+        )
+        XCTAssertFalse(recorder.muted, "the idle chokepoint still ran and cleared per-recording state")
+    }
+
+    /// The closing edge is the engine's exit, not a clock. Also covers the
+    /// short-drain case (AE5): the flag opens on the stop response and comes
+    /// down when the event lands, however early that is.
+    func testFinalizeEventClosesTheDrain() async {
+        let recorder = drainController(entersDrain: true, outcome: .completed)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+        XCTAssertTrue(recorder.finalizing)
+
+        recorder._testHandleStderrLine(
+            #"{"type":"recording_finalized","schema_version":1,"ts":2.0,"force_stopped":false,"destination":"local"}"#
+        )
+
+        XCTAssertFalse(recorder.finalizing, "the finalize event is what ends the drain")
+    }
+
+    /// SCR-69 guard. A slow clean stop is not a drain: the wait timing out tells
+    /// us nothing about whether finalize work is running, and treating it as
+    /// evidence would resurrect the false "still finalizing" surface that made
+    /// `inAppStopTimeout` 60s in the first place. Only the daemon's own report
+    /// opens the flag.
+    func testStopWaitTimingOutWithoutADrainReportOpensNothing() async {
+        let recorder = drainController(entersDrain: false, outcome: .timedOut)
+
+        recorder.stop()
+        await waitUntil { recorder.state == .idle }
+
+        XCTAssertFalse(
+            recorder.finalizing,
+            "the wait expiring is not evidence of a drain — only the stop response is"
+        )
+    }
+
+    /// A stop that never reached the daemon started no drain — the throwing
+    /// verb means the flag's opening edge never fires. The daemon transport
+    /// settles this failure to `.idle` via `handleDaemonOperationFailure`
+    /// (only the CLI path rolls back to `.recording`), so this waits on the
+    /// stop clearing rather than pinning either terminal state.
+    func testFailedStopDispatchOpensNoDrain() async {
+        let recorder = drainController(
+            entersDrain: true,
+            outcome: .sendSignalFailed(NSError(domain: "test", code: 1)),
+            stopError: NSError(domain: "test", code: 1)
+        )
+
+        recorder.stop()
+        await waitUntil { !recorder.state.isStopping }
+
+        XCTAssertFalse(recorder.finalizing, "a stop that never reached the daemon started no drain")
+    }
+
     // MARK: - HUD hide control
 
     /// Drive the controller into `.recording` via the real `.starting` →
@@ -1165,10 +1343,17 @@ final class RecorderControllerTests: XCTestCase {
 
         XCTAssertFalse(recorder.state.isRecording, "a finalizing session is not a live recording")
         // This path is PASSIVE (probeDaemon on launch) and the drain always ends
-        // on its own, so it must surface nothing: `lastError` is the red
+        // on its own, so it must surface no ERROR: `lastError` is the red
         // terminal-failure channel and is cleared only by `enterStarting()`, so
         // a notice written here would outlive the drain it describes.
         XCTAssertNil(recorder.lastError, "a passive finalizing probe must not paint an error banner")
+        // SCR-296 (R3/R12, AE3): it does open the auto-clearing drain surface,
+        // which is how a relaunch into a running drain — or a CLI/ambient stop
+        // this app never issued — reaches the menu bar and the rows.
+        XCTAssertTrue(
+            recorder.finalizing,
+            "a drain this app did not start must still reach the drain surface"
+        )
         await recorder._testCancelDaemonTask()
     }
 
@@ -1517,6 +1702,11 @@ final class CapturingDaemonSessionService: DaemonSessionService {
     private(set) var setMutedCalled = false
     private(set) var capturedMuted: Bool?
     private(set) var setMutedCallCount = 0
+    /// SCR-296: the drain report `stopRecording` returns — `true` models the
+    /// SCR-273 no-kill stop handing the engine off to a background drain.
+    var stopEntersDrain = false
+    /// When set, `stopRecording` throws it, modelling a stop-dispatch failure.
+    var stopRecordingError: Error?
 
     init(startResult: DaemonSession.StartedRecording) {
         self.startResult = startResult
@@ -1531,7 +1721,10 @@ final class CapturingDaemonSessionService: DaemonSessionService {
         return startResult
     }
 
-    func stopRecording(force: Bool) async throws {}
+    func stopRecording(force: Bool) async throws -> Bool {
+        if let stopRecordingError { throw stopRecordingError }
+        return stopEntersDrain
+    }
 
     func setMuted(_ muted: Bool) async throws -> Bool {
         setMutedCalled = true
@@ -1567,7 +1760,7 @@ private final class StaleGrantDaemonSessionService: DaemonSessionService {
     func startRecording(name: String?, audio: Bool?) async throws -> DaemonSession.StartedRecording {
         DaemonSession.StartedRecording(cursor: 0, sessionID: "stale", audioEcho: nil)
     }
-    func stopRecording(force: Bool) async throws {}
+    func stopRecording(force: Bool) async throws -> Bool { false }
     func setMuted(_ muted: Bool) async throws -> Bool { muted }
     func translateFailure(_ error: Error) -> DaemonSession.FailureOutcome { .other(localizedDescription: "") }
     func reload() async -> Result<Void, DaemonSession.ReloadError> {
