@@ -625,6 +625,72 @@ struct RecordingRenameResponse: Decodable {
     }
 }
 
+/// `recording.share` input (SCR-299 U2). Op-discriminated: `create` shares
+/// `recordingId`, `revoke` targets `token`, `list` needs neither. Optional
+/// fields encode via `encodeIfPresent`, so an op only ever sends its own keys —
+/// omitting `expiresDays` lets the daemon apply its configured default, which
+/// is a different statement from sending an explicit null.
+///
+/// Callers do not build this directly; the three `share*` helpers below make an
+/// invalid op/field combination unrepresentable at the call site.
+struct RecordingShareRequest: Encodable {
+    let op: String
+    let recordingId: String?
+    let token: String?
+    let expiresDays: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case op
+        case recordingId = "recording_id"
+        case token
+        case expiresDays = "expires_days"
+    }
+}
+
+/// One share record created on THIS Mac, from `recording.share` op `list`.
+///
+/// The daemon's store is a local JSON file — there is no cross-Mac share index —
+/// so this is the whole universe of shares the app can see or revoke (KTD4).
+/// `revoked` is written only once a share has been revoked, so a live record
+/// simply lacks the key and decodes as nil.
+struct ShareRecord: Decodable, Equatable {
+    let token: String
+    let recording: String
+    let expiresAt: String?
+    let revoked: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case token
+        case recording
+        case expiresAt = "expires_at"
+        case revoked
+    }
+}
+
+/// `recording.share` output (SCR-299 U2). ONE model backs all three ops —
+/// create returns url/token/expiresAt, revoke returns revoked/token, list
+/// returns shares — so every field is optional and each caller reads only what
+/// its own op populates. A decoder that required create's fields would break
+/// revoke and list.
+///
+/// `url` carries the share key in its fragment. It is the secret: never log it,
+/// never put it in an error message, never mark it public in a log annotation.
+struct RecordingShareResponse: Decodable {
+    let url: String?
+    let token: String?
+    let expiresAt: String?
+    let revoked: Bool?
+    let shares: [ShareRecord]?
+
+    enum CodingKeys: String, CodingKey {
+        case url
+        case token
+        case expiresAt = "expires_at"
+        case revoked
+        case shares
+    }
+}
+
 /// `timeline.query` input. v1 always passes an explicit `limit` — the verb
 /// defaults to 50 and truncates earliest-first by `timestamp_ms`, so without a
 /// raised limit + bounding window the recency ranking would silently drop the
@@ -1681,6 +1747,64 @@ enum DaemonClient {
     static func recordingRename(recording: String, title: String) async throws -> RecordingRenameResponse {
         let body = try JSONEncoder().encode(RecordingRenameRequest(recordingId: recording, title: title))
         return try await request(method: "POST", path: "/v0/recording.rename", body: body)
+    }
+
+    // MARK: - SCR-299 share-by-link verbs
+
+    /// How long a share creation may take before the client gives up.
+    ///
+    /// Creating a share synchronously fetches the masked cloud copy,
+    /// re-encrypts it under a fresh per-recording key, and uploads the result —
+    /// unbounded in a way `recording.rename` is not, so the 10s default would
+    /// abort a legitimate share of a long recording. Set well above worst case
+    /// while still surfacing a genuinely hung call rather than hanging the
+    /// window forever (the same posture as `LiveInspectDataLoader`'s ceiling).
+    static let shareCreateTimeout: TimeInterval = 300
+
+    /// Mint a view-only share link for a cloud recording (SCR-299 R1).
+    ///
+    /// The returned `url` carries the decryption key in its fragment — the
+    /// daemon mints that key locally and it never reaches the server. Treat the
+    /// value as a secret: it must not be logged or embedded in an error.
+    ///
+    /// `expiresDays` nil leaves the daemon's configured default in force.
+    /// Typed failures arrive as `.envelopeError(code:)` with U1's vocabulary
+    /// (`not_signed_in`, `share_unavailable`, `share_backend_unavailable`).
+    static func shareCreate(
+        recording: String,
+        expiresDays: Int? = nil
+    ) async throws -> RecordingShareResponse {
+        let body = try JSONEncoder().encode(
+            RecordingShareRequest(
+                op: "create", recordingId: recording, token: nil, expiresDays: expiresDays
+            )
+        )
+        return try await request(
+            method: "POST",
+            path: "/v0/recording.share",
+            body: body,
+            timeout: shareCreateTimeout
+        )
+    }
+
+    /// Revoke a share link by token (SCR-299 R4). Stops the server serving the
+    /// ciphertext; it cannot retract a copy a recipient already fetched.
+    /// Cheap server-side, so it keeps the default timeout.
+    static func shareRevoke(token: String) async throws -> RecordingShareResponse {
+        let body = try JSONEncoder().encode(
+            RecordingShareRequest(op: "revoke", recordingId: nil, token: token, expiresDays: nil)
+        )
+        return try await request(method: "POST", path: "/v0/recording.share", body: body)
+    }
+
+    /// List the shares created on THIS Mac (SCR-299 R14). A local read of the
+    /// daemon's share record — a link minted on another Mac is not in here and
+    /// cannot be revoked from this app.
+    static func shareList() async throws -> RecordingShareResponse {
+        let body = try JSONEncoder().encode(
+            RecordingShareRequest(op: "list", recordingId: nil, token: nil, expiresDays: nil)
+        )
+        return try await request(method: "POST", path: "/v0/recording.share", body: body)
     }
 
     /// Transcript keyword search (SCR-118). Hits are chunk-granular (no
