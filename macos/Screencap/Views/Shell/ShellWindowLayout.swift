@@ -102,6 +102,65 @@ enum ShellWindowLayout {
     static let playbackAspectMin: CGFloat = 0.5
     static let playbackAspectMax: CGFloat = 4.0
 
+    // MARK: - Day page vertical terms (SCR-301)
+
+    /// The vertical twin of the width contract above, and it failed the same
+    /// way. `DayTimelineView.body` is a plain `VStack` of header / narrative /
+    /// playback pane / strip, and three of those four cannot give height back:
+    /// the header is a fixed control row, the pane declares
+    /// `playbackPaneMinHeight`, and the strip is fixed metrics. The narrative is
+    /// the exception — it is `Text` at its wrapped height, so it grows with the
+    /// day's prose and never compresses.
+    ///
+    /// At the 640pt window floor the three fixed terms leave the narrative about
+    /// 100pt — roughly three wrapped lines. A longer day pushed the stack past
+    /// the page, and a `VStack` that cannot fit does not clip or scroll: it
+    /// overflows symmetrically about the centre. Once the overflow passed twice
+    /// the header's height the **entire header row went off the top** — no Back
+    /// button, no date navigator, no way to leave the day — while the strip
+    /// stayed visible below.
+    ///
+    /// The fix is to stop the narrative being unbounded: it gets whatever the
+    /// three fixed terms leave (`dayNarrativeMaxHeight(inPageHeight:)`) and
+    /// scrolls inside that, so the page's hard minimum is a constant again. The
+    /// two measured heights below are what make that arithmetic true, so
+    /// `ShellWindowLayoutTests` measures the real views against them rather than
+    /// trusting the estimate — a wider system font or a taller AppKit control
+    /// would otherwise re-open the overflow with no test failing.
+
+    /// `DayTimelineView.header`'s rendered height, budgeted for its *tallest*
+    /// day rather than a typical one.
+    ///
+    /// The row is 63pt on a short date ("Tuesday, 28 July") but 70pt on a long
+    /// one ("Wednesday, 30 September"): at the minimum detail width the header
+    /// has only ~31pt of slack over `dayHeaderMinWidth`, so a long date outgrows
+    /// the label's declared floor and wraps to a second line. That is a
+    /// cosmetic defect in its own right (SCR-304) — the point here is that the
+    /// height budget must cover it, because a budget set from whatever date the
+    /// test happened to run on would be short for most of the calendar.
+    static let dayHeaderMinHeight: CGFloat = 76
+
+    /// `DayTimelineView.strip`'s rendered height — `DayStripView`'s band, hour
+    /// labels and legend plus its 38pt of page padding, with the same slack.
+    ///
+    /// Measured at the *minimum* detail width, which is where it is tallest: the
+    /// legend's row of swatches needs about 1100pt to stay on one line, so below
+    /// that it wraps and the strip grows from 151pt to 164pt. Budgeting it from
+    /// a comfortable window would leave the page 13pt short at exactly the size
+    /// this bug appears at.
+    static let dayStripMinHeight: CGFloat = 170
+
+    /// The smallest day narrative worth drawing: one wrapped line inside the
+    /// card's chrome.
+    ///
+    /// This is *not* a floor the layout enforces — enforcing one would re-open
+    /// the overflow on a page too short to honour it. It exists so the window
+    /// minimum can be stated as "room for the page's chrome **and** a readable
+    /// narrative" rather than just "the chrome fits". At the 640pt floor the
+    /// narrative gets a little over this and scrolls; by the 780pt default it
+    /// has room for a dozen lines.
+    static let dayNarrativeMinHeight: CGFloat = 60
+
     // MARK: - Window
 
     /// The window's declared minimum content width. Derived from
@@ -144,6 +203,47 @@ enum ShellWindowLayout {
     /// The narrowest content width the shell lays out without overflowing.
     static var minContentWidth: CGFloat {
         sidebarWidth + dayHeaderMinWidth
+    }
+
+    /// The day page's three incompressible vertical terms — everything except
+    /// the narrative.
+    static var dayChromeMinHeight: CGFloat {
+        dayHeaderMinHeight + playbackPaneMinHeight + dayStripMinHeight
+    }
+
+    /// The shortest content height the shell lays out without overflowing, with
+    /// a readable narrative still on the page. The mirror of `minContentWidth`,
+    /// and pinned the same way (`windowMinHeight >= minContentHeight`).
+    ///
+    /// Stated in *window* content height, which the day page usually receives in
+    /// full — but not always. `MainWindow.shellContent` puts the first-run
+    /// privacy banner in a `VStack` above the two-column row, so while that
+    /// banner is up the page gets ~147pt less than the window. This is why the
+    /// narrative's cap is derived from the page's own measured height rather
+    /// than from `windowMinHeight`: the cap stays correct in either case, and
+    /// the page degrades by dropping the narrative instead of overflowing. What
+    /// this constant guarantees is the ordinary, banner-free case.
+    static var minContentHeight: CGFloat {
+        dayChromeMinHeight + dayNarrativeMinHeight
+    }
+
+    /// The height the day narrative may occupy on a page of `pageHeight`: what
+    /// the header, the playback pane's floor and the strip leave behind.
+    ///
+    /// Deliberately unclamped at the bottom, and callers must treat a result
+    /// below `dayNarrativeMinHeight` as "do not draw the narrative at all"
+    /// rather than as a small slot. A `.frame(maxHeight:)` does not shrink the
+    /// card past its own chrome and does not clip: capped at 0 the card still
+    /// lays out 44pt of padding and border, centred on the empty slot, drawn
+    /// straight over the header above it. Dropping the section is the honest
+    /// degradation — losing the day's prose is a far smaller failure than
+    /// losing the header, which is the only in-page way off the day.
+    ///
+    /// In the ordinary case the result is comfortable: ~70pt at the window
+    /// floor, growing with the window (up to roughly half the page's spare
+    /// height, since the stack shares what is left with the playback pane).
+    static func dayNarrativeMaxHeight(inPageHeight pageHeight: CGFloat) -> CGFloat {
+        max(0, pageHeight - dayChromeMinHeight)
     }
 }
 
