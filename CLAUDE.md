@@ -8,6 +8,8 @@ Screencap is a macOS CLI for screen recording. The recording engine lives at `sr
 
 A native SwiftUI app shell lives at `macos/` and wraps the bundled CLI; see "macOS SwiftUI app shell" below for details.
 
+A Chrome extension lives at `extension/` (TypeScript, Manifest V3) — the browser tier, which records browser work without a macOS install. It is a self-contained npm sub-project with its own toolchain and shares no build with the Python layer; the Python conventions below do not govern it. Its viewer half lives in the sibling `screencap-website` repo. See `docs/plans/2026-07-29-001-feat-chrome-extension-browser-tier-plan.md`.
+
 ### Privacy subsystem packages (SCR-33)
 
 The privacy code is split into three sibling packages forming a one-way dependency DAG (`privacy` is the leaf; both halves depend on it; neither depends on the other):
@@ -70,6 +72,14 @@ pytest tests/ -v --cov
 ```
 
 Linting uses `ruff` for the engine sub-package: `ruff check src/screencap/engine/`.
+
+```bash
+# Chrome extension (self-contained; run from extension/)
+npm install
+npm test          # vitest
+npm run typecheck # tsc over src including tests
+npm run build     # emits a loadable unpacked extension into extension/dist/
+```
 
 ## Key Patterns
 
