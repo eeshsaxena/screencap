@@ -412,3 +412,17 @@ class TestMaskAndDefaultActionFields:
         for before_row, after_row in zip(baseline["apps"], after["apps"]):
             assert before_row["resolved_action"] == after_row["resolved_action"]
             assert before_row["action_source"] == after_row["action_source"]
+
+    def test_user_title_rule_row_reports_user_rule(self):
+        """Rows are evaluated with the display name as the window title, so a
+        user title pattern can decide one. It must read as the user's rule, not
+        the matrix's."""
+        self._write_privacy(
+            '[privacy]\nmode = "internal"\n'
+            'mask_title_patterns = ["Visual Studio"]\n'
+        )
+        row = _by_bundle(json.loads(_invoke_apps_json().stdout.strip()),
+                         "com.microsoft.VSCode")
+        assert row["resolved_action"] == "mask_window"
+        assert row["action_source"] == "user_rule"
+        assert row["has_per_frame_overrides"] is True

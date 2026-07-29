@@ -2585,6 +2585,11 @@ def apps(as_json, include_spotlight):
         elif decision.reason in (
             ReasonCode.POLICY_MASKED_APP,
             ReasonCode.POLICY_ALLOWED_APP,
+            # Reachable here: the row is evaluated with the display name as the
+            # window title, so a user title pattern can match. Domain rules
+            # cannot fire (no domain is passed) but belong in the same class.
+            ReasonCode.POLICY_MASKED_TITLE,
+            ReasonCode.POLICY_MASKED_DOMAIN,
         ):
             action_source = "user_rule"
         elif decision.reason == ReasonCode.POLICY_DEFAULT_FLOOR:
