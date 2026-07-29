@@ -240,3 +240,11 @@ jobs:
         # reach a built extension.
         working-directory: extension
         run: npm run typecheck
+
+      - name: Build
+        # The build config is stricter than the typecheck one — it drops the
+        # test-only node types, so this is what catches a node builtin reaching
+        # shipped source. It also exercises the static-asset copy that makes
+        # dist/ a loadable unpacked extension.
+        working-directory: extension
+        run: npm run build

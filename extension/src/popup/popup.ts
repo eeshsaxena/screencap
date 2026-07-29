@@ -48,8 +48,27 @@ function setText(id: string, value: string | null): void {
   node.hidden = value === null;
 }
 
+/**
+ * The auth state the last render computed.
+ *
+ * Add and remove finish asynchronously and then repaint. Hardcoding `true` for
+ * that repaint meant a sign-out landing mid-flight was undone: the stale
+ * refresh resolved afterwards and re-showed a live allow-list panel underneath
+ * the signed-out UI.
+ */
+let lastSignedIn = false;
+
+/**
+ * Guards against an older refresh painting over a newer one.
+ *
+ * Refreshes are started from several places and are not awaited by their
+ * callers, so a slow one can resolve after a fast one that superseded it.
+ */
+let refreshGeneration = 0;
+
 function render(view: PopupView): void {
   const signedIn = view.status === "signed-in" || view.status === "stale";
+  lastSignedIn = signedIn;
 
   el("signed-in").hidden = !signedIn;
   el("signed-out").hidden = view.status !== "signed-out";
@@ -74,11 +93,20 @@ async function refreshAllowlist(
   signedIn: boolean,
   message: { error?: string | null; notice?: string | null } = {},
 ): Promise<void> {
-  const entries = signedIn ? await allowlist.list() : [];
+  const generation = ++refreshGeneration;
+  const listing = signedIn
+    ? await allowlist.list()
+    : { entries: [], state: "ok" as const };
+
+  // A newer refresh started while this one was awaiting; its paint is the
+  // current one and must not be overwritten by this stale result.
+  if (generation !== refreshGeneration) return;
+
   renderAllowlist(
     allowlistView({
       signedIn,
-      entries,
+      entries: listing.entries,
+      state: listing.state,
       error: message.error ?? null,
       notice: message.notice ?? null,
     }),
@@ -87,7 +115,10 @@ async function refreshAllowlist(
 
 function renderAllowlist(view: AllowlistView): void {
   el("allowlist").hidden = !view.visible;
-  setText("allowlist-empty", view.empty ? view.emptyMessage : null);
+  // `emptyMessage` is already null whenever a warning is showing, so the panel
+  // cannot say "nothing can be recorded" beside a warning that says otherwise.
+  setText("allowlist-empty", view.emptyMessage);
+  setText("allowlist-warning", view.warning);
   setText("allowlist-notice", view.notice);
   setText("allowlist-error", view.error);
 
@@ -116,11 +147,11 @@ async function removeOrigin(button: HTMLButtonElement, pattern: string): Promise
   button.disabled = true;
   try {
     await allowlist.remove(pattern);
-    await refreshAllowlist(true);
+    await refreshAllowlist(lastSignedIn);
   } catch (error) {
     // The entry stays when the revoke did not take — a list that still shows a
     // live grant is honest, one that hides it is not.
-    await refreshAllowlist(true, { error: asError(error) });
+    await refreshAllowlist(lastSignedIn, { error: asError(error) });
   } finally {
     button.disabled = false;
   }
@@ -172,10 +203,10 @@ function addOrigin(): void {
   void pending
     .then(async (result) => {
       if (result.ok) addInput.value = "";
-      await refreshAllowlist(true, addOutcome(result, raw));
+      await refreshAllowlist(lastSignedIn, addOutcome(result, raw));
     })
     .catch(async (error: unknown) => {
-      await refreshAllowlist(true, { error: asError(error) });
+      await refreshAllowlist(lastSignedIn, { error: asError(error) });
     })
     .finally(() => {
       addButton.disabled = false;

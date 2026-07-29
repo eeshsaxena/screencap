@@ -69,6 +69,7 @@ Neither correction changes what U2 must do. Both change what an implementer woul
 - **KTD6. Adding an origin grants that exact host only.** `https://example.com/*` does not cover `app.example.com`; a subdomain is a separate decision the user makes separately. Matches R11's literal "origins" wording and keeps each grant as narrow as the feature allows. Chrome may still widen a grant through its own prompt — `contains()` matches by pattern subsumption, so a widened grant answers correctly without special handling.
 - **KTD7. `optional_host_permissions` declares the requestable envelope, not the grants.** Origins are user-chosen at runtime and cannot be enumerated at build time, so the manifest declares `https://*/*` and `http://*/*` as *optional*. This grants nothing on install. `file://` is excluded — local files are outside R11's origin model and would broaden the Web Store review surface for no persona benefit.
 - **KTD8. This unit does not touch `desktopCapture` or `offscreen`.** The parent unit's approach step 1 places them here; they belong with the code that uses them in `parent U3`. Declaring a permission before any code exercises it is the posture KTD2 of the parent plan exists to avoid.
+- **KTD10. An empty allow-list is only allowed to mean "nothing can be recorded" when that is verifiably true.** (Added during code review, which found the original design collapsed three states into one empty array.) `list()` returns `ok`, `broad-grant`, or `grants-unreadable` beside the entries, and the popup withholds its empty-state copy for the latter two. Keeping the all-sites envelope out of the rows — KTD2's adoption guard — stops it being mistaken for a user's choice, but does nothing to stop it authorizing capture, so the state is what prevents the panel making a safety claim the boundary does not support. Governs R11.
 - **KTD9. The extension test suite gains a CI job in this unit.** All four jobs in `.github/workflows/ci.yml` are Python; `npm test` in `extension/` runs on no gate today. U2 is the capture-time privacy boundary for this tier, so it is the wrong unit to merge with unenforced tests.
 
 ### High-Level Technical Design
@@ -153,7 +154,7 @@ U1 is pure vocabulary with no Chrome surface and unblocks the rest. U2 is the su
 - **Dependencies:** none
 - **Files:** `extension/src/permissions/origins.ts`, `extension/src/permissions/origins.test.ts`
 - **Approach:**
-  1. Export `toMatchPattern(input: string): string | null` — parse with `URL`, keep scheme and host, drop path, query, and fragment, emit `<scheme>://<host>/*`. Return `null` rather than throwing for anything unparseable; the caller decides how to surface it.
+  1. Export `normalizeOrigin(input: string): NormalizedOrigin | null` — parse with `URL`, keep scheme and host, drop path, query, and fragment, emit `<scheme>://<host>/*`. Return `null` rather than throwing for anything unparseable; the caller decides how to surface it. **As built this returns a record `{ pattern, label, portDropped }` rather than the bare pattern string this plan first specified** — OQ1 resolved against carrying the port, and the caller has to be able to say the grant widened (see step 4).
   2. Accept bare hosts (`example.com`) by defaulting to `https://`, since that is what a user types. Reject any scheme other than `http` and `https`, per KTD7.
   3. Export `originLabel(pattern: string): string` for display — the pattern without the trailing `/*`, so the popup shows `https://example.com` rather than a pattern.
   4. Settle OQ1 here: write the port case as a test first, and let the answer decide whether the port is carried into the pattern or dropped. If dropped, `originLabel` must still show what was granted, not what was typed.
@@ -169,7 +170,7 @@ U1 is pure vocabulary with no Chrome surface and unblocks the rest. U2 is the su
   - A host with an explicit port resolves per OQ1, and the test asserts the decided behavior explicitly rather than accepting either.
   - `https://example.com` and `https://app.example.com` produce different patterns — subdomains are not collapsed.
   - `originLabel` round-trips a pattern to a displayable origin with no trailing `/*`.
-- **Verification:** Every string the popup can pass to `chrome.permissions.request()` came out of `toMatchPattern`, and no other module builds a pattern by concatenation.
+- **Verification:** Every string the popup can pass to `chrome.permissions.request()` came out of `normalizeOrigin`, and no other module builds a pattern by concatenation.
 
 ### U2. Allow-list store, bidirectional reconcile, and the `isAllowed` seam
 
@@ -180,12 +181,18 @@ U1 is pure vocabulary with no Chrome surface and unblocks the rest. U2 is the su
 - **Approach:**
   1. Add `optional_host_permissions: ["https://*/*", "http://*/*"]` to the manifest per KTD7. Add nothing else — no `desktopCapture`, no `offscreen` (KTD8).
   2. Define `AllowlistDeps` (`permissionsRequest`, `permissionsRemove`, `permissionsContains`, `permissionsGetAll`, `storage`) and a `chromeAllowlistDeps()` adapter, mirroring `AuthDeps` / `chromeAuthDeps()` in `extension/src/auth/firebase.ts:80-155` so the store is testable with fakes and the adapter is covered separately.
-  3. `isAllowed(url)` resolves `toMatchPattern(url)` then returns `permissionsContains({origins:[pattern]})`. A `null` pattern is `false`. **A throw is `false`** (KTD4) — never a rethrow, never a cached answer. Never read storage here (KTD2). State that contract in the module docstring, since `parent U3` and `parent U4` both consume it.
+  3. `isAllowed(url)` resolves `normalizeOrigin(url)` then returns `permissionsContains({origins:[pattern]})`. A `null` pattern is `false`. **A throw is `false`** (KTD4) — never a rethrow, never a cached answer. Never read storage here (KTD2). State that contract in the module docstring, since `parent U3` and `parent U4` both consume it.
   4. `list()` performs the reconcile in the matrix above (KTD1, KTD3): read stored entries and `permissionsGetAll().origins`, drop entries with no live grant, adopt granted origins with no entry, return the reconciled view, then best-effort persist. A rejected persist is swallowed after the reconciled view is computed — the answer is already correct.
-  5. **Adopt only concrete-host patterns.** A pattern whose host is a bare `*` — including the `https://*/*` and `http://*/*` envelope from step 1 — is never adopted into the allow-list, and neither is any other pattern `toMatchPattern` would not itself have produced. Chrome's documentation describes `Permissions.origins` as including origins "specified in the `optional_permissions` or `permissions` keys in the manifest", so it is not certain that `getAll()` excludes the declared-but-ungranted envelope. If it does not, an unguarded adoption path would write the envelope into the allow-list and read back as *everything allowed* — a silent fail-open of the exact boundary this unit exists to build. The guard costs one predicate and removes the dependence on that ambiguity entirely.
-  6. `add(input)` normalizes, calls `permissionsRequest` (the caller supplies the gesture, per KTD5), and appends **only** on `granted === true`. A declined prompt and a rejected request both leave storage untouched.
-  7. `remove(pattern)` calls `permissionsRemove` then deletes the entry. If the revoke fails, do not delete the entry — a list that still shows a live grant is honest; one that hides it is not.
-  8. Do **not** add a `chrome.runtime` message verb for `isAllowed` here — that belongs with its first consumer. Record in the module docstring how each caller reaches it, because the answer differs by context: the popup and the service worker call `isAllowed` directly, but **a content script cannot** — `chrome.permissions` is not exposed to content scripts, so `parent U4` must ask the service worker over a message. Note also that `isTrustedSender` in `extension/src/background/service-worker.ts:57-59` rejects any sender with a `tab`, which is every content script; `parent U4` needs its own sender predicate for that verb rather than reusing the auth one, which is deliberately stricter.
+  5. **Adopt only concrete-host patterns.** A pattern whose host is a bare `*` — the `https://*/*` and `http://*/*` envelope from step 1 — is never adopted into the allow-list. Chrome's documentation describes `Permissions.origins` as including origins "specified in the `optional_permissions` or `permissions` keys in the manifest", so it is not certain that `getAll()` excludes the declared-but-ungranted envelope. If it does not, an unguarded adoption path would write the envelope into the allow-list and read back as *everything allowed* — a silent fail-open of the exact boundary this unit exists to build.
+
+     **Narrowed during implementation:** this plan first said to refuse any pattern the normalizer would not itself have produced. That is too strong — it would also refuse `https://*.example.com/*`, a real bounded grant a user can make through Chrome's own prompt, and hiding it would be the precise harm adoption exists to prevent. Only a bare-`*` host is refused.
+
+     **And it is not sufficient on its own — see step 6.** Refusing to adopt the envelope keeps it out of the rows, but it does not stop it authorizing capture.
+  6. **Report a live all-sites grant instead of rendering it as an empty list.** Step 5 keeps the envelope out of the rows; `isAllowed` still answers `true` for every URL by subsumption while it is granted. An empty list would then read as "nothing can be recorded" while everything is — a false all-clear on this unit's own boundary, and the same shape as the fail-open step 5 guards against. So `list()` returns a state alongside the entries: `ok`, `broad-grant`, or `grants-unreadable`, and the popup replaces the empty-state copy with a warning for the latter two. Detecting a *live* envelope needs more than its presence in `getAll()` (the ambiguity in step 5 cuts both ways — warning on a declared-only envelope would cry wolf on every open), so its presence only triggers a `contains()` probe against a reserved `.invalid` host that nobody could have granted individually; Chrome answers `true` there only when a broader pattern subsumes it.
+  7. **A failed `getAll()` is not an empty grant set.** Returning `[]` on that path would both make the same false all-clear and persist the empty list, destroying the ordering the stored list exists to keep. Report `grants-unreadable` with the last known entries, and write nothing.
+  8. `add(input)` normalizes, calls `permissionsRequest` (the caller supplies the gesture, per KTD5), and appends **only** on `granted === true`. A declined prompt and a rejected request both leave storage untouched.
+  9. `remove(pattern)` calls `permissionsRemove` then deletes the entry. If the revoke fails, do not delete the entry — a list that still shows a live grant is honest; one that hides it is not.
+  10. Do **not** add a `chrome.runtime` message verb for `isAllowed` here — that belongs with its first consumer. Record in the module docstring how each caller reaches it, because the answer differs by context: the popup and the service worker call `isAllowed` directly, but **a content script cannot** — `chrome.permissions` is not exposed to content scripts, so `parent U4` must ask the service worker over a message. Note also that `isTrustedSender` in `extension/src/background/service-worker.ts:57-59` rejects any sender with a `tab`, which is every content script; `parent U4` needs its own sender predicate for that verb rather than reusing the auth one, which is deliberately stricter.
 - **Execution note:** Write the out-of-band-revoke test before the happy path. It is the case `permissions.onRemoved` cannot cover and the reason the design reads rather than listens.
 - **Patterns to follow:** `extension/src/auth/firebase.ts` for the injected-deps class plus thin Chrome adapter; `extension/src/auth/chrome-deps.test.ts` for stubbing `globalThis.chrome` to cover the adapter itself; `src/screencap/auth.py:525` for refusing on an unresolvable state rather than guessing.
 - **Test scenarios:**
@@ -197,6 +204,10 @@ U1 is pure vocabulary with no Chrome surface and unblocks the rest. U2 is the su
   - An origin whose grant was revoked outside the extension reads as not allowed from `isAllowed` and is absent from `list()`.
   - A granted origin with no stored entry is adopted into `list()` and shown as allowed.
   - A bare-wildcard-host pattern present in `getAll().origins` — `https://*/*` or `http://*/*` — is **never** adopted, and `list()` stays empty rather than reading back as everything-allowed.
+  - A **live** all-sites grant reports state `broad-grant`, and the same test asserts `isAllowed` returns `true` for an arbitrary URL in that state — the two halves pinned together, so a list that says "empty" can never drift apart from a gate that says "yes".
+  - An envelope present in `getAll()` but **not** live reports `ok` — a declared-only envelope must not raise a warning on every popup open.
+  - No probe call is made at all when no envelope is present.
+  - A failed `getAll()` reports `grants-unreadable` with the last known entries, and leaves the stored list byte-identical.
   - A reconcile whose storage write rejects still returns the corrected list — the stale store does not leak into the answer.
   - `isAllowed` returns `false` when `permissionsContains` throws.
   - `isAllowed` returns `false` for an unparseable URL and for a `chrome://` URL.
@@ -249,7 +260,8 @@ U1 is pure vocabulary with no Chrome surface and unblocks the rest. U2 is the su
 |---|---|---|
 | Extension tests | `npm test` in `extension/` | U1, U2, U3 |
 | Extension type-check | `npm run typecheck` in `extension/` | U1, U2, U3 |
-| Extension build loads | `npm run build` in `extension/`, then load `dist/` unpacked | U2, U3 |
+| Extension build (browser-only gate) | `npm run build` in `extension/` — stricter than type-check, since `tsconfig.build.json` drops the test-only node types | U1, U2, U3 |
+| Extension build loads | load `dist/` unpacked in Chrome | U2, U3 |
 | CI job present | The Node job runs on a PR touching `extension/` | U4 |
 
 `pytest -m privacy` does **not** apply to any unit in this plan — no unit adds or changes Python. This corrects the parent plan's Verification Contract row, which U4 amends at the source.
@@ -260,6 +272,7 @@ U1 is pure vocabulary with no Chrome surface and unblocks the rest. U2 is the su
 
 - A user can add and remove origins in the popup, and each add is backed by a real Chrome host-permission grant.
 - `isAllowed(url)` returns `false` for every URL that is not covered by a live grant, including when the underlying Chrome call throws.
+- The popup never says nothing can be recorded unless that is verifiably true — a live all-sites grant and an unreadable grant state each surface as a warning instead.
 - Revoking site access from `chrome://extensions` is reflected on the next popup read with no extension reload; granting it there is adopted into the list.
 - The manifest declares no required host permissions, and no permission the code does not exercise.
 - The extension suite runs on CI and fails the build when broken.

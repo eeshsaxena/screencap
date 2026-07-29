@@ -16,8 +16,16 @@
  * Web Store review surface for no benefit to the operator persona. */
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 
-/** Matches a leading `scheme:` so a bare host can be told from a full URL. */
-const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
+/**
+ * Matches a leading `scheme://` so a bare host can be told from a full URL.
+ *
+ * The `://` is required, not decoration. Without it this also matches the host
+ * half of `localhost:3000` — `localhost:` is a syntactically valid scheme — so
+ * a typed `host:port` would skip the https default, parse with protocol
+ * `localhost:`, and be rejected as "not a site address". A local dev server on
+ * a port is the operator persona's most likely input.
+ */
+const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 /** A well-formed host-permission pattern: http or https, some host, `/*`. */
 const HOST_PATTERN = /^(https?):\/\/([^/]+)\/\*$/;
@@ -112,3 +120,29 @@ export function isAdoptablePattern(pattern: string): boolean {
   const host = match[2];
   return host !== "*";
 }
+
+/**
+ * Whether a pattern covers every host on its scheme — the all-sites envelope.
+ *
+ * Distinct from `!isAdoptablePattern(p)`, which is also true for a malformed
+ * string. This is the specific shape that, if actually granted, makes every
+ * origin recordable, so the caller can say so rather than rendering an empty
+ * allow-list as "nothing can be recorded".
+ */
+export function isBroadHostPattern(pattern: string): boolean {
+  const match = HOST_PATTERN.exec(pattern);
+  return match !== null && match[2] === "*";
+}
+
+/**
+ * A host that cannot have been granted on its own, used to ask Chrome whether
+ * an all-sites grant is genuinely live.
+ *
+ * `.invalid` is reserved by RFC 2606 and can never be a real site, so nobody
+ * can have allow-listed it. `permissions.contains` therefore answers true for
+ * it only when some broader pattern subsumes it. This settles the ambiguity
+ * `isAdoptablePattern` documents — Chrome's docs leave open whether
+ * `getAll().origins` includes the manifest's declared-but-ungranted envelope,
+ * and a declared-only envelope must not be reported to the user as live.
+ */
+export const BROAD_GRANT_PROBE = "https://broad-grant-probe.invalid/*";

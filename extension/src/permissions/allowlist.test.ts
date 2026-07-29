@@ -94,7 +94,7 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     seedStored("https://example.com/*");
     fake.granted = [];
 
-    expect(await new Allowlist(deps()).list()).toEqual([]);
+    expect((await new Allowlist(deps()).list()).entries).toEqual([]);
   });
 
   it("persists the prune so the stored list stops disagreeing", async () => {
@@ -112,7 +112,7 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     // an origin the user cannot see is one they cannot revoke.
     fake.granted = ["https://adopted.example/*"];
 
-    expect(await new Allowlist(deps()).list()).toEqual([
+    expect((await new Allowlist(deps()).list()).entries).toEqual([
       { pattern: "https://adopted.example/*", label: "https://adopted.example" },
     ]);
     expect(storedPatterns()).toEqual(["https://adopted.example/*"]);
@@ -124,15 +124,33 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     fake.granted = [];
     fake.failStorageSet = true;
 
-    expect(await new Allowlist(deps()).list()).toEqual([]);
+    expect((await new Allowlist(deps()).list()).entries).toEqual([]);
     expect(storedPatterns()).toEqual(["https://example.com/*"]);
   });
 
-  it("reports nothing allowed when the grant state cannot be read", async () => {
+  it("flags an unreadable grant state instead of calling it empty", async () => {
+    // Reporting [] here would tell the user nothing can be recorded while the
+    // real grants — and therefore isAllowed — are untouched and still live.
     seedStored("https://example.com/*");
     fake.failGetAll = true;
 
-    expect(await new Allowlist(deps()).list()).toEqual([]);
+    const listing = await new Allowlist(deps()).list();
+
+    expect(listing.state).toBe("grants-unreadable");
+    expect(listing.entries).toEqual([
+      { pattern: "https://example.com/*", label: "https://example.com" },
+    ]);
+  });
+
+  it("does not overwrite the stored list when grants cannot be read", async () => {
+    // A transient getAll() failure must not destroy the ordering that is the
+    // entire reason a stored list exists alongside Chrome's grants.
+    seedStored("https://a.example/*", "https://b.example/*");
+    fake.failGetAll = true;
+
+    await new Allowlist(deps()).list();
+
+    expect(storedPatterns()).toEqual(["https://a.example/*", "https://b.example/*"]);
   });
 
   it("leaves the stored list alone when it already agrees with Chrome", async () => {
@@ -140,14 +158,14 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     fake.granted = ["https://example.com/*"];
     fake.failStorageSet = true; // would throw if a write were attempted
 
-    expect(await new Allowlist(deps()).list()).toHaveLength(1);
+    expect((await new Allowlist(deps()).list()).entries).toHaveLength(1);
   });
 
   it("shows the widened pattern when Chrome granted more than was asked for", async () => {
     seedStored("https://example.com/*");
     fake.granted = ["https://*.example.com/*"];
 
-    expect(await new Allowlist(deps()).list()).toEqual([
+    expect((await new Allowlist(deps()).list()).entries).toEqual([
       { pattern: "https://*.example.com/*", label: "https://*.example.com" },
     ]);
   });
@@ -159,7 +177,7 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     seedStored("https://example.com/*", "https://example.com/*");
     fake.granted = ["https://example.com/*"];
 
-    expect(await new Allowlist(deps()).list()).toEqual([
+    expect((await new Allowlist(deps()).list()).entries).toEqual([
       { pattern: "https://example.com/*", label: "https://example.com" },
     ]);
     expect(storedPatterns()).toEqual(["https://example.com/*"]);
@@ -169,7 +187,7 @@ describe("reconcile: drift between the stored list and Chrome's grants", () => {
     fake.storageArea.set(ALLOWLIST_STORAGE_KEY, "{not json");
     fake.granted = ["https://example.com/*"];
 
-    expect(await new Allowlist(deps()).list()).toHaveLength(1);
+    expect((await new Allowlist(deps()).list()).entries).toHaveLength(1);
   });
 });
 
@@ -183,15 +201,53 @@ describe("reconcile: the adoption guard", () => {
     // everything-allowed — a silent fail-open of the whole boundary.
     fake.granted = [envelope];
 
-    expect(await new Allowlist(deps()).list()).toEqual([]);
+    expect((await new Allowlist(deps()).list()).entries).toEqual([]);
   });
 
   it("adopts real grants while refusing the envelope beside them", async () => {
     fake.granted = ["https://*/*", "https://real.example/*"];
 
-    expect(await new Allowlist(deps()).list()).toEqual([
+    expect((await new Allowlist(deps()).list()).entries).toEqual([
       { pattern: "https://real.example/*", label: "https://real.example" },
     ]);
+  });
+
+  it("reports a live all-sites grant rather than showing an empty list", async () => {
+    // The whole point. Refusing to adopt the envelope keeps it out of the rows
+    // — there would be no way to revoke it from one — but an empty list here
+    // would read as "nothing can be recorded" while isAllowed answers true for
+    // every URL by subsumption. The state is what stops that claim being made.
+    fake.granted = ["https://*/*"];
+    fake.containsResult = true; // Chrome confirms the probe host is covered
+
+    const allowlist = new Allowlist(deps());
+    const listing = await allowlist.list();
+
+    expect(listing.state).toBe("broad-grant");
+    expect(listing.entries).toEqual([]);
+    // ...and the gate genuinely does allow everything in this state, which is
+    // exactly why the list must not claim otherwise.
+    expect(await allowlist.isAllowed("https://anything.example/page")).toBe(true);
+  });
+
+  it("stays quiet when the envelope is declared but not actually granted", async () => {
+    // Chrome's docs leave open whether getAll() reports the manifest's declared
+    // optional envelope. If it does, warning on its mere presence would cry
+    // wolf on every popup open, so the probe decides instead.
+    fake.granted = ["https://*/*"];
+    fake.containsResult = false; // no live grant covers the probe host
+
+    const listing = await new Allowlist(deps()).list();
+
+    expect(listing.state).toBe("ok");
+    expect(listing.entries).toEqual([]);
+  });
+
+  it("does not probe at all when no envelope is present", async () => {
+    fake.granted = ["https://real.example/*"];
+
+    expect((await new Allowlist(deps()).list()).state).toBe("ok");
+    expect(fake.containsCalls).toEqual([]);
   });
 });
 

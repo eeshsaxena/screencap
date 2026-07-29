@@ -31,7 +31,13 @@
  *   deliberately stricter.
  */
 
-import { isAdoptablePattern, normalizeOrigin, originLabel } from "./origins.js";
+import {
+  BROAD_GRANT_PROBE,
+  isAdoptablePattern,
+  isBroadHostPattern,
+  normalizeOrigin,
+  originLabel,
+} from "./origins.js";
 
 export const ALLOWLIST_STORAGE_KEY = "screencap.allowlist.origins";
 
@@ -57,6 +63,31 @@ export interface AllowlistDeps {
 export interface AllowlistEntry {
   pattern: string;
   label: string;
+}
+
+/**
+ * Why the reconciled list should — or should not — be read as the whole truth.
+ *
+ * Without this, three very different situations all surface as an empty array:
+ * nothing is granted, Chrome's grant state could not be read, and Chrome is
+ * granting *every* site. Only the first means "nothing can be recorded", and a
+ * UI that says so in the other two states tells the user they are safe while
+ * capture is either unverified or wide open.
+ */
+export type AllowlistState =
+  /** The list is complete and authoritative. */
+  | "ok"
+  /** `permissions.getAll()` failed; the entries are the last known list, not a
+   * verified one, and nothing was persisted. */
+  | "grants-unreadable"
+  /** An all-sites grant is live, so every origin is recordable regardless of
+   * what the list shows. Never adopted as an entry — there would be no way to
+   * revoke it from a row — so it is reported here instead. */
+  | "broad-grant";
+
+export interface AllowlistListing {
+  entries: AllowlistEntry[];
+  state: AllowlistState;
 }
 
 export type AddResult =
@@ -97,10 +128,10 @@ export class Allowlist {
     }
   }
 
-  /** The allow-list as it actually stands, reconciled against Chrome. */
-  async list(): Promise<AllowlistEntry[]> {
-    const reconciled = await this.reconcile();
-    return reconciled.map(toEntry);
+  /** The allow-list as it actually stands, reconciled against Chrome, plus
+   * whether that list can be read as the whole truth. */
+  async list(): Promise<AllowlistListing> {
+    return this.reconcile();
   }
 
   /**
@@ -150,13 +181,22 @@ export class Allowlist {
    * Returns the corrected list first and persists it second, so a storage
    * failure degrades to a stale store rather than a wrong answer.
    */
-  private async reconcile(): Promise<string[]> {
+  private async reconcile(): Promise<AllowlistListing> {
     const [stored, granted] = await Promise.all([
       this.readStored(),
       this.readGranted(),
     ]);
 
-    const adoptable = granted.filter(isAdoptablePattern);
+    if (!granted.ok) {
+      // Treating an unreadable grant state as "nothing is granted" would both
+      // tell the user nothing can be recorded — while `isAllowed` keeps
+      // answering from grants that are still perfectly live — and persist that
+      // empty list, destroying the ordering the stored list exists to keep.
+      // Report the last known entries as unverified and write nothing.
+      return { entries: stored.map(toEntry), state: "grants-unreadable" };
+    }
+
+    const adoptable = granted.origins.filter(isAdoptablePattern);
     const live = new Set(adoptable);
 
     // Stored entries that still hold a grant keep their original order, then
@@ -172,7 +212,33 @@ export class Allowlist {
     if (!sameOrder(reconciled, stored)) {
       await this.persist(reconciled);
     }
-    return reconciled;
+    return {
+      entries: reconciled.map(toEntry),
+      state: (await this.hasLiveBroadGrant(granted.origins)) ? "broad-grant" : "ok",
+    };
+  }
+
+  /**
+   * Whether an all-sites grant is actually in force.
+   *
+   * The manifest declares an all-http/https envelope so arbitrary origins can
+   * be requested at runtime, and Chrome's docs leave open whether `getAll()`
+   * reports that declared-but-ungranted envelope. Warning on the declared one
+   * would cry wolf on every open; ignoring a granted one would let the panel
+   * claim nothing is recordable while everything is. So the envelope's presence
+   * only triggers the question, and Chrome answers it: `contains` says true for
+   * a host nobody could have granted individually exactly when a broader
+   * pattern subsumes it.
+   */
+  private async hasLiveBroadGrant(granted: string[]): Promise<boolean> {
+    if (!granted.some(isBroadHostPattern)) return false;
+    try {
+      return await this.deps.permissionsContains([BROAD_GRANT_PROBE]);
+    } catch {
+      // Unconfirmable. Stay quiet rather than warn on a guess — the same throw
+      // already makes `isAllowed` refuse everything.
+      return false;
+    }
   }
 
   /** Corrupt or absent storage reads as an empty list rather than throwing —
@@ -195,12 +261,15 @@ export class Allowlist {
     }
   }
 
-  /** Grant state that cannot be read means nothing can be shown as allowed. */
-  private async readGranted(): Promise<string[]> {
+  /** Reports failure rather than an empty list: "Chrome granted nothing" and
+   * "Chrome could not be asked" lead to opposite things being safe to say. */
+  private async readGranted(): Promise<
+    { ok: true; origins: string[] } | { ok: false }
+  > {
     try {
-      return await this.deps.permissionsGetAll();
+      return { ok: true, origins: await this.deps.permissionsGetAll() };
     } catch {
-      return [];
+      return { ok: false };
     }
   }
 

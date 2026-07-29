@@ -43,6 +43,19 @@
         margin: 12px 0 0;
         color: #b3261e;
       }
+      .warning {
+        font-size: 12px;
+        margin: 0 0 12px;
+        padding: 8px;
+        border-radius: 6px;
+        border: 1px solid currentColor;
+        color: #8a5a00;
+      }
+      @media (prefers-color-scheme: dark) {
+        .warning {
+          color: #e8b339;
+        }
+      }
       .note {
         font-size: 12px;
         margin: 0 0 12px;
@@ -124,6 +137,7 @@
       <hr />
       <h2>Sites Screencap may record</h2>
       <p id="allowlist-empty" class="note" hidden></p>
+      <p id="allowlist-warning" class="warning" hidden></p>
       <ul id="allowlist-entries"></ul>
       <div class="add-row">
         <input

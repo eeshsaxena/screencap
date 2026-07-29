@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { isAdoptablePattern, normalizeOrigin, originLabel } from "./origins.js";
+import {
+  isAdoptablePattern,
+  isBroadHostPattern,
+  normalizeOrigin,
+  originLabel,
+} from "./origins.js";
 
 describe("normalizeOrigin", () => {
   it("discards path and query, keeping scheme and host", () => {
@@ -68,6 +73,27 @@ describe("normalizeOrigin port handling", () => {
   it("does not report a dropped port for a default-port URL", () => {
     expect(normalizeOrigin("https://example.com:443")?.portDropped).toBeNull();
   });
+
+  it("accepts a bare host:port, which reads as a scheme but is not one", () => {
+    // `localhost:` is a syntactically valid scheme, so a naive has-a-scheme
+    // test treats `localhost:3000` as scheme-qualified, parses it with protocol
+    // `localhost:`, and rejects it outright — while `http://localhost:3000`
+    // works. A dev server on a port is the operator persona's likeliest input.
+    expect(normalizeOrigin("localhost:3000")).toEqual({
+      pattern: "https://localhost/*",
+      label: "https://localhost",
+      portDropped: "3000",
+    });
+  });
+
+  it("defaults a bare host:port to https, same as any other bare host", () => {
+    // Worth pinning rather than leaving implicit: someone typing a plain http
+    // dev server gets an https grant, and the dropped-port notice is what shows
+    // them the origin that was actually allowed.
+    expect(normalizeOrigin("internal.corp:8080")?.pattern).toBe(
+      "https://internal.corp/*",
+    );
+  });
 });
 
 describe("normalizeOrigin rejections", () => {
@@ -130,5 +156,26 @@ describe("isAdoptablePattern", () => {
   it("refuses a malformed pattern rather than assuming it is safe", () => {
     expect(isAdoptablePattern("garbage")).toBe(false);
     expect(isAdoptablePattern("")).toBe(false);
+  });
+});
+
+describe("isBroadHostPattern", () => {
+  it.each([
+    ["the https envelope", "https://*/*"],
+    ["the http envelope", "http://*/*"],
+  ])("recognizes %s", (_label, pattern) => {
+    expect(isBroadHostPattern(pattern)).toBe(true);
+  });
+
+  it.each([
+    ["a concrete host", "https://example.com/*"],
+    ["a subdomain wildcard", "https://*.example.com/*"],
+    ["a malformed pattern", "garbage"],
+    ["an empty string", ""],
+  ])("does not treat %s as all-sites", (_label, pattern) => {
+    // Deliberately narrower than !isAdoptablePattern, which is also true for
+    // malformed input. Only the genuine all-sites shape may trigger the warning
+    // that tells a user their per-site list is not what limits recording.
+    expect(isBroadHostPattern(pattern)).toBe(false);
   });
 });

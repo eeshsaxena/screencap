@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { EMPTY_MESSAGE, addOutcome, allowlistView } from "./allowlist-view.js";
+import {
+  BROAD_GRANT_MESSAGE,
+  EMPTY_MESSAGE,
+  UNREADABLE_MESSAGE,
+  addOutcome,
+  allowlistView,
+} from "./allowlist-view.js";
 
 const entry = (label: string) => ({ pattern: `${label}/*`, label });
 
@@ -41,6 +47,51 @@ describe("allowlistView", () => {
 
     expect(view.entries).toHaveLength(1);
     expect(view.error).not.toBeNull();
+  });
+});
+
+describe("allowlistView warnings", () => {
+  it("never claims nothing can be recorded when an all-sites grant is live", () => {
+    // The empty list is not the whole truth here: Chrome is allowing every
+    // origin regardless of what the rows say. Showing EMPTY_MESSAGE would be a
+    // false all-clear on the exact boundary this panel exists to represent.
+    const view = allowlistView({
+      signedIn: true,
+      entries: [],
+      state: "broad-grant",
+    });
+
+    expect(view.emptyMessage).toBeNull();
+    expect(view.warning).toBe(BROAD_GRANT_MESSAGE);
+  });
+
+  it("never claims nothing can be recorded when grants could not be read", () => {
+    const view = allowlistView({
+      signedIn: true,
+      entries: [],
+      state: "grants-unreadable",
+    });
+
+    expect(view.emptyMessage).toBeNull();
+    expect(view.warning).toBe(UNREADABLE_MESSAGE);
+  });
+
+  it("keeps warning alongside entries, since both concern what is allowed beyond them", () => {
+    const view = allowlistView({
+      signedIn: true,
+      entries: [entry("https://example.com")],
+      state: "broad-grant",
+    });
+
+    expect(view.entries).toHaveLength(1);
+    expect(view.warning).toBe(BROAD_GRANT_MESSAGE);
+  });
+
+  it("shows no warning in the ordinary state", () => {
+    const view = allowlistView({ signedIn: true, entries: [], state: "ok" });
+
+    expect(view.warning).toBeNull();
+    expect(view.emptyMessage).toBe(EMPTY_MESSAGE);
   });
 });
 

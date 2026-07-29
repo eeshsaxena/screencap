@@ -1,4 +1,12 @@
 {
   "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Shipped source is browser-only. The base config adds "node" so the test
+    // suite can read manifest.json off disk, and without overriding it here
+    // that would be inherited by the build too — letting a `node:` import in
+    // real source type-check clean and fail at load in Chrome instead. Tests
+    // are excluded below, so nothing left in this project needs node types.
+    "types": ["chrome"]
+  },
   "exclude": ["src/**/*.test.ts"]
 }
