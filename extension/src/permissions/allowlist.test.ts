@@ -195,6 +195,16 @@ describe("add", () => {
     expect(storedPatterns()).toEqual(["https://example.com/*"]);
   });
 
+  it("reaches the permission request before yielding, so the gesture survives", () => {
+    // Chrome only honours permissions.request() inside a user gesture, and an
+    // await before it spends the gesture. Nothing is awaited here on purpose:
+    // if add() ever grows a storage read or a message round-trip ahead of the
+    // request, requestCalls is still empty at this point and this fails.
+    void new Allowlist(deps()).add("example.com");
+
+    expect(fake.requestCalls).toEqual([["https://example.com/*"]]);
+  });
+
   it("leaves the allow-list unchanged when the prompt is declined", async () => {
     fake.requestResult = false;
 
