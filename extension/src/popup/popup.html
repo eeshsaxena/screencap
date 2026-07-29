@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Screencap</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        width: 260px;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 12px;
+      }
+      button {
+        width: 100%;
+        padding: 8px 12px;
+        font: inherit;
+        border-radius: 6px;
+        border: 1px solid currentColor;
+        background: transparent;
+        cursor: pointer;
+      }
+      button[disabled] {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .account {
+        font-size: 13px;
+        margin: 0 0 12px;
+        word-break: break-all;
+      }
+      .error {
+        font-size: 12px;
+        margin: 12px 0 0;
+        color: #b3261e;
+      }
+      .note {
+        font-size: 12px;
+        margin: 0 0 12px;
+        opacity: 0.75;
+      }
+      [hidden] {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Screencap</h1>
+
+    <section id="signed-out" hidden>
+      <p class="account">Sign in to record your browser work.</p>
+      <button id="sign-in">Sign in</button>
+    </section>
+
+    <section id="signed-in" hidden>
+      <p class="account">Signed in as <strong id="account"></strong></p>
+      <p id="stale-note" class="note" hidden>
+        Can't reach Screencap right now — you're still signed in.
+      </p>
+      <button id="sign-out">Sign out</button>
+    </section>
+
+    <section id="unknown" hidden>
+      <p class="account">Couldn't reach the extension's background service.</p>
+      <button id="retry">Try again</button>
+    </section>
+
+    <p id="error" class="error" hidden></p>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
