@@ -41,15 +41,6 @@ def _isolate_recordings_and_run_dir(tmp_path, monkeypatch):
     isolated.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("SCREENCAP_RECORDINGS_DIR", str(isolated))
     monkeypatch.setattr(ts, "_RUN_DIR", tmp_path / "ts-run")
-    # Paid-only launch (SCR): both client paywall flags now DEFAULT ON in
-    # config.py. Daemon tests are not billing tests, so force both OFF for the
-    # suite — the env var short-circuits the config read, so the default flip
-    # cannot 402 the read-only recall/search verbs or gate recording.start.
-    # Tests that DO exercise the gates override this by monkeypatching the config
-    # fn (subscription-gate tests) or setting the env themselves;
-    # ``test_config_isolation`` clears the env to exercise the config-file read.
-    monkeypatch.setenv("SCREENCAP_STRIPE_PAYWALL", "0")
-    monkeypatch.setenv("SCREENCAP_LOCAL_PAYWALL_ENFORCE", "0")
     # U14: the daemon's whoami / entitlement.refresh verbs now reconcile an
     # on-disk entitlement lease under ``get_base_dir()/run/``. Point the base dir
     # at a per-test tmp so those writes never touch the developer's real
