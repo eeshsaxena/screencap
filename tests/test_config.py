@@ -438,7 +438,7 @@ class TestSentinelShowOnWebsite:
 
 
 class TestStripePaywall:
-    """Tests for get_stripe_paywall_enabled() (default OFF)."""
+    """Tests for get_stripe_paywall_enabled() (default ON, paid-only launch)."""
 
     def test_default_value(self):
         import screencap.config as cfg
@@ -447,7 +447,7 @@ class TestStripePaywall:
         env = {k: v for k, v in os.environ.items() if k != "SCREENCAP_STRIPE_PAYWALL"}
         with mock.patch.dict(os.environ, env, clear=True):
             cfg._config_cache = {}  # empty config — no stripe_paywall key
-            assert get_stripe_paywall_enabled() is False
+            assert get_stripe_paywall_enabled() is True
 
     def test_env_var_true(self):
         from screencap.config import get_stripe_paywall_enabled
@@ -480,7 +480,7 @@ class TestStripePaywall:
 
 
 class TestLocalPaywallEnforce:
-    """Tests for get_local_paywall_enforced() (default OFF)."""
+    """Tests for get_local_paywall_enforced() (default ON, paid-only launch)."""
 
     def test_default_value(self):
         import screencap.config as cfg
@@ -493,7 +493,7 @@ class TestLocalPaywallEnforce:
         }
         with mock.patch.dict(os.environ, env, clear=True):
             cfg._config_cache = {}  # empty config — no local_paywall_enforce key
-            assert get_local_paywall_enforced() is False
+            assert get_local_paywall_enforced() is True
 
     def test_env_var_true(self):
         from screencap.config import get_local_paywall_enforced

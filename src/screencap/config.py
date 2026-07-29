@@ -414,28 +414,28 @@ def get_wifi_metrics() -> bool:
 def get_stripe_paywall_enabled() -> bool:
     """Return whether the Stripe cloud paywall is active on the client (True = on).
 
-    Default OFF: when off, cloud upload behaves exactly as before this feature —
-    no pricing copy, no soft gate, no checkout routing. Flipping it on activates
-    the app/CLI paywall surfaces. The signer's *enforcement* is governed
-    separately by the ``STRIPE_PAYWALL_ENFORCE`` Cloud Function env (KTD-6), so
-    the two release tracks can be sequenced independently at cutover.
+    Default ON (paid-only launch): the app/CLI paywall surfaces — pricing copy,
+    soft gate, checkout routing — are active out of the box. An explicit
+    ``SCREENCAP_STRIPE_PAYWALL=0`` / ``stripe_paywall = false`` opts a machine
+    back out (dev/test). The signer's *enforcement* is governed separately by the
+    ``STRIPE_PAYWALL_ENFORCE`` Cloud Function env (KTD-6), so the two release
+    tracks can be sequenced independently at cutover.
     """
-    return _parse_bool_env("SCREENCAP_STRIPE_PAYWALL", "stripe_paywall", False)
+    return _parse_bool_env("SCREENCAP_STRIPE_PAYWALL", "stripe_paywall", True)
 
 
 def get_local_paywall_enforced() -> bool:
     """Return whether the client-side local paywall gates are enforced (True = on).
 
-    Default OFF: when off, starting a recording and the local recall/search
-    verbs behave exactly as before this feature — no gate. Flipping it on lets
-    the daemon's recording-start and recall gates refuse an unentitled account
-    (bounded by the last-known-good entitlement lease). This is separate from
-    the client ``SCREENCAP_STRIPE_PAYWALL`` (UI/checkout surfaces) and the
-    signer's ``STRIPE_PAYWALL_ENFORCE`` (cloud upload hard gate), so local
-    enforcement lands dark and flips independently at cutover.
+    Default ON (paid-only launch): the daemon's recording-start and recall/search
+    gates refuse an unentitled account (bounded by the last-known-good
+    entitlement lease). An explicit ``SCREENCAP_LOCAL_PAYWALL_ENFORCE=0`` /
+    ``local_paywall_enforce = false`` opts a machine back out (dev/test). This is
+    separate from the client ``SCREENCAP_STRIPE_PAYWALL`` (UI/checkout surfaces)
+    and the signer's ``STRIPE_PAYWALL_ENFORCE`` (cloud upload hard gate).
     """
     return _parse_bool_env(
-        "SCREENCAP_LOCAL_PAYWALL_ENFORCE", "local_paywall_enforce", False
+        "SCREENCAP_LOCAL_PAYWALL_ENFORCE", "local_paywall_enforce", True
     )
 
 
