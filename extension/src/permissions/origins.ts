@@ -101,13 +101,16 @@ export function originLabel(pattern: string): string {
  *
  * The manifest has to declare a broad optional envelope — every http and https
  * host — because allow-listed origins are chosen at runtime and cannot be
- * enumerated at build time. Chrome's documentation describes
- * `Permissions.origins` as including origins declared in the manifest's
- * permission keys, so it is not certain that `getAll()` excludes that
- * ungranted envelope. Adopting it would write "everything" into the allow-list
- * and read back as everything-allowed — a silent fail-open of the boundary this
- * feature exists to draw. Refusing a bare `*` host removes the dependence on
- * that ambiguity entirely.
+ * enumerated at build time. Adopting that envelope would write "everything"
+ * into the allow-list and read back as everything-allowed — a silent fail-open
+ * of the boundary this feature exists to draw.
+ *
+ * Measured on Chrome 151: with the envelope declared as optional and nothing
+ * granted, `getAll().origins` is `[]` — the declared-but-ungranted envelope is
+ * *not* reported, contrary to what the API docs' wording allows for. So this
+ * guard is not load-bearing against that case in practice; it is the cheap
+ * belt-and-braces that keeps a future change in those semantics from becoming a
+ * fail-open.
  *
  * A subdomain wildcard (`https://*.example.com/*`) IS adoptable: it is a real,
  * bounded grant the user made through Chrome's own prompt, and hiding it from
@@ -140,9 +143,10 @@ export function isBroadHostPattern(pattern: string): boolean {
  *
  * `.invalid` is reserved by RFC 2606 and can never be a real site, so nobody
  * can have allow-listed it. `permissions.contains` therefore answers true for
- * it only when some broader pattern subsumes it. This settles the ambiguity
- * `isAdoptablePattern` documents — Chrome's docs leave open whether
- * `getAll().origins` includes the manifest's declared-but-ungranted envelope,
- * and a declared-only envelope must not be reported to the user as live.
+ * it only when some broader pattern subsumes it.
+ *
+ * Verified on Chrome 151: `false` with nothing granted, `true` under a live
+ * all-sites grant. Chrome accepts a `.invalid` host in a match pattern rather
+ * than rejecting it, which is what makes the probe usable at all.
  */
 export const BROAD_GRANT_PROBE = "https://broad-grant-probe.invalid/*";

@@ -222,13 +222,18 @@ export class Allowlist {
    * Whether an all-sites grant is actually in force.
    *
    * The manifest declares an all-http/https envelope so arbitrary origins can
-   * be requested at runtime, and Chrome's docs leave open whether `getAll()`
-   * reports that declared-but-ungranted envelope. Warning on the declared one
-   * would cry wolf on every open; ignoring a granted one would let the panel
-   * claim nothing is recordable while everything is. So the envelope's presence
-   * only triggers the question, and Chrome answers it: `contains` says true for
-   * a host nobody could have granted individually exactly when a broader
-   * pattern subsumes it.
+   * be requested at runtime. Warning on a merely-declared envelope would cry
+   * wolf on every open; ignoring a granted one would let the panel claim nothing
+   * is recordable while everything is. So the envelope's presence only triggers
+   * the question, and Chrome answers it: `contains` says true for a host nobody
+   * could have granted individually exactly when a broader pattern subsumes it.
+   *
+   * Measured on Chrome 151, presence in `getAll()` already implies granted — the
+   * declared-but-ungranted envelope is not reported. The probe is kept as the
+   * cheap confirmation that keeps this correct if those semantics ever change,
+   * and it costs one `contains()` call on a popup read, never on the capture
+   * path. Both of its answers are verified: `false` with nothing granted, `true`
+   * under a live all-sites grant.
    */
   private async hasLiveBroadGrant(granted: string[]): Promise<boolean> {
     if (!granted.some(isBroadHostPattern)) return false;
