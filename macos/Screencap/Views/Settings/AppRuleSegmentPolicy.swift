@@ -12,13 +12,18 @@ import Foundation
 ///   3. `resolved_action == exclude` — Block selected (matrix default for
 ///      sensitive classes at the current mode); Record either confirms
 ///      (`confirmation_required`) or attempts the allow override.
-///   4. `resolved_action`   — matrix-resolved: mask → Mask selected-but-locked
-///      (the per-app Mask *override* is SCR-225; the matrix mask itself is
-///      real), allow → Record. A legacy (unconfirmed) allow entry renders its
-///      real floor state here; Record re-confirms it.
+///   4. `in_mask_apps`      — Mask selected by the user's own Mask rule
+///      (SCR-225). Sits below the two above because both are stricter or more
+///      explicit: a deny wins outright, and a confirmed allow is the one rule
+///      the user confirmed individually.
+///   5. `resolved_action`   — matrix-resolved: mask → Mask, allow → Record. A
+///      legacy (unconfirmed) allow entry renders its real floor state here;
+///      Record re-confirms it. A row the user's blanket default tightened
+///      lands here too, distinguished by `action_source`.
 ///
-/// The Mask segment is never tappable in v1: it is either the matrix's own
-/// (true) state or a stub (KTD-8, SCR-225).
+/// All three segments accept interaction since SCR-225. Mask writes the
+/// tightening-only per-app rule, so unlike Record it never needs a
+/// confirmation dialog.
 struct AppRuleSegmentPolicy: Equatable {
     enum Segment: Equatable {
         case record
@@ -36,11 +41,19 @@ struct AppRuleSegmentPolicy: Equatable {
         /// consequences dialog first; on confirm the CLI runs with the
         /// `--confirm-sensitive` flag.
         case allowConfirm
+        /// SCR-225: set the per-app Mask rule. Needs no confirmation — a Mask
+        /// rule is tightening-only, so it cannot expose anything.
+        case maskAdd
     }
 
     /// The selected segment; nil renders no selection (the SCR-224 stub row).
     let selection: Segment?
     let recordEnabled: Bool
+    /// False where a Mask rule cannot change the outcome: the row is already
+    /// masked, or it resolves to EXCLUDE, which is stricter than mask. A Mask
+    /// rule is tightening-only, so it cannot loosen an excluded row — offering
+    /// the tap would write a rule with no visible effect.
+    let maskEnabled: Bool
     let blockEnabled: Bool
     /// Tooltip explaining a fully-locked row; nil for writable rows.
     /// SCR-235 retired the matrix-immutable lock, so this is nil for every
@@ -48,9 +61,9 @@ struct AppRuleSegmentPolicy: Equatable {
     let lockedReason: String?
     let note: String
 
-    /// Tooltip on the (never-tappable) Mask segment when it is not the
-    /// matrix-selected state.
-    static let maskStubHelp = "Coming soon — SCR-225"
+    /// True when the selection came from the user's own rule rather than the
+    /// matrix or their blanket default. Drives the row note's wording.
+    let isUserRule: Bool
 
     static func derive(for app: InstalledApp) -> AppRuleSegmentPolicy {
         let classLabel = contextClassLabel(app.contextClass)
@@ -59,32 +72,60 @@ struct AppRuleSegmentPolicy: Equatable {
             return AppRuleSegmentPolicy(
                 selection: .block,
                 recordEnabled: true,
+                maskEnabled: false,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: "blocked by you"
+                note: "blocked by you",
+                isUserRule: true
             )
         }
         if app.allowConfirmed {
             return AppRuleSegmentPolicy(
                 selection: .record,
                 recordEnabled: true,
+                maskEnabled: true,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: "recorded · allowed by you"
+                note: "recorded · allowed by you",
+                isUserRule: true
             )
         }
+        // The resolved-EXCLUDE check must precede the Mask-rule branch. A Mask
+        // rule on an EXCLUDE-class app is tightening-only, so enforcement still
+        // excludes — rendering Mask there would claim a weaker protection than
+        // the recorder actually applies.
         if app.resolvedAction == "exclude" {
             // Matrix-resolved EXCLUDE without the user's own exclude entry —
             // the sensitive-class default (SCR-235 made this a first-class,
             // unlockable state; it was the hard-locked matrix-immutable row).
             // Record confirms the allow (consequences dialog) when the class
             // requires it, or attempts the plain allow override otherwise.
+            // A blanket Block default lands here too, so the note names the
+            // default rather than the class when that is what decided it.
             return AppRuleSegmentPolicy(
                 selection: .block,
                 recordEnabled: true,
+                maskEnabled: false,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: joined("blocked by default", classLabel)
+                note: app.actionSource == "default_floor"
+                    ? "blocked by your default for new apps"
+                    : joined("blocked by default", classLabel),
+                isUserRule: false
+            )
+        }
+        if app.inMaskApps {
+            // The user's own Mask rule (SCR-225). Distinct note from the
+            // matrix's mask below: the user chose this one and can undo it,
+            // whereas the matrix's mask reflects the app's class.
+            return AppRuleSegmentPolicy(
+                selection: .mask,
+                recordEnabled: true,
+                maskEnabled: false,
+                blockEnabled: true,
+                lockedReason: nil,
+                note: "window masked · masked by you",
+                isUserRule: true
             )
         }
         switch app.resolvedAction {
@@ -92,17 +133,23 @@ struct AppRuleSegmentPolicy: Equatable {
             return AppRuleSegmentPolicy(
                 selection: .mask,
                 recordEnabled: true,
+                maskEnabled: false,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: joined("window masked while recording", classLabel)
+                note: app.actionSource == "default_floor"
+                    ? "window masked by your default for new apps"
+                    : joined("window masked while recording", classLabel),
+                isUserRule: false
             )
         case "text_redact":
             return AppRuleSegmentPolicy(
                 selection: .mask,
                 recordEnabled: true,
+                maskEnabled: false,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: joined("text redacted while recording", classLabel)
+                note: joined("text redacted while recording", classLabel),
+                isUserRule: false
             )
         default:
             // "allow" and any unknown future action render as recorded rather
@@ -110,9 +157,11 @@ struct AppRuleSegmentPolicy: Equatable {
             return AppRuleSegmentPolicy(
                 selection: .record,
                 recordEnabled: true,
+                maskEnabled: true,
                 blockEnabled: true,
                 lockedReason: nil,
-                note: app.inAllowApps ? "recorded · allowed by you" : "recorded"
+                note: app.inAllowApps ? "recorded · allowed by you" : "recorded",
+                isUserRule: app.inAllowApps
             )
         }
     }
@@ -122,7 +171,12 @@ struct AppRuleSegmentPolicy: Equatable {
     static func transition(for app: InstalledApp, tapping segment: Segment) -> Transition? {
         switch segment {
         case .mask:
-            return nil
+            // SCR-225: writes the per-app Mask rule. No confirmation gate —
+            // a Mask rule can only tighten, so there is nothing to disclose.
+            // `maskEnabled` is false wherever a mask rule cannot change the
+            // outcome (already masked, or resolved EXCLUDE, which is stricter),
+            // so those rows are a no-op like the other two segments.
+            return derive(for: app).maskEnabled ? .maskAdd : nil
         case .block:
             let current = derive(for: app)
             return current.selection == .block ? nil : .excludeAdd

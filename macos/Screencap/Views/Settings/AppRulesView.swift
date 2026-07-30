@@ -1,12 +1,12 @@
 import SwiftUI
 
 /// U13 — the prototype App rules pane (design 518–549): intro copy, the
-/// default-for-new-apps banner (Record active; Mask/Block stubbed SCR-225),
-/// and per-app rows — 30px initials tile, name, mono note, and the tri-state
-/// Record/Mask/Block segmented control. Writable where the backend has
-/// vocabulary (`allow_apps` / `exclude_apps` via the CLI settings layer, R8),
-/// locked where it doesn't (matrix-immutable rows; the Mask override is
-/// SCR-225). Row semantics derive from `AppRuleSegmentPolicy`.
+/// default-action banner, and per-app rows — 30px initials tile, name, mono
+/// note, and the tri-state Record/Mask/Block segmented control. All three
+/// segments write since SCR-225 (`allow_apps` / `mask_apps` / `exclude_apps`
+/// via the CLI settings layer, R8), as does the banner (`default_action`). The
+/// only non-writable row left is the SCR-224 private-windows stub. Row
+/// semantics derive from `AppRuleSegmentPolicy`.
 struct AppRulesView: View {
     @EnvironmentObject private var privacy: PrivacyController
 
@@ -22,6 +22,10 @@ struct AppRulesView: View {
     /// confirmation-required row). Cancel writes nothing; Confirm issues the
     /// CLI write with the confirm flag.
     @State private var confirmingApp: InstalledApp?
+    /// Locks the banner for the round trip of a default-action write, so a
+    /// rapid second tap can't race the first (mirrors `pendingSegments` for
+    /// rows, but the banner is a single control so one flag suffices).
+    @State private var defaultWritePending = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -75,29 +79,38 @@ struct AppRulesView: View {
         }
     }
 
-    // MARK: - Default-for-new-apps banner (design 522–529; stub SCR-225)
+    // MARK: - Default-action banner (design 522–529; live since SCR-225)
 
-    /// "Record" reflects the real matrix default for unlisted apps; choosing a
-    /// different default is per-app-override territory (SCR-225), so the other
-    /// segments are stubs.
+    /// The blanket floor for apps with no explicit rule. Deliberately NOT
+    /// "anything not listed below" — every installed app is listed below, so
+    /// that phrasing described a partial list that does not exist. What the
+    /// control actually governs is any app the user has not given a rule.
+    ///
+    /// Its Record differs from a row's Record: this one means "let the app's
+    /// category decide", while a row's Record is an explicit per-app allow that
+    /// overrides the category. Stricter values here can only tighten.
     private var defaultForNewAppsBanner: some View {
         HStack(spacing: 12) {
-            (
-                // Text-concatenation styling must return `Text`, and the
-                // Text-returning foregroundStyle overload is macOS 14+ — the
-                // deployment target is 13, so these two use foregroundColor.
-                Text("Default for new apps").font(SCTypography.sans(size: 13, weight: .semibold)).foregroundColor(.scInk)
-                + Text(" — anything not listed below").font(SCTypography.sans(size: 13)).foregroundColor(.scInkSecondary)
-            )
+            VStack(alignment: .leading, spacing: 2) {
+                (
+                    // Text-concatenation styling must return `Text`, and the
+                    // Text-returning foregroundStyle overload is macOS 14+ — the
+                    // deployment target is 13, so these two use foregroundColor.
+                    Text("Default for apps you haven't set").font(SCTypography.sans(size: 13, weight: .semibold)).foregroundColor(.scInk)
+                    + Text(" — applies to every app below without its own rule").font(SCTypography.sans(size: 13)).foregroundColor(.scInkSecondary)
+                )
+                Text(defaultActionCaption)
+                    .font(SCTypography.metaMonoSmall)
+                    .foregroundStyle(Color.scInkMuted)
+            }
             Spacer(minLength: 8)
             HStack(spacing: 0) {
-                segmentLabel("Record", state: .selected(.record), enabled: false)
-                segmentLabel("Mask", state: .idle, enabled: false)
-                segmentLabel("Block", state: .idle, enabled: false)
+                defaultSegment("Record", value: "allow", segment: .record)
+                defaultSegment("Mask", value: "mask_window", segment: .mask)
+                defaultSegment("Block", value: "exclude", segment: .block)
             }
             .overlay(Capsule().strokeBorder(Color.scBorderWarm, lineWidth: 1))
             .clipShape(Capsule())
-            .help(AppRuleSegmentPolicy.maskStubHelp)  // Stub: SCR-225 default-for-new-apps rule
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -107,6 +120,47 @@ struct AppRulesView: View {
             RoundedRectangle(cornerRadius: SCMetrics.radiusChip)
                 .strokeBorder(Color.scBorderWarm, lineWidth: 1)
         )
+    }
+
+    /// Names the consequence of the current default in plain terms. The strict
+    /// values have a wide blast radius — for most libraries "no rule" is nearly
+    /// every app — so the banner says so rather than leaving it to the label.
+    private var defaultActionCaption: String {
+        switch privacy.defaultAction {
+        case "exclude":
+            return "nothing is recorded unless you set it to Record"
+        case "mask_window":
+            return "windows are masked unless you set them to Record"
+        default:
+            return "each app's category decides"
+        }
+    }
+
+    /// One banner segment. Selected state comes from the controller's published
+    /// default, so a failed write reverting the value also reverts the control.
+    @ViewBuilder
+    private func defaultSegment(
+        _ label: String,
+        value: String,
+        segment: AppRuleSegmentPolicy.Segment
+    ) -> some View {
+        let selected = privacy.defaultAction == value
+        Button {
+            guard !selected, !defaultWritePending else { return }
+            defaultWritePending = true
+            Task {
+                await privacy.setDefaultAction(value)
+                defaultWritePending = false
+            }
+        } label: {
+            segmentLabel(
+                label,
+                state: selected ? .selected(segment) : .idle,
+                enabled: !selected && !defaultWritePending
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(selected || defaultWritePending)
     }
 
     // MARK: - Rows
@@ -190,6 +244,8 @@ struct AppRulesView: View {
                 await privacy.toggleAllow(bundleId: app.bundleId, allowed: true)
             case .allowConfirm:
                 break  // handled above before pending state is set
+            case .maskAdd:
+                await privacy.toggleMask(bundleId: app.bundleId)
             }
             pendingSegments.removeValue(forKey: app.bundleId)
         }
@@ -314,12 +370,14 @@ private struct AppRuleRow: View {
             segmentButton(
                 "Mask",
                 state: selection == .mask ? .selected(.mask) : .idle,
-                // The Mask segment never accepts interaction in v1: it either
-                // shows the matrix's own (real) state or stubs the SCR-225
-                // per-app override.
-                enabled: false,
-                help: selection == .mask ? nil : AppRuleSegmentPolicy.maskStubHelp
-            ) {}
+                // Writable since SCR-225, but only where a Mask rule would
+                // change the outcome — `maskEnabled` is false on rows that
+                // already mask or that resolve to the stricter EXCLUDE.
+                enabled: !busy && policy.maskEnabled,
+                help: nil
+            ) {
+                fire(.mask)
+            }
             segmentButton(
                 "Block",
                 state: selection == .block ? .selected(.block) : .idle,

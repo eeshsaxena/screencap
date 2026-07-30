@@ -14,9 +14,14 @@ class ReasonCode:
     # Policy-layer reasons
     POLICY_EXCLUDED_APP = "policy_excluded_app"
     POLICY_MASKED_DOMAIN = "policy_masked_domain"
+    POLICY_MASKED_APP = "policy_masked_app"
     POLICY_ALLOWED_APP = "policy_allowed_app"
     POLICY_MASKED_TITLE = "policy_masked_title"
     POLICY_MODE_DEFAULT = "policy_mode_default"
+    # The user's blanket default tightened the matrix action for an app they
+    # had written no rule for (SCR-225). Emitted only when the floor actually
+    # changed the action, so an untightened decision keeps its context reason.
+    POLICY_DEFAULT_FLOOR = "policy_default_floor"
 
     # Context-classifier reasons
     CONTEXT_EMAIL = "context_email_surface"

@@ -32,13 +32,18 @@ _PRIVACY_LIST_FIELDS = (
     "exclude_apps",
     "allow_apps",
     "confirmed_allow_apps",
+    "mask_apps",
     "mask_domains",
     "mask_title_patterns",
 )
+# The three per-app rule lists. A bundle may appear in at most one of them:
+# `_prune_sibling_rules` enforces that at add time (SCR-225), so a row in the
+# App-rules pane can never render a selection the evaluator contradicts.
+_PRIVACY_APP_RULE_FIELDS = ("exclude_apps", "allow_apps", "confirmed_allow_apps")
 # `matrix_acknowledged_v2026_04` is NOT exposed here (todo 012) — it's an
 # internal migration flag written by `_maybe_prompt_matrix_acknowledgement`
 # and should not be flippable from a `screencap settings` invocation.
-_PRIVACY_SCALAR_FIELDS = ("mode", "setup_skipped")
+_PRIVACY_SCALAR_FIELDS = ("mode", "setup_skipped", "default_action")
 _PRIVACY_MAP_FIELDS = ("app_classes",)
 # `shared` is reserved for MASK_REGION (not yet implemented); accepting it
 # would write an unenforceable value that crashes the next start (todo 011).
@@ -391,6 +396,58 @@ def _matching_entries(arr, value: str) -> list:
     return [e for e in arr if str(e).lower() == value.lower()]
 
 
+def _privacy_default_action_values() -> tuple[str, ...]:
+    """The settable ``privacy.default_action`` values.
+
+    Derived from the policy layer's single definition so the CLI's write-seam
+    validation cannot drift from what ``parse_privacy_config`` will accept on
+    the next start — the drift that would let a ``settings privacy`` call write
+    a value that crashes startup. Deferred import keeps ``--help`` cheap.
+    """
+    from screencap.privacy.policy import SETTABLE_DEFAULT_ACTIONS
+
+    return tuple(a.value for a in SETTABLE_DEFAULT_ACTIONS)
+
+
+def _prune_sibling_rules(privacy_tbl, field: str, value: str) -> bool:
+    """Drop ``value`` from the rule lists that must not hold it alongside ``field``.
+
+    The App-rules pane presents Record / Mask / Block as one segmented control,
+    so the underlying lists have to behave like a single choice per bundle
+    (SCR-225 R8). Adding a Mask rule clears the allow and deny entries; adding a
+    deny or an allow clears the Mask rule. Matching is case-insensitive because
+    runtime membership is case-normalized — an exact-case prune would leave a
+    case-variant entry live at runtime but invisible to the UI.
+
+    Deliberately does NOT touch the pre-existing exclude/allow relationship:
+    those two already coexist with a documented precedence (deny wins), and the
+    pane's Record/Block transitions manage them. Only the new list participates.
+
+    Returns True when it removed something, so the caller can report a real
+    change even on an otherwise-idempotent add. That case is reachable: a
+    hand-edited config listing one bundle in both ``allow_apps`` and
+    ``mask_apps`` renders as Mask (the read path fails closed), so the user's
+    Record tap is an idempotent ``allow_apps add`` — without counting the prune
+    the tap would silently do nothing and the row would stay on Mask.
+    """
+    if field == "mask_apps":
+        siblings = _PRIVACY_APP_RULE_FIELDS
+    elif field in ("exclude_apps", "allow_apps"):
+        siblings = ("mask_apps",)
+    else:
+        return False
+
+    pruned = False
+    for name in siblings:
+        arr = privacy_tbl.get(name)
+        if arr is None:
+            continue
+        for stale in _matching_entries(arr, value):
+            arr.remove(stale)
+            pruned = True
+    return pruned
+
+
 def _allow_requires_confirmation(ctx_class) -> bool:
     """True when allow-listing this class needs the explicit confirm flag.
 
@@ -515,27 +572,25 @@ def _settings_privacy_apply(
                     error=f"confirmation_required:{effective_class.value}",
                 )
         else:
-            # Unknown bundle (no BUNDLE_ID_MAP entry, no app_classes
-            # override) — fail-closed (Finding 001 Variant A). The runtime
-            # evaluator's strictness floor (policy.py allow_apps step)
-            # already blocks loosening when a downstream classifier
-            # resolves the bundle to CHAT/EMAIL/etc., so the harm window
-            # is narrow. But the CLI add-time path stays explicit: require
-            # the user to classify the bundle first, so the matrix can
-            # reason about it. Keeps the privacy-first posture symmetric
-            # with how PASSWORD_MANAGER and friends are handled.
-            err_console.print(
-                f"[red]Error:[/red] '{escape(str(value))}' is not in BUNDLE_ID_MAP and has no "
-                f"app_classes override — refusing to allow-list an unclassified "
-                f"bundle. Run [bold]screencap settings privacy app_classes set "
-                f"{escape(str(value))}=<class>[/bold] first (e.g., browser_unverified for an "
-                f"AI tool), then add to allow_apps if needed."
-            )
-            _result(
-                False,
-                exit_code=1,
-                error=f"unknown_bundle_id:{value}",
-            )
+            # Unknown bundle (no BUNDLE_ID_MAP entry, no app_classes override)
+            # — permitted as a plain allow since SCR-225 (KTD9).
+            #
+            # This used to fail closed and demand the user classify the bundle
+            # first. That refusal became untenable once `default_action` could
+            # be tightened: a Block default excludes every app the user has not
+            # ruled on, and most of a real library is absent from
+            # BUNDLE_ID_MAP, so the escape hatch (tap Record in the App-rules
+            # pane) hard-failed on precisely the apps the floor had caught.
+            #
+            # What still holds: `_allow_requires_confirmation` above gates
+            # every bundle that *does* resolve to a confirmation-required
+            # class, via BUNDLE_ID_MAP or an app_classes override, and the
+            # app_classes remove guard still blocks the two-step bypass. The
+            # residual exposure is named in SECURITY.md — a genuinely
+            # sensitive app that no map or override classifies has no static
+            # class to check, so it allow-lists without the consequences
+            # dialog.
+            pass
 
     if is_list:
         # Mutate the tomlkit Array in place (todo 016) so per-item inline
@@ -551,7 +606,7 @@ def _settings_privacy_apply(
         # seam would leave hand-edited case-variant entries live at runtime
         # but unremovable here. mask_domains/mask_title_patterns keep exact
         # matching (patterns are case-sensitive regexes).
-        is_bundle_field = field in ("exclude_apps", "allow_apps", "confirmed_allow_apps")
+        is_bundle_field = field in _PRIVACY_APP_RULE_FIELDS + ("mask_apps",)
         if op == "add":
             if field == "allow_apps":
                 # SCR-235: adds through this flow are confirmed — write both
@@ -565,7 +620,11 @@ def _settings_privacy_apply(
                     privacy_tbl["confirmed_allow_apps"] = confirmed
                 already = bool(_matching_entries(arr, value))
                 conf_already = bool(_matching_entries(confirmed, value))
-                if already and conf_already:
+                # A Mask rule for this bundle loses to the explicit allow the
+                # user just asked for; prune before the idempotency check so a
+                # re-add of an existing allow still clears a stale mask entry.
+                pruned = _prune_sibling_rules(privacy_tbl, field, value)
+                if already and conf_already and not pruned:
                     err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} (confirmed) — no change.[/dim]")
                     _result(True, changed=False)
                     return False
@@ -579,12 +638,14 @@ def _settings_privacy_apply(
                     if is_bundle_field
                     else value in arr
                 )
-                if already:
+                pruned = _prune_sibling_rules(privacy_tbl, field, value)
+                if already and not pruned:
                     # Idempotent no-op
                     err_console.print(f"[dim]{escape(str(field))} already contains {escape(str(value))} — no change.[/dim]")
                     _result(True, changed=False)
                     return False
-                arr.append(value)
+                if not already:
+                    arr.append(value)
         else:  # remove
             if is_bundle_field:
                 matches = _matching_entries(arr, value)
