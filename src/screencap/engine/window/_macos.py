@@ -11,12 +11,9 @@ try:
     import AppKit
     import ApplicationServices
     import Foundation
-    import oa_atomacos
     import Quartz
 except ImportError as e:
-    raise ImportError(
-        f"macOS window capture requires AppKit, Quartz, and oa_atomacos: {e}"
-    )
+    raise ImportError(f"macOS window capture requires AppKit, Quartz: {e}")
 
 from loguru import logger
 
@@ -503,11 +500,9 @@ def deepconvert_objc(object: Any) -> Any | list | dict | Literal[0]:
             logger.warning(
                 f"Unknown type: {type(object)} - "
                 "Please report this on GitHub: "
-                "github.com/Divide-By-0/screencap/issues/new"
+                "github.com/proteus-computer-use/screencap/issues/new"
             )
             logger.warning(f"{object=}")
-    if value:
-        value = oa_atomacos._converter.Converter().convert_value(value)
     return value
 
 
@@ -534,13 +529,27 @@ def get_active_element_state(
         # returns {} instead of raising on a bare desktop.
         return {}
     pid = window_meta["kCGWindowOwnerPID"]
-    app = oa_atomacos._a11y.AXUIElement.from_pid(pid)
-    app.set_timeout(config.AX_ELEMENT_TIMEOUT)
-    el = app.get_element_at_position(x, y)
-    if el is None:
+    app_ref = ApplicationServices.AXUIElementCreateApplication(pid)
+    # Set messaging timeout to avoid 6s hangs on unresponsive apps (Electron, etc.)
+    ApplicationServices.AXUIElementSetMessagingTimeout(
+        app_ref, config.AX_ELEMENT_TIMEOUT
+    )
+    error_code, el = ApplicationServices.AXUIElementCopyElementAtPosition(
+        app_ref, x, y, None
+    )
+    if error_code or el is None:
+        if error_code == ApplicationServices.kAXErrorAPIDisabled:
+            # Actionable: the user has not granted Accessibility permission.
+            logger.warning(
+                "AX element capture unavailable: Accessibility permission not granted"
+            )
+        else:
+            # kAXErrorNoValue is the common benign case — the point is over the
+            # desktop, a Canvas/WebGL surface, or any other view with no AX object.
+            logger.debug(f"No AX element at ({x}, {y}) (error {error_code})")
         return {}
     state = dump_state(
-        el.ref,
+        el,
         max_depth=max_depth,
         timeout=config.AX_DUMP_TIMEOUT,
         attr_allowlist=_AX_ATTRS,
