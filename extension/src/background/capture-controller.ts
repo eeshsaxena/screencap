@@ -323,7 +323,13 @@ async function dispatch(
  * from the event-stream unit onward one runs on every allow-listed origin, and
  * a visited page must never be able to start or stop a recording.
  */
-export function registerCaptureListener(controller: CaptureController): void {
+export function registerCaptureListener(
+  controller: CaptureController,
+  /** Run after any verb that could have changed state, so the toolbar badge is
+   * repainted from the new truth. Injected rather than imported so the
+   * controller stays free of presentation concerns. */
+  onChanged: () => void = () => {},
+): void {
   chrome.runtime.onMessage.addListener(
     (request: unknown, sender, sendResponse: (r: CaptureMessageResponse) => void) => {
       const failed = isRecorderFailed(request);
@@ -338,8 +344,14 @@ export function registerCaptureListener(controller: CaptureController): void {
         : dispatch(controller, request);
 
       work
-        .then(sendResponse)
-        .catch((error: unknown) => sendResponse({ ok: false, error: describe(error) }));
+        .then((response) => {
+          sendResponse(response);
+          onChanged();
+        })
+        .catch((error: unknown) => {
+          sendResponse({ ok: false, error: describe(error) });
+          onChanged();
+        });
       // Keeps the message channel open for the async response above.
       return true;
     },

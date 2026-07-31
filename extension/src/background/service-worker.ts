@@ -20,6 +20,7 @@ import {
   chromeCaptureDeps,
   registerCaptureListener,
 } from "./capture-controller.js";
+import { applyBadge, badgeFor, chromeBadgeDeps } from "./indicator.js";
 import { isExtensionPageSender as isTrustedSender } from "./senders.js";
 
 const session = new AuthSession(chromeAuthDeps());
@@ -93,4 +94,23 @@ chrome.runtime.onMessage.addListener(
 
 // Registered after the auth listener, not instead of it: both see every message
 // and decline what is not theirs.
-registerCaptureListener(new CaptureController(chromeCaptureDeps()));
+const capture = new CaptureController(chromeCaptureDeps());
+
+/**
+ * Repaint the badge from the reconciled session.
+ *
+ * Called at module load as well as after each verb, because module load *is*
+ * worker startup in MV3: a revived worker inherits whatever badge the browser
+ * kept, which may describe a recording that has since ended.
+ */
+async function syncBadge(): Promise<void> {
+  try {
+    await applyBadge(chromeBadgeDeps(), badgeFor(await capture.status()));
+  } catch {
+    // A worker that cannot read its own state should still come up; the badge
+    // is an indicator, and the popup asks for status directly anyway.
+  }
+}
+
+registerCaptureListener(capture, () => void syncBadge());
+void syncBadge();

@@ -7,6 +7,7 @@
   "permissions": [
     "identity",
     "storage",
+    "activeTab",
     "tabCapture",
     "offscreen",
     "unlimitedStorage"

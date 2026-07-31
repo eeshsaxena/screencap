@@ -411,10 +411,19 @@ describe("manifest", () => {
     expect(manifest.permissions).toEqual([
       "identity",
       "storage",
+      "activeTab",
       "tabCapture",
       "offscreen",
       "unlimitedStorage",
     ]);
+  });
+
+  it("does not turn activeTab into standing access to every tab", () => {
+    // activeTab is what lets the popup read the current tab's title and capture
+    // it, scoped to the moment the user opens the popup. The `tabs` permission
+    // would grant the same reads across every tab, permanently, and warn the
+    // user accordingly — a much wider ask for the same feature.
+    expect(manifest.permissions).not.toContain("tabs");
   });
 
   it("does not request desktopCapture", () => {
