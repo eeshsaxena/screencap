@@ -237,8 +237,9 @@ Screencap can also store the entire local library inside an app-managed **encryp
 Screencap is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). It is not an open-source license.
 
 - **Free:** personal use, hobby projects, private study, and research, plus use by charitable, educational, public research, public safety or health, environmental, and government organizations.
-- **Paid:** any commercial use — use in a business or production environment, use that generates or supports revenue, or use by or on behalf of a for-profit entity — requires a separate commercial license. Email aayushgupta5000@gmail.com.
+- **Trial:** commercial evaluation, development, and testing are permitted free for **7 days**, at any organization size — an additional permission granted on top of the license.
+- **Paid:** after the trial, any commercial use — use in a business or production environment, use that generates or supports revenue, or use by or on behalf of a for-profit entity — requires a separate commercial license. Email aayushgupta5000@gmail.com.
 
-Versions released before this change remain available under AGPL-3.0-or-later.
+Copyright 2026 Ivy Research LLC. Versions released before this change remain available under AGPL-3.0-or-later.
 
-Bundled and required third-party components keep their own licenses — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Contributions require signing the [CLA](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
+Bundled and required third-party components keep their own licenses — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Outside contributions require signing the [CLA](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).

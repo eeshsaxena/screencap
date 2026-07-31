@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Relicensed as PolyForm Noncommercial 1.0.0**, replacing AGPL-3.0-or-later.
   ScreenCap is now source-available, not open source. Noncommercial, personal,
-  research, educational, charitable, and government use remains free; **all
-  commercial use now requires a paid license.** Versions released under
+  research, educational, charitable, and government use remains free; **commercial
+  use requires a paid license** after a 7-day evaluation period, granted as an
+  additional permission on top of the license (PolyForm itself has no trial
+  clause). Copyright is held by Ivy Research LLC. Versions released under
   AGPL-3.0-or-later remain available under that license. `pyproject.toml`
   declares the new SPDX expression, and `build-system.requires` now needs
   setuptools >= 77 for PEP 639 support.

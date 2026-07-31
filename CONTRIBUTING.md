@@ -8,11 +8,15 @@ ScreenCap is **source-available, not open source**. It is distributed under the
 [PolyForm Noncommercial License 1.0.0](LICENSE), and licensed separately on
 commercial terms to paying users.
 
-Because of that dual arrangement, **every contributor must sign the
+Because of that dual arrangement, **outside contributors must sign the
 [Contributor License Agreement](CLA.md) before their first pull request is
-merged.** The CLA lets you keep the copyright in your work while granting the
-maintainers the right to distribute it under both the noncommercial license and
+merged.** The CLA lets you keep the copyright in your work while granting Ivy
+Research LLC the right to distribute it under both the noncommercial license and
 paid commercial licenses. Without a signed CLA we cannot merge your contribution.
+
+**Ivy Research LLC employees do not need to sign.** Work created within the scope
+of your employment is already owned by the company, so there is nothing left for
+a CLA to grant.
 
 ### How to sign
 

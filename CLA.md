@@ -29,8 +29,8 @@ means. It does not include anything you conspicuously mark in writing as
 **"Project"** means the ScreenCap software maintained at
 https://github.com/proteus-computer-use/screencap.
 
-**"Maintainers"** means the copyright holders of the Project and anyone they
-authorize to act for them in licensing it.
+**"Maintainers"** means Ivy Research LLC, the copyright holder of the Project,
+and anyone it authorizes to act for it in licensing the Project.
 
 ## 2. Copyright License
 
