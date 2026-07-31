@@ -97,12 +97,19 @@ export const SESSION_STORAGE_KEY = "screencap.capture.session";
 
 /** States that mean a recording is genuinely in flight, so a second start must
  * be refused and a missing document means a crash. */
-const LIVE_STATES: readonly StoredSessionState[] = [
-  "starting",
-  "recording",
-  "paused",
-  "stopping",
-];
+const LIVE_STATES = new Set<string>(["starting", "recording", "paused", "stopping"]);
+
+/**
+ * Whether a recording is genuinely in flight.
+ *
+ * Exported because the controller gates starts and stops on the same question,
+ * and two lists of "which states count as live" would drift — the failure being
+ * a second recording admitted over a running one, or a stop refused for a real
+ * recording.
+ */
+export function isLiveSessionKind(kind: ResolvedSessionKind): boolean {
+  return LIVE_STATES.has(kind);
+}
 
 const IDLE: ResolvedSession = { kind: "idle", record: null, error: null };
 
@@ -128,7 +135,7 @@ export function reconcile(
   if (record.state === "failed") {
     return { kind: "failed", record, error: record.error };
   }
-  if (LIVE_STATES.includes(record.state) && !offscreenExists) {
+  if (isLiveSessionKind(record.state) && !offscreenExists) {
     return { kind: "interrupted", record, error: null };
   }
   return { kind: record.state, record, error: null };
@@ -146,7 +153,7 @@ export function beginSession(
   current: Pick<ResolvedSession, "kind">,
   init: SessionInit,
 ): StartOutcome {
-  if (current.kind !== "idle" && current.kind !== "failed" && current.kind !== "interrupted") {
+  if (isLiveSessionKind(current.kind)) {
     return { ok: false, reason: "already-recording" };
   }
   return {

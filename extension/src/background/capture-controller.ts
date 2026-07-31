@@ -41,9 +41,11 @@ import {
   markRecording,
   markResumed,
   markStopping,
+  isLiveSessionKind,
   reconcile,
   type CaptureSource,
   type ResolvedSession,
+  type SessionRecord,
 } from "../capture/session.js";
 import { isExtensionPageSender } from "./senders.js";
 
@@ -84,9 +86,6 @@ export interface CaptureControllerDeps {
   newSessionId(): string;
 }
 
-/** States in which a start must be refused. */
-const LIVE_KINDS = new Set(["starting", "recording", "paused", "stopping"]);
-
 export class CaptureController {
   constructor(private readonly deps: CaptureControllerDeps) {}
 
@@ -103,7 +102,7 @@ export class CaptureController {
 
   async start(source: CaptureSourceRequest): Promise<CaptureStartOutcome> {
     const current = await this.status();
-    if (LIVE_KINDS.has(current.kind) && current.record !== null) {
+    if (isLiveSessionKind(current.kind) && current.record !== null) {
       return {
         ok: false,
         reason: "already-recording",
@@ -123,7 +122,9 @@ export class CaptureController {
       startedAtEpochMs: this.deps.now(),
     });
     if (!begun.ok) {
-      return { ok: false, reason: "already-recording", runningSource: current.record!.source };
+      // Unreachable in practice: the guard above already established this
+      // session is not live, which is the only thing `beginSession` refuses on.
+      return { ok: false, reason: "failed", error: "A recording is already running." };
     }
 
     await this.deps.createOffscreenDocument();
@@ -148,21 +149,18 @@ export class CaptureController {
     }
     if (!response.result.ok) {
       const { reason, error } = response.result;
-      await this.deps.closeOffscreenDocument();
-      await this.deps.session.clear();
+      await this.teardown();
       return { ok: false, reason, error };
     }
 
-    // The recorder is the only party that knows what the browser accepted, and
-    // it cannot write the record itself — an offscreen document reaches only
-    // chrome.runtime.
-    const source_ = response.result.sourceLabel
-      ? { ...begun.record.source, label: response.result.sourceLabel }
+    // The recorder is the only party that knows what the browser accepted and
+    // what the source is actually called, and it cannot write the record itself
+    // — an offscreen document reaches only chrome.runtime.
+    const { mimeType, sourceLabel } = response.result;
+    const named = sourceLabel
+      ? { ...begun.record.source, label: sourceLabel }
       : begun.record.source;
-    const recording = markRecording(
-      { ...begun.record, source: source_ },
-      response.result.mimeType,
-    );
+    const recording = markRecording({ ...begun.record, source: named }, mimeType);
     await this.deps.session.write(recording);
 
     return { ok: true, sessionId: recording.id, source: recording.source };
@@ -170,7 +168,7 @@ export class CaptureController {
 
   async stop(): Promise<CaptureStopOutcome> {
     const current = await this.status();
-    if (!LIVE_KINDS.has(current.kind) || current.record === null) {
+    if (!isLiveSessionKind(current.kind) || current.record === null) {
       return { ok: false, reason: "not-recording" };
     }
     const record = current.record;
@@ -220,8 +218,8 @@ export class CaptureController {
 
   private async shift(
     type: "offscreen.pause" | "offscreen.resume",
-    from: string,
-    apply: (record: Parameters<typeof markPaused>[0], atEpochMs: number) => ReturnType<typeof markPaused>,
+    from: ResolvedSession["kind"],
+    apply: (record: SessionRecord, atEpochMs: number) => SessionRecord,
   ): Promise<boolean> {
     const current = await this.status();
     if (current.kind !== from || current.record === null) return false;
