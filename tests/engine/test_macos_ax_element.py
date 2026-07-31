@@ -15,6 +15,12 @@ import pytest
 
 pytestmark = pytest.mark.macos_hw
 
+# ``_macos`` imports AppKit/ApplicationServices/Quartz at module scope and raises
+# ImportError off macOS, so collection has to be skipped *before* that import.
+# The macos_hw marker cannot do it: pytest reads markers only after importing the
+# module, so on Linux the import blows up first and fails the whole run.
+pytest.importorskip("AppKit", reason="macOS-only: _macos requires PyObjC")
+
 from screencap.engine.window import _macos
 
 # Real AX error codes (ApplicationServices).
