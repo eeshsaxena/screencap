@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArOLsP2xtmWTbe5KeGI1s7oSD2KbvKG1qeNWpHTVUTt0r5DLpps5Hg7OwTTcRcpSXci7ZxTfPi+vzvVmhzr4N6bhdIo2w2wVbshmq7tRmha8LXxXK2aagoWBz0SynTYNUEf1Gqgls+FQqHBhK6pIFqc0/938+QNx2+Mv28KLnGiLueKkIxIFfsdRoKxOtqyx7Cckjb0o7T4O1NcLKhtuZP6xuDwvBGC62LamEhMb7zkNRvAt7lKjqt1YSDFnNBbiBnDeYJ8+fkpFOdLUMvSte/o4HBUVyeWRDNv1tWk7hDsy1LF2g/E7siavVmKzIBjVZF2md0BoRU+js87AWfz/RlwIDAQAB",
   "name": "Screencap",
   "version": "0.1.0",
   "description": "Record your browser work and watch it back — no app install required.",
@@ -12,7 +13,10 @@
     "offscreen",
     "unlimitedStorage"
   ],
-  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
   "background": {
     "service_worker": "background/service-worker.js",
     "type": "module"

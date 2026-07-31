@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Relicensed as PolyForm Noncommercial 1.0.0**, replacing AGPL-3.0-or-later.
+  ScreenCap is now source-available, not open source. Noncommercial, personal,
+  research, educational, charitable, and government use remains free; **commercial
+  use requires a paid license** after a 7-day evaluation period, granted as an
+  additional permission on top of the license (PolyForm itself has no trial
+  clause). The LICENSE header also scopes the terms to the source code and
+  self-built binaries: official prebuilt builds are governed by the
+  subscription terms shipped with them, so a paid plan buys the signed build,
+  updates, support, and cloud rather than the right to use the software.
+  Copyright is held by Ivy Research LLC. Versions released under
+  AGPL-3.0-or-later remain available under that license. `pyproject.toml`
+  declares the new SPDX expression, and `build-system.requires` now needs
+  setuptools >= 77 for PEP 639 support.
+- **Contributions now require a signed CLA** (`CLA.md`, `CONTRIBUTING.md`). The
+  CLA grants outbound relicensing rights, without which commercial licenses
+  cannot be offered over contributed code.
+
+### Added
+
+- `THIRD-PARTY-NOTICES.md` — third-party license audit and obligations, covering
+  the `pynput` LGPL-3.0 substitution mechanism for the frozen daemon and the UT1
+  CC BY-SA 4.0 data attribution.
+
+### Removed
+
+- **`oa-atomacos` dependency dropped** — it was GPL-2.0-only, and importing it
+  in-process formed a combined work that could not be conveyed under PolyForm
+  terms (nor, as it happens, under the previous AGPL-3.0 license). Replaced with
+  direct PyObjC Accessibility API calls, matching the pattern already used by
+  `get_active_window()` in the same module.
+
+### Fixed
+
+- **AX hit-test misses no longer log a warning per event.** `oa-atomacos` raised
+  on every non-success AX error code, including `kAXErrorNoValue` — the ordinary
+  result when the pointer is over the desktop, a Canvas/WebGL surface, or any
+  other view with no accessibility object. That exception propagated out of
+  `get_active_element_state()` and was swallowed by `AXQueryCache`, which logged
+  `AXQueryCache query failed: ...` on every miss. The `if el is None` branch that
+  was meant to handle this was unreachable. The error code is now checked
+  directly, so misses return `{}` quietly and a missing Accessibility permission
+  (`kAXErrorAPIDisabled`) is reported distinctly instead of being conflated with
+  a benign miss.
+
 ## [0.30.0] - 2026-07-21
 
 ### Added

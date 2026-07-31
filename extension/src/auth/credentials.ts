@@ -4,12 +4,12 @@
  * than hardcoded per developer, and an un-provisioned build resolves to a
  * placeholder that `isPlaceholderCredential` recognizes.
  *
- * **Not yet wired.** No build step rewrites {@link PROVISIONED} today, and no
- * release guard calls {@link isPlaceholderCredential} — the checked-in values
- * are placeholders and `bundledCredentials` throws on them, so an
- * un-provisioned build fails loudly at first sign-in rather than shipping a
- * broken one silently. Wiring the injection and the release check is
- * outstanding work, tracked with the rest of the browser tier.
+ * The injected values live in `./provisioned.ts`, whose compiled output
+ * `scripts/generate-provisioned.mjs` overwrites during packaging. The
+ * checked-in values there are placeholders and `bundledCredentials` throws on
+ * them, so an un-provisioned build fails loudly rather than shipping broken —
+ * at the release guard when packaging, or at first sign-in if one is ever
+ * loaded unpacked.
  *
  * Neither value is secret: a Firebase web API key and an OAuth client id are
  * public identifiers. Unlike the CLI's Google **Desktop** OAuth client, the
@@ -18,17 +18,25 @@
  * and no client secret to bundle at all.
  */
 
+import {
+  FIREBASE_API_KEY as INJECTED_FIREBASE_API_KEY,
+  OAUTH_CLIENT_ID as INJECTED_OAUTH_CLIENT_ID,
+} from "./provisioned.js";
+
+/**
+ * The sentinels {@link isPlaceholderCredential} compares against. Written out
+ * literally rather than imported from `./provisioned.ts`: that module's
+ * compiled output is replaced wholesale at build time, so it cannot be the
+ * source of truth for what "un-provisioned" means. `credentials.test.ts` pins
+ * the two copies together.
+ */
 export const DEFAULT_FIREBASE_API_KEY = "UNPROVISIONED_FIREBASE_API_KEY";
 export const DEFAULT_OAUTH_CLIENT_ID = "UNPROVISIONED_OAUTH_CLIENT_ID";
 
-/**
- * Build-time injection point. The release build rewrites this object; the
- * checked-in values are placeholders so an un-provisioned build fails loudly
- * at the release guard rather than silently at a user's first sign-in.
- */
+/** Resolved from the build-time injection point. See `./provisioned.ts`. */
 export const PROVISIONED = {
-  firebaseApiKey: DEFAULT_FIREBASE_API_KEY,
-  oauthClientId: DEFAULT_OAUTH_CLIENT_ID,
+  firebaseApiKey: INJECTED_FIREBASE_API_KEY,
+  oauthClientId: INJECTED_OAUTH_CLIENT_ID,
 } as const;
 
 /** True when a resolved credential is still an un-provisioned placeholder. */

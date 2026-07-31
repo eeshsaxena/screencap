@@ -234,7 +234,14 @@ Screencap can also store the entire local library inside an app-managed **encryp
 
 ## License
 
-Screencap is dual-licensed:
+Screencap is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). It is not an open-source license.
 
-- **Open source:** GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE). If you use, modify, or offer Screencap as a network service, you must release your modifications under the same license.
-- **Commercial:** If the AGPL terms don't fit your use case (e.g. embedding Screencap in a closed-source product or offering it as a hosted service without source disclosure), a commercial license is available. Email aayushgupta5000@gmail.com.
+The license covers the **source code** and anything you build from it. Official prebuilt builds — the signed, notarized app and its bundled CLI — are covered by the subscription terms that come with them. Building from source for a permitted purpose is always free; a paid plan buys the official build, updates, support, and cloud.
+
+- **Free:** personal use, hobby projects, private study, and research, plus use by charitable, educational, public research, public safety or health, environmental, and government organizations.
+- **Trial:** commercial evaluation, development, and testing are permitted free for **7 days**, at any organization size — an additional permission granted on top of the license.
+- **Paid:** after the trial, any commercial use — use in a business or production environment, use that generates or supports revenue, or use by or on behalf of a for-profit entity — requires a separate commercial license. Email aayushgupta5000@gmail.com.
+
+Copyright 2026 Ivy Research LLC. Versions released before this change remain available under AGPL-3.0-or-later.
+
+Bundled and required third-party components keep their own licenses — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Outside contributions require signing the [CLA](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
