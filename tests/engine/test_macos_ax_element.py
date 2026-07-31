@@ -15,6 +15,17 @@ import pytest
 
 pytestmark = pytest.mark.macos_hw
 
+# The marker alone is not enough: it deselects *after* collection, while the
+# import below runs *during* it. On Linux `_macos` raises ImportError for the
+# missing PyObjC bindings, which fails collection outright and takes the whole
+# suite with it rather than skipping this module. Guarding the way
+# `test_stats.py` and `test_comparison.py` already do keeps the skip a skip.
+pytest.importorskip(
+    "AppKit",
+    exc_type=ImportError,
+    reason="macOS PyObjC bindings are not available",
+)
+
 from screencap.engine.window import _macos
 
 # Real AX error codes (ApplicationServices).
