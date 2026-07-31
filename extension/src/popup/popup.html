@@ -43,6 +43,19 @@
         margin: 12px 0 0;
         color: #b3261e;
       }
+      .warning {
+        font-size: 12px;
+        margin: 0 0 12px;
+        padding: 8px;
+        border-radius: 6px;
+        border: 1px solid currentColor;
+        color: #8a5a00;
+      }
+      @media (prefers-color-scheme: dark) {
+        .warning {
+          color: #e8b339;
+        }
+      }
       .note {
         font-size: 12px;
         margin: 0 0 12px;
@@ -50,6 +63,57 @@
       }
       [hidden] {
         display: none;
+      }
+      hr {
+        border: 0;
+        border-top: 1px solid currentColor;
+        opacity: 0.2;
+        margin: 16px 0 12px;
+      }
+      h2 {
+        font-size: 13px;
+        margin: 0 0 8px;
+      }
+      #allowlist-entries {
+        list-style: none;
+        margin: 0 0 12px;
+        padding: 0;
+        font-size: 13px;
+      }
+      #allowlist-entries li {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 0;
+      }
+      #allowlist-entries .origin {
+        flex: 1;
+        word-break: break-all;
+      }
+      #allowlist-entries button {
+        width: auto;
+        flex: none;
+        padding: 2px 8px;
+        font-size: 12px;
+      }
+      .add-row {
+        display: flex;
+        gap: 6px;
+      }
+      .add-row input {
+        flex: 1;
+        min-width: 0;
+        padding: 6px 8px;
+        font: inherit;
+        font-size: 13px;
+        border-radius: 6px;
+        border: 1px solid currentColor;
+        background: transparent;
+        color: inherit;
+      }
+      .add-row button {
+        width: auto;
+        flex: none;
       }
     </style>
   </head>
@@ -67,6 +131,25 @@
         Can't reach Screencap right now — you're still signed in.
       </p>
       <button id="sign-out">Sign out</button>
+    </section>
+
+    <section id="allowlist" hidden>
+      <hr />
+      <h2>Sites Screencap may record</h2>
+      <p id="allowlist-empty" class="note" hidden></p>
+      <p id="allowlist-warning" class="warning" hidden></p>
+      <ul id="allowlist-entries"></ul>
+      <div class="add-row">
+        <input
+          id="allowlist-input"
+          type="text"
+          placeholder="example.com"
+          aria-label="Site to allow"
+        />
+        <button id="allowlist-add">Add</button>
+      </div>
+      <p id="allowlist-notice" class="note" hidden></p>
+      <p id="allowlist-error" class="error" hidden></p>
     </section>
 
     <section id="unknown" hidden>

@@ -4,7 +4,12 @@
     "module": "ES2022",
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM"],
-    "types": ["chrome"],
+    // "node" is here for the test suite only — `allowlist.test.ts` reads
+    // manifest.json off disk to pin the no-required-host-permissions invariant.
+    // Shipped source must stay browser-only; tsconfig.build.json drops the
+    // tests, so anything reaching for a node builtin outside a test would fail
+    // at load rather than be caught here.
+    "types": ["chrome", "node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,

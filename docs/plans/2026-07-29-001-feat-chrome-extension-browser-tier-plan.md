@@ -503,15 +503,17 @@ Each unit is sized for one session and tracked as its own Linear issue.
 
 | Scope | Command | Applies to |
 |---|---|---|
-| Python tests | `pytest tests/` | U6, U10 |
-| Privacy lane | `pytest -m privacy` | U2, U4 |
+| Python tests | `pytest tests/` | U10 |
+| Privacy lane | `pytest -m privacy` | any unit changing Python privacy behavior — none in the capture track as scoped |
 | Engine lint | `ruff check src/screencap/engine/` | any unit touching `src/screencap/engine/` |
 | Cloud function tests | `pytest scripts/cloud-function/` | U6, U10 |
-| Extension tests | `npm test` in `extension/` | U1–U6 |
+| Extension tests + type-check | `npm test` and `npm run typecheck` in `extension/` | U1–U6 |
 | Website tests | `npm test` in the `screencap-website` repo | U7–U10 |
 | Website lint and build | `npm run lint && npm run build` in the `screencap-website` repo | U7–U10 |
 
-Run the privacy lane for any change to allow-list evaluation or event capture — CI runs `pytest -m privacy` as its gate, so a privacy-bearing test that is not marked never runs there.
+**Corrected during U2 (SCR-307).** The privacy lane originally listed U2 and U4, and `pytest tests/` listed U6. All three are implemented entirely in TypeScript under `extension/`, so `pytest` has nothing to collect for them and the rows could never have passed. The capture track's privacy-bearing behavior — the allow-list boundary and event capture — is proven by the extension suite instead, which U2 put on CI as the `Extension tests (Node)` job in `.github/workflows/ci.yml`. That job also runs `typecheck`, because `vitest` does not type-check.
+
+The privacy lane still applies to any unit that changes Python privacy behavior; CI runs `pytest -m privacy` as its gate, so a privacy-bearing Python test that is not marked never runs there.
 
 ---
 
