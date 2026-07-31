@@ -248,3 +248,22 @@ jobs:
         # dist/ a loadable unpacked extension.
         working-directory: extension
         run: npm run build
+
+      - name: Release guard rejects an un-provisioned build
+        # The build above emits placeholder credentials (no secrets on CI), so
+        # dist/ is exactly the un-provisioned state the guard exists to refuse.
+        # Asserting the refusal here is what proves the guard works; a unit test
+        # alone would not catch the guard being dropped from the packaging
+        # chain.
+        #
+        # Deliberately NOT `npm run package` for this: packaging runs the
+        # credential generator first, which exits on the missing variables
+        # before the guard is ever reached — that route would report the
+        # generator's fail-closed path as if it were the guard's.
+        working-directory: extension
+        run: |
+          if npm run verify-provisioned; then
+            echo "::error::release guard passed an un-provisioned build — it is not failing closed"
+            exit 1
+          fi
+          echo "Release guard correctly refused an un-provisioned build."
