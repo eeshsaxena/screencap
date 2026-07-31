@@ -22,7 +22,7 @@ import {
   type AllowlistEntry,
 } from "../permissions/allowlist.js";
 import { addOutcome, allowlistView, type AllowlistView } from "./allowlist-view.js";
-import { captureView, type CaptureView } from "./capture-view.js";
+import { captureProblem, captureView, type CaptureView } from "./capture-view.js";
 import { popupView, unreachableView, type PopupView } from "./view.js";
 
 const allowlist = new Allowlist(chromeAllowlistDeps());
@@ -106,38 +106,42 @@ async function sendCapture(message: CaptureMessage): Promise<CaptureMessageRespo
   return chrome.runtime.sendMessage<CaptureMessage, CaptureMessageResponse>(message);
 }
 
+const NO_SESSION = { kind: "idle", record: null, error: null } as const;
+
+/**
+ * Re-read capture state and paint it.
+ *
+ * An unanswered or failed round-trip is reported as *unreachable*, never as an
+ * idle session. Substituting an idle placeholder would make the panel say "Not
+ * recording" on the strength of no information at all.
+ */
 async function refreshCapture(
   signedIn: boolean,
   error: string | null = null,
 ): Promise<void> {
   if (!signedIn) {
-    renderCapture(
-      captureView({
-        signedIn: false,
-        status: { kind: "idle", record: null, error: null },
-      }),
-    );
+    renderCapture(captureView({ signedIn: false, status: NO_SESSION }));
     return;
   }
 
   try {
     const response = await sendCapture({ type: "capture.status" });
+    const reachable = response.ok && "status" in response;
     renderCapture(
       captureView({
         signedIn: true,
-        status:
-          "status" in response && response.ok
-            ? response.status
-            : { kind: "idle", record: null, error: null },
+        status: reachable ? response.status : NO_SESSION,
+        reachable,
         busy: captureBusy,
-        error,
+        error: error ?? (response.ok ? null : response.error),
       }),
     );
   } catch (caught) {
     renderCapture(
       captureView({
         signedIn: true,
-        status: { kind: "idle", record: null, error: null },
+        status: NO_SESSION,
+        reachable: false,
         busy: captureBusy,
         error: error ?? asError(caught),
       }),
@@ -161,38 +165,27 @@ function renderCapture(view: CaptureView): void {
   captureStop.disabled = !view.canStop;
 }
 
-/** Runs a capture verb and repaints from whatever state it left behind. */
+/**
+ * Run a capture verb and repaint once, carrying whatever went wrong.
+ *
+ * The outcome is latched rather than painted inside the try/catch, because a
+ * trailing repaint that defaulted the error to null would erase the message it
+ * had just rendered — leaving a refused start or a failed stop silently
+ * invisible.
+ */
 async function runCapture(
   start: () => Promise<CaptureMessageResponse>,
 ): Promise<void> {
   captureBusy = true;
+  let problem: string | null = null;
   try {
-    const response = await start();
-    await refreshCapture(lastSignedIn, captureProblem(response));
+    problem = captureProblem(await start());
   } catch (error) {
-    await refreshCapture(lastSignedIn, asError(error));
+    problem = asError(error);
   } finally {
     captureBusy = false;
-    await refreshCapture(lastSignedIn);
+    await refreshCapture(lastSignedIn, problem);
   }
-}
-
-/** Turn a refused or failed verb into something worth reading. A dismissed
- * picker is not one: the user closed it deliberately. */
-function captureProblem(response: CaptureMessageResponse): string | null {
-  if (!response.ok) return response.error;
-  if ("start" in response && !response.start.ok) {
-    if (response.start.reason === "already-recording") {
-      return `Already recording ${response.start.runningSource.label}.`;
-    }
-    return response.start.reason === "cancelled" ? null : response.start.error;
-  }
-  if ("stop" in response && !response.stop.ok) {
-    return response.stop.reason === "not-recording"
-      ? "There was no recording to stop."
-      : response.stop.error;
-  }
-  return null;
 }
 
 /**
@@ -404,7 +397,11 @@ void chrome.tabs
   .catch(() => {
     // Leaves `activeTab` null, which disables tab capture rather than starting
     // a recording of a tab we cannot name.
-  });
+  })
+  // Repaint whichever promise settles last: the tab button's disabled state is
+  // latched at render time and would otherwise stay stuck off when this
+  // resolves after the first paint.
+  .finally(() => void refreshCapture(lastSignedIn));
 
 signIn.addEventListener("click", () => void run(signIn, { type: "auth.signIn" }));
 signOut.addEventListener("click", () => void run(signOut, { type: "auth.signOut" }));

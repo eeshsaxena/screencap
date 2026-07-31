@@ -26,7 +26,7 @@
  */
 
 import {
-  RECORDER_FAILED,
+  isRecorderEnded,
   isRecorderFailed,
   type OffscreenRequest,
   type OffscreenResponse,
@@ -110,8 +110,20 @@ export class CaptureController {
       };
     }
 
-    // Anything open at this point is an orphan, not a recording — the guard
-    // above already ruled out a live one.
+    // Refuse before the cleanup below, not after: an unknown state means a
+    // document is alive whose record we cannot read, and the orphan close would
+    // tear down a recording that is still running.
+    if (current.kind === "unknown") {
+      return {
+        ok: false,
+        reason: "failed",
+        error:
+          "Screencap can't tell whether a recording is already running. Reopen the popup to try again.",
+      };
+    }
+
+    // Anything open at this point is an orphan, not a recording — the guards
+    // above ruled out both a live one and an unreadable one.
     if (await this.deps.hasOffscreenDocument()) {
       await this.deps.closeOffscreenDocument();
     }
@@ -122,8 +134,8 @@ export class CaptureController {
       startedAtEpochMs: this.deps.now(),
     });
     if (!begun.ok) {
-      // Unreachable in practice: the guard above already established this
-      // session is not live, which is the only thing `beginSession` refuses on.
+      // Unreachable in practice: the guards above already ruled out both states
+      // `beginSession` refuses on.
       return { ok: false, reason: "failed", error: "A recording is already running." };
     }
 
@@ -209,11 +221,32 @@ export class CaptureController {
   /** Capture died on its own. The worker is not in the slice path, so this
    * message is the only way it finds out. */
   async recorderFailed(error: string): Promise<void> {
-    const record = await this.deps.session.read();
-    if (record !== null) {
-      await this.deps.session.write(markFailed(record, error));
+    try {
+      const read = await this.deps.session.read();
+      if (read.kind === "record") {
+        await this.deps.session.write(markFailed(read.record, error));
+      }
+    } finally {
+      // Closed even when the record could not be written: a live document
+      // behind a dead recorder is what makes the session keep reading as
+      // running.
+      await this.deps.closeOffscreenDocument().catch(() => undefined);
     }
-    await this.deps.closeOffscreenDocument().catch(() => undefined);
+  }
+
+  /**
+   * The source ended without the extension asking — the user hit the browser's
+   * own stop control, or the captured surface went away.
+   *
+   * Torn down like an ordinary stop rather than marked failed: the recording
+   * finished normally, it just did not finish on our command. A session id that
+   * is not the live one is ignored, so a message that arrives late cannot end a
+   * recording the user has since started.
+   */
+  async recorderEnded(sessionId: string): Promise<void> {
+    const read = await this.deps.session.read();
+    if (read.kind !== "record" || read.record.id !== sessionId) return;
+    await this.teardown();
   }
 
   private async shift(
@@ -231,12 +264,14 @@ export class CaptureController {
     return true;
   }
 
-  /** Close the document and forget the session, in that order — a cleared
-   * record with a live document reads as an orphan the next start can clean
-   * up, whereas the reverse reads as a recording in progress. */
+  /** Forget the session first, then close the document. A worker that dies
+   * between the two leaves a cleared record with a live document, which reads
+   * as an orphan the next start cleans up; the reverse order would leave a live
+   * record with no document, reporting a clean stop as an interrupted
+   * recording. */
   private async teardown(): Promise<void> {
-    await this.deps.closeOffscreenDocument().catch(() => undefined);
     await this.deps.session.clear();
+    await this.deps.closeOffscreenDocument().catch(() => undefined);
   }
 
   private async abandonStart(error: string): Promise<CaptureStartOutcome> {
@@ -314,6 +349,30 @@ async function dispatch(
 }
 
 /**
+ * The two things the offscreen document reports without being asked.
+ *
+ * Returns null when the message is not one of them, so the caller can fall
+ * through to the ordinary verbs. Both end the session; they differ in whether
+ * that ending was a fault.
+ */
+function unsolicitedWork(
+  controller: CaptureController,
+  request: unknown,
+): Promise<CaptureMessageResponse> | null {
+  if (isRecorderFailed(request)) {
+    return controller
+      .recorderFailed(request.error)
+      .then(() => ({ ok: true as const, changed: true }));
+  }
+  if (isRecorderEnded(request)) {
+    return controller
+      .recorderEnded(request.sessionId)
+      .then(() => ({ ok: true as const, changed: true }));
+  }
+  return null;
+}
+
+/**
  * Register the capture verbs beside the auth listener.
  *
  * Both listeners see every message and decline what is not theirs, which is the
@@ -330,16 +389,16 @@ export function registerCaptureListener(
 ): void {
   chrome.runtime.onMessage.addListener(
     (request: unknown, sender, sendResponse: (r: CaptureMessageResponse) => void) => {
-      const failed = isRecorderFailed(request);
-      if (!failed && !isCaptureMessage(request)) return false;
+      const unsolicited = unsolicitedWork(controller, request);
+      if (unsolicited === null && !isCaptureMessage(request)) return false;
       if (!isExtensionPageSender(sender)) {
         sendResponse({ ok: false, error: "Unauthorized sender" });
         return false;
       }
 
-      const work = failed
-        ? controller.recorderFailed(request.error).then(() => ({ ok: true as const, changed: true }))
-        : dispatch(controller, request);
+      const work =
+        unsolicited ??
+        dispatch(controller, request as CaptureMessage);
 
       work
         .then((response) => {
@@ -392,4 +451,3 @@ export function chromeCaptureDeps(): CaptureControllerDeps {
 }
 
 export const OFFSCREEN_DOCUMENT_URL = "capture/offscreen.html";
-export { RECORDER_FAILED };

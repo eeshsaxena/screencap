@@ -67,6 +67,10 @@ export async function handle(request: AuthRequest): Promise<AuthResponse> {
     case "auth.signIn":
       return { ok: true, who: toWhoAmI(await session.signIn()) };
     case "auth.signOut":
+      // Stop capture before dropping the session. The recording panel is gated
+      // on being signed in, so signing out mid-recording would take away the
+      // only Stop control while the offscreen document kept recording.
+      await capture.stop().catch(() => undefined);
       await session.signOut();
       return { ok: true, who: SIGNED_OUT };
   }

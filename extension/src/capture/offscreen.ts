@@ -13,6 +13,7 @@
 import { isExtensionPageSender } from "../background/senders.js";
 import { ChunkStore, indexedDbChunkStorage } from "./chunk-store.js";
 import {
+  RECORDER_ENDED,
   RECORDER_FAILED,
   isOffscreenRequest,
   type OffscreenRequest,
@@ -22,13 +23,25 @@ import { CaptureRecorder, browserRecorderDeps } from "./recorder.js";
 
 const chunks = new ChunkStore(indexedDbChunkStorage());
 
+/**
+ * Tell the worker something happened that it did not ask for.
+ *
+ * If the message cannot be delivered, this document closes itself. That is not
+ * a giving-up: its own disappearance is a signal the worker's reconciliation
+ * already understands, so the session degrades to `interrupted` — bytes
+ * stranded, honestly reported — instead of staying `recording` forever behind a
+ * recorder that is already dead.
+ */
+function announce(message: { type: string; [key: string]: unknown }): void {
+  void chrome.runtime.sendMessage(message).catch(() => window.close());
+}
+
 const recorder = new CaptureRecorder(
-  browserRecorderDeps(chunks, (error) => {
-    // Unprompted: capture died on its own and the worker is not in the slice
-    // path, so nothing else would tell it. A rejected send means the worker is
-    // gone, which its own reconciliation already covers.
-    void chrome.runtime.sendMessage({ type: RECORDER_FAILED, error }).catch(() => {});
-  }),
+  browserRecorderDeps(
+    chunks,
+    (error) => announce({ type: RECORDER_FAILED, error }),
+    (sessionId) => announce({ type: RECORDER_ENDED, sessionId }),
+  ),
 );
 
 async function handle(request: OffscreenRequest): Promise<OffscreenResponse> {

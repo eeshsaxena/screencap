@@ -11,6 +11,7 @@ import {
   reconcile,
   type SessionRecord,
   type SessionStorage,
+  type StoredSessionRead,
 } from "./session.js";
 
 const START = {
@@ -23,6 +24,11 @@ function recording(overrides: Partial<SessionRecord> = {}): SessionRecord {
   const begun = beginSession({ kind: "idle" }, START);
   if (!begun.ok) throw new Error("fixture could not begin a session");
   return { ...markRecording(begun.record), ...overrides };
+}
+
+/** Wrap a record the way the store now reports it. */
+function stored(record: SessionRecord): StoredSessionRead {
+  return { kind: "record", record };
 }
 
 /** In-memory stand-in for `chrome.storage.local`, which the store never calls
@@ -53,33 +59,46 @@ describe("reconcile", () => {
 
   it("resolves a running record with no offscreen document to interrupted", () => {
     // AE-U3-2. The browser crashed: the record outlived the document.
-    expect(reconcile(recording(), false).kind).toBe("interrupted");
+    expect(reconcile(stored(recording()), false).kind).toBe("interrupted");
   });
 
   it("keeps a paused record honest when the document is gone", () => {
-    expect(reconcile(markPaused(recording(), 2_000), false).kind).toBe("interrupted");
+    expect(reconcile(stored(markPaused(recording(), 2_000)), false).kind).toBe("interrupted");
   });
 
   it("reads no record as idle whether or not a document exists", () => {
-    expect(reconcile(null, false).kind).toBe("idle");
+    expect(reconcile({ kind: "none" }, false).kind).toBe("idle");
     // A document with no record is an orphan, not a recording — the controller
     // closes it. Reporting it as running would strand the user.
-    expect(reconcile(null, true).kind).toBe("idle");
+    expect(reconcile({ kind: "none" }, true).kind).toBe("idle");
   });
 
   it("reports a failed record as failed rather than interrupted", () => {
     // Failure already closed the document, so absence is expected here and
     // must not be re-read as a crash.
-    const resolved = reconcile(markFailed(recording(), "encoder died"), false);
+    const resolved = reconcile(stored(markFailed(recording(), "encoder died")), false);
     expect(resolved.kind).toBe("failed");
     expect(resolved.error).toBe("encoder died");
+  });
+
+  it("refuses to call a live document idle when the record cannot be read", () => {
+    // A storage failure during a real recording must not render as "nothing is
+    // recording" — that is the one claim this state cannot support, and the
+    // document standing there is the evidence against it.
+    expect(reconcile({ kind: "unreadable" }, true).kind).toBe("unknown");
+  });
+
+  it("reads an unreadable record with no document as idle", () => {
+    // Nothing is capturing regardless of what the cell says, so there is no
+    // uncertainty left to report.
+    expect(reconcile({ kind: "unreadable" }, false).kind).toBe("idle");
   });
 });
 
 describe("beginSession", () => {
   it("refuses a second recording and leaves the running one untouched", () => {
     // AE-U3-3.
-    const running = reconcile(recording(), true);
+    const running = reconcile(stored(recording()), true);
     const result = beginSession(running, { ...START, id: "session-2" });
 
     expect(result).toEqual({ ok: false, reason: "already-recording" });
@@ -88,13 +107,22 @@ describe("beginSession", () => {
 
   it("allows a new recording over an interrupted one", () => {
     // AE-U3-2's second half: stranded bytes must not wedge the extension.
-    const result = beginSession(reconcile(recording(), false), {
+    const result = beginSession(reconcile(stored(recording()), false), {
       ...START,
       id: "session-2",
     });
 
     expect(result.ok).toBe(true);
     expect(result.ok && result.record.id).toBe("session-2");
+  });
+
+  it("refuses to start when the current state is unknown", () => {
+    // Fail closed: starting here would open a second document beside one that
+    // may still be capturing.
+    expect(beginSession({ kind: "unknown" }, START)).toEqual({
+      ok: false,
+      reason: "state-unknown",
+    });
   });
 });
 
@@ -124,7 +152,7 @@ describe("SessionStore", () => {
     // Storage never authorizes capture, so an unreadable cell costs display
     // only — the same posture `Allowlist.readStored` takes.
     const { storage } = fakeStorage({ [SESSION_STORAGE_KEY]: "{not json" });
-    expect(await new SessionStore(storage).read()).toBeNull();
+    expect(await new SessionStore(storage).read()).toEqual({ kind: "unreadable" });
   });
 
   it("clears the record so a finished recording stops reading as running", async () => {
@@ -134,6 +162,6 @@ describe("SessionStore", () => {
     await store.clear();
 
     expect(cells.has(SESSION_STORAGE_KEY)).toBe(false);
-    expect(await store.read()).toBeNull();
+    expect(await store.read()).toEqual({ kind: "none" });
   });
 });

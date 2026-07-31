@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ResolvedSession, SessionRecord } from "../capture/session.js";
-import { captureView } from "./capture-view.js";
+import { UNREACHABLE_MESSAGE, captureProblem, captureView } from "./capture-view.js";
 
 function session(
   kind: ResolvedSession["kind"],
@@ -101,5 +101,86 @@ describe("captureView", () => {
     const status = { kind: "recording", record: null, error: null } as ResolvedSession;
 
     expect(captureView({ signedIn: true, status }).message).toBe("Recording.");
+  });
+
+  it("admits it cannot tell rather than claiming nothing is recording", () => {
+    // The worker did not answer, so there is no status to report. Rendering
+    // "Not recording." would assert the one thing that must never be guessed.
+    const view = captureView({
+      signedIn: true,
+      status: session("idle"),
+      reachable: false,
+    });
+
+    expect(view.message).toBe(UNREACHABLE_MESSAGE);
+    expect(view.message).not.toBe(
+      captureView({ signedIn: true, status: session("idle") }).message,
+    );
+    // Neither action can be trusted to reach anything.
+    expect(view).toMatchObject({ showStart: false, showStop: false });
+  });
+
+  it("offers stop but not start when something is recording unidentifiably", () => {
+    // A document is alive whose record could not be read. Starting would open a
+    // second one beside it; stopping can only help.
+    expect(captureView({ signedIn: true, status: session("unknown") })).toMatchObject({
+      showStart: false,
+      showStop: true,
+    });
+  });
+});
+
+describe("captureProblem", () => {
+  it("names what is already running when a start is refused", () => {
+    expect(
+      captureProblem({
+        ok: true,
+        start: {
+          ok: false,
+          reason: "already-recording",
+          runningSource: { kind: "tab", label: "Looker" },
+        },
+      }),
+    ).toBe("Already recording Looker.");
+  });
+
+  it("stays silent when the user dismissed the picker", () => {
+    // They closed it on purpose; an error message would scold them for it.
+    expect(
+      captureProblem({
+        ok: true,
+        start: { ok: false, reason: "cancelled", error: "NotAllowedError" },
+      }),
+    ).toBeNull();
+  });
+
+  it("surfaces a genuine start failure", () => {
+    expect(
+      captureProblem({
+        ok: true,
+        start: { ok: false, reason: "unsupported", error: "No usable container." },
+      }),
+    ).toBe("No usable container.");
+  });
+
+  it("explains a stop that had nothing to stop", () => {
+    expect(
+      captureProblem({ ok: true, stop: { ok: false, reason: "not-recording" } }),
+    ).toBe("There was no recording to stop.");
+  });
+
+  it("passes a transport failure straight through", () => {
+    expect(captureProblem({ ok: false, error: "Unauthorized sender" })).toBe(
+      "Unauthorized sender",
+    );
+  });
+
+  it("says nothing about a verb that worked", () => {
+    expect(
+      captureProblem({
+        ok: true,
+        start: { ok: true, sessionId: "s1", source: { kind: "tab", label: "Looker" } },
+      }),
+    ).toBeNull();
   });
 });

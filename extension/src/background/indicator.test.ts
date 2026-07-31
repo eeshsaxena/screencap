@@ -35,6 +35,15 @@ describe("badgeFor", () => {
     }
   });
 
+  it("marks an unidentifiable capture rather than showing nothing", () => {
+    // A blank badge reads as "nothing is recording", which is exactly what this
+    // state cannot support: a capture document is alive.
+    const badge = badgeFor(session("unknown"));
+
+    expect(badge.text).not.toBe(IDLE_BADGE.text);
+    expect(badge.title).toMatch(/can't tell/i);
+  });
+
   it("stays quiet through brief transitions", () => {
     for (const kind of ["starting", "stopping", "idle"] as const) {
       expect(badgeFor(session(kind))).toEqual(IDLE_BADGE);

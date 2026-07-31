@@ -42,17 +42,22 @@ class FakeRecorder implements RecorderHandle {
 function fakeStream(
   trackCount = 2,
   label = "Screen 1",
-): CaptureStream & { stoppedTracks: number } {
+): CaptureStream & { stoppedTracks: number; endTrack(): void } {
   let stoppedTracks = 0;
+  const endHandlers: (() => void)[] = [];
   const tracks = Array.from({ length: trackCount }, () => ({
     label,
     stop: () => void (stoppedTracks += 1),
+    onEnded: (handler: () => void) => void endHandlers.push(handler),
   }));
   return {
     getTracks: () => tracks,
     get stoppedTracks() {
       return stoppedTracks;
     },
+    /** Simulates the browser's own stop-sharing control, or the captured
+     * surface going away. */
+    endTrack: () => endHandlers[0]?.(),
   };
 }
 
@@ -64,6 +69,7 @@ function named(name: string): Error {
 
 let rows: { sessionId: string; row: ChunkRow }[];
 let failures: string[];
+let ended: string[];
 let recorder: FakeRecorder | null;
 let stream: ReturnType<typeof fakeStream>;
 let failNextPut: Error | null;
@@ -93,6 +99,7 @@ function harness(overrides: Partial<RecorderDeps> = {}) {
     },
     chunks: new ChunkStore(storage),
     onFailure: (error) => void failures.push(error),
+    onEnded: (sessionId) => void ended.push(sessionId),
     ...overrides,
   };
 
@@ -106,6 +113,7 @@ const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
 beforeEach(() => {
   rows = [];
   failures = [];
+  ended = [];
   recorder = null;
   failNextPut = null;
   stream = fakeStream();
@@ -229,6 +237,35 @@ describe("slice persistence", () => {
     expect(recorder?.stopped).toBe(true);
   });
 
+  it("releases the source when the recording fails", async () => {
+    // A live track keeps the browser telling the user they are being recorded
+    // long after capture died.
+    const { recorder: capture } = harness();
+    await capture.start("s1", { kind: "tab", streamId: "x" });
+
+    failNextPut = new Error("quota exceeded");
+    recorder?.emit("a");
+    await settled();
+
+    expect(stream.stoppedTracks).toBe(2);
+  });
+
+  it("reports a recording truncated by a failed write as incomplete", async () => {
+    // The store can only see holes, and a failed write leaves none — it stops
+    // the recording, so the surviving indices stay contiguous. Passing that
+    // through unchanged would let a truncated recording claim to be whole.
+    const { recorder: capture } = harness();
+    await capture.start("s1", { kind: "tab", streamId: "x" });
+    recorder?.emit("a");
+    await settled();
+
+    failNextPut = new Error("quota exceeded");
+    recorder?.emit("b");
+    await settled();
+
+    expect((await capture.stop()).complete).toBe(false);
+  });
+
   it("surfaces a recorder error through the same failure path", async () => {
     const { recorder: capture } = harness();
     await capture.start("s1", { kind: "tab", streamId: "x" });
@@ -260,6 +297,44 @@ describe("pause and resume", () => {
     capture.pause();
     expect(capture.resume()).toBe(true);
     expect(recorder?.paused).toBe(false);
+  });
+});
+
+describe("the source ending on its own", () => {
+  it("announces the session so the worker stops claiming a live recording", async () => {
+    // Chrome gives the user its own stop-sharing control. Nothing about it goes
+    // through this extension, so without this the badge stays on REC and the
+    // popup keeps naming a source nobody is capturing.
+    const { recorder: capture } = harness();
+    await capture.start("s1", { kind: "tab", streamId: "x" });
+
+    stream.endTrack();
+
+    expect(ended).toEqual(["s1"]);
+    expect(failures).toEqual([]);
+  });
+
+  it("releases the source rather than leaving tracks live", async () => {
+    const { recorder: capture } = harness();
+    await capture.start("s1", { kind: "tab", streamId: "x" });
+
+    stream.endTrack();
+
+    expect(stream.stoppedTracks).toBe(2);
+  });
+
+  it("stays quiet when the recording already failed", async () => {
+    // A failure tears the stream down, which ends its tracks. Reporting that as
+    // a user-initiated ending would race the failure the worker already has.
+    const { recorder: capture } = harness();
+    await capture.start("s1", { kind: "tab", streamId: "x" });
+
+    failNextPut = new Error("quota exceeded");
+    recorder?.emit("a");
+    await settled();
+    stream.endTrack();
+
+    expect(ended).toEqual([]);
   });
 });
 

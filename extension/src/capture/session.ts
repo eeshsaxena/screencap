@@ -75,7 +75,11 @@ export type ResolvedSessionKind =
   | "idle"
   | StoredSessionState
   | /** A live record with no document behind it: the browser died mid-recording
-     * and this session's chunks are stranded. */ "interrupted";
+     * and this session's chunks are stranded. */ "interrupted"
+  | /** A capture document is alive but its record could not be read. Something
+     * is being recorded and we cannot say what. Distinct from `idle` because
+     * claiming nothing is recording is the one answer that must never be
+     * guessed. */ "unknown";
 
 export interface ResolvedSession {
   kind: ResolvedSessionKind;
@@ -91,7 +95,20 @@ export interface SessionInit {
 
 export type StartOutcome =
   | { ok: true; record: SessionRecord }
-  | { ok: false; reason: "already-recording" };
+  | { ok: false; reason: "already-recording" | "state-unknown" };
+
+/**
+ * What the store found.
+ *
+ * `unreadable` is separate from `none` on purpose: a storage error or a corrupt
+ * cell means we do not know whether a recording is running, and collapsing that
+ * into "there is none" would both tell the user nothing is being captured and
+ * let the next start close a document that is still recording.
+ */
+export type StoredSessionRead =
+  | { kind: "none" }
+  | { kind: "record"; record: SessionRecord }
+  | { kind: "unreadable" };
 
 export const SESSION_STORAGE_KEY = "screencap.capture.session";
 
@@ -128,10 +145,20 @@ const IDLE: ResolvedSession = { kind: "idle", record: null, error: null };
  * looking at a recording they cannot stop.
  */
 export function reconcile(
-  record: SessionRecord | null,
+  read: StoredSessionRead,
   offscreenExists: boolean,
 ): ResolvedSession {
-  if (record === null) return IDLE;
+  if (read.kind === "unreadable") {
+    // A document with no readable record is the one case where "nothing is
+    // recording" would be a guess, and the dangerous direction of one. With no
+    // document there is genuinely nothing to report.
+    return offscreenExists
+      ? { kind: "unknown", record: null, error: null }
+      : IDLE;
+  }
+  if (read.kind === "none") return IDLE;
+
+  const record = read.record;
   if (record.state === "failed") {
     return { kind: "failed", record, error: record.error };
   }
@@ -155,6 +182,11 @@ export function beginSession(
 ): StartOutcome {
   if (isLiveSessionKind(current.kind)) {
     return { ok: false, reason: "already-recording" };
+  }
+  // Fail closed: starting here would open a second document beside one that may
+  // still be capturing, and the cleanup path would close whichever it found.
+  if (current.kind === "unknown") {
+    return { ok: false, reason: "state-unknown" };
   }
   return {
     ok: true,
@@ -234,27 +266,29 @@ export class SessionStore {
   constructor(private readonly storage: SessionStorage) {}
 
   /**
-   * The stored record, or null when there is none.
+   * What the store holds, distinguishing "no session" from "could not tell".
    *
-   * An unreadable or malformed cell reads as null rather than throwing. The
-   * record authorizes nothing — {@link reconcile} still needs a live document
-   * to call anything running — so the cost of a bad read is a lost indicator,
-   * not a lost guarantee. `Allowlist.readStored` takes the same position for
-   * the same reason.
+   * A throwing storage layer, malformed JSON, or a shape an older build wrote
+   * all read as `unreadable` rather than as no session. Collapsing them would
+   * report a live recording as idle — and {@link reconcile}, which is the only
+   * thing that can see the document beside it, would have nothing left to
+   * catch the mistake with.
    */
-  async read(): Promise<SessionRecord | null> {
+  async read(): Promise<StoredSessionRead> {
     let raw: string | null;
     try {
       raw = await this.storage.get(SESSION_STORAGE_KEY);
     } catch {
-      return null;
+      return { kind: "unreadable" };
     }
-    if (raw === null) return null;
+    if (raw === null) return { kind: "none" };
     try {
       const parsed: unknown = JSON.parse(raw);
-      return isSessionRecord(parsed) ? parsed : null;
+      return isSessionRecord(parsed)
+        ? { kind: "record", record: parsed }
+        : { kind: "unreadable" };
     } catch {
-      return null;
+      return { kind: "unreadable" };
     }
   }
 

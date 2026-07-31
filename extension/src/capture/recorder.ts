@@ -60,6 +60,15 @@ export interface CaptureTrack {
    * only way to learn which screen or window the user actually picked — the
    * picker runs inside this document and reports nothing else. */
   readonly label?: string;
+  /**
+   * Fires when the source ends without this extension asking — Chrome's own
+   * "Stop sharing" control, a captured tab closing, a display disconnecting.
+   *
+   * Subscribed rather than ignored because these paths do not go through
+   * {@link CaptureRecorder.stop}, so without them the worker would keep
+   * reporting a recording nobody is making.
+   */
+  onEnded(handler: () => void): void;
 }
 
 export interface CaptureStream {
@@ -93,6 +102,10 @@ export interface RecorderDeps {
    * The controller turns this into a failed session; nothing else notices
    * otherwise, because the worker is not told about slices. */
   onFailure(error: string): void;
+  /** Called when the user ends the share from the browser's own control, or the
+   * captured surface disappears. A normal ending, not a failure — but one the
+   * extension did not initiate, so it still has to be announced. */
+  onEnded(sessionId: string): void;
 }
 
 export type CaptureRequest =
@@ -188,6 +201,12 @@ export class CaptureRecorder {
     });
     this.handle.start(TIMESLICE_MS);
 
+    // Subscribed after the recorder exists so an immediate end still finds
+    // something to stop.
+    for (const track of stream.getTracks()) {
+      track.onEnded(() => this.sourceEnded());
+    }
+
     const label = stream.getTracks()[0]?.label;
     return { ok: true, mimeType, sourceLabel: label ? label : null };
   }
@@ -244,7 +263,12 @@ export class CaptureRecorder {
     return {
       chunkCount: recording.chunks.length,
       byteLength: recording.byteLength,
-      complete: recording.complete,
+      // The store can only see *holes*, and a failed write leaves no hole — it
+      // stops the recording, so the surviving indices stay contiguous and a
+      // truncated recording would otherwise pass as whole. The recorder is the
+      // only party that knows a slice was lost, so its own view decides.
+      complete:
+        recording.complete && !this.failed && recording.chunks.length === this.nextIndex,
     };
   }
 
@@ -266,12 +290,37 @@ export class CaptureRecorder {
   private fail(error: string): void {
     if (this.failed) return;
     this.failed = true;
+    this.release();
+    this.deps.onFailure(error);
+  }
+
+  /**
+   * The source ended without us asking — the user hit the browser's own stop
+   * control, or the captured surface went away.
+   *
+   * Reported rather than treated as a failure: the recording is finished, and
+   * the worker needs to know so its record and the badge stop describing a
+   * capture that is over.
+   */
+  private sourceEnded(): void {
+    if (this.failed || this.sessionId === null || this.handle === null) return;
+    const sessionId = this.sessionId;
+    this.release();
+    this.deps.onEnded(sessionId);
+  }
+
+  /** Stop the encoder and let the source go. Releasing the tracks is what
+   * makes the browser's own sharing indicator disappear; leaving one live
+   * tells the user they are still being recorded. */
+  private release(): void {
     try {
       this.handle?.stop();
     } catch {
-      // Already dead; the report below is what matters.
+      // Already inactive — the caller's report is what matters.
     }
-    this.deps.onFailure(error);
+    for (const track of this.stream?.getTracks() ?? []) {
+      track.stop();
+    }
   }
 }
 
@@ -284,27 +333,56 @@ function describe(error: unknown): string {
  * `MediaRecorder` nor `getUserMedia` — so it stays as thin as the mapping
  * allows and is verified by recording in a real browser.
  */
+/** Keeps the real stream reachable for `MediaRecorder` while the recorder above
+ * sees only the narrow {@link CaptureStream} surface. */
+interface BrowserCaptureStream extends CaptureStream {
+  readonly native: MediaStream;
+}
+
+/**
+ * Wrap a `MediaStream` in the injected surface.
+ *
+ * `MediaStreamTrack` signals its end through an `ended` *event*, which the
+ * narrow interface exposes as a subscription so a test can fire it without a
+ * DOM. Tracks are mapped once so repeated `getTracks()` calls return the same
+ * wrappers rather than fresh ones that would lose their subscriptions.
+ */
+function asCaptureStream(native: MediaStream): BrowserCaptureStream {
+  const tracks: CaptureTrack[] = native.getTracks().map((track) => ({
+    label: track.label,
+    stop: () => track.stop(),
+    onEnded: (handler) => track.addEventListener("ended", handler, { once: true }),
+  }));
+  return { native, getTracks: () => tracks };
+}
+
 export function browserRecorderDeps(
   chunks: ChunkStore,
   onFailure: (error: string) => void,
+  onEnded: (sessionId: string) => void,
 ): RecorderDeps {
   return {
     // The `mandatory` constraint shape is Chrome's own extension-capture
     // dialect, not standard `MediaTrackConstraints`, so it is cast rather than
     // typed.
-    tabStream: (streamId) =>
-      navigator.mediaDevices.getUserMedia({
-        video: {
-          mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId },
-        },
-      } as unknown as MediaStreamConstraints),
+    tabStream: async (streamId) =>
+      asCaptureStream(
+        await navigator.mediaDevices.getUserMedia({
+          video: {
+            mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId },
+          },
+        } as unknown as MediaStreamConstraints),
+      ),
 
-    displayStream: () => navigator.mediaDevices.getDisplayMedia({ video: true }),
+    displayStream: async () =>
+      asCaptureStream(await navigator.mediaDevices.getDisplayMedia({ video: true })),
 
     isTypeSupported: (mimeType) => MediaRecorder.isTypeSupported(mimeType),
 
     createRecorder: (stream, mimeType, events) => {
-      const recorder = new MediaRecorder(stream as MediaStream, { mimeType });
+      const recorder = new MediaRecorder((stream as BrowserCaptureStream).native, {
+        mimeType,
+      });
       recorder.ondataavailable = (event) => events.onData(event.data);
       recorder.onerror = () => events.onError(new Error("Recording stopped unexpectedly"));
       recorder.onstop = () => events.onStop();
@@ -318,5 +396,6 @@ export function browserRecorderDeps(
 
     chunks,
     onFailure,
+    onEnded,
   };
 }

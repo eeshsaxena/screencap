@@ -17,6 +17,7 @@
  * mid-click rather than grey out.
  */
 
+import type { CaptureMessageResponse } from "../background/capture-controller.js";
 import type { ResolvedSession, ResolvedSessionKind } from "../capture/session.js";
 
 export interface CaptureViewInput {
@@ -24,6 +25,11 @@ export interface CaptureViewInput {
   status: ResolvedSession;
   /** A verb is in flight; actions grey out so a second click cannot race it. */
   busy?: boolean;
+  /**
+   * Whether the service worker answered at all. False means the status below is
+   * a placeholder, not an observation — see {@link captureView}.
+   */
+  reachable?: boolean;
   error?: string | null;
 }
 
@@ -58,6 +64,9 @@ const ACTIONS: Record<ResolvedSessionKind, { showStart: boolean; showStop: boole
   stopping: { showStart: false, showStop: true },
   interrupted: { showStart: true, showStop: false },
   failed: { showStart: true, showStop: false },
+  // Something is capturing and we cannot say what. Starting would open a second
+  // document beside it; stopping is the one action that can only help.
+  unknown: { showStart: false, showStop: true },
 };
 
 /** Named only while a source is genuinely held; after an interrupted or failed
@@ -68,6 +77,11 @@ const NAMES_SOURCE = new Set<ResolvedSessionKind>([
   "starting",
   "stopping",
 ]);
+
+/** Shown when the extension's own background service cannot be reached, so no
+ * claim about recording state can be made at all. */
+export const UNREACHABLE_MESSAGE =
+  "Can't reach Screencap's background service, so it can't tell whether a recording is running.";
 
 function messageFor(status: ResolvedSession, label: string | null): string {
   switch (status.kind) {
@@ -90,17 +104,42 @@ function messageFor(status: ResolvedSession, label: string | null): string {
       return status.error === null
         ? "Your last recording stopped unexpectedly."
         : `Your last recording stopped: ${status.error}`;
+    case "unknown":
+      return "Something is being recorded, but Screencap can't tell what.";
     case "idle":
       return "Not recording.";
   }
 }
 
+/**
+ * What the panel shows.
+ *
+ * An unreachable service worker is rendered as its own state rather than as
+ * idle. The caller has no status to report in that case, and "Not recording"
+ * would be an assertion made from an absence of information — the one claim a
+ * screen recorder must never guess at. The auth half of this popup takes the
+ * same position with its `unknown` status.
+ */
 export function captureView({
   signedIn,
   status,
   busy = false,
+  reachable = true,
   error = null,
 }: CaptureViewInput): CaptureView {
+  if (signedIn && !reachable) {
+    return {
+      visible: true,
+      message: UNREACHABLE_MESSAGE,
+      sourceLabel: null,
+      showStart: false,
+      showStop: false,
+      canStart: false,
+      canStop: false,
+      error,
+    };
+  }
+
   const label = status.record?.source.label ?? null;
   const { showStart, showStop } = ACTIONS[status.kind];
 
@@ -114,4 +153,28 @@ export function captureView({
     canStop: showStop && !busy,
     error,
   };
+}
+
+/**
+ * Turn the outcome of a capture verb into something worth reading.
+ *
+ * Lives here rather than beside the DOM wiring for the reason the rest of this
+ * module does: it is a decision about what the user is told, and decisions are
+ * testable while element assignment is not. A dismissed picker returns null —
+ * the user closed it on purpose and does not need telling.
+ */
+export function captureProblem(response: CaptureMessageResponse): string | null {
+  if (!response.ok) return response.error;
+  if ("start" in response && !response.start.ok) {
+    if (response.start.reason === "already-recording") {
+      return `Already recording ${response.start.runningSource.label}.`;
+    }
+    return response.start.reason === "cancelled" ? null : response.start.error;
+  }
+  if ("stop" in response && !response.stop.ok) {
+    return response.stop.reason === "not-recording"
+      ? "There was no recording to stop."
+      : response.stop.error;
+  }
+  return null;
 }

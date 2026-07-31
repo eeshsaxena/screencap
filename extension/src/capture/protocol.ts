@@ -52,6 +52,26 @@ export interface RecorderFailed {
 }
 
 /**
+ * Sent unprompted when the *source* ends without the extension asking.
+ *
+ * Chrome gives the user its own "Stop sharing" control, and a captured tab can
+ * simply close. Neither goes through this extension, so without this message
+ * the worker keeps a session record saying `recording` and the indicator names
+ * a source nobody is capturing any more.
+ *
+ * Distinct from {@link RECORDER_FAILED} because a user ending their own share
+ * is a normal stop, not a failure to report as one.
+ */
+export const RECORDER_ENDED = "capture.recorderEnded";
+
+export interface RecorderEnded {
+  type: typeof RECORDER_ENDED;
+  /** Which session ended, so a message that arrives late cannot end a newer
+   * one. */
+  sessionId: string;
+}
+
+/**
  * Whether this listener owns the message.
  *
  * Both contexts receive every `chrome.runtime.sendMessage`, including their own
@@ -74,5 +94,14 @@ export function isRecorderFailed(request: unknown): request is RecorderFailed {
     typeof request === "object" &&
     request !== null &&
     (request as { type?: unknown }).type === RECORDER_FAILED
+  );
+}
+
+export function isRecorderEnded(request: unknown): request is RecorderEnded {
+  return (
+    typeof request === "object" &&
+    request !== null &&
+    (request as { type?: unknown }).type === RECORDER_ENDED &&
+    typeof (request as { sessionId?: unknown }).sessionId === "string"
   );
 }

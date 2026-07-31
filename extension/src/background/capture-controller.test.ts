@@ -317,6 +317,48 @@ describe("message listener", () => {
   });
 });
 
+describe("the source ending on its own", () => {
+  it("tears down so the indicator stops claiming a live recording", async () => {
+    // Chrome's own stop-sharing control does not go through this extension.
+    const controller = new CaptureController(deps());
+    const started = await running(controller);
+    const sessionId = started.ok ? started.sessionId : "";
+
+    await controller.recorderEnded(sessionId);
+
+    expect((await controller.status()).kind).toBe("idle");
+    expect(fake.lifecycle).toEqual(["close"]);
+  });
+
+  it("ignores a message naming a session that is no longer the live one", async () => {
+    // A late message must not end a recording the user has since started.
+    const controller = new CaptureController(deps());
+    await running(controller);
+
+    await controller.recorderEnded("some-older-session");
+
+    expect((await controller.status()).kind).toBe("recording");
+    expect(fake.lifecycle).toEqual([]);
+  });
+});
+
+describe("unreadable session state", () => {
+  it("refuses to start rather than closing a document it cannot identify", async () => {
+    // The record could not be read but a capture document is alive. Starting
+    // would run the orphan cleanup against a recording that may still be going.
+    fake.cells.set("screencap.capture.session", "{not json");
+    fake.offscreenExists = true;
+    const controller = new CaptureController(deps());
+
+    expect((await controller.status()).kind).toBe("unknown");
+
+    const result = await controller.start(TAB);
+
+    expect(result.ok).toBe(false);
+    expect(fake.lifecycle).toEqual([]);
+  });
+});
+
 describe("recorder failure", () => {
   it("marks the session failed and closes the document", async () => {
     const controller = new CaptureController(deps());

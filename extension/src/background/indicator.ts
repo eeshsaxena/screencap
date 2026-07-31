@@ -60,6 +60,16 @@ export function badgeFor(status: ResolvedSession): Badge {
         title: "Your last Screencap recording didn't finish",
       };
 
+    case "unknown":
+      // Something is capturing and its record could not be read. A blank badge
+      // would say "nothing is recording", which is the one thing this state
+      // cannot support.
+      return {
+        text: "?",
+        color: ATTENTION_AMBER,
+        title: "Screencap can't tell whether a recording is running",
+      };
+
     case "starting":
     case "stopping":
     case "idle":
