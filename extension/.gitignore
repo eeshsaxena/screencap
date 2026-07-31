@@ -1,2 +1,4 @@
 node_modules/
 dist/
+# Packaged builds carry injected credentials; they are release artifacts, not source.
+screencap-extension-*.zip
