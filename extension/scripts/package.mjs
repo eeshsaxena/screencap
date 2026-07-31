@@ -39,6 +39,16 @@ await rm(archivePath, { force: true });
 
 // `-r .` from inside dist/ so the manifest lands at the archive root, which is
 // where Chrome and the Web Store expect it.
-await execFileAsync("zip", ["-q", "-r", archivePath, "."], { cwd: distDir });
+try {
+  await execFileAsync("zip", ["-q", "-r", archivePath, "."], { cwd: distDir });
+} catch (error) {
+  const missing = error && typeof error === "object" && error.code === "ENOENT";
+  console.error(
+    missing
+      ? "ERROR: `zip` is not installed — it is the only external tool packaging needs."
+      : `ERROR: could not create the archive: ${error instanceof Error ? error.message : error}`,
+  );
+  process.exit(1);
+}
 
 console.log(`Wrote ${archivePath}`);

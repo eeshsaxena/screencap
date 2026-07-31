@@ -79,6 +79,10 @@ npm install
 npm test          # vitest
 npm run typecheck # tsc over src including tests
 npm run build     # emits a loadable unpacked extension into extension/dist/
+
+# Packaging (release only). `build` stays green with placeholder credentials;
+# `package` injects the real ones and refuses to emit an un-provisioned archive.
+SCREENCAP_FIREBASE_API_KEY=... SCREENCAP_EXTENSION_OAUTH_CLIENT_ID=... npm run package
 ```
 
 ## Key Patterns

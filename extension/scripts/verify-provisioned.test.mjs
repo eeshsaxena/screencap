@@ -1,6 +1,8 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CREDENTIALS_RELATIVE_PATH, verifyProvisioned } from "./verify-provisioned.mjs";
 
@@ -42,6 +44,41 @@ export function bundledCredentials() {
     "utf8",
   );
   return dir;
+}
+
+describe("running the guard as a script", () => {
+  // The predicate deciding whether the script body runs at all. Getting it
+  // wrong does not throw — the script exits 0 having checked nothing, which for
+  // a release guard is worse than any wrong answer it could give.
+  //
+  // The temp path exercises both ways the naive comparison breaks at once: it
+  // contains a space (encoding) and on macOS sits under a symlinked prefix
+  // (`/var` -> `/private/var`). Either alone is enough to silently skip the
+  // guard's body.
+  it("recognizes itself on a spaced, symlinked path", async () => {
+    const spaced = await mkdtemp(join(tmpdir(), "ce guard space-"));
+    const scriptPath = join(spaced, "verify-provisioned.mjs");
+    await copyFile(fileURLToPath(new URL("./verify-provisioned.mjs", import.meta.url)), scriptPath);
+
+    const { code, stdout, stderr } = await runNode(scriptPath, spaced);
+
+    // No build exists beside the copy, so a guard that actually ran must refuse.
+    // Exit 0 with no output would mean it silently skipped its own body.
+    expect(code).toBe(1);
+    expect(`${stdout}${stderr}`).toMatch(/refusing to package an un-provisioned build/);
+    await rm(spaced, { recursive: true, force: true });
+  });
+});
+
+function runNode(scriptPath, cwd) {
+  return new Promise((resolvePromise) => {
+    const child = spawn(process.execPath, [scriptPath], { cwd });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("close", (code) => resolvePromise({ code, stdout, stderr }));
+  });
 }
 
 describe("verifyProvisioned", () => {

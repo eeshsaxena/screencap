@@ -24,6 +24,7 @@
  * secret at all. "Inject, don't commit" keeps them out of git; it is not a
  * security boundary. See `docs/runbooks/cloud-auth-setup.md`.
  */
+import { realpathSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -92,9 +93,23 @@ export const OAUTH_CLIENT_ID = ${JSON.stringify(clientId)};
   return { ok: true, missing: [], outputPath };
 }
 
-/** True when this module is being run as a script rather than imported. */
+/**
+ * True when this module is being run as a script rather than imported.
+ *
+ * Compares real paths rather than `import.meta.url` against an interpolated
+ * `file://` + `argv[1]`, which diverges both on encoding (Node percent-encodes
+ * the URL, argv is raw) and on symlinks (Node resolves the URL, argv keeps the
+ * path as invoked — so anything under macOS `/tmp` or `/var` breaks). Getting it
+ * wrong here means exiting 0 having injected nothing. See the fuller note in
+ * `verify-provisioned.mjs`.
+ */
 function isMain() {
-  return process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
+  if (process.argv[1] === undefined) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
 }
 
 if (isMain()) {

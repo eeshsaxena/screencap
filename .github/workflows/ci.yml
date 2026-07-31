@@ -262,8 +262,21 @@ jobs:
         # generator's fail-closed path as if it were the guard's.
         working-directory: extension
         run: |
-          if npm run verify-provisioned; then
+          set +e
+          output=$(npm run verify-provisioned 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
             echo "::error::release guard passed an un-provisioned build — it is not failing closed"
+            exit 1
+          fi
+          # A non-zero exit alone is not proof the guard worked: a syntax error,
+          # a wrong path in package.json, or an unsupported Node version all exit
+          # non-zero too, and treating those as a refusal would make this step
+          # the same class of silent-pass mechanism it exists to rule out.
+          if ! printf '%s' "$output" | grep -q "refusing to package an un-provisioned build"; then
+            echo "::error::guard exited non-zero without refusing — it failed for some other reason"
             exit 1
           fi
           echo "Release guard correctly refused an un-provisioned build."

@@ -18,6 +18,7 @@
  *
  *     node scripts/verify-provisioned.mjs
  */
+import { realpathSync } from "node:fs";
 import { access } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -75,9 +76,30 @@ function describe(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** True when this module is being run as a script rather than imported. */
+/**
+ * True when this module is being run as a script rather than imported.
+ *
+ * Getting this wrong does not throw — the script exits 0 having checked
+ * nothing, which is the one outcome a release guard must never produce. Two
+ * independent things break the naive `import.meta.url === "file://" + argv[1]`
+ * comparison, and both are ordinary rather than exotic:
+ *
+ * - **Encoding.** Node percent-encodes `import.meta.url`; `argv[1]` is raw. Any
+ *   checkout under a directory with a space or a non-ASCII character diverges.
+ * - **Symlinks.** Node resolves `import.meta.url` through symlinks; `argv[1]`
+ *   keeps the path as invoked. On macOS this fires for anything under `/tmp` or
+ *   `/var`, which are symlinks to `/private/*`.
+ *
+ * Comparing real paths settles both: `fileURLToPath` undoes the encoding, and
+ * `realpathSync` resolves the symlinks the module URL already went through.
+ */
 function isMain() {
-  return process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
+  if (process.argv[1] === undefined) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
 }
 
 if (isMain()) {
