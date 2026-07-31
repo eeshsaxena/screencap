@@ -8,10 +8,12 @@ the wrong prefix is provably caught (a prefix-only mock would miss it).
 """
 
 import contextlib
+import logging
 from datetime import timedelta
 from unittest import mock
 
 import flask
+import google.api_core.exceptions
 import google.auth.exceptions
 import main
 import pytest
@@ -629,6 +631,74 @@ def test_upload_refreshes_signing_credential_once_not_per_file(gcs):
         status, _ = _invoke(_req(body))
     assert status == 200
     assert refresh.call_count == 1
+
+
+# --------------------------------------------------------------------------
+# GCS-level failure -> structured 503 (not a bare 500 HTML traceback)
+# --------------------------------------------------------------------------
+
+
+# Every action that reaches GCS, and the auth stance each one needs. A new
+# storage-touching action belongs here too — the dispatcher-level guard covers
+# it automatically, and this list is what proves it.
+GCS_TOUCHING = [
+    ({"action": "demo-list"}, False),
+    ({"action": "demo-sign-download", "recording": "r"}, False),
+    ({"action": "resolve-share", "token": "a" * 32}, False),
+    ({"action": "list"}, True),
+    ({"action": "sign-download", "recording": "r"}, True),
+    ({"recording": "r", "files": [{"name": "v.mp4"}]}, True),
+]
+
+
+@pytest.mark.parametrize("body,authed", GCS_TOUCHING)
+def test_gcs_failure_returns_structured_503_not_bare_500(gcs, body, authed):
+    """A GCS-level failure answers structured JSON on EVERY storage path.
+
+    GCS returns 403 for a bucket that does not exist (it will not confirm
+    existence), so a mis-set SCREENCAP_BUCKET and a revoked grant are the same
+    exception. Neither is a signBlob credential failure, so the per-handler
+    ``except GoogleAuthError`` never caught them: they escaped as a bare 500
+    whose body named neither the action nor the bucket.
+    """
+    boom = google.api_core.exceptions.Forbidden(
+        "does not have storage.objects.list access "
+        "(or it may not exist)"
+    )
+    ctx = _auth(uid="userA") if authed else contextlib.nullcontext()
+    req = _req(body) if authed else _req_noauth(body)
+    with ctx, \
+         mock.patch.object(main._storage_client, "list_blobs", side_effect=boom), \
+         mock.patch.object(main._bucket, "blob", side_effect=boom):
+        status, payload = _invoke(req)
+
+    assert status == 503
+    assert "error" in payload
+
+
+def test_gcs_failure_logs_the_bucket_it_could_not_reach(gcs, caplog):
+    # The 503 body deliberately says nothing about infrastructure, so the log is
+    # the ONLY place the operator can learn which bucket was unreachable. A
+    # misconfigured SCREENCAP_BUCKET must be readable at a glance here rather
+    # than reconstructed from a stack trace.
+    boom = google.api_core.exceptions.Forbidden("denied")
+    with mock.patch.object(main._storage_client, "list_blobs", side_effect=boom), \
+         caplog.at_level(logging.ERROR):
+        status, payload = _invoke(_req_noauth({"action": "demo-list"}))
+
+    assert status == 503
+    assert main.BUCKET in caplog.text
+    assert "demo-list" in caplog.text
+    # The failure must not leak infrastructure detail to an anonymous caller.
+    assert main.BUCKET not in payload["error"]
+
+
+def test_gcs_guard_does_not_mask_auth_denials(gcs):
+    # The dispatcher-level guard wraps the handlers, so it must not swallow the
+    # 401/403-shaped outcomes those handlers return as values.
+    with _auth(exc=AuthInvalid("bad token")):
+        status, _ = _invoke(_req({"action": "list"}))
+    assert status == 401
 
 
 def test_resolve_project_id_ignores_ambient_google_cloud_project(monkeypatch):
