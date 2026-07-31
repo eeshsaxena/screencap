@@ -15,6 +15,7 @@ import {
   toWhoAmI,
   type WhoAmI,
 } from "../auth/firebase.js";
+import { isExtensionPageSender as isTrustedSender } from "./senders.js";
 
 const session = new AuthSession(chromeAuthDeps());
 
@@ -48,15 +49,10 @@ export function isAuthRequest(request: unknown): request is AuthRequest {
 }
 
 /**
- * Whether the sender may drive auth.
- *
- * Only extension pages qualify — a `tab` on the sender means a content script,
- * which from U4 onward runs on allow-listed origins and must not be able to
- * start or end a session.
+ * Whether the sender may drive auth. The offscreen document applies the same
+ * rule to capture, so the predicate itself lives in `./senders.ts`.
  */
-export function isTrustedSender(sender: chrome.runtime.MessageSender): boolean {
-  return sender.id === chrome.runtime.id && sender.tab === undefined;
-}
+export { isTrustedSender };
 
 export async function handle(request: AuthRequest): Promise<AuthResponse> {
   switch (request.type) {
