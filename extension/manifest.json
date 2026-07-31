@@ -5,6 +5,7 @@
   "description": "Record your browser work and watch it back — no app install required.",
   "minimum_chrome_version": "116",
   "permissions": ["identity", "storage"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": {
     "service_worker": "background/service-worker.js",
     "type": "module"

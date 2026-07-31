@@ -58,8 +58,15 @@ _SURFACE_STRATEGY: dict[ContextClass, MaskStrategy] = {
     ContextClass.VIDEO_CALL: MaskStrategy.FULL_WINDOW,
     ContextClass.BROWSER_UNVERIFIED: MaskStrategy.FULL_WINDOW,
     ContextClass.UNKNOWN: MaskStrategy.FULL_WINDOW,
-    # PASSWORD_MANAGER / BANKING -> EXCLUDE (no masking, file deleted)
-    # CODE_EDITOR_TERMINAL / ADMIN_CONSOLE -> TEXT_REDACT (no masking needed)
+    # Since SCR-225 a user can set Mask on any app, so these two are answerable
+    # even though their matrix rows never ask for masking on their own. This map
+    # says "how would this surface be masked if asked" — NOT "does the matrix
+    # ask for masking", which is what the earlier omission assumed.
+    ContextClass.CODE_EDITOR_TERMINAL: MaskStrategy.FULL_WINDOW,
+    ContextClass.ADMIN_CONSOLE: MaskStrategy.FULL_WINDOW,
+    # PASSWORD_MANAGER / BANKING stay absent: every rule that can reach them
+    # resolves to EXCLUDE (a user Mask is tightening-only, so it cannot weaken
+    # them), and an EXCLUDE frame is deleted rather than masked.
 }
 
 

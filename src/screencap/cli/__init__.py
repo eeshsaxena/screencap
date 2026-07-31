@@ -49,7 +49,7 @@ def _stdin_is_tty() -> bool:
 # silently bump the version SwiftUI reads from `status --json`, and a status
 # payload tweak can be signalled without disturbing the event stream.
 _STATUS_SCHEMA_VERSION = 1
-_APPS_SCHEMA_VERSION = 3
+_APPS_SCHEMA_VERSION = 4
 _SETTINGS_PRIVACY_SCHEMA_VERSION = 2
 # v2 (todo 012 follow-up, SCR-17): adds the `privacy` block to the payload so
 # the SwiftUI first-run banner can read `mode`, `setup_skipped`, and
@@ -2453,8 +2453,10 @@ def apps(as_json, include_spotlight):
     Output (per app, when --json is set):
       bundle_id, display_name, path, icon_path, context_class,
       classification_source, resolved_action, in_exclude_apps,
-      in_allow_apps, allow_confirmed, confirmation_required,
-      is_matrix_exclude, has_per_frame_overrides
+      in_allow_apps, in_mask_apps, action_source, allow_confirmed,
+      confirmation_required, is_matrix_exclude, has_per_frame_overrides
+
+    The envelope carries ``default_action`` alongside ``schema_version``.
 
     Schema v3 (SCR-235): ``allow_confirmed`` is true when the entry is an
     authoritative confirmed allow (present in both allow_apps and
@@ -2462,6 +2464,15 @@ def apps(as_json, include_spotlight):
     class needs --confirm-sensitive to allow (matrix EXCLUDE in any mode).
     ``is_matrix_exclude`` (EXCLUDE in *every* mode) is kept for backward
     compatibility but no longer drives row locking.
+
+    Schema v4 (SCR-225): ``in_mask_apps`` reports the per-app Mask rule, and
+    ``action_source`` names which layer decided ``resolved_action`` —
+    ``user_rule`` (the user's own deny/mask/allow), ``default_floor`` (their
+    blanket default tightened the matrix), or ``matrix``. The pane needs the
+    distinction to render "blocked by you" separately from "blocked by
+    default"; it is deliberately not derived from the reason code alone,
+    because a legacy allow whose matrix action is EXCLUDE reports the same
+    reason as a real exclude_apps entry.
 
     has_per_frame_overrides is true when ``mask_domains`` or
     ``mask_title_patterns`` is non-empty in config.toml. The per-app
@@ -2485,6 +2496,7 @@ def apps(as_json, include_spotlight):
             get_matrix_action,
             requires_confirmed_allow,
         )
+        from screencap.privacy.reasons import ReasonCode
     except ImportError:
         err_console.print(_RECORD_EXTRAS_MSG)
         raise SystemExit(1)
@@ -2556,6 +2568,35 @@ def apps(as_json, include_spotlight):
         )
         decision = evaluator.evaluate(ctx_result, frame)
 
+        # Which layer decided this row (schema v4, SCR-225), so the pane can
+        # render "blocked by you" distinctly from "blocked by default".
+        #
+        # NOT derivable from the reason code alone: POLICY_EXCLUDED_APP is
+        # emitted both for a real exclude_apps entry and for a legacy allow
+        # whose matrix action is EXCLUDE. Attributing the second to the user
+        # would claim they blocked an app the matrix protected. Config
+        # membership is the disambiguator.
+        if decision.reason == ReasonCode.POLICY_EXCLUDED_APP:
+            action_source = (
+                "user_rule"
+                if privacy_cfg.is_excluded_app(meta.bundle_id)
+                else "matrix"
+            )
+        elif decision.reason in (
+            ReasonCode.POLICY_MASKED_APP,
+            ReasonCode.POLICY_ALLOWED_APP,
+            # Reachable here: the row is evaluated with the display name as the
+            # window title, so a user title pattern can match. Domain rules
+            # cannot fire (no domain is passed) but belong in the same class.
+            ReasonCode.POLICY_MASKED_TITLE,
+            ReasonCode.POLICY_MASKED_DOMAIN,
+        ):
+            action_source = "user_rule"
+        elif decision.reason == ReasonCode.POLICY_DEFAULT_FLOOR:
+            action_source = "default_floor"
+        else:
+            action_source = "matrix"
+
         rows.append({
             "bundle_id": meta.bundle_id,
             "display_name": meta.display_name,
@@ -2568,6 +2609,8 @@ def apps(as_json, include_spotlight):
             # case-normalized (SCR-235) and mixed-case bundle IDs must match.
             "in_exclude_apps": privacy_cfg.is_excluded_app(meta.bundle_id),
             "in_allow_apps": privacy_cfg.is_allowed_app(meta.bundle_id),
+            "in_mask_apps": privacy_cfg.is_masked_app(meta.bundle_id),
+            "action_source": action_source,
             "allow_confirmed": privacy_cfg.is_confirmed_allowed_app(meta.bundle_id),
             "confirmation_required": requires_confirmed_allow(ctx_class),
             "is_matrix_exclude": is_matrix_exclude,
@@ -2578,6 +2621,7 @@ def apps(as_json, include_spotlight):
         sys.stdout.write(_json.dumps({
             "ok": True,
             "schema_version": _APPS_SCHEMA_VERSION,
+            "default_action": privacy_cfg.default_action.value,
             "apps": rows,
         }) + "\n")
         sys.stdout.flush()
@@ -3880,14 +3924,17 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
     \b
     Valid FIELD names (todo 022):
       list fields (add/remove): exclude_apps, allow_apps, confirmed_allow_apps,
-                                mask_domains, mask_title_patterns
-      scalar fields (set):      mode (public|internal), setup_skipped (bool)
+                                mask_apps, mask_domains, mask_title_patterns
+      scalar fields (set):      mode (public|internal), setup_skipped (bool),
+                                default_action (allow|mask_window|exclude)
       map fields (BUNDLE=CLASS): app_classes
 
     \b
     Examples:
       screencap settings privacy exclude_apps add com.example.foo
       screencap settings privacy allow_apps remove com.example.bar
+      screencap settings privacy mask_apps add com.apple.Terminal
+      screencap settings privacy default_action set exclude
       screencap settings privacy mode set internal
       screencap settings privacy app_classes set com.example.foo=chat
 
@@ -3897,10 +3944,16 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
 
     ``allow_apps add`` writes a *confirmed* allow (SCR-235): the entry is
     authoritative over the privacy matrix in every mode. Sensitive classes
-    (excluded by the matrix in any mode) require ``--confirm-sensitive``;
-    unclassified bundles are refused until classified via ``app_classes``.
+    (excluded by the matrix in any mode) require ``--confirm-sensitive``.
     ``confirmed_allow_apps add`` is gated identically. ``allow_apps remove``
     also drops the confirmation, so re-allowing a sensitive app re-prompts.
+
+    ``mask_apps`` and ``default_action`` are the SCR-225 tightening rules and
+    can only strengthen the matrix, never weaken it: a Mask rule needs no
+    confirmation because it cannot loosen anything, and ``default_action`` is
+    the floor for apps with no explicit rule (``allow`` is the identity floor
+    and the default). The three per-app rules are mutually exclusive — adding
+    one clears the bundle from the others in the same write.
     """
     import json as _json
 
@@ -3912,6 +3965,7 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
         _PRIVACY_MODE_VALUES,
         _PRIVACY_SCALAR_FIELDS,
         _privacy_config_writer,
+        _privacy_default_action_values,
         _privacy_list_field_value,
         _settings_privacy_apply,
     )
@@ -3993,6 +4047,22 @@ def settings_privacy(field, op, value, as_json, confirm_sensitive):
                     f"{_PRIVACY_MODE_VALUES}, got: {escape(str(value))}"
                 )
                 _result(False, exit_code=1, error=f"invalid_mode:{value}")
+            parsed_value = value.lower()
+        elif field == "default_action":
+            # The blanket floor for apps with no explicit rule (SCR-225).
+            # Validate here, at the write seam, against the same set
+            # parse_privacy_config accepts — an unvalidated write would
+            # persist a value that raises InvalidPrivacyConfigError on the
+            # next start, which is the failure `mode`'s value list prevents.
+            valid_actions = _privacy_default_action_values()
+            if value.lower() not in valid_actions:
+                err_console.print(
+                    f"[red]Error:[/red] default_action must be one of "
+                    f"{valid_actions}, got: {escape(str(value))}"
+                )
+                _result(
+                    False, exit_code=1, error=f"invalid_default_action:{value}"
+                )
             parsed_value = value.lower()
         elif field == "setup_skipped":
             if value.lower() in ("true", "1", "yes"):

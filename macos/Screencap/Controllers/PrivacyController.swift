@@ -14,6 +14,9 @@ import Foundation
 @MainActor
 final class PrivacyController: ObservableObject {
     @Published private(set) var apps: [InstalledApp] = []
+    /// The blanket default for apps with no explicit rule (SCR-225). Seeded
+    /// from `apps --json`; `allow` is the identity floor and the default.
+    @Published private(set) var defaultAction: String = "allow"
     @Published private(set) var status: PrivacyStatus?
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var lastError: String?
@@ -125,6 +128,7 @@ final class PrivacyController: ObservableObject {
     /// toggle mid-round-trip would otherwise race two `--set` writes and leave
     /// the optimistic value pointing at whichever landed last.
     private var uploadDefaultWriteInFlight: Bool = false
+    private var defaultActionWriteInFlight: Bool = false
 
     /// Serializes `setCloudE2EE` writes — a double-tap on the E2EE toggle
     /// mid-round-trip would otherwise race an enable against a disable and
@@ -194,9 +198,39 @@ final class PrivacyController: ObservableObject {
                 return
             }
             apps = envelope.apps
+            defaultAction = envelope.defaultAction ?? "allow"
             lastError = nil
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    /// Set the blanket default for apps with no explicit rule (SCR-225).
+    ///
+    /// Optimistic flip with revert-on-failure, mirroring `setUploadDefault`:
+    /// the published value moves immediately so the banner tracks the tap, and
+    /// a CLI failure restores the previous value rather than leaving the
+    /// segment showing a default that contradicts disk. On success the app list
+    /// is refreshed — the floor can change every unruled row's resolved action.
+    @discardableResult
+    func setDefaultAction(_ value: String) async -> Bool {
+        guard !defaultActionWriteInFlight else { return false }
+        defaultActionWriteInFlight = true
+        defer { defaultActionWriteInFlight = false }
+
+        let previous = defaultAction
+        defaultAction = value
+        do {
+            _ = try await invoke(
+                ["settings", "privacy", "default_action", "set", value, "--json"]
+            )
+            lastError = nil
+            await refreshApps()
+            return true
+        } catch {
+            defaultAction = previous
+            lastError = error.localizedDescription
+            return false
         }
     }
 
@@ -235,6 +269,13 @@ final class PrivacyController: ObservableObject {
     /// matrix-masked app).
     func toggleAllow(bundleId: String, allowed: Bool) async {
         await toggleMembership(key: "allow_apps", bundleId: bundleId, add: allowed)
+    }
+
+    /// Set the per-app Mask rule for `bundleId` (SCR-225). The CLI clears the
+    /// bundle's allow/deny entries in the same write, so no companion call is
+    /// needed to leave the other two segments consistent.
+    func toggleMask(bundleId: String) async {
+        await toggleMembership(key: "mask_apps", bundleId: bundleId, add: true)
     }
 
     /// Allow a confirmation-required app (SCR-235). The view has already

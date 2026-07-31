@@ -202,3 +202,49 @@ jobs:
 
       - name: Run cloud-function billing test suite
         run: python -m pytest scripts/cloud-function/ -q
+
+  extension-tests:
+    # First non-Python lane in this workflow. The browser tier's origin
+    # allow-list (SCR-307) is a capture-time privacy boundary implemented
+    # entirely in TypeScript, so `pytest -m privacy` — the gate every other
+    # privacy-bearing change runs through — has nothing to execute for it.
+    # Without this job the allow-list tests would run only on a developer's
+    # machine.
+    #
+    # Deliberately unfiltered: no other job in this workflow uses a `paths`
+    # filter, and a job that skips on some PRs cannot serve as a required
+    # status check. The lane is ubuntu-only with no heavy dependencies, so
+    # running it always costs little.
+    name: Extension tests (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - name: Install dependencies
+        working-directory: extension
+        run: npm ci
+
+      - name: Run extension test suite
+        working-directory: extension
+        run: npm test
+
+      - name: Type-check
+        # vitest does not type-check, so tests alone would let a type error
+        # reach a built extension.
+        working-directory: extension
+        run: npm run typecheck
+
+      - name: Build
+        # The build config is stricter than the typecheck one — it drops the
+        # test-only node types, so this is what catches a node builtin reaching
+        # shipped source. It also exercises the static-asset copy that makes
+        # dist/ a loadable unpacked extension.
+        working-directory: extension
+        run: npm run build

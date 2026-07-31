@@ -272,13 +272,13 @@ enum PrivacySettingsCopy {
         + "recordings already uploaded are not re-encrypted."
     static let e2eeConfirmAction = "Turn On Encryption"
 
-    // The always-on capture-time policy engine (true today); per-app
-    // overrides are SCR-225.
+    // The always-on capture-time policy engine (true today). Per-app Mask
+    // rules exist since SCR-225 and tighten it; they cannot switch it off.
     static let maskTitle = "Mask sensitive content automatically"
     static let maskChip = "always on"
     static let maskSub = "Policy-driven: password managers, banking, and other sensitive windows are masked or blocked while recording."
     static let maskLink = "See per-app rules"
-    static let maskHelp = "Masking is policy-driven and always on. Per-app overrides coming soon — SCR-225"
+    static let maskHelp = "Masking is policy-driven and always on. Set a per-app Mask rule in App rules."
 
     // Stub: SCR-224 private-window detection / auto-pause — the design claims
     // auto-pause exists; it does not, so the row says so (R7).

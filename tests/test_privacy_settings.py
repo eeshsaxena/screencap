@@ -366,30 +366,175 @@ class TestSettingsPrivacyApply:
         assert list(tbl["allow_apps"]) == []
         assert list(tbl["confirmed_allow_apps"]) == []
 
-    def test_allow_apps_add_unclassified_bundle_still_refused(self):
-        """The fail-closed refusal for unclassified bundles is unchanged:
-        classification stays a prerequisite to any allow, confirmed or not."""
+    def test_allow_apps_add_unclassified_bundle_is_permitted(self):
+        """SCR-225 (KTD9) retired the unclassified-bundle refusal.
+
+        The old rule made a tightened `default_action` unusable: it blocks every
+        app the user has not ruled on, and most of a real library is absent from
+        BUNDLE_ID_MAP, so the escape hatch (tap Record) hard-failed on exactly
+        the apps the floor caught. An unclassified bundle now allow-lists as a
+        plain confirmed entry; `_allow_requires_confirmation` still gates every
+        bundle that resolves to a confirmation-required class."""
         import tomlkit
 
         tbl = tomlkit.table()
         tbl["mode"] = "internal"
-        recorder = _ResultRecorder()
 
-        with pytest.raises(SystemExit):
-            self._apply(
-                tbl,
-                field="allow_apps",
-                op="add",
-                value="com.example.mystery",
-                is_list=True,
-                is_scalar=False,
-                confirm_sensitive=True,  # the flag must not bypass classification
-                result=recorder,
-            )
+        changed, recorder = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.example.mystery",
+            is_list=True,
+            is_scalar=False,
+        )
 
-        call = recorder.calls[0]
-        assert call["exit_code"] == 1
-        assert call["error"] == "unknown_bundle_id:com.example.mystery"
+        assert changed is True
+        assert list(tbl["allow_apps"]) == ["com.example.mystery"]
+        assert list(tbl["confirmed_allow_apps"]) == ["com.example.mystery"]
+        assert not any(c["exit_code"] for c in recorder.calls)
+
+    # --- SCR-225: mask_apps and the three-way mutual exclusion -------------
+
+    def test_mask_apps_add_needs_no_confirmation_for_a_sensitive_class(self):
+        """A Mask rule is tightening-only, so it never asks for the
+        allow-listing confirmation even on a password manager."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+
+        changed, recorder = self._apply(
+            tbl,
+            field="mask_apps",
+            op="add",
+            value="com.1password.1password",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["mask_apps"]) == ["com.1password.1password"]
+        assert not any(c["exit_code"] for c in recorder.calls)
+
+    def test_mask_apps_add_prunes_the_other_two_rules(self):
+        """The three segments are mutually exclusive per bundle, enforced in one
+        transaction so a row can never render a state evaluation contradicts."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        for f in ("exclude_apps", "allow_apps", "confirmed_allow_apps"):
+            arr = tomlkit.array()
+            arr.append("com.apple.Terminal")
+            tbl[f] = arr
+
+        changed, _ = self._apply(
+            tbl,
+            field="mask_apps",
+            op="add",
+            value="com.apple.Terminal",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["mask_apps"]) == ["com.apple.Terminal"]
+        assert list(tbl["exclude_apps"]) == []
+        assert list(tbl["allow_apps"]) == []
+        assert list(tbl["confirmed_allow_apps"]) == []
+
+    def test_exclude_apps_add_prunes_a_mask_rule(self):
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.apple.Terminal")
+        tbl["mask_apps"] = arr
+
+        changed, _ = self._apply(
+            tbl,
+            field="exclude_apps",
+            op="add",
+            value="com.apple.Terminal",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["exclude_apps"]) == ["com.apple.Terminal"]
+        assert list(tbl["mask_apps"]) == []
+
+    def test_allow_apps_add_prunes_a_mask_rule(self):
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("com.apple.Terminal")
+        tbl["mask_apps"] = arr
+
+        changed, _ = self._apply(
+            tbl,
+            field="allow_apps",
+            op="add",
+            value="com.apple.Terminal",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["allow_apps"]) == ["com.apple.Terminal"]
+        assert list(tbl["mask_apps"]) == []
+
+    def test_cross_list_pruning_is_case_insensitive(self):
+        """Runtime membership is case-normalized, so a case-variant stored
+        entry must still be pruned — otherwise it stays live but unreachable."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        arr = tomlkit.array()
+        arr.append("COM.APPLE.TERMINAL")
+        tbl["exclude_apps"] = arr
+
+        self._apply(
+            tbl,
+            field="mask_apps",
+            op="add",
+            value="com.apple.Terminal",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert list(tbl["exclude_apps"]) == []
+
+    def test_mask_apps_remove_leaves_the_other_rules_alone(self):
+        """Pruning is an add-time concern; remove must not touch siblings."""
+        import tomlkit
+
+        tbl = tomlkit.table()
+        tbl["mode"] = "internal"
+        mask = tomlkit.array()
+        mask.append("com.apple.Terminal")
+        tbl["mask_apps"] = mask
+        excl = tomlkit.array()
+        excl.append("com.example.other")
+        tbl["exclude_apps"] = excl
+
+        changed, _ = self._apply(
+            tbl,
+            field="mask_apps",
+            op="remove",
+            value="com.apple.Terminal",
+            is_list=True,
+            is_scalar=False,
+        )
+
+        assert changed is True
+        assert list(tbl["mask_apps"]) == []
+        assert list(tbl["exclude_apps"]) == ["com.example.other"]
 
     def test_allow_apps_add_reclassified_sensitive_needs_flag(self):
         """The gate consults on-disk app_classes overrides (todo 030): a

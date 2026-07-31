@@ -25,10 +25,15 @@ Deploy (project: proteus-photos, region: southamerica-east1):
         --role roles/iam.serviceAccountTokenCreator
     # The SA also needs roles/storage.objectAdmin on the target recordings bucket.
 
-    # Deploy (set SCREENCAP_BUCKET to the staging bucket pre-cutover; the prod
-    # default is the unset 'screencap-recordings'). ALWAYS set
-    # SCREENCAP_PROJECT_ID explicitly — it is the only thing that pins the
-    # trusted Firebase project; there is NO ambient fallback (see
+    # Deploy. ALWAYS set SCREENCAP_BUCKET explicitly to the staging bucket:
+    # 'screencap-recordings' is only the code DEFAULT and the eventual cutover
+    # name — that bucket DOES NOT EXIST in proteus-photos until the migration's
+    # recordings cutover (U7) creates it and copies the data. Setting it early
+    # deploys green and then 403s on the first GCS call, which is what took the
+    # public gallery and share resolution down for days. Verify before deploying:
+    #     gcloud storage ls "gs://$SCREENCAP_BUCKET/demo/" --project proteus-photos
+    # ALWAYS set SCREENCAP_PROJECT_ID explicitly too — it is the only thing that
+    # pins the trusted Firebase project; there is NO ambient fallback (see
     # _resolve_project_id):
     gcloud functions deploy get-upload-urls \
         --project proteus-photos --gen2 \
@@ -68,6 +73,7 @@ from datetime import datetime, timedelta, timezone
 
 import firebase_admin
 import functions_framework
+import google.api_core.exceptions
 import google.auth
 import google.auth.exceptions
 import google.auth.transport.requests
@@ -152,13 +158,16 @@ def _cors(response, status=200):
 
 @functions_framework.http
 def get_upload_urls(request):
-    """Dispatch to the upload / list / sign-download handlers.
+    """Entry point: parse the request, route it via ``_dispatch``, and convert a
+    GCS-level failure into a structured 503 instead of a bare 500.
 
     Every real-user action is token-gated (``verify_bearer``) and scoped to
-    ``users/{uid}/…`` via the central ``resolve_prefix``. The dispatcher enforces
-    a strict action allow-list: anything not enumerated here is a 400, so a
+    ``users/{uid}/…`` via the central ``resolve_prefix``. ``_dispatch`` enforces
+    a strict action allow-list: anything not enumerated there is a 400, so a
     forgotten or removed legacy action (e.g. the retired ``get-index``) cannot
-    survive as an unauthenticated reader.
+    survive as an unauthenticated reader. The storage guard below only ever
+    answers 503 — it can turn a would-be crash into a denial, never into a
+    served response, so the fail-closed posture is preserved.
 
     Actions (all Bearer-required):
     - (default) / "upload": POST {"recording": "...", "files": [...]}
@@ -174,6 +183,37 @@ def get_upload_urls(request):
 
     action = data.get("action")
 
+    try:
+        return _dispatch(request, data, action)
+    except google.api_core.exceptions.GoogleAPICallError as exc:
+        # Every handler below reaches GCS, and a GCS-level failure (bucket
+        # missing or SCREENCAP_BUCKET mis-set, IAM revoked, storage outage) is
+        # NOT something the per-handler `except GoogleAuthError` catches — that
+        # one covers signBlob credential refresh only. Uncaught, it escapes as a
+        # bare 500 HTML traceback whose body names neither the action nor the
+        # bucket, so the caller sees "something broke" and the operator has to
+        # dig the stack trace out of Cloud Logging to find the bucket name.
+        #
+        # This is not hypothetical: a deploy that set SCREENCAP_BUCKET to a
+        # bucket that did not exist took the public gallery AND share resolution
+        # down for days behind exactly that opaque 500. GCS answers 403 (not
+        # 404) for a nonexistent bucket so it cannot be told apart from a
+        # revoked grant — hence one branch for both, with the bucket logged so
+        # the misconfiguration is legible at a glance.
+        logger.error(
+            "GCS call failed (action=%r bucket=%r): %s", action, BUCKET, exc
+        )
+        return _cors((jsonify({"error": "Storage temporarily unavailable"}), 503))
+
+
+def _dispatch(request, data, action):
+    """Route one already-parsed request to its handler.
+
+    Split out of ``get_upload_urls`` so the storage-failure guard there wraps
+    EVERY handler uniformly — including any added later — rather than repeating
+    a try/except at each GCS call site, where one omission silently restores the
+    bare-500 behavior.
+    """
     # Public demo actions — dispatched BEFORE any token-gated branch so a demo
     # request never touches verify_bearer-gated code. They hard-code the demo/
     # prefix via resolve_prefix(authenticated=False, ...) and honor no
