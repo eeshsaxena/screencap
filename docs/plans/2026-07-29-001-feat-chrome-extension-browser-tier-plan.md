@@ -187,7 +187,7 @@ Verified externally:
 Assumed and not yet verified — each is load-bearing:
 
 - Firebase's web SDK can authenticate an extension and the website into the same project and resolve both to the uid the macOS app already uses.
-- Chrome Web Store will approve the extension with optional per-origin permissions plus `desktopCapture`. The permission model is chosen to make this likely, not to guarantee it.
+- Chrome Web Store will approve the extension with optional per-origin permissions plus the capture permissions. The permission model is chosen to make this likely, not to guarantee it. **Correction (U3, SCR-308):** `desktopCapture` turned out to be unusable in this architecture and is not requested, so the review surface is one sensitive permission narrower than assumed here.
 - Cloud cost per recording-hour is unmodeled. Video storage and egress for this tier have no budget attached.
 - The requester matches the operator persona in `STRATEGY.md:22`. This rests on one user's request with little detail. If they turn out to be, for example, a Windows user, this becomes a platform-reach play and the scope shifts.
 - Whether this tier stays a lane for people who cannot install the app, or becomes the primary surface with the macOS app as an upgrade path, is undecided. v1 is scoped so that answer can arrive later without invalidating what was already captured.
@@ -327,7 +327,7 @@ Each unit is sized for one session and tracked as its own Linear issue.
 - **Repo:** screencap
 - **Files:** `extension/manifest.json`, `extension/src/permissions/allowlist.ts`, `extension/src/popup/AllowlistPanel.tsx`, `extension/src/permissions/allowlist.test.ts`
 - **Approach:**
-  1. Declare optional host permissions rather than a broad host permission, per KTD2. The manifest requests `desktopCapture` and `offscreen` up front and no blanket origin access.
+  1. Declare optional host permissions rather than a broad host permission, per KTD2, and no blanket origin access. **Correction (U3, SCR-308):** `desktopCapture` is not requested at all — its stream ids cannot be consumed inside an offscreen document, so whole-screen capture uses the web-standard display picker instead. The capture permissions (`offscreen`, `tabCapture`, `unlimitedStorage`, `activeTab`) are declared by U3, which exercises them.
   2. Adding an origin to the allow-list triggers a runtime permission request for that origin; revoking removes both the list entry and the grant, so the stored list and Chrome's grant state cannot drift apart.
   3. Expose the current allow-list in the popup with add and remove, and treat Chrome's grant state as the source of truth on read.
 - **Patterns to follow:** the fail-closed posture in `src/screencap/privacy/policy.py` — an origin whose state cannot be determined is treated as not allowed.
