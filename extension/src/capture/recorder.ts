@@ -220,7 +220,13 @@ export class CaptureRecorder {
    * away. A track left live tells the user they are still being recorded.
    */
   async stop(): Promise<StopSummary> {
-    this.handle?.stop();
+    try {
+      this.handle?.stop();
+    } catch {
+      // Already inactive — a failure stopped it moments ago and the user's stop
+      // raced the failure message. `MediaRecorder.stop()` throws in that state,
+      // and reporting it would replace a real cause with a confusing one.
+    }
     await this.stopped;
     await this.writeQueue;
 

@@ -66,23 +66,35 @@ describe("captureView", () => {
     expect(view.canStart).toBe(true);
   });
 
-  it("offers neither action mid-transition", () => {
+  it("keeps stop reachable mid-transition so a dead worker cannot strand it", () => {
+    // starting/stopping are normally momentary, but a worker that dies mid-verb
+    // leaves one persisted. A state offering no action at all would wedge the
+    // user until the browser restarted.
     for (const kind of ["starting", "stopping"] as const) {
       expect(captureView({ signedIn: true, status: session(kind) })).toMatchObject({
         canStart: false,
-        canStop: false,
+        canStop: true,
       });
     }
   });
 
-  it("withholds both actions while a verb is in flight", () => {
+  it("greys actions out while a verb is in flight rather than hiding them", () => {
     // A second click during start would race the first into a refused start.
-    expect(
-      captureView({ signedIn: true, status: session("idle"), busy: true }).canStart,
-    ).toBe(false);
-    expect(
-      captureView({ signedIn: true, status: session("recording"), busy: true }).canStop,
-    ).toBe(false);
+    // Removing the button instead of disabling it makes it vanish under the
+    // cursor mid-click.
+    const starting = captureView({
+      signedIn: true,
+      status: session("idle"),
+      busy: true,
+    });
+    expect(starting).toMatchObject({ showStart: true, canStart: false });
+
+    const stopping = captureView({
+      signedIn: true,
+      status: session("recording"),
+      busy: true,
+    });
+    expect(stopping).toMatchObject({ showStop: true, canStop: false });
   });
 
   it("falls back to an unnamed recording rather than rendering a blank source", () => {

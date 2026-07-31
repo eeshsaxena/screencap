@@ -150,10 +150,13 @@ function renderCapture(view: CaptureView): void {
   el("capture-status").textContent = view.message;
   setText("capture-error", view.error);
 
-  captureTab.hidden = !view.canStart;
-  captureScreen.hidden = !view.canStart;
-  captureStop.hidden = !view.canStop;
-  captureTab.disabled = !view.canStart;
+  // Visibility follows the state, availability also follows whether a verb is
+  // in flight — so an in-flight action greys out instead of vanishing under
+  // the cursor.
+  captureTab.hidden = !view.showStart;
+  captureScreen.hidden = !view.showStart;
+  captureStop.hidden = !view.showStop;
+  captureTab.disabled = !view.canStart || activeTab === null;
   captureScreen.disabled = !view.canStart;
   captureStop.disabled = !view.canStop;
 }
