@@ -1,6 +1,18 @@
 ScreenCap is licensed under the PolyForm Noncommercial License 1.0.0, reproduced
 in full below.
 
+SCOPE -- SOURCE CODE VS. OFFICIAL BUILDS
+
+These terms govern the ScreenCap source code and any binaries you or a third
+party build from it. They do not govern official prebuilt builds of ScreenCap
+distributed by Ivy Research LLC -- the signed and notarized macOS app and its
+bundled CLI. Use of an official build is governed by the subscription or license
+terms accompanying that build.
+
+Building ScreenCap from source and using it for a purpose permitted by these
+terms is always free of charge. A paid plan covers the official build, its
+updates and support, and any cloud services -- not the right to use the software.
+
 Noncommercial use -- personal use, hobby projects, research, and use by
 charitable, educational, public research, public safety or health, environmental,
 and government organizations -- is permitted free of charge under these terms.

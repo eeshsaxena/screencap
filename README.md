@@ -236,6 +236,8 @@ Screencap can also store the entire local library inside an app-managed **encryp
 
 Screencap is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). It is not an open-source license.
 
+The license covers the **source code** and anything you build from it. Official prebuilt builds — the signed, notarized app and its bundled CLI — are covered by the subscription terms that come with them. Building from source for a permitted purpose is always free; a paid plan buys the official build, updates, support, and cloud.
+
 - **Free:** personal use, hobby projects, private study, and research, plus use by charitable, educational, public research, public safety or health, environmental, and government organizations.
 - **Trial:** commercial evaluation, development, and testing are permitted free for **7 days**, at any organization size — an additional permission granted on top of the license.
 - **Paid:** after the trial, any commercial use — use in a business or production environment, use that generates or supports revenue, or use by or on behalf of a for-profit entity — requires a separate commercial license. Email aayushgupta5000@gmail.com.

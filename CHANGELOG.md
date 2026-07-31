@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   research, educational, charitable, and government use remains free; **commercial
   use requires a paid license** after a 7-day evaluation period, granted as an
   additional permission on top of the license (PolyForm itself has no trial
-  clause). Copyright is held by Ivy Research LLC. Versions released under
+  clause). The LICENSE header also scopes the terms to the source code and
+  self-built binaries: official prebuilt builds are governed by the
+  subscription terms shipped with them, so a paid plan buys the signed build,
+  updates, support, and cloud rather than the right to use the software.
+  Copyright is held by Ivy Research LLC. Versions released under
   AGPL-3.0-or-later remain available under that license. `pyproject.toml`
   declares the new SPDX expression, and `build-system.requires` now needs
   setuptools >= 77 for PEP 639 support.
