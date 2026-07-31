@@ -5,6 +5,24 @@ import {
   DEFAULT_OAUTH_CLIENT_ID,
   isPlaceholderCredential,
 } from "./credentials.js";
+import { FIREBASE_API_KEY, OAUTH_CLIENT_ID } from "./provisioned.js";
+
+describe("the injection point and the sentinels", () => {
+  // The one failure mode splitting the injected values into their own module
+  // introduces. `isPlaceholderCredential` compares against the sentinels here,
+  // not against what `provisioned.ts` actually holds, so a typo there would
+  // make an un-provisioned build read as provisioned and pass the release
+  // guard — the exact thing the guard exists to catch.
+  it("agree on what un-provisioned looks like", () => {
+    expect(FIREBASE_API_KEY).toBe(DEFAULT_FIREBASE_API_KEY);
+    expect(OAUTH_CLIENT_ID).toBe(DEFAULT_OAUTH_CLIENT_ID);
+  });
+
+  it("means the checked-in injection point reads as a placeholder", () => {
+    expect(isPlaceholderCredential(FIREBASE_API_KEY)).toBe(true);
+    expect(isPlaceholderCredential(OAUTH_CLIENT_ID)).toBe(true);
+  });
+});
 
 describe("isPlaceholderCredential", () => {
   it("recognizes both un-provisioned sentinels", () => {
