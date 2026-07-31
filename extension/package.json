@@ -2,6 +2,7 @@
   "name": "screencap-extension",
   "version": "0.1.0",
   "private": true,
+  "license": "SEE LICENSE IN ../LICENSE",
   "type": "module",
   "description": "Screencap browser tier — records browser work without the macOS app.",
   "scripts": {

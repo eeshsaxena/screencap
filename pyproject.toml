@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+# setuptools >= 77 is required for PEP 639 support: `[project] license` is an
+# SPDX expression string ("PolyForm-Noncommercial-1.0.0"), which older
+# setuptools rejects as invalid config.
+requires = ["setuptools>=77.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +10,7 @@ name = "screencap"
 version = "0.32.0"
 description = "macOS CLI for screen capture"
 requires-python = ">=3.10"
-license = "AGPL-3.0-or-later"
+license = "PolyForm-Noncommercial-1.0.0"
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
@@ -65,7 +68,6 @@ record = [
     "tqdm>=4.0.0",
     "numpy>=1.20.0",
     "faster-whisper>=1.1.0",
-    "oa-atomacos>=3.2.0; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
