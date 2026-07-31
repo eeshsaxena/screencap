@@ -115,6 +115,14 @@
         width: auto;
         flex: none;
       }
+      .capture-actions {
+        display: grid;
+        gap: 6px;
+      }
+      #capture-status {
+        margin: 0 0 10px;
+        opacity: 1;
+      }
     </style>
   </head>
   <body>
@@ -131,6 +139,18 @@
         Can't reach Screencap right now — you're still signed in.
       </p>
       <button id="sign-out">Sign out</button>
+    </section>
+
+    <section id="capture" hidden>
+      <hr />
+      <h2>Recording</h2>
+      <p id="capture-status" class="note"></p>
+      <div class="capture-actions">
+        <button id="capture-tab">Record this tab</button>
+        <button id="capture-screen">Record screen</button>
+        <button id="capture-stop">Stop recording</button>
+      </div>
+      <p id="capture-error" class="error" hidden></p>
     </section>
 
     <section id="allowlist" hidden>

@@ -40,6 +40,14 @@ describe("manifest key", () => {
   it("leaves the permissions the auth path depends on intact", () => {
     // Pinning the key is a one-field addition; it must not disturb the
     // identity/storage grants sign-in and credential persistence rely on.
-    expect(manifest.permissions).toEqual(["identity", "storage"]);
+    //
+    // Containment rather than equality: capture added its own permissions to
+    // this same array, and two tests asserting the whole list would fight over
+    // it every time either half grows. This one guards what auth needs; the
+    // exhaustive pin — the one that catches a permission nothing exercises —
+    // lives in `../permissions/allowlist.test.ts`.
+    expect(manifest.permissions).toEqual(
+      expect.arrayContaining(["identity", "storage"]),
+    );
   });
 });

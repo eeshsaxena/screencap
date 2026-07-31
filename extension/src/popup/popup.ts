@@ -10,6 +10,11 @@
  * gesture and throws. See {@link addOrigin}.
  */
 
+import type {
+  CaptureMessage,
+  CaptureMessageResponse,
+  CaptureSourceRequest,
+} from "../background/capture-controller.js";
 import type { AuthRequest, AuthResponse } from "../background/service-worker.js";
 import {
   Allowlist,
@@ -17,6 +22,7 @@ import {
   type AllowlistEntry,
 } from "../permissions/allowlist.js";
 import { addOutcome, allowlistView, type AllowlistView } from "./allowlist-view.js";
+import { captureProblem, captureView, type CaptureView } from "./capture-view.js";
 import { popupView, unreachableView, type PopupView } from "./view.js";
 
 const allowlist = new Allowlist(chromeAllowlistDeps());
@@ -79,6 +85,155 @@ function render(view: PopupView): void {
   setText("error", view.error);
 
   void refreshAllowlist(signedIn);
+  void refreshCapture(signedIn);
+}
+
+/**
+ * The tab the popup was opened over, captured at load.
+ *
+ * Read once, up front, because the capture handler cannot afford to await:
+ * `chrome.tabCapture.getMediaStreamId()` must run inside the user gesture, and
+ * a `tabs.query()` first would spend it — the same constraint {@link addOrigin}
+ * documents for permission requests.
+ */
+let activeTab: { id: number; title: string } | null = null;
+
+/** A capture verb is in flight. Both buttons withhold so a second click cannot
+ * race the first into a refused start. */
+let captureBusy = false;
+
+async function sendCapture(message: CaptureMessage): Promise<CaptureMessageResponse> {
+  return chrome.runtime.sendMessage<CaptureMessage, CaptureMessageResponse>(message);
+}
+
+const NO_SESSION = { kind: "idle", record: null, error: null } as const;
+
+/**
+ * Re-read capture state and paint it.
+ *
+ * An unanswered or failed round-trip is reported as *unreachable*, never as an
+ * idle session. Substituting an idle placeholder would make the panel say "Not
+ * recording" on the strength of no information at all.
+ */
+async function refreshCapture(
+  signedIn: boolean,
+  error: string | null = null,
+): Promise<void> {
+  if (!signedIn) {
+    renderCapture(captureView({ signedIn: false, status: NO_SESSION }));
+    return;
+  }
+
+  try {
+    const response = await sendCapture({ type: "capture.status" });
+    const reachable = response.ok && "status" in response;
+    renderCapture(
+      captureView({
+        signedIn: true,
+        status: reachable ? response.status : NO_SESSION,
+        reachable,
+        busy: captureBusy,
+        error: error ?? (response.ok ? null : response.error),
+      }),
+    );
+  } catch (caught) {
+    renderCapture(
+      captureView({
+        signedIn: true,
+        status: NO_SESSION,
+        reachable: false,
+        busy: captureBusy,
+        error: error ?? asError(caught),
+      }),
+    );
+  }
+}
+
+function renderCapture(view: CaptureView): void {
+  el("capture").hidden = !view.visible;
+  el("capture-status").textContent = view.message;
+  setText("capture-error", view.error);
+
+  // Visibility follows the state, availability also follows whether a verb is
+  // in flight — so an in-flight action greys out instead of vanishing under
+  // the cursor.
+  captureTab.hidden = !view.showStart;
+  captureScreen.hidden = !view.showStart;
+  captureStop.hidden = !view.showStop;
+  captureTab.disabled = !view.canStart || activeTab === null;
+  captureScreen.disabled = !view.canStart;
+  captureStop.disabled = !view.canStop;
+}
+
+/**
+ * Run a capture verb and repaint once, carrying whatever went wrong.
+ *
+ * The outcome is latched rather than painted inside the try/catch, because a
+ * trailing repaint that defaulted the error to null would erase the message it
+ * had just rendered — leaving a refused start or a failed stop silently
+ * invisible.
+ */
+async function runCapture(
+  start: () => Promise<CaptureMessageResponse>,
+): Promise<void> {
+  captureBusy = true;
+  let problem: string | null = null;
+  try {
+    problem = captureProblem(await start());
+  } catch (error) {
+    problem = asError(error);
+  } finally {
+    captureBusy = false;
+    await refreshCapture(lastSignedIn, problem);
+  }
+}
+
+/**
+ * Start recording the tab the popup was opened over.
+ *
+ * `getMediaStreamId` is called **before this handler awaits anything**. Chrome
+ * requires it inside the user gesture, and it cannot be delegated to the
+ * service worker: the popup is the extension page holding the gesture, and this
+ * extension uses a popup, so `action.onClicked` never fires in the worker at
+ * all.
+ */
+function startTabRecording(): void {
+  if (captureBusy || activeTab === null) return;
+  const { id, title } = activeTab;
+
+  const streamId = tabStreamId(id);
+  void runCapture(async () =>
+    sendCapture({
+      type: "capture.start",
+      source: { kind: "tab", streamId: await streamId, label: title },
+    }),
+  );
+}
+
+/**
+ * Promise-wrap the callback form of `getMediaStreamId`.
+ *
+ * The wrapper matters for more than ergonomics: a Promise executor runs
+ * synchronously, so Chrome's API is still invoked inside the gesture. Checking
+ * `lastError` is what turns a refusal — no `activeTab` grant, a tab that cannot
+ * be captured — into a message instead of a silently unresolved promise.
+ */
+function tabStreamId(targetTabId: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    chrome.tabCapture.getMediaStreamId({ targetTabId }, (id) => {
+      const failure = chrome.runtime.lastError;
+      if (failure) reject(new Error(failure.message ?? "Chrome would not capture this tab."));
+      else resolve(id);
+    });
+  });
+}
+
+/** The display picker opens inside the offscreen document, so no gesture is
+ * spent here — unlike the tab path above. */
+function startScreenRecording(): void {
+  if (captureBusy) return;
+  const source: CaptureSourceRequest = { kind: "screen" };
+  void runCapture(() => sendCapture({ type: "capture.start", source }));
 }
 
 /**
@@ -218,6 +373,35 @@ const signOut = el<HTMLButtonElement>("sign-out");
 const retry = el<HTMLButtonElement>("retry");
 const addButton = el<HTMLButtonElement>("allowlist-add");
 const addInput = el<HTMLInputElement>("allowlist-input");
+const captureTab = el<HTMLButtonElement>("capture-tab");
+const captureScreen = el<HTMLButtonElement>("capture-screen");
+const captureStop = el<HTMLButtonElement>("capture-stop");
+
+captureTab.addEventListener("click", startTabRecording);
+captureScreen.addEventListener("click", startScreenRecording);
+captureStop.addEventListener("click", () => {
+  if (captureBusy) return;
+  void runCapture(() => sendCapture({ type: "capture.stop" }));
+});
+
+// Resolved before any click can arrive, so the tab handler never has to await.
+// The title needs activeTab, which Chrome grants for the duration of this
+// popup being open.
+void chrome.tabs
+  .query({ active: true, currentWindow: true })
+  .then(([tab]) => {
+    if (tab?.id !== undefined) {
+      activeTab = { id: tab.id, title: tab.title?.trim() || "this tab" };
+    }
+  })
+  .catch(() => {
+    // Leaves `activeTab` null, which disables tab capture rather than starting
+    // a recording of a tab we cannot name.
+  })
+  // Repaint whichever promise settles last: the tab button's disabled state is
+  // latched at render time and would otherwise stay stuck off when this
+  // resolves after the first paint.
+  .finally(() => void refreshCapture(lastSignedIn));
 
 signIn.addEventListener("click", () => void run(signIn, { type: "auth.signIn" }));
 signOut.addEventListener("click", () => void run(signOut, { type: "auth.signOut" }));

@@ -15,6 +15,13 @@ import {
   toWhoAmI,
   type WhoAmI,
 } from "../auth/firebase.js";
+import {
+  CaptureController,
+  chromeCaptureDeps,
+  registerCaptureListener,
+} from "./capture-controller.js";
+import { applyBadge, badgeFor, chromeBadgeDeps } from "./indicator.js";
+import { isExtensionPageSender as isTrustedSender } from "./senders.js";
 
 const session = new AuthSession(chromeAuthDeps());
 
@@ -48,15 +55,10 @@ export function isAuthRequest(request: unknown): request is AuthRequest {
 }
 
 /**
- * Whether the sender may drive auth.
- *
- * Only extension pages qualify — a `tab` on the sender means a content script,
- * which from U4 onward runs on allow-listed origins and must not be able to
- * start or end a session.
+ * Whether the sender may drive auth. The offscreen document applies the same
+ * rule to capture, so the predicate itself lives in `./senders.ts`.
  */
-export function isTrustedSender(sender: chrome.runtime.MessageSender): boolean {
-  return sender.id === chrome.runtime.id && sender.tab === undefined;
-}
+export { isTrustedSender };
 
 export async function handle(request: AuthRequest): Promise<AuthResponse> {
   switch (request.type) {
@@ -65,6 +67,10 @@ export async function handle(request: AuthRequest): Promise<AuthResponse> {
     case "auth.signIn":
       return { ok: true, who: toWhoAmI(await session.signIn()) };
     case "auth.signOut":
+      // Stop capture before dropping the session. The recording panel is gated
+      // on being signed in, so signing out mid-recording would take away the
+      // only Stop control while the offscreen document kept recording.
+      await capture.stop().catch(() => undefined);
       await session.signOut();
       return { ok: true, who: SIGNED_OUT };
   }
@@ -89,3 +95,26 @@ chrome.runtime.onMessage.addListener(
     return true;
   },
 );
+
+// Registered after the auth listener, not instead of it: both see every message
+// and decline what is not theirs.
+const capture = new CaptureController(chromeCaptureDeps());
+
+/**
+ * Repaint the badge from the reconciled session.
+ *
+ * Called at module load as well as after each verb, because module load *is*
+ * worker startup in MV3: a revived worker inherits whatever badge the browser
+ * kept, which may describe a recording that has since ended.
+ */
+async function syncBadge(): Promise<void> {
+  try {
+    await applyBadge(chromeBadgeDeps(), badgeFor(await capture.status()));
+  } catch {
+    // A worker that cannot read its own state should still come up; the badge
+    // is an indicator, and the popup asks for status directly anyway.
+  }
+}
+
+registerCaptureListener(capture, () => void syncBadge());
+void syncBadge();

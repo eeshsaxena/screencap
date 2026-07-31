@@ -408,7 +408,35 @@ describe("manifest", () => {
   });
 
   it("does not carry permissions no code exercises yet", () => {
-    // desktopCapture and offscreen belong with the capture unit that uses them.
-    expect(manifest.permissions).toEqual(["identity", "storage"]);
+    expect(manifest.permissions).toEqual([
+      "identity",
+      "storage",
+      "activeTab",
+      "tabCapture",
+      "offscreen",
+      "unlimitedStorage",
+    ]);
+  });
+
+  it("does not turn activeTab into standing access to every tab", () => {
+    // activeTab is what lets the popup read the current tab's title and capture
+    // it, scoped to the moment the user opens the popup. The `tabs` permission
+    // would grant the same reads across every tab, permanently, and warn the
+    // user accordingly — a much wider ask for the same feature.
+    expect(manifest.permissions).not.toContain("tabs");
+  });
+
+  it("does not request desktopCapture", () => {
+    // A desktopCapture stream id cannot be consumed inside an offscreen
+    // document, so whole-screen capture uses the web-standard display picker
+    // instead and this permission would buy nothing — while costing a
+    // sensitive-permission line in Chrome Web Store review.
+    expect(manifest.permissions).not.toContain("desktopCapture");
+  });
+
+  it("keeps recorded bytes exempt from quota eviction", () => {
+    // Slices live in IndexedDB until upload. Without unlimitedStorage the
+    // browser may evict a recording that has not been uploaded yet.
+    expect(manifest.permissions).toContain("unlimitedStorage");
   });
 });

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Screencap capture</title>
+  </head>
+  <body>
+    <!--
+      Never rendered. This document exists only to host MediaRecorder, which
+      needs a DOM the MV3 service worker does not have. It keeps recording
+      while the worker is suspended, which is the whole reason it exists.
+    -->
+    <script type="module" src="offscreen.js"></script>
+  </body>
+</html>

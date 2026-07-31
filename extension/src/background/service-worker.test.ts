@@ -23,7 +23,24 @@ beforeAll(async () => {
     },
     storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } },
     identity: { launchWebAuthFlow: async () => "", getRedirectURL: () => "" },
+    // The worker paints the recording badge from its reconciled state at
+    // startup, so importing it now touches the action and offscreen surfaces.
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+      setTitle: async () => {},
+    },
+    offscreen: {
+      Reason: { USER_MEDIA: "USER_MEDIA", DISPLAY_MEDIA: "DISPLAY_MEDIA" },
+      closeDocument: async () => {},
+    },
   };
+  (
+    globalThis as unknown as { chrome: { runtime: Record<string, unknown> } }
+  ).chrome.runtime.getContexts = async () => [];
+  (
+    globalThis as unknown as { chrome: { runtime: Record<string, unknown> } }
+  ).chrome.runtime.ContextType = { OFFSCREEN_DOCUMENT: "OFFSCREEN_DOCUMENT" };
 
   const mod = await import("./service-worker.js");
   isAuthRequest = mod.isAuthRequest;
