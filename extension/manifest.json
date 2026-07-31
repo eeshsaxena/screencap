@@ -4,7 +4,13 @@
   "version": "0.1.0",
   "description": "Record your browser work and watch it back — no app install required.",
   "minimum_chrome_version": "116",
-  "permissions": ["identity", "storage"],
+  "permissions": [
+    "identity",
+    "storage",
+    "tabCapture",
+    "offscreen",
+    "unlimitedStorage"
+  ],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": {
     "service_worker": "background/service-worker.js",

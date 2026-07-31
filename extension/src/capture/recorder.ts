@@ -56,6 +56,10 @@ const CANCELLED_ERROR_NAMES = new Set(["NotAllowedError", "AbortError"]);
  * where the browser would supply a `MediaStream`. */
 export interface CaptureTrack {
   stop(): void;
+  /** What the browser calls this source. For whole-screen capture it is the
+   * only way to learn which screen or window the user actually picked — the
+   * picker runs inside this document and reports nothing else. */
+  readonly label?: string;
 }
 
 export interface CaptureStream {
@@ -96,7 +100,14 @@ export type CaptureRequest =
   | { kind: "screen" };
 
 export type StartResult =
-  | { ok: true; mimeType: string }
+  | {
+      ok: true;
+      mimeType: string;
+      /** The track's own name for the source, when it has one. Null leaves the
+       * controller's provisional label in place rather than replacing it with
+       * an empty string. */
+      sourceLabel: string | null;
+    }
   | {
       ok: false;
       /** `cancelled`: the user dismissed the picker. `unsupported`: no usable
@@ -177,7 +188,8 @@ export class CaptureRecorder {
     });
     this.handle.start(TIMESLICE_MS);
 
-    return { ok: true, mimeType };
+    const label = stream.getTracks()[0]?.label;
+    return { ok: true, mimeType, sourceLabel: label ? label : null };
   }
 
   /** Suspend capture. Returns whether this actually changed anything, so the

@@ -39,9 +39,13 @@ class FakeRecorder implements RecorderHandle {
   }
 }
 
-function fakeStream(trackCount = 2): CaptureStream & { stoppedTracks: number } {
+function fakeStream(
+  trackCount = 2,
+  label = "Screen 1",
+): CaptureStream & { stoppedTracks: number } {
   let stoppedTracks = 0;
   const tracks = Array.from({ length: trackCount }, () => ({
+    label,
     stop: () => void (stoppedTracks += 1),
   }));
   return {
@@ -122,6 +126,28 @@ describe("start", () => {
     expect(result).toMatchObject({ ok: true });
     expect(seen).toEqual(["stream-7"]);
     expect(recorder?.started).toBeGreaterThan(0);
+  });
+
+  it("reports the track's own name so the indicator can say what is being captured", async () => {
+    // For whole-screen capture the picker runs in here and reports nothing
+    // else, so the track label is the only description of what the user chose.
+    stream = fakeStream(1, "Screen 1");
+    const { recorder: capture } = harness();
+
+    expect(await capture.start("s1", { kind: "screen" })).toMatchObject({
+      sourceLabel: "Screen 1",
+    });
+  });
+
+  it("reports no label rather than an empty one", async () => {
+    // An empty string would overwrite the controller's provisional label with
+    // nothing, leaving the user a recording indicator that names no source.
+    stream = fakeStream(1, "");
+    const { recorder: capture } = harness();
+
+    expect(await capture.start("s1", { kind: "screen" })).toMatchObject({
+      sourceLabel: null,
+    });
   });
 
   it("reports a dismissed picker as cancelled and writes nothing", async () => {

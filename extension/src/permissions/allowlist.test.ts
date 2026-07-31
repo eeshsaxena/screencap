@@ -408,7 +408,26 @@ describe("manifest", () => {
   });
 
   it("does not carry permissions no code exercises yet", () => {
-    // desktopCapture and offscreen belong with the capture unit that uses them.
-    expect(manifest.permissions).toEqual(["identity", "storage"]);
+    expect(manifest.permissions).toEqual([
+      "identity",
+      "storage",
+      "tabCapture",
+      "offscreen",
+      "unlimitedStorage",
+    ]);
+  });
+
+  it("does not request desktopCapture", () => {
+    // A desktopCapture stream id cannot be consumed inside an offscreen
+    // document, so whole-screen capture uses the web-standard display picker
+    // instead and this permission would buy nothing — while costing a
+    // sensitive-permission line in Chrome Web Store review.
+    expect(manifest.permissions).not.toContain("desktopCapture");
+  });
+
+  it("keeps recorded bytes exempt from quota eviction", () => {
+    // Slices live in IndexedDB until upload. Without unlimitedStorage the
+    // browser may evict a recording that has not been uploaded yet.
+    expect(manifest.permissions).toContain("unlimitedStorage");
   });
 });

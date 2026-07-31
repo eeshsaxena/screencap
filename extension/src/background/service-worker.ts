@@ -15,6 +15,11 @@ import {
   toWhoAmI,
   type WhoAmI,
 } from "../auth/firebase.js";
+import {
+  CaptureController,
+  chromeCaptureDeps,
+  registerCaptureListener,
+} from "./capture-controller.js";
 import { isExtensionPageSender as isTrustedSender } from "./senders.js";
 
 const session = new AuthSession(chromeAuthDeps());
@@ -85,3 +90,7 @@ chrome.runtime.onMessage.addListener(
     return true;
   },
 );
+
+// Registered after the auth listener, not instead of it: both see every message
+// and decline what is not theirs.
+registerCaptureListener(new CaptureController(chromeCaptureDeps()));
