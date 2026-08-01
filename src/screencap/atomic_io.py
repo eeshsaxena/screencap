@@ -33,7 +33,14 @@ def atomic_write_0600(
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=suffix)
     closed = False
     try:
-        os.write(fd, data)
+        # os.write can write fewer bytes than requested for a large buffer, so
+        # loop until every byte lands. A single unchecked os.write() would leave
+        # a truncated temp file that os.replace then promotes into place (for an
+        # encrypted still, a corrupt artifact), defeating the completeness this
+        # primitive promises.
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
         if fsync:
             os.fsync(fd)
         os.close(fd)
